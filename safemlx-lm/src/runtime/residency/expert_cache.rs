@@ -1453,7 +1453,10 @@ pub enum ExpertCacheError {
 mod tests {
     use std::sync::Arc;
 
-    use safemlx::{Device, DeviceType, HostTransferStorageKind};
+    use safemlx::{
+        host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy,
+        HostTransferStorageKind,
+    };
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
 
     use super::*;
@@ -1540,7 +1543,10 @@ mod tests {
         prefill_target: u64,
         eviction: CacheEvictionPolicy,
     ) -> ExpertCache {
-        let experts = OffloadConfig::new(Some(device), Some(host), 1)
+        let binding_capacity =
+            host_transfer_capacity_upper_bound(8, HostTransferPolicy::Transfer).unwrap() as u64;
+        let physical_host = (host / 8).checked_mul(binding_capacity).unwrap();
+        let experts = OffloadConfig::new(Some(device), Some(physical_host), 1)
             .unwrap()
             .with_eviction_policy(eviction);
         ExpertCache::new(

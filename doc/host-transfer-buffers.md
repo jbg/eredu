@@ -21,12 +21,14 @@ buffer reports its actual `HostTransferStorageKind`, shape, dtype, logical byte
 length, and allocation capacity.
 
 Transfer storage has a dedicated allocation path instead of borrowing a
-possibly larger entry from MLX's ordinary buffer cache. CPU capacity is the
-requested payload size, CUDA pinned/managed capacity is the requested size,
-and Metal capacity is the page-rounded shared-buffer length. The backend
-publishes that exact pre-allocation upper bound, so a residency manager can
-reserve capacity before allocating and replace the reservation with the
-buffer's reported capacity without a transient overcommit.
+possibly larger entry from MLX's ordinary buffer cache. CPU storage uses an
+anonymous OS page allocation whose charged extent includes the allocator
+header. Metal rounds every non-empty shared buffer to the VM page size. CUDA
+rounds pinned and managed requests to a conservative 64 KiB backing extent
+before calling the runtime allocator. The backend publishes the same charged
+extent before allocation and from the resulting buffer, so a residency manager
+can reserve it before allocating without a transient overcommit. Logical copy
+lengths remain the tensor's `nbytes`; unused backing capacity is never copied.
 
 `host_transfer_memory_stats` reports process-wide active and peak physical
 bytes and allocation counts independently for CPU, Metal shared, CUDA pinned,
@@ -34,7 +36,7 @@ and CUDA managed storage. Resetting a peak is race-safe with concurrent
 allocation. This includes every allocation owned by this primitive, including
 CUDA memory returned by `cudaMallocHost`, even though pinned bytes are outside
 MLX's device allocator counters. It intentionally does not claim visibility
-into opaque memory owned internally by a platform driver; the direct
+into opaque bookkeeping owned internally by a platform driver; the direct
 `cudaMemcpyAsync` path has no MLX-owned payload staging allocation, and backend
 tests check the device allocator independently for accidental staging.
 

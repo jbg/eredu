@@ -30,7 +30,7 @@ pub(crate) const DENSE_TRANSFER_WINDOW: usize = 2;
 pub struct DenseDiskStreamLoadOptions {
     /// Finite logical device parameter budget, including pinned static weights.
     pub device_budget_bytes: u64,
-    /// Finite logical host layer budget. Zero selects direct disk-to-device loading.
+    /// Finite charged host-allocation budget. Zero selects direct disk-to-device loading.
     pub host_budget_bytes: u64,
     /// Number of current and imminent layer host copies protected from eviction.
     pub host_lookahead: usize,
@@ -494,7 +494,9 @@ mod tests {
             OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy,
         },
     };
-    use safemlx::{Device, DeviceType, Stream};
+    use safemlx::{
+        host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy, Stream,
+    };
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     #[derive(Default)]
@@ -564,8 +566,11 @@ mod tests {
             definitions.push(OffloadUnit::new(id.clone(), [binding]).unwrap());
             ids.push(id);
         }
+        let binding_capacity =
+            host_transfer_capacity_upper_bound(8, HostTransferPolicy::Transfer).unwrap() as u64;
+        let physical_host_budget = (host_budget / 8).checked_mul(binding_capacity).unwrap();
         let plan = OffloadPlan::new(
-            OffloadConfig::new(Some(u64::MAX), Some(host_budget), 1).unwrap(),
+            OffloadConfig::new(Some(u64::MAX), Some(physical_host_budget), 1).unwrap(),
             specs,
         )
         .unwrap();
@@ -658,8 +663,10 @@ mod tests {
         let store = Arc::new(SafetensorsWeightStore::open(directory.path()).unwrap());
         let id = OffloadUnitId::new("layer.0").unwrap();
         let binding = WeightBinding::new("weight", "weight", TensorSelection::Full, 8).unwrap();
+        let host_capacity =
+            host_transfer_capacity_upper_bound(8, HostTransferPolicy::Transfer).unwrap() as u64;
         let plan = OffloadPlan::new(
-            OffloadConfig::new(Some(8), Some(8), 1).unwrap(),
+            OffloadConfig::new(Some(8), Some(host_capacity), 1).unwrap(),
             [
                 OffloadUnitSpec::new(id.clone(), 8, ResidencyPolicy::Cacheable, MemoryTier::Disk)
                     .unwrap(),

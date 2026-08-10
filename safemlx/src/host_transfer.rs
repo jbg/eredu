@@ -119,9 +119,10 @@ pub fn reset_host_transfer_peak_memory(kind: HostTransferStorageKind) -> Result<
 
 /// Returns a conservative physical capacity to reserve before allocation.
 ///
-/// CPU, Metal, and CUDA return the exact capacity of their dedicated
-/// host-transfer allocation path. A future backend may conservatively return a
-/// larger value, but an allocation must never exceed it.
+/// CPU and Metal return their page-rounded owned backing extent. CUDA returns
+/// the conservative 64 KiB-granular extent it requests from the runtime. A
+/// future backend may return a larger conservative value, but an allocation
+/// must never exceed it.
 pub fn host_transfer_capacity_upper_bound(
     nbytes: usize,
     policy: HostTransferPolicy,
@@ -255,7 +256,7 @@ impl HostTransferBuffer {
         })
     }
 
-    /// Physical allocation capacity in bytes.
+    /// Charged backing-allocation extent in bytes.
     pub fn capacity(&self) -> Result<usize> {
         let _guard = runtime_lock::enter();
         usize::try_from_op(|output| unsafe {
@@ -404,7 +405,7 @@ impl ImmutableHostTransferBuffer {
         self.buffer.nbytes()
     }
 
-    /// Physical allocation capacity in bytes.
+    /// Charged backing-allocation extent in bytes.
     pub fn capacity(&self) -> Result<usize> {
         self.buffer.capacity()
     }

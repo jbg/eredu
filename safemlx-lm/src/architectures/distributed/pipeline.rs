@@ -102,7 +102,8 @@ use crate::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
     },
     runtime::residency::manager::{
-        OffloadUnit, ResidencyManager, ResidencyReport, ResidentLayerGroup,
+        host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyManager, ResidencyReport,
+        ResidentLayerGroup,
     },
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
@@ -6115,15 +6116,23 @@ where
     let mut specs = Vec::with_capacity(layer_count);
     let mut units = Vec::with_capacity(layer_count);
     let mut bytes = Vec::with_capacity(layer_count);
+    let mut host_bytes = Vec::with_capacity(layer_count);
     let mut planned_layer_bytes = 0u64;
+    let mut planned_host_bytes = 0u64;
     for global_layer in range {
         let layer = make_layer(global_layer, stream)?;
         let bindings = make_bindings(global_layer, &layer, store.as_ref())?;
         let layer_bytes = binding_bytes(&bindings)?;
+        let layer_host_bytes = host_capacity_upper_bound_for_bindings(&bindings)?;
         planned_layer_bytes = planned_layer_bytes
             .checked_add(layer_bytes)
             .ok_or_else(|| {
                 Error::Parallel("pipeline streamed-layer byte total overflowed".into())
+            })?;
+        planned_host_bytes = planned_host_bytes
+            .checked_add(layer_host_bytes)
+            .ok_or_else(|| {
+                Error::Parallel("pipeline host allocation-capacity total overflowed".into())
             })?;
         let id = OffloadUnitId::new(format!("pipeline.layer.{global_layer:05}"))?;
         definitions.push(OffloadUnit::new(id.clone(), bindings)?);
@@ -6138,9 +6147,10 @@ where
         specs.push(OffloadUnitSpec::new(id.clone(), layer_bytes, policy, tier)?);
         units.push(id);
         bytes.push(layer_bytes);
+        host_bytes.push(layer_host_bytes);
     }
-    let largest = |depth: usize| -> Result<u64, Error> {
-        bytes
+    let largest = |values: &[u64], depth: usize| -> Result<u64, Error> {
+        values
             .windows(depth)
             .try_fold(0u64, |largest, window| {
                 window
@@ -6150,7 +6160,7 @@ where
             })
             .ok_or_else(|| Error::Parallel("pipeline layer-window byte total overflowed".into()))
     };
-    let device_window_bytes = largest(device_depth)?;
+    let device_window_bytes = largest(&bytes, device_depth)?;
     let required_device = static_device_bytes
         .checked_add(device_window_bytes)
         .ok_or_else(|| Error::Parallel("pipeline device parameter total overflowed".into()))?;
@@ -6164,9 +6174,9 @@ where
                 }
             }
             if let Some(budget) = options.offload.host_budget_bytes() {
-                if planned_layer_bytes > budget {
+                if planned_host_bytes > budget {
                     return Err(Error::Parallel(format!(
-                        "pipeline host budget {budget} cannot eagerly hold all {planned_layer_bytes} rank-local layer bytes"
+                        "pipeline host budget {budget} cannot eagerly hold all {planned_host_bytes} rank-local host allocation bytes"
                     )));
                 }
             }
@@ -6190,7 +6200,7 @@ where
             }
             let device_layer_budget = options.device_budget_bytes - static_device_bytes;
             if options.host_budget_bytes > 0 {
-                let host_window_bytes = largest(options.host_lookahead)?;
+                let host_window_bytes = largest(&host_bytes, options.host_lookahead)?;
                 if host_window_bytes > options.host_budget_bytes {
                     return Err(Error::Parallel(format!(
                         "pipeline host budget {} cannot hold the largest protected local layer window ({host_window_bytes} bytes)",
@@ -6238,6 +6248,7 @@ where
                 options,
                 units.len(),
                 planned_layer_bytes,
+                host_bytes.iter().copied().max().unwrap_or(0),
                 static_device_bytes,
                 [("pipeline_stage".to_string(), units.clone())],
             )?))
@@ -24441,7 +24452,7 @@ mod tests {
         topology: ParallelTopology,
         stream: &Stream,
         weights_stream: &Stream,
-    ) -> (u64, u64, u64) {
+    ) -> (u64, u64, u64, u64) {
         let sizing = load_pipeline_model_with_options(
             model_dir,
             ModelLoadOptions::with_parallel(topology).with_weight_residency(
@@ -24462,8 +24473,9 @@ mod tests {
         let report = sizing.dense_stream_report().unwrap().unwrap();
         let static_bytes = report.pinned_static_device_bytes();
         let layer_bytes = report.planned_layer_bytes();
+        let host_bytes = report.maximum_host_layer_bytes();
         let device_bytes = static_bytes.checked_add(layer_bytes).unwrap();
-        (device_bytes, layer_bytes, static_bytes)
+        (device_bytes, host_bytes, static_bytes, layer_bytes)
     }
 
     fn sampled_dense_options(
@@ -24635,14 +24647,15 @@ mod tests {
             };
             assert_close(&actual, &expected);
         }
-        for (model, (device_budget, host_budget, static_bytes)) in
+        for (model, (device_budget, host_budget, static_bytes, layer_bytes)) in
             [(&first, first_requirements), (&last, last_requirements)]
         {
             let report = model.dense_stream_report().unwrap().unwrap();
             assert!(report.residency().offload().mlx_memory().is_some());
             assert!(report.residency().offload().process_sampled());
             assert_eq!(report.pinned_static_device_bytes(), static_bytes);
-            assert_eq!(report.planned_layer_bytes(), host_budget);
+            assert_eq!(report.planned_layer_bytes(), layer_bytes);
+            assert_eq!(report.maximum_host_layer_bytes(), host_budget);
             assert!(
                 report
                     .device_layers()
@@ -24664,10 +24677,10 @@ mod tests {
         initialize_parameters(&mut reference, stream);
         let dir = tempfile::tempdir().unwrap();
         write_llama_fixture(dir.path(), &reference, false);
-        let (device_bytes, layer_bytes, static_bytes) =
+        let (device_bytes, host_bytes, static_bytes, layer_bytes) =
             llama_pipeline_dense_requirements(dir.path(), gpu_topology(0), stream, cpu.stream());
 
-        let host_budget = layer_bytes.checked_sub(1).unwrap();
+        let host_budget = host_bytes.checked_sub(1).unwrap();
         let host_error = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
@@ -24684,7 +24697,7 @@ mod tests {
             host_error,
             Error::Parallel(message)
                 if message == format!(
-                    "pipeline host budget {host_budget} cannot hold the largest protected local layer window ({layer_bytes} bytes)"
+                    "pipeline host budget {host_budget} cannot hold the largest protected local layer window ({host_bytes} bytes)"
                 )
         ));
 
@@ -24694,7 +24707,7 @@ mod tests {
             ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
                 WeightResidency::dense_disk_stream(sampled_dense_options(
                     device_budget,
-                    layer_bytes,
+                    host_bytes,
                 )),
             ),
             stream,
@@ -24724,7 +24737,7 @@ mod tests {
             host_error,
             Error::Parallel(message)
                 if message == format!(
-                    "pipeline host budget {host_budget} cannot eagerly hold all {layer_bytes} rank-local layer bytes"
+                    "pipeline host budget {host_budget} cannot eagerly hold all {host_bytes} rank-local host allocation bytes"
                 )
         ));
 

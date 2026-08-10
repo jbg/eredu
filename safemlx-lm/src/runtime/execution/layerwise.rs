@@ -36,8 +36,8 @@ use crate::{
         DENSE_TRANSFER_WINDOW,
     },
     runtime::residency::manager::{
-        OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentLayerGroup,
-        ResidentTransfer, ResidentUnitLease,
+        host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyError, ResidencyManager,
+        ResidencyReport, ResidentLayerGroup, ResidentTransfer, ResidentUnitLease,
     },
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
@@ -437,6 +437,7 @@ impl LayerWeightResidency {
 pub struct DenseDiskStreamReport {
     planned_layer_count: usize,
     planned_layer_bytes: u64,
+    maximum_host_layer_bytes: u64,
     pinned_static_device_bytes: u64,
     transfer_stream_index: i32,
     residency: ResidencyReport,
@@ -687,6 +688,10 @@ impl DenseDiskStreamReport {
     pub const fn planned_layer_bytes(&self) -> u64 {
         self.planned_layer_bytes
     }
+    /// Returns the charged host-transfer capacity of the largest execution unit.
+    pub const fn maximum_host_layer_bytes(&self) -> u64 {
+        self.maximum_host_layer_bytes
+    }
     /// Returns pinned static parameter bytes outside the streamed-layer totals.
     pub const fn pinned_static_device_bytes(&self) -> u64 {
         self.pinned_static_device_bytes
@@ -830,6 +835,7 @@ pub(crate) struct DenseStreamController {
     background: Option<BackgroundLayerPrefetch>,
     planned_layer_count: usize,
     planned_layer_bytes: u64,
+    maximum_host_layer_bytes: u64,
     pinned_static_device_bytes: u64,
     transfer_stream_index: i32,
     groups: Vec<DenseExecutionGroupPlan>,
@@ -843,6 +849,7 @@ impl DenseStreamController {
         options: DenseDiskStreamLoadOptions,
         planned_layer_count: usize,
         planned_layer_bytes: u64,
+        maximum_host_layer_bytes: u64,
         pinned_static_device_bytes: u64,
         groups: impl IntoIterator<Item = (String, Vec<OffloadUnitId>)>,
     ) -> Result<Self, Error> {
@@ -864,6 +871,7 @@ impl DenseStreamController {
             background,
             planned_layer_count,
             planned_layer_bytes,
+            maximum_host_layer_bytes,
             pinned_static_device_bytes,
             transfer_stream_index: manager.device_stream_index()?,
             groups,
@@ -1218,6 +1226,7 @@ impl DenseStreamController {
         Ok(DenseDiskStreamReport {
             planned_layer_count: self.planned_layer_count,
             planned_layer_bytes: self.planned_layer_bytes,
+            maximum_host_layer_bytes: self.maximum_host_layer_bytes,
             pinned_static_device_bytes: self.pinned_static_device_bytes,
             transfer_stream_index: self.transfer_stream_index,
             host_layers: tier_report(MemoryTier::Host),
@@ -1417,6 +1426,7 @@ pub struct LayerwiseModelMetadata {
     residency: ExecutionResidency,
     layer_parameter_bytes: u64,
     maximum_device_layer_bytes: u64,
+    maximum_host_layer_bytes: u64,
     device_layer_capacity: usize,
     materialization: Option<BoundedQuantizationReport>,
 }
@@ -1500,6 +1510,10 @@ impl LayerwiseModelMetadata {
     /// Returns the largest possible device-resident decoder-layer byte total.
     pub const fn maximum_device_layer_bytes(&self) -> u64 {
         self.maximum_device_layer_bytes
+    }
+    /// Returns the charged host-transfer capacity of the largest decoder layer.
+    pub const fn maximum_host_layer_bytes(&self) -> u64 {
+        self.maximum_host_layer_bytes
     }
     /// Returns the maximum number of decoder layers retained on device.
     pub const fn device_layer_capacity(&self) -> usize {
@@ -2455,6 +2469,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             residency: ExecutionResidency::LayerwiseHost,
             layer_parameter_bytes: 0,
             maximum_device_layer_bytes: 0,
+            maximum_host_layer_bytes: 0,
             device_layer_capacity: 0,
             materialization: None,
         };
@@ -3890,10 +3905,12 @@ where
     let execution_graph = adapter.execution_graph()?;
     let mut groups = Vec::with_capacity(execution_graph.groups().len());
     let mut layer_parameter_bytes = 0u64;
+    let mut host_layer_parameter_bytes = 0u64;
     let mut device_window_bytes = 0u64;
     let mut host_window_bytes = 0u64;
     let mut planned_layer_count = 0usize;
     let mut maximum_group_depth = 0usize;
+    let mut maximum_host_layer_bytes = 0u64;
     for (group_index, group_spec) in execution_graph.groups().iter().enumerate() {
         let layer_count = adapter.layer_count(group_index)?;
         let depth = options.device_depth(layer_count);
@@ -3912,10 +3929,18 @@ where
         }
         let mut layer_ids = Vec::with_capacity(layer_count);
         let mut layer_bytes = Vec::with_capacity(layer_count);
+        let mut layer_host_bytes = Vec::with_capacity(layer_count);
         for index in 0..layer_count {
             let layer = adapter.new_layer(group_index, index, stream)?;
             let bindings = adapter.layer_bindings(group_index, index, &layer, store.as_ref())?;
             let bytes = binding_bytes(&bindings)?;
+            let host_bytes = host_capacity_upper_bound_for_bindings(&bindings)?;
+            maximum_host_layer_bytes = maximum_host_layer_bytes.max(host_bytes);
+            host_layer_parameter_bytes = host_layer_parameter_bytes.checked_add(host_bytes).ok_or(
+                LayerwiseModelError::ArithmeticOverflow {
+                    context: "host execution-unit allocation-capacity total",
+                },
+            )?;
             layer_parameter_bytes = layer_parameter_bytes.checked_add(bytes).ok_or(
                 LayerwiseModelError::ArithmeticOverflow {
                     context: "host execution-unit byte total",
@@ -3953,14 +3978,17 @@ where
             )?;
             layer_ids.push(id);
             layer_bytes.push(bytes);
+            layer_host_bytes.push(host_bytes);
         }
         let group_device_window = largest_window_bytes(&layer_bytes, depth)?;
         if dense.is_some() {
             device_window_bytes = device_window_bytes.max(group_device_window);
             if let Some(dense) = dense {
                 if dense.host_budget_bytes > 0 {
-                    host_window_bytes = host_window_bytes
-                        .max(largest_window_bytes(&layer_bytes, dense.host_lookahead)?);
+                    host_window_bytes = host_window_bytes.max(largest_window_bytes(
+                        &layer_host_bytes,
+                        dense.host_lookahead,
+                    )?);
                 }
             }
         } else {
@@ -3988,7 +4016,7 @@ where
     } else if dense.is_some() {
         validate_host_budget(offload, host_window_bytes)?;
     } else {
-        validate_host_budget(offload, layer_parameter_bytes)?;
+        validate_host_budget(offload, host_layer_parameter_bytes)?;
     }
     validate_device_budget(
         offload,
@@ -4037,6 +4065,7 @@ where
         residency: options.residency(),
         layer_parameter_bytes,
         maximum_device_layer_bytes: device_window_bytes,
+        maximum_host_layer_bytes,
         device_layer_capacity: if fully_resident {
             planned_layer_count
         } else {
@@ -4055,6 +4084,7 @@ where
             dense,
             planned_layer_count,
             layer_parameter_bytes,
+            maximum_host_layer_bytes,
             static_device_bytes,
             execution_groups,
         )?);
@@ -4120,10 +4150,12 @@ where
     let execution_graph = adapter.execution_graph()?;
     let mut groups = Vec::with_capacity(execution_graph.groups().len());
     let mut layer_parameter_bytes = 0u64;
+    let mut host_layer_parameter_bytes = 0u64;
     let mut device_window_bytes = 0u64;
     let mut host_window_bytes = 0u64;
     let mut planned_layer_count = 0usize;
     let mut maximum_group_depth = 0usize;
+    let mut maximum_host_layer_bytes = 0u64;
     for (group_index, group_spec) in execution_graph.groups().iter().enumerate() {
         let layer_count = adapter.layer_count(group_index)?;
         let depth = options.device_depth(layer_count);
@@ -4142,6 +4174,7 @@ where
         }
         let mut layer_ids = Vec::with_capacity(layer_count);
         let mut layer_bytes = Vec::with_capacity(layer_count);
+        let mut layer_host_bytes = Vec::with_capacity(layer_count);
         for index in 0..layer_count {
             let global_layer = adapter.new_layer(group_index, index, stream)?;
             let global_bindings =
@@ -4161,6 +4194,13 @@ where
                 stream,
             )?;
             let bytes = binding_bytes(&bindings)?;
+            let host_bytes = host_capacity_upper_bound_for_bindings(&bindings)?;
+            maximum_host_layer_bytes = maximum_host_layer_bytes.max(host_bytes);
+            host_layer_parameter_bytes = host_layer_parameter_bytes.checked_add(host_bytes).ok_or(
+                LayerwiseModelError::ArithmeticOverflow {
+                    context: "host TP execution-unit allocation-capacity total",
+                },
+            )?;
             layer_parameter_bytes = layer_parameter_bytes.checked_add(bytes).ok_or(
                 LayerwiseModelError::ArithmeticOverflow {
                     context: "host TP execution-unit byte total",
@@ -4198,14 +4238,17 @@ where
             )?;
             layer_ids.push(id);
             layer_bytes.push(bytes);
+            layer_host_bytes.push(host_bytes);
         }
         let group_device_window = largest_window_bytes(&layer_bytes, depth)?;
         if dense.is_some() {
             device_window_bytes = device_window_bytes.max(group_device_window);
             if let Some(dense) = dense {
                 if dense.host_budget_bytes > 0 {
-                    host_window_bytes = host_window_bytes
-                        .max(largest_window_bytes(&layer_bytes, dense.host_lookahead)?);
+                    host_window_bytes = host_window_bytes.max(largest_window_bytes(
+                        &layer_host_bytes,
+                        dense.host_lookahead,
+                    )?);
                 }
             }
         } else {
@@ -4231,7 +4274,7 @@ where
     } else if dense.is_some() {
         validate_host_budget(offload, host_window_bytes)?;
     } else {
-        validate_host_budget(offload, layer_parameter_bytes)?;
+        validate_host_budget(offload, host_layer_parameter_bytes)?;
     }
     validate_device_budget(
         offload,
@@ -4280,6 +4323,7 @@ where
         residency: options.residency(),
         layer_parameter_bytes,
         maximum_device_layer_bytes: device_window_bytes,
+        maximum_host_layer_bytes,
         device_layer_capacity: if fully_resident {
             planned_layer_count
         } else {
@@ -4326,6 +4370,7 @@ where
             dense,
             planned_layer_count,
             layer_parameter_bytes,
+            maximum_host_layer_bytes,
             static_device_bytes,
             execution_groups,
         )?);
@@ -4845,10 +4890,10 @@ pub enum LayerwiseModelError {
         /// Unexpected keys in stable order.
         unused: Vec<String>,
     },
-    /// The host cannot retain every decoder layer.
-    #[error("host budget {budget} bytes cannot contain all {required} decoder-weight bytes")]
+    /// The host cannot retain the required decoder-layer allocation capacity.
+    #[error("host budget {budget} bytes cannot contain {required} bytes of decoder host-transfer allocations")]
     HostBudgetTooSmall {
-        /// Required decoder bytes.
+        /// Required charged host-allocation bytes.
         required: u64,
         /// Configured host budget.
         budget: u64,
@@ -5451,7 +5496,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let host_budget = metadata.maximum_device_layer_bytes();
+        let host_budget = metadata.maximum_host_layer_bytes();
         drop(sizing);
 
         let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1).unwrap();
@@ -5640,7 +5685,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let host_budget = metadata.maximum_device_layer_bytes();
+        let host_budget = metadata.maximum_host_layer_bytes();
         drop(sizing);
 
         let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1).unwrap();

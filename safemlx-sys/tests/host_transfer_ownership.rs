@@ -49,6 +49,7 @@ fn host_transfer_handles_obey_c_ownership_contract() {
             0
         );
         assert_eq!(capacity, bound);
+        assert!(capacity > bytes);
         let mut kind = 0;
         assert_eq!(
             safemlx_sys::mlx_host_transfer_buffer_storage_kind(&mut kind, buffer),

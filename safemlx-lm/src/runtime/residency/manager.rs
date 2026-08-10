@@ -2472,33 +2472,34 @@ fn resident_capacity_requirement(
     if tier != MemoryTier::Host {
         return Ok(unit.spec.bytes());
     }
-    unit.definition
-        .bindings
-        .iter()
-        .try_fold(0u64, |total, binding| {
-            let logical = usize::try_from(binding.expected_bytes).map_err(|_| {
-                ResidencyError::ArithmeticOverflow {
-                    context: "host capacity-bound input conversion",
-                }
+    host_capacity_upper_bound_for_bindings(&unit.definition.bindings)
+}
+
+/// Returns the complete charged host-transfer capacity for one atomic unit.
+pub(crate) fn host_capacity_upper_bound_for_bindings(
+    bindings: &[WeightBinding],
+) -> Result<u64, ResidencyError> {
+    bindings.iter().try_fold(0u64, |total, binding| {
+        let logical = usize::try_from(binding.expected_bytes).map_err(|_| {
+            ResidencyError::ArithmeticOverflow {
+                context: "host capacity-bound input conversion",
+            }
+        })?;
+        let capacity = host_transfer_capacity_upper_bound(logical, HostTransferPolicy::Transfer)
+            .map_err(|source| ResidencyError::Mlx {
+                id: internal_id(),
+                operation: "host-transfer capacity-bound query",
+                source,
             })?;
-            let capacity =
-                host_transfer_capacity_upper_bound(logical, HostTransferPolicy::Transfer).map_err(
-                    |source| ResidencyError::Mlx {
-                        id: unit.spec.id().clone(),
-                        operation: "host-transfer capacity-bound query",
-                        source,
-                    },
-                )?;
-            let capacity =
-                u64::try_from(capacity).map_err(|_| ResidencyError::ArithmeticOverflow {
-                    context: "host capacity-bound output conversion",
-                })?;
-            total
-                .checked_add(capacity)
-                .ok_or(ResidencyError::ArithmeticOverflow {
-                    context: "host unit capacity bound",
-                })
-        })
+        let capacity = u64::try_from(capacity).map_err(|_| ResidencyError::ArithmeticOverflow {
+            context: "host capacity-bound output conversion",
+        })?;
+        total
+            .checked_add(capacity)
+            .ok_or(ResidencyError::ArithmeticOverflow {
+                context: "host unit capacity bound",
+            })
+    })
 }
 
 fn host_buffers_nbytes(buffers: &ResidentHostBuffers) -> Result<u64, ResidencyError> {
@@ -2728,7 +2729,10 @@ mod tests {
         time::Duration,
     };
 
-    use safemlx::{Device, DeviceType, HostTransferStorageKind};
+    use safemlx::{
+        host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy,
+        HostTransferStorageKind,
+    };
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     use super::*;
@@ -2836,6 +2840,18 @@ mod tests {
         specs: impl IntoIterator<Item = OffloadUnitSpec>,
         units: impl IntoIterator<Item = OffloadUnit>,
     ) -> ResidencyManager {
+        // Most fixtures below use one independently allocated eight-byte
+        // binding as their accounting unit. Preserve those unit-count tests
+        // while exercising the production contract, which charges the full
+        // backing extent of every host-transfer allocation.
+        let host_budget = config.host_budget_bytes().map(fixture_physical_host_budget);
+        let config = OffloadConfig::new(
+            config.device_budget_bytes(),
+            host_budget,
+            config.prefetch_depth(),
+        )
+        .unwrap()
+        .with_eviction_policy(config.eviction_policy());
         ResidencyManager::new(
             store,
             OffloadPlan::new(config, specs).unwrap(),
@@ -2844,6 +2860,42 @@ mod tests {
             cpu_stream(),
         )
         .unwrap()
+    }
+
+    fn fixture_physical_host_budget(logical_bytes: u64) -> u64 {
+        if logical_bytes == 0 {
+            return 0;
+        }
+        let minimum_capacity =
+            host_transfer_capacity_upper_bound(1, HostTransferPolicy::Transfer).unwrap() as u64;
+        if logical_bytes >= minimum_capacity {
+            return logical_bytes;
+        }
+        let complete_bindings = logical_bytes / 8;
+        let remainder = logical_bytes % 8;
+        let binding_capacity = fixture_binding_capacity();
+        complete_bindings
+            .checked_mul(binding_capacity)
+            .and_then(|bytes| {
+                (remainder != 0)
+                    .then(|| {
+                        host_transfer_capacity_upper_bound(
+                            remainder as usize,
+                            HostTransferPolicy::Transfer,
+                        )
+                        .unwrap() as u64
+                    })
+                    .map_or(Some(bytes), |tail| bytes.checked_add(tail))
+            })
+            .unwrap()
+    }
+
+    fn fixture_binding_capacity() -> u64 {
+        host_transfer_capacity_upper_bound(8, HostTransferPolicy::Transfer).unwrap() as u64
+    }
+
+    fn fixture_host_capacity(bindings: u64) -> u64 {
+        bindings.checked_mul(fixture_binding_capacity()).unwrap()
     }
 
     fn single(name: &str, key: &str) -> OffloadUnit {
@@ -3217,7 +3269,10 @@ mod tests {
         assert!(!state(&report, "disk").host_resident());
         assert!(state(&report, "host").host_resident());
         assert!(state(&report, "device").device_resident());
-        assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 8);
+        assert_eq!(
+            report.offload().resident_bytes().get(MemoryTier::Host),
+            fixture_binding_capacity()
+        );
         assert_eq!(report.offload().resident_bytes().get(MemoryTier::Device), 8);
         assert!(matches!(
             manager.evict(&id("host"), MemoryTier::Host),
@@ -3291,7 +3346,7 @@ mod tests {
         let store = Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
         let manager = manager(
             store,
-            OffloadConfig::new(None, Some(6), 1).unwrap(),
+            OffloadConfig::new(None, Some(fixture_host_capacity(3)), 1).unwrap(),
             [
                 spec("a-good", 2, ResidencyPolicy::Cacheable, MemoryTier::Host),
                 spec("z-bad", 4, ResidencyPolicy::Cacheable, MemoryTier::Host),
@@ -3320,7 +3375,10 @@ mod tests {
         assert!(!report.initialized());
         assert!(state(&report, "a-good").host_resident());
         assert!(!state(&report, "z-bad").host_resident());
-        assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 2);
+        assert_eq!(
+            report.offload().resident_bytes().get(MemoryTier::Host),
+            fixture_binding_capacity()
+        );
     }
 
     #[test]
@@ -3453,7 +3511,10 @@ mod tests {
         assert!(!state(&report, "window-b").host_resident());
         assert!(state(&report, "cache-c").host_resident());
         assert_eq!(report.offload().evictions().count(), 1);
-        assert_eq!(report.offload().evictions().bytes(), 8);
+        assert_eq!(
+            report.offload().evictions().bytes(),
+            fixture_binding_capacity()
+        );
 
         manager.evict(&id("cache-a"), MemoryTier::Host).unwrap();
         manager.evict(&id("cache-c"), MemoryTier::Host).unwrap();
@@ -3464,7 +3525,9 @@ mod tests {
         assert!(!state(&report, "cache-a").host_resident());
         assert!(state(&report, "cache-c").host_resident());
         assert!(state(&report, "window-b").host_resident());
-        assert!(report.offload().resident_bytes().get(MemoryTier::Host) <= 16);
+        assert!(
+            report.offload().resident_bytes().get(MemoryTier::Host) <= fixture_host_capacity(2)
+        );
     }
 
     #[test]
@@ -3531,7 +3594,10 @@ mod tests {
         assert!(!state(&report, "a").host_resident());
         assert!(state(&report, "a").device_resident());
         assert!(state(&report, "b").host_resident());
-        assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 8);
+        assert_eq!(
+            report.offload().resident_bytes().get(MemoryTier::Host),
+            fixture_binding_capacity()
+        );
         assert_eq!(report.offload().resident_bytes().get(MemoryTier::Device), 8);
     }
 
@@ -3598,7 +3664,10 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 8);
+        assert_eq!(
+            report.offload().resident_bytes().get(MemoryTier::Host),
+            fixture_binding_capacity()
+        );
         barrier.wait();
         for handle in handles {
             handle.join().unwrap();
@@ -3677,8 +3746,8 @@ mod tests {
                 blocking_units,
                 ..
             } => {
-                assert_eq!(required_bytes, 8);
-                assert_eq!(budget_bytes, 16);
+                assert_eq!(required_bytes, fixture_binding_capacity());
+                assert_eq!(budget_bytes, fixture_host_capacity(2));
                 assert_eq!(blocking_units.len(), 2);
                 assert!(blocking_units.iter().any(|unit| unit.pinned));
                 assert!(blocking_units.iter().any(|unit| unit.in_use == 1));
@@ -3734,10 +3803,13 @@ mod tests {
         assert_eq!(host_i32(&indices, "weight"), [14, 15]);
         let report = manager.report().unwrap();
         assert_eq!(report.offload().prefetch().stalls(), 2);
-        assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 16);
+        assert_eq!(
+            report.offload().resident_bytes().get(MemoryTier::Host),
+            fixture_host_capacity(2)
+        );
         assert_eq!(
             report.offload().peak_resident_bytes().get(MemoryTier::Host),
-            16
+            fixture_host_capacity(2)
         );
         assert!(report.weight_store().mapping_hits > 0);
     }
@@ -3787,7 +3859,7 @@ mod tests {
     fn promotes_host_buffers_to_a_real_metal_stream() {
         let (_dir, store) = fixture_store();
         let plan = OffloadPlan::new(
-            OffloadConfig::new(Some(8), Some(8), 1).unwrap(),
+            OffloadConfig::new(Some(8), Some(fixture_binding_capacity()), 1).unwrap(),
             [spec("a", 8, ResidencyPolicy::Cacheable, MemoryTier::Host)],
         )
         .unwrap();

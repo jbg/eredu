@@ -1022,7 +1022,10 @@ mod tests {
     use crate::runtime::{
         checkpoint::{quantization::AffineQuantization, store::GgufWeightStore},
         residency::{
-            manager::{OffloadUnit, ResidencyManager, WeightBinding},
+            manager::{
+                host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyManager,
+                WeightBinding,
+            },
             policy::{
                 MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec,
                 ResidencyPolicy,
@@ -1609,11 +1612,15 @@ mod tests {
             WeightBinding::new(name, key, TensorSelection::Full, bytes).unwrap()
         })
         .collect::<Vec<_>>();
+        let host_capacity = host_capacity_upper_bound_for_bindings(&bindings).unwrap();
         let unit = OffloadUnit::new(id.clone(), bindings).unwrap();
         let spec = OffloadUnitSpec::new(id.clone(), 320, ResidencyPolicy::Pinned, MemoryTier::Host)
             .unwrap();
-        let offload =
-            OffloadPlan::new(OffloadConfig::new(None, Some(320), 1).unwrap(), [spec]).unwrap();
+        let offload = OffloadPlan::new(
+            OffloadConfig::new(None, Some(host_capacity), 1).unwrap(),
+            [spec],
+        )
+        .unwrap();
         let source_context = cpu_context();
         let device_context = cpu_context();
         let manager = ResidencyManager::new(
@@ -1627,7 +1634,10 @@ mod tests {
         manager.initialize().unwrap();
         let report = manager.report().unwrap();
         assert_eq!(report.offload().planned_bytes().get(MemoryTier::Host), 320);
-        assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 320);
+        assert_eq!(
+            report.offload().resident_bytes().get(MemoryTier::Host),
+            host_capacity
+        );
         let lease = manager.acquire(&id, MemoryTier::Host).unwrap();
         let resident_bytes = lease
             .binding_names()

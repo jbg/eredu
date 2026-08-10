@@ -38,7 +38,7 @@ typedef enum mlx_host_transfer_storage_kind_ {
   MLX_HOST_TRANSFER_STORAGE_CUDA_MANAGED,
 } mlx_host_transfer_storage_kind;
 
-/** Process-wide physical allocation telemetry for one storage kind. */
+/** Process-wide charged backing-allocation telemetry for one storage kind. */
 typedef struct mlx_host_transfer_memory_stats_ {
   size_t active_bytes;
   size_t peak_bytes;
@@ -46,7 +46,7 @@ typedef struct mlx_host_transfer_memory_stats_ {
   size_t peak_allocations;
 } mlx_host_transfer_memory_stats;
 
-/** Read current and peak physical host-transfer allocation telemetry. */
+/** Read current and peak charged host-transfer backing telemetry. */
 int mlx_host_transfer_memory_stats_get(
     mlx_host_transfer_memory_stats* stats,
     mlx_host_transfer_storage_kind kind);
@@ -55,7 +55,7 @@ int mlx_host_transfer_memory_stats_get(
 int mlx_host_transfer_memory_stats_reset_peak(
     mlx_host_transfer_storage_kind kind);
 
-/** Return a conservative capacity bound for pre-allocation admission. */
+/** Return the charged backing bound for pre-allocation admission. */
 int mlx_host_transfer_capacity_upper_bound(
     size_t* capacity,
     size_t nbytes,
@@ -113,6 +113,7 @@ int mlx_host_transfer_buffer_size(
 int mlx_host_transfer_buffer_nbytes(
     size_t* nbytes,
     mlx_host_transfer_buffer buffer);
+/** Return the charged backing-allocation extent. */
 int mlx_host_transfer_buffer_capacity(
     size_t* capacity,
     mlx_host_transfer_buffer buffer);

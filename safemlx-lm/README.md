@@ -179,8 +179,8 @@ Dense disk streaming is mainly appropriate for capacity-first experiments,
 large prefill or offline batches, quantized checkpoints, fast local storage,
 and workloads that benefit from OS page-cache retention. On Apple silicon, CPU
 and GPU arrays share physical unified memory, so host/device tiers do not
-create additional physical capacity even though host reports charge exact
-typed-buffer capacity. Pinned embeddings, final norms and
+create additional physical capacity even though host reports charge the full
+page-rounded typed-buffer backing extent. Pinned embeddings, final norms and
 output projections, activations, KV or recurrent state, kernels, allocator
 caches, and temporary compact expert banks are outside streamed-layer totals.
 Exact physical disk I/O is not observable from mmap telemetry: logical misses,
@@ -281,7 +281,9 @@ Weight residency, independent expert caching, and paged KV-cache residency all
 use typed host-transfer buffers for their host tiers. Independently owned
 request caches can share a `CacheResidencyPool`, which
 enforces aggregate device, host, transfer-in-flight, and live-disk limits while
-retaining tighter per-request limits. The opt-in
+retaining tighter per-request limits. An implicit single-request pool sets its
+transfer throttle to twice the larger device or charged-host tier so one
+source and one destination reservation can overlap. The opt-in
 `llama_residency` example accepts a real checkpoint directory and reports
 latency, throughput, logical residency, transfer telemetry, allocator samples,
 and mapped-shard diagnostics.
@@ -1181,6 +1183,10 @@ The remaining global limitations are:
   workspace. Ordinary residency plans are constructed only after the packed
   overlay exists, so pinned static bytes, layerwise-host budgets, dense-stream
   host/device windows, and expert-cache budgets all count packed bindings.
+  Host budgets and host residency telemetry charge complete backend allocation
+  extents, including page rounding; dense-stream reports expose
+  `maximum_host_layer_bytes()` so callers can size a one-layer host window
+  without confusing logical tensor bytes with physical host capacity.
   `LayerwiseModelMetadata::materialization`,
   `PipelineStageInfo::materialization`, `ResidencyReport::materialization`, and
   `ExpertCacheReport::materialization` expose selected source bytes, output

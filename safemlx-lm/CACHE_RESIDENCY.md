@@ -14,6 +14,10 @@ for aggregate device, host, transfer-in-flight, and live-disk bytes; per-cache
 limits remain in force so one request cannot monopolize it. Constructors reject
 zero device budgets, zero recent-block protection, non-positive block sizes,
 incoherent per-cache and pool limits, and unbounded implicit limits.
+When no process pool is supplied, its transfer-in-flight throttle is twice the
+larger per-cache device or charged-host budget. This admits one retained source
+and one concurrent destination reservation without enlarging either residency
+budget.
 
 ```rust
 use safemlx_lm::{
@@ -100,8 +104,8 @@ No throughput improvement is promised.
 
 Apple unified memory means host/device placement does not create additional
 system capacity. Residency reports count logical device/disk payload bytes and
-the exact physical capacity of typed host-transfer allocations. They do not
-claim physical disk bytes:
+the complete charged backing extent of typed host-transfer allocations. They
+do not include opaque driver bookkeeping and do not claim physical disk bytes:
 mapped pages may be served by the operating-system cache. SafeMLX's immutable
 weight residency manager, expert cache, and paged attention cache use MLX
 completion events to retain transfer sources and order compatible execution

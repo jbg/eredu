@@ -84,6 +84,7 @@ fn physical_capacity_bound_and_native_high_water_track_allocation_lifetime() {
     let buffer =
         HostTransferBuffer::new(&[5000], Dtype::Float32, HostTransferPolicy::Transfer).unwrap();
     let capacity = buffer.capacity().unwrap();
+    assert!(capacity > buffer.nbytes().unwrap());
     assert_eq!(
         host_transfer_capacity_upper_bound(buffer.nbytes().unwrap(), HostTransferPolicy::Transfer)
             .unwrap(),

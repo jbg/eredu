@@ -4254,10 +4254,11 @@ mod tests {
     };
     use safemlx::{
         error::Exception,
+        host_transfer_capacity_upper_bound,
         module::{Module, ModuleParameters, Param},
         ops::{indexing::TryIndexOp, ones_dtype, zeros_dtype},
         transforms::eval,
-        Array, Device, DeviceType, Dtype, ExecutionContext,
+        Array, Device, DeviceType, Dtype, ExecutionContext, HostTransferPolicy,
     };
     use serde_json::{json, Value};
     use std::{collections::HashMap, fs, path::Path, time::SystemTime};
@@ -5051,7 +5052,14 @@ mod tests {
         let mut paged = resident.clone();
         let prompt = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
         let mut resident_cache = resident.new_cache();
-        let options = PagedCacheOptions::new(2, 192, 4096, 1)
+        let host_budget = [32usize, 16]
+            .into_iter()
+            .map(|bytes| {
+                host_transfer_capacity_upper_bound(bytes, HostTransferPolicy::Transfer).unwrap()
+                    as u64
+            })
+            .sum();
+        let options = PagedCacheOptions::new(2, 192, host_budget, 1)
             .unwrap()
             .with_full_attention(true);
         let mut paged_cache = paged

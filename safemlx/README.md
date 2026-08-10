@@ -100,9 +100,10 @@ ordinary CPU storage, Metal shared storage, or CUDA page-locked host storage;
 backends. The physical selection is available through `storage_kind()`.
 `host_transfer_capacity_upper_bound()` supports admission before allocation,
 while `host_transfer_memory_stats()` and `reset_host_transfer_peak_memory()`
-report process-wide active and peak physical bytes/allocation counts per
-storage kind. These counters include CUDA pinned allocations even though MLX's
-device allocator does not.
+report process-wide active and peak charged backing bytes/allocation counts per
+storage kind. These counters include the conservative extent requested for
+CUDA pinned allocations even though MLX's device allocator does not; opaque
+driver bookkeeping remains outside the owned-storage contract.
 
 Transfers return pending values which retain their storage and completion
 event. Array-to-host bytes are unavailable until `synchronize()` succeeds.

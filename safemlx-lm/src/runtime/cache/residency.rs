@@ -236,9 +236,14 @@ impl CacheResidencyPool {
             LiveCacheDiskPolicy::Disabled => 0,
             LiveCacheDiskPolicy::Enabled { budget_bytes, .. } => *budget_bytes,
         };
+        // A transition can retain one source allocation while a concurrent
+        // promotion or demotion owns another transfer reservation. Once host
+        // backing is page-rounded, twice the larger tier is the smallest safe
+        // implicit bound; transfer bytes are a throttle, not extra residency.
         let transfer_bytes = options
             .device_budget_bytes()
             .max(options.host_budget_bytes())
+            .saturating_mul(2)
             .max(1);
         Ok(Self::new(CachePoolLimits::new(
             options.device_budget_bytes(),
@@ -7437,8 +7442,8 @@ mod tests {
         PROMPT_CACHE_SCHEMA_VERSION,
     };
     use safemlx::{
-        transforms::async_eval_with_event, Array, Device, DeviceType, HostTransferStorageKind,
-        Stream,
+        host_transfer_capacity_upper_bound, transforms::async_eval_with_event, Array, Device,
+        DeviceType, HostTransferPolicy, HostTransferStorageKind, Stream,
     };
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
     use std::{
@@ -8818,8 +8823,12 @@ mod tests {
     #[test]
     fn promoted_and_cancelled_writes_retain_host_reservations_until_release() {
         let directory = tempfile::tempdir().unwrap();
-        let pool = CacheResidencyPool::new(CachePoolLimits::new(16, 16, 16, 1024).unwrap());
-        let options = PagedCacheOptions::new(1, 16, 16, 1)
+        let host_block = test_host_block();
+        let host_capacity = host_block.capacity().unwrap();
+        let pool = CacheResidencyPool::new(
+            CachePoolLimits::new(16, host_capacity, host_capacity, 1024).unwrap(),
+        );
+        let options = PagedCacheOptions::new(1, 16, host_capacity, 1)
             .unwrap()
             .with_live_disk(directory.path(), 1024, 1)
             .unwrap()
@@ -8861,7 +8870,7 @@ mod tests {
                     reservation_id: 7,
                     global_layer: id.global_layer,
                     logical_bytes: 16,
-                    host_capacity: 8,
+                    host_capacity,
                     ticket: ticket.clone(),
                 },
             );
@@ -8870,7 +8879,7 @@ mod tests {
                 CacheBlockRecord {
                     id: id.clone(),
                     physical: CacheBlockPhysicalState::Host {
-                        block: test_host_block(),
+                        block: host_block,
                         persistence: HostCachePersistence::Writing(PendingDiskOperation {
                             ticket: ticket.clone(),
                         }),
@@ -8888,12 +8897,12 @@ mod tests {
         }
 
         let report = manager.report().unwrap();
-        assert_eq!(report.current_host_bytes, 8);
-        assert_eq!(report.in_flight_write_bytes, 8);
+        assert_eq!(report.current_host_bytes, host_capacity);
+        assert_eq!(report.in_flight_write_bytes, host_capacity);
         assert_eq!(report.host_blocks, 1);
         let aggregate = pool.report().unwrap();
-        assert_eq!(aggregate.current_host_bytes, 8);
-        assert_eq!(aggregate.current_transfer_in_flight_bytes, 8);
+        assert_eq!(aggregate.current_host_bytes, host_capacity);
+        assert_eq!(aggregate.current_transfer_in_flight_bytes, host_capacity);
         assert_eq!(aggregate.current_disk_bytes, 16);
 
         // A pending host write is encoded only by the Host variant. Promotion
@@ -8923,11 +8932,11 @@ mod tests {
         let report = manager.report().unwrap();
         assert_eq!(report.cancellations, 1);
         assert_eq!(report.host_blocks, 0);
-        assert_eq!(report.current_host_bytes, 8);
-        assert_eq!(report.in_flight_write_bytes, 8);
+        assert_eq!(report.current_host_bytes, host_capacity);
+        assert_eq!(report.in_flight_write_bytes, host_capacity);
         let aggregate = pool.report().unwrap();
-        assert_eq!(aggregate.current_host_bytes, 8);
-        assert_eq!(aggregate.current_transfer_in_flight_bytes, 8);
+        assert_eq!(aggregate.current_host_bytes, host_capacity);
+        assert_eq!(aggregate.current_transfer_in_flight_bytes, host_capacity);
         assert_eq!(aggregate.current_disk_bytes, 16);
         release_tx.send(()).unwrap();
         cleared_rx
@@ -9190,6 +9199,13 @@ mod tests {
         CacheBlockArrays::KeyValue { keys, values }
     }
 
+    fn two_buffer_host_capacity(logical_bytes_each: usize) -> u64 {
+        let capacity =
+            host_transfer_capacity_upper_bound(logical_bytes_each, HostTransferPolicy::Transfer)
+                .unwrap() as u64;
+        capacity.checked_mul(2).unwrap()
+    }
+
     fn f32_storage_pointers(arrays: &CacheBlockArrays) -> [usize; 2] {
         arrays
             .arrays()
@@ -9226,9 +9242,12 @@ mod tests {
     fn exercise_backend_cache_lifecycle(device: Device, expected_storage: HostTransferStorageKind) {
         let stream = Stream::new_with_device(&device);
         let consumer = Stream::new_with_device(&device);
-        let pool = CacheResidencyPool::new(CachePoolLimits::new(16, 16, 16, 0).unwrap());
+        let host_capacity = two_buffer_host_capacity(size_of::<f32>());
+        let pool = CacheResidencyPool::new(
+            CachePoolLimits::new(16, host_capacity * 2, host_capacity * 2, 16).unwrap(),
+        );
         let options = || {
-            PagedCacheOptions::new(1, 16, 16, 1)
+            PagedCacheOptions::new(1, 16, host_capacity, 1)
                 .unwrap()
                 .with_full_attention(true)
                 .with_pool(pool.clone())
@@ -9254,8 +9273,8 @@ mod tests {
         let demotion = manager.begin_device_demotion(&id).unwrap();
         let in_flight = pool.report().unwrap();
         assert_eq!(in_flight.current_device_bytes, 16);
-        assert_eq!(in_flight.current_host_bytes, 8);
-        assert_eq!(in_flight.current_transfer_in_flight_bytes, 8);
+        assert_eq!(in_flight.current_host_bytes, host_capacity);
+        assert_eq!(in_flight.current_transfer_in_flight_bytes, host_capacity);
         manager.finish_device_demotion(&demotion).unwrap();
         {
             let state = manager.lock().unwrap();
@@ -9266,7 +9285,7 @@ mod tests {
         }
         let demoted = pool.report().unwrap();
         assert_eq!(demoted.current_device_bytes, 8);
-        assert_eq!(demoted.current_host_bytes, 8);
+        assert_eq!(demoted.current_host_bytes, host_capacity);
         assert_eq!(demoted.current_transfer_in_flight_bytes, 0);
 
         let destination = tempfile::tempdir().unwrap();
@@ -9373,8 +9392,11 @@ mod tests {
     #[test]
     fn two_block_prefetch_uses_a_dedicated_cpu_stream_and_bounds_leases() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let manager =
-            CacheResidencyManager::new(PagedCacheOptions::new(2, 32, 32, 1).unwrap()).unwrap();
+        let host_capacity = two_buffer_host_capacity(2 * size_of::<f32>());
+        let manager = CacheResidencyManager::new(
+            PagedCacheOptions::new(2, 32, host_capacity * 2, 1).unwrap(),
+        )
+        .unwrap();
         let ids = (0..3)
             .map(|index| {
                 manager
@@ -9417,8 +9439,11 @@ mod tests {
     #[test]
     fn two_block_prefetch_falls_back_under_a_one_block_device_budget() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let manager =
-            CacheResidencyManager::new(PagedCacheOptions::new(2, 16, 32, 1).unwrap()).unwrap();
+        let host_capacity = two_buffer_host_capacity(2 * size_of::<f32>());
+        let manager = CacheResidencyManager::new(
+            PagedCacheOptions::new(2, 16, host_capacity * 2, 1).unwrap(),
+        )
+        .unwrap();
         let ids = (0..3)
             .map(|index| {
                 manager
@@ -9526,7 +9551,8 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn promotion_waits_for_pending_write_without_overcommitting_host_storage() {
         let directory = tempfile::tempdir().unwrap();
-        let options = PagedCacheOptions::new(2, 32, 16, 1)
+        let host_capacity = two_buffer_host_capacity(2 * size_of::<f32>());
+        let options = PagedCacheOptions::new(2, 32, host_capacity, 1)
             .unwrap()
             .with_live_disk(directory.path(), 1024, 1)
             .unwrap();
@@ -9562,8 +9588,8 @@ mod tests {
             .seal_block(0, 4, 6, None, execution_key_value_block(&stream), false)
             .unwrap();
         let report = manager.report().unwrap();
-        assert_eq!(report.current_host_bytes, 16);
-        assert_eq!(report.in_flight_write_bytes, 16);
+        assert_eq!(report.current_host_bytes, host_capacity);
+        assert_eq!(report.in_flight_write_bytes, host_capacity);
 
         let promotion_manager = manager.clone();
         let (promoted_tx, promoted_rx) = mpsc::channel();
@@ -9577,8 +9603,8 @@ mod tests {
             result => panic!("promotion completed before host capacity was released: {result:?}"),
         }
         let report = manager.report().unwrap();
-        assert_eq!(report.current_host_bytes, 16);
-        assert_eq!(report.in_flight_write_bytes, 16);
+        assert_eq!(report.current_host_bytes, host_capacity);
+        assert_eq!(report.in_flight_write_bytes, host_capacity);
         assert!(report.current_host_bytes <= manager.options().host_budget_bytes());
 
         release_tx.send(()).unwrap();
@@ -9597,7 +9623,8 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn host_to_disk_demotion_returns_before_background_write_completes() {
         let directory = tempfile::tempdir().unwrap();
-        let options = PagedCacheOptions::new(2, 16, 16, 1)
+        let host_capacity = two_buffer_host_capacity(2 * size_of::<f32>());
+        let options = PagedCacheOptions::new(2, 16, host_capacity, 1)
             .unwrap()
             .with_live_disk(directory.path(), 1024, 1)
             .unwrap();
@@ -9641,8 +9668,8 @@ mod tests {
             .unwrap();
         let report = manager.report().unwrap();
         assert_eq!(report.in_flight_write_blocks, 1);
-        assert_eq!(report.in_flight_write_bytes, 16);
-        assert_eq!(report.current_host_bytes, 16);
+        assert_eq!(report.in_flight_write_bytes, host_capacity);
+        assert_eq!(report.current_host_bytes, host_capacity);
         assert_eq!(report.host_blocks, 1);
         assert!(report.current_host_bytes <= manager.options().host_budget_bytes());
         assert_eq!(report.disk_demotions, 0);
@@ -9663,8 +9690,8 @@ mod tests {
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
         let report = manager.report().unwrap();
-        assert_eq!(report.current_host_bytes, 16);
-        assert_eq!(report.in_flight_write_bytes, 16);
+        assert_eq!(report.current_host_bytes, host_capacity);
+        assert_eq!(report.in_flight_write_bytes, host_capacity);
 
         release_tx.send(()).unwrap();
         assert!(matches!(blocker_ticket.wait().unwrap(), DiskResult::Test));
@@ -9810,8 +9837,10 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn asynchronous_host_demotion_charges_both_allocations_until_reconciled() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let host_capacity = two_buffer_host_capacity(2 * size_of::<f32>());
         let manager =
-            CacheResidencyManager::new(PagedCacheOptions::new(2, 32, 16, 1).unwrap()).unwrap();
+            CacheResidencyManager::new(PagedCacheOptions::new(2, 32, host_capacity, 1).unwrap())
+                .unwrap();
         manager.bind_transfer_device(&stream).unwrap();
         let arrays = execution_key_value_block(&stream);
         let device_pointers = f32_storage_pointers(&arrays);
@@ -9835,24 +9864,24 @@ mod tests {
         assert_eq!(report.device_blocks, 1);
         assert_eq!(report.host_blocks, 1);
         assert_eq!(report.current_device_bytes, 16);
-        assert_eq!(report.current_host_bytes, 16);
+        assert_eq!(report.current_host_bytes, host_capacity);
         assert_eq!(report.in_flight_host_demotion_blocks, 1);
-        assert_eq!(report.in_flight_host_demotion_bytes, 16);
-        assert_eq!(report.peak_in_flight_host_demotion_bytes, 16);
+        assert_eq!(report.in_flight_host_demotion_bytes, host_capacity);
+        assert_eq!(report.peak_in_flight_host_demotion_bytes, host_capacity);
         let layer = report
             .per_layer
             .iter()
             .find(|layer| layer.global_layer == 0)
             .unwrap();
         assert_eq!(layer.stats.in_flight_host_demotion_blocks, 1);
-        assert_eq!(layer.stats.in_flight_host_demotion_bytes, 16);
+        assert_eq!(layer.stats.in_flight_host_demotion_bytes, host_capacity);
 
         manager.finish_device_demotion(&ticket).unwrap();
         let report = manager.report().unwrap();
         assert_eq!(report.device_blocks, 0);
         assert_eq!(report.host_blocks, 1);
         assert_eq!(report.current_device_bytes, 0);
-        assert_eq!(report.current_host_bytes, 16);
+        assert_eq!(report.current_host_bytes, host_capacity);
         assert_eq!(report.in_flight_host_demotion_blocks, 0);
         assert_eq!(report.in_flight_host_demotion_bytes, 0);
         assert_eq!(report.host_demotions, 1);
@@ -9893,8 +9922,10 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn clear_waits_for_asynchronous_host_demotion_resources() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let host_capacity = two_buffer_host_capacity(2 * size_of::<f32>());
         let manager =
-            CacheResidencyManager::new(PagedCacheOptions::new(2, 32, 16, 1).unwrap()).unwrap();
+            CacheResidencyManager::new(PagedCacheOptions::new(2, 32, host_capacity, 1).unwrap())
+                .unwrap();
         manager.bind_transfer_device(&stream).unwrap();
         let id = manager
             .seal_block(0, 0, 2, None, execution_key_value_block(&stream), false)
@@ -9918,7 +9949,8 @@ mod tests {
         // Two 16-byte blocks fit on the device. A third block forces the oldest
         // one into backend-selected host-transfer storage while retaining one
         // recent block.
-        let options = PagedCacheOptions::new(2, 32, 16, 1).unwrap();
+        let host_capacity = two_buffer_host_capacity(2 * size_of::<f32>());
+        let options = PagedCacheOptions::new(2, 32, host_capacity, 1).unwrap();
         let manager = CacheResidencyManager::new(options).unwrap();
         manager.bind_transfer_device(&stream).unwrap();
         let first_arrays = execution_key_value_block(&stream);
@@ -9945,7 +9977,7 @@ mod tests {
         assert_eq!(report.device_blocks, 2);
         assert_eq!(report.host_blocks, 1);
         assert_eq!(report.current_device_bytes, 32);
-        assert_eq!(report.current_host_bytes, 16);
+        assert_eq!(report.current_host_bytes, host_capacity);
 
         let lease = manager.lease_block(&first, &stream).unwrap();
         let promoted_pointers = f32_storage_pointers(lease.arrays());
@@ -9975,7 +10007,7 @@ mod tests {
         assert_eq!(report.device_blocks, 2);
         assert_eq!(report.host_blocks, 1);
         assert_eq!(report.current_device_bytes, 32);
-        assert_eq!(report.current_host_bytes, 16);
+        assert_eq!(report.current_host_bytes, host_capacity);
         assert_eq!(report.host_promotions, 1);
         assert_eq!(report.host_demotions, 2);
         let layer = report

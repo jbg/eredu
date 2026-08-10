@@ -35,9 +35,11 @@ fallback. Metal promotions use the contiguous vector-copy primitive because a
 typed host-transfer buffer preserves the source's contiguous logical layout.
 Shape, dtype, capacity, policy, physical storage identity, ownership, and
 completion lifetime pass through MLX-C and the checked-in Rust bindings. The
-patch also exposes an exact backend allocation-capacity bound and process-wide
-active/peak physical byte and allocation counters for each host-transfer
-storage kind, including CUDA pinned storage outside the device allocator.
+patch also exposes the backend's charged backing-allocation bound and
+process-wide active/peak charged-byte and allocation counters for each
+host-transfer storage kind, including CUDA pinned storage outside the device
+allocator. CPU and Metal charges are OS/VM-page rounded; CUDA requests and
+charges a conservative 64 KiB-granular extent.
 
 The MLX-C headers expose opaque `mlx_event` ownership, async evaluation with an
 event, stream wait, host synchronize, query, and identity accessors. The
