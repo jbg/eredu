@@ -1,7 +1,7 @@
 //! Opt-in expert-parallel performance and parity probe.
 //!
 //! This compares a complete single-rank model, replicated-input expert
-//! parallelism, and the synthetic sharded-token all-to-all fallback. Phase
+//! parallelism, and synthetic sharded-token compact all-to-all-v. Phase
 //! profiling inserts evaluation boundaries and is intentionally not enabled by
 //! normal inference.
 
@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
     let sharded_routes = route_range(synthetic.statistics.local_routes, &group, &stream)?;
 
     if group.rank() == 0 {
-        println!("strategy,phase,iterations,tokens,wall_ms,tokens_per_s,router_ms,compaction_ms,exchange_ms,expert_ms,reduction_ms,shared_ms,total_moe_ms,model_ms,local_routes_min_total,local_routes_max_total,imbalance,padding_routes,exchanged_bytes,synchronizations,sync_ms");
+        println!("strategy,phase,iterations,tokens,wall_ms,tokens_per_s,router_ms,compaction_ms,payload_exchange_ms,expert_ms,reduction_ms,shared_ms,total_moe_ms,model_ms,local_routes_min_total,local_routes_max_total,imbalance,padding_routes,useful_sent_bytes,useful_received_bytes,padding_bytes,backend_physical_bytes,temporary_high_water_bytes,payload_allocation_upper_bound_bytes,count_consensus,count_consensus_ms,host_synchronizations,host_sync_ms,routed_transport");
         let baseline = baseline.expect("rank zero created the complete-model baseline");
         print_phase(
             "complete",
@@ -493,6 +493,10 @@ fn milliseconds(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+fn optional_bytes(value: Option<usize>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
 fn print_phase(
     strategy: &str,
     phase: &str,
@@ -512,12 +516,12 @@ fn print_phase(
         result.tokens as f64 / result.seconds
     };
     println!(
-        "{strategy},{phase},{iterations},{},{:.3},{throughput:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{imbalance:.3},{},{},{},{:.3}",
+        "{strategy},{phase},{iterations},{},{:.3},{throughput:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{imbalance:.3},{},{},{},{},{},{},{},{},{:.3},{},{:.3},{:?}",
         result.tokens,
         result.seconds * 1_000.0,
         milliseconds(stats.router_time),
         milliseconds(stats.compaction_time),
-        milliseconds(stats.exchange_time),
+        milliseconds(stats.payload_exchange_time),
         milliseconds(stats.expert_time),
         milliseconds(stats.reduction_time),
         milliseconds(stats.shared_expert_time),
@@ -526,8 +530,16 @@ fn print_phase(
         routes.0,
         routes.1,
         stats.padding_routes,
-        stats.exchanged_bytes,
-        stats.synchronization_count,
-        milliseconds(stats.synchronization_time),
+        stats.useful_sent_bytes,
+        stats.useful_received_bytes,
+        stats.padding_bytes,
+        optional_bytes(stats.backend_physical_bytes),
+        optional_bytes(stats.temporary_high_water_bytes),
+        stats.payload_allocation_upper_bound_bytes,
+        stats.count_consensus_count,
+        milliseconds(stats.count_consensus_time),
+        stats.host_synchronization_count,
+        milliseconds(stats.host_synchronization_time),
+        stats.routed_transport,
     );
 }

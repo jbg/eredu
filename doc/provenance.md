@@ -33,7 +33,11 @@ The source under `safemlx-sys/src/mlx-c` originated in Apple's
 [`ml-explore/mlx-c`](https://github.com/ml-explore/mlx-c) project and is
 vendored so the Rust crate can build a compatible native library. The current
 native build pins MLX v0.32.0. Local changes to the C surface and build system
-are visible in this repository's history.
+are visible in this repository's history. Upstreamable MLX source changes are
+carried as an ordered, idempotent inventory under
+`safemlx-sys/src/mlx-c/patches/`, including completion events and the
+backend-independent variable-count all-to-all primitive; generated
+FetchContent output is not a source artifact.
 
 ## GGUF conversion
 

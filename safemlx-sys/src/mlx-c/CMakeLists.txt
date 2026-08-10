@@ -56,26 +56,30 @@ else()
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
       COMMAND ${CMAKE_COMMAND}
       -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-completion-events.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
+      COMMAND ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-variable-all-to-all.patch
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake)
   FetchContent_MakeAvailable(mlx)
 endif()
 
 if(MLX_C_BUILD_PATCH_TESTS)
   add_executable(
-    mlx-completion-patch-test-binary
+    mlx-patch-test-binary
     ${mlx_SOURCE_DIR}/tests/tests.cpp
-    ${mlx_SOURCE_DIR}/tests/completion_tests.cpp)
-  target_link_libraries(mlx-completion-patch-test-binary PRIVATE mlx doctest)
+    ${mlx_SOURCE_DIR}/tests/completion_tests.cpp
+    ${mlx_SOURCE_DIR}/tests/distributed_all_to_all_v_tests.cpp)
+  target_link_libraries(mlx-patch-test-binary PRIVATE mlx doctest)
 
   add_custom_target(
-    mlx-completion-patch-tests
+    mlx-patch-tests
     COMMAND
       ${CMAKE_COMMAND} -E env DEVICE=cpu
-      $<TARGET_FILE:mlx-completion-patch-test-binary>
-      "--test-case=*completion*,*failed CPU event*"
-    DEPENDS mlx-completion-patch-test-binary
+      $<TARGET_FILE:mlx-patch-test-binary>
+      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*"
+    DEPENDS mlx-patch-test-binary
     USES_TERMINAL
-    COMMENT "Running vendored MLX completion-event tests")
+    COMMENT "Running tests carried by SafeMLX's vendored MLX patches")
 endif()
 
 # When MLX is a FetchContent dependency its own install rules are not included

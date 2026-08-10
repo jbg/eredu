@@ -27,6 +27,37 @@ extern "C" int mlx_distributed_all_gather(
   }
   return 0;
 }
+extern "C" int mlx_distributed_all_to_all_v(
+    mlx_array* res,
+    const mlx_array x,
+    const int64_t* send_counts,
+    size_t send_counts_num,
+    const int64_t* recv_counts,
+    size_t recv_counts_num,
+    const mlx_distributed_group group /* may be null */,
+    const mlx_stream s) {
+  try {
+    auto send = send_counts_num == 0
+        ? std::vector<int64_t>{}
+        : std::vector<int64_t>(send_counts, send_counts + send_counts_num);
+    auto recv = recv_counts_num == 0
+        ? std::vector<int64_t>{}
+        : std::vector<int64_t>(recv_counts, recv_counts + recv_counts_num);
+    mlx_array_set_(
+        *res,
+        mlx::core::distributed::all_to_all_v(
+            mlx_array_get_(x),
+            send,
+            recv,
+            (group.ctx ? std::make_optional(mlx_distributed_group_get_(group))
+                       : std::nullopt),
+            mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_distributed_all_max(
     mlx_array* res,
     const mlx_array x,

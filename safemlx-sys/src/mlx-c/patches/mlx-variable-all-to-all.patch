@@ -1,0 +1,1402 @@
+diff --git a/mlx/backend/cpu/distributed.cpp b/mlx/backend/cpu/distributed.cpp
+index 22dc4b4cc86b29f76df6749b38c161a6fa61dfad..5d2e0dafb857c68bdacee145240517a7495de0bc 100644
+--- a/mlx/backend/cpu/distributed.cpp
++++ b/mlx/backend/cpu/distributed.cpp
+@@ -100,4 +100,20 @@ void ReduceScatter::eval_cpu(
+     std::vector<array>& outputs) {
+   throw std::runtime_error("[ReduceScatter] Not implemented yet.");
+ }
++
++void AllToAllV::eval_cpu(
++    const std::vector<array>& inputs,
++    std::vector<array>& outputs) {
++  assert(inputs.size() == 1);
++  assert(outputs.size() == 1);
++
++  auto [in, copied] = ensure_row_contiguous(inputs[0], stream());
++  outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
++  distributed::detail::all_to_all_v(
++      group(), in, outputs[0], send_counts(), recv_counts(), stream());
++  if (copied) {
++    auto& enc = cpu::get_command_encoder(stream());
++    enc.add_temporary(in);
++  }
++}
+ } // namespace mlx::core::distributed
+diff --git a/mlx/backend/cuda/distributed.cu b/mlx/backend/cuda/distributed.cu
+index ac798757899234cf719a6fe7063a1350d50b8989..bd301b8749a9dcb3ddd0c8878e1f8c4731c05c81 100644
+--- a/mlx/backend/cuda/distributed.cu
++++ b/mlx/backend/cuda/distributed.cu
+@@ -118,4 +118,27 @@ void ReduceScatter::eval_gpu(
+       throw std::runtime_error("Only sum scatter is supported. ");
+   }
+ }
++
++void AllToAllV::eval_gpu(
++    const std::vector<array>& inputs,
++    std::vector<array>& outputs) {
++  assert(inputs.size() == 1);
++  assert(outputs.size() == 1);
++
++  auto& s = stream();
++  auto& encoder = cu::get_command_encoder(s);
++  auto input = inputs[0];
++  if (!input.flags().row_contiguous) {
++    input = contiguous_copy_gpu(input, s);
++    encoder.add_temporary(input);
++  }
++  outputs[0].set_data(cu::malloc_async(outputs[0].nbytes(), encoder));
++
++  encoder.set_input_array(input);
++  encoder.set_output_array(outputs[0]);
++
++  auto capture = encoder.capture_context();
++  distributed::detail::all_to_all_v(
++      group(), input, outputs[0], send_counts(), recv_counts(), s);
++}
+ } // namespace mlx::core::distributed
+diff --git a/mlx/backend/metal/distributed.cpp b/mlx/backend/metal/distributed.cpp
+index 217ee3c94688fb6433b52060bd6c54719f885f08..ee7c55f595b79929210b4974d7af084f1fc58c1d 100644
+--- a/mlx/backend/metal/distributed.cpp
++++ b/mlx/backend/metal/distributed.cpp
+@@ -35,4 +35,9 @@ void ReduceScatter::eval_gpu(const std::vector<array>&, std::vector<array>&) {
+       "[ReduceScatter::eval_gpu] has no GPU implementation.");
+ }
+ 
++void AllToAllV::eval_gpu(const std::vector<array>&, std::vector<array>&) {
++  throw std::runtime_error(
++      "[AllToAllV::eval_gpu] has no Metal implementation.");
++}
++
+ } // namespace mlx::core::distributed
+diff --git a/mlx/backend/no_cpu/primitives.cpp b/mlx/backend/no_cpu/primitives.cpp
+index ae51dd9b2f0190ca776fa8421e89ea8c36c28cba..751572c995f741944c4d194dd8443217888b461b 100644
+--- a/mlx/backend/no_cpu/primitives.cpp
++++ b/mlx/backend/no_cpu/primitives.cpp
+@@ -141,6 +141,7 @@ NO_CPU_MULTI(AllGather)
+ NO_CPU_MULTI(Send)
+ NO_CPU_MULTI(Recv)
+ NO_CPU_MULTI(ReduceScatter)
++NO_CPU_MULTI(AllToAllV)
+ } // namespace distributed
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/no_gpu/primitives.cpp b/mlx/backend/no_gpu/primitives.cpp
+index 4819ed2724f4653132acedc527cc362b729bf6c1..2c685b72aa409ea2b7178bea76d19b36c7f15dc2 100644
+--- a/mlx/backend/no_gpu/primitives.cpp
++++ b/mlx/backend/no_gpu/primitives.cpp
+@@ -180,6 +180,7 @@ NO_GPU_MULTI(AllGather)
+ NO_GPU_MULTI(Send)
+ NO_GPU_MULTI(Recv)
+ NO_GPU_MULTI(ReduceScatter)
++NO_GPU_MULTI(AllToAllV)
+ } // namespace distributed
+ 
+ } // namespace mlx::core
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+index 3cde6a263bbf07d42ecec85b08bd8a36de08fb3f..7809fce53252c6391f21e24d73179ce165775e80 100644
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -1,5 +1,7 @@
+ // Copyright © 2024 Apple Inc.
+ 
++#include <limits>
++#include <sstream>
+ #include <unordered_map>
+ 
+ #include "mlx/backend/cuda/cuda.h"
+@@ -50,6 +52,57 @@ void sum_scatter(
+   group.raw_group()->sum_scatter(input, output, stream);
+ }
+ 
++ByteLayout all_to_all_v_layout(
++    const array& x,
++    const std::vector<size_t>& counts,
++    const char* counts_name) {
++  size_t row_bytes = x.itemsize();
++  for (size_t axis = 1; axis < x.ndim(); ++axis) {
++    auto dimension = static_cast<size_t>(x.shape(axis));
++    if (dimension != 0 &&
++        row_bytes > std::numeric_limits<size_t>::max() / dimension) {
++      throw std::overflow_error("[all_to_all_v] Row byte size exceeds size_t.");
++    }
++    row_bytes *= dimension;
++  }
++
++  ByteLayout layout;
++  layout.offsets.reserve(counts.size());
++  layout.sizes.reserve(counts.size());
++  size_t offset = 0;
++  for (size_t peer = 0; peer < counts.size(); ++peer) {
++    if (counts[peer] != 0 &&
++        row_bytes > std::numeric_limits<size_t>::max() / counts[peer]) {
++      std::ostringstream msg;
++      msg << "[all_to_all_v] " << counts_name << "[" << peer
++          << "] byte size exceeds size_t.";
++      throw std::overflow_error(msg.str());
++    }
++    size_t bytes = counts[peer] * row_bytes;
++    if (bytes > std::numeric_limits<size_t>::max() - offset) {
++      std::ostringstream msg;
++      msg << "[all_to_all_v] " << counts_name
++          << " byte displacement exceeds size_t.";
++      throw std::overflow_error(msg.str());
++    }
++    layout.offsets.push_back(offset);
++    layout.sizes.push_back(bytes);
++    offset += bytes;
++  }
++  return layout;
++}
++
++void all_to_all_v(
++    Group group,
++    const array& input,
++    array& output,
++    const std::vector<size_t>& send_counts,
++    const std::vector<size_t>& recv_counts,
++    Stream stream) {
++  group.raw_group()->all_to_all_v(
++      input, output, send_counts, recv_counts, stream);
++}
++
+ class EmptyGroup : public GroupImpl {
+  public:
+   Stream communication_stream(StreamOrDevice s) override {
+@@ -98,6 +151,15 @@ class EmptyGroup : public GroupImpl {
+     throw std::runtime_error(
+         "Communication not implemented in an empty distributed group.");
+   }
++  void all_to_all_v(
++      const array&,
++      array&,
++      const std::vector<size_t>&,
++      const std::vector<size_t>&,
++      Stream) override {
++    throw std::runtime_error(
++        "Communication not implemented in an empty distributed group.");
++  }
+ };
+ 
+ } // namespace detail
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+index d889587abcdb81b4538e97ea8df67f8c1d33c83d..be2eb7502fd745b7edde78ff5a41f42db7541fdf 100644
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -30,8 +30,24 @@ class GroupImpl {
+   virtual void all_min(const array& input, array& output, Stream stream) = 0;
+   virtual void
+   sum_scatter(const array& input, array& output, Stream stream) = 0;
++  virtual void all_to_all_v(
++      const array& input,
++      array& output,
++      const std::vector<size_t>& send_counts,
++      const std::vector<size_t>& recv_counts,
++      Stream stream) = 0;
+ };
+ 
++struct ByteLayout {
++  std::vector<size_t> offsets;
++  std::vector<size_t> sizes;
++};
++
++ByteLayout all_to_all_v_layout(
++    const array& x,
++    const std::vector<size_t>& counts,
++    const char* counts_name);
++
+ /* Define the MLX stream that the communication should happen in. */
+ Stream communication_stream(Group group, StreamOrDevice s = {});
+ 
+@@ -56,4 +72,13 @@ void all_min(Group group, const array& input, array& output, Stream stream);
+ /** Reduce scatter with average operation */
+ void sum_scatter(Group group, const array& input, array& output, Stream stream);
+ 
++/** Exchange variable-sized leading-axis row blocks between all ranks. */
++void all_to_all_v(
++    Group group,
++    const array& input,
++    array& output,
++    const std::vector<size_t>& send_counts,
++    const std::vector<size_t>& recv_counts,
++    Stream stream);
++
+ } // namespace mlx::core::distributed::detail
+diff --git a/mlx/distributed/jaccl/jaccl.cpp b/mlx/distributed/jaccl/jaccl.cpp
+index 01cc415a00cda8e776d81d1f16b0012953de8f9e..0bb84dd5f559df73ac4bae53671f82d025ef0bcc 100644
+--- a/mlx/distributed/jaccl/jaccl.cpp
++++ b/mlx/distributed/jaccl/jaccl.cpp
+@@ -148,6 +148,34 @@ class JACCLGroup : public GroupImpl {
+     throw std::runtime_error("[jaccl] sum_scatter not supported.");
+   }
+ 
++  void all_to_all_v(
++      const array& input,
++      array& output,
++      const std::vector<size_t>& send_counts,
++      const std::vector<size_t>& recv_counts,
++      Stream stream) override {
++    auto send = detail::all_to_all_v_layout(input, send_counts, "send_counts");
++    auto recv = detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
++    auto* input_ptr = input.data<char>();
++    auto* output_ptr = output.data<char>();
++    auto& encoder = cpu::get_command_encoder(stream);
++    encoder.set_input_array(input);
++    encoder.set_output_array(output);
++    encoder.dispatch([input_ptr,
++                      output_ptr,
++                      send = std::move(send),
++                      recv = std::move(recv),
++                      this]() {
++      group_->all_to_all_v(
++          input_ptr,
++          output_ptr,
++          send.offsets,
++          send.sizes,
++          recv.offsets,
++          recv.sizes);
++    });
++  }
++
+   std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
+     throw std::runtime_error("[jaccl] Group split not supported.");
+   }
+diff --git a/mlx/distributed/jaccl/lib/jaccl/group.h b/mlx/distributed/jaccl/lib/jaccl/group.h
+index 758109c256ed076334d108688a7251b92aaaadbb..ce75f33382f04cd6cd52a212be70904a51786fec 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/group.h
++++ b/mlx/distributed/jaccl/lib/jaccl/group.h
+@@ -4,6 +4,7 @@
+ 
+ #include <cstddef>
+ #include <memory>
++#include <vector>
+ 
+ namespace jaccl {
+ 
+@@ -30,6 +31,13 @@ class Group {
+ 
+   virtual void send(const void* input, size_t n_bytes, int dst) = 0;
+   virtual void recv(void* output, size_t n_bytes, int src) = 0;
++  virtual void all_to_all_v(
++      const void* input,
++      void* output,
++      const std::vector<size_t>& send_offsets,
++      const std::vector<size_t>& send_sizes,
++      const std::vector<size_t>& recv_offsets,
++      const std::vector<size_t>& recv_sizes) = 0;
+   virtual void barrier() = 0;
+ };
+ 
+diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
+index d120114323efff37ac9ceb12b295770e418d83ee..97e9e8e4423740c2ec184509467830f142f2a042 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
+@@ -4,6 +4,10 @@
+ #include "jaccl/reduction_ops.h"
+ #include "jaccl/types.h"
+ 
++#include <cstring>
++#include <future>
++#include <limits>
++
+ namespace jaccl {
+ 
+ MeshGroup::MeshGroup(
+@@ -184,6 +188,52 @@ void MeshGroup::recv(void* output, size_t n_bytes, int src) {
+   mesh_.recv(static_cast<char*>(output), n_bytes, src);
+ }
+ 
++void MeshGroup::all_to_all_v(
++    const void* input,
++    void* output,
++    const std::vector<size_t>& send_offsets,
++    const std::vector<size_t>& send_sizes,
++    const std::vector<size_t>& recv_offsets,
++    const std::vector<size_t>& recv_sizes) {
++  for (size_t peer = 0; peer < send_sizes.size(); ++peer) {
++    if (send_sizes[peer] >
++            static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
++        recv_sizes[peer] >
++            static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
++      throw std::overflow_error(
++          "[jaccl::mesh::all_to_all_v] Peer byte count exceeds INT64_MAX.");
++    }
++  }
++  if (send_sizes[rank_] != recv_sizes[rank_]) {
++    throw std::invalid_argument(
++        "[jaccl::mesh::all_to_all_v] Self send and receive byte counts must match.");
++  }
++
++  auto* in = static_cast<const char*>(input);
++  auto* out = static_cast<char*>(output);
++  if (send_sizes[rank_] != 0) {
++    std::memcpy(
++        out + recv_offsets[rank_], in + send_offsets[rank_], send_sizes[rank_]);
++  }
++  for (int step = 1; step < size_; ++step) {
++    int destination = (rank_ + step) % size_;
++    int source = (rank_ + size_ - step) % size_;
++    std::future<void> receive;
++    if (recv_sizes[source] != 0) {
++      receive = std::async(std::launch::async, [&, source]() {
++        recv(out + recv_offsets[source], recv_sizes[source], source);
++      });
++    }
++    if (send_sizes[destination] != 0) {
++      send(
++          in + send_offsets[destination], send_sizes[destination], destination);
++    }
++    if (receive.valid()) {
++      receive.get();
++    }
++  }
++}
++
+ void MeshGroup::barrier() {
+   uint8_t b = 0;
+   all_sum(&b, &b, sizeof(b), Dtype::UInt8);
+diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh.h b/mlx/distributed/jaccl/lib/jaccl/mesh.h
+index 2ced24416f50b516d198d2f86a4adcede6d0f5d6..596d8e42932f3aa125c87898666c25564b628a90 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh.h
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh.h
+@@ -46,6 +46,13 @@ class MeshGroup : public Group {
+ 
+   void send(const void* input, size_t n_bytes, int dst) override;
+   void recv(void* output, size_t n_bytes, int src) override;
++  void all_to_all_v(
++      const void* input,
++      void* output,
++      const std::vector<size_t>& send_offsets,
++      const std::vector<size_t>& send_sizes,
++      const std::vector<size_t>& recv_offsets,
++      const std::vector<size_t>& recv_sizes) override;
+ 
+   void barrier() override;
+ 
+diff --git a/mlx/distributed/jaccl/lib/jaccl/ring.cpp b/mlx/distributed/jaccl/lib/jaccl/ring.cpp
+index 541e825b4b3645f4a96e803d46450193328aa90d..38a340c44349ed0b429cb868d940d9db97e3ccde 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/ring.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/ring.cpp
+@@ -4,6 +4,12 @@
+ #include "jaccl/reduction_ops.h"
+ #include "jaccl/types.h"
+ 
++#include <cstdint>
++#include <cstring>
++#include <future>
++#include <limits>
++#include <sstream>
++
+ namespace jaccl {
+ 
+ RingGroup::RingGroup(
+@@ -190,6 +196,102 @@ void RingGroup::recv(void* output, size_t n_bytes, int src) {
+   ring_.recv(static_cast<char*>(output), n_bytes, src, n_conns_);
+ }
+ 
++void RingGroup::all_to_all_v(
++    const void* input,
++    void* output,
++    const std::vector<size_t>& send_offsets,
++    const std::vector<size_t>& send_sizes,
++    const std::vector<size_t>& recv_offsets,
++    const std::vector<size_t>& recv_sizes) {
++  for (size_t peer = 0; peer < send_sizes.size(); ++peer) {
++    if (send_sizes[peer] >
++            static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
++        recv_sizes[peer] >
++            static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
++      throw std::overflow_error(
++          "[jaccl::ring::all_to_all_v] Peer byte count exceeds INT64_MAX.");
++    }
++  }
++  if (send_sizes[rank_] != recv_sizes[rank_]) {
++    throw std::invalid_argument(
++        "[jaccl::ring::all_to_all_v] Self send and receive byte counts must match.");
++  }
++
++  struct PacketHeader {
++    uint64_t bytes;
++    uint32_t source;
++    uint32_t destination;
++  };
++  auto* in = static_cast<const char*>(input);
++  auto* out = static_cast<char*>(output);
++  if (send_sizes[rank_] != 0) {
++    std::memcpy(
++        out + recv_offsets[rank_], in + send_offsets[rank_], send_sizes[rank_]);
++  }
++
++  int right = (rank_ + 1) % size_;
++  int left = (rank_ + size_ - 1) % size_;
++  for (int distance = 1; distance < size_; ++distance) {
++    int destination = (rank_ + distance) % size_;
++    PacketHeader current_header{
++        static_cast<uint64_t>(send_sizes[destination]),
++        static_cast<uint32_t>(rank_),
++        static_cast<uint32_t>(destination)};
++    std::vector<char> current(current_header.bytes);
++    if (!current.empty()) {
++      std::memcpy(
++          current.data(), in + send_offsets[destination], current.size());
++    }
++
++    for (int hop = 1; hop <= distance; ++hop) {
++      PacketHeader incoming_header{};
++      auto receive_header = std::async(std::launch::async, [&]() {
++        recv(&incoming_header, sizeof(incoming_header), left);
++      });
++      send(&current_header, sizeof(current_header), right);
++      receive_header.get();
++
++      if (incoming_header.bytes >
++          static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
++        throw std::overflow_error(
++            "[jaccl::ring::all_to_all_v] Routed packet exceeds size_t.");
++      }
++      std::vector<char> incoming(static_cast<size_t>(incoming_header.bytes));
++      std::future<void> receive_payload;
++      if (!incoming.empty()) {
++        receive_payload = std::async(std::launch::async, [&]() {
++          recv(incoming.data(), incoming.size(), left);
++        });
++      }
++      if (!current.empty()) {
++        send(current.data(), current.size(), right);
++      }
++      if (receive_payload.valid()) {
++        receive_payload.get();
++      }
++      current_header = incoming_header;
++      current = std::move(incoming);
++    }
++
++    if (current_header.destination != static_cast<uint32_t>(rank_) ||
++        current_header.source >= static_cast<uint32_t>(size_)) {
++      throw std::runtime_error(
++          "[jaccl::ring::all_to_all_v] Received invalid routing metadata.");
++    }
++    size_t source = current_header.source;
++    if (current.size() != recv_sizes[source]) {
++      std::ostringstream msg;
++      msg << "[jaccl::ring::all_to_all_v] Received " << current.size()
++          << " bytes from source " << source << ", expected "
++          << recv_sizes[source] << ".";
++      throw std::runtime_error(msg.str());
++    }
++    if (!current.empty()) {
++      std::memcpy(out + recv_offsets[source], current.data(), current.size());
++    }
++  }
++}
++
+ void RingGroup::barrier() {
+   uint8_t b = 0;
+   all_sum(&b, &b, sizeof(b), Dtype::UInt8);
+diff --git a/mlx/distributed/jaccl/lib/jaccl/ring.h b/mlx/distributed/jaccl/lib/jaccl/ring.h
+index 016c6af6456c6f05d4d15d01a4aed3b35c0899d9..6e6d022c7d7f0b0e295adcb7d81055b7aeb29f9a 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/ring.h
++++ b/mlx/distributed/jaccl/lib/jaccl/ring.h
+@@ -47,6 +47,13 @@ class RingGroup : public Group {
+ 
+   void send(const void* input, size_t n_bytes, int dst) override;
+   void recv(void* output, size_t n_bytes, int src) override;
++  void all_to_all_v(
++      const void* input,
++      void* output,
++      const std::vector<size_t>& send_offsets,
++      const std::vector<size_t>& send_sizes,
++      const std::vector<size_t>& recv_offsets,
++      const std::vector<size_t>& recv_sizes) override;
+ 
+   void barrier() override;
+ 
+diff --git a/mlx/distributed/mpi/mpi.cpp b/mlx/distributed/mpi/mpi.cpp
+index 3b176e6e6718cbbce451a29ae28188563dca4c2f..f356ac382e22a8618f333f0d3378e389c51c0088 100644
+--- a/mlx/distributed/mpi/mpi.cpp
++++ b/mlx/distributed/mpi/mpi.cpp
+@@ -3,6 +3,8 @@
+ #include <dlfcn.h>
+ #include <cstdlib>
+ #include <iostream>
++#include <limits>
++#include <sstream>
+ 
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/distributed/distributed.h"
+@@ -129,6 +131,7 @@ struct MPIWrapper {
+     LOAD_SYMBOL(MPI_Comm_free, comm_free);
+     LOAD_SYMBOL(MPI_Allreduce, all_reduce);
+     LOAD_SYMBOL(MPI_Allgather, all_gather);
++    LOAD_SYMBOL(MPI_Alltoallv, all_to_all_v);
+     LOAD_SYMBOL(MPI_Send, send);
+     LOAD_SYMBOL(MPI_Recv, recv);
+     LOAD_SYMBOL(MPI_Type_contiguous, mpi_type_contiguous);
+@@ -237,6 +240,10 @@ struct MPIWrapper {
+     }
+   }
+ 
++  MPI_Datatype byte_datatype() {
++    return mpi_uint8_;
++  }
++
+   MPI_Op op_sum(const array& arr) {
+     switch (arr.dtype()) {
+       case float16:
+@@ -290,6 +297,16 @@ struct MPIWrapper {
+       int,
+       MPI_Datatype,
+       MPI_Comm);
++  int (*all_to_all_v)(
++      const void*,
++      const int*,
++      const int*,
++      MPI_Datatype,
++      void*,
++      const int*,
++      const int*,
++      MPI_Datatype,
++      MPI_Comm);
+   int (*comm_split)(MPI_Comm, int, int, MPI_Comm*);
+   int (*comm_free)(MPI_Comm*);
+   int (*send)(const void*, int, MPI_Datatype, int, int, MPI_Comm);
+@@ -476,6 +493,67 @@ class MPIGroup : public GroupImpl {
+     throw std::runtime_error("[mpi] sum_scatter not yet implemented.");
+   }
+ 
++  void all_to_all_v(
++      const array& input,
++      array& output,
++      const std::vector<size_t>& send_counts,
++      const std::vector<size_t>& recv_counts,
++      Stream stream) override {
++    auto send = detail::all_to_all_v_layout(input, send_counts, "send_counts");
++    auto recv = detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
++    std::vector<int> send_sizes;
++    std::vector<int> send_offsets;
++    std::vector<int> recv_sizes;
++    std::vector<int> recv_offsets;
++    send_sizes.reserve(send.sizes.size());
++    send_offsets.reserve(send.offsets.size());
++    recv_sizes.reserve(recv.sizes.size());
++    recv_offsets.reserve(recv.offsets.size());
++
++    auto convert = [](size_t value, size_t peer, const char* field) {
++      if (value > std::numeric_limits<int>::max()) {
++        std::ostringstream msg;
++        msg << "[mpi::all_to_all_v] Byte " << field << " for peer " << peer
++            << " exceeds MPI INT_MAX; transfers requiring chunking are not "
++               "supported.";
++        throw std::overflow_error(msg.str());
++      }
++      return static_cast<int>(value);
++    };
++    for (size_t peer = 0; peer < send.sizes.size(); ++peer) {
++      send_sizes.push_back(convert(send.sizes[peer], peer, "count"));
++      send_offsets.push_back(convert(send.offsets[peer], peer, "displacement"));
++      recv_sizes.push_back(convert(recv.sizes[peer], peer, "count"));
++      recv_offsets.push_back(convert(recv.offsets[peer], peer, "displacement"));
++    }
++
++    auto& encoder = cpu::get_command_encoder(stream);
++    encoder.set_input_array(input);
++    encoder.set_output_array(output);
++    encoder.dispatch([input_ptr = input.data<void>(),
++                      output_ptr = output.data<void>(),
++                      send_sizes = std::move(send_sizes),
++                      send_offsets = std::move(send_offsets),
++                      recv_sizes = std::move(recv_sizes),
++                      recv_offsets = std::move(recv_offsets),
++                      byte_type = mpi().byte_datatype(),
++                      comm = comm_]() {
++      int result = mpi().all_to_all_v(
++          input_ptr,
++          send_sizes.data(),
++          send_offsets.data(),
++          byte_type,
++          output_ptr,
++          recv_sizes.data(),
++          recv_offsets.data(),
++          byte_type,
++          comm);
++      if (result != MPI_SUCCESS) {
++        throw std::runtime_error("[mpi::all_to_all_v] MPI_Alltoallv failed.");
++      }
++    });
++  }
++
+  private:
+   MPI_Comm comm_;
+   bool global_;
+diff --git a/mlx/distributed/nccl/nccl.cpp b/mlx/distributed/nccl/nccl.cpp
+index faaee3183a6a99efad02616a6e19924b3e801527..4b31514a7e3f4b32455528d9e31fa9b71d4dd21a 100644
+--- a/mlx/distributed/nccl/nccl.cpp
++++ b/mlx/distributed/nccl/nccl.cpp
+@@ -87,6 +87,22 @@ MLX_NCCL_TYPE_LIST(MLX_DEF_NCCL_MAP)
+ 
+ namespace detail {
+ 
++void check_cuda(cudaError_t result, const char* operation) {
++  if (result != cudaSuccess) {
++    throw std::runtime_error(
++        std::string("[nccl::all_to_all_v] ") + operation + " failed: " +
++        cudaGetErrorString(result));
++  }
++}
++
++void check_nccl(ncclResult_t result, const char* operation) {
++  if (result != ncclSuccess) {
++    throw std::runtime_error(
++        std::string("[nccl::all_to_all_v] ") + operation + " failed: " +
++        ncclGetErrorString(result));
++  }
++}
++
+ template <typename F>
+ void dispatch_dtype(const array& arr, F&& f) {
+   dispatch_all_types(arr.dtype(), [&](auto type_tag) {
+@@ -386,6 +402,80 @@ class NCCLGroup : public GroupImpl {
+     });
+   }
+ 
++  void all_to_all_v(
++      const array& input,
++      array& output,
++      const std::vector<size_t>& send_counts,
++      const std::vector<size_t>& recv_counts,
++      Stream stream) override {
++    auto send = detail::all_to_all_v_layout(input, send_counts, "send_counts");
++    auto recv = detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
++    if (send.sizes[rank_] != recv.sizes[rank_]) {
++      throw std::invalid_argument(
++          "[nccl::all_to_all_v] Self send and receive byte counts must match.");
++    }
++
++    auto& encoder = cu::get_command_encoder(stream);
++    auto* send_ptr = gpu_ptr<uint8_t>(input);
++    auto* recv_ptr = gpu_ptr<uint8_t>(output);
++    if (send.sizes[rank_] != 0) {
++      detail::check_cuda(
++          cudaMemcpyAsync(
++              recv_ptr + recv.offsets[rank_],
++              send_ptr + send.offsets[rank_],
++              send.sizes[rank_],
++              cudaMemcpyDeviceToDevice,
++              encoder.stream()),
++          "self copy");
++    }
++
++    bool have_peer_work = false;
++    for (int peer = 0; peer < size_; ++peer) {
++      if (peer != rank_ && (send.sizes[peer] != 0 || recv.sizes[peer] != 0)) {
++        have_peer_work = true;
++        break;
++      }
++    }
++    if (!have_peer_work) {
++      return;
++    }
++
++    detail::check_nccl(ncclGroupStart(), "ncclGroupStart");
++    ncclResult_t grouped_result = ncclSuccess;
++    for (int peer = 0; peer < size_; ++peer) {
++      if (peer == rank_) {
++        continue;
++      }
++      if (send.sizes[peer] != 0) {
++        auto result = ncclSend(
++            send_ptr + send.offsets[peer],
++            send.sizes[peer],
++            ncclUint8,
++            peer,
++            comm_->comm,
++            encoder.stream());
++        if (grouped_result == ncclSuccess) {
++          grouped_result = result;
++        }
++      }
++      if (recv.sizes[peer] != 0) {
++        auto result = ncclRecv(
++            recv_ptr + recv.offsets[peer],
++            recv.sizes[peer],
++            ncclUint8,
++            peer,
++            comm_->comm,
++            encoder.stream());
++        if (grouped_result == ncclSuccess) {
++          grouped_result = result;
++        }
++      }
++    }
++    auto group_end_result = ncclGroupEnd();
++    detail::check_nccl(grouped_result, "grouped send or receive");
++    detail::check_nccl(group_end_result, "ncclGroupEnd");
++  }
++
+   template <typename T>
+   void all_reduce_impl(
+       const array& input,
+diff --git a/mlx/distributed/ops.cpp b/mlx/distributed/ops.cpp
+index 1762f0e6bc99cf5de6705cb940c970b747148220..10c3d38d67b3aa1f65977a7b47bcf82776dea588 100644
+--- a/mlx/distributed/ops.cpp
++++ b/mlx/distributed/ops.cpp
+@@ -1,5 +1,6 @@
+ // Copyright © 2024 Apple Inc.
+ 
++#include <limits>
+ #include <sstream>
+ 
+ #include "mlx/backend/cuda/cuda.h"
+@@ -183,4 +184,121 @@ array sum_scatter(
+       std::make_shared<ReduceScatter>(stream, group, ReduceScatter::Sum),
+       {x});
+ }
++
++array all_to_all_v(
++    const array& x,
++    const std::vector<int64_t>& send_counts,
++    const std::vector<int64_t>& recv_counts,
++    std::optional<Group> group_ /* = std::nullopt */,
++    StreamOrDevice s /* = {} */) {
++  auto group = to_group(group_);
++  if (x.ndim() == 0) {
++    throw std::invalid_argument(
++        "[all_to_all_v] Input must have a leading row dimension.");
++  }
++  if (send_counts.size() != group.size() ||
++      recv_counts.size() != group.size()) {
++    std::ostringstream msg;
++    msg << "[all_to_all_v] send_counts and recv_counts must each have "
++        << "group.size() entries (expected " << group.size() << ", got "
++        << send_counts.size() << " and " << recv_counts.size() << ").";
++    throw std::invalid_argument(msg.str());
++  }
++
++  auto validate_counts = [](const std::vector<int64_t>& counts,
++                            const char* name) {
++    std::vector<size_t> converted;
++    converted.reserve(counts.size());
++    size_t total = 0;
++    for (size_t i = 0; i < counts.size(); ++i) {
++      if (counts[i] < 0) {
++        std::ostringstream msg;
++        msg << "[all_to_all_v] " << name << "[" << i
++            << "] must be nonnegative.";
++        throw std::invalid_argument(msg.str());
++      }
++      auto count = static_cast<uint64_t>(counts[i]);
++      if (count > std::numeric_limits<size_t>::max()) {
++        std::ostringstream msg;
++        msg << "[all_to_all_v] " << name << "[" << i << "] exceeds size_t.";
++        throw std::overflow_error(msg.str());
++      }
++      auto value = static_cast<size_t>(count);
++      if (value > std::numeric_limits<size_t>::max() - total) {
++        std::ostringstream msg;
++        msg << "[all_to_all_v] " << name << " sum exceeds size_t.";
++        throw std::overflow_error(msg.str());
++      }
++      total += value;
++      converted.push_back(value);
++    }
++    return std::pair{std::move(converted), total};
++  };
++
++  auto [send_rows, total_send_rows] =
++      validate_counts(send_counts, "send_counts");
++  auto [recv_rows, total_recv_rows] =
++      validate_counts(recv_counts, "recv_counts");
++  if (total_send_rows != static_cast<size_t>(x.shape(0))) {
++    std::ostringstream msg;
++    msg << "[all_to_all_v] sum(send_counts)=" << total_send_rows
++        << " does not equal input.shape(0)=" << x.shape(0) << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (total_recv_rows > std::numeric_limits<int>::max()) {
++    throw std::overflow_error(
++        "[all_to_all_v] Output leading dimension exceeds the MLX shape limit.");
++  }
++
++  size_t row_bytes = x.itemsize();
++  for (size_t axis = 1; axis < x.ndim(); ++axis) {
++    auto dimension = static_cast<size_t>(x.shape(axis));
++    if (dimension != 0 &&
++        row_bytes > std::numeric_limits<size_t>::max() / dimension) {
++      throw std::overflow_error("[all_to_all_v] Row byte size exceeds size_t.");
++    }
++    row_bytes *= dimension;
++  }
++  if (total_recv_rows != 0 &&
++      row_bytes > std::numeric_limits<size_t>::max() / total_recv_rows) {
++    throw std::overflow_error(
++        "[all_to_all_v] Output byte size exceeds size_t.");
++  }
++  for (size_t i = 0; i < group.size(); ++i) {
++    if ((send_rows[i] != 0 &&
++         row_bytes > std::numeric_limits<size_t>::max() / send_rows[i]) ||
++        (recv_rows[i] != 0 &&
++         row_bytes > std::numeric_limits<size_t>::max() / recv_rows[i])) {
++      throw std::overflow_error(
++          "[all_to_all_v] Peer transfer byte size exceeds size_t.");
++    }
++  }
++
++  if (group.size() == 1) {
++    if (total_recv_rows != total_send_rows) {
++      throw std::invalid_argument(
++          "[all_to_all_v] Singleton send and receive counts must match.");
++    }
++    return x;
++  }
++
++  if (send_rows[group.rank()] != recv_rows[group.rank()]) {
++    std::ostringstream msg;
++    msg << "[all_to_all_v] Self send count " << send_rows[group.rank()]
++        << " does not match self receive count " << recv_rows[group.rank()]
++        << ".";
++    throw std::invalid_argument(msg.str());
++  }
++
++  auto result_shape = x.shape();
++  result_shape[0] = static_cast<int>(total_recv_rows);
++  auto stream = detail::communication_stream(group, s);
++
++  return array(
++      std::move(result_shape),
++      x.dtype(),
++      std::make_shared<AllToAllV>(
++          stream, group, std::move(send_rows), std::move(recv_rows)),
++      {x});
++}
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/ops.h b/mlx/distributed/ops.h
+index e223c5bea2e3a39b476d1201350dafa7b55e9703..84a85ff8e7df0fe408759eec77d4c45347f8a55a 100644
+--- a/mlx/distributed/ops.h
++++ b/mlx/distributed/ops.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <optional>
++#include <vector>
+ 
+ #include "mlx/api.h"
+ #include "mlx/distributed/distributed.h"
+@@ -54,4 +55,11 @@ MLX_API array sum_scatter(
+     std::optional<Group> group = std::nullopt,
+     StreamOrDevice s = {});
+ 
++MLX_API array all_to_all_v(
++    const array& x,
++    const std::vector<int64_t>& send_counts,
++    const std::vector<int64_t>& recv_counts,
++    std::optional<Group> group = std::nullopt,
++    StreamOrDevice s = {});
++
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/primitives.cpp b/mlx/distributed/primitives.cpp
+index 5e8d5327a109dca0d9a46fe6ddc432949736344a..58812f7aa8caf61924d5e1de469b2d95901fa576 100644
+--- a/mlx/distributed/primitives.cpp
++++ b/mlx/distributed/primitives.cpp
+@@ -92,4 +92,67 @@ std::pair<std::vector<array>, std::vector<int>> Send::vmap(
+   return {{send(inputs[0], dst_, group(), stream())}, axes};
+ }
+ 
++namespace {
++
++std::vector<int64_t> signed_counts(const std::vector<size_t>& counts) {
++  std::vector<int64_t> result;
++  result.reserve(counts.size());
++  for (auto count : counts) {
++    result.push_back(static_cast<int64_t>(count));
++  }
++  return result;
++}
++
++} // namespace
++
++std::pair<std::vector<array>, std::vector<int>> AllToAllV::vmap(
++    const std::vector<array>& inputs,
++    const std::vector<int>& axes) {
++  auto& in = inputs[0];
++  auto ax = axes[0];
++  if (ax == 0) {
++    return {
++        {all_to_all_v(
++            moveaxis(in, 0, 1, stream()),
++            signed_counts(send_counts_),
++            signed_counts(recv_counts_),
++            group(),
++            stream())},
++        {1}};
++  }
++  return {
++      {all_to_all_v(
++          in,
++          signed_counts(send_counts_),
++          signed_counts(recv_counts_),
++          group(),
++          stream())},
++      axes};
++}
++
++std::vector<array> AllToAllV::jvp(
++    const std::vector<array>& primals,
++    const std::vector<array>& tangents,
++    const std::vector<int>&) {
++  return {all_to_all_v(
++      tangents[0],
++      signed_counts(send_counts_),
++      signed_counts(recv_counts_),
++      group(),
++      stream())};
++}
++
++std::vector<array> AllToAllV::vjp(
++    const std::vector<array>& primals,
++    const std::vector<array>& cotangents,
++    const std::vector<int>&,
++    const std::vector<array>&) {
++  return {all_to_all_v(
++      cotangents[0],
++      signed_counts(recv_counts_),
++      signed_counts(send_counts_),
++      group(),
++      stream())};
++}
++
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/primitives.h b/mlx/distributed/primitives.h
+index 18a0d65f5f30881eb06f1de6ddeae03b09b0c6ba..d17779ef51a2bddbacac42ffb6cf92247eccc353 100644
+--- a/mlx/distributed/primitives.h
++++ b/mlx/distributed/primitives.h
+@@ -153,4 +153,48 @@ class ReduceScatter : public DistPrimitive {
+  private:
+   ReduceType reduce_type_;
+ };
++
++class AllToAllV : public DistPrimitive {
++ public:
++  AllToAllV(
++      Stream stream,
++      Group group,
++      std::vector<size_t> send_counts,
++      std::vector<size_t> recv_counts)
++      : DistPrimitive(stream, group),
++        send_counts_(std::move(send_counts)),
++        recv_counts_(std::move(recv_counts)) {}
++
++  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override;
++  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override;
++
++  std::pair<std::vector<array>, std::vector<int>> vmap(
++      const std::vector<array>& inputs,
++      const std::vector<int>& axes) override;
++  std::vector<array> jvp(
++      const std::vector<array>& primals,
++      const std::vector<array>& tangents,
++      const std::vector<int>& argnums) override;
++  std::vector<array> vjp(
++      const std::vector<array>& primals,
++      const std::vector<array>& cotangents,
++      const std::vector<int>& argnums,
++      const std::vector<array>& outputs) override;
++
++  const std::vector<size_t>& send_counts() const {
++    return send_counts_;
++  }
++
++  const std::vector<size_t>& recv_counts() const {
++    return recv_counts_;
++  }
++
++  DEFINE_NAME(AllToAllV);
++
++ private:
++  std::vector<size_t> send_counts_;
++  std::vector<size_t> recv_counts_;
++};
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+index ea40042844bf6da909b3a37d5457fcc0aa88c041..ee0b17deb5efb83d80fd9d6a68f9046bf8aa3396 100644
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -6,9 +6,12 @@
+ #include <unistd.h>
+ 
+ #include <chrono>
++#include <cstdint>
++#include <cstring>
+ #include <fstream>
+ #include <future>
+ #include <iostream>
++#include <limits>
+ #include <list>
+ #include <sstream>
+ #include <thread>
+@@ -579,6 +582,105 @@ class RingGroup : public GroupImpl {
+     throw std::runtime_error("[ring] sum_scatter not supported.");
+   }
+ 
++  void all_to_all_v(
++      const array& input,
++      array& output,
++      const std::vector<size_t>& send_counts,
++      const std::vector<size_t>& recv_counts,
++      Stream stream) override {
++    auto send = detail::all_to_all_v_layout(input, send_counts, "send_counts");
++    auto recv = detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
++    if (send.sizes[rank_] != recv.sizes[rank_]) {
++      throw std::invalid_argument(
++          "[ring::all_to_all_v] Self send and receive byte counts must match.");
++    }
++
++    auto* input_ptr = input.data<char>();
++    auto* output_ptr = output.data<char>();
++    auto& encoder = cpu::get_command_encoder(stream);
++    encoder.set_input_array(input);
++    encoder.set_output_array(output);
++    encoder.dispatch([input_ptr,
++                      output_ptr,
++                      send = std::move(send),
++                      recv = std::move(recv),
++                      this]() {
++      struct PacketHeader {
++        uint64_t bytes;
++        uint32_t source;
++        uint32_t destination;
++      };
++
++      if (send.sizes[rank_] != 0) {
++        std::memcpy(
++            output_ptr + recv.offsets[rank_],
++            input_ptr + send.offsets[rank_],
++            send.sizes[rank_]);
++      }
++
++      for (int distance = 1; distance < size_; ++distance) {
++        int destination = (rank_ + distance) % size_;
++        PacketHeader current_header{
++            static_cast<uint64_t>(send.sizes[destination]),
++            static_cast<uint32_t>(rank_),
++            static_cast<uint32_t>(destination)};
++        std::vector<char> current(current_header.bytes);
++        if (!current.empty()) {
++          std::memcpy(
++              current.data(),
++              input_ptr + send.offsets[destination],
++              current.size());
++        }
++
++        for (int hop = 1; hop <= distance; ++hop) {
++          PacketHeader incoming_header{};
++          auto recv_header =
++              comm_.recv(sockets_left_[0], &incoming_header, size_t(1));
++          auto send_header =
++              comm_.send(sockets_right_[0], &current_header, size_t(1));
++          recv_header.get();
++          send_header.get();
++
++          if (incoming_header.bytes >
++              static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
++            throw std::overflow_error(
++                "[ring::all_to_all_v] Routed packet exceeds size_t.");
++          }
++          std::vector<char> incoming(
++              static_cast<size_t>(incoming_header.bytes));
++          auto recv_payload =
++              comm_.recv(sockets_left_[0], incoming.data(), incoming.size());
++          auto send_payload =
++              comm_.send(sockets_right_[0], current.data(), current.size());
++          recv_payload.get();
++          send_payload.get();
++          current_header = incoming_header;
++          current = std::move(incoming);
++        }
++
++        if (current_header.destination != static_cast<uint32_t>(rank_) ||
++            current_header.source >= static_cast<uint32_t>(size_)) {
++          throw std::runtime_error(
++              "[ring::all_to_all_v] Received invalid routing metadata.");
++        }
++        size_t source = current_header.source;
++        if (current.size() != recv.sizes[source]) {
++          std::ostringstream msg;
++          msg << "[ring::all_to_all_v] Received " << current.size()
++              << " bytes from source " << source << ", expected "
++              << recv.sizes[source] << ".";
++          throw std::runtime_error(msg.str());
++        }
++        if (!current.empty()) {
++          std::memcpy(
++              output_ptr + recv.offsets[source],
++              current.data(),
++              current.size());
++        }
++      }
++    });
++  }
++
+  private:
+   template <typename T, typename ReduceOp>
+   void all_reduce(
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 27c73cbbaf11d3c300a53b26105edbb1dcd16bf0..b8f000e7bdca269aa4a17681179aa4676c4f2132 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -21,6 +21,7 @@ target_sources(
+           blas_tests.cpp
+           compile_tests.cpp
+           completion_tests.cpp
++          distributed_all_to_all_v_tests.cpp
+           custom_vjp_tests.cpp
+           creations_tests.cpp
+           device_tests.cpp
+diff --git a/tests/distributed_all_to_all_v_tests.cpp b/tests/distributed_all_to_all_v_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb14346fc30024bae51d47caf7bdb8fedc2806fd
+--- /dev/null
++++ b/tests/distributed_all_to_all_v_tests.cpp
+@@ -0,0 +1,241 @@
++// Copyright © 2026 Apple Inc.
++
++#include "doctest/doctest.h"
++
++#include <atomic>
++#include <cstring>
++#include <limits>
++#include <memory>
++#include <stdexcept>
++#include <vector>
++
++#include "mlx/backend/cpu/encoder.h"
++#include "mlx/distributed/distributed_impl.h"
++#include "mlx/distributed/ops.h"
++#include "mlx/mlx.h"
++
++using namespace mlx::core;
++
++namespace {
++
++class TestGroup : public distributed::detail::GroupImpl {
++ public:
++  TestGroup(int rank, int size, std::vector<char> result = {})
++      : rank_(rank), size_(size), result_(std::move(result)) {}
++
++  Stream communication_stream(StreamOrDevice s) override {
++    return to_stream(s, Device::cpu);
++  }
++  int rank() override {
++    return rank_;
++  }
++  int size() override {
++    return size_;
++  }
++  std::shared_ptr<GroupImpl> split(int, int) override {
++    throw std::runtime_error("unused");
++  }
++  void all_sum(const array&, array&, Stream) override {
++    throw std::runtime_error("unused");
++  }
++  void all_gather(const array&, array&, Stream) override {
++    throw std::runtime_error("unused");
++  }
++  void send(const array&, int, Stream) override {
++    throw std::runtime_error("unused");
++  }
++  void recv(array&, int, Stream) override {
++    throw std::runtime_error("unused");
++  }
++  void all_max(const array&, array&, Stream) override {
++    throw std::runtime_error("unused");
++  }
++  void all_min(const array&, array&, Stream) override {
++    throw std::runtime_error("unused");
++  }
++  void sum_scatter(const array&, array&, Stream) override {
++    throw std::runtime_error("unused");
++  }
++
++  void all_to_all_v(
++      const array& input,
++      array& output,
++      const std::vector<size_t>& send_counts,
++      const std::vector<size_t>& recv_counts,
++      Stream stream) override {
++    calls++;
++    saw_row_contiguous = input.flags().row_contiguous;
++    last_send_counts = send_counts;
++    last_recv_counts = recv_counts;
++    if (!result_.empty() && result_.size() != output.nbytes()) {
++      throw std::runtime_error("test result byte size mismatch");
++    }
++    auto* input_ptr = input.data<char>();
++    auto* output_ptr = output.data<char>();
++    auto result = result_;
++    auto input_bytes = input.nbytes();
++    auto output_bytes = output.nbytes();
++    auto& encoder = cpu::get_command_encoder(stream);
++    encoder.set_input_array(input);
++    encoder.set_output_array(output);
++    encoder.dispatch([input_ptr,
++                      output_ptr,
++                      input_bytes,
++                      output_bytes,
++                      result = std::move(result)]() {
++      if (!result.empty()) {
++        std::memcpy(output_ptr, result.data(), result.size());
++      } else if (output_bytes != 0) {
++        if (input_bytes != output_bytes) {
++          throw std::runtime_error("test identity byte size mismatch");
++        }
++        std::memcpy(output_ptr, input_ptr, output_bytes);
++      }
++    });
++  }
++
++  std::atomic<int> calls{0};
++  bool saw_row_contiguous{false};
++  std::vector<size_t> last_send_counts;
++  std::vector<size_t> last_recv_counts;
++
++ private:
++  int rank_;
++  int size_;
++  std::vector<char> result_;
++};
++
++template <typename T>
++std::vector<char> as_bytes(const std::vector<T>& values) {
++  std::vector<char> result(values.size() * sizeof(T));
++  std::memcpy(result.data(), values.data(), result.size());
++  return result;
++}
++
++distributed::Group group(std::shared_ptr<TestGroup> implementation) {
++  return distributed::Group(std::move(implementation));
++}
++
++} // namespace
++
++TEST_CASE("test all_to_all_v API validation and singleton") {
++  auto singleton_impl = std::make_shared<TestGroup>(0, 1);
++  auto singleton = group(singleton_impl);
++  auto x = array({1, 2, 3, 4}, {2, 2});
++  auto y = distributed::all_to_all_v(x, {2}, {2}, singleton);
++  CHECK_EQ(y.id(), x.id());
++  CHECK_EQ(singleton_impl->calls.load(), 0);
++
++  CHECK_THROWS_WITH(
++      distributed::all_to_all_v(array(1), {1}, {1}, singleton),
++      "[all_to_all_v] Input must have a leading row dimension.");
++  CHECK_THROWS_WITH(
++      distributed::all_to_all_v(x, {}, {2}, singleton),
++      "[all_to_all_v] send_counts and recv_counts must each have group.size() entries (expected 1, got 0 and 1).");
++  CHECK_THROWS_WITH(
++      distributed::all_to_all_v(x, {-1}, {2}, singleton),
++      "[all_to_all_v] send_counts[0] must be nonnegative.");
++  CHECK_THROWS_WITH(
++      distributed::all_to_all_v(x, {1}, {2}, singleton),
++      "[all_to_all_v] sum(send_counts)=1 does not equal input.shape(0)=2.");
++  CHECK_THROWS_WITH(
++      distributed::all_to_all_v(x, {2}, {1}, singleton),
++      "[all_to_all_v] Singleton send and receive counts must match.");
++
++  auto size_three = group(std::make_shared<TestGroup>(0, 3));
++  CHECK_THROWS_WITH(
++      distributed::all_to_all_v(
++          zeros({0, 1}), {0, 0, 0}, {1, 0, 0}, size_three),
++      "[all_to_all_v] Self send count 0 does not match self receive count 1.");
++  CHECK_THROWS_WITH(
++      distributed::all_to_all_v(
++          zeros({0, 1}),
++          {0, 0, 0},
++          {std::numeric_limits<int>::max(), 1, 0},
++          size_three),
++      "[all_to_all_v] Output leading dimension exceeds the MLX shape limit.");
++}
++
++TEST_CASE("test all_to_all_v asymmetric source order and trailing shape") {
++  auto implementation = std::make_shared<TestGroup>(
++      1, 3, as_bytes<int32_t>({10, 11, 12, 13, 30, 31}));
++  auto g = group(implementation);
++  auto input = array({100, 101, 200, 201, 202, 203}, {3, 2});
++  auto output = distributed::all_to_all_v(input, {0, 1, 2}, {2, 1, 0}, g);
++  CHECK_EQ(output.shape(), Shape({3, 2}));
++  CHECK_EQ(output.dtype(), int32);
++  CHECK_FALSE(output.is_available());
++  eval(output);
++  CHECK(array_equal(output, array({10, 11, 12, 13, 30, 31}, {3, 2}))
++            .item<bool>());
++  CHECK_EQ(implementation->last_send_counts, std::vector<size_t>({0, 1, 2}));
++  CHECK_EQ(implementation->last_recv_counts, std::vector<size_t>({2, 1, 0}));
++}
++
++TEST_CASE("test all_to_all_v empty and noncontiguous inputs") {
++  {
++    auto implementation = std::make_shared<TestGroup>(2, 3);
++    auto output = distributed::all_to_all_v(
++        zeros({0, 4}, float16), {0, 0, 0}, {0, 0, 0}, group(implementation));
++    eval(output);
++    CHECK_EQ(output.shape(), Shape({0, 4}));
++    CHECK_EQ(output.dtype(), float16);
++    CHECK_EQ(implementation->calls.load(), 1);
++  }
++  {
++    auto implementation = std::make_shared<TestGroup>(0, 2);
++    auto input = transpose(array({1, 2, 3, 4, 5, 6}, {2, 3}));
++    auto output =
++        distributed::all_to_all_v(input, {1, 2}, {1, 2}, group(implementation));
++    eval(output);
++    CHECK(implementation->saw_row_contiguous);
++    CHECK(array_equal(output, input).item<bool>());
++  }
++}
++
++TEST_CASE("test all_to_all_v JVP VJP and vmap") {
++  auto implementation = std::make_shared<TestGroup>(0, 2);
++  auto g = group(implementation);
++  auto function = [g](const array& input) {
++    return distributed::all_to_all_v(input, {1, 1}, {1, 1}, g);
++  };
++
++  auto primal = array({1.0f, 2.0f}, {2, 1});
++  auto tangent = array({3.0f, 4.0f}, {2, 1});
++  auto tangent_output = jvp(function, primal, tangent).second;
++  CHECK(array_equal(tangent_output, tangent).item<bool>());
++
++  auto cotangent = array({5.0f, 6.0f}, {2, 1});
++  auto gradient = vjp(function, primal, cotangent).second;
++  CHECK(array_equal(gradient, cotangent).item<bool>());
++  CHECK_EQ(implementation->last_send_counts, std::vector<size_t>({1, 1}));
++  CHECK_EQ(implementation->last_recv_counts, std::vector<size_t>({1, 1}));
++
++  auto batched =
++      array({1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f}, {4, 2, 1});
++  auto mapped = vmap(function)(batched);
++  CHECK(array_equal(mapped, batched).item<bool>());
++  auto axis_one_batched = moveaxis(batched, 0, 1);
++  auto axis_one_mapped = vmap(function, 1, 1)(axis_one_batched);
++  CHECK(array_equal(axis_one_mapped, axis_one_batched).item<bool>());
++  CHECK_THROWS_WITH(vmap(function, 3)(batched), "SmallVector out of range.");
++}
++
++TEST_CASE("test all_to_all_v lazy completion handoff") {
++  auto implementation = std::make_shared<TestGroup>(0, 2);
++  auto producer = new_thread_unsafe_stream(Device::cpu);
++  auto consumer = new_thread_unsafe_stream(Device::cpu);
++  auto output = distributed::all_to_all_v(
++      array({1.0f, 2.0f}, {2, 1}),
++      {1, 1},
++      {1, 1},
++      group(implementation),
++      producer);
++  CHECK_EQ(implementation->calls.load(), 0);
++  auto completion = async_eval_with_completion({output});
++  completion.wait(consumer);
++  auto downstream = add(output, array(1.0f), consumer);
++  eval(downstream);
++  CHECK(array_equal(downstream, array({2.0f, 3.0f}, {2, 1})).item<bool>());
++  CHECK(completion.is_complete());
++}

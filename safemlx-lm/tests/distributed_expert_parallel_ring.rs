@@ -608,7 +608,7 @@ fn expert_parallel_model_ring_worker() {
     assert!(timings.compaction_time > Duration::ZERO);
     assert!(timings.expert_time > Duration::ZERO);
     assert!(timings.reduction_time > Duration::ZERO);
-    assert_eq!(timings.exchange_time, Duration::ZERO);
+    assert_eq!(timings.payload_exchange_time, Duration::ZERO);
     if !sparse_cached && !tensor_expert && !uses_external_expert_bank(&architecture) {
         assert!(timings.router_time > Duration::ZERO);
         assert_eq!(

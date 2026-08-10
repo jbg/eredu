@@ -2,14 +2,28 @@
 
 Rust bindings to the mlx-c API. Generated using bindgen.
 
-## Vendored MLX completion patch
+## Vendored MLX patches
 
-The vendored MLX-C build pins MLX 0.32.0 and applies
-`src/mlx-c/patches/mlx-completion-events.patch` after the existing platform and
-kernel patches. This reviewable patch exposes a move-only C++ `Completion`
+The vendored MLX-C build pins MLX 0.32.0 and applies the reviewable patches in
+`src/mlx-c/patches/` idempotently. The inventory covers Apple mobile platforms,
+CUDA command-encoder lifetime, group-16 affine quantization, completion events,
+and variable-count all-to-all. No generated FetchContent source is edited.
+
+`mlx-completion-events.patch` exposes a move-only C++ `Completion`
 around MLX's existing internal `Event`; it does not introduce a SafeMLX-side
 backend runtime or modify FetchContent output. It also makes CPU scheduler and
 backend event errors persistent for repeated completion observation.
+
+`mlx-variable-all-to-all.patch` adds the lazy `distributed::all_to_all_v`
+primitive from the public C++ operation through CPU/CUDA evaluation and every
+MLX 0.32 distributed backend. MPI uses checked byte `MPI_Alltoallv`; NCCL uses
+grouped `ncclSend`/`ncclRecv` on MLX's CUDA stream; JACCL mesh performs direct
+personalized transfers; and TCP Ring plus JACCL Ring use deterministic
+clockwise store-and-forward packets which stop at their destinations. Ring
+therefore moves exact endpoint payloads without global replication, although
+physical hop bytes can exceed useful logical bytes. Counts, byte layout,
+backend integer limits, noncontiguous copies, autodiff, vmap, empty routes, and
+singleton identity are handled in the MLX layer.
 
 The MLX-C headers expose opaque `mlx_event` ownership, async evaluation with an
 event, stream wait, host synchronize, query, and identity accessors. The
@@ -26,17 +40,16 @@ integration target with the CUDA-specific handoff test enabled. Metal and CUDA
 runtime handoff tests remain explicit and ignored because no GPU runners are
 currently configured.
 
-MLX's direct completion tests, including deterministic asynchronous failure
-retention and consumer-stream poisoning, are deliberately separate from normal
-Cargo builds. Run their opt-in CMake target through:
+MLX's direct completion and all-to-all-v tests are deliberately separate from
+normal Cargo builds. Run the generalized opt-in CMake target through:
 
 ```console
-bash safemlx-sys/scripts/test-mlx-completion-patch.sh
+bash safemlx-sys/scripts/test-mlx-patches.sh
 ```
 
-The dedicated CI workflow is path-scoped to the vendored patch, its CMake
-harness, and this script, so unrelated builds do not compile or run upstream
-MLX's test suite.
+The dedicated CI workflow is path-scoped to the vendored patches, their CMake
+harness, and this script. Runtime MPI, JACCL, and NCCL coverage still requires
+the corresponding launcher and hardware.
 
 ## Linux and CUDA
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_dir="$(cd -- "${script_dir}/../.." && pwd)"
-build_dir="${1:-${repository_dir}/target/mlx-completion-patch-tests}"
+build_dir="${1:-${repository_dir}/target/mlx-patch-tests}"
 
 cmake \
   -S "${repository_dir}/safemlx-sys/src/mlx-c" \
@@ -18,5 +18,5 @@ cmake \
 
 cmake \
   --build "${build_dir}" \
-  --target mlx-completion-patch-tests \
+  --target mlx-patch-tests \
   --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"

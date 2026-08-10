@@ -11,7 +11,10 @@ use safemlx::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
 };
-use safemlx_lm::{CartesianExecution, DeviceAssignment, ParallelTopology};
+use safemlx_lm::{
+    architectures::distributed::expert::{AllToAllVPlan, RoutedTransport},
+    CartesianExecution, DeviceAssignment, ParallelTopology,
+};
 
 const WORKER_ENV: &str = "SAFEMLX_CARTESIAN_RING_WORKER";
 const TRIPLE_WORKER_ENV: &str = "SAFEMLX_CARTESIAN_TRIPLE_RING_WORKER";
@@ -36,6 +39,34 @@ fn values(value: &Array) -> Vec<i32> {
     value.evaluated().unwrap().as_slice::<i32>().to_vec()
 }
 
+fn native_all_to_all_counts() -> [[usize; 4]; 4] {
+    [[1, 2, 1, 0], [1, 0, 0, 2], [0, 0, 0, 0], [1, 1, 0, 1]]
+}
+
+fn compact_rows(source: usize, counts: &[usize], columns: i32, stream: &Stream) -> Array {
+    let mut rows = Vec::new();
+    for (destination, &count) in counts.iter().enumerate() {
+        for row in 0..count {
+            let value = (source * 100 + destination * 10 + row) as i32;
+            rows.extend([value, -value]);
+        }
+    }
+    Array::from_slice(&rows, &[rows.len() as i32 / columns, columns])
+        .copy(stream)
+        .unwrap()
+}
+
+fn expected_rows(counts: &[[usize; 4]; 4], destination: usize) -> Vec<i32> {
+    let mut expected = Vec::new();
+    for (source, source_counts) in counts.iter().enumerate() {
+        for row in 0..source_counts[destination] {
+            let value = (source * 100 + destination * 10 + row) as i32;
+            expected.extend([value, -value]);
+        }
+    }
+    expected
+}
+
 #[test]
 fn cartesian_ring_worker() {
     let Some(expected_rank) = std::env::var_os(WORKER_ENV) else {
@@ -46,6 +77,42 @@ fn cartesian_ring_worker() {
     assert_eq!(world.rank(), expected_rank);
     assert_eq!(world.size(), 4);
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+
+    // Native four-rank exchange: rank 2 sends no routes, counts are uneven,
+    // traffic is bidirectional, and source order is visible in two-column rows.
+    let count_matrix = native_all_to_all_counts();
+    let send_counts = count_matrix[expected_rank];
+    let recv_counts = count_matrix.map(|source| source[expected_rank]);
+    let plan = AllToAllVPlan::new(&send_counts, &world, &stream).unwrap();
+    for _ in 0..2 {
+        let input = compact_rows(expected_rank, &send_counts, 2, &stream);
+        let exchange = plan.exchange(&input, &world, &stream).unwrap();
+        assert_eq!(exchange.source_counts, recv_counts);
+        assert_eq!(
+            values(&exchange.received),
+            expected_rows(&count_matrix, expected_rank)
+        );
+        assert_eq!(exchange.statistics.padding_bytes, 0);
+        assert_eq!(
+            exchange.statistics.routed_transport,
+            RoutedTransport::Native
+        );
+        let legacy_padded_bytes = 4 * 4 * 2 * 2 * std::mem::size_of::<i32>();
+        assert!(
+            exchange.statistics.payload_allocation_upper_bound_bytes < legacy_padded_bytes,
+            "rank {expected_rank} compact bound {} was not below legacy {legacy_padded_bytes}",
+            exchange.statistics.payload_allocation_upper_bound_bytes
+        );
+    }
+    let empty = safemlx::ops::zeros_dtype(&[0, 3], safemlx::Dtype::Float32, &stream).unwrap();
+    let empty_counts = [0usize; 4];
+    let empty =
+        distributed::all_to_all_v(&empty, &empty_counts, &empty_counts, &world, &stream).unwrap();
+    assert_eq!(empty.shape(), &[0, 3]);
+    empty.evaluated().unwrap();
+    let after_exchange =
+        distributed::all_sum(&scalar(expected_rank as i32 + 1), &world, &stream).unwrap();
+    assert_eq!(values(&after_exchange), vec![10]);
 
     // TP+PP: TP groups are [0, 1] and [2, 3]; pipeline lanes are [0, 2]
     // and [1, 3]. Both axes are logical subgroups under Ring.
@@ -106,6 +173,32 @@ fn cartesian_ring_worker() {
             values(&reduced),
             vec![if expected_rank < 2 { 3 } else { 7 }]
         );
+
+        // Ring cannot split these EP pairs natively. Exercise the topology-
+        // planned logical route with asymmetric counts in both directions.
+        let expert_group = execution.expert_group().unwrap();
+        assert!(expert_group.is_logical());
+        let local_rank = expert_group.rank();
+        let logical_send = if local_rank == 0 { [0, 2] } else { [1, 0] };
+        let logical_recv = if local_rank == 0 { [0, 1] } else { [2, 0] };
+        let logical_input = compact_rows(expected_rank, &logical_send, 2, &stream);
+        let logical_received = distributed::all_to_all_v(
+            &logical_input,
+            &logical_send,
+            &logical_recv,
+            expert_group,
+            &stream,
+        )
+        .unwrap();
+        let peer_global_rank = execution.preflight().expert_subgroup.global_ranks[1 - local_rank];
+        let destination = local_rank;
+        let expected = (0..logical_recv[1 - local_rank])
+            .flat_map(|row| {
+                let value = (peer_global_rank * 100 + destination * 10 + row) as i32;
+                [value, -value]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values(&logical_received), expected);
     }
 
     // PP+EP: stage-local EP reduction followed by matching-EP pipeline transport.

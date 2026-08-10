@@ -195,6 +195,11 @@ impl Group {
             .map_or_else(|| self.native_size(), |logical| logical.global_ranks.len())
     }
 
+    /// Return whether this group uses SafeMLX topology-routed membership.
+    pub fn is_logical(&self) -> bool {
+        self.logical.is_some()
+    }
+
     /// Split the group by `color`, optionally ordering new ranks by `key`.
     ///
     /// A missing or negative key asks MLX to use the current group rank. Backend
@@ -376,6 +381,142 @@ fn collective(
     })
 }
 
+fn depends_on(value: &Array, dependency: &Array) -> Result<Array> {
+    let mut outputs = crate::transforms::depends([value], [dependency])?;
+    outputs
+        .pop()
+        .ok_or_else(|| Exception::custom("MLX depends returned no output"))
+}
+
+fn validate_all_to_all_v(
+    input: &Array,
+    send_counts: &[usize],
+    recv_counts: &[usize],
+    group: &Group,
+) -> Result<(Vec<i64>, Vec<i64>, Vec<i32>)> {
+    if input.ndim() == 0 {
+        return Err(Exception::custom(
+            "all_to_all_v input must have a leading row dimension",
+        ));
+    }
+    if send_counts.len() != group.size() || recv_counts.len() != group.size() {
+        return Err(Exception::custom(format!(
+            "all_to_all_v requires {} send counts and receive counts, got {} and {}",
+            group.size(),
+            send_counts.len(),
+            recv_counts.len()
+        )));
+    }
+    let send_rows = send_counts.iter().try_fold(0usize, |total, count| {
+        total
+            .checked_add(*count)
+            .ok_or_else(|| Exception::custom("all_to_all_v send count sum overflowed usize"))
+    })?;
+    let recv_rows = recv_counts.iter().try_fold(0usize, |total, count| {
+        total
+            .checked_add(*count)
+            .ok_or_else(|| Exception::custom("all_to_all_v receive count sum overflowed usize"))
+    })?;
+    let input_rows = usize::try_from(input.dim(0))
+        .map_err(|_| Exception::custom("all_to_all_v input row count is negative"))?;
+    if send_rows != input_rows {
+        return Err(Exception::custom(format!(
+            "all_to_all_v send count sum {send_rows} does not match input row count {input_rows}"
+        )));
+    }
+    i32::try_from(recv_rows)
+        .map_err(|_| Exception::custom("all_to_all_v output row count exceeds i32"))?;
+
+    let mut row_bytes = input.item_size();
+    for &dimension in &input.shape()[1..] {
+        let dimension = usize::try_from(dimension)
+            .map_err(|_| Exception::custom("all_to_all_v trailing shape is negative"))?;
+        row_bytes = row_bytes
+            .checked_mul(dimension)
+            .ok_or_else(|| Exception::custom("all_to_all_v row byte size overflowed usize"))?;
+    }
+    row_bytes
+        .checked_mul(recv_rows)
+        .ok_or_else(|| Exception::custom("all_to_all_v output byte size overflowed usize"))?;
+    for (peer, (&send, &recv)) in send_counts.iter().zip(recv_counts).enumerate() {
+        row_bytes.checked_mul(send).ok_or_else(|| {
+            Exception::custom(format!(
+                "all_to_all_v send byte size for peer {peer} overflowed usize"
+            ))
+        })?;
+        row_bytes.checked_mul(recv).ok_or_else(|| {
+            Exception::custom(format!(
+                "all_to_all_v receive byte size for peer {peer} overflowed usize"
+            ))
+        })?;
+    }
+    if group.size() == 1 && send_rows != recv_rows {
+        return Err(Exception::custom(
+            "all_to_all_v singleton send and receive counts must match",
+        ));
+    }
+    if send_counts[group.rank()] != recv_counts[group.rank()] {
+        return Err(Exception::custom(format!(
+            "all_to_all_v self send count {} does not match self receive count {}",
+            send_counts[group.rank()],
+            recv_counts[group.rank()]
+        )));
+    }
+
+    let send = send_counts
+        .iter()
+        .map(|count| {
+            i64::try_from(*count)
+                .map_err(|_| Exception::custom("all_to_all_v send count exceeds i64"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let recv = recv_counts
+        .iter()
+        .map(|count| {
+            i64::try_from(*count)
+                .map_err(|_| Exception::custom("all_to_all_v receive count exceeds i64"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut offsets = Vec::with_capacity(send_counts.len());
+    let mut offset = 0usize;
+    for &count in send_counts {
+        offsets.push(
+            i32::try_from(offset)
+                .map_err(|_| Exception::custom("all_to_all_v row offset exceeds i32"))?,
+        );
+        offset = offset
+            .checked_add(count)
+            .ok_or_else(|| Exception::custom("all_to_all_v row offset overflowed usize"))?;
+    }
+    Ok((send, recv, offsets))
+}
+
+fn native_all_to_all_v(
+    input: &Array,
+    send_counts: &[i64],
+    recv_counts: &[i64],
+    group: &Group,
+    stream: &Stream,
+) -> Result<Array> {
+    let _guard = runtime_lock::enter();
+    Array::try_from_op(|res| {
+        // SAFETY: count slices and all borrowed MLX handles remain alive for
+        // the call. The returned primitive retains its own group and counts.
+        unsafe {
+            safemlx_sys::mlx_distributed_all_to_all_v(
+                res,
+                input.as_ptr(),
+                send_counts.as_ptr(),
+                send_counts.len(),
+                recv_counts.as_ptr(),
+                recv_counts.len(),
+                group.native.c_group,
+                stream.as_ptr(),
+            )
+        }
+    })
+}
+
 fn pack_logical_value(
     input: &Array,
     slot: usize,
@@ -441,6 +582,97 @@ fn native_recv_like(like: &Array, source: usize, group: &Group, stream: &Stream)
             )
         }
     })
+}
+
+fn logical_all_to_all_v(
+    input: &Array,
+    send_counts: &[usize],
+    recv_counts: &[usize],
+    send_offsets: &[i32],
+    group: &Group,
+    stream: &Stream,
+) -> Result<Array> {
+    let logical = group
+        .logical
+        .as_ref()
+        .expect("logical all_to_all_v requires logical membership");
+    let routes = if let Some(routes) = &logical.routes {
+        routes
+            .iter()
+            .map(|route| (route.source_rank, route.exchanges.clone()))
+            .collect::<Vec<_>>()
+    } else if logical.global_ranks.len() == 2 {
+        let peer = logical.global_ranks[1 - logical.rank];
+        let native_rank = group.native_rank();
+        let native_size = group.native_size();
+        let direct =
+            (native_rank + 1) % native_size == peer || (peer + 1) % native_size == native_rank;
+        if !direct {
+            return Err(Exception::custom(
+                "all_to_all_v logical pair has no topology-planned neighbor route",
+            ));
+        }
+        vec![
+            (logical.rank, Vec::new()),
+            (1 - logical.rank, vec![Some(peer)]),
+        ]
+    } else {
+        return Err(Exception::custom(
+            "all_to_all_v logical subgroups larger than two require topology-planned neighbor routes",
+        ));
+    };
+
+    let mut received = Vec::with_capacity(routes.len());
+    for (source_rank, exchanges) in routes {
+        let shift =
+            (logical.rank + logical.global_ranks.len() - source_rank) % logical.global_ranks.len();
+        let destination = (logical.rank + shift) % logical.global_ranks.len();
+        let start = send_offsets[destination];
+        let end = start
+            .checked_add(
+                i32::try_from(send_counts[destination]).map_err(|_| {
+                    Exception::custom("all_to_all_v logical send count exceeds i32")
+                })?,
+            )
+            .ok_or_else(|| Exception::custom("all_to_all_v logical slice end overflowed i32"))?;
+        let mut routed = input.try_index_device(start..end, stream)?;
+
+        for peer in exchanges.into_iter().flatten() {
+            let current_rows = i64::from(routed.dim(0));
+            let count = Array::from_slice(&[current_rows], &[1]).copy(stream)?;
+            let sent_count = native_send(&count, peer, group, stream)?;
+            let received_count = native_recv_like(&count, peer, group, stream)?;
+            let received_count = depends_on(&received_count, &sent_count)?;
+            crate::transforms::async_eval_with_event([&received_count])?.synchronize()?;
+            let incoming_rows = received_count.evaluated()?.as_slice::<i64>()[0];
+            let incoming_rows = i32::try_from(incoming_rows).map_err(|_| {
+                Exception::custom("all_to_all_v logical routed row count is outside i32")
+            })?;
+            if incoming_rows < 0 {
+                return Err(Exception::custom(
+                    "all_to_all_v logical routed row count is negative",
+                ));
+            }
+
+            let mut incoming_shape = input.shape().to_vec();
+            incoming_shape[0] = incoming_rows;
+            let empty = zeros_dtype(&incoming_shape, input.dtype(), stream)?;
+            let sent = native_send(&routed, peer, group, stream)?;
+            let incoming = native_recv_like(&empty, peer, group, stream)?;
+            routed = depends_on(&incoming, &sent)?;
+        }
+        if usize::try_from(routed.dim(0)).ok() != Some(recv_counts[source_rank]) {
+            return Err(Exception::custom(format!(
+                "all_to_all_v logical route from source {source_rank} produced {} rows, expected {}",
+                routed.dim(0),
+                recv_counts[source_rank]
+            )));
+        }
+        received.push((source_rank, routed));
+    }
+    received.sort_unstable_by_key(|(source_rank, _)| *source_rank);
+    let arrays = received.iter().map(|(_, array)| array).collect::<Vec<_>>();
+    concatenate_axis(&arrays, 0, stream)
 }
 
 fn logical_direct_exchange(input: &Array, group: &Group, stream: &Stream) -> Result<Option<Array>> {
@@ -655,6 +887,41 @@ pub fn all_gather(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> R
         stream.as_ref(),
         safemlx_sys::mlx_distributed_all_gather,
     )
+}
+
+/// Exchange variable-sized leading-axis row blocks between all ranks.
+///
+/// `send_counts[d]` rows are addressed to destination group rank `d`, and the
+/// compact input is concatenated in destination-rank order. `recv_counts[s]`
+/// rows are expected from source group rank `s`; the compact output is
+/// concatenated in source-rank order. The operation is lazy for native MLX
+/// groups. Logical Ring/JACCL subgroups use their topology-planned neighbor
+/// routes and exchange only the addressed payload, with small routed count
+/// headers materialized to size intermediate receives.
+pub fn all_to_all_v(
+    input: &Array,
+    send_counts: &[usize],
+    recv_counts: &[usize],
+    group: &Group,
+    stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
+    let (send, recv, send_offsets) = validate_all_to_all_v(input, send_counts, recv_counts, group)?;
+    if group.size() == 1 {
+        return Ok(input.clone());
+    }
+    if group.logical.is_some() {
+        logical_all_to_all_v(
+            input,
+            send_counts,
+            recv_counts,
+            &send_offsets,
+            group,
+            stream,
+        )
+    } else {
+        native_all_to_all_v(input, &send, &recv, group, stream)
+    }
 }
 
 /// Gather equal-shaped shards along an arbitrary existing tensor axis.
@@ -1033,6 +1300,57 @@ mod tests {
             let output = output.evaluated().unwrap();
             assert_eq!(output.as_slice::<f32>(), &[1.0, 2.0]);
         }
+    }
+
+    #[test]
+    fn singleton_all_to_all_v_is_a_validated_identity() {
+        let group = singleton();
+        let stream = crate::test_stream();
+        let input = Array::arange::<_, i32>(Some(1), 5, None::<i32>, stream)
+            .unwrap()
+            .reshape(&[2, 2], stream)
+            .unwrap();
+        let output = all_to_all_v(&input, &[2], &[2], &group, stream).unwrap();
+        drop(input);
+        assert_eq!(output.shape(), &[2, 2]);
+        assert_eq!(output.evaluated().unwrap().as_slice::<i32>(), &[1, 2, 3, 4]);
+
+        let empty = zeros_dtype(&[0, 3], Dtype::Float32, stream).unwrap();
+        let output = all_to_all_v(&empty, &[0], &[0], &group, stream).unwrap();
+        assert_eq!(output.shape(), &[0, 3]);
+    }
+
+    #[test]
+    fn all_to_all_v_reports_exact_validation_errors() {
+        let group = singleton();
+        let stream = crate::test_stream();
+        let scalar = Array::from_int(1);
+        assert_eq!(
+            all_to_all_v(&scalar, &[1], &[1], &group, stream)
+                .unwrap_err()
+                .what(),
+            "all_to_all_v input must have a leading row dimension"
+        );
+
+        let input = Array::arange::<_, i32>(Some(0), 2, None::<i32>, stream).unwrap();
+        assert_eq!(
+            all_to_all_v(&input, &[], &[2], &group, stream)
+                .unwrap_err()
+                .what(),
+            "all_to_all_v requires 1 send counts and receive counts, got 0 and 1"
+        );
+        assert_eq!(
+            all_to_all_v(&input, &[1], &[1], &group, stream)
+                .unwrap_err()
+                .what(),
+            "all_to_all_v send count sum 1 does not match input row count 2"
+        );
+        assert_eq!(
+            all_to_all_v(&input, &[2], &[1], &group, stream)
+                .unwrap_err()
+                .what(),
+            "all_to_all_v singleton send and receive counts must match"
+        );
     }
 
     #[test]

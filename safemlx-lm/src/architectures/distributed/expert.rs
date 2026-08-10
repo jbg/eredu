@@ -4,10 +4,8 @@
 //! only routed expert banks. [`crate::runtime::distributed::expert::dispatch_replicated`]
 //! exploits the replicated
 //! token layout: ranks compact only routes owned by their experts and all-sum
-//! the resulting token buffer. [`crate::runtime::distributed::expert::all_to_all_v`]
-//! is the general sharded-token
-//! transport.  It is intentionally an all-gather fallback and therefore uses
-//! `O(group_size)` temporary replication until MLX exposes native all-to-all.
+//! the resulting token buffer. Sharded-token dispatch uses compact native or
+//! topology-routed variable-count all-to-all payload exchange.
 
 use std::{
     path::{Path, PathBuf},
@@ -6693,7 +6691,8 @@ mod tests {
         assert_eq!(returned.statistics.local_routes, 0);
         assert_eq!(returned.statistics.sent_routes, 0);
         assert_eq!(returned.statistics.received_routes, 0);
-        assert_eq!(returned.statistics.exchanged_bytes, 0);
+        assert_eq!(returned.statistics.useful_sent_bytes, 0);
+        assert_eq!(returned.statistics.useful_received_bytes, 0);
     }
 
     #[test]
@@ -7351,7 +7350,7 @@ mod tests {
         .unwrap();
         assert_eq!(stats.total_routes, 4);
         assert_eq!(stats.local_routes, 2);
-        assert_eq!(stats.synchronization_count, 1);
+        assert_eq!(stats.host_synchronization_count, 1);
         assert_eq!(
             routes
                 .global_expert_ids
@@ -7413,7 +7412,10 @@ mod tests {
         let stream = stream();
         let group = Group::init(false, Backend::Any).unwrap();
         let payload = Array::from_slice(&[1i32, 2, 3, 4], &[2, 2]);
-        let received = all_to_all_v(&[payload], &group, &stream).unwrap();
+        let plan = AllToAllVPlan::new(&[2], &group, &stream).unwrap();
+        assert_eq!(plan.count_matrix(), &[2]);
+        assert_eq!(plan.reverse().send_counts(), &[2]);
+        let received = plan.exchange(&payload, &group, &stream).unwrap();
         eval([&received.received]).unwrap();
         assert_eq!(received.source_counts, vec![2]);
         assert_eq!(
@@ -7422,9 +7424,20 @@ mod tests {
         );
 
         let empty = Array::from_slice::<i32>(&[], &[0, 2]);
-        let received = all_to_all_v(&[empty], &group, &stream).unwrap();
+        let plan = AllToAllVPlan::new(&[0], &group, &stream).unwrap();
+        let received = plan.exchange(&empty, &group, &stream).unwrap();
         assert_eq!(received.source_counts, vec![0]);
         assert_eq!(received.received.shape(), &[0, 2]);
+
+        let mismatched = AllToAllVPlan::new(&[1], &group, &stream)
+            .unwrap()
+            .exchange(&empty, &group, &stream)
+            .err()
+            .expect("mismatched plan must fail before payload exchange");
+        assert_eq!(
+            mismatched.to_string(),
+            "parallel placement error: all-to-all-v planned 1 send rows but payload has 0 rows"
+        );
     }
 
     #[test]

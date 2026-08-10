@@ -20,6 +20,9 @@ SafeMLX is independent of Apple and is not an official MLX project.
   asynchronous evaluation, including host query/wait and backend-ordered
   same-device stream dependencies. See the [ordering contract and current
   adoption state](doc/completion-events.md).
+- Compact variable-count all-to-all across MLX MPI, TCP Ring, JACCL, and NCCL,
+  with topology-routed logical Cartesian subgroups and no padded payload
+  all-gather.
 - High-level loading and generation for supported text, multimodal, and
   realtime speech model families.
 - SafeTensors and bounded, streaming GGUF checkpoint readers.

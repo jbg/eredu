@@ -33,6 +33,15 @@ int mlx_distributed_all_gather(
     const mlx_array x,
     const mlx_distributed_group group /* may be null */,
     const mlx_stream S);
+int mlx_distributed_all_to_all_v(
+    mlx_array* res,
+    const mlx_array x,
+    const int64_t* send_counts,
+    size_t send_counts_num,
+    const int64_t* recv_counts,
+    size_t recv_counts_num,
+    const mlx_distributed_group group /* may be null */,
+    const mlx_stream s);
 int mlx_distributed_all_max(
     mlx_array* res,
     const mlx_array x,

@@ -2268,22 +2268,31 @@ once per rank and added *after* that all-sum; they are never multiplied by EP
 size. Exact compaction performs one scalar route-count synchronization
 per sparse layer, with no per-expert synchronization and no capacity dropping.
 
-For future token-sharded execution, `all_to_all_v` accepts destination-major
-activation or metadata blocks and returns received rows in source-rank order.
-Because MLX 0.32 has no native all-to-all C API, it gathers counts, pads all
-blocks to the global maximum, all-gathers the destination matrix, extracts the
-current destination, and removes padding. This is a real Ring-compatible
-fallback, but its transfer and temporary storage replicate `O(world_size)`
-data. `RoutingStatistics` exposes route counts, padding, synchronization,
-logical exchanged bytes, and router/compaction/exchange/expert/reduction/shared
-expert/total MoE wall times so probes can report imbalance and phase overhead;
-`model_time` separately records the complete model forward. Normal inference
-keeps MLX's lazy scheduling, so those fields primarily measure host submission
-apart from explicit waits. The opt-in `profile_expert_parallel_timings` guard
-materializes each phase and the final logits before its timer stops. It is meant
-for measurement only: the inserted synchronization changes scheduling and can
-reduce production throughput. Use MLX device profiling when kernel-only timing
-is required.
+Token-sharded execution builds one architecture-neutral `AllToAllVPlan` per
+complete dispatch. It all-gathers the tiny source/destination count matrix once,
+materializes that matrix once, derives source-major receive counts, and reuses
+the plan for hidden rows, global expert ids, original route indices, and
+weights. The reverse plan transposes the known count relation without another
+consensus and is reused for returned expert outputs and indices. Every rank
+enters the same six dependency-ordered payload phases, including route-empty
+ranks, and a divergent field row count is rejected before payload traffic.
+
+The payload path is MLX's patched lazy `all_to_all_v`, not padded all-gather.
+Native MPI, TCP Ring, JACCL mesh/ring, and NCCL groups transfer compact addressed
+rows. Ring uses store-and-forward neighbor packets which stop at their
+destinations; physical hop bytes can therefore exceed logical endpoint bytes,
+but no rank materializes the global source/destination payload matrix. Logical
+Cartesian EP subgroups use their topology-planned neighbor routes with the same
+destination-specific property.
+
+`RoutingStatistics` separates useful sent/received bytes, zero native padding,
+known or unknown backend physical bytes, measurable staging high water, a
+SafeMLX-visible allocation bound, count-consensus time, payload-exchange time,
+and native versus logical routed transport. Normal inference keeps MLX's lazy
+scheduling, so phase fields primarily measure graph submission apart from the
+one required count-matrix wait. The opt-in `profile_expert_parallel_timings`
+guard materializes each phase and the final logits before its timer stops; this
+changes scheduling and is for measurement only.
 
 For fully resident DeepSeek, Kimi Linear, and Qwen3,
 `ExpertParallelModel::forward_with_observer` preserves global router ids and
@@ -2356,11 +2365,10 @@ cargo run --release -p safemlx-lm --example expert_parallel_generate -- /path/to
 
 The example prints assignment metadata, performs prefill and multiple decode
 steps, samples only on rank zero, synchronizes token/stop state, and reports
-routing counters. Ring is intended for correctness and functional testing.
-JACCL or NCCL is expected for practical low-latency EP. Small-batch decode is
-often dominated by expert imbalance, and the all-gather all-to-all fallback has
-substantial memory/bandwidth overhead. Replicated-input EP avoids token exchange
-entirely and is usually preferable until a native all-to-all is available. No
+routing counters. Ring is intended for correctness and functional testing. Its
+exact payload can cross several physical hops; JACCL mesh or NCCL is expected
+for practical low-latency EP. Small-batch decode is often dominated by expert
+imbalance, and replicated-input EP still avoids token exchange entirely. No
 speedup is implied without measurements on the target checkpoint and backend.
 
 For a device-complete performance probe comparing a complete model on rank
@@ -2373,11 +2381,12 @@ cargo run --release -p safemlx-lm --example expert_parallel_benchmark -- \
 ```
 
 The CSV reports prefill and fixed-token decode latency/throughput, every MoE
-phase, summed MoE and whole-model time, routes-per-rank imbalance, logical
-bytes, padding, synchronization, peak MLX memory, and complete-versus-EP logit
-error. The synthetic case deliberately uses uneven destination counts to expose
-fallback padding. Ring can be used with `--backend ring --device cpu` for a
-functional comparison; MLX Ring collectives do not currently execute on GPU.
+phase, summed MoE and whole-model time, routes-per-rank imbalance, useful sent
+and received bytes, padding bytes, backend physical bytes when known, staging
+high water when measurable, allocation bounds, count consensus, routed
+transport, peak MLX memory, and complete-versus-EP logit error. The synthetic
+case uses uneven destination counts and verifies zero payload padding. Ring can
+be used with `--backend ring --device cpu`; MLX Ring collectives execute on CPU.
 Results include the synchronization introduced by phase profiling and should
 not be presented as unprofiled production throughput or as an automatic EP
 speedup.

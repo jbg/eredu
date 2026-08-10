@@ -4,10 +4,9 @@
 //! only routed expert banks. [`crate::runtime::distributed::expert::dispatch_replicated`]
 //! exploits the replicated
 //! token layout: ranks compact only routes owned by their experts and all-sum
-//! the resulting token buffer. [`crate::runtime::distributed::expert::all_to_all_v`]
-//! is the general sharded-token
-//! transport.  It is intentionally an all-gather fallback and therefore uses
-//! `O(group_size)` temporary replication until MLX exposes native all-to-all.
+//! the resulting token buffer. Sharded-token dispatch uses one reusable
+//! [`AllToAllVPlan`](crate::runtime::distributed::expert::AllToAllVPlan)
+//! and compact variable-count exchanges in both directions.
 
 use std::{
     cell::Cell,
@@ -17,7 +16,7 @@ use std::{
 use safemlx::{
     distributed::{self, Group},
     ops::{concatenate_axis, indexing::TryIndexOp, r#where, segment_sum_by_index, zeros_dtype},
-    transforms::eval,
+    transforms::{depends, eval},
     Array, Dtype, Stream,
 };
 
@@ -298,8 +297,20 @@ pub enum TokenLayout {
 pub enum ExpertExchangeStrategy {
     /// Compact local routes, execute local experts, and all-sum token outputs.
     ReplicatedInputAllSum,
-    /// Variable-count all-to-all emulated with padded all-gather.
-    AllGatherAllToAllV,
+    /// Compact variable-count all-to-all over the active EP group.
+    AllToAllV,
+}
+
+/// Route transport selected for a sharded expert exchange.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum RoutedTransport {
+    /// No routed payload transport was used.
+    #[default]
+    None,
+    /// A native MLX distributed group executed the exchange.
+    Native,
+    /// SafeMLX topology-planned neighbor routes executed the exchange.
+    Logical,
 }
 
 /// Per-dispatch counters used by diagnostics and benchmark probes.
@@ -313,20 +324,37 @@ pub struct RoutingStatistics {
     pub sent_routes: usize,
     /// Routes received by a sharded-input exchange.
     pub received_routes: usize,
-    /// Padding rows introduced by the fallback transport.
+    /// Padding rows introduced by transport; zero for all-to-all-v.
     pub padding_routes: usize,
-    /// Explicit host-visible synchronization points.
-    pub synchronization_count: usize,
-    /// Payload bytes transferred logically, excluding backend internals.
-    pub exchanged_bytes: usize,
-    /// Time spent waiting for explicit route metadata synchronization.
-    pub synchronization_time: Duration,
+    /// Useful logical payload bytes sent to all destinations.
+    pub useful_sent_bytes: usize,
+    /// Useful logical payload bytes received from all sources.
+    pub useful_received_bytes: usize,
+    /// Padding payload bytes transferred by the selected transport.
+    pub padding_bytes: usize,
+    /// Backend physical or Ring hop bytes, when exposed exactly.
+    pub backend_physical_bytes: Option<usize>,
+    /// Measured temporary/staging high-water bytes, when exposed exactly.
+    pub temporary_high_water_bytes: Option<usize>,
+    /// Conservative SafeMLX-visible retained-plus-Ring-staging payload bound.
+    /// Backend-internal buffers are excluded when the backend does not expose them.
+    pub payload_allocation_upper_bound_bytes: usize,
+    /// Count-matrix consensus operations performed for this dispatch.
+    pub count_consensus_count: usize,
+    /// Time spent materializing count-matrix consensus.
+    pub count_consensus_time: Duration,
+    /// Other explicit host-visible validation synchronizations.
+    pub host_synchronization_count: usize,
+    /// Time spent in explicit host-visible validation synchronization.
+    pub host_synchronization_time: Duration,
+    /// Native versus topology-routed payload transport.
+    pub routed_transport: RoutedTransport,
     /// Wall time spent computing router decisions.
     pub router_time: Duration,
     /// Wall time spent validating and compacting owner-local routes.
     pub compaction_time: Duration,
     /// Wall time spent in route transport collectives.
-    pub exchange_time: Duration,
+    pub payload_exchange_time: Duration,
     /// Wall time spent in local expert computation.
     pub expert_time: Duration,
     /// Wall time spent reducing or recombining routed outputs.
@@ -342,17 +370,50 @@ pub struct RoutingStatistics {
 impl RoutingStatistics {
     /// Adds counters and measured synchronization time from another dispatch.
     pub fn accumulate(&mut self, other: &Self) {
+        let self_has_routed_transport = self.routed_transport != RoutedTransport::None;
+        let other_has_routed_transport = other.routed_transport != RoutedTransport::None;
         self.total_routes += other.total_routes;
         self.local_routes += other.local_routes;
         self.sent_routes += other.sent_routes;
         self.received_routes += other.received_routes;
         self.padding_routes += other.padding_routes;
-        self.synchronization_count += other.synchronization_count;
-        self.exchanged_bytes += other.exchanged_bytes;
-        self.synchronization_time += other.synchronization_time;
+        self.useful_sent_bytes += other.useful_sent_bytes;
+        self.useful_received_bytes += other.useful_received_bytes;
+        self.padding_bytes += other.padding_bytes;
+        self.backend_physical_bytes = match (self_has_routed_transport, other_has_routed_transport)
+        {
+            (false, false) => None,
+            (false, true) => other.backend_physical_bytes,
+            (true, false) => self.backend_physical_bytes,
+            (true, true) => match (self.backend_physical_bytes, other.backend_physical_bytes) {
+                (Some(left), Some(right)) => left.checked_add(right),
+                _ => None,
+            },
+        };
+        self.temporary_high_water_bytes =
+            match (self_has_routed_transport, other_has_routed_transport) {
+                (false, false) => None,
+                (false, true) => other.temporary_high_water_bytes,
+                (true, false) => self.temporary_high_water_bytes,
+                (true, true) => match (
+                    self.temporary_high_water_bytes,
+                    other.temporary_high_water_bytes,
+                ) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    _ => None,
+                },
+            };
+        self.payload_allocation_upper_bound_bytes += other.payload_allocation_upper_bound_bytes;
+        self.count_consensus_count += other.count_consensus_count;
+        self.count_consensus_time += other.count_consensus_time;
+        self.host_synchronization_count += other.host_synchronization_count;
+        self.host_synchronization_time += other.host_synchronization_time;
+        if other.routed_transport != RoutedTransport::None {
+            self.routed_transport = other.routed_transport;
+        }
         self.router_time += other.router_time;
         self.compaction_time += other.compaction_time;
-        self.exchange_time += other.exchange_time;
+        self.payload_exchange_time += other.payload_exchange_time;
         self.expert_time += other.expert_time;
         self.reduction_time += other.reduction_time;
         self.shared_expert_time += other.shared_expert_time;
@@ -542,8 +603,8 @@ pub fn compact_local_routes(
         RoutingStatistics {
             total_routes: expert_ids.size(),
             local_routes,
-            synchronization_count: 1,
-            synchronization_time,
+            host_synchronization_count: 1,
+            host_synchronization_time: synchronization_time,
             ..RoutingStatistics::default()
         },
     ))
@@ -704,7 +765,215 @@ where
     })
 }
 
-/// Result of one variable-count all-to-all fallback.
+/// Reusable count and receive-layout plan for a complete expert dispatch.
+#[derive(Debug, Clone)]
+pub struct AllToAllVPlan {
+    send_counts: Vec<usize>,
+    recv_counts: Vec<usize>,
+    count_matrix: Vec<usize>,
+    count_consensus_count: usize,
+    count_consensus_time: Duration,
+}
+
+impl AllToAllVPlan {
+    /// Gather one source/destination count matrix and derive this rank's
+    /// source-major receive counts.
+    pub fn new(send_counts: &[usize], group: &Group, stream: &Stream) -> Result<Self, Error> {
+        if send_counts.len() != group.size() {
+            return Err(Error::Parallel(format!(
+                "all-to-all-v plan requires {} send counts, got {}",
+                group.size(),
+                send_counts.len()
+            )));
+        }
+        let local_counts = send_counts
+            .iter()
+            .map(|count| {
+                i32::try_from(*count)
+                    .map_err(|_| Error::Parallel("all-to-all-v count exceeds i32".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (count_matrix, count_consensus_count, count_consensus_time) = if group.size() == 1 {
+            (send_counts.to_vec(), 0, Duration::ZERO)
+        } else {
+            let counts = Array::from_slice(
+                &local_counts,
+                &[i32::try_from(group.size())
+                    .map_err(|_| Error::Parallel("EP group size exceeds i32".into()))?],
+            )
+            .copy(stream)?;
+            let gathered = distributed::all_gather(&counts, group, stream)?;
+            let started = Instant::now();
+            let evaluated = gathered.evaluated()?;
+            let elapsed = started.elapsed();
+            let values = evaluated.as_slice::<i32>();
+            let expected = group
+                .size()
+                .checked_mul(group.size())
+                .ok_or_else(|| Error::Parallel("count matrix size overflowed usize".into()))?;
+            if values.len() != expected {
+                return Err(Error::Parallel(format!(
+                    "all-to-all-v count matrix has {} entries, expected {expected}",
+                    values.len()
+                )));
+            }
+            let values = values
+                .iter()
+                .map(|value| {
+                    usize::try_from(*value).map_err(|_| {
+                        Error::Parallel(
+                            "all-to-all-v count matrix contains a negative count".into(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (values, 1, elapsed)
+        };
+        let recv_counts = (0..group.size())
+            .map(|source| count_matrix[source * group.size() + group.rank()])
+            .collect();
+        Ok(Self {
+            send_counts: send_counts.to_vec(),
+            recv_counts,
+            count_matrix,
+            count_consensus_count,
+            count_consensus_time,
+        })
+    }
+
+    /// Destination-major row counts supplied by this rank.
+    pub fn send_counts(&self) -> &[usize] {
+        &self.send_counts
+    }
+
+    /// Source-major row counts expected by this rank.
+    pub fn recv_counts(&self) -> &[usize] {
+        &self.recv_counts
+    }
+
+    /// Row-major source/destination count matrix materialized by the plan.
+    pub fn count_matrix(&self) -> &[usize] {
+        &self.count_matrix
+    }
+
+    /// Return the reverse exchange without another count consensus.
+    pub fn reverse(&self) -> Self {
+        let size = self.send_counts.len();
+        let mut count_matrix = vec![0; self.count_matrix.len()];
+        for source in 0..size {
+            for destination in 0..size {
+                count_matrix[destination * size + source] =
+                    self.count_matrix[source * size + destination];
+            }
+        }
+        Self {
+            send_counts: self.recv_counts.clone(),
+            recv_counts: self.send_counts.clone(),
+            count_matrix,
+            count_consensus_count: 0,
+            count_consensus_time: Duration::ZERO,
+        }
+    }
+
+    fn consensus_statistics(&self) -> RoutingStatistics {
+        RoutingStatistics {
+            count_consensus_count: self.count_consensus_count,
+            count_consensus_time: self.count_consensus_time,
+            ..Default::default()
+        }
+    }
+
+    /// Apply this plan to one compact destination-major field.
+    pub fn exchange(
+        &self,
+        input: &Array,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<ExchangeResult, Error> {
+        let send_rows = self.send_counts.iter().try_fold(0usize, |total, count| {
+            total
+                .checked_add(*count)
+                .ok_or_else(|| Error::Parallel("all-to-all-v send rows overflowed usize".into()))
+        })?;
+        if usize::try_from(input.dim(0)).ok() != Some(send_rows) {
+            return Err(Error::Parallel(format!(
+                "all-to-all-v planned {send_rows} send rows but payload has {} rows",
+                input.dim(0)
+            )));
+        }
+        let row_elements = input.shape()[1..]
+            .iter()
+            .try_fold(1usize, |size, dimension| {
+                let dimension = usize::try_from(*dimension).map_err(|_| {
+                    Error::Parallel("all-to-all-v trailing shape is negative".into())
+                })?;
+                size.checked_mul(dimension)
+                    .ok_or_else(|| Error::Parallel("all-to-all-v row size overflowed usize".into()))
+            })?;
+        let row_bytes = row_elements
+            .checked_mul(input.item_size())
+            .ok_or_else(|| Error::Parallel("all-to-all-v row bytes overflowed usize".into()))?;
+        let recv_rows = self.recv_counts.iter().try_fold(0usize, |total, count| {
+            total
+                .checked_add(*count)
+                .ok_or_else(|| Error::Parallel("all-to-all-v receive rows overflowed usize".into()))
+        })?;
+        let useful_sent_bytes = send_rows
+            .checked_mul(row_bytes)
+            .ok_or_else(|| Error::Parallel("all-to-all-v sent bytes overflowed usize".into()))?;
+        let useful_received_bytes = recv_rows.checked_mul(row_bytes).ok_or_else(|| {
+            Error::Parallel("all-to-all-v received bytes overflowed usize".into())
+        })?;
+        // Store-and-forward Ring implementations retain one outgoing and one
+        // incoming packet. Native mesh collectives use no larger bound.
+        let routing_window = self
+            .send_counts
+            .iter()
+            .chain(&self.recv_counts)
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .checked_mul(row_bytes)
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| {
+                Error::Parallel("all-to-all-v routing window overflowed usize".into())
+            })?;
+        let allocation_bound = useful_sent_bytes
+            .checked_add(useful_received_bytes)
+            .and_then(|bytes| bytes.checked_add(routing_window))
+            .ok_or_else(|| {
+                Error::Parallel("all-to-all-v allocation bound overflowed usize".into())
+            })?;
+
+        let started = Instant::now();
+        let received =
+            distributed::all_to_all_v(input, &self.send_counts, &self.recv_counts, group, stream)?;
+        materialize_timing_phase([&received])?;
+        let payload_exchange_time = started.elapsed();
+        Ok(ExchangeResult {
+            received,
+            source_counts: self.recv_counts.clone(),
+            statistics: RoutingStatistics {
+                sent_routes: send_rows,
+                received_routes: recv_rows,
+                useful_sent_bytes,
+                useful_received_bytes,
+                padding_routes: 0,
+                padding_bytes: 0,
+                payload_allocation_upper_bound_bytes: allocation_bound,
+                payload_exchange_time,
+                routed_transport: if group.is_logical() {
+                    RoutedTransport::Logical
+                } else {
+                    RoutedTransport::Native
+                },
+                ..Default::default()
+            },
+        })
+    }
+}
+
+/// Result of one planned variable-count all-to-all exchange.
 pub struct ExchangeResult {
     /// Received rows concatenated in source-rank order.
     pub received: Array,
@@ -772,11 +1041,16 @@ fn validate_sharded_blocks(blocks: &ShardedRouteBlocks, world: usize) -> Result<
     Ok(())
 }
 
+fn compact_blocks(blocks: &[Array], stream: &Stream) -> Result<Array, Error> {
+    let references = blocks.iter().collect::<Vec<_>>();
+    Ok(concatenate_axis(&references, 0, stream)?)
+}
+
 /// Exchanges sharded-token routes, executes owner-local experts, and returns
 /// exact weighted results to their source ranks.
 ///
-/// All payload and metadata exchange uses [`all_to_all_v`]. Collectives are
-/// entered in a fixed order on every rank, including ranks with zero routes.
+/// All payload and metadata exchange uses one [`AllToAllVPlan`]. Collectives
+/// are dependency-ordered on every rank, including ranks with zero routes.
 pub fn dispatch_sharded(
     blocks: ShardedRouteBlocks,
     assignment: &ExpertAssignment,
@@ -791,23 +1065,36 @@ pub fn dispatch_sharded(
         ));
     }
     validate_sharded_blocks(&blocks, group.size())?;
-    let total_routes = blocks
+    let send_counts = blocks
         .hidden
         .iter()
-        .map(|block| block.dim(0) as usize)
-        .sum();
-    let hidden = all_to_all_v(&blocks.hidden, group, stream)?;
-    let global_ids = all_to_all_v(&blocks.global_expert_ids, group, stream)?;
-    let route_indices = all_to_all_v(&blocks.original_route_indices, group, stream)?;
-    let weights = all_to_all_v(&blocks.weights, group, stream)?;
-    if hidden.source_counts != global_ids.source_counts
-        || hidden.source_counts != route_indices.source_counts
-        || hidden.source_counts != weights.source_counts
-    {
-        return Err(Error::Parallel(
-            "sharded route payload and metadata receive counts diverged".into(),
-        ));
-    }
+        .map(|block| {
+            usize::try_from(block.dim(0))
+                .map_err(|_| Error::Parallel("sharded route count is negative".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let total_routes = send_counts.iter().try_fold(0usize, |total, count| {
+        total
+            .checked_add(*count)
+            .ok_or_else(|| Error::Parallel("sharded route count overflowed usize".into()))
+    })?;
+    let plan = AllToAllVPlan::new(&send_counts, group, stream)?;
+    let hidden = plan.exchange(&compact_blocks(&blocks.hidden, stream)?, group, stream)?;
+    let compact_global_ids = compact_blocks(&blocks.global_expert_ids, stream)?;
+    let compact_global_ids = depends([&compact_global_ids], [&hidden.received])?
+        .pop()
+        .ok_or_else(|| Error::Parallel("all-to-all-v dependency produced no payload".into()))?;
+    let global_ids = plan.exchange(&compact_global_ids, group, stream)?;
+    let compact_route_indices = compact_blocks(&blocks.original_route_indices, stream)?;
+    let compact_route_indices = depends([&compact_route_indices], [&global_ids.received])?
+        .pop()
+        .ok_or_else(|| Error::Parallel("all-to-all-v dependency produced no payload".into()))?;
+    let route_indices = plan.exchange(&compact_route_indices, group, stream)?;
+    let compact_weights = compact_blocks(&blocks.weights, stream)?;
+    let compact_weights = depends([&compact_weights], [&route_indices.received])?
+        .pop()
+        .ok_or_else(|| Error::Parallel("all-to-all-v dependency produced no payload".into()))?;
+    let weights = plan.exchange(&compact_weights, group, stream)?;
     let received_routes = hidden.received.dim(0);
     let owner_local = Array::from_slice(
         &assignment
@@ -823,7 +1110,10 @@ pub fn dispatch_sharded(
     let weighted = if received_routes == 0 {
         let mut shape = hidden.received.shape().to_vec();
         shape[0] = 0;
-        zeros_dtype(&shape, hidden.received.dtype(), stream)?
+        let empty = zeros_dtype(&shape, hidden.received.dtype(), stream)?;
+        depends([&empty], [&weights.received])?
+            .pop()
+            .ok_or_else(|| Error::Parallel("all-to-all-v dependency produced no payload".into()))?
     } else {
         bank.execute_local_routes(&hidden.received, &local_ids, stream)?
             .multiply(weights.received.expand_dims(1, stream)?, stream)?
@@ -834,7 +1124,11 @@ pub fn dispatch_sharded(
     let mut indices_to_source = Vec::with_capacity(group.size());
     let mut offset = 0i32;
     for count in &hidden.source_counts {
-        let end = offset + *count as i32;
+        let count = i32::try_from(*count)
+            .map_err(|_| Error::Parallel("all-to-all-v receive count exceeds i32".into()))?;
+        let end = offset
+            .checked_add(count)
+            .ok_or_else(|| Error::Parallel("all-to-all-v receive offset exceeds i32".into()))?;
         output_to_source.push(weighted.try_index_device(offset..end, stream)?);
         indices_to_source.push(
             route_indices
@@ -843,13 +1137,15 @@ pub fn dispatch_sharded(
         );
         offset = end;
     }
-    let returned_output = all_to_all_v(&output_to_source, group, stream)?;
-    let returned_indices = all_to_all_v(&indices_to_source, group, stream)?;
-    if returned_output.source_counts != returned_indices.source_counts {
-        return Err(Error::Parallel(
-            "returned sharded outputs and route indices diverged".into(),
-        ));
-    }
+    let reverse_plan = plan.reverse();
+    let returned_output =
+        reverse_plan.exchange(&compact_blocks(&output_to_source, stream)?, group, stream)?;
+    let compact_returned_indices = compact_blocks(&indices_to_source, stream)?;
+    let compact_returned_indices =
+        depends([&compact_returned_indices], [&returned_output.received])?
+            .pop()
+            .ok_or_else(|| Error::Parallel("all-to-all-v dependency produced no payload".into()))?;
+    let returned_indices = reverse_plan.exchange(&compact_returned_indices, group, stream)?;
     let token_indices = returned_indices
         .received
         .as_dtype(Dtype::Int32, stream)?
@@ -872,6 +1168,7 @@ pub fn dispatch_sharded(
         reduction_time,
         ..Default::default()
     };
+    statistics.accumulate(&plan.consensus_statistics());
     for exchange in [
         hidden,
         global_ids,
@@ -880,134 +1177,46 @@ pub fn dispatch_sharded(
         returned_output,
         returned_indices,
     ] {
-        statistics.padding_routes += exchange.statistics.padding_routes;
-        statistics.synchronization_count += exchange.statistics.synchronization_count;
-        statistics.exchanged_bytes += exchange.statistics.exchanged_bytes;
-        statistics.synchronization_time += exchange.statistics.synchronization_time;
-        statistics.exchange_time += exchange.statistics.exchange_time;
+        statistics.padding_routes = statistics
+            .padding_routes
+            .checked_add(exchange.statistics.padding_routes)
+            .ok_or_else(|| {
+                Error::Parallel("all-to-all-v padding row count overflowed usize".into())
+            })?;
+        statistics.useful_sent_bytes = statistics
+            .useful_sent_bytes
+            .checked_add(exchange.statistics.useful_sent_bytes)
+            .ok_or_else(|| {
+                Error::Parallel("all-to-all-v sent byte total overflowed usize".into())
+            })?;
+        statistics.useful_received_bytes = statistics
+            .useful_received_bytes
+            .checked_add(exchange.statistics.useful_received_bytes)
+            .ok_or_else(|| {
+                Error::Parallel("all-to-all-v received byte total overflowed usize".into())
+            })?;
+        statistics.padding_bytes = statistics
+            .padding_bytes
+            .checked_add(exchange.statistics.padding_bytes)
+            .ok_or_else(|| {
+                Error::Parallel("all-to-all-v padding byte total overflowed usize".into())
+            })?;
+        statistics.payload_allocation_upper_bound_bytes = statistics
+            .payload_allocation_upper_bound_bytes
+            .checked_add(exchange.statistics.payload_allocation_upper_bound_bytes)
+            .ok_or_else(|| {
+                Error::Parallel("all-to-all-v allocation bound overflowed usize".into())
+            })?;
+        if let Some(bytes) = exchange.statistics.temporary_high_water_bytes {
+            statistics.temporary_high_water_bytes = Some(
+                statistics
+                    .temporary_high_water_bytes
+                    .map_or(bytes, |current| current.max(bytes)),
+            );
+        }
+        statistics.payload_exchange_time += exchange.statistics.payload_exchange_time;
+        statistics.routed_transport = exchange.statistics.routed_transport;
     }
     statistics.total_time = total_started.elapsed();
     Ok(ShardedReturnedRoutes { output, statistics })
-}
-
-/// Exchanges destination-major variable-sized blocks using padded all-gather.
-///
-/// `send_blocks[d]` contains rows addressed to destination rank `d`; all
-/// blocks must have the same trailing shape and dtype.  The fallback gathers
-/// `group_size` destination blocks from every source, so peak transfer storage
-/// and bandwidth are `O(group_size)` larger than a native all-to-all.
-pub fn all_to_all_v(
-    send_blocks: &[Array],
-    group: &Group,
-    stream: &Stream,
-) -> Result<ExchangeResult, Error> {
-    let total_started = Instant::now();
-    let world = group.size();
-    if send_blocks.len() != world || send_blocks.is_empty() {
-        return Err(Error::Parallel(format!(
-            "all_to_all_v requires {world} destination blocks"
-        )));
-    }
-    if send_blocks.iter().any(|block| block.ndim() == 0) {
-        return Err(Error::Parallel(
-            "all_to_all_v blocks must have a leading row dimension".into(),
-        ));
-    }
-    let dtype = send_blocks[0].dtype();
-    let first_shape = send_blocks[0].shape();
-    let tail = &first_shape[1..];
-    if send_blocks
-        .iter()
-        .any(|block| block.dtype() != dtype || &block.shape()[1..] != tail)
-    {
-        return Err(Error::Parallel(
-            "all_to_all_v blocks must share dtype and trailing shape".into(),
-        ));
-    }
-    let local_counts = send_blocks
-        .iter()
-        .map(|block| block.dim(0))
-        .collect::<Vec<_>>();
-    // Materialize the tiny host count vector onto the explicit execution
-    // stream before entering the collective.
-    let counts = Array::from_slice(&local_counts, &[world as i32]).copy(stream)?;
-    let gathered_counts = distributed::all_gather(&counts, group, stream)?;
-    let started = std::time::Instant::now();
-    let evaluated_counts = gathered_counts.evaluated()?;
-    let synchronization_time = started.elapsed();
-    let all_counts = evaluated_counts.as_slice::<i32>();
-    let max_rows = all_counts.iter().copied().max().unwrap_or(0) as usize;
-    if max_rows == 0 {
-        let mut shape = send_blocks[0].shape().to_vec();
-        shape[0] = 0;
-        let exchange_time = total_started.elapsed();
-        return Ok(ExchangeResult {
-            received: zeros_dtype(&shape, dtype, stream)?,
-            source_counts: vec![0; world],
-            statistics: RoutingStatistics {
-                synchronization_count: 1,
-                synchronization_time,
-                exchange_time,
-                total_time: exchange_time,
-                ..Default::default()
-            },
-        });
-    }
-    let mut padded = Vec::with_capacity(world);
-    for block in send_blocks {
-        let rows = block.dim(0) as usize;
-        if rows == max_rows {
-            padded.push(block.clone());
-        } else {
-            let mut shape = block.shape().to_vec();
-            shape[0] = (max_rows - rows) as i32;
-            let padding = zeros_dtype(&shape, dtype, stream)?;
-            padded.push(concatenate_axis(&[block, &padding], 0, stream)?);
-        }
-    }
-    let refs = padded.iter().collect::<Vec<_>>();
-    let packed = concatenate_axis(&refs, 0, stream)?;
-    let gathered = distributed::all_gather(&packed, group, stream)?;
-    let mut received = Vec::with_capacity(world);
-    let mut source_counts = Vec::with_capacity(world);
-    for source in 0..world {
-        let count = all_counts[source * world + group.rank()] as usize;
-        source_counts.push(count);
-        let start = (source * world * max_rows + group.rank() * max_rows) as i32;
-        received.push(gathered.try_index_device(start..start + count as i32, stream)?);
-    }
-    let refs = received.iter().collect::<Vec<_>>();
-    let received = concatenate_axis(&refs, 0, stream)?;
-    materialize_timing_phase([&received])?;
-    let sent_routes = local_counts
-        .iter()
-        .map(|value| *value as usize)
-        .sum::<usize>();
-    let received_routes = source_counts.iter().sum::<usize>();
-    let padding_routes = world * world * max_rows
-        - all_counts
-            .iter()
-            .map(|value| *value as usize)
-            .sum::<usize>();
-    let row_bytes = tail
-        .iter()
-        .map(|dimension| *dimension as usize)
-        .product::<usize>()
-        * send_blocks[0].item_size();
-    let exchange_time = total_started.elapsed();
-    Ok(ExchangeResult {
-        received,
-        source_counts,
-        statistics: RoutingStatistics {
-            sent_routes,
-            received_routes,
-            padding_routes,
-            synchronization_count: 1,
-            synchronization_time,
-            exchange_time,
-            total_time: exchange_time,
-            exchanged_bytes: world * world * max_rows * row_bytes,
-            ..Default::default()
-        },
-    })
 }

@@ -11,14 +11,15 @@ use std::{
 use safemlx::{
     distributed::{self, Backend},
     module::Param,
+    ops::concatenate_axis,
     transforms::{async_eval_with_event, eval},
     Array, Device, DeviceType, Stream,
 };
 use safemlx_lm::{
     architectures::deepseek_v3::model::RoutedExperts,
     architectures::distributed::expert::{
-        all_to_all_v, dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,
-        DispatchedRoutes, ExpertAssignment, ShardedRouteBlocks,
+        dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
+        DispatchedRoutes, ExpertAssignment, RoutedTransport, ShardedRouteBlocks,
     },
     error::Error,
     nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
@@ -198,7 +199,14 @@ fn expert_exchange_ring_worker() {
         .map(|destination| arrays[&format!("r{expected_rank}d{destination}")].clone())
         .collect::<Vec<_>>();
     let _profiling = profile_expert_parallel_timings();
-    let exchanged = all_to_all_v(&blocks, &group, &stream).unwrap();
+    let send_counts = blocks
+        .iter()
+        .map(|block| block.dim(0) as usize)
+        .collect::<Vec<_>>();
+    let block_refs = blocks.iter().collect::<Vec<_>>();
+    let compact = concatenate_axis(&block_refs, 0, &stream).unwrap();
+    let plan = AllToAllVPlan::new(&send_counts, &group, &stream).unwrap();
+    let exchanged = plan.exchange(&compact, &group, &stream).unwrap();
     eval([&exchanged.received]).unwrap();
     let received = exchanged.received.evaluated().unwrap();
     if expected_rank == 0 {
@@ -208,14 +216,18 @@ fn expert_exchange_ring_worker() {
         assert_eq!(exchanged.source_counts, vec![2, 1]);
         assert_eq!(received.as_slice::<i32>(), &[11, 12, 21]);
     }
-    assert_eq!(exchanged.statistics.padding_routes, 4);
-    assert_eq!(exchanged.statistics.exchanged_bytes, 32);
-    assert_eq!(exchanged.statistics.synchronization_count, 1);
-    assert!(exchanged.statistics.exchange_time > Duration::ZERO);
+    assert_eq!(exchanged.statistics.padding_routes, 0);
+    assert_eq!(exchanged.statistics.padding_bytes, 0);
     assert_eq!(
-        exchanged.statistics.total_time,
-        exchanged.statistics.exchange_time
+        exchanged.statistics.useful_sent_bytes,
+        12 - expected_rank * 8
     );
+    assert_eq!(
+        exchanged.statistics.routed_transport,
+        RoutedTransport::Native
+    );
+    assert_eq!(plan.recv_counts(), exchanged.source_counts);
+    assert!(exchanged.statistics.payload_exchange_time > Duration::ZERO);
 
     let assignment = ExpertAssignment::balanced(4, 2, expected_rank).unwrap();
     let mut relu2 = relu2_bank(&stream);
@@ -235,7 +247,13 @@ fn expert_exchange_ring_worker() {
     assert_eq!(dispatched.statistics.total_routes, 4);
     assert_eq!(dispatched.statistics.sent_routes, 4);
     assert_eq!(dispatched.statistics.received_routes, 4);
-    assert_eq!(dispatched.statistics.synchronization_count, 6);
+    assert_eq!(dispatched.statistics.count_consensus_count, 1);
+    assert_eq!(dispatched.statistics.padding_routes, 0);
+    assert_eq!(dispatched.statistics.padding_bytes, 0);
+    assert_eq!(
+        dispatched.statistics.routed_transport,
+        RoutedTransport::Native
+    );
 
     let empty_hidden = f32_array(&[], &[0, 1], &stream);
     let empty_i32 = i32_array(&[], &[0], &stream);
@@ -273,7 +291,8 @@ fn expert_exchange_ring_worker() {
         empty_dispatched.statistics.received_routes,
         usize::from(expected_rank == 1)
     );
-    assert_eq!(empty_dispatched.statistics.synchronization_count, 6);
+    assert_eq!(empty_dispatched.statistics.count_consensus_count, 1);
+    assert_eq!(empty_dispatched.statistics.padding_routes, 0);
 
     let mut fp8 = fp8_bank(&stream);
     let fp8_dispatched = dispatch_sharded(
@@ -299,7 +318,8 @@ fn expert_exchange_ring_worker() {
     assert_eq!(fp8_dispatched.statistics.total_routes, 4);
     assert_eq!(fp8_dispatched.statistics.sent_routes, 4);
     assert_eq!(fp8_dispatched.statistics.received_routes, 4);
-    assert_eq!(fp8_dispatched.statistics.synchronization_count, 6);
+    assert_eq!(fp8_dispatched.statistics.count_consensus_count, 1);
+    assert_eq!(fp8_dispatched.statistics.padding_bytes, 0);
 
     let qwen_gate_up = [1.0f32, 1.0, 2.0, 1.0, 1.0, 2.0, 0.5, 3.0];
     let qwen_down = [1.0f32, 1.5, 2.0, 0.5];

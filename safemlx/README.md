@@ -107,6 +107,15 @@ let sum = distributed::all_sum(&input, &group, &stream)?;
 # Ok::<(), safemlx::error::Exception>(())
 ```
 
+`distributed::all_to_all_v` exchanges compact leading-axis row blocks without
+padding. Its input is destination-major, its output is source-major, and the
+caller supplies checked row counts for both layouts. Native MPI, Ring, JACCL,
+and NCCL groups use the patched MLX primitive lazily. Logical Cartesian
+subgroups which Ring or JACCL cannot split use the existing topology-planned
+neighbor routes and transfer only addressed payloads; their small routed count
+headers are materialized to size intermediate receives. Ring payloads may cross
+multiple physical hops, so endpoint bytes and hop bytes are not equivalent.
+
 Choose process-local devices with `distributed::device_for_local_rank`. A
 global distributed rank is not a local GPU index because ranks may span
 machines. In a one-process-per-visible-GPU launch, the local device index is

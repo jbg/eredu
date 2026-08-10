@@ -54,7 +54,7 @@ Benchmark timing barriers intentionally continue to drain their measured
 streams, because the whole-stream boundary is the quantity being timed.
 
 The deterministic MLX C++ tests for CPU error retention and poisoned consumer
-streams are built only through the opt-in `mlx-completion-patch-tests` CMake
+streams are built only through the opt-in `mlx-patch-tests` CMake
 target. The path-scoped `mlx-patch-tests.yml` workflow runs that target when the
 vendored patch or harness changes; ordinary MLX/Cargo builds keep
 `MLX_C_BUILD_PATCH_TESTS=OFF` and do not build upstream tests.

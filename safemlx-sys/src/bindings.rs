@@ -1498,6 +1498,18 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn mlx_distributed_all_to_all_v(
+        res: *mut mlx_array,
+        x: mlx_array,
+        send_counts: *const i64,
+        send_counts_num: usize,
+        recv_counts: *const i64,
+        recv_counts_num: usize,
+        group: mlx_distributed_group,
+        s: mlx_stream,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn mlx_distributed_all_max(
         res: *mut mlx_array,
         x: mlx_array,

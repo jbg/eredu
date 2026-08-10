@@ -66,6 +66,28 @@ pub use grad::*;
 pub use keyed_value_and_grad::*;
 pub use value_and_grad::*;
 
+/// Return `inputs` unchanged while making them depend on `dependencies`.
+///
+/// This sequences lazy side-effecting primitives while retaining every array
+/// handle in the resulting MLX graph. At least one input is required.
+pub fn depends<'a, 'b>(
+    inputs: impl IntoIterator<Item = &'a Array>,
+    dependencies: impl IntoIterator<Item = &'b Array>,
+) -> Result<Vec<Array>> {
+    let mut inputs = inputs.into_iter().peekable();
+    if inputs.peek().is_none() {
+        return Err(crate::error::Exception::custom(
+            "depends requires at least one input",
+        ));
+    }
+    let inputs = VectorArray::try_from_iter(inputs)?;
+    let dependencies = VectorArray::try_from_iter(dependencies.into_iter())?;
+    let _guard = runtime_lock::enter();
+    <Vec<Array> as Guarded>::try_from_op(|result| unsafe {
+        safemlx_sys::mlx_depends(result, inputs.as_ptr(), dependencies.as_ptr())
+    })
+}
+
 /// Evaluate an iterator of [`Array`]s.
 pub fn eval<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<()> {
     let vec = VectorArray::try_from_iter(outputs.into_iter())?;
