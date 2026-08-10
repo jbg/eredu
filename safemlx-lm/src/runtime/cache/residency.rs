@@ -7191,13 +7191,16 @@ mod tests {
         HostCacheBlock, HostCachePersistence, HostDemotionCompletion, HostDemotionTicket,
         HostWriteReservation, LayerCachePolicy, LayerSchedule, MutableStateResidency,
         PagedCacheOptions, PendingDiskOperation, PromptCacheBlock, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheStateTensor, PromptCacheTopology,
-        StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-        StateTensorRole, TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor,
+        PromptCacheTopology, StateTensorDimension, StateTensorDtype, StateTensorOwner,
+        StateTensorPolicy, StateTensorRole, TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
         MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_GENERATIONS_DIRECTORY,
         PROMPT_CACHE_SCHEMA_VERSION,
     };
-    use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Stream};
+    use safemlx::{
+        transforms::async_eval_with_event, Array, Device, DeviceType, HostTransferStorageKind,
+        Stream,
+    };
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
     use std::{
         fs,
@@ -8576,9 +8579,12 @@ mod tests {
     #[test]
     fn promoted_and_cancelled_writes_retain_host_reservations_until_release() {
         let directory = tempfile::tempdir().unwrap();
+        let pool = CacheResidencyPool::new(CachePoolLimits::new(16, 16, 16, 1024).unwrap());
         let options = PagedCacheOptions::new(1, 16, 16, 1)
             .unwrap()
             .with_live_disk(directory.path(), 1024, 1)
+            .unwrap()
+            .with_pool(pool.clone())
             .unwrap();
         let manager = CacheResidencyManager::new(options).unwrap();
         let worker = manager.inner.disk_worker.as_ref().unwrap();
@@ -8645,6 +8651,10 @@ mod tests {
         assert_eq!(report.current_host_bytes, 16);
         assert_eq!(report.in_flight_write_bytes, 16);
         assert_eq!(report.host_blocks, 1);
+        let aggregate = pool.report().unwrap();
+        assert_eq!(aggregate.current_host_bytes, 16);
+        assert_eq!(aggregate.current_transfer_in_flight_bytes, 16);
+        assert_eq!(aggregate.current_disk_bytes, 16);
 
         // A pending host write is encoded only by the Host variant. Promotion
         // waits for that write rather than creating an incoherent device block
@@ -8675,6 +8685,10 @@ mod tests {
         assert_eq!(report.host_blocks, 0);
         assert_eq!(report.current_host_bytes, 16);
         assert_eq!(report.in_flight_write_bytes, 16);
+        let aggregate = pool.report().unwrap();
+        assert_eq!(aggregate.current_host_bytes, 16);
+        assert_eq!(aggregate.current_transfer_in_flight_bytes, 16);
+        assert_eq!(aggregate.current_disk_bytes, 16);
         release_tx.send(()).unwrap();
         cleared_rx
             .recv_timeout(Duration::from_secs(1))
@@ -8684,6 +8698,10 @@ mod tests {
         let report = manager.report().unwrap();
         assert_eq!(report.current_host_bytes, 0);
         assert_eq!(report.in_flight_write_bytes, 0);
+        let aggregate = pool.report().unwrap();
+        assert_eq!(aggregate.current_host_bytes, 0);
+        assert_eq!(aggregate.current_transfer_in_flight_bytes, 0);
+        assert_eq!(aggregate.current_disk_bytes, 0);
     }
 
     #[test]
@@ -8936,6 +8954,180 @@ mod tests {
         arrays
             .arrays()
             .map(|array| array.evaluated().unwrap().as_slice::<f32>().as_ptr() as usize)
+    }
+
+    fn backend_key_value_block(stream: &Stream) -> CacheBlockArrays {
+        let keys = Array::ones::<f32>(&[1, 1, 1, 1], stream).unwrap();
+        let values = Array::ones::<f32>(&[1, 1, 1, 1], stream)
+            .unwrap()
+            .multiply(Array::from(2.0f32), stream)
+            .unwrap();
+        async_eval_with_event([&keys, &values])
+            .unwrap()
+            .synchronize()
+            .unwrap();
+        CacheBlockArrays::KeyValue { keys, values }
+    }
+
+    fn assert_backend_key_value_block(arrays: &CacheBlockArrays) {
+        let CacheBlockArrays::KeyValue { keys, values } = arrays else {
+            panic!("expected key/value cache arrays");
+        };
+        assert_eq!(
+            keys.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
+            &[1.0]
+        );
+        assert_eq!(
+            values.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
+            &[2.0]
+        );
+    }
+
+    fn exercise_backend_cache_lifecycle(device: Device, expected_storage: HostTransferStorageKind) {
+        let stream = Stream::new_with_device(&device);
+        let consumer = Stream::new_with_device(&device);
+        let pool = CacheResidencyPool::new(CachePoolLimits::new(16, 16, 16, 0).unwrap());
+        let options = || {
+            PagedCacheOptions::new(1, 16, 16, 1)
+                .unwrap()
+                .with_full_attention(true)
+                .with_pool(pool.clone())
+                .unwrap()
+        };
+        let manager = CacheResidencyManager::new(options()).unwrap();
+        manager.bind_transfer_device(&stream).unwrap();
+        let id = manager
+            .seal_block(0, 0, 1, None, backend_key_value_block(&stream), false)
+            .unwrap();
+        let competing = CacheResidencyManager::new(options()).unwrap();
+        competing.set_tail_state(0, 8, 1).unwrap();
+        let aggregate_error = competing.set_tail_state(0, 12, 1).unwrap_err();
+        assert!(matches!(
+            aggregate_error,
+            CacheResidencyError::PoolBudgetExceeded {
+                resource: CachePoolResource::Device,
+                required: 20,
+                budget: 16,
+            }
+        ));
+
+        let demotion = manager.begin_device_demotion(&id).unwrap();
+        let in_flight = pool.report().unwrap();
+        assert_eq!(in_flight.current_device_bytes, 16);
+        assert_eq!(in_flight.current_host_bytes, 8);
+        assert_eq!(in_flight.current_transfer_in_flight_bytes, 8);
+        manager.finish_device_demotion(&demotion).unwrap();
+        {
+            let state = manager.lock().unwrap();
+            let block = state.blocks.get(&id).unwrap().host_block().unwrap();
+            for buffer in block.buffers() {
+                assert_eq!(buffer.storage_kind().unwrap(), expected_storage);
+            }
+        }
+        let demoted = pool.report().unwrap();
+        assert_eq!(demoted.current_device_bytes, 8);
+        assert_eq!(demoted.current_host_bytes, 8);
+        assert_eq!(demoted.current_transfer_in_flight_bytes, 0);
+
+        let destination = tempfile::tempdir().unwrap();
+        let cache_path = destination.path().join("backend-cache");
+        manager
+            .save_prompt_cache(
+                &cache_path,
+                prompt_descriptor(),
+                &[7],
+                &[],
+                &PromptCacheOptions {
+                    application_namespace: Some("backend-verification".into()),
+                    replace_existing: false,
+                },
+            )
+            .unwrap();
+        let (restored, manifest) = open_prompt_cache(
+            &cache_path,
+            &prompt_descriptor(),
+            &prompt_model_identity(),
+            &[7],
+            options(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.application_namespace.as_deref(),
+            Some("backend-verification")
+        );
+        restored.bind_transfer_device(&stream).unwrap();
+        let restored_id = restored
+            .lock()
+            .unwrap()
+            .blocks
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let transfer = restored
+            .prepare_block_transfer(&restored_id, &stream)
+            .unwrap();
+        transfer.wait_on(&consumer).unwrap();
+        let consumed = transfer.arrays().arrays()[0].square(&consumer).unwrap();
+        async_eval_with_event([&consumed])
+            .unwrap()
+            .synchronize()
+            .unwrap();
+        assert_backend_key_value_block(transfer.arrays());
+        drop(transfer);
+
+        let restored_report = restored.report().unwrap();
+        assert_eq!(restored_report.prompt_cache_loads, 1);
+        assert_eq!(restored_report.disk_promotions, 1);
+        assert!(restored_report.transfer_bytes >= 8);
+        let aggregate = pool.report().unwrap();
+        assert_eq!(aggregate.managers, 3);
+        assert!(aggregate.current_device_bytes <= aggregate.limits.device_bytes());
+        assert!(aggregate.current_host_bytes <= aggregate.limits.host_bytes());
+        assert!(
+            aggregate.current_transfer_in_flight_bytes
+                <= aggregate.limits.transfer_in_flight_bytes()
+        );
+
+        manager.clear().unwrap();
+        competing.clear().unwrap();
+        restored.clear().unwrap();
+        let cleared = pool.report().unwrap();
+        assert_eq!(cleared.current_device_bytes, 0);
+        assert_eq!(cleared.current_host_bytes, 0);
+        assert_eq!(cleared.current_transfer_in_flight_bytes, 0);
+        drop((manager, competing, restored));
+        assert_eq!(pool.report().unwrap().managers, 0);
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+    #[test]
+    fn cpu_cache_backend_preserves_ordering_persistence_and_aggregate_budgets() {
+        exercise_backend_cache_lifecycle(
+            Device::new(DeviceType::Cpu, 0),
+            HostTransferStorageKind::Cpu,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit Metal cache-residency test; run outside the sandbox"]
+    fn metal_cache_backend_preserves_ordering_persistence_and_aggregate_budgets() {
+        exercise_backend_cache_lifecycle(
+            Device::new(DeviceType::Gpu, 0),
+            HostTransferStorageKind::MetalShared,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "explicit CUDA cache-residency test; requires a CUDA-capable host"]
+    fn cuda_cache_backend_preserves_ordering_persistence_and_aggregate_budgets() {
+        assert!(safemlx::cuda::is_available().unwrap());
+        exercise_backend_cache_lifecycle(
+            Device::new(DeviceType::Gpu, 0),
+            HostTransferStorageKind::CudaPinned,
+        );
     }
 
     #[test]

@@ -124,6 +124,23 @@ let (restored, host) = host.copy_to_array(&stream)?.synchronize()?;
 # Ok::<(), safemlx::error::Exception>(())
 ```
 
+Backend verification lives in `tests/host_transfer.rs`. CPU-only tests assert
+exact `Cpu` storage, numerical round-trip parity, and allocator high-water
+bounds. Explicit Metal tests assert `MetalShared` storage, Metal completion
+events, cross-stream ordering, and that device-to-host or host-to-device copies
+do not add another payload-sized MLX staging allocation. CUDA-gated tests make
+the corresponding assertions for `CudaPinned` storage and separately verify
+that the managed policy reports `CudaManaged`; pinned host bytes are outside
+the MLX device allocator counter, so any payload-sized device-counter increase
+during device-to-host copying is treated as hidden staging.
+
+```sh
+cargo test -p safemlx --no-default-features --test host_transfer
+cargo test -p safemlx --test host_transfer metal_ -- --ignored
+cargo test -p safemlx --features cuda --no-default-features \
+  --test host_transfer cuda_ -- --ignored
+```
+
 The language-model paged live-cache manager uses frozen buffers for host-tier
 key/value and compressed-MLA blocks. Weight residency and independent expert
 caching have not yet adopted this storage class.

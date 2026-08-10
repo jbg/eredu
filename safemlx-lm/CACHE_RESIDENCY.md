@@ -245,6 +245,24 @@ cancellation drop the state and release its pool contribution, while
 `release_request_cache` hands an idle decoder cache back to the caller and keeps
 it charged until that caller persists or drops it.
 
+Backend lifecycle tests exercise the same residency manager on CPU, Metal, and
+CUDA builds. They cover numerical parity after demotion and promotion,
+completion-ordered consumption on a second stream, schema-v5 persistence and
+reload, competing-request pool admission, cancellation ownership, and release
+of device, host, transfer-in-flight, and disk reservations. Metal tests are
+explicitly ignored by the ordinary suite and must run outside constrained
+sandboxes. CUDA variants are feature-gated and require a CUDA-capable Linux or
+Windows host.
+
+```sh
+cargo test -p safemlx-lm --lib \
+  metal_cache_backend_preserves_ordering_persistence_and_aggregate_budgets \
+  -- --ignored
+cargo test -p safemlx-lm --features cuda --no-default-features --lib \
+  cuda_cache_backend_preserves_ordering_persistence_and_aggregate_budgets \
+  -- --ignored
+```
+
 `AttentionPolicy::Sliding { window: N }` includes the current token in the `N`
 positions. Ordinary live state therefore needs at most `N - 1` past positions
 between calls. Paged backing is block-granular and may retain an older block
