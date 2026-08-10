@@ -471,6 +471,9 @@ impl PagedCompressedLatentCache {
     }
 
     fn append(&mut self, latent: Array, rotary: Array, stream: &Stream) -> Result<(), Exception> {
+        self.manager
+            .bind_transfer_device(stream)
+            .map_err(cache_residency_exception)?;
         if latent.ndim() != 3
             || rotary.ndim() != 3
             || latent.dim(0) != rotary.dim(0)
@@ -1380,6 +1383,9 @@ impl PagedKeyValueCache {
     }
 
     fn append(&mut self, keys: Array, values: Array, stream: &Stream) -> Result<(), Exception> {
+        self.manager
+            .bind_transfer_device(stream)
+            .map_err(cache_residency_exception)?;
         Self::validate_update(&keys, &values)?;
         if let Some(tail) = &self.tail_keys {
             if tail.dim(0) != keys.dim(0)

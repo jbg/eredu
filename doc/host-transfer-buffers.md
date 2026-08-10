@@ -58,6 +58,11 @@ blocks as immutable typed host-transfer buffers. Its physical block state is a
 sum type: a block is device arrays, host buffers, or disk backing, with only the
 pending operation valid for that state. Disk reads and writes serialize the
 typed host bytes directly, and promotion creates device arrays only on demand.
+Device demotion is a fourth, explicitly transitional variant: a dedicated
+worker creates a task-local stream on the cache's bound execution device and
+retains the device arrays and pending typed destinations through both completion
+events. Residency accounting charges those bytes to device and host budgets
+simultaneously until immutable host ownership is published.
 
 Immutable weight residency and independent expert caching still represent
 their host-planned parameters as MLX arrays. Moving those stores to typed

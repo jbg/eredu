@@ -1148,7 +1148,9 @@ The remaining global limitations are:
   layer computation. Background disk-to-host warming remains bounded and may
   still stall demand. Paged-cache attention now uses a dedicated transfer
   stream and a fixed current-plus-next block window; same-device promotions are
-  event-ordered while CPU-owned demotions wait only for their exact completion.
+  event-ordered, while a dedicated host-demotion worker retains and charges
+  both source and destination allocations until its exact events complete.
+  Callers wait only when a finite budget requires the source to be released.
   Expert prediction/prefetch and broader activation double buffering remain
   future work. MTP same-device handoffs are event-ordered independently.
 - Load-time affine/MXFP4 conversion applies to semantically eligible grouped

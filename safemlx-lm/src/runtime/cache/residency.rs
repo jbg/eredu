@@ -43,6 +43,7 @@ pub(crate) const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_LIVE_SHARD_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_WRITE_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_HOST_DEMOTION_ID: AtomicU64 = AtomicU64::new(1);
 static LIVE_PROCESS_NAMESPACE: OnceLock<String> = OnceLock::new();
 
 /// Selects the existing device-resident cache or bounded paged residency.
@@ -491,11 +492,185 @@ impl HostCacheBlock {
     }
 }
 
+#[derive(Debug, Default)]
+struct HostDemotionCompletion {
+    result: Mutex<Option<Result<HostCacheBlock, String>>>,
+    ready: Condvar,
+}
+
+impl HostDemotionCompletion {
+    fn finish(&self, result: Result<HostCacheBlock, CacheResidencyError>) {
+        if let Ok(mut slot) = self.result.lock() {
+            if slot.is_none() {
+                *slot = Some(result.map_err(|error| error.to_string()));
+                self.ready.notify_all();
+            }
+        }
+    }
+
+    fn wait(&self) -> Result<HostCacheBlock, CacheResidencyError> {
+        let mut slot = self
+            .result
+            .lock()
+            .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
+        while slot.is_none() {
+            slot = self
+                .ready
+                .wait(slot)
+                .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
+        }
+        match slot.as_ref().expect("host demotion completion is ready") {
+            Ok(block) => Ok(block.clone()),
+            Err(error) => Err(CacheResidencyError::Runtime(error.clone())),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HostDemotionTicket {
+    operation_id: u64,
+    id: CacheBlockId,
+    completion: Arc<HostDemotionCompletion>,
+}
+
+impl HostDemotionTicket {
+    fn wait(&self) -> Result<HostCacheBlock, CacheResidencyError> {
+        self.completion.wait()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CacheTransferDevice {
+    device_type: DeviceType,
+    index: i32,
+}
+
+impl CacheTransferDevice {
+    const CPU: Self = Self {
+        device_type: DeviceType::Cpu,
+        index: 0,
+    };
+
+    fn from_stream(stream: &Stream) -> Result<Self, CacheResidencyError> {
+        let device = stream
+            .get_device()
+            .map_err(|source| transfer_error("inspect cache transfer device", source))?;
+        Ok(Self {
+            device_type: device
+                .get_type()
+                .map_err(|source| transfer_error("inspect cache transfer device type", source))?,
+            index: device
+                .get_index()
+                .map_err(|source| transfer_error("inspect cache transfer device index", source))?,
+        })
+    }
+}
+
+enum HostDemotionRequest {
+    Demote {
+        arrays: CacheBlockArrays,
+        device: CacheTransferDevice,
+        completion: Arc<HostDemotionCompletion>,
+    },
+    Stop,
+}
+
+struct HostDemotionWorker {
+    sender: mpsc::Sender<HostDemotionRequest>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for HostDemotionWorker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HostDemotionWorker").finish()
+    }
+}
+
+impl HostDemotionWorker {
+    fn new() -> Result<Self, CacheResidencyError> {
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name("safemlx-cache-host-demotion".into())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    match request {
+                        HostDemotionRequest::Demote {
+                            arrays,
+                            device,
+                            completion,
+                        } => {
+                            let result = catch_unwind(AssertUnwindSafe(|| {
+                                let device = Device::new(device.device_type, device.index);
+                                let stream = Stream::new_with_device(&device);
+                                HostCacheBlock::from_device_arrays(&arrays, &stream)
+                            }))
+                            .unwrap_or_else(|_| {
+                                Err(CacheResidencyError::Runtime(
+                                    "cache host demotion worker operation panicked".into(),
+                                ))
+                            });
+                            completion.finish(result);
+                        }
+                        HostDemotionRequest::Stop => break,
+                    }
+                }
+            })
+            .map_err(|source| CacheResidencyError::Io {
+                action: "start cache host demotion worker",
+                path: PathBuf::from("safemlx-cache-host-demotion"),
+                source,
+            })?;
+        Ok(Self {
+            sender,
+            handle: Mutex::new(Some(handle)),
+        })
+    }
+
+    fn submit(
+        &self,
+        id: &CacheBlockId,
+        arrays: CacheBlockArrays,
+        device: CacheTransferDevice,
+    ) -> Result<HostDemotionTicket, CacheResidencyError> {
+        let completion = Arc::new(HostDemotionCompletion::default());
+        let ticket = HostDemotionTicket {
+            operation_id: NEXT_HOST_DEMOTION_ID.fetch_add(1, Ordering::Relaxed),
+            id: id.clone(),
+            completion: Arc::clone(&completion),
+        };
+        self.sender
+            .send(HostDemotionRequest::Demote {
+                arrays,
+                device,
+                completion,
+            })
+            .map_err(|_| {
+                CacheResidencyError::Runtime("cache host demotion worker stopped".into())
+            })?;
+        Ok(ticket)
+    }
+}
+
+impl Drop for HostDemotionWorker {
+    fn drop(&mut self) {
+        let _ = self.sender.send(HostDemotionRequest::Stop);
+        if let Ok(handle) = self.handle.get_mut() {
+            if let Some(handle) = handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CacheBlockPhysicalState {
     Device {
         arrays: CacheBlockArrays,
         disk: Option<DiskLocation>,
+    },
+    Demoting {
+        arrays: CacheBlockArrays,
+        ticket: HostDemotionTicket,
     },
     Host {
         block: HostCacheBlock,
@@ -529,7 +704,7 @@ enum DiskCacheReadState {
 impl CacheBlockPhysicalState {
     fn tier(&self) -> CacheTier {
         match self {
-            Self::Device { .. } => CacheTier::Device,
+            Self::Device { .. } | Self::Demoting { .. } => CacheTier::Device,
             Self::Host { .. } => CacheTier::Host,
             Self::Disk { .. } => CacheTier::Disk,
         }
@@ -538,6 +713,7 @@ impl CacheBlockPhysicalState {
     fn disk(&self) -> Option<&DiskLocation> {
         match self {
             Self::Device { disk, .. } => disk.as_ref(),
+            Self::Demoting { .. } => None,
             Self::Host {
                 persistence: HostCachePersistence::Backed(location),
                 ..
@@ -561,6 +737,7 @@ impl CacheBlockPhysicalState {
                 ..
             } => Some(pending),
             Self::Device { .. }
+            | Self::Demoting { .. }
             | Self::Host { .. }
             | Self::Disk {
                 read: DiskCacheReadState::Ready,
@@ -594,7 +771,8 @@ impl CacheBlockPhysicalState {
                     read: DiskCacheReadState::Ready,
                 };
             }
-            Self::Device { .. } | Self::Host { .. } | Self::Disk { .. } => {}
+            Self::Device { .. } | Self::Demoting { .. } | Self::Host { .. } | Self::Disk { .. } => {
+            }
         }
     }
 }
@@ -678,6 +856,12 @@ struct HostWriteReservation {
     global_layer: usize,
     bytes: u64,
     ticket: DiskTicket,
+}
+
+#[derive(Debug, Clone)]
+struct RetiringHostDemotion {
+    id: CacheBlockId,
+    bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1310,9 +1494,11 @@ impl CacheBlockRecord {
         self.physical.pending()
     }
 
+    #[cfg(test)]
     fn device_arrays(&self) -> Option<&CacheBlockArrays> {
         match &self.physical {
-            CacheBlockPhysicalState::Device { arrays, .. } => Some(arrays),
+            CacheBlockPhysicalState::Device { arrays, .. }
+            | CacheBlockPhysicalState::Demoting { arrays, .. } => Some(arrays),
             CacheBlockPhysicalState::Host { .. } | CacheBlockPhysicalState::Disk { .. } => None,
         }
     }
@@ -1320,7 +1506,18 @@ impl CacheBlockRecord {
     fn host_block(&self) -> Option<&HostCacheBlock> {
         match &self.physical {
             CacheBlockPhysicalState::Host { block, .. } => Some(block),
-            CacheBlockPhysicalState::Device { .. } | CacheBlockPhysicalState::Disk { .. } => None,
+            CacheBlockPhysicalState::Device { .. }
+            | CacheBlockPhysicalState::Demoting { .. }
+            | CacheBlockPhysicalState::Disk { .. } => None,
+        }
+    }
+
+    fn host_demotion_ticket(&self) -> Option<&HostDemotionTicket> {
+        match &self.physical {
+            CacheBlockPhysicalState::Demoting { ticket, .. } => Some(ticket),
+            CacheBlockPhysicalState::Device { .. }
+            | CacheBlockPhysicalState::Host { .. }
+            | CacheBlockPhysicalState::Disk { .. } => None,
         }
     }
 }
@@ -1361,6 +1558,10 @@ pub struct CacheLayerResidencyStats {
     pub in_flight_write_blocks: u64,
     /// Logical bytes owned by background disk writes.
     pub in_flight_write_bytes: u64,
+    /// Blocks retaining both device and host allocations during demotion.
+    pub in_flight_host_demotion_blocks: u64,
+    /// Logical bytes charged to both device and host during demotion.
+    pub in_flight_host_demotion_bytes: u64,
     /// Recent device blocks protected from demotion.
     pub protected_recent_blocks: u64,
     /// Prefix or sink blocks protected for attention.
@@ -1411,6 +1612,8 @@ impl CacheLayerResidencyStats {
         self.mutable_tail_bytes += other.mutable_tail_bytes;
         self.in_flight_write_blocks += other.in_flight_write_blocks;
         self.in_flight_write_bytes += other.in_flight_write_bytes;
+        self.in_flight_host_demotion_blocks += other.in_flight_host_demotion_blocks;
+        self.in_flight_host_demotion_bytes += other.in_flight_host_demotion_bytes;
         self.protected_recent_blocks += other.protected_recent_blocks;
         self.protected_prefix_blocks += other.protected_prefix_blocks;
         self.host_promotions += other.host_promotions;
@@ -1502,6 +1705,12 @@ pub struct CacheResidencyReport {
     pub in_flight_write_bytes: u64,
     /// Peak logical bytes owned by background disk writes.
     pub peak_in_flight_write_bytes: u64,
+    /// Blocks retaining both device and host allocations during demotion.
+    pub in_flight_host_demotion_blocks: u64,
+    /// Logical bytes charged to both device and host during demotion.
+    pub in_flight_host_demotion_bytes: u64,
+    /// Peak logical bytes simultaneously charged to both tiers by demotion.
+    pub peak_in_flight_host_demotion_bytes: u64,
     /// Current bytes in mutable tails.
     pub mutable_tail_bytes: u64,
     /// Recent blocks protected from device demotion.
@@ -1591,6 +1800,8 @@ struct CacheManagerState {
     blocks: BTreeMap<CacheBlockId, CacheBlockRecord>,
     tails: HashMap<usize, (u64, i64)>,
     host_write_reservations: HashMap<DiskOperationKey, HostWriteReservation>,
+    retiring_host_demotions: HashMap<u64, RetiringHostDemotion>,
+    transfer_device: Option<CacheTransferDevice>,
     layer_activity: BTreeMap<usize, CacheLayerActivityCounters>,
     layer_activity_overflow: CacheLayerActivityCounters,
     counters: CacheCounters,
@@ -1598,12 +1809,7 @@ struct CacheManagerState {
     device_budget_bytes: u64,
     host_budget_bytes: u64,
     disk_budget_bytes: Option<u64>,
-    host_stream: Stream,
 }
-
-// SAFETY: all access to the CPU stream and cache arrays is serialized by the
-// manager mutex. MLX operations additionally use safemlx's runtime guard.
-unsafe impl Send for CacheManagerState {}
 
 impl CacheManagerState {
     fn layer_activity_mut(&mut self, global_layer: usize) -> &mut CacheLayerResidencyStats {
@@ -1623,6 +1829,7 @@ pub struct CacheResidencyManager {
     session_id: u64,
     options: PagedCacheOptions,
     state: Arc<Mutex<CacheManagerState>>,
+    host_demotion_worker: Arc<HostDemotionWorker>,
     disk_worker: Option<Arc<DiskWorker>>,
 }
 
@@ -1630,6 +1837,11 @@ enum HostDemotionProgress {
     Retry,
     Freed,
     Pending(DiskTicket),
+}
+
+enum PendingCacheOperation {
+    Disk(DiskTicket),
+    HostDemotion(HostDemotionTicket),
 }
 
 impl CacheResidencyManager {
@@ -1650,6 +1862,7 @@ impl CacheResidencyManager {
         let mut counters = CacheCounters::default();
         counters.report.queue_capacity = effective_queue_capacity;
         let disk_worker = Some(Arc::new(DiskWorker::new(effective_queue_capacity)?));
+        let host_demotion_worker = Arc::new(HostDemotionWorker::new()?);
         let recent_device_blocks = options.recent_device_blocks;
         let device_budget_bytes = options.device_budget_bytes;
         let host_budget_bytes = options.host_budget_bytes;
@@ -1667,6 +1880,8 @@ impl CacheResidencyManager {
                 blocks: BTreeMap::new(),
                 tails: HashMap::new(),
                 host_write_reservations: HashMap::new(),
+                retiring_host_demotions: HashMap::new(),
+                transfer_device: None,
                 layer_activity: BTreeMap::new(),
                 layer_activity_overflow: CacheLayerActivityCounters::default(),
                 counters,
@@ -1674,8 +1889,8 @@ impl CacheResidencyManager {
                 device_budget_bytes,
                 host_budget_bytes,
                 disk_budget_bytes,
-                host_stream: cpu_stream(),
             })),
+            host_demotion_worker,
             disk_worker,
         })
     }
@@ -1694,6 +1909,22 @@ impl CacheResidencyManager {
         self.state
             .lock()
             .map_err(|_| CacheResidencyError::ManagerPoisoned)
+    }
+
+    pub(crate) fn bind_transfer_device(&self, stream: &Stream) -> Result<(), CacheResidencyError> {
+        let device = CacheTransferDevice::from_stream(stream)?;
+        let mut state = self.lock()?;
+        match state.transfer_device {
+            Some(bound) if bound != device => Err(CacheResidencyError::Runtime(format!(
+                "paged cache is bound to {:?} device {} but received {:?} device {}",
+                bound.device_type, bound.index, device.device_type, device.index
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                state.transfer_device = Some(device);
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn set_tail_state(
@@ -1993,6 +2224,7 @@ impl CacheResidencyManager {
         id: &CacheBlockId,
         transfer_stream: &Stream,
     ) -> Result<CacheBlockLease, CacheResidencyError> {
+        self.bind_transfer_device(transfer_stream)?;
         let started = Instant::now();
         let mut loaded_from_disk = false;
         loop {
@@ -2006,6 +2238,10 @@ impl CacheResidencyManager {
                 .clone();
 
             match physical {
+                CacheBlockPhysicalState::Demoting { ticket, .. } => {
+                    drop(state);
+                    self.finish_device_demotion(&ticket)?;
+                }
                 CacheBlockPhysicalState::Disk { location, read } => {
                     let worker = self.disk_worker.as_ref().ok_or_else(|| {
                         CacheResidencyError::Runtime("cache disk worker is unavailable".into())
@@ -2324,14 +2560,37 @@ impl CacheResidencyManager {
         Ok(state.counters.report.clone())
     }
 
-    fn retire_tickets(&self, tickets: &[DiskTicket]) -> Result<(), CacheResidencyError> {
-        if let Some(worker) = &self.disk_worker {
-            for ticket in tickets {
-                ticket.wait_for_task_resources()?;
-                worker.retire(ticket);
+    fn retire_tickets(&self, tickets: &[PendingCacheOperation]) -> Result<(), CacheResidencyError> {
+        let mut first_error = None;
+        for ticket in tickets {
+            match ticket {
+                PendingCacheOperation::Disk(ticket) => match ticket.wait_for_task_resources() {
+                    Ok(()) => {
+                        if let Some(worker) = &self.disk_worker {
+                            worker.retire(ticket);
+                        }
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                },
+                PendingCacheOperation::HostDemotion(ticket) => {
+                    let result = self.finish_device_demotion(ticket);
+                    let mut state = self.lock()?;
+                    state.retiring_host_demotions.remove(&ticket.operation_id);
+                    update_report_totals(&mut state);
+                    drop(state);
+                    if let Err(error) = result {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
             }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn record_attention_scan(
@@ -2553,6 +2812,116 @@ impl CacheResidencyManager {
         }
     }
 
+    fn begin_device_demotion(
+        &self,
+        id: &CacheBlockId,
+    ) -> Result<HostDemotionTicket, CacheResidencyError> {
+        let mut state = self.lock()?;
+        let record = state
+            .blocks
+            .get(id)
+            .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+        if record.leases != 0 {
+            return Err(CacheResidencyError::BlockLeased(id.clone()));
+        }
+        let arrays = match &record.physical {
+            CacheBlockPhysicalState::Device { arrays, disk: None } => arrays.clone(),
+            CacheBlockPhysicalState::Device { disk: Some(_), .. }
+            | CacheBlockPhysicalState::Demoting { .. }
+            | CacheBlockPhysicalState::Host { .. }
+            | CacheBlockPhysicalState::Disk { .. } => {
+                return Err(CacheResidencyError::MissingResidentArrays(id.clone()));
+            }
+        };
+        let required_host_bytes = state
+            .counters
+            .report
+            .current_host_bytes
+            .saturating_add(record.bytes);
+        if required_host_bytes > self.options.host_budget_bytes {
+            return Err(CacheResidencyError::BudgetExceeded {
+                tier: CacheTier::Host,
+                required: required_host_bytes,
+                budget: self.options.host_budget_bytes,
+            });
+        }
+        let device = state.transfer_device.unwrap_or(CacheTransferDevice::CPU);
+        let ticket = self
+            .host_demotion_worker
+            .submit(id, arrays.clone(), device)?;
+        let record = state.blocks.get_mut(id).expect("demotion block exists");
+        record.physical = CacheBlockPhysicalState::Demoting {
+            arrays,
+            ticket: ticket.clone(),
+        };
+        update_report_totals(&mut state);
+        Ok(ticket)
+    }
+
+    fn finish_device_demotion(
+        &self,
+        ticket: &HostDemotionTicket,
+    ) -> Result<(), CacheResidencyError> {
+        let started = Instant::now();
+        let result = ticket.wait();
+        let elapsed = started.elapsed();
+        let mut state = self.lock()?;
+        let matches = state
+            .blocks
+            .get(&ticket.id)
+            .and_then(CacheBlockRecord::host_demotion_ticket)
+            .is_some_and(|pending| pending.operation_id == ticket.operation_id);
+        if !matches {
+            return Ok(());
+        }
+        state.counters.report.in_flight_waits += 1;
+        state.counters.report.transfer_wait += elapsed;
+        let activity = state.layer_activity_mut(ticket.id.global_layer);
+        activity.in_flight_waits += 1;
+        activity.transfer_wait += elapsed;
+        match result {
+            Ok(block) => {
+                let bytes = state
+                    .blocks
+                    .get(&ticket.id)
+                    .expect("demotion block exists")
+                    .bytes;
+                let record = state
+                    .blocks
+                    .get_mut(&ticket.id)
+                    .expect("demotion block exists");
+                record.physical = CacheBlockPhysicalState::Host {
+                    block,
+                    persistence: HostCachePersistence::Unbacked,
+                };
+                state.counters.report.host_demotions += 1;
+                state.counters.report.transfer_bytes += bytes;
+                let activity = state.layer_activity_mut(ticket.id.global_layer);
+                activity.host_demotions += 1;
+                activity.transfer_bytes += bytes;
+                update_report_totals(&mut state);
+                Ok(())
+            }
+            Err(error) => {
+                let record = state
+                    .blocks
+                    .get_mut(&ticket.id)
+                    .expect("demotion block exists");
+                let CacheBlockPhysicalState::Demoting { arrays, .. } = &record.physical else {
+                    unreachable!("matching host demotion changed while cache state was locked");
+                };
+                record.physical = CacheBlockPhysicalState::Device {
+                    arrays: arrays.clone(),
+                    disk: None,
+                };
+                state.counters.report.failures += 1;
+                state.layer_activity_mut(ticket.id.global_layer).failures += 1;
+                update_report_totals(&mut state);
+                Err(error)
+            }
+        }
+    }
+
     fn rebalance(
         &self,
         required: Option<&CacheBlockId>,
@@ -2567,6 +2936,16 @@ impl CacheResidencyManager {
             }
             update_report_totals(&mut state);
             if state.counters.report.current_device_bytes > self.options.device_budget_bytes {
+                if let Some(ticket) = state
+                    .blocks
+                    .values()
+                    .find_map(CacheBlockRecord::host_demotion_ticket)
+                    .cloned()
+                {
+                    drop(state);
+                    self.finish_device_demotion(&ticket)?;
+                    continue;
+                }
                 let candidate = eviction_candidate(
                     &state,
                     CacheTier::Device,
@@ -2686,25 +3065,8 @@ impl CacheResidencyManager {
                         }
                     });
                 }
-                let device_arrays = state
-                    .blocks
-                    .get(&id)
-                    .and_then(CacheBlockRecord::device_arrays)
-                    .cloned()
-                    .ok_or_else(|| CacheResidencyError::MissingResidentArrays(id.clone()))?;
-                let host_block =
-                    HostCacheBlock::from_device_arrays(&device_arrays, &state.host_stream)?;
-                let record = state.blocks.get_mut(&id).expect("candidate exists");
-                record.physical = CacheBlockPhysicalState::Host {
-                    block: host_block,
-                    persistence: HostCachePersistence::Unbacked,
-                };
-                let bytes = record.bytes;
-                state.counters.report.host_demotions += 1;
-                state.counters.report.transfer_bytes += bytes;
-                let activity = state.layer_activity_mut(id.global_layer);
-                activity.host_demotions += 1;
-                activity.transfer_bytes += bytes;
+                drop(state);
+                self.begin_device_demotion(&id)?;
                 continue;
             }
 
@@ -2762,7 +3124,7 @@ impl CacheResidencyManager {
 
             // Start one background write as soon as the finite host tier fills.
             // It remains charged to host memory until the worker commits and
-            // releases its arrays; a later demotion waits only if it needs space.
+            // releases its buffers; a later demotion waits only if it needs space.
             let proactive = matches!(&self.options.live_disk, LiveCacheDiskPolicy::Enabled { .. })
                 && state.counters.report.current_host_bytes != 0
                 && state.counters.report.current_host_bytes >= self.options.host_budget_bytes;
@@ -2878,7 +3240,8 @@ impl CacheResidencyManager {
                 let shard = format!("block-{index:08}.safetensors");
                 let shard_path = temporary.join(&shard);
                 match &record.physical {
-                    CacheBlockPhysicalState::Device { arrays, .. } => {
+                    CacheBlockPhysicalState::Device { arrays, .. }
+                    | CacheBlockPhysicalState::Demoting { arrays, .. } => {
                         save_block_arrays(&shard_path, arrays)?;
                     }
                     CacheBlockPhysicalState::Host { block, .. } => {
@@ -4960,21 +5323,33 @@ fn cancel_record_operation(record: &CacheBlockRecord, report: &mut CacheResidenc
     }
 }
 
-fn advance_generation_locked(state: &mut CacheManagerState) -> Vec<DiskTicket> {
+fn advance_generation_locked(state: &mut CacheManagerState) -> Vec<PendingCacheOperation> {
     state.generation = state.generation.wrapping_add(1);
     state.background_disk_error = None;
     let mut tickets = Vec::new();
+    let mut demotion_reservations = Vec::new();
     for record in state.blocks.values_mut() {
+        if let Some(ticket) = record.host_demotion_ticket().cloned() {
+            demotion_reservations.push((
+                ticket.operation_id,
+                RetiringHostDemotion {
+                    id: record.id.clone(),
+                    bytes: record.bytes,
+                },
+            ));
+            tickets.push(PendingCacheOperation::HostDemotion(ticket));
+        }
         if let Some(pending) = record.pending_disk().cloned() {
             if pending.ticket.cancel() {
                 state.counters.report.cancellations += 1;
             }
-            tickets.push(pending.ticket.clone());
+            tickets.push(PendingCacheOperation::Disk(pending.ticket.clone()));
             if pending.ticket.key.kind != DiskOperationKind::Write {
                 record.physical.clear_pending(&pending.ticket.key);
             }
         }
     }
+    state.retiring_host_demotions.extend(demotion_reservations);
     tickets
 }
 
@@ -4994,6 +5369,8 @@ fn update_report_totals(state: &mut CacheManagerState) {
     report.current_disk_bytes = 0;
     report.in_flight_write_blocks = 0;
     report.in_flight_write_bytes = 0;
+    report.in_flight_host_demotion_blocks = 0;
+    report.in_flight_host_demotion_bytes = 0;
     report.protected_prefix_blocks = 0;
     report.protected_recent_blocks = 0;
     report.logical_cached_tokens = 0;
@@ -5039,20 +5416,34 @@ fn update_report_totals(state: &mut CacheManagerState) {
                 layer_report.current_host_bytes += record.bytes;
             }
         }
-        match record.tier() {
-            CacheTier::Device => {
+        match &record.physical {
+            CacheBlockPhysicalState::Device { .. } => {
                 report.device_blocks += 1;
                 report.current_device_bytes += record.bytes;
                 layer_report.device_blocks += 1;
                 layer_report.current_device_bytes += record.bytes;
             }
-            CacheTier::Host => {
+            CacheBlockPhysicalState::Demoting { .. } => {
+                report.device_blocks += 1;
+                report.host_blocks += 1;
+                report.current_device_bytes += record.bytes;
+                report.current_host_bytes += record.bytes;
+                report.in_flight_host_demotion_blocks += 1;
+                report.in_flight_host_demotion_bytes += record.bytes;
+                layer_report.device_blocks += 1;
+                layer_report.host_blocks += 1;
+                layer_report.current_device_bytes += record.bytes;
+                layer_report.current_host_bytes += record.bytes;
+                layer_report.in_flight_host_demotion_blocks += 1;
+                layer_report.in_flight_host_demotion_bytes += record.bytes;
+            }
+            CacheBlockPhysicalState::Host { .. } => {
                 report.host_blocks += 1;
                 report.current_host_bytes += record.bytes;
                 layer_report.host_blocks += 1;
                 layer_report.current_host_bytes += record.bytes;
             }
-            CacheTier::Disk => {
+            CacheBlockPhysicalState::Disk { .. } => {
                 report.disk_blocks += 1;
                 report.current_disk_bytes += record.bytes;
                 layer_report.disk_blocks += 1;
@@ -5070,6 +5461,29 @@ fn update_report_totals(state: &mut CacheManagerState) {
             .entry(record.id.global_layer)
             .and_modify(|end| *end = (*end).max(record.id.end))
             .or_insert(record.id.end);
+    }
+    for (operation_id, reservation) in &state.retiring_host_demotions {
+        let covered_by_demoting_record = state.blocks.get(&reservation.id).is_some_and(|record| {
+            record
+                .host_demotion_ticket()
+                .is_some_and(|ticket| ticket.operation_id == *operation_id)
+        });
+        if covered_by_demoting_record {
+            continue;
+        }
+        report.device_blocks += 1;
+        report.host_blocks += 1;
+        report.current_device_bytes += reservation.bytes;
+        report.current_host_bytes += reservation.bytes;
+        report.in_flight_host_demotion_blocks += 1;
+        report.in_flight_host_demotion_bytes += reservation.bytes;
+        let layer_report = per_layer.entry(reservation.id.global_layer).or_default();
+        layer_report.device_blocks += 1;
+        layer_report.host_blocks += 1;
+        layer_report.current_device_bytes += reservation.bytes;
+        layer_report.current_host_bytes += reservation.bytes;
+        layer_report.in_flight_host_demotion_blocks += 1;
+        layer_report.in_flight_host_demotion_bytes += reservation.bytes;
     }
     for (key, reservation) in &state.host_write_reservations {
         report.in_flight_write_blocks += 1;
@@ -5150,6 +5564,9 @@ fn update_report_totals(state: &mut CacheManagerState) {
     report.peak_in_flight_write_bytes = report
         .peak_in_flight_write_bytes
         .max(report.in_flight_write_bytes);
+    report.peak_in_flight_host_demotion_bytes = report
+        .peak_in_flight_host_demotion_bytes
+        .max(report.in_flight_host_demotion_bytes);
 }
 
 fn eviction_candidate(
@@ -5161,7 +5578,11 @@ fn eviction_candidate(
 ) -> Option<CacheBlockId> {
     let mut recent = HashMap::<usize, Vec<i64>>::new();
     if tier == CacheTier::Device && recent_per_layer > 0 {
-        for record in state.blocks.values().filter(|record| record.tier() == tier) {
+        for record in state
+            .blocks
+            .values()
+            .filter(|record| matches!(record.physical, CacheBlockPhysicalState::Device { .. }))
+        {
             recent
                 .entry(record.id.global_layer)
                 .or_default()
@@ -5176,7 +5597,7 @@ fn eviction_candidate(
         .blocks
         .values()
         .filter(|record| {
-            record.tier() == tier
+            physical_state_is_tier_candidate(&record.physical, tier)
                 && record.leases == 0
                 && record.pending_disk().is_none()
                 && required != Some(&record.id)
@@ -5194,6 +5615,15 @@ fn eviction_candidate(
             }
         })
         .map(|record| record.id.clone())
+}
+
+fn physical_state_is_tier_candidate(physical: &CacheBlockPhysicalState, tier: CacheTier) -> bool {
+    matches!(
+        (physical, tier),
+        (CacheBlockPhysicalState::Device { .. }, CacheTier::Device)
+            | (CacheBlockPhysicalState::Host { .. }, CacheTier::Host)
+            | (CacheBlockPhysicalState::Disk { .. }, CacheTier::Disk)
+    )
 }
 
 fn write_live_block(
@@ -5878,6 +6308,7 @@ fn stored_dtype_name(dtype: safetensors::Dtype) -> String {
     .into()
 }
 
+#[cfg(test)]
 fn cpu_stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
 }
@@ -6125,13 +6556,13 @@ mod tests {
         CacheRepresentation, CacheResidencyError, CacheResidencyManager, CacheTier,
         DiskCacheReadState, DiskLocation, DiskOperationKey, DiskOperationKind, DiskResult,
         DiskTask, DiskWorker, DiskWriteCommit, HostCacheBlock, HostCachePersistence,
-        HostWriteReservation, LayerCachePolicy, LayerSchedule, PagedCacheOptions,
-        PendingDiskOperation, PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest,
-        PromptCacheModelIdentity, PromptCacheStateTensor, PromptCacheTopology,
-        StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-        StateTensorRole, TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
-        MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_GENERATIONS_DIRECTORY,
-        PROMPT_CACHE_SCHEMA_VERSION,
+        HostDemotionCompletion, HostDemotionTicket, HostWriteReservation, LayerCachePolicy,
+        LayerSchedule, PagedCacheOptions, PendingDiskOperation, PromptCacheBlock,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheStateTensor, PromptCacheTopology, StateTensorDimension, StateTensorDtype,
+        StateTensorOwner, StateTensorPolicy, StateTensorRole, TemporaryFileGuard,
+        CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
+        PROMPT_CACHE_GENERATIONS_DIRECTORY, PROMPT_CACHE_SCHEMA_VERSION,
     };
     use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Stream};
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
@@ -8027,6 +8458,189 @@ mod tests {
     }
 
     #[test]
+    fn failed_asynchronous_host_demotion_restores_the_device_state() {
+        let manager =
+            CacheResidencyManager::new(PagedCacheOptions::new(1, 16, 16, 1).unwrap()).unwrap();
+        let id = disk_test_id(0);
+        let completion = Arc::new(HostDemotionCompletion::default());
+        completion.finish(Err(CacheResidencyError::Runtime(
+            "injected host demotion failure".into(),
+        )));
+        let ticket = HostDemotionTicket {
+            operation_id: 71,
+            id: id.clone(),
+            completion,
+        };
+        manager.lock().unwrap().blocks.insert(
+            id.clone(),
+            CacheBlockRecord {
+                id: id.clone(),
+                physical: CacheBlockPhysicalState::Demoting {
+                    arrays: test_device_block(),
+                    ticket: ticket.clone(),
+                },
+                bytes: 8,
+                shapes: [vec![1], vec![1]],
+                dtypes: ["Float32".into(), "Float32".into()],
+                imported: false,
+                leases: 0,
+                access_count: 0,
+                last_access: 0,
+                protected_prefix: false,
+            },
+        );
+
+        let error = manager.finish_device_demotion(&ticket).unwrap_err();
+        assert!(error.to_string().contains("injected host demotion failure"));
+        let state = manager.lock().unwrap();
+        assert!(matches!(
+            state.blocks.get(&id).unwrap().physical,
+            CacheBlockPhysicalState::Device { .. }
+        ));
+        drop(state);
+        let report = manager.report().unwrap();
+        assert_eq!(report.current_device_bytes, 8);
+        assert_eq!(report.current_host_bytes, 0);
+        assert_eq!(report.in_flight_host_demotion_blocks, 0);
+        assert_eq!(report.failures, 1);
+    }
+
+    #[test]
+    fn retiring_host_demotion_remains_charged_during_generation_reset() {
+        let manager =
+            CacheResidencyManager::new(PagedCacheOptions::new(1, 16, 16, 1).unwrap()).unwrap();
+        let id = disk_test_id(0);
+        let completion = Arc::new(HostDemotionCompletion::default());
+        let ticket = HostDemotionTicket {
+            operation_id: 72,
+            id: id.clone(),
+            completion: Arc::clone(&completion),
+        };
+        manager.lock().unwrap().blocks.insert(
+            id.clone(),
+            CacheBlockRecord {
+                id,
+                physical: CacheBlockPhysicalState::Demoting {
+                    arrays: test_device_block(),
+                    ticket,
+                },
+                bytes: 8,
+                shapes: [vec![1], vec![1]],
+                dtypes: ["Float32".into(), "Float32".into()],
+                imported: false,
+                leases: 0,
+                access_count: 0,
+                last_access: 0,
+                protected_prefix: false,
+            },
+        );
+
+        let clearing_manager = manager.clone();
+        let clearing = thread::spawn(move || clearing_manager.clear());
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let report = manager.report().unwrap();
+            if report.in_flight_host_demotion_blocks == 1
+                && manager.lock().unwrap().blocks.is_empty()
+            {
+                assert_eq!(report.current_device_bytes, 8);
+                assert_eq!(report.current_host_bytes, 8);
+                assert_eq!(report.in_flight_host_demotion_bytes, 8);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "clear did not publish its retiring demotion reservation"
+            );
+            thread::yield_now();
+        }
+
+        completion.finish(Err(CacheResidencyError::Runtime(
+            "discarded generation transfer failed".into(),
+        )));
+        clearing.join().unwrap().unwrap();
+        let report = manager.report().unwrap();
+        assert_eq!(report.current_device_bytes, 0);
+        assert_eq!(report.current_host_bytes, 0);
+        assert_eq!(report.in_flight_host_demotion_blocks, 0);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn asynchronous_host_demotion_charges_both_allocations_until_reconciled() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let manager =
+            CacheResidencyManager::new(PagedCacheOptions::new(2, 32, 16, 1).unwrap()).unwrap();
+        manager.bind_transfer_device(&stream).unwrap();
+        let arrays = execution_key_value_block(&stream);
+        let device_pointers = f32_storage_pointers(&arrays);
+        let id = manager.seal_block(0, 0, 2, None, arrays, false).unwrap();
+
+        let ticket = manager.begin_device_demotion(&id).unwrap();
+        {
+            let state = manager.lock().unwrap();
+            let record = state.blocks.get(&id).unwrap();
+            let CacheBlockPhysicalState::Demoting {
+                arrays,
+                ticket: live,
+            } = &record.physical
+            else {
+                panic!("device demotion was not represented as in flight");
+            };
+            assert_eq!(live.operation_id, ticket.operation_id);
+            assert_eq!(f32_storage_pointers(arrays), device_pointers);
+        }
+        let report = manager.report().unwrap();
+        assert_eq!(report.device_blocks, 1);
+        assert_eq!(report.host_blocks, 1);
+        assert_eq!(report.current_device_bytes, 16);
+        assert_eq!(report.current_host_bytes, 16);
+        assert_eq!(report.in_flight_host_demotion_blocks, 1);
+        assert_eq!(report.in_flight_host_demotion_bytes, 16);
+        assert_eq!(report.peak_in_flight_host_demotion_bytes, 16);
+        let layer = report
+            .per_layer
+            .iter()
+            .find(|layer| layer.global_layer == 0)
+            .unwrap();
+        assert_eq!(layer.stats.in_flight_host_demotion_blocks, 1);
+        assert_eq!(layer.stats.in_flight_host_demotion_bytes, 16);
+
+        manager.finish_device_demotion(&ticket).unwrap();
+        let report = manager.report().unwrap();
+        assert_eq!(report.device_blocks, 0);
+        assert_eq!(report.host_blocks, 1);
+        assert_eq!(report.current_device_bytes, 0);
+        assert_eq!(report.current_host_bytes, 16);
+        assert_eq!(report.in_flight_host_demotion_blocks, 0);
+        assert_eq!(report.in_flight_host_demotion_bytes, 0);
+        assert_eq!(report.host_demotions, 1);
+        assert_eq!(report.transfer_bytes, 16);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn clear_waits_for_asynchronous_host_demotion_resources() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let manager =
+            CacheResidencyManager::new(PagedCacheOptions::new(2, 32, 16, 1).unwrap()).unwrap();
+        manager.bind_transfer_device(&stream).unwrap();
+        let id = manager
+            .seal_block(0, 0, 2, None, execution_key_value_block(&stream), false)
+            .unwrap();
+        let ticket = manager.begin_device_demotion(&id).unwrap();
+
+        manager.clear().unwrap();
+        assert!(ticket.wait().is_ok());
+        let report = manager.report().unwrap();
+        assert_eq!(report.device_blocks, 0);
+        assert_eq!(report.host_blocks, 0);
+        assert_eq!(report.current_device_bytes, 0);
+        assert_eq!(report.current_host_bytes, 0);
+        assert_eq!(report.in_flight_host_demotion_blocks, 0);
+    }
+
+    #[test]
     #[ignore = "requires MLX runtime execution"]
     fn host_demotion_uses_typed_buffers_and_promotion_rebuilds_device_arrays() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
@@ -8034,6 +8648,7 @@ mod tests {
         // one to a distinct CPU allocation while retaining one recent block.
         let options = PagedCacheOptions::new(2, 32, 16, 1).unwrap();
         let manager = CacheResidencyManager::new(options).unwrap();
+        manager.bind_transfer_device(&stream).unwrap();
         let first_arrays = execution_key_value_block(&stream);
         let first_device_pointers = f32_storage_pointers(&first_arrays);
         let first = manager

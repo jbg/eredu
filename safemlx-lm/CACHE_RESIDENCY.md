@@ -100,14 +100,21 @@ two-block window (current plus next), submit each completed recurrence before
 waiting on the next block, and thereby permit the next promotion to overlap
 current-block attention. A one-block device budget falls back to demand
 promotion rather than exceeding the configured limit. Device-to-host demotion
-must establish independent host-buffer ownership, so it host-waits only for
-the two exact block-copy completions; it never synchronizes the whole transfer
-stream or creates CPU MLX arrays. This is cache-block pipelining, not general
-activation double buffering. Disk reads and writes use a bounded manager-owned worker
-queue. Duplicate block operations
+is submitted to a dedicated worker which owns a task-local stream on the cache's
+bound execution device and both completion events. The initiating thread does
+not wait merely to establish host ownership. While the copy is in flight, the
+physical state retains the device
+arrays, reserves the typed host destination, and charges the block's bytes to
+both finite budgets. A capacity-changing operation waits for completion only
+when releasing the device source is necessary to admit that operation. The
+worker then publishes immutable host buffers without creating CPU MLX arrays.
+`in_flight_host_demotion_blocks`, `in_flight_host_demotion_bytes`, and
+`peak_in_flight_host_demotion_bytes` expose the overlap explicitly. This is
+cache-block pipelining, not general activation double buffering. Disk reads and
+writes use a bounded manager-owned worker queue. Duplicate block operations
 join one shared completion, capacity waits occur without holding cache state,
-and reset or truncation cancels queued work from the prior generation. The
-worker is stopped and joined on drop. Host-to-disk demotion returns after queue
+and reset or truncation cancels queued work from the prior generation. Both
+workers are stopped and joined on drop. Host-to-disk demotion returns after queue
 admission rather than waiting for the write: the block remains readable from
 its immutable host buffers until the worker publishes the disk backing.
 `in_flight_write_blocks` and `in_flight_write_bytes` report this writeback state,
@@ -116,8 +123,10 @@ device-to-host demotion waits for an in-flight write when that write must finish
 to keep the finite host-byte budget; queue-capacity backpressure is enforced
 separately. Demand promotion does not release that host charge while the writer
 still owns the staging allocation. Reset and truncation cancel obsolete work
-but wait for each canceled task to release its buffers before returning, so a
-new generation cannot reuse capacity that is still physically occupied.
+but wait for each canceled disk write or host demotion to release its arrays
+and buffers before returning, so a new generation cannot reuse capacity that is
+still physically occupied. A retirement reservation keeps both tier charges
+visible after the old catalog entry is removed and until that wait completes.
 Asynchronous write failures are returned by the next
 residency-changing cache operation. Live shard names include a process-unique
 namespace, write identity, representation, and pipeline/tensor/expert rank.
