@@ -315,6 +315,42 @@ enum PreparedPipelineIngress {
     Identity(PreparedModelInputIdentity),
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PlacedIngressRankRoute {
+    encoder_predecessor: Option<usize>,
+    encoder_successor: Option<usize>,
+    finalizer_destination: Option<usize>,
+    finalizer_source: Option<usize>,
+    executes_encoder: bool,
+    finalizes: bool,
+}
+
+fn placed_ingress_rank_route(
+    placement: &PlacedExecutionDag,
+    pp_rank: usize,
+) -> Result<PlacedIngressRankRoute, Error> {
+    let path = placement.encoder_rank_path();
+    let terminal = path.last().copied().ok_or_else(|| {
+        Error::Parallel("multimodal placement omitted an encoder owner path".into())
+    })?;
+    let finalizer = placement
+        .group("modality_finalization")
+        .and_then(ExecutionGroupPlacement::first_owner)
+        .ok_or_else(|| {
+            Error::Parallel("multimodal placement omitted a finalization owner".into())
+        })?;
+    let position = path.iter().position(|rank| *rank == pp_rank);
+    Ok(PlacedIngressRankRoute {
+        encoder_predecessor: position
+            .and_then(|position| position.checked_sub(1).map(|index| path[index])),
+        encoder_successor: position.and_then(|position| path.get(position + 1).copied()),
+        finalizer_destination: (pp_rank == terminal && terminal != finalizer).then_some(finalizer),
+        finalizer_source: (pp_rank == finalizer && terminal != finalizer).then_some(terminal),
+        executes_encoder: position.is_some(),
+        finalizes: pp_rank == finalizer,
+    })
+}
+
 fn send_array_bundle(
     arrays: &[Array],
     peer: usize,
@@ -5853,64 +5889,37 @@ impl PipelineModel {
                         })?;
                 let active = self.stage.placed_ingress_active(state.as_ref())?;
                 if active {
-                    let finalizer_owner = self
-                        .info
-                        .placement
-                        .group("modality_finalization")
-                        .and_then(ExecutionGroupPlacement::first_owner)
-                        .ok_or_else(|| {
-                            Error::Parallel(
-                                "multimodal placement omitted a finalization owner".into(),
-                            )
-                        })?;
-                    let encoder_tail = ["vision_encoder", "audio_encoder"]
-                        .into_iter()
-                        .filter_map(|group| {
-                            self.info
-                                .placement
-                                .group(group)
-                                .and_then(ExecutionGroupPlacement::last_owner)
-                        })
-                        .max()
-                        .ok_or_else(|| {
-                            Error::Parallel("multimodal placement omitted an encoder owner".into())
-                        })?;
-                    if self.info.pipeline_stage > 0 && self.info.pipeline_stage <= encoder_tail {
-                        let arrays =
-                            recv_array_bundle(self.info.pipeline_stage - 1, group, stream)?;
+                    let route = placed_ingress_rank_route(
+                        self.info.placement.as_ref(),
+                        self.info.pipeline_stage,
+                    )?;
+                    if let Some(predecessor) = route.encoder_predecessor {
+                        let arrays = recv_array_bundle(predecessor, group, stream)?;
                         self.stage
                             .replace_placed_ingress_arrays(state.as_mut(), arrays)?;
                     }
-                    if self.info.pipeline_stage <= encoder_tail {
+                    if route.executes_encoder {
                         self.stage
                             .execute_placed_ingress(state.as_mut(), step, tensor, stream)?;
                     }
-                    if self.info.pipeline_stage < encoder_tail {
+                    if let Some(successor) = route.encoder_successor {
                         let arrays = self.stage.placed_ingress_arrays(state.as_ref())?;
-                        placed_retained.extend(send_array_bundle(
-                            &arrays,
-                            self.info.pipeline_stage + 1,
-                            group,
-                            stream,
-                        )?);
-                    } else if self.info.pipeline_stage != finalizer_owner {
+                        placed_retained
+                            .extend(send_array_bundle(&arrays, successor, group, stream)?);
+                    } else if let Some(finalizer) = route.finalizer_destination {
                         let arrays = self.stage.placed_ingress_arrays(state.as_ref())?;
-                        placed_retained.extend(send_array_bundle(
-                            &arrays,
-                            finalizer_owner,
-                            group,
-                            stream,
-                        )?);
+                        placed_retained
+                            .extend(send_array_bundle(&arrays, finalizer, group, stream)?);
                     }
 
-                    if self.info.pipeline_stage == finalizer_owner {
-                        if finalizer_owner != encoder_tail {
-                            let arrays = recv_array_bundle(encoder_tail, group, stream)?;
+                    if route.finalizes {
+                        if let Some(source) = route.finalizer_source {
+                            let arrays = recv_array_bundle(source, group, stream)?;
                             self.stage
                                 .replace_placed_ingress_arrays(state.as_mut(), arrays)?;
                         }
                         let payload = self.stage.finish_placed_ingress(state, tensor, stream)?;
-                        if finalizer_owner == 0 {
+                        if self.info.pipeline_stage == 0 {
                             placed_payload = Some(payload);
                         } else {
                             let arrays = std::iter::once(payload.hidden)
@@ -5919,8 +5928,14 @@ impl PipelineModel {
                             placed_retained.extend(send_array_bundle(&arrays, 0, group, stream)?);
                         }
                     }
-                    if self.info.pipeline_stage == 0 && finalizer_owner != 0 {
-                        let mut arrays = recv_array_bundle(finalizer_owner, group, stream)?;
+                    if self.info.pipeline_stage == 0 && !route.finalizes {
+                        let finalizer = self
+                            .info
+                            .placement
+                            .group("modality_finalization")
+                            .and_then(ExecutionGroupPlacement::first_owner)
+                            .expect("validated placed ingress finalizer");
+                        let mut arrays = recv_array_bundle(finalizer, group, stream)?;
                         if arrays.is_empty() {
                             return Err(Error::Parallel(
                                 "placed modality finalization produced an empty decoder payload"
@@ -21641,6 +21656,34 @@ mod tests {
             assert_eq!(stage.media_layer_count, stage.media_units.len());
             assert!(stage.embedding.is_none());
             assert!(stage.embed_norm.is_none());
+        }
+    }
+
+    #[test]
+    fn placed_ingress_route_leaves_unowned_pipeline_stages_idle() {
+        let placement = multimodal_placement(3, 3, Some(1), None).unwrap();
+        assert_eq!(placement.encoder_rank_path(), [0]);
+
+        let owner = placed_ingress_rank_route(&placement, 0).unwrap();
+        assert!(owner.executes_encoder);
+        assert!(owner.finalizes);
+        assert_eq!(owner.encoder_predecessor, None);
+        assert_eq!(owner.encoder_successor, None);
+        assert_eq!(owner.finalizer_destination, None);
+        assert_eq!(owner.finalizer_source, None);
+
+        for rank in [1, 2] {
+            assert_eq!(
+                placed_ingress_rank_route(&placement, rank).unwrap(),
+                PlacedIngressRankRoute {
+                    encoder_predecessor: None,
+                    encoder_successor: None,
+                    finalizer_destination: None,
+                    finalizer_source: None,
+                    executes_encoder: false,
+                    finalizes: false,
+                }
+            );
         }
     }
 

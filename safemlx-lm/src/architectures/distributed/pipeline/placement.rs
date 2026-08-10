@@ -246,6 +246,7 @@ pub struct PlacedExecutionDag {
     pipeline_stages: usize,
     groups: Vec<ExecutionGroupPlacement>,
     routes: Vec<PlacementRoute>,
+    encoder_rank_path: Vec<usize>,
     execution_order: Vec<usize>,
     output: usize,
 }
@@ -321,6 +322,20 @@ impl PlacedExecutionDag {
             .map(|(index, group)| (group.id.as_str(), index))
             .collect::<BTreeMap<_, _>>();
         let mut routes = Vec::new();
+        for group in &groups {
+            for owners in group.owners.windows(2) {
+                let from = owners[0].pp_rank;
+                let to = owners[1].pp_rank;
+                routes.push(PlacementRoute {
+                    from_group: group.id.clone(),
+                    to_group: group.id.clone(),
+                    from_pp_rank: from,
+                    to_pp_rank: to,
+                    pp_path: vec![from, to],
+                    payload_schema: group.output_schema.clone(),
+                });
+            }
+        }
         for consumer in &groups {
             let to = consumer.first_owner().unwrap_or(consumer.merge_destination);
             for dependency in &consumer.dependencies {
@@ -346,6 +361,7 @@ impl PlacedExecutionDag {
                 });
             }
         }
+        let encoder_rank_path = ordered_encoder_rank_path(&groups)?;
         validate_segment_graph(&groups, &routes)?;
         let output = groups
             .iter()
@@ -355,6 +371,7 @@ impl PlacedExecutionDag {
             pipeline_stages,
             groups,
             routes,
+            encoder_rank_path,
             execution_order: semantic.execution_order().to_vec(),
             output,
         })
@@ -371,6 +388,14 @@ impl PlacedExecutionDag {
     /// Returns topology-planned routes.
     pub fn routes(&self) -> &[PlacementRoute] {
         &self.routes
+    }
+    /// Returns the dependency-safe serial path through every encoder owner.
+    ///
+    /// Independent ready roots share this deterministic path. A PP coordinate
+    /// appears at most once; projector and finalization routes may return the
+    /// payload to an earlier coordinate after the terminal encoder owner.
+    pub fn encoder_rank_path(&self) -> &[usize] {
+        &self.encoder_rank_path
     }
     /// Returns stable topological group order.
     pub fn execution_order(&self) -> &[usize] {
@@ -393,6 +418,55 @@ impl PlacedExecutionDag {
             .iter()
             .filter_map(move |group| group.local_units(pp_rank).map(|range| (group, range)))
     }
+}
+
+fn ordered_encoder_rank_path(groups: &[ExecutionGroupPlacement]) -> Result<Vec<usize>, Error> {
+    let encoders = groups.iter().filter(|group| {
+        matches!(
+            group.kind,
+            ExecutionGroupKind::VisionEncoder | ExecutionGroupKind::AudioEncoder
+        )
+    });
+    let mut ranks = BTreeSet::new();
+    let mut edges = BTreeMap::<usize, BTreeSet<usize>>::new();
+    let mut indegree = BTreeMap::<usize, usize>::new();
+    for group in encoders {
+        for owner in &group.owners {
+            ranks.insert(owner.pp_rank);
+            indegree.entry(owner.pp_rank).or_default();
+        }
+        for owners in group.owners.windows(2) {
+            let from = owners[0].pp_rank;
+            let to = owners[1].pp_rank;
+            if edges.entry(from).or_default().insert(to) {
+                *indegree.entry(to).or_default() += 1;
+            }
+        }
+    }
+    let mut ready = ranks
+        .iter()
+        .copied()
+        .filter(|rank| indegree.get(rank).copied().unwrap_or_default() == 0)
+        .collect::<BTreeSet<_>>();
+    let mut path = Vec::with_capacity(ranks.len());
+    while let Some(rank) = ready.pop_first() {
+        path.push(rank);
+        for &dependent in edges.get(&rank).into_iter().flatten() {
+            let degree = indegree
+                .get_mut(&dependent)
+                .expect("encoder owner has indegree");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+    if path.len() != ranks.len() {
+        return Err(Error::Parallel(
+            "encoder PP owner paths contain a rank-level cycle".into(),
+        ));
+    }
+    Ok(path)
 }
 
 fn validate_rank_path(id: &str, stages: usize, ranks: &[usize]) -> Result<(), Error> {
@@ -679,9 +753,87 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(graph.encoder_rank_path(), [0, 1, 2]);
+        assert!(graph.routes().iter().any(|route| {
+            route.from_group == "vision" && route.to_group == "vision" && route.pp_path == [0, 1]
+        }));
         assert!(graph.routes().iter().any(|route| {
             route.from_group == "projector" && route.to_group == "text" && route.pp_path == [3, 1]
         }));
+    }
+
+    #[test]
+    fn encoder_path_excludes_unowned_ranks_and_preserves_non_adjacent_owners() {
+        let single = PlacedExecutionDag::plan(
+            4,
+            vec![request(
+                "vision",
+                &[],
+                ExecutionGroupKind::VisionEncoder,
+                1,
+                &[0, 1, 2, 3],
+                "pixels",
+                "encoded",
+            )],
+            "vision",
+        )
+        .unwrap();
+        assert_eq!(single.encoder_rank_path(), [0]);
+        assert!(single.routes().is_empty());
+
+        let non_adjacent = PlacedExecutionDag::plan(
+            4,
+            vec![request(
+                "vision",
+                &[],
+                ExecutionGroupKind::VisionEncoder,
+                2,
+                &[0, 2],
+                "pixels",
+                "encoded",
+            )],
+            "vision",
+        )
+        .unwrap();
+        assert_eq!(non_adjacent.encoder_rank_path(), [0, 2]);
+        assert_eq!(non_adjacent.routes()[0].pp_path, [0, 2]);
+    }
+
+    #[test]
+    fn rejects_incompatible_encoder_rank_paths() {
+        let conflicting = vec![
+            request(
+                "vision",
+                &[],
+                ExecutionGroupKind::VisionEncoder,
+                2,
+                &[0, 1],
+                "media",
+                "media",
+            ),
+            request(
+                "audio",
+                &[],
+                ExecutionGroupKind::AudioEncoder,
+                2,
+                &[1, 0],
+                "media",
+                "media",
+            ),
+            request(
+                "merge",
+                &["vision", "audio"],
+                ExecutionGroupKind::Merger,
+                1,
+                &[0],
+                "media",
+                "media",
+            ),
+        ];
+        let error = PlacedExecutionDag::plan(2, conflicting, "merge").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("encoder PP owner paths contain a rank-level cycle"));
     }
 
     #[test]

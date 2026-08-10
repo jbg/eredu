@@ -507,8 +507,7 @@ fn pipeline_ring_worker() {
     }
     if dense_stream {
         let report = model.dense_stream_report().unwrap().unwrap();
-        let expected_units = expected_range.len()
-            + usize::from(family.has_streamed_media_unit() && pipeline_rank == 0);
+        let expected_units = expected_range.len() + usize::from(family.has_streamed_media_unit());
         assert_eq!(report.planned_layer_count(), expected_units);
         assert!(report
             .residency()
@@ -536,8 +535,7 @@ fn pipeline_ring_worker() {
         assert!(model.dense_stream_report().unwrap().is_none());
         let report = model.parameter_residency_report().unwrap().unwrap();
         assert!(report.initialized());
-        let expected_units = expected_range.len()
-            + usize::from(family.has_streamed_media_unit() && pipeline_rank == 0);
+        let expected_units = expected_range.len() + usize::from(family.has_streamed_media_unit());
         assert_eq!(report.units().len(), expected_units);
         assert!(report
             .units()
@@ -2836,7 +2834,7 @@ fn write_qwen35_multimodal_fixture(directory: &Path, moe: bool) {
         "video_token_id": 43,
         "text_config": text_config,
         "vision_config": {
-            "depth": 1,
+            "depth": 2,
             "hidden_size": 8,
             "hidden_act": "silu",
             "intermediate_size": 8,
@@ -2848,7 +2846,7 @@ fn write_qwen35_multimodal_fixture(directory: &Path, moe: bool) {
             "temporal_patch_size": 1,
             "window_size": 8,
             "out_hidden_size": 16,
-            "fullatt_block_indexes": [0],
+            "fullatt_block_indexes": [0, 1],
             "deepstack_visual_indexes": []
         }
     });
