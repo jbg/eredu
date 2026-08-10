@@ -48,10 +48,11 @@ use crate::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
             save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
-            CacheResidencyReport, LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor,
-            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-            PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension,
-            StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+            CacheResidencyPolicy, CacheResidencyPool, CacheResidencyReport, LayerCachePolicy,
+            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
+            PromptCacheStateArray, StateTensorDimension, StateTensorDtype, StateTensorOwner,
+            StateTensorPolicy, StateTensorRole,
         },
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
@@ -1248,6 +1249,14 @@ impl Cache {
             .transpose()
     }
 
+    /// Returns the aggregate process pool for paged attention state.
+    pub fn residency_pool(&self) -> Option<&CacheResidencyPool> {
+        self.layers.iter().find_map(|layer| match layer {
+            LayerCache::Attention(cache) => cache.manager().map(CacheResidencyManager::pool),
+            LayerCache::Conv(_) => None,
+        })
+    }
+
     /// Returns the consumed-token offset.
     pub fn offset(&self) -> i32 {
         self.layers.first().map(LayerCache::offset).unwrap_or(0)
@@ -2000,6 +2009,15 @@ impl Model {
     /// Creates an empty heterogeneous cache.
     pub fn new_cache(&self) -> Cache {
         Cache::new(&self.args).expect("validated LFM2 layer schedule")
+    }
+
+    /// Creates resident heterogeneous state or pages growing attention state
+    /// under the same policy used by layerwise and tensor-parallel execution.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => Cache::new_paged(&self.args, options, None),
+        }
     }
 
     pub(crate) fn save_prompt_cache_with_rank(
@@ -2944,6 +2962,26 @@ mod tests {
         assert!(matches!(cache.layers[1], super::LayerCache::Attention(_)));
         assert!(matches!(cache.layers[2], super::LayerCache::Conv(_)));
         validate_model_config_value(&config).unwrap();
+    }
+
+    #[test]
+    fn resident_lfm2_uses_the_shared_cache_policy_and_pool() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let args = model_args_from_config_value(&dense_config()).unwrap();
+        let model = super::Model::new(args, context.stream()).unwrap();
+        let pool = crate::CacheResidencyPool::new(
+            crate::CachePoolLimits::new(4096, 4096, 4096, 0).unwrap(),
+        );
+        let options = crate::PagedCacheOptions::new(1, 4096, 4096, 1)
+            .unwrap()
+            .with_full_attention(true)
+            .with_pool(pool.clone())
+            .unwrap();
+        let cache = model
+            .new_cache_with_options(crate::CacheResidencyPolicy::Paged(options))
+            .unwrap();
+        assert_eq!(cache.residency_pool().unwrap().id(), pool.id());
+        assert_eq!(pool.report().unwrap().managers, 1);
     }
 
     #[test]

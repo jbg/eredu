@@ -57,10 +57,11 @@ use crate::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
             save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
-            CacheResidencyReport, LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor,
-            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-            PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension,
-            StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+            CacheResidencyPolicy, CacheResidencyPool, CacheResidencyReport, LayerCachePolicy,
+            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
+            PromptCacheStateArray, StateTensorDimension, StateTensorDtype, StateTensorOwner,
+            StateTensorPolicy, StateTensorRole,
         },
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
@@ -1246,6 +1247,19 @@ impl Cache {
                 LayerCache::LinearAttention(_) => None,
             })
             .transpose()
+    }
+
+    /// Returns the aggregate process pool for paged full-attention state.
+    pub fn residency_pool(&self) -> Option<&CacheResidencyPool> {
+        self.layers
+            .iter()
+            .chain(&self.mtp_layers)
+            .find_map(|layer| match layer {
+                LayerCache::FullAttention(cache) => {
+                    cache.manager().map(CacheResidencyManager::pool)
+                }
+                LayerCache::LinearAttention(_) => None,
+            })
     }
 
     pub(crate) fn offset(&self) -> i32 {
@@ -5129,6 +5143,15 @@ impl Model {
         Cache::new(&self.args).expect("validated Qwen hybrid layer schedule")
     }
 
+    /// Creates resident hybrid state or pages growing full-attention state
+    /// under the same policy used by layerwise and tensor-parallel execution.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => Cache::new_paged(&self.args, options, None),
+        }
+    }
+
     /// Returns the configured model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
@@ -7590,6 +7613,33 @@ mod tests {
             quantization: None,
             quantized_weight_configs: None,
         }
+    }
+
+    #[test]
+    fn resident_qwen_hybrid_uses_the_shared_cache_policy_and_pool() {
+        let _guard = mlx_runtime_test_guard();
+        let context = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let model = Model::new(
+            tiny_args(vec![FULL, LINEAR]),
+            None,
+            None,
+            None,
+            context.stream(),
+        )
+        .unwrap();
+        let pool = crate::CacheResidencyPool::new(
+            crate::CachePoolLimits::new(4096, 4096, 4096, 0).unwrap(),
+        );
+        let options = crate::PagedCacheOptions::new(1, 4096, 4096, 1)
+            .unwrap()
+            .with_full_attention(true)
+            .with_pool(pool.clone())
+            .unwrap();
+        let cache = model
+            .new_cache_with_options(crate::CacheResidencyPolicy::Paged(options))
+            .unwrap();
+        assert_eq!(cache.residency_pool().unwrap().id(), pool.id());
+        assert_eq!(pool.report().unwrap().managers, 1);
     }
 
     fn tiny_vision_config(out_hidden_size: i32) -> VisionConfig {

@@ -888,8 +888,12 @@ Pure pipeline inference uses the architecture-neutral distributed scheduler.
 That canonical runtime owns request/work identity, isolated per-request program
 state, bounded stable round-robin queues, cancellation, exact collective work
 consensus, failure poisoning, and occupancy/throughput reporting. The decoder
-adapter binds each request to one rank-local cache and contributes exact
-prefill/decode descriptors, so request ids, work sequence numbers, phases,
+adapter binds each paged request cache to one process-wide
+`CacheResidencyPool`; aggregate device, host, transfer-in-flight, and live-disk
+accounting is enforced in addition to each manager's tighter local limits.
+Cancellation and failure release ownership, while a cache explicitly handed to
+the caller remains charged. The decoder adapter contributes exact prefill/decode
+descriptors, so request ids, work sequence numbers, phases,
 batch/sequence dimensions, and mask metadata are compared before point-to-point
 traffic. Different requests can occupy different stages concurrently, while
 one autoregressive request remains dependent on its preceding sampled token.

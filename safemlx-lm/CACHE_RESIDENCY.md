@@ -7,13 +7,25 @@ budgets and lifetimes.
 
 `CacheResidencyPolicy::Paged` divides attention state into immutable sealed
 blocks and a mutable device tail. One `CacheResidencyManager` is shared by all
-attention layers in a model cache, so finite device and host byte limits apply
-globally instead of once per layer. Constructors reject zero device budgets,
-zero recent-block protection, non-positive block sizes, and unbounded implicit
-limits.
+attention layers in a model cache, so its finite device and host byte limits
+apply once per request instead of once per layer. Multiple managers can also
+share one `CacheResidencyPool`. The pool is the process-wide admission boundary
+for aggregate device, host, transfer-in-flight, and live-disk bytes; per-cache
+limits remain in force so one request cannot monopolize it. Constructors reject
+zero device budgets, zero recent-block protection, non-positive block sizes,
+incoherent per-cache and pool limits, and unbounded implicit limits.
 
 ```rust
-use safemlx_lm::{CacheResidencyPolicy, PagedCacheOptions};
+use safemlx_lm::{
+    CachePoolLimits, CacheResidencyPolicy, CacheResidencyPool, PagedCacheOptions,
+};
+
+let pool = CacheResidencyPool::new(CachePoolLimits::new(
+    2 << 30,  // aggregate device-cache bytes
+    8 << 30,  // aggregate host-cache bytes
+    1 << 30,  // aggregate bytes retained by active transfers
+    0,        // aggregate live-disk bytes; zero disables the tier
+)?);
 
 let options = PagedCacheOptions::new(
     128,          // tokens per block
@@ -21,7 +33,8 @@ let options = PagedCacheOptions::new(
     2 << 30,      // finite logical host-cache bytes
     1,            // recent device blocks protected per layer
 )?
-.with_full_attention(true);
+.with_full_attention(true)
+.with_pool(pool)?;
 
 let cache = model.new_cache_with_options(CacheResidencyPolicy::Paged(options))?;
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -32,7 +45,7 @@ through these current entry points:
 
 - High-level `Model::new_cache_with_options`
   supports Llama/Mistral, DeepSeek, Kimi Linear, GPT-OSS, dense Qwen2/Qwen3,
-  Inkling, and Nemotron-H.
+  Inkling, Nemotron-H, LFM2/LFM2-MoE, and Qwen3-Next/Qwen3.5 hybrid models.
 - `PipelineModel::new_cache_with_options`
   supports every advertised pipeline stage adapter. It materializes the
   adapter's canonical per-layer cache descriptors, including heterogeneous
@@ -41,9 +54,10 @@ through these current entry points:
   supports DeepSeek, GPT-OSS, dense Qwen, Inkling, and Nemotron-H replicated
   attention state.
 
-LFM2/LFM2-MoE and Qwen hybrid models can use paged attention through the
-pipeline runtime. Their high-level and tensor-parallel model entry points reject
-paged residency explicitly.
+LFM2/LFM2-MoE and Qwen hybrid high-level, layerwise, tensor-parallel, and
+pipeline entry points use the same `CacheResidencyPolicy`. Only sealable
+attention state is paged; their fixed convolution and recurrent state retains
+its declared behavioral residency.
 
 Live state has one authoritative behavioral classification. `SealablePaged`
 belongs to append-only KV and compressed-latent payloads; `AlwaysDeviceMutable`
@@ -220,13 +234,16 @@ expert-sharded.
 
 The architecture-neutral distributed scheduler owns one isolated program state
 per active request. The decoder adapter stores one complete rank-local
-`PipelineCache` in that state, so device caches add directly across requests. A
-paged cache's limits apply to that request's `CacheResidencyManager`, not to the
-scheduler as an aggregate pool; deployments bound aggregate exposure with
-`max_active_requests` and choose per-request `PagedCacheOptions` accordingly.
-No arrays are shared between request identities. EOS and cancellation drop the
-state and cache, while `release_request_cache` hands an idle decoder cache back
-to the caller for explicit schema-v5 persistence.
+`PipelineCache` in that state and binds every paged manager to one scheduler
+pool. `PipelineInferenceScheduler::new_with_cache_pool` accepts an explicit
+process pool; the ordinary constructor creates the pool from the first paged
+request and reuses it thereafter. `cache_pool_report` exposes aggregate current
+and peak device, host, transfer-in-flight, and disk bytes separately from each
+manager's local report. A request using a different explicit pool is rejected
+before registration. No arrays are shared between request identities. EOS and
+cancellation drop the state and release its pool contribution, while
+`release_request_cache` hands an idle decoder cache back to the caller and keeps
+it charged until that caller persists or drops it.
 
 `AttentionPolicy::Sliding { window: N }` includes the current token in the `N`
 positions. Ordinary live state therefore needs at most `N - 1` past positions

@@ -273,7 +273,9 @@ checkpoint-native packed GGUF tensors load directly and are never implicitly
 transcoded. Selecting this weight policy does not enable KV-cache offload, and
 weight residency still represents host-planned parameters as MLX arrays. Paged
 KV-cache residency independently uses typed host-transfer buffers for its host
-tier. The opt-in
+tier. Independently owned request caches can share a `CacheResidencyPool`, which
+enforces aggregate device, host, transfer-in-flight, and live-disk limits while
+retaining tighter per-request limits. The opt-in
 `llama_residency` example accepts a real checkpoint directory and reports
 latency, throughput, logical residency, transfer telemetry, allocator samples,
 and mapped-shard diagnostics.
@@ -1347,6 +1349,10 @@ EOS and cancellation discard queued work and release the corresponding cache;
 an idle cache can instead be released for prompt-cache persistence. Scheduler
 reports expose current/peak queue occupancy, request count, completed and
 failed/discarded work, terminal counts, drain cycles, and poison state.
+`PipelineInferenceScheduler::cache_pool_report` separately reports aggregate
+cache ownership and high-water marks. Cancellation and EOS release a request's
+pool contribution; a cache released for persistence remains charged while the
+caller owns it.
 
 Realtime and other programs reuse `FairScheduler` by supplying program state,
 a work payload implementing `WorkDescriptor`, and an executor closure.

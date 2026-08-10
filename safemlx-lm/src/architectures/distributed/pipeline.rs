@@ -60,10 +60,10 @@ use crate::{
     },
     runtime::cache::residency::{
         load_prompt_cache_state_tensors, open_prompt_cache, validate_prompt_cache_model_identity,
-        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheStateArray, PromptCacheTopology, StateTensorOwner,
-        StateTensorPolicy, StateTensorRole,
+        CachePoolReport, CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy,
+        CacheResidencyPool, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateArray,
+        PromptCacheTopology, StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
     runtime::cache::{
         CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -822,6 +822,7 @@ pub struct PipelineInferenceScheduler {
     model_kind: ModelKind,
     global_layer_range: Range<usize>,
     architecture_fingerprint: String,
+    cache_pool: Option<CacheResidencyPool>,
     scheduler: FairScheduler<ScheduledPipelineMicrobatch, PipelineRequestState>,
 }
 
@@ -833,8 +834,21 @@ impl PipelineInferenceScheduler {
             model_kind: model.info.model_kind,
             global_layer_range: model.info.global_layer_range.clone(),
             architecture_fingerprint: model.prompt_cache_architecture_fingerprint()?,
+            cache_pool: None,
             scheduler: FairScheduler::new(limits)?,
         })
+    }
+
+    /// Binds a scheduler to an explicit process-wide cache pool before any
+    /// request state is allocated.
+    pub fn new_with_cache_pool(
+        model: &PipelineModel,
+        limits: SchedulerLimits,
+        cache_pool: CacheResidencyPool,
+    ) -> Result<Self, Error> {
+        let mut scheduler = Self::new(model, limits)?;
+        scheduler.cache_pool = Some(cache_pool);
+        Ok(scheduler)
     }
 
     /// Registers a request with a fresh device-resident cache.
@@ -866,6 +880,7 @@ impl PipelineInferenceScheduler {
     ) -> Result<(), Error> {
         self.validate_model(model)?;
         self.scheduler.validate_registration(request)?;
+        let policy = self.bind_cache_policy(policy)?;
         let cache = model.new_cache_with_options(policy)?;
         self.validate_cache(model, &cache)?;
         self.scheduler.register(
@@ -888,6 +903,9 @@ impl PipelineInferenceScheduler {
         self.validate_model(model)?;
         self.scheduler.validate_registration(request)?;
         self.validate_cache(model, &cache)?;
+        if let Some(manager) = cache.residency_manager.as_ref() {
+            self.bind_existing_cache_pool(manager.pool())?;
+        }
         self.scheduler.register(
             request,
             PipelineRequestState {
@@ -1183,9 +1201,70 @@ impl PipelineInferenceScheduler {
         self.scheduler.report()
     }
 
+    /// Returns aggregate cache-pool occupancy for all attached request caches,
+    /// including caches released to callers while they retain pool membership.
+    pub fn cache_pool_report(&self) -> Result<Option<CachePoolReport>, Error> {
+        self.cache_pool
+            .as_ref()
+            .map(|pool| {
+                pool.report()
+                    .map_err(|error| Error::Parallel(error.to_string()))
+            })
+            .transpose()
+    }
+
     /// Returns the failure that invalidated this scheduler, if any.
     pub fn poison_reason(&self) -> Option<&str> {
         self.scheduler.poison_reason()
+    }
+
+    fn bind_cache_policy(
+        &mut self,
+        policy: CacheResidencyPolicy,
+    ) -> Result<CacheResidencyPolicy, Error> {
+        let CacheResidencyPolicy::Paged(options) = policy else {
+            return Ok(CacheResidencyPolicy::Device);
+        };
+        let requested_pool = options.pool().cloned();
+        let pool = match (&self.cache_pool, requested_pool) {
+            (Some(pool), Some(requested)) if pool != &requested => {
+                return Err(Error::Parallel(format!(
+                    "pipeline scheduler cache pool {} does not match requested pool {}",
+                    pool.id(),
+                    requested.id()
+                )));
+            }
+            (Some(pool), _) => pool.clone(),
+            (None, Some(pool)) => {
+                self.cache_pool = Some(pool.clone());
+                pool
+            }
+            (None, None) => {
+                let pool = CacheResidencyPool::for_paged_options(&options)
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
+                self.cache_pool = Some(pool.clone());
+                pool
+            }
+        };
+        let options = options
+            .with_pool(pool)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(CacheResidencyPolicy::Paged(options))
+    }
+
+    fn bind_existing_cache_pool(&mut self, requested: &CacheResidencyPool) -> Result<(), Error> {
+        match &self.cache_pool {
+            Some(pool) if pool != requested => Err(Error::Parallel(format!(
+                "pipeline scheduler cache pool {} does not match restored cache pool {}",
+                pool.id(),
+                requested.id()
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                self.cache_pool = Some(requested.clone());
+                Ok(())
+            }
+        }
     }
 
     fn validate_model(&self, model: &PipelineModel) -> Result<(), Error> {
@@ -24854,6 +24933,72 @@ mod tests {
         let released = scheduler.release_request_cache(second_request).unwrap();
         assert_eq!(released.global_layers(), vec![0]);
         assert_eq!(scheduler.request_status(second_request), None);
+    }
+
+    #[test]
+    fn pipeline_scheduler_owns_one_pool_across_request_lifecycle() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut source = llama::ResidentModel::new(llama_args(false), stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let (first, _) = llama_pipeline_stages(&source, stream);
+        let pool = CacheResidencyPool::new(
+            crate::CachePoolLimits::new(2 << 20, 2 << 20, 1 << 20, 0).unwrap(),
+        );
+        let mut scheduler = PipelineInferenceScheduler::new_with_cache_pool(
+            &first,
+            SchedulerLimits::new(2, 2).unwrap(),
+            pool.clone(),
+        )
+        .unwrap();
+        let options = || {
+            PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true)
+        };
+        let first_request = RequestId::new(101);
+        let second_request = RequestId::new(202);
+        scheduler
+            .register_request_with_options(
+                &first,
+                first_request,
+                CacheResidencyPolicy::Paged(options()),
+            )
+            .unwrap();
+        scheduler
+            .register_request_with_options(
+                &first,
+                second_request,
+                CacheResidencyPolicy::Paged(options()),
+            )
+            .unwrap();
+        let report = scheduler.cache_pool_report().unwrap().unwrap();
+        assert_eq!(report.pool_id, pool.id());
+        assert_eq!(report.managers, 2);
+
+        scheduler.cancel_request(first_request).unwrap();
+        assert_eq!(scheduler.cache_pool_report().unwrap().unwrap().managers, 1);
+        let foreign_pool = CacheResidencyPool::new(
+            crate::CachePoolLimits::new(2 << 20, 2 << 20, 1 << 20, 0).unwrap(),
+        );
+        let foreign_options = options().with_pool(foreign_pool).unwrap();
+        let mismatch = scheduler
+            .register_request_with_options(
+                &first,
+                RequestId::new(303),
+                CacheResidencyPolicy::Paged(foreign_options),
+            )
+            .unwrap_err();
+        assert!(mismatch
+            .to_string()
+            .contains("does not match requested pool"));
+        scheduler.finish_request(second_request).unwrap();
+        let report = scheduler.cache_pool_report().unwrap().unwrap();
+        assert_eq!(report.managers, 0);
+        assert_eq!(report.current_device_bytes, 0);
+        assert_eq!(report.current_host_bytes, 0);
+        assert_eq!(report.current_transfer_in_flight_bytes, 0);
+        assert_eq!(report.current_disk_bytes, 0);
     }
 
     #[test]

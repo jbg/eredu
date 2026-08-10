@@ -41,6 +41,8 @@ const PROMPT_CACHE_GENERATIONS_DIRECTORY: &str = ".generations";
 const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
 pub(crate) const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CACHE_POOL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CACHE_POOL_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_LIVE_SHARD_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_WRITE_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_DEMOTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -54,6 +56,389 @@ pub enum CacheResidencyPolicy {
     Device,
     /// Store sealed state in token-addressable blocks under finite budgets.
     Paged(PagedCacheOptions),
+}
+
+/// Process-wide finite limits shared by independently owned live caches.
+///
+/// Per-cache limits remain in [`PagedCacheOptions`] so one request cannot
+/// monopolize a pool. These limits are the additional aggregate admission
+/// boundary across every manager attached to the pool.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CachePoolLimits {
+    device_bytes: u64,
+    host_bytes: u64,
+    transfer_in_flight_bytes: u64,
+    disk_bytes: u64,
+}
+
+impl CachePoolLimits {
+    /// Creates finite aggregate cache limits. Device and transfer capacity
+    /// must be nonzero; zero host or disk capacity disables that tier.
+    pub fn new(
+        device_bytes: u64,
+        host_bytes: u64,
+        transfer_in_flight_bytes: u64,
+        disk_bytes: u64,
+    ) -> Result<Self, CacheResidencyError> {
+        if device_bytes == 0 {
+            return Err(CacheResidencyError::InvalidOptions(
+                "cache pool device budget must be nonzero".into(),
+            ));
+        }
+        if transfer_in_flight_bytes == 0 {
+            return Err(CacheResidencyError::InvalidOptions(
+                "cache pool transfer-in-flight budget must be nonzero".into(),
+            ));
+        }
+        Ok(Self {
+            device_bytes,
+            host_bytes,
+            transfer_in_flight_bytes,
+            disk_bytes,
+        })
+    }
+
+    /// Aggregate device-cache capacity.
+    pub const fn device_bytes(self) -> u64 {
+        self.device_bytes
+    }
+
+    /// Aggregate host-cache capacity.
+    pub const fn host_bytes(self) -> u64 {
+        self.host_bytes
+    }
+
+    /// Aggregate bytes retained by asynchronous transfers.
+    pub const fn transfer_in_flight_bytes(self) -> u64 {
+        self.transfer_in_flight_bytes
+    }
+
+    /// Aggregate live-cache disk capacity. Zero disables live disk storage.
+    pub const fn disk_bytes(self) -> u64 {
+        self.disk_bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct CachePoolUsage {
+    device_bytes: u64,
+    host_bytes: u64,
+    transfer_in_flight_bytes: u64,
+    disk_bytes: u64,
+}
+
+impl CachePoolUsage {
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            device_bytes: self.device_bytes.saturating_add(other.device_bytes),
+            host_bytes: self.host_bytes.saturating_add(other.host_bytes),
+            transfer_in_flight_bytes: self
+                .transfer_in_flight_bytes
+                .saturating_add(other.transfer_in_flight_bytes),
+            disk_bytes: self.disk_bytes.saturating_add(other.disk_bytes),
+        }
+    }
+
+    fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            device_bytes: self.device_bytes.saturating_sub(other.device_bytes),
+            host_bytes: self.host_bytes.saturating_sub(other.host_bytes),
+            transfer_in_flight_bytes: self
+                .transfer_in_flight_bytes
+                .saturating_sub(other.transfer_in_flight_bytes),
+            disk_bytes: self.disk_bytes.saturating_sub(other.disk_bytes),
+        }
+    }
+}
+
+/// Aggregate process-pool occupancy and high-water marks.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CachePoolReport {
+    /// Stable process-local pool identity.
+    pub pool_id: u64,
+    /// Number of live cache managers contributing occupancy.
+    pub managers: usize,
+    /// Current aggregate device bytes.
+    pub current_device_bytes: u64,
+    /// Peak aggregate device bytes successfully admitted.
+    pub peak_device_bytes: u64,
+    /// Current aggregate host bytes.
+    pub current_host_bytes: u64,
+    /// Peak aggregate host bytes successfully admitted.
+    pub peak_host_bytes: u64,
+    /// Current bytes retained by in-flight transfers.
+    pub current_transfer_in_flight_bytes: u64,
+    /// Peak bytes retained by in-flight transfers.
+    pub peak_transfer_in_flight_bytes: u64,
+    /// Current disk bytes, including pending write reservations.
+    pub current_disk_bytes: u64,
+    /// Peak disk bytes successfully admitted.
+    pub peak_disk_bytes: u64,
+    /// Aggregate finite limits.
+    pub limits: CachePoolLimits,
+}
+
+#[derive(Debug)]
+struct CachePoolState {
+    managers: HashMap<u64, CachePoolUsage>,
+    reservations: HashMap<u64, CachePoolUsage>,
+    current: CachePoolUsage,
+    peak: CachePoolUsage,
+}
+
+/// Shareable aggregate accounting pool for scheduler-owned and standalone caches.
+#[derive(Clone)]
+pub struct CacheResidencyPool {
+    id: u64,
+    limits: CachePoolLimits,
+    state: Arc<Mutex<CachePoolState>>,
+}
+
+impl std::fmt::Debug for CacheResidencyPool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CacheResidencyPool")
+            .field("id", &self.id)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for CacheResidencyPool {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl Eq for CacheResidencyPool {}
+
+impl CacheResidencyPool {
+    /// Creates an empty process pool under aggregate finite limits.
+    pub fn new(limits: CachePoolLimits) -> Self {
+        Self {
+            id: NEXT_CACHE_POOL_ID.fetch_add(1, Ordering::Relaxed),
+            limits,
+            state: Arc::new(Mutex::new(CachePoolState {
+                managers: HashMap::new(),
+                reservations: HashMap::new(),
+                current: CachePoolUsage::default(),
+                peak: CachePoolUsage::default(),
+            })),
+        }
+    }
+
+    /// Creates a pool whose aggregate limits match one paged-cache policy.
+    /// This is useful for a scheduler that learns its cache policy on the first
+    /// request and then binds subsequent requests to the same pool.
+    pub fn for_paged_options(options: &PagedCacheOptions) -> Result<Self, CacheResidencyError> {
+        let disk_bytes = match options.live_disk_policy() {
+            LiveCacheDiskPolicy::Disabled => 0,
+            LiveCacheDiskPolicy::Enabled { budget_bytes, .. } => *budget_bytes,
+        };
+        let transfer_bytes = options
+            .device_budget_bytes()
+            .max(options.host_budget_bytes())
+            .max(1);
+        Ok(Self::new(CachePoolLimits::new(
+            options.device_budget_bytes(),
+            options.host_budget_bytes(),
+            transfer_bytes,
+            disk_bytes,
+        )?))
+    }
+
+    /// Returns this pool's stable process-local identity.
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Returns aggregate finite limits.
+    pub const fn limits(&self) -> CachePoolLimits {
+        self.limits
+    }
+
+    /// Returns aggregate current occupancy and high-water marks.
+    pub fn report(&self) -> Result<CachePoolReport, CacheResidencyError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CacheResidencyError::PoolPoisoned)?;
+        Ok(CachePoolReport {
+            pool_id: self.id,
+            managers: state.managers.len(),
+            current_device_bytes: state.current.device_bytes,
+            peak_device_bytes: state.peak.device_bytes,
+            current_host_bytes: state.current.host_bytes,
+            peak_host_bytes: state.peak.host_bytes,
+            current_transfer_in_flight_bytes: state.current.transfer_in_flight_bytes,
+            peak_transfer_in_flight_bytes: state.peak.transfer_in_flight_bytes,
+            current_disk_bytes: state.current.disk_bytes,
+            peak_disk_bytes: state.peak.disk_bytes,
+            limits: self.limits,
+        })
+    }
+
+    fn update_manager(
+        &self,
+        manager: u64,
+        usage: CachePoolUsage,
+    ) -> Result<CachePoolUsage, CacheResidencyError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CacheResidencyError::PoolPoisoned)?;
+        let previous = state.managers.insert(manager, usage).unwrap_or_default();
+        state.current = state.current.saturating_sub(previous).saturating_add(usage);
+        if state.current.device_bytes <= self.limits.device_bytes {
+            state.peak.device_bytes = state.peak.device_bytes.max(state.current.device_bytes);
+        }
+        if state.current.host_bytes <= self.limits.host_bytes {
+            state.peak.host_bytes = state.peak.host_bytes.max(state.current.host_bytes);
+        }
+        if state.current.transfer_in_flight_bytes <= self.limits.transfer_in_flight_bytes {
+            state.peak.transfer_in_flight_bytes = state
+                .peak
+                .transfer_in_flight_bytes
+                .max(state.current.transfer_in_flight_bytes);
+        }
+        if state.current.disk_bytes <= self.limits.disk_bytes {
+            state.peak.disk_bytes = state.peak.disk_bytes.max(state.current.disk_bytes);
+        }
+        Ok(state.current)
+    }
+
+    fn remove_manager(&self, manager: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(previous) = state.managers.remove(&manager) {
+                state.current = state.current.saturating_sub(previous);
+            }
+        }
+    }
+
+    fn reserve_transfer(&self, bytes: u64) -> Result<CachePoolReservation, CacheResidencyError> {
+        self.reserve_additional(CachePoolUsage {
+            transfer_in_flight_bytes: bytes,
+            ..CachePoolUsage::default()
+        })
+    }
+
+    fn reserve_additional(
+        &self,
+        usage: CachePoolUsage,
+    ) -> Result<CachePoolReservation, CacheResidencyError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CacheResidencyError::PoolPoisoned)?;
+        Self::validate_additional(state.current, usage, self.limits)?;
+        let required = state.current.saturating_add(usage);
+        let reservation = NEXT_CACHE_POOL_RESERVATION_ID.fetch_add(1, Ordering::Relaxed);
+        state.reservations.insert(reservation, usage);
+        state.current = required;
+        if required.device_bytes <= self.limits.device_bytes {
+            state.peak.device_bytes = state.peak.device_bytes.max(required.device_bytes);
+        }
+        if required.host_bytes <= self.limits.host_bytes {
+            state.peak.host_bytes = state.peak.host_bytes.max(required.host_bytes);
+        }
+        if required.transfer_in_flight_bytes <= self.limits.transfer_in_flight_bytes {
+            state.peak.transfer_in_flight_bytes = state
+                .peak
+                .transfer_in_flight_bytes
+                .max(required.transfer_in_flight_bytes);
+        }
+        if required.disk_bytes <= self.limits.disk_bytes {
+            state.peak.disk_bytes = state.peak.disk_bytes.max(required.disk_bytes);
+        }
+        Ok(CachePoolReservation {
+            reservation,
+            pool: self.clone(),
+        })
+    }
+
+    fn validate_additional(
+        current: CachePoolUsage,
+        usage: CachePoolUsage,
+        limits: CachePoolLimits,
+    ) -> Result<(), CacheResidencyError> {
+        let required = current.saturating_add(usage);
+        for (resource, additional, required, budget) in [
+            (
+                CachePoolResource::Device,
+                usage.device_bytes,
+                required.device_bytes,
+                limits.device_bytes,
+            ),
+            (
+                CachePoolResource::Host,
+                usage.host_bytes,
+                required.host_bytes,
+                limits.host_bytes,
+            ),
+            (
+                CachePoolResource::TransferInFlight,
+                usage.transfer_in_flight_bytes,
+                required.transfer_in_flight_bytes,
+                limits.transfer_in_flight_bytes,
+            ),
+            (
+                CachePoolResource::Disk,
+                usage.disk_bytes,
+                required.disk_bytes,
+                limits.disk_bytes,
+            ),
+        ] {
+            if additional != 0 && required > budget {
+                return Err(CacheResidencyError::PoolBudgetExceeded {
+                    resource,
+                    required,
+                    budget,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CachePoolReservation {
+    reservation: u64,
+    pool: CacheResidencyPool,
+}
+
+impl Drop for CachePoolReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.pool.state.lock() {
+            if let Some(usage) = state.reservations.remove(&self.reservation) {
+                state.current = state.current.saturating_sub(usage);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachePoolMembership {
+    manager: u64,
+    pool: CacheResidencyPool,
+}
+
+impl Drop for CachePoolMembership {
+    fn drop(&mut self) {
+        self.pool.remove_manager(self.manager);
+    }
+}
+
+/// Resource axis named by an aggregate pool admission error.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CachePoolResource {
+    /// Device-resident cache allocations.
+    Device,
+    /// Host-transfer cache allocations.
+    Host,
+    /// Buffers retained until asynchronous transfer completion.
+    TransferInFlight,
+    /// Live-cache disk files and pending write reservations.
+    Disk,
 }
 
 /// Controls optional disk backing for a live inference cache.
@@ -85,6 +470,7 @@ pub struct PagedCacheOptions {
     retain_discarded_for_persistence: bool,
     live_disk: LiveCacheDiskPolicy,
     sample_process: bool,
+    pool: Option<Arc<CacheResidencyPool>>,
 }
 
 impl PagedCacheOptions {
@@ -120,6 +506,7 @@ impl PagedCacheOptions {
             retain_discarded_for_persistence: false,
             live_disk: LiveCacheDiskPolicy::Disabled,
             sample_process: false,
+            pool: None,
         })
     }
 
@@ -178,6 +565,38 @@ impl PagedCacheOptions {
         self
     }
 
+    /// Attaches this per-cache policy to an aggregate process pool.
+    ///
+    /// Clones retain the same pool identity, allowing high-level, tensor-
+    /// parallel, expert-parallel, and pipeline constructors to share one
+    /// scheduler-owned accounting boundary without architecture dispatch.
+    pub fn with_pool(mut self, pool: CacheResidencyPool) -> Result<Self, CacheResidencyError> {
+        if self.device_budget_bytes > pool.limits().device_bytes() {
+            return Err(CacheResidencyError::InvalidOptions(format!(
+                "per-cache device budget {} exceeds cache pool budget {}",
+                self.device_budget_bytes,
+                pool.limits().device_bytes()
+            )));
+        }
+        if self.host_budget_bytes > pool.limits().host_bytes() {
+            return Err(CacheResidencyError::InvalidOptions(format!(
+                "per-cache host budget {} exceeds cache pool budget {}",
+                self.host_budget_bytes,
+                pool.limits().host_bytes()
+            )));
+        }
+        if let LiveCacheDiskPolicy::Enabled { budget_bytes, .. } = &self.live_disk {
+            if *budget_bytes > pool.limits().disk_bytes() {
+                return Err(CacheResidencyError::InvalidOptions(format!(
+                    "per-cache disk budget {budget_bytes} exceeds cache pool budget {}",
+                    pool.limits().disk_bytes()
+                )));
+            }
+        }
+        self.pool = Some(Arc::new(pool));
+        Ok(self)
+    }
+
     /// Returns the block size in tokens.
     pub const fn block_size_tokens(&self) -> i32 {
         self.block_size_tokens
@@ -211,6 +630,11 @@ impl PagedCacheOptions {
     /// Returns the live disk policy.
     pub const fn live_disk_policy(&self) -> &LiveCacheDiskPolicy {
         &self.live_disk
+    }
+
+    /// Returns the explicitly attached aggregate pool, if any.
+    pub fn pool(&self) -> Option<&CacheResidencyPool> {
+        self.pool.as_deref()
     }
 }
 
@@ -1794,6 +2218,8 @@ struct CacheCounters {
 
 #[derive(Debug)]
 struct CacheManagerState {
+    pool: CacheResidencyPool,
+    pool_manager_id: u64,
     generation: u64,
     background_disk_error: Option<String>,
     access_clock: u64,
@@ -1823,14 +2249,23 @@ impl CacheManagerState {
     }
 }
 
-/// Shared architecture-independent manager enforcing budgets across all layers.
-#[derive(Debug, Clone)]
-pub struct CacheResidencyManager {
-    session_id: u64,
+#[derive(Debug)]
+struct CacheResidencyManagerInner {
     options: PagedCacheOptions,
     state: Arc<Mutex<CacheManagerState>>,
     host_demotion_worker: Arc<HostDemotionWorker>,
     disk_worker: Option<Arc<DiskWorker>>,
+    pool_membership: Arc<CachePoolMembership>,
+}
+
+/// Shared architecture-independent manager enforcing budgets across all layers.
+///
+/// Clones retain one compact shared inner allocation containing the catalog,
+/// workers, options, and process-pool membership.
+#[derive(Debug, Clone)]
+pub struct CacheResidencyManager {
+    session_id: u64,
+    inner: Arc<CacheResidencyManagerInner>,
 }
 
 enum HostDemotionProgress {
@@ -1870,28 +2305,43 @@ impl CacheResidencyManager {
             LiveCacheDiskPolicy::Disabled => None,
             LiveCacheDiskPolicy::Enabled { budget_bytes, .. } => Some(*budget_bytes),
         };
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let pool = match options.pool.clone() {
+            Some(pool) => pool.as_ref().clone(),
+            None => CacheResidencyPool::for_paged_options(&options)?,
+        };
+        pool.update_manager(session_id, CachePoolUsage::default())?;
+        let pool_membership = Arc::new(CachePoolMembership {
+            manager: session_id,
+            pool: pool.clone(),
+        });
         Ok(Self {
-            session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
-            options,
-            state: Arc::new(Mutex::new(CacheManagerState {
-                generation: 0,
-                background_disk_error: None,
-                access_clock: 0,
-                blocks: BTreeMap::new(),
-                tails: HashMap::new(),
-                host_write_reservations: HashMap::new(),
-                retiring_host_demotions: HashMap::new(),
-                transfer_device: None,
-                layer_activity: BTreeMap::new(),
-                layer_activity_overflow: CacheLayerActivityCounters::default(),
-                counters,
-                recent_device_blocks,
-                device_budget_bytes,
-                host_budget_bytes,
-                disk_budget_bytes,
-            })),
-            host_demotion_worker,
-            disk_worker,
+            session_id,
+            inner: Arc::new(CacheResidencyManagerInner {
+                options,
+                state: Arc::new(Mutex::new(CacheManagerState {
+                    pool,
+                    pool_manager_id: session_id,
+                    generation: 0,
+                    background_disk_error: None,
+                    access_clock: 0,
+                    blocks: BTreeMap::new(),
+                    tails: HashMap::new(),
+                    host_write_reservations: HashMap::new(),
+                    retiring_host_demotions: HashMap::new(),
+                    transfer_device: None,
+                    layer_activity: BTreeMap::new(),
+                    layer_activity_overflow: CacheLayerActivityCounters::default(),
+                    counters,
+                    recent_device_blocks,
+                    device_budget_bytes,
+                    host_budget_bytes,
+                    disk_budget_bytes,
+                })),
+                host_demotion_worker,
+                disk_worker,
+                pool_membership,
+            }),
         })
     }
 
@@ -1901,12 +2351,18 @@ impl CacheResidencyManager {
     }
 
     /// Returns validated paged-cache options.
-    pub const fn options(&self) -> &PagedCacheOptions {
-        &self.options
+    pub fn options(&self) -> &PagedCacheOptions {
+        &self.inner.options
+    }
+
+    /// Returns the aggregate process pool accounting for this manager.
+    pub fn pool(&self) -> &CacheResidencyPool {
+        &self.inner.pool_membership.pool
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CacheManagerState>, CacheResidencyError> {
-        self.state
+        self.inner
+            .state
             .lock()
             .map_err(|_| CacheResidencyError::ManagerPoisoned)
     }
@@ -2243,12 +2699,18 @@ impl CacheResidencyManager {
                     self.finish_device_demotion(&ticket)?;
                 }
                 CacheBlockPhysicalState::Disk { location, read } => {
-                    let worker = self.disk_worker.as_ref().ok_or_else(|| {
+                    let worker = self.inner.disk_worker.as_ref().ok_or_else(|| {
                         CacheResidencyError::Runtime("cache disk worker is unavailable".into())
                     })?;
-                    let (ticket, submission, joined) = match read {
-                        DiskCacheReadState::Reading(pending) => (pending.ticket, None, true),
+                    let (ticket, submission, joined, _transfer_reservation) = match read {
+                        DiskCacheReadState::Reading(pending) => (pending.ticket, None, true, None),
                         DiskCacheReadState::Ready => {
+                            let bytes = state
+                                .blocks
+                                .get(id)
+                                .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
+                                .bytes;
+                            let transfer_reservation = Some(state.pool.reserve_transfer(bytes)?);
                             let submission = worker.prepare_read(
                                 generation,
                                 id,
@@ -2266,7 +2728,7 @@ impl CacheResidencyManager {
                                     ticket: ticket.clone(),
                                 }),
                             };
-                            (ticket, Some(submission), false)
+                            (ticket, Some(submission), false, transfer_reservation)
                         }
                     };
                     drop(state);
@@ -2361,6 +2823,12 @@ impl CacheResidencyManager {
                             continue;
                         }
                     };
+                    let bytes = state
+                        .blocks
+                        .get(id)
+                        .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
+                        .bytes;
+                    let transfer_reservation = state.pool.reserve_transfer(bytes)?;
                     let (device_arrays, completions) = block.copy_to_device(transfer_stream)?;
                     if state.generation != generation {
                         return Err(CacheResidencyError::DiskOperationCancelled { generation });
@@ -2422,6 +2890,7 @@ impl CacheResidencyManager {
                         arrays: device_arrays,
                         manager: self.clone(),
                         completions,
+                        _transfer_reservation: Some(transfer_reservation),
                         released: false,
                     });
                 }
@@ -2479,6 +2948,7 @@ impl CacheResidencyManager {
                         arrays,
                         manager: self.clone(),
                         completions: vec![completion],
+                        _transfer_reservation: None,
                         released: false,
                     });
                 }
@@ -2493,7 +2963,7 @@ impl CacheResidencyManager {
         visible_start: i64,
         prefix_tokens: i64,
     ) -> Result<(), CacheResidencyError> {
-        if self.options.retain_discarded_for_persistence {
+        if self.options().retain_discarded_for_persistence {
             return Ok(());
         }
         let mut state = self.lock()?;
@@ -2554,7 +3024,7 @@ impl CacheResidencyManager {
     pub fn report(&self) -> Result<CacheResidencyReport, CacheResidencyError> {
         let mut state = self.lock()?;
         update_report_totals(&mut state);
-        if self.options.sample_process {
+        if self.options().sample_process {
             sample_process(&mut state.counters.report);
         }
         Ok(state.counters.report.clone())
@@ -2566,7 +3036,7 @@ impl CacheResidencyManager {
             match ticket {
                 PendingCacheOperation::Disk(ticket) => match ticket.wait_for_task_resources() {
                     Ok(()) => {
-                        if let Some(worker) = &self.disk_worker {
+                        if let Some(worker) = &self.inner.disk_worker {
                             worker.retire(ticket);
                         }
                     }
@@ -2628,7 +3098,7 @@ impl CacheResidencyManager {
 
     fn release_lease(&self, id: &CacheBlockId) {
         let mut background_failed = false;
-        if let Ok(mut state) = self.state.lock() {
+        if let Ok(mut state) = self.inner.state.lock() {
             if let Some(record) = state.blocks.get_mut(id) {
                 record.leases = record.leases.saturating_sub(1);
             }
@@ -2666,13 +3136,13 @@ impl CacheResidencyManager {
             return Ok(HostDemotionProgress::Freed);
         }
 
-        let (directory, budget_bytes) = match &self.options.live_disk {
+        let (directory, budget_bytes) = match &self.options().live_disk {
             LiveCacheDiskPolicy::Disabled => {
                 state.counters.report.failures += 1;
                 state.layer_activity_mut(id.global_layer).failures += 1;
                 return Err(CacheResidencyError::LiveDiskRequired {
                     required: state.counters.report.current_host_bytes,
-                    budget: self.options.host_budget_bytes,
+                    budget: self.options().host_budget_bytes,
                 });
             }
             LiveCacheDiskPolicy::Enabled {
@@ -2681,7 +3151,7 @@ impl CacheResidencyManager {
                 ..
             } => (directory.clone(), *budget_bytes),
         };
-        let worker = self.disk_worker.as_ref().ok_or_else(|| {
+        let worker = self.inner.disk_worker.as_ref().ok_or_else(|| {
             CacheResidencyError::Runtime("live cache disk worker is unavailable".into())
         })?;
         let record = state.blocks.get(id).expect("host block exists");
@@ -2694,8 +3164,13 @@ impl CacheResidencyManager {
             .saturating_add(
                 state
                     .host_write_reservations
-                    .values()
-                    .map(|reservation| reservation.bytes)
+                    .iter()
+                    .filter(|(key, _)| {
+                        !state.blocks.get(&key.id).is_some_and(|record| {
+                            record.disk().is_some_and(|location| !location.persistent)
+                        })
+                    })
+                    .map(|(_, reservation)| reservation.bytes)
                     .sum(),
             );
         let projected = live_disk_bytes.saturating_add(record.bytes);
@@ -2708,6 +3183,11 @@ impl CacheResidencyManager {
                 budget: budget_bytes,
             });
         }
+        let pool_admission = state.pool.reserve_additional(CachePoolUsage {
+            transfer_in_flight_bytes: record.bytes,
+            disk_bytes: record.bytes,
+            ..CachePoolUsage::default()
+        })?;
         let block = record
             .host_block()
             .ok_or_else(|| CacheResidencyError::MissingResidentArrays(id.clone()))?
@@ -2717,7 +3197,7 @@ impl CacheResidencyManager {
             &directory,
             id,
             &block,
-            Arc::downgrade(&self.state),
+            Arc::downgrade(&self.inner.state),
         )?;
         let ticket = submission.ticket.clone();
         let record_bytes = record.bytes;
@@ -2741,6 +3221,7 @@ impl CacheResidencyManager {
             ticket: ticket.clone(),
         });
         update_report_totals(&mut state);
+        drop(pool_admission);
         drop(state);
 
         let enqueue_started = Instant::now();
@@ -2838,15 +3319,21 @@ impl CacheResidencyManager {
             .report
             .current_host_bytes
             .saturating_add(record.bytes);
-        if required_host_bytes > self.options.host_budget_bytes {
+        if required_host_bytes > self.options().host_budget_bytes {
             return Err(CacheResidencyError::BudgetExceeded {
                 tier: CacheTier::Host,
                 required: required_host_bytes,
-                budget: self.options.host_budget_bytes,
+                budget: self.options().host_budget_bytes,
             });
         }
+        let pool_admission = state.pool.reserve_additional(CachePoolUsage {
+            host_bytes: record.bytes,
+            transfer_in_flight_bytes: record.bytes,
+            ..CachePoolUsage::default()
+        })?;
         let device = state.transfer_device.unwrap_or(CacheTransferDevice::CPU);
         let ticket = self
+            .inner
             .host_demotion_worker
             .submit(id, arrays.clone(), device)?;
         let record = state.blocks.get_mut(id).expect("demotion block exists");
@@ -2855,6 +3342,7 @@ impl CacheResidencyManager {
             ticket: ticket.clone(),
         };
         update_report_totals(&mut state);
+        drop(pool_admission);
         Ok(ticket)
     }
 
@@ -2935,7 +3423,12 @@ impl CacheResidencyManager {
                 )));
             }
             update_report_totals(&mut state);
-            if state.counters.report.current_device_bytes > self.options.device_budget_bytes {
+            let pool_report = state.pool.report()?;
+            let pool_device_over =
+                pool_report.current_device_bytes > pool_report.limits.device_bytes();
+            let local_device_over =
+                state.counters.report.current_device_bytes > self.options().device_budget_bytes;
+            if local_device_over || pool_device_over {
                 if let Some(ticket) = state
                     .blocks
                     .values()
@@ -2950,8 +3443,8 @@ impl CacheResidencyManager {
                     &state,
                     CacheTier::Device,
                     required,
-                    self.options.recent_device_blocks,
-                    self.options.eviction_policy,
+                    self.options().recent_device_blocks,
+                    self.options().eviction_policy,
                 )
                 .or_else(|| {
                     // Recent protection remains strict for mutation capacity,
@@ -2962,7 +3455,7 @@ impl CacheResidencyManager {
                             CacheTier::Device,
                             required,
                             0,
-                            self.options.eviction_policy,
+                            self.options().eviction_policy,
                         )
                     } else {
                         None
@@ -2975,10 +3468,18 @@ impl CacheResidencyManager {
                     } else {
                         state.layer_activity_overflow.stats.failures += 1;
                     }
-                    return Err(CacheResidencyError::BudgetExceeded {
-                        tier: CacheTier::Device,
-                        required: state.counters.report.current_device_bytes,
-                        budget: self.options.device_budget_bytes,
+                    return Err(if pool_device_over && !local_device_over {
+                        CacheResidencyError::PoolBudgetExceeded {
+                            resource: CachePoolResource::Device,
+                            required: pool_report.current_device_bytes,
+                            budget: pool_report.limits.device_bytes(),
+                        }
+                    } else {
+                        CacheResidencyError::BudgetExceeded {
+                            tier: CacheTier::Device,
+                            required: state.counters.report.current_device_bytes,
+                            budget: self.options().device_budget_bytes,
+                        }
                     });
                 };
                 if let Some(location) = state
@@ -3002,14 +3503,14 @@ impl CacheResidencyManager {
                     .report
                     .current_host_bytes
                     .saturating_add(candidate_bytes);
-                if required_host_bytes > self.options.host_budget_bytes {
-                    if candidate_bytes > self.options.host_budget_bytes {
+                if required_host_bytes > self.options().host_budget_bytes {
+                    if candidate_bytes > self.options().host_budget_bytes {
                         state.counters.report.failures += 1;
                         state.layer_activity_mut(id.global_layer).failures += 1;
                         return Err(CacheResidencyError::BudgetExceeded {
                             tier: CacheTier::Host,
                             required: candidate_bytes,
-                            budget: self.options.host_budget_bytes,
+                            budget: self.options().host_budget_bytes,
                         });
                     }
                     let host_candidate = eviction_candidate(
@@ -3017,7 +3518,7 @@ impl CacheResidencyManager {
                         CacheTier::Host,
                         required,
                         0,
-                        self.options.eviction_policy,
+                        self.options().eviction_policy,
                     );
                     let pending = state
                         .host_write_reservations
@@ -3051,16 +3552,16 @@ impl CacheResidencyManager {
                     let mut state = self.lock()?;
                     state.counters.report.failures += 1;
                     state.layer_activity_mut(id.global_layer).failures += 1;
-                    return Err(match &self.options.live_disk {
+                    return Err(match &self.options().live_disk {
                         LiveCacheDiskPolicy::Disabled => CacheResidencyError::LiveDiskRequired {
                             required: required_host_bytes,
-                            budget: self.options.host_budget_bytes,
+                            budget: self.options().host_budget_bytes,
                         },
                         LiveCacheDiskPolicy::Enabled { .. } => {
                             CacheResidencyError::BudgetExceeded {
                                 tier: CacheTier::Host,
                                 required: required_host_bytes,
-                                budget: self.options.host_budget_bytes,
+                                budget: self.options().host_budget_bytes,
                             }
                         }
                     });
@@ -3070,13 +3571,17 @@ impl CacheResidencyManager {
                 continue;
             }
 
-            if state.counters.report.current_host_bytes > self.options.host_budget_bytes {
+            let pool_report = state.pool.report()?;
+            let pool_host_over = pool_report.current_host_bytes > pool_report.limits.host_bytes();
+            let local_host_over =
+                state.counters.report.current_host_bytes > self.options().host_budget_bytes;
+            if local_host_over || pool_host_over {
                 let candidate = eviction_candidate(
                     &state,
                     CacheTier::Host,
                     required,
                     0,
-                    self.options.eviction_policy,
+                    self.options().eviction_policy,
                 );
                 let pending = state
                     .host_write_reservations
@@ -3115,26 +3620,37 @@ impl CacheResidencyManager {
                 } else {
                     state.layer_activity_overflow.stats.failures += 1;
                 }
-                return Err(CacheResidencyError::BudgetExceeded {
-                    tier: CacheTier::Host,
-                    required: required_host_bytes,
-                    budget: self.options.host_budget_bytes,
+                return Err(if pool_host_over && !local_host_over {
+                    CacheResidencyError::PoolBudgetExceeded {
+                        resource: CachePoolResource::Host,
+                        required: pool_report.current_host_bytes,
+                        budget: pool_report.limits.host_bytes(),
+                    }
+                } else {
+                    CacheResidencyError::BudgetExceeded {
+                        tier: CacheTier::Host,
+                        required: required_host_bytes,
+                        budget: self.options().host_budget_bytes,
+                    }
                 });
             }
 
             // Start one background write as soon as the finite host tier fills.
             // It remains charged to host memory until the worker commits and
             // releases its buffers; a later demotion waits only if it needs space.
-            let proactive = matches!(&self.options.live_disk, LiveCacheDiskPolicy::Enabled { .. })
-                && state.counters.report.current_host_bytes != 0
-                && state.counters.report.current_host_bytes >= self.options.host_budget_bytes;
+            let proactive = matches!(
+                &self.options().live_disk,
+                LiveCacheDiskPolicy::Enabled { .. }
+            ) && state.counters.report.current_host_bytes != 0
+                && (state.counters.report.current_host_bytes >= self.options().host_budget_bytes
+                    || pool_report.current_host_bytes >= pool_report.limits.host_bytes());
             let candidate = if proactive {
                 eviction_candidate(
                     &state,
                     CacheTier::Host,
                     required,
                     0,
-                    self.options.eviction_policy,
+                    self.options().eviction_policy,
                 )
             } else {
                 None
@@ -3322,7 +3838,7 @@ impl CacheResidencyManager {
                 layer_count: descriptor.layer_count,
                 global_layer_start: descriptor.global_layer_start,
                 global_layer_end: descriptor.global_layer_end,
-                block_size_tokens: self.options.block_size_tokens,
+                block_size_tokens: self.options().block_size_tokens,
                 batch_size: descriptor.batch_size,
                 total_prefix_tokens: prefix_token_ids.len(),
                 prefix_sha256: hash_token_ids(prefix_token_ids),
@@ -3394,10 +3910,10 @@ impl CacheResidencyManager {
 
 impl Drop for CacheResidencyManager {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.state) != 1 {
+        if Arc::strong_count(&self.inner) != 1 {
             return;
         }
-        if let Ok(state) = self.state.lock() {
+        if let Ok(state) = self.inner.state.lock() {
             for record in state.blocks.values() {
                 remove_ephemeral_file(record);
             }
@@ -3475,7 +3991,7 @@ impl CacheBlockPrefetch {
             .get(id)
             .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
             .bytes;
-        Ok(pending_bytes.saturating_add(next_bytes) <= self.manager.options.device_budget_bytes)
+        Ok(pending_bytes.saturating_add(next_bytes) <= self.manager.options().device_budget_bytes)
     }
 
     #[cfg(test)]
@@ -3509,6 +4025,7 @@ pub(crate) struct CacheBlockLease {
     arrays: CacheBlockArrays,
     manager: CacheResidencyManager,
     completions: Vec<Event>,
+    _transfer_reservation: Option<CachePoolReservation>,
     released: bool,
 }
 
@@ -5428,6 +5945,24 @@ fn update_report_totals(state: &mut CacheManagerState) {
     let device_budget_bytes = state.device_budget_bytes;
     let host_budget_bytes = state.host_budget_bytes;
     let disk_budget_bytes = state.disk_budget_bytes;
+    let pool_disk_bytes = state
+        .blocks
+        .values()
+        .filter(|record| record.disk().is_some_and(|location| !location.persistent))
+        .map(|record| record.bytes)
+        .sum::<u64>()
+        .saturating_add(
+            state
+                .host_write_reservations
+                .iter()
+                .filter(|(key, _)| {
+                    !state.blocks.get(&key.id).is_some_and(|record| {
+                        record.disk().is_some_and(|location| !location.persistent)
+                    })
+                })
+                .map(|(_, reservation)| reservation.bytes)
+                .sum(),
+        );
     let report = &mut state.counters.report;
     report.key_value_blocks = 0;
     report.compressed_latent_blocks = 0;
@@ -5638,6 +6173,17 @@ fn update_report_totals(state: &mut CacheManagerState) {
     report.peak_in_flight_host_demotion_bytes = report
         .peak_in_flight_host_demotion_bytes
         .max(report.in_flight_host_demotion_bytes);
+    let pool_usage = CachePoolUsage {
+        device_bytes: report.current_device_bytes,
+        host_bytes: report.current_host_bytes,
+        transfer_in_flight_bytes: report
+            .in_flight_write_bytes
+            .saturating_add(report.in_flight_host_demotion_bytes),
+        // Pending writes reserve their eventual disk extent before the worker
+        // owns the request, so aggregate disk admission cannot overcommit.
+        disk_bytes: pool_disk_bytes,
+    };
+    let _ = state.pool.update_manager(state.pool_manager_id, pool_usage);
 }
 
 fn eviction_candidate(
@@ -6546,6 +7092,18 @@ pub enum CacheResidencyError {
         /// Configured finite tier budget.
         budget: u64,
     },
+    /// Aggregate process-pool capacity could not admit an operation.
+    #[error(
+        "process cache pool {resource:?} budget exceeded: requires {required} bytes, budget is {budget}"
+    )]
+    PoolBudgetExceeded {
+        /// Aggregate resource that could not admit the operation.
+        resource: CachePoolResource,
+        /// Aggregate bytes required by the operation.
+        required: u64,
+        /// Configured aggregate budget.
+        budget: u64,
+    },
     /// Full-context history exceeded host memory without explicit disk backing.
     #[error(
         "host cache requires {required} bytes but budget is {budget}; enable live disk backing or use a larger finite budget"
@@ -6559,6 +7117,9 @@ pub enum CacheResidencyError {
     /// The manager lock was poisoned by a panic.
     #[error("cache residency manager lock was poisoned")]
     ManagerPoisoned,
+    /// The aggregate process-pool lock was poisoned by a panic.
+    #[error("cache residency process-pool lock was poisoned")]
+    PoolPoisoned,
     /// A queued or in-flight disk operation belonged to an invalidated generation.
     #[error("cache disk operation from generation {generation} was cancelled")]
     DiskOperationCancelled {
@@ -6623,17 +7184,18 @@ mod tests {
         map_prompt_cache_shard, open_prompt_cache, publish_live_block_file,
         publish_prompt_cache_generation, safe_shard_path, validate_prompt_cache_model_identity,
         verify_disk_payload, AttentionPolicy, CacheBlockArrays, CacheBlockId,
-        CacheBlockPhysicalState, CacheBlockRecord, CacheLayerResidencyStats, CacheRankIdentity,
-        CacheRepresentation, CacheResidencyError, CacheResidencyManager, CacheTier,
-        DiskCacheReadState, DiskLocation, DiskOperationKey, DiskOperationKind, DiskResult,
-        DiskTask, DiskWorker, DiskWriteCommit, HostCacheBlock, HostCachePersistence,
-        HostDemotionCompletion, HostDemotionTicket, HostWriteReservation, LayerCachePolicy,
-        LayerSchedule, MutableStateResidency, PagedCacheOptions, PendingDiskOperation,
-        PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheStateTensor, PromptCacheTopology, StateTensorDimension, StateTensorDtype,
-        StateTensorOwner, StateTensorPolicy, StateTensorRole, TemporaryFileGuard,
-        CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
-        PROMPT_CACHE_GENERATIONS_DIRECTORY, PROMPT_CACHE_SCHEMA_VERSION,
+        CacheBlockPhysicalState, CacheBlockRecord, CacheLayerResidencyStats, CachePoolLimits,
+        CachePoolResource, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
+        CacheResidencyManager, CacheResidencyPool, CacheTier, DiskCacheReadState, DiskLocation,
+        DiskOperationKey, DiskOperationKind, DiskResult, DiskTask, DiskWorker, DiskWriteCommit,
+        HostCacheBlock, HostCachePersistence, HostDemotionCompletion, HostDemotionTicket,
+        HostWriteReservation, LayerCachePolicy, LayerSchedule, MutableStateResidency,
+        PagedCacheOptions, PendingDiskOperation, PromptCacheBlock, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheStateTensor, PromptCacheTopology,
+        StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
+        StateTensorRole, TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+        MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_GENERATIONS_DIRECTORY,
+        PROMPT_CACHE_SCHEMA_VERSION,
     };
     use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Stream};
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
@@ -6643,7 +7205,7 @@ mod tests {
         hash::{DefaultHasher, Hash, Hasher},
         io::Write as _,
         path::Path,
-        sync::{mpsc, Arc, OnceLock},
+        sync::{mpsc, Arc, Barrier, OnceLock},
         thread,
         time::Duration,
     };
@@ -6716,6 +7278,155 @@ mod tests {
             },
         );
         manager
+    }
+
+    #[test]
+    fn process_pool_enforces_aggregate_device_budget_and_releases_membership() {
+        let pool = CacheResidencyPool::new(CachePoolLimits::new(20, 20, 20, 0).unwrap());
+        let options = PagedCacheOptions::new(1, 20, 20, 1)
+            .unwrap()
+            .with_pool(pool.clone())
+            .unwrap();
+        let first = CacheResidencyManager::new(options.clone()).unwrap();
+        let second = CacheResidencyManager::new(options).unwrap();
+        let first_layer_handle = first.clone();
+
+        first.set_tail_state(0, 12, 1).unwrap();
+        let error = second.set_tail_state(0, 12, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            CacheResidencyError::PoolBudgetExceeded {
+                resource: CachePoolResource::Device,
+                required: 24,
+                budget: 20,
+            }
+        ));
+        let report = pool.report().unwrap();
+        assert_eq!(report.managers, 2);
+        assert_eq!(report.current_device_bytes, 12);
+        assert_eq!(report.peak_device_bytes, 12);
+
+        drop(first);
+        let report = pool.report().unwrap();
+        assert_eq!(report.managers, 2);
+        assert_eq!(report.current_device_bytes, 12);
+        drop(first_layer_handle);
+        let report = pool.report().unwrap();
+        assert_eq!(report.managers, 1);
+        assert_eq!(report.current_device_bytes, 0);
+        drop(second);
+        assert_eq!(pool.report().unwrap().managers, 0);
+    }
+
+    #[test]
+    fn process_pool_bounds_and_releases_transient_transfer_capacity() {
+        let pool = CacheResidencyPool::new(CachePoolLimits::new(64, 64, 10, 0).unwrap());
+        let first = pool.reserve_transfer(6).unwrap();
+        let error = pool.reserve_transfer(5).unwrap_err();
+        assert!(matches!(
+            error,
+            CacheResidencyError::PoolBudgetExceeded {
+                resource: CachePoolResource::TransferInFlight,
+                required: 11,
+                budget: 10,
+            }
+        ));
+        assert_eq!(pool.report().unwrap().current_transfer_in_flight_bytes, 6);
+        drop(first);
+        assert_eq!(pool.report().unwrap().current_transfer_in_flight_bytes, 0);
+        assert_eq!(pool.report().unwrap().peak_transfer_in_flight_bytes, 6);
+    }
+
+    #[test]
+    fn process_pool_enforces_aggregate_host_and_disk_reservations() {
+        let pool = CacheResidencyPool::new(CachePoolLimits::new(64, 10, 64, 10).unwrap());
+        pool.update_manager(
+            7,
+            super::CachePoolUsage {
+                host_bytes: 8,
+                disk_bytes: 8,
+                ..super::CachePoolUsage::default()
+            },
+        )
+        .unwrap();
+        for (usage, expected) in [
+            (
+                super::CachePoolUsage {
+                    host_bytes: 3,
+                    ..super::CachePoolUsage::default()
+                },
+                CachePoolResource::Host,
+            ),
+            (
+                super::CachePoolUsage {
+                    disk_bytes: 3,
+                    ..super::CachePoolUsage::default()
+                },
+                CachePoolResource::Disk,
+            ),
+        ] {
+            assert!(matches!(
+                pool.reserve_additional(usage),
+                Err(CacheResidencyError::PoolBudgetExceeded {
+                    resource,
+                    required: 11,
+                    budget: 10,
+                }) if resource == expected
+            ));
+        }
+        let report = pool.report().unwrap();
+        assert_eq!(report.current_host_bytes, 8);
+        assert_eq!(report.current_disk_bytes, 8);
+        pool.remove_manager(7);
+        assert_eq!(pool.report().unwrap().current_host_bytes, 0);
+        assert_eq!(pool.report().unwrap().current_disk_bytes, 0);
+    }
+
+    #[test]
+    fn process_pool_admission_is_atomic_across_concurrent_managers() {
+        let pool = CacheResidencyPool::new(CachePoolLimits::new(64, 10, 64, 0).unwrap());
+        let start = Arc::new(Barrier::new(3));
+        let finish = Arc::new(Barrier::new(3));
+        let (sender, receiver) = mpsc::channel();
+        let handles = (0..2)
+            .map(|_| {
+                let pool = pool.clone();
+                let start = Arc::clone(&start);
+                let finish = Arc::clone(&finish);
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    let admission = pool.reserve_additional(super::CachePoolUsage {
+                        host_bytes: 6,
+                        ..super::CachePoolUsage::default()
+                    });
+                    sender.send(admission.is_ok()).unwrap();
+                    finish.wait();
+                    drop(admission);
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(sender);
+        start.wait();
+        let admitted = [receiver.recv().unwrap(), receiver.recv().unwrap()];
+        assert_eq!(admitted.into_iter().filter(|admitted| *admitted).count(), 1);
+        assert_eq!(pool.report().unwrap().current_host_bytes, 6);
+        finish.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(pool.report().unwrap().current_host_bytes, 0);
+    }
+
+    #[test]
+    fn per_cache_limits_cannot_exceed_their_process_pool() {
+        let pool = CacheResidencyPool::new(CachePoolLimits::new(8, 4, 8, 0).unwrap());
+        let error = PagedCacheOptions::new(1, 16, 4, 1)
+            .unwrap()
+            .with_pool(pool)
+            .unwrap_err();
+        assert!(matches!(error, CacheResidencyError::InvalidOptions(_)));
+        assert!(error.to_string().contains("per-cache device budget 16"));
     }
 
     fn prompt_descriptor() -> PromptCacheDescriptor {
@@ -7811,7 +8522,7 @@ mod tests {
                 .with_full_attention(true),
         )
         .unwrap();
-        let worker = manager.disk_worker.as_ref().unwrap();
+        let worker = manager.inner.disk_worker.as_ref().unwrap();
         let id = disk_test_id(0);
         let key = DiskOperationKey {
             generation: 0,
@@ -7841,7 +8552,7 @@ mod tests {
             },
         );
         DiskWriteCommit {
-            state: Arc::downgrade(&manager.state),
+            state: Arc::downgrade(&manager.inner.state),
             key,
             reservation_id: 0,
             armed: true,
@@ -7870,7 +8581,7 @@ mod tests {
             .with_live_disk(directory.path(), 1024, 1)
             .unwrap();
         let manager = CacheResidencyManager::new(options).unwrap();
-        let worker = manager.disk_worker.as_ref().unwrap();
+        let worker = manager.inner.disk_worker.as_ref().unwrap();
         let id = disk_test_id(0);
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -7886,7 +8597,7 @@ mod tests {
                     started: started_tx,
                     release: release_rx,
                     commit: Some(DiskWriteCommit {
-                        state: Arc::downgrade(&manager.state),
+                        state: Arc::downgrade(&manager.inner.state),
                         key: key.clone(),
                         reservation_id: 7,
                         armed: true,
@@ -8388,7 +9099,7 @@ mod tests {
             .with_live_disk(directory.path(), 1024, 1)
             .unwrap();
         let manager = CacheResidencyManager::new(options).unwrap();
-        let worker = manager.disk_worker.as_ref().unwrap();
+        let worker = manager.inner.disk_worker.as_ref().unwrap();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let blocker = worker
@@ -8459,7 +9170,7 @@ mod tests {
             .with_live_disk(directory.path(), 1024, 1)
             .unwrap();
         let manager = CacheResidencyManager::new(options).unwrap();
-        let worker = manager.disk_worker.as_ref().unwrap();
+        let worker = manager.inner.disk_worker.as_ref().unwrap();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let blocker = worker

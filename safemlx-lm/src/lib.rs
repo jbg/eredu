@@ -36,8 +36,9 @@ pub use architectures::llama::layerwise::{
 pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheBlockId, CacheBlockLifecycle, CacheLayerResidencyReport,
-    CacheLayerResidencyStats, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
-    CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, CacheTier, LayerCachePolicy,
+    CacheLayerResidencyStats, CachePoolLimits, CachePoolReport, CachePoolResource,
+    CacheRankIdentity, CacheRepresentation, CacheResidencyError, CacheResidencyManager,
+    CacheResidencyPolicy, CacheResidencyPool, CacheResidencyReport, CacheTier, LayerCachePolicy,
     LiveCacheDiskPolicy, MutableStateResidency, PagedCacheOptions, PromptCacheBlock,
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions, PromptCacheStateTensor,
     PromptCacheTopology, StateResidencyClass, StateTensorDimension, StateTensorDtype,

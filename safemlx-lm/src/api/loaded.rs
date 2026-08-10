@@ -1711,6 +1711,19 @@ impl LoadedModel {
         self.model.new_cache_with_options(policy)
     }
 
+    /// Creates a paged cache attached to an aggregate process-wide pool.
+    pub fn new_cache_in_pool(
+        &self,
+        options: PagedCacheOptions,
+        pool: CacheResidencyPool,
+    ) -> Result<ModelCache, Exception> {
+        let options = options
+            .with_pool(pool)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        self.model
+            .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+    }
+
     /// Returns the canonical cache-relevant architecture identity for this loaded model.
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
         self.model.prompt_cache_architecture_fingerprint()
