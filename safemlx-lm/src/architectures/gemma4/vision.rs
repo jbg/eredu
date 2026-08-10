@@ -726,6 +726,36 @@ impl Gemma4VisionLayerwiseStatic {
         ))
     }
 
+    /// Reconstructs the parameter-free padding and rotary state required by
+    /// a later pipeline owner. Its hidden activation is supplied separately
+    /// by the preceding owner.
+    pub(crate) fn continuation_state(
+        &self,
+        pixel_values: &Array,
+        position_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Gemma4VisionLayerwiseState, Exception> {
+        validate_vision_inputs(pixel_values, position_ids)?;
+        let x_positions = position_ids.try_index_device((.., .., 0), stream)?;
+        let y_positions = position_ids.try_index_device((.., .., 1), stream)?;
+        let padding = x_positions
+            .eq(Array::from_int(-1), stream)?
+            .logical_and(&y_positions.eq(Array::from_int(-1), stream)?, stream)?;
+        let (cos, sin) = vision_rope(
+            position_ids,
+            self.config.head_dim,
+            self.config.rope_theta(),
+            stream,
+        )?;
+        Ok(Gemma4VisionLayerwiseState {
+            position_ids: position_ids.clone(),
+            padding,
+            cos,
+            sin,
+            working_dtype: pixel_values.dtype(),
+        })
+    }
+
     pub(crate) fn finish(
         &self,
         hidden: &Array,

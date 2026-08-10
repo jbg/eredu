@@ -7,11 +7,19 @@
 //! drains bounded, round-robin microbatch queues so different requests can
 //! occupy different pipeline stages concurrently. Communication groups are
 //! borrowed for each operation and are never retained by model state.
-//! Multimodal families place their semantic encoder roots on stage zero and
-//! transport only adapter-declared decoder ingress tensors to later stages;
-//! tower and decoder units share the same rank-local residency plan.
+//! Multimodal encoder, projection, merge, finalization, and decoder groups use
+//! one validated placement DAG with topology-planned payload routes.
+
+mod placement;
+
+pub use placement::{
+    ActiveParallelSubgroup, CheckpointBinding, ExecutionGroupKind, ExecutionGroupPlacement,
+    ExecutionGroupPlacementRequest, PayloadField, PayloadSchema, PlacedExecutionDag,
+    PlacedUnitRange, PlacementRoute, ResidencyBinding, StaticTensorOwnership,
+};
 
 use std::{
+    any::Any,
     collections::{BTreeMap, HashMap},
     ops::Range,
     path::{Path, PathBuf},
@@ -162,6 +170,8 @@ fn build_pipeline_expert_cache(
 /// Immutable, inspectable description of the local pipeline stage.
 #[derive(Debug, Clone)]
 pub struct PipelineStageInfo {
+    /// Authoritative global placement of decoder and multimodal execution groups.
+    pub placement: Arc<PlacedExecutionDag>,
     /// Complete Cartesian topology and local TP/PP/EP coordinates.
     pub topology: ParallelTopology,
     /// Rank in the distributed group.
@@ -180,6 +190,14 @@ pub struct PipelineStageInfo {
     pub embedded_mtp_layers: usize,
     /// Global decoder-layer indices owned by this stage.
     pub global_layer_range: Range<usize>,
+    /// Complete encoder/projector/merge/finalization unit geometry.
+    pub global_encoder_units: usize,
+    /// Encoder/projector/merge/finalization units owned by this PP coordinate.
+    pub local_encoder_units: usize,
+    /// Explicit encoder and merge routes touching this PP coordinate.
+    pub encoder_routes: Vec<PlacementRoute>,
+    /// Conservative concurrent rank-local parameter residency peak.
+    pub concurrent_residency_peak_bytes: u64,
     /// Total routed experts in global model geometry, when applicable.
     pub global_expert_count: Option<usize>,
     /// Checkpoint-global expert ids owned by this stage rank.
@@ -295,6 +313,123 @@ enum ScheduledPipelineIngress {
 enum PreparedPipelineIngress {
     Payload(PreparedModelInput),
     Identity(PreparedModelInputIdentity),
+}
+
+fn send_array_bundle(
+    arrays: &[Array],
+    peer: usize,
+    group: &Group,
+    stream: &Stream,
+) -> Result<Vec<Array>, Error> {
+    let count = Array::from_slice(&[arrays.len() as i32], &[1]);
+    let sent_count = distributed::send(&count, peer, group, stream)?;
+    synchronize_outputs([&sent_count])?;
+    let mut retained = vec![sent_count];
+    for array in arrays {
+        let shape = array.shape();
+        if shape.len() > 8 {
+            return Err(Error::Parallel(format!(
+                "placed payload tensor rank {} exceeds wire maximum 8",
+                shape.len()
+            )));
+        }
+        let mut header = vec![array.dtype() as i32, shape.len() as i32];
+        header.extend(shape);
+        header.resize(10, 0);
+        let header = Array::from_slice(&header, &[10]);
+        let sent_header = distributed::send(&header, peer, group, stream)?;
+        synchronize_outputs([&sent_header])?;
+        retained.push(sent_header);
+        let sent_array = distributed::send(array, peer, group, stream)?;
+        synchronize_outputs([&sent_array])?;
+        retained.push(sent_array);
+    }
+    Ok(retained)
+}
+
+fn recv_array_bundle(peer: usize, group: &Group, stream: &Stream) -> Result<Vec<Array>, Error> {
+    let count = distributed::recv(&[1], Dtype::Int32, peer, group, stream)?;
+    synchronize_outputs([&count])?;
+    let count = usize::try_from(count.try_item::<i32>(stream)?)
+        .map_err(|_| Error::Parallel("placed payload advertised a negative tensor count".into()))?;
+    let mut arrays = Vec::with_capacity(count);
+    for _ in 0..count {
+        let header = distributed::recv(&[10], Dtype::Int32, peer, group, stream)?;
+        synchronize_outputs([&header])?;
+        let evaluated = header.evaluated()?;
+        let header = evaluated.try_as_slice::<i32>().map_err(|error| {
+            Error::Parallel(format!("placed payload header is not readable: {error}"))
+        })?;
+        let dtype = Dtype::try_from(header[0] as u32)
+            .map_err(|_| Error::Parallel("placed payload advertised an invalid dtype".into()))?;
+        let ndim = usize::try_from(header[1]).map_err(|_| {
+            Error::Parallel("placed payload advertised a negative tensor rank".into())
+        })?;
+        if ndim > 8 || header[2..2 + ndim].iter().any(|dimension| *dimension < 0) {
+            return Err(Error::Parallel(
+                "placed payload advertised malformed tensor geometry".into(),
+            ));
+        }
+        arrays.push(distributed::recv(
+            &header[2..2 + ndim],
+            dtype,
+            peer,
+            group,
+            stream,
+        )?);
+        synchronize_outputs([arrays.last().expect("received bundle array")])?;
+    }
+    Ok(arrays)
+}
+
+fn send_prepared_input(
+    input: &PreparedModelInput,
+    peer: usize,
+    group: &Group,
+    stream: &Stream,
+) -> Result<Vec<Array>, Error> {
+    let descriptor = input.identity().descriptor()?;
+    let length = Array::from_slice(&[descriptor.len() as i32], &[1]);
+    let descriptor = Array::from_slice(&descriptor, &[descriptor.len() as i32]);
+    let sent_length = distributed::send(&length, peer, group, stream)?;
+    synchronize_outputs([&sent_length])?;
+    let sent_descriptor = distributed::send(&descriptor, peer, group, stream)?;
+    synchronize_outputs([&sent_descriptor])?;
+    let mut retained = vec![sent_length, sent_descriptor];
+    for array in input.wire_arrays() {
+        let sent = distributed::send(&array, peer, group, stream)?;
+        synchronize_outputs([&sent])?;
+        retained.push(sent);
+    }
+    Ok(retained)
+}
+
+fn recv_prepared_input(
+    peer: usize,
+    group: &Group,
+    stream: &Stream,
+) -> Result<PreparedModelInput, Error> {
+    let length = distributed::recv(&[1], Dtype::Int32, peer, group, stream)?;
+    synchronize_outputs([&length])?;
+    let length = usize::try_from(length.try_item::<i32>(stream)?).map_err(|_| {
+        Error::Parallel("prepared-input route advertised a negative descriptor length".into())
+    })?;
+    let descriptor = distributed::recv(&[length as i32], Dtype::Uint32, peer, group, stream)?;
+    synchronize_outputs([&descriptor])?;
+    let evaluated = descriptor.evaluated()?;
+    let descriptor = evaluated.try_as_slice::<u32>().map_err(|error| {
+        Error::Parallel(format!(
+            "prepared-input route descriptor is not readable: {error}"
+        ))
+    })?;
+    let identity = PreparedModelInputIdentity::from_descriptor(descriptor)?;
+    let mut arrays = Vec::new();
+    for (dtype, shape) in identity.wire_arrays() {
+        let array = distributed::recv(&shape, dtype, peer, group, stream)?;
+        synchronize_outputs([&array])?;
+        arrays.push(array);
+    }
+    PreparedModelInput::from_identity_wire_arrays(&identity, arrays)
 }
 
 impl ScheduledPipelineIngress {
@@ -1421,6 +1556,7 @@ struct Qwen3VlStage {
     args: qwen3_vl::ModelArgs,
     layer_adapter: Qwen3VlLayerwiseAdapter,
     range: Range<usize>,
+    vision_range: Range<usize>,
     vision_layers: Vec<Qwen3VlLayer>,
     layers: Vec<Qwen3VlLayer>,
     dense_layers: Option<PipelineLayerStorage>,
@@ -1594,6 +1730,39 @@ trait PipelineStageAdapter {
     fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error>;
     fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error>;
 
+    fn begin_placed_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error>;
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error>;
+    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error>;
+    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error>;
+    fn replace_placed_ingress_arrays(
+        &self,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error>;
+    fn execute_placed_ingress(
+        &mut self,
+        state: &mut dyn Any,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error>;
+    fn finish_placed_ingress(
+        &mut self,
+        state: Box<dyn Any>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error>;
+
     fn embedded_mtp_len(&self) -> usize;
     fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error>;
     #[allow(clippy::too_many_arguments)]
@@ -1656,6 +1825,60 @@ trait PipelineStageSemantics {
     fn dense_layers(&self) -> Option<&PipelineLayerStorage>;
     fn expert_cache(&self) -> Option<&ExpertCache> {
         None
+    }
+    fn begin_placed_ingress(
+        &mut self,
+        _input: crate::api::input::ModelInput<'_>,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        _stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        Ok(None)
+    }
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.begin_placed_ingress(input, execution, stream)
+    }
+    fn placed_ingress_active(&self, _state: &dyn Any) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn placed_ingress_arrays(&self, _state: &dyn Any) -> Result<Vec<Array>, Error> {
+        Ok(Vec::new())
+    }
+    fn replace_placed_ingress_arrays(
+        &self,
+        _state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        if arrays.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Parallel(
+                "text-only stage received a placed encoder payload".into(),
+            ))
+        }
+    }
+    fn execute_placed_ingress(
+        &mut self,
+        _state: &mut dyn Any,
+        _step: PipelineStep,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        _stream: &Stream,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    fn finish_placed_ingress(
+        &mut self,
+        _state: Box<dyn Any>,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        _stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        Err(Error::Parallel(
+            "text-only stage cannot finish placed multimodal ingress".into(),
+        ))
     }
     fn embedded_mtp_len(&self) -> usize {
         0
@@ -1786,6 +2009,61 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
             .map(ExpertCache::report)
             .transpose()
             .map_err(Error::from)
+    }
+
+    fn begin_placed_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.0.begin_placed_ingress(input, execution, stream)
+    }
+
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.0
+            .begin_placed_ingress_continuation(input, execution, stream)
+    }
+
+    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
+        self.0.placed_ingress_active(state)
+    }
+
+    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
+        self.0.placed_ingress_arrays(state)
+    }
+
+    fn replace_placed_ingress_arrays(
+        &self,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        self.0.replace_placed_ingress_arrays(state, arrays)
+    }
+
+    fn execute_placed_ingress(
+        &mut self,
+        state: &mut dyn Any,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.0
+            .execute_placed_ingress(state, step, execution, stream)
+    }
+
+    fn finish_placed_ingress(
+        &mut self,
+        state: Box<dyn Any>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        self.0.finish_placed_ingress(state, execution, stream)
     }
 
     fn embedded_mtp_len(&self) -> usize {
@@ -2684,6 +2962,91 @@ impl PipelineStageSemantics for GemmaStage {
         ModelKind::Gemma4
     }
 
+    fn begin_placed_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.has_multimodal_ingress
+            .then(|| {
+                self.layer_adapter
+                    .begin_pipeline_ingress(input, execution, stream)
+                    .map(|state| Box::new(state) as Box<dyn Any>)
+            })
+            .transpose()
+    }
+
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.has_multimodal_ingress
+            .then(|| {
+                self.layer_adapter
+                    .begin_pipeline_continuation(input, stream)
+                    .map(|state| Box::new(state) as Box<dyn Any>)
+            })
+            .transpose()
+    }
+
+    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
+        let state = state
+            .downcast_ref::<crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Gemma placed ingress state type mismatch".into()))?;
+        Ok(!self.layer_adapter.pipeline_ingress_arrays(state).is_empty())
+    }
+
+    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
+        let state = state
+            .downcast_ref::<crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Gemma placed ingress state type mismatch".into()))?;
+        Ok(self.layer_adapter.pipeline_ingress_arrays(state))
+    }
+
+    fn replace_placed_ingress_arrays(
+        &self,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Gemma placed ingress state type mismatch".into()))?;
+        self.layer_adapter
+            .replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn execute_placed_ingress(
+        &mut self,
+        state: &mut dyn Any,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Gemma placed ingress state type mismatch".into()))?;
+        self.execute_placed_media_state(state, step, execution, stream)
+    }
+
+    fn finish_placed_ingress(
+        &mut self,
+        state: Box<dyn Any>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        let state = state
+            .downcast::<crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState>()
+            .map_err(|_| Error::Parallel("Gemma placed ingress state type mismatch".into()))?;
+        let prepared = self
+            .layer_adapter
+            .finish_pipeline_ingress(*state, execution, stream)?;
+        let step = PipelineStep::new(prepared.hidden.dim(0), prepared.hidden.dim(1))?;
+        self.package_placed_ingress(prepared, step, stream)
+    }
+
     fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
         let mut shapes = Vec::new();
         if self.args.hidden_size_per_layer_input > 0 {
@@ -2696,7 +3059,7 @@ impl PipelineStageSemantics for GemmaStage {
         }
         if self.has_multimodal_ingress && step.sequence_length > 1 {
             shapes.extend(std::iter::repeat_n(
-                vec![1, 1, step.sequence_length, step.sequence_length],
+                vec![step.sequence_length, step.sequence_length],
                 1 + self.multimodal_mask_windows.len(),
             ));
         }
@@ -2927,6 +3290,165 @@ impl PipelineStageSemantics for Qwen3VlStage {
         } else {
             ModelKind::Qwen3Vl
         }
+    }
+
+    fn begin_placed_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.layer_adapter
+            .begin_pipeline_ingress(input, execution, stream)
+            .map(|state| Some(Box::new(state) as Box<dyn Any>))
+    }
+
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.layer_adapter
+            .begin_pipeline_continuation(input, stream)
+            .map(|state| Some(Box::new(state) as Box<dyn Any>))
+    }
+
+    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
+        let state = state
+            .downcast_ref::<crate::architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
+            )
+            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
+        Ok(self.layer_adapter.pipeline_ingress_active(state))
+    }
+
+    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
+        let state = state
+            .downcast_ref::<crate::architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
+            )
+            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
+        Ok(self.layer_adapter.pipeline_ingress_arrays(state))
+    }
+
+    fn replace_placed_ingress_arrays(
+        &self,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
+            )
+            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
+        self.layer_adapter
+            .replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn execute_placed_ingress(
+        &mut self,
+        state: &mut dyn Any,
+        _step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
+            )
+            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
+        if let Some(storage) = self.dense_layers.as_ref() {
+            let prefill = true;
+            let forward_guard = match &storage.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.forward_guard(prefill, &storage.residency)?)
+                }
+            };
+            let group_guard = match &storage.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.group_guard(&storage.residency, "pipeline_stage"))
+                }
+            };
+            let mut window = storage.transfer_window(0..self.vision_range.len(), prefill)?;
+            for (ordinal, index) in self.vision_range.clone().enumerate() {
+                let transfer = window
+                    .as_mut()
+                    .map(|window| window.next(stream))
+                    .transpose()?;
+                let lease = transfer
+                    .is_none()
+                    .then(|| storage.prepare_layerwise_absolute(ordinal))
+                    .transpose()?;
+                let mut layer = self.layer_adapter.new_cartesian_layer(
+                    0,
+                    index,
+                    self.parallel_layout.as_ref(),
+                    None,
+                    stream,
+                )?;
+                populate_module_from_lease(
+                    &mut layer,
+                    transfer
+                        .as_ref()
+                        .map(|transfer| transfer.lease())
+                        .or(lease.as_ref())
+                        .expect("Qwen3-VL placed vision residency lease"),
+                )?;
+                let retained = self
+                    .layer_adapter
+                    .forward_pipeline_vision_layer(index, &mut layer, state, execution, stream)?;
+                synchronize_outputs(retained.iter())?;
+                drop(transfer);
+                drop(lease);
+                if let Some(window) = &mut window {
+                    window.refill()?;
+                } else {
+                    storage.trim_after_absolute(ordinal)?;
+                }
+            }
+            storage.complete_forward()?;
+            if let Some(guard) = group_guard {
+                guard.complete()?;
+            }
+            if let Some(guard) = forward_guard {
+                guard.complete()?;
+            }
+        } else {
+            for (index, layer) in self.vision_range.clone().zip(&mut self.vision_layers) {
+                self.layer_adapter
+                    .forward_pipeline_vision_layer(index, layer, state, execution, stream)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_placed_ingress(
+        &mut self,
+        state: Box<dyn Any>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        let state = state
+            .downcast::<crate::architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>()
+            .map_err(|_| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
+        let prepared = self
+            .layer_adapter
+            .finish_pipeline_ingress(*state, execution, stream)?;
+        let activation_dtype = prepared.hidden.dtype();
+        Ok(PipelinePayload {
+            hidden: prepared.hidden,
+            auxiliary: PipelineAuxiliaryState::new(
+                std::iter::once(prepared.cos.as_dtype(activation_dtype, stream)?)
+                    .chain(std::iter::once(
+                        prepared.sin.as_dtype(activation_dtype, stream)?,
+                    ))
+                    .chain(std::iter::once(
+                        Array::from_slice(&[prepared.rope_delta as f32], &[1])
+                            .as_dtype(activation_dtype, stream)?,
+                    ))
+                    .chain(prepared.deepstack_features)
+                    .collect(),
+            ),
+        })
     }
 
     fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
@@ -3873,6 +4395,99 @@ impl PipelineStageSemantics for QwenHybridStage {
         }
     }
 
+    fn begin_placed_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.has_multimodal_ingress
+            .then(|| {
+                self.layer_adapter
+                    .begin_pipeline_ingress(input, execution, stream)
+                    .map(|state| Box::new(state) as Box<dyn Any>)
+            })
+            .transpose()
+    }
+
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.has_multimodal_ingress
+            .then(|| {
+                self.layer_adapter
+                    .begin_pipeline_continuation(input, stream)
+                    .map(|state| Box::new(state) as Box<dyn Any>)
+            })
+            .transpose()
+    }
+
+    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
+        let state = state
+            .downcast_ref::<crate::architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
+        Ok(self
+            .layer_adapter
+            .pipeline_media_groups()
+            .into_iter()
+            .any(|(group, _)| {
+                self.layer_adapter
+                    .should_execute_pipeline_group(group, state)
+            }))
+    }
+
+    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
+        let state = state
+            .downcast_ref::<crate::architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
+        Ok(self.layer_adapter.pipeline_ingress_arrays(state))
+    }
+
+    fn replace_placed_ingress_arrays(
+        &self,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
+        self.layer_adapter
+            .replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn execute_placed_ingress(
+        &mut self,
+        state: &mut dyn Any,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
+        self.execute_multimodal_ingress_state(state, step, execution, stream)
+    }
+
+    fn finish_placed_ingress(
+        &mut self,
+        state: Box<dyn Any>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        let state = state
+            .downcast::<crate::architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
+            .map_err(|_| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
+        Ok(PipelinePayload {
+            hidden: self
+                .layer_adapter
+                .finish_pipeline_ingress(*state, execution, stream)?,
+            auxiliary: PipelineAuxiliaryState::default(),
+        })
+    }
+
     fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
         Vec::new()
     }
@@ -4169,6 +4784,92 @@ impl PipelineStageSemantics for InklingStage {
         ModelKind::Inkling
     }
 
+    fn begin_placed_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.has_multimodal_ingress
+            .then(|| {
+                self.layer_adapter
+                    .begin_pipeline_ingress(input, execution, stream)
+                    .map(|state| Box::new(state) as Box<dyn Any>)
+            })
+            .transpose()
+    }
+
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        _stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.has_multimodal_ingress
+            .then(|| {
+                self.layer_adapter
+                    .begin_pipeline_continuation(input)
+                    .map(|state| Box::new(state) as Box<dyn Any>)
+            })
+            .transpose()
+    }
+
+    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
+        let state = state
+            .downcast_ref::<crate::architectures::inkling::layerwise::InklingPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Inkling placed ingress state type mismatch".into()))?;
+        Ok(!self.layer_adapter.pipeline_ingress_arrays(state).is_empty())
+    }
+
+    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
+        let state = state
+            .downcast_ref::<crate::architectures::inkling::layerwise::InklingPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Inkling placed ingress state type mismatch".into()))?;
+        Ok(self.layer_adapter.pipeline_ingress_arrays(state))
+    }
+
+    fn replace_placed_ingress_arrays(
+        &self,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::inkling::layerwise::InklingPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Inkling placed ingress state type mismatch".into()))?;
+        self.layer_adapter
+            .replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn execute_placed_ingress(
+        &mut self,
+        state: &mut dyn Any,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::inkling::layerwise::InklingPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Inkling placed ingress state type mismatch".into()))?;
+        self.execute_placed_media_state(state, step, execution, stream)
+    }
+
+    fn finish_placed_ingress(
+        &mut self,
+        state: Box<dyn Any>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        let state = state
+            .downcast::<crate::architectures::inkling::layerwise::InklingPipelineIngressState>()
+            .map_err(|_| Error::Parallel("Inkling placed ingress state type mismatch".into()))?;
+        Ok(PipelinePayload {
+            hidden: self
+                .layer_adapter
+                .finish_pipeline_ingress(*state, execution, stream)?,
+            auxiliary: PipelineAuxiliaryState::default(),
+        })
+    }
+
     fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
         Vec::new()
     }
@@ -4381,9 +5082,32 @@ impl std::fmt::Debug for PipelineModel {
 impl PipelineModel {
     fn from_adapter(
         topology: ParallelTopology,
-        info: PipelineStageInfo,
+        mut info: PipelineStageInfo,
         stage: impl PipelineStageAdapter + 'static,
     ) -> Result<Self, Error> {
+        info.global_encoder_units = info
+            .placement
+            .groups()
+            .iter()
+            .filter(|group| group.kind != ExecutionGroupKind::Decoder)
+            .map(|group| group.global_unit_range.len())
+            .sum();
+        info.local_encoder_units = info
+            .placement
+            .local_groups(info.pipeline_stage)
+            .filter(|(group, _)| group.kind != ExecutionGroupKind::Decoder)
+            .map(|(_, range)| range.len())
+            .sum();
+        info.encoder_routes = info
+            .placement
+            .routes()
+            .iter()
+            .filter(|route| {
+                route.from_pp_rank == info.pipeline_stage || route.to_pp_rank == info.pipeline_stage
+            })
+            .cloned()
+            .collect();
+        info.concurrent_residency_peak_bytes = info.planned_owned_parameter_bytes;
         if stage.model_kind() != info.model_kind {
             return Err(Error::Parallel(format!(
                 "pipeline adapter architecture {:?} does not match stage architecture {:?}",
@@ -4736,7 +5460,7 @@ impl PipelineModel {
             .forward(input, step, mask, &mut cache.layers, stream)
     }
 
-    /// Executes typed multimodal ingress on stage zero without communication.
+    /// Executes the local typed-ingress reference path without communication.
     ///
     /// This complements [`Self::forward_stage`] for deterministic composition
     /// tests and custom schedulers. Distributed callers normally use
@@ -4769,8 +5493,8 @@ impl PipelineModel {
 
     /// Runs one distributed pipeline microbatch without queue management.
     ///
-    /// Stage zero embeds and sends, intermediate stages receive/execute/send,
-    /// and the final stage receives and returns logits. Every lazy point-to-
+    /// Placed ingress groups follow their declared routes before decoder stages
+    /// receive/execute/send and the final stage returns logits. Every lazy point-to-
     /// point operation is explicitly submitted before the operation returns.
     /// The returned completion owns its exact backend event and must be waited
     /// before host access. Multi-request inference should normally use
@@ -4796,6 +5520,7 @@ impl PipelineModel {
             self.info.successor_rank,
             None,
             None,
+            false,
             stream,
         )?
         .submit()
@@ -4839,6 +5564,7 @@ impl PipelineModel {
                 .map(|_| self.topology.pipeline_parallel_rank + 1),
             tensor.as_ref(),
             cartesian.expert_group(),
+            false,
             stream,
         )?;
         // A lane-local barrier keeps later world-wide sampling or consensus
@@ -4874,6 +5600,7 @@ impl PipelineModel {
             self.info.successor_rank,
             None,
             None,
+            true,
             stream,
         )?
         .submit()
@@ -4917,6 +5644,7 @@ impl PipelineModel {
                 .map(|_| self.topology.pipeline_parallel_rank + 1),
             tensor.as_ref(),
             cartesian.expert_group(),
+            true,
             stream,
         )?;
         let barrier = distributed::all_sum(&Array::from_int(0), pipeline, stream)?;
@@ -4952,46 +5680,53 @@ impl PipelineModel {
         execution: &crate::CartesianExecution<'_>,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
-        let owner = self
-            .topology
-            .global_rank_for(ParallelCoordinates {
-                tensor: 0,
-                pipeline: self.topology.pipeline_parallel_size - 1,
-                expert: 0,
-            })
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        let is_owner = self.topology.global_rank == owner;
-        let vocabulary = Array::from_int(if is_owner {
-            local_logits.as_ref().map_or(0, |logits| logits.dim(-1))
-        } else {
-            0
-        });
-        let vocabulary = distributed::all_sum(&vocabulary, execution.world(), stream)?;
-        synchronize_outputs([&vocabulary])?;
-        let vocabulary = vocabulary.try_item::<i32>(stream)?;
-        if vocabulary <= 0 {
+        // Every TP/EP replica on the final PP coordinate owns the same gathered
+        // logits and decoder hidden state. Count those contributors explicitly
+        // instead of assuming one particular global-rank numbering convention.
+        let contributes = local_logits.is_some() && local_hidden.is_some();
+        let contribution_count = distributed::all_sum(
+            &Array::from_int(i32::from(contributes)),
+            execution.world(),
+            stream,
+        )?;
+        let vocabulary_sum = distributed::all_sum(
+            &Array::from_int(local_logits.as_ref().map_or(0, |logits| logits.dim(-1))),
+            execution.world(),
+            stream,
+        )?;
+        synchronize_outputs([&contribution_count, &vocabulary_sum])?;
+        let contribution_count = contribution_count.try_item::<i32>(stream)?;
+        if contribution_count <= 0 {
             return Err(Exception::custom(
-                "pipeline embedded MTP owner did not publish a vocabulary width",
+                "pipeline embedded MTP final stage did not publish output tensors",
             ));
         }
+        let vocabulary_sum = vocabulary_sum.try_item::<i32>(stream)?;
+        if vocabulary_sum <= 0 || vocabulary_sum % contribution_count != 0 {
+            return Err(Exception::custom(
+                "pipeline embedded MTP replicas published inconsistent vocabulary widths",
+            ));
+        }
+        let vocabulary = vocabulary_sum / contribution_count;
         let shape = [tokens.dim(0), tokens.dim(1), vocabulary];
-        let logits = if is_owner {
+        let logits = if contributes {
             local_logits
-                .ok_or_else(|| Exception::custom("pipeline embedded MTP owner produced no logits"))?
+                .expect("contributing pipeline MTP rank has logits")
                 .as_dtype(Dtype::Float32, stream)?
         } else {
             safemlx::ops::zeros_dtype(&shape, Dtype::Float32, stream)?
         };
         let hidden_shape = [tokens.dim(0), tokens.dim(1), self.info.hidden_size];
-        let hidden = if is_owner {
-            local_hidden.ok_or_else(|| {
-                Exception::custom("pipeline embedded MTP owner retained no hidden state")
-            })?
+        let hidden = if contributes {
+            local_hidden.expect("contributing pipeline MTP rank has hidden state")
         } else {
             safemlx::ops::zeros_dtype(&hidden_shape, self.info.activation_dtype, stream)?
         };
-        let logits = distributed::all_sum(&logits, execution.world(), stream)?;
-        let hidden = distributed::all_sum(&hidden, execution.world(), stream)?;
+        let divisor = Array::from_f32(contribution_count as f32);
+        let logits =
+            distributed::all_sum(&logits, execution.world(), stream)?.divide(&divisor, stream)?;
+        let hidden = distributed::all_sum(&hidden, execution.world(), stream)?
+            .divide(divisor.as_dtype(hidden.dtype(), stream)?, stream)?;
         synchronize_outputs([&logits, &hidden])?;
         Ok(EmbeddedMtpOutput {
             logits,
@@ -5070,8 +5805,139 @@ impl PipelineModel {
         successor: Option<usize>,
         tensor: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
+        typed_ingress: bool,
         stream: &Stream,
     ) -> Result<PendingPipelineStageCompletion, Error> {
+        let mut placed_retained = Vec::new();
+        let routed_prepared = if typed_ingress && self.info.placement.groups().len() > 1 {
+            if self.info.pipeline_stage == 0 {
+                if let Some(PipelineIngress::ModelInput(input)) = ingress {
+                    let owned = PreparedModelInput::from_model_input(input)?;
+                    for peer in 1..self.info.pipeline_stages {
+                        placed_retained.extend(send_prepared_input(&owned, peer, group, stream)?);
+                    }
+                }
+                None
+            } else {
+                let input = recv_prepared_input(0, group, stream)?;
+                Some(input)
+            }
+        } else {
+            None
+        };
+        let routed_parts = routed_prepared
+            .as_ref()
+            .map(PreparedModelInput::input_parts);
+        let ingress = routed_parts
+            .as_ref()
+            .map(|parts| PipelineIngress::ModelInput(crate::api::input::ModelInput::new(parts)))
+            .or(ingress);
+        let mut placed_payload = None;
+        if let Some(PipelineIngress::ModelInput(input)) = ingress {
+            let has_media_tensor = input.parts.iter().any(|part| {
+                part.modality != crate::api::input::Modality::Text
+                    && matches!(part.payload, crate::api::input::InputPayload::Tensor(_))
+            });
+            if self.info.placement.groups().len() > 1 && (has_media_tensor || self.info.is_first) {
+                let mut state = if self.info.pipeline_stage == 0 {
+                        self.stage.begin_placed_ingress(input, tensor, stream)?
+                    } else {
+                        self.stage
+                            .begin_placed_ingress_continuation(input, tensor, stream)?
+                    }
+                        .ok_or_else(|| {
+                            Error::Parallel(format!(
+                                "pipeline architecture {:?} has multimodal placement but no placed ingress state",
+                                self.info.model_kind
+                            ))
+                        })?;
+                let active = self.stage.placed_ingress_active(state.as_ref())?;
+                if active {
+                    let finalizer_owner = self
+                        .info
+                        .placement
+                        .group("modality_finalization")
+                        .and_then(ExecutionGroupPlacement::first_owner)
+                        .ok_or_else(|| {
+                            Error::Parallel(
+                                "multimodal placement omitted a finalization owner".into(),
+                            )
+                        })?;
+                    let encoder_tail = ["vision_encoder", "audio_encoder"]
+                        .into_iter()
+                        .filter_map(|group| {
+                            self.info
+                                .placement
+                                .group(group)
+                                .and_then(ExecutionGroupPlacement::last_owner)
+                        })
+                        .max()
+                        .ok_or_else(|| {
+                            Error::Parallel("multimodal placement omitted an encoder owner".into())
+                        })?;
+                    if self.info.pipeline_stage > 0 && self.info.pipeline_stage <= encoder_tail {
+                        let arrays =
+                            recv_array_bundle(self.info.pipeline_stage - 1, group, stream)?;
+                        self.stage
+                            .replace_placed_ingress_arrays(state.as_mut(), arrays)?;
+                    }
+                    if self.info.pipeline_stage <= encoder_tail {
+                        self.stage
+                            .execute_placed_ingress(state.as_mut(), step, tensor, stream)?;
+                    }
+                    if self.info.pipeline_stage < encoder_tail {
+                        let arrays = self.stage.placed_ingress_arrays(state.as_ref())?;
+                        placed_retained.extend(send_array_bundle(
+                            &arrays,
+                            self.info.pipeline_stage + 1,
+                            group,
+                            stream,
+                        )?);
+                    } else if self.info.pipeline_stage != finalizer_owner {
+                        let arrays = self.stage.placed_ingress_arrays(state.as_ref())?;
+                        placed_retained.extend(send_array_bundle(
+                            &arrays,
+                            finalizer_owner,
+                            group,
+                            stream,
+                        )?);
+                    }
+
+                    if self.info.pipeline_stage == finalizer_owner {
+                        if finalizer_owner != encoder_tail {
+                            let arrays = recv_array_bundle(encoder_tail, group, stream)?;
+                            self.stage
+                                .replace_placed_ingress_arrays(state.as_mut(), arrays)?;
+                        }
+                        let payload = self.stage.finish_placed_ingress(state, tensor, stream)?;
+                        if finalizer_owner == 0 {
+                            placed_payload = Some(payload);
+                        } else {
+                            let arrays = std::iter::once(payload.hidden)
+                                .chain(payload.auxiliary.tensors)
+                                .collect::<Vec<_>>();
+                            placed_retained.extend(send_array_bundle(&arrays, 0, group, stream)?);
+                        }
+                    }
+                    if self.info.pipeline_stage == 0 && finalizer_owner != 0 {
+                        let mut arrays = recv_array_bundle(finalizer_owner, group, stream)?;
+                        if arrays.is_empty() {
+                            return Err(Error::Parallel(
+                                "placed modality finalization produced an empty decoder payload"
+                                    .into(),
+                            ));
+                        }
+                        let hidden = arrays.remove(0);
+                        placed_payload = Some(PipelinePayload {
+                            hidden,
+                            auxiliary: PipelineAuxiliaryState::new(arrays),
+                        });
+                    }
+                } else if self.info.is_first {
+                    placed_payload = Some(self.stage.finish_placed_ingress(state, tensor, stream)?);
+                }
+            }
+        }
         let mut received_payload = None;
         let stage_input = if self.info.is_first {
             Some(
@@ -5079,12 +5945,6 @@ impl PipelineModel {
                     .ok_or_else(|| Error::Parallel("pipeline stage zero requires input".into()))?,
             )
         } else {
-            if ingress.is_some() {
-                return Err(Error::Parallel(format!(
-                    "pipeline stage {} receives hidden activations and must not receive ingress",
-                    self.info.pipeline_stage
-                )));
-            }
             let peer = predecessor.expect("non-first predecessor");
             let received = distributed::recv(
                 &step.activation_shape(self.info.hidden_size),
@@ -5152,15 +6012,27 @@ impl PipelineModel {
                 }
                 PipelineIngress::ModelInput(input) => {
                     crate::api::input::validate(input)?;
-                    self.stage.prefill(
-                        input,
-                        step,
-                        mask,
-                        &mut cache.layers,
-                        tensor,
-                        expert_group,
-                        stream,
-                    )?
+                    if let Some(payload) = placed_payload.as_ref() {
+                        self.stage.forward_with_execution(
+                            PipelineStageInput::Hidden(payload),
+                            step,
+                            mask,
+                            &mut cache.layers,
+                            tensor,
+                            expert_group,
+                            stream,
+                        )?
+                    } else {
+                        self.stage.prefill(
+                            input,
+                            step,
+                            mask,
+                            &mut cache.layers,
+                            tensor,
+                            expert_group,
+                            stream,
+                        )?
+                    }
                 }
             }
         } else {
@@ -5186,6 +6058,7 @@ impl PipelineModel {
             .flat_map(PipelineLayerCache::retained_arrays)
             .cloned()
             .collect::<Vec<_>>();
+        retained.extend(placed_retained);
         match output {
             PipelineStageOutput::Hidden(payload) => {
                 let hidden = &payload.hidden;
@@ -5614,12 +6487,17 @@ fn gemma_pipeline_ranges(
 fn base_info(
     topology: ParallelTopology,
     range: Range<usize>,
+    global_layers: usize,
     model_kind: ModelKind,
     hidden_size: i32,
 ) -> PipelineStageInfo {
     let stage = topology.pipeline_parallel_rank;
     let last = topology.pipeline_parallel_size - 1;
     PipelineStageInfo {
+        placement: Arc::new(
+            decoder_only_placement(global_layers, topology.pipeline_parallel_size)
+                .expect("validated decoder topology has a placement"),
+        ),
         topology,
         global_rank: topology.global_rank,
         pipeline_stage: stage,
@@ -5629,6 +6507,10 @@ fn base_info(
         owns_embedded_mtp: false,
         embedded_mtp_layers: 0,
         global_layer_range: range,
+        global_encoder_units: 0,
+        local_encoder_units: 0,
+        encoder_routes: Vec::new(),
+        concurrent_residency_peak_bytes: 0,
         global_expert_count: None,
         local_expert_ids: Vec::new(),
         predecessor_rank: topology
@@ -5647,6 +6529,211 @@ fn base_info(
         checkpoint_diagnostics: None,
         materialization: None,
     }
+}
+
+fn decoder_payload_schema(id: &str) -> PayloadSchema {
+    PayloadSchema::new(
+        id,
+        vec![PayloadField::required(
+            "hidden",
+            ["batch", "sequence", "hidden"],
+        )],
+    )
+}
+
+fn decoder_only_placement(
+    global_layers: usize,
+    pipeline_stages: usize,
+) -> Result<PlacedExecutionDag, Error> {
+    PlacedExecutionDag::plan(
+        pipeline_stages,
+        vec![ExecutionGroupPlacementRequest {
+            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::root("text_decoder"),
+            kind: ExecutionGroupKind::Decoder,
+            unit_count: global_layers,
+            rank_path: (0..pipeline_stages).collect(),
+            active_subgroup: ActiveParallelSubgroup::decoder(),
+            first_owner_static_roles: vec!["embedding".into()],
+            last_owner_static_roles: vec!["norm".into(), "output".into()],
+            input_schema: decoder_payload_schema("decoder_hidden"),
+            output_schema: decoder_payload_schema("logits"),
+            merge_destination: None,
+            residency: ResidencyBinding {
+                unit_prefix: "text_decoder".into(),
+                request_optional: false,
+            },
+            checkpoint_group: "text_decoder".into(),
+        }],
+        "text_decoder",
+    )
+}
+
+fn multimodal_placement(
+    pipeline_stages: usize,
+    decoder_layers: usize,
+    vision_depth: Option<usize>,
+    audio_depth: Option<usize>,
+) -> Result<PlacedExecutionDag, Error> {
+    let all_ranks = || (0..pipeline_stages).collect::<Vec<_>>();
+    let media_input = PayloadSchema::new(
+        "prepared_media",
+        vec![PayloadField::required("prepared_parts", ["parts", "payload"]).optional()],
+    );
+    let encoded = PayloadSchema::new(
+        "encoded_modality",
+        vec![PayloadField::required(
+            "encoded",
+            ["media_batch", "media_sequence", "width"],
+        )],
+    );
+    let mut requests = Vec::new();
+    let mut projected = Vec::new();
+    if let Some(depth) = vision_depth {
+        requests.push(ExecutionGroupPlacementRequest {
+            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::root("vision_encoder"),
+            kind: ExecutionGroupKind::VisionEncoder,
+            unit_count: depth,
+            rank_path: all_ranks(),
+            active_subgroup: ActiveParallelSubgroup::tensor_sharded(),
+            first_owner_static_roles: vec!["vision_input".into()],
+            last_owner_static_roles: Vec::new(),
+            input_schema: media_input.clone(),
+            output_schema: encoded.clone(),
+            merge_destination: None,
+            residency: ResidencyBinding {
+                unit_prefix: "vision_encoder".into(),
+                request_optional: true,
+            },
+            checkpoint_group: "vision_encoder".into(),
+        });
+        requests.push(ExecutionGroupPlacementRequest {
+            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+                "vision_projector",
+                ["vision_encoder"],
+            ),
+            kind: ExecutionGroupKind::Projector,
+            unit_count: 1,
+            rank_path: vec![0],
+            active_subgroup: ActiveParallelSubgroup::tensor_sharded(),
+            first_owner_static_roles: vec!["vision_projector".into()],
+            last_owner_static_roles: Vec::new(),
+            input_schema: encoded.clone(),
+            output_schema: encoded.clone(),
+            merge_destination: None,
+            residency: ResidencyBinding {
+                unit_prefix: "vision_projector".into(),
+                request_optional: true,
+            },
+            checkpoint_group: "vision_projector".into(),
+        });
+        projected.push("vision_projector");
+    }
+    if let Some(depth) = audio_depth {
+        requests.push(ExecutionGroupPlacementRequest {
+            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::root("audio_encoder"),
+            kind: ExecutionGroupKind::AudioEncoder,
+            // Static dMel ingress remains a placed unit even when the family
+            // has no repeated audio blocks.
+            unit_count: depth.max(1),
+            rank_path: all_ranks(),
+            active_subgroup: ActiveParallelSubgroup::tensor_sharded(),
+            first_owner_static_roles: vec!["audio_input".into()],
+            last_owner_static_roles: Vec::new(),
+            input_schema: media_input.clone(),
+            output_schema: encoded.clone(),
+            merge_destination: None,
+            residency: ResidencyBinding {
+                unit_prefix: "audio_encoder".into(),
+                request_optional: true,
+            },
+            checkpoint_group: "audio_encoder".into(),
+        });
+        requests.push(ExecutionGroupPlacementRequest {
+            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+                "audio_projector",
+                ["audio_encoder"],
+            ),
+            kind: ExecutionGroupKind::Projector,
+            unit_count: 1,
+            rank_path: vec![0],
+            active_subgroup: ActiveParallelSubgroup::tensor_sharded(),
+            first_owner_static_roles: vec!["audio_projector".into()],
+            last_owner_static_roles: Vec::new(),
+            input_schema: encoded.clone(),
+            output_schema: encoded.clone(),
+            merge_destination: None,
+            residency: ResidencyBinding {
+                unit_prefix: "audio_projector".into(),
+                request_optional: true,
+            },
+            checkpoint_group: "audio_projector".into(),
+        });
+        projected.push("audio_projector");
+    }
+    if projected.is_empty() {
+        return decoder_only_placement(decoder_layers, pipeline_stages);
+    }
+    requests.push(ExecutionGroupPlacementRequest {
+        spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+            "modality_merger",
+            projected.iter().copied(),
+        ),
+        kind: ExecutionGroupKind::Merger,
+        unit_count: 1,
+        rank_path: vec![0],
+        active_subgroup: ActiveParallelSubgroup::tensor_sharded(),
+        first_owner_static_roles: vec!["modality_merger".into()],
+        last_owner_static_roles: Vec::new(),
+        input_schema: encoded.clone(),
+        output_schema: encoded.clone(),
+        merge_destination: None,
+        residency: ResidencyBinding {
+            unit_prefix: "modality_merger".into(),
+            request_optional: true,
+        },
+        checkpoint_group: "modality_merger".into(),
+    });
+    requests.push(ExecutionGroupPlacementRequest {
+        spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+            "modality_finalization",
+            ["modality_merger"],
+        ),
+        kind: ExecutionGroupKind::ModalityFinalization,
+        unit_count: 1,
+        rank_path: vec![0],
+        active_subgroup: ActiveParallelSubgroup::tensor_sharded(),
+        first_owner_static_roles: vec!["embedding".into()],
+        last_owner_static_roles: Vec::new(),
+        input_schema: encoded,
+        output_schema: decoder_payload_schema("decoder_hidden"),
+        merge_destination: None,
+        residency: ResidencyBinding {
+            unit_prefix: "modality_finalization".into(),
+            request_optional: true,
+        },
+        checkpoint_group: "modality_finalization".into(),
+    });
+    requests.push(ExecutionGroupPlacementRequest {
+        spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+            "text_decoder",
+            ["modality_finalization"],
+        ),
+        kind: ExecutionGroupKind::Decoder,
+        unit_count: decoder_layers,
+        rank_path: all_ranks(),
+        active_subgroup: ActiveParallelSubgroup::decoder(),
+        first_owner_static_roles: Vec::new(),
+        last_owner_static_roles: vec!["norm".into(), "output".into()],
+        input_schema: decoder_payload_schema("decoder_hidden"),
+        output_schema: decoder_payload_schema("logits"),
+        merge_destination: None,
+        residency: ResidencyBinding {
+            unit_prefix: "text_decoder".into(),
+            request_optional: false,
+        },
+        checkpoint_group: "text_decoder".into(),
+    });
+    PlacedExecutionDag::plan(pipeline_stages, requests, "text_decoder")
 }
 
 #[cfg(test)]
@@ -7146,6 +8233,7 @@ fn load_llama_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        source_args.attention_schedule.len(),
         ModelKind::Llama,
         source_args.hidden_size,
     );
@@ -8259,6 +9347,7 @@ fn load_dense_qwen_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        source_args.attention_schedule.len(),
         source_args.model_kind(),
         source_args.hidden_size,
     );
@@ -8644,9 +9733,16 @@ fn load_qwen3_vl_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        source_args.text_config.num_hidden_layers as usize,
         kind,
         source_args.text_config.hidden_size,
     );
+    info.placement = Arc::new(multimodal_placement(
+        topology.pipeline_parallel_size,
+        source_args.text_config.num_hidden_layers as usize,
+        Some(source_args.vision_config.layer_count()),
+        None,
+    )?);
     let mut stage = Qwen3VlStage::new(
         target_args.clone(),
         range,
@@ -8687,8 +9783,12 @@ fn load_qwen3_vl_pipeline(
         None
     };
     stage.parallel_layout = parallel_layout.clone();
-    if info.is_first {
-        stage.vision_layers = (0..target_args.vision_config.layer_count())
+    if let Some(local_vision) = info
+        .placement
+        .group("vision_encoder")
+        .and_then(|group| group.local_units(info.pipeline_stage))
+    {
+        stage.vision_layers = local_vision
             .map(|index| {
                 stage.layer_adapter.new_cartesian_layer(
                     0,
@@ -8713,8 +9813,22 @@ fn load_qwen3_vl_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let local_deepstack_mergers = stage
+        .vision_range
+        .clone()
+        .filter_map(|index| {
+            target_args
+                .vision_config
+                .layer_policy(index)
+                .and_then(|policy| policy.deepstack_merger)
+                .map(|index| index as usize)
+        })
+        .collect::<Vec<_>>();
     let static_roles = selected_pipeline_static_roles([
-        ("vision", info.is_first),
+        (
+            "vision",
+            info.is_first || !local_deepstack_mergers.is_empty(),
+        ),
         (
             "embedding",
             info.is_first
@@ -8733,7 +9847,8 @@ fn load_qwen3_vl_pipeline(
                 store,
                 &binding_adapter,
                 &target_binding_adapter,
-                PipelineStageQuantizationSelection::new(&static_roles, 1, stage.range.clone()),
+                PipelineStageQuantizationSelection::new(&static_roles, 1, stage.range.clone())
+                    .with_layer_group(0, stage.vision_range.clone()),
                 quantization,
                 stream,
                 weights_stream,
@@ -8754,7 +9869,7 @@ fn load_qwen3_vl_pipeline(
     info.materialization = materialization;
     let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Qwen3-VL");
-    if info.is_first {
+    if info.is_first || !local_deepstack_mergers.is_empty() {
         let bindings = if let Some(layout) = parallel_layout.as_ref() {
             shard_layer_bindings(
                 pipeline_static_bindings(&static_units, "vision")?.to_vec(),
@@ -8765,14 +9880,39 @@ fn load_qwen3_vl_pipeline(
         } else {
             pipeline_static_bindings(&static_units, "vision")?.to_vec()
         };
-        loaded.load(
-            stage.layer_adapter.vision_mut(),
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
+        if info.is_first {
+            loaded.load(
+                stage.layer_adapter.vision_mut(),
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        } else {
+            let keep = local_deepstack_mergers
+                .iter()
+                .map(|index| format!("deepstack_merger_list.{index}."))
+                .collect::<Vec<_>>();
+            let bindings = bindings
+                .into_iter()
+                .filter(|binding| {
+                    let target = binding.logical_target().unwrap_or_else(|| binding.name());
+                    keep.iter().any(|prefix| target.contains(prefix))
+                })
+                .collect::<Vec<_>>();
+            loaded.load_excluding(
+                stage.layer_adapter.vision_mut(),
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+                &|name| !keep.iter().any(|prefix| name.starts_with(prefix)),
+            )?;
+        }
+    }
+    if info.is_first {
         if let Some(module) = stage.layer_adapter.parallel_embedding_mut() {
             let bindings = shard_layer_bindings(
                 pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
@@ -8861,25 +10001,31 @@ fn load_qwen3_vl_pipeline(
             }
         }
     }
-    if info.is_first {
-        for (index, layer) in stage.vision_layers.iter_mut().enumerate() {
-            let bindings = binding_adapter.cartesian_layer_bindings(
-                0,
-                index,
-                layer,
-                store.as_ref(),
-                parallel_layout.as_ref(),
-                None,
-                stream,
-            )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
+    if dense_stream.is_none() {
+        if let Some(local_vision) = info
+            .placement
+            .group("vision_encoder")
+            .and_then(|group| group.local_units(info.pipeline_stage))
+        {
+            for (index, layer) in local_vision.zip(&mut stage.vision_layers) {
+                let bindings = binding_adapter.cartesian_layer_bindings(
+                    0,
+                    index,
+                    layer,
+                    store.as_ref(),
+                    parallel_layout.as_ref(),
+                    None,
+                    stream,
+                )?;
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     if dense_stream.is_none() {
@@ -8922,35 +10068,62 @@ fn load_qwen3_vl_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
+        let vision_start = stage.vision_range.start;
+        let vision_count = stage.vision_range.len();
+        let text_start = stage.range.start;
+        let unit_count = vision_count + stage.range.len();
         let dense_layers = build_pipeline_layer_storage(
             Arc::clone(&store),
-            stage.range.clone(),
+            0..unit_count,
             options,
             static_bytes,
             info.materialization.clone(),
             stream,
             weights_stream,
-            |global_layer, stream| {
-                streamed_adapter.new_cartesian_layer(
-                    1,
-                    global_layer,
-                    streamed_layout.as_ref(),
-                    streamed_assignment.as_ref(),
-                    stream,
-                )
+            |ordinal, stream| {
+                if ordinal < vision_count {
+                    streamed_adapter.new_cartesian_layer(
+                        0,
+                        vision_start + ordinal,
+                        streamed_layout.as_ref(),
+                        None,
+                        stream,
+                    )
+                } else {
+                    streamed_adapter.new_cartesian_layer(
+                        1,
+                        text_start + ordinal - vision_count,
+                        streamed_layout.as_ref(),
+                        streamed_assignment.as_ref(),
+                        stream,
+                    )
+                }
             },
-            |global_layer, layer, store| {
-                binding_adapter.cartesian_layer_bindings(
-                    1,
-                    global_layer,
-                    layer,
-                    store,
-                    streamed_layout.as_ref(),
-                    streamed_assignment.as_ref(),
-                    stream,
-                )
+            |ordinal, layer, store| {
+                if ordinal < vision_count {
+                    binding_adapter.cartesian_layer_bindings(
+                        0,
+                        vision_start + ordinal,
+                        layer,
+                        store,
+                        streamed_layout.as_ref(),
+                        None,
+                        stream,
+                    )
+                } else {
+                    binding_adapter.cartesian_layer_bindings(
+                        1,
+                        text_start + ordinal - vision_count,
+                        layer,
+                        store,
+                        streamed_layout.as_ref(),
+                        streamed_assignment.as_ref(),
+                        stream,
+                    )
+                }
             },
-        )?;
+        )?
+        .with_execution_offset(vision_count)?;
         stage.dense_layers = Some(if expert_cache_options.is_some() {
             dense_layers.with_independent_experts("mlp.experts.")
         } else {
@@ -9028,6 +10201,11 @@ impl Qwen3VlStage {
             layer_adapter,
             args,
             range,
+            vision_range: info
+                .placement
+                .group("vision_encoder")
+                .and_then(|group| group.local_units(info.pipeline_stage))
+                .unwrap_or(0..0),
             vision_layers: Vec::new(),
             layers: Vec::new(),
             dense_layers: None,
@@ -10111,6 +11289,7 @@ fn load_gpt_oss_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        source_args.attention_schedule.len(),
         ModelKind::GptOss,
         source_args.hidden_size,
     );
@@ -11059,6 +12238,7 @@ fn load_lfm2_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        source_args.layer_schedule.len(),
         ModelKind::Lfm2,
         source_args.hidden_size,
     );
@@ -12575,6 +13755,7 @@ fn load_nemotron_h_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        source_args.num_hidden_layers as usize,
         ModelKind::NemotronH,
         source_args.hidden_size,
     );
@@ -13890,7 +15071,25 @@ fn load_qwen_hybrid_pipeline(
     } else {
         ModelKind::Qwen35
     };
-    let mut info = base_info(topology, range.clone(), kind, source_args.hidden_size);
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        source_args.num_hidden_layers as usize,
+        kind,
+        source_args.hidden_size,
+    );
+    if vision_config.is_some() {
+        let vision_depth = binding_adapter
+            .pipeline_media_groups()
+            .first()
+            .map(|(_, depth)| *depth);
+        info.placement = Arc::new(multimodal_placement(
+            topology.pipeline_parallel_size,
+            source_args.num_hidden_layers as usize,
+            vision_depth,
+            None,
+        )?);
+    }
     let mut stage = QwenHybridStage::new(
         target_args.clone(),
         image_token_id,
@@ -14006,15 +15205,21 @@ fn load_qwen_hybrid_pipeline(
     ]);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let (store, report) = quantize_pipeline_stage_store(
-                store,
-                &binding_adapter,
-                &target_binding_adapter,
+            let selection = stage.media_units.iter().fold(
                 PipelineStageQuantizationSelection::new(
                     &static_roles,
                     text_group,
                     stage.range.clone(),
                 ),
+                |selection, unit| {
+                    selection.with_layer_group(unit.group, unit.index..unit.index + 1)
+                },
+            );
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                selection,
                 quantization,
                 stream,
                 weights_stream,
@@ -14671,20 +15876,42 @@ impl QwenHybridStage {
     ) -> Result<Array, Error> {
         if !self.has_multimodal_ingress || self.media_layer_count != self.media_units.len() {
             return Err(Error::UnsupportedArchitecture(
-                "Qwen3.5 pipeline typed ingress requires configured stage-zero vision semantics"
-                    .into(),
+                "Qwen3.5 pipeline typed ingress requires configured placed vision semantics".into(),
             ));
         }
         let mut state = self
             .layer_adapter
             .begin_pipeline_ingress(input, execution, stream)?;
+        self.execute_multimodal_ingress_state(&mut state, step, execution, stream)?;
+        let hidden = self
+            .layer_adapter
+            .finish_pipeline_ingress(state, execution, stream)?;
+        if hidden.dim(0) != step.batch_size || hidden.dim(1) != step.sequence_length {
+            return Err(Error::Parallel(format!(
+                "Qwen3.5 multimodal pipeline ingress produced [{}, {}] batch/sequence geometry, scheduled [{}, {}]",
+                hidden.dim(0),
+                hidden.dim(1),
+                step.batch_size,
+                step.sequence_length
+            )));
+        }
+        Ok(hidden)
+    }
+
+    fn execute_multimodal_ingress_state(
+        &mut self,
+        state: &mut crate::architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
         let active_indices = self
             .media_units
             .iter()
             .enumerate()
             .filter_map(|(ordinal, unit)| {
                 self.layer_adapter
-                    .should_execute_pipeline_group(unit.group, &state)
+                    .should_execute_pipeline_group(unit.group, state)
                     .then_some(ordinal)
             })
             .collect::<Vec<_>>();
@@ -14742,7 +15969,7 @@ impl QwenHybridStage {
                         .expect("pipeline storage provides a residency lease"),
                 )?;
                 let retained = self.layer_adapter.forward_pipeline_media_layer(
-                    unit.group, unit.index, &mut layer, &mut state, execution, stream,
+                    unit.group, unit.index, &mut layer, state, execution, stream,
                 )?;
                 synchronize_outputs(retained.iter())?;
                 drop(transfer);
@@ -14760,7 +15987,7 @@ impl QwenHybridStage {
                     ))
                 })?;
                 self.layer_adapter.forward_pipeline_media_layer(
-                    unit.group, unit.index, layer, &mut state, execution, stream,
+                    unit.group, unit.index, layer, state, execution, stream,
                 )?
             };
             if self.dense_layers.is_none() {
@@ -14776,19 +16003,7 @@ impl QwenHybridStage {
         if let Some(guard) = forward_guard {
             guard.complete()?;
         }
-        let hidden = self
-            .layer_adapter
-            .finish_pipeline_ingress(state, execution, stream)?;
-        if hidden.dim(0) != step.batch_size || hidden.dim(1) != step.sequence_length {
-            return Err(Error::Parallel(format!(
-                "Qwen3.5 multimodal pipeline ingress produced [{}, {}] batch/sequence geometry, scheduled [{}, {}]",
-                hidden.dim(0),
-                hidden.dim(1),
-                step.batch_size,
-                step.sequence_length
-            )));
-        }
-        Ok(hidden)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14817,17 +16032,19 @@ impl QwenHybridStage {
         } else {
             QwenHybridLayerwiseAdapter::new_text(args.clone(), stream)?
         };
-        let media_units = if info.is_first {
-            layer_adapter
-                .pipeline_media_groups()
-                .into_iter()
-                .flat_map(|(group, depth)| {
-                    (0..depth).map(move |index| PipelineMediaUnit { group, index })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let graph = layer_adapter.execution_graph()?;
+        let media_units = layer_adapter
+            .pipeline_media_groups()
+            .into_iter()
+            .flat_map(|(group, _)| {
+                info.placement
+                    .group(graph.groups()[group].id())
+                    .and_then(|placement| placement.local_units(info.pipeline_stage))
+                    .into_iter()
+                    .flatten()
+                    .map(move |index| PipelineMediaUnit { group, index })
+            })
+            .collect::<Vec<_>>();
         let media_layer_count = media_units.len();
         let adapter_owns_ingress = info.is_first && has_multimodal_ingress;
         let complete = qwen_hybrid::Model::new(args.clone(), None, None, None, stream)?;
@@ -15393,6 +16610,7 @@ fn load_kimi_linear_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        source_args.num_hidden_layers as usize,
         ModelKind::KimiLinear,
         source_args.hidden_size,
     );
@@ -16479,9 +17697,24 @@ fn load_inkling_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        args.text_config.num_hidden_layers as usize,
         ModelKind::Inkling,
         args.text_config.hidden_size,
     );
+    if args.vision_config.is_some() || args.audio_config.is_some() {
+        let groups = source_binding_adapter.pipeline_media_groups();
+        let vision_depth = args.vision_config.as_ref().and_then(|_| {
+            groups
+                .iter()
+                .find_map(|(group, depth)| (*group == 0).then_some(*depth))
+        });
+        info.placement = Arc::new(multimodal_placement(
+            topology.pipeline_parallel_size,
+            args.text_config.num_hidden_layers as usize,
+            vision_depth,
+            args.audio_config.as_ref().map(|_| 0),
+        )?);
+    }
     let mut stage = InklingStage::new(
         target_args.clone(),
         range,
@@ -16607,15 +17840,21 @@ fn load_inkling_pipeline(
     ]);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let (store, report) = quantize_pipeline_stage_store(
-                store,
-                &source_binding_adapter,
-                &target_binding_adapter,
+            let selection = stage.media_units.iter().fold(
                 PipelineStageQuantizationSelection::new(
                     &static_roles,
                     text_group,
                     stage.range.clone(),
                 ),
+                |selection, unit| {
+                    selection.with_layer_group(unit.group, unit.index..unit.index + 1)
+                },
+            );
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &source_binding_adapter,
+                &target_binding_adapter,
+                selection,
                 quantization,
                 stream,
                 weights_stream,
@@ -17120,8 +18359,7 @@ impl InklingStage {
     ) -> Result<Array, Error> {
         if !self.has_multimodal_ingress || self.media_layer_count != self.media_units.len() {
             return Err(Error::UnsupportedArchitecture(
-                "Inkling pipeline typed ingress requires configured stage-zero media semantics"
-                    .into(),
+                "Inkling pipeline typed ingress requires configured placed media semantics".into(),
             ));
         }
         let mut state = self
@@ -17240,6 +18478,113 @@ impl InklingStage {
         Ok(hidden)
     }
 
+    fn execute_placed_media_state(
+        &mut self,
+        state: &mut crate::architectures::inkling::layerwise::InklingPipelineIngressState,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let active = self
+            .media_units
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, unit)| {
+                self.layer_adapter
+                    .should_execute_pipeline_group(unit.group, state)
+                    .then_some(ordinal)
+            })
+            .collect::<Vec<_>>();
+        let prefill = step.sequence_length > 1;
+        let forward_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.forward_guard(prefill, &layers.residency))
+                }
+            })
+            .transpose()?;
+        let group_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.group_guard(&layers.residency, "vision_encoder"))
+                }
+            });
+        let mut window = self
+            .dense_layers
+            .as_ref()
+            .map(|storage| storage.transfer_window(active.iter().copied(), prefill))
+            .transpose()?
+            .flatten();
+        for ordinal in active {
+            let unit = self.media_units[ordinal];
+            let retained = if let Some(storage) = self.dense_layers.as_ref() {
+                let transfer = window
+                    .as_mut()
+                    .map(|window| window.next(stream))
+                    .transpose()?;
+                let lease = transfer
+                    .is_none()
+                    .then(|| storage.prepare_layerwise_absolute(ordinal))
+                    .transpose()?;
+                let mut layer = self.layer_adapter.new_cartesian_layer(
+                    unit.group,
+                    unit.index,
+                    self.parallel_layout.as_ref(),
+                    self.expert_assignment.as_ref(),
+                    stream,
+                )?;
+                populate_module_from_lease(
+                    &mut layer,
+                    transfer
+                        .as_ref()
+                        .map(|transfer| transfer.lease())
+                        .or(lease.as_ref())
+                        .expect("placed Inkling residency lease"),
+                )?;
+                let retained = self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, &mut layer, state, execution, stream,
+                )?;
+                synchronize_outputs(retained.iter())?;
+                drop(transfer);
+                drop(lease);
+                if let Some(window) = &mut window {
+                    window.refill()?;
+                } else {
+                    storage.trim_after_absolute(ordinal)?;
+                }
+                retained
+            } else {
+                let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "Inkling placed media unit {ordinal} was not materialized"
+                    ))
+                })?;
+                self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, layer, state, execution, stream,
+                )?
+            };
+            if self.dense_layers.is_none() {
+                eval(retained.iter())?;
+            }
+        }
+        if let Some(storage) = self.dense_layers.as_ref() {
+            storage.complete_forward()?;
+        }
+        if let Some(guard) = group_guard {
+            guard.complete()?;
+        }
+        if let Some(guard) = forward_guard {
+            guard.complete()?;
+        }
+        Ok(())
+    }
+
     fn new(
         args: inkling::ModelArgs,
         range: Range<usize>,
@@ -17253,17 +18598,19 @@ impl InklingStage {
         } else {
             InklingLayerwiseAdapter::new(args.clone(), stream)?
         };
-        let media_units = if info.is_first {
-            layer_adapter
-                .pipeline_media_groups()
-                .into_iter()
-                .flat_map(|(group, depth)| {
-                    (0..depth).map(move |index| PipelineMediaUnit { group, index })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let graph = layer_adapter.execution_graph()?;
+        let media_units = layer_adapter
+            .pipeline_media_groups()
+            .into_iter()
+            .flat_map(|(group, _)| {
+                info.placement
+                    .group(graph.groups()[group].id())
+                    .and_then(|placement| placement.local_units(info.pipeline_stage))
+                    .into_iter()
+                    .flatten()
+                    .map(move |index| PipelineMediaUnit { group, index })
+            })
+            .collect::<Vec<_>>();
         let media_layer_count = media_units.len();
         let adapter_owns_ingress = info.is_first && has_multimodal_ingress;
         let complete = inkling::Model::new(args.clone(), stream)?;
@@ -17910,9 +19257,26 @@ fn load_gemma_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        source_args.layer_schedule.len(),
         ModelKind::Gemma4,
         source_args.hidden_size,
     );
+    if vision_config.is_some() || audio_config.is_some() {
+        let groups = binding_adapter.pipeline_media_groups();
+        let mut cursor = 0;
+        let vision_depth = vision_config.as_ref().map(|_| {
+            let depth = groups[cursor].1;
+            cursor += 1;
+            depth
+        });
+        let audio_depth = audio_config.as_ref().map(|_| groups[cursor].1);
+        info.placement = Arc::new(multimodal_placement(
+            topology.pipeline_parallel_size,
+            source_args.layer_schedule.len(),
+            vision_depth,
+            audio_depth,
+        )?);
+    }
     let mut stage = GemmaStage::new(
         target_args.clone(),
         vision_config.clone(),
@@ -18097,15 +19461,21 @@ fn load_gemma_pipeline(
     ]);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let (store, report) = quantize_pipeline_stage_store(
-                store,
-                &binding_adapter,
-                &target_binding_adapter,
+            let selection = stage.media_units.iter().fold(
                 PipelineStageQuantizationSelection::new(
                     &static_roles,
                     stage.layer_adapter.pipeline_text_group(),
                     stage.range.clone(),
                 ),
+                |selection, unit| {
+                    selection.with_layer_group(unit.group, unit.index..unit.index + 1)
+                },
+            );
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                selection,
                 quantization,
                 stream,
                 weights_stream,
@@ -18570,7 +19940,7 @@ impl GemmaStage {
         stream: &Stream,
     ) -> Result<Self, Error> {
         let has_multimodal_ingress = vision_config.is_some() || audio_config.is_some();
-        let layer_adapter = if info.is_first && has_multimodal_ingress && external_experts {
+        let layer_adapter = if has_multimodal_ingress && external_experts {
             Gemma4LayerwiseAdapter::new_pipeline_external_experts(
                 args.clone(),
                 vision_config,
@@ -18580,7 +19950,7 @@ impl GemmaStage {
                 audio_token_id,
                 stream,
             )?
-        } else if info.is_first && has_multimodal_ingress {
+        } else if has_multimodal_ingress {
             Gemma4LayerwiseAdapter::new_pipeline(
                 args.clone(),
                 vision_config,
@@ -18595,11 +19965,17 @@ impl GemmaStage {
         } else {
             Gemma4LayerwiseAdapter::new_text(args.clone(), stream)?
         };
+        let graph = layer_adapter.execution_graph()?;
         let media_units = layer_adapter
             .pipeline_media_groups()
             .into_iter()
-            .flat_map(|(group, depth)| {
-                (0..depth).map(move |index| PipelineMediaUnit { group, index })
+            .flat_map(|(group, _)| {
+                info.placement
+                    .group(graph.groups()[group].id())
+                    .and_then(|placement| placement.local_units(info.pipeline_stage))
+                    .into_iter()
+                    .flatten()
+                    .map(move |index| PipelineMediaUnit { group, index })
             })
             .collect::<Vec<_>>();
         let media_layer_count = media_units.len();
@@ -18734,8 +20110,7 @@ impl GemmaStage {
     ) -> Result<(Array, PipelineAuxiliaryState), Error> {
         if !self.has_multimodal_ingress || self.media_layer_count != self.media_units.len() {
             return Err(Error::UnsupportedArchitecture(
-                "Gemma 4 pipeline typed ingress requires configured stage-zero media semantics"
-                    .into(),
+                "Gemma 4 pipeline typed ingress requires configured placed media semantics".into(),
             ));
         }
         let mut state = self
@@ -18859,9 +20234,16 @@ impl GemmaStage {
             auxiliary.push(per_layer);
         }
         if step.sequence_length > 1 {
-            auxiliary.push(prepared.full_mask.ok_or_else(|| {
-                Error::Parallel("Gemma multimodal ingress did not produce a full mask".into())
-            })?);
+            auxiliary.push(
+                prepared
+                    .full_mask
+                    .ok_or_else(|| {
+                        Error::Parallel(
+                            "Gemma multimodal ingress did not produce a full mask".into(),
+                        )
+                    })?
+                    .try_index_device((0, 0, .., ..), stream)?,
+            );
             if prepared.sliding_masks.len() != self.multimodal_mask_windows.len() {
                 return Err(Error::Parallel(format!(
                     "Gemma multimodal ingress produced {} sliding masks, expected {}",
@@ -18869,9 +20251,172 @@ impl GemmaStage {
                     self.multimodal_mask_windows.len()
                 )));
             }
-            auxiliary.extend(prepared.sliding_masks);
+            auxiliary.extend(
+                prepared
+                    .sliding_masks
+                    .into_iter()
+                    .map(|mask| mask.try_index_device((0, 0, .., ..), stream))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
         Ok((prepared.hidden, PipelineAuxiliaryState::new(auxiliary)))
+    }
+
+    fn execute_placed_media_state(
+        &mut self,
+        state: &mut crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let active = self
+            .media_units
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, unit)| {
+                self.layer_adapter
+                    .should_execute_pipeline_group(unit.group, state)
+                    .then_some(ordinal)
+            })
+            .collect::<Vec<_>>();
+        let prefill = step.sequence_length > 1;
+        let forward_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.forward_guard(prefill, &layers.residency))
+                }
+            })
+            .transpose()?;
+        let group_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.group_guard(&layers.residency, "pipeline_stage"))
+                }
+            });
+        let mut window = self
+            .dense_layers
+            .as_ref()
+            .map(|storage| storage.transfer_window(active.iter().copied(), prefill))
+            .transpose()?
+            .flatten();
+        for ordinal in active {
+            let unit = self.media_units[ordinal];
+            let retained = if let Some(storage) = self.dense_layers.as_ref() {
+                let transfer = window
+                    .as_mut()
+                    .map(|window| window.next(stream))
+                    .transpose()?;
+                let lease = transfer
+                    .is_none()
+                    .then(|| storage.prepare_layerwise_absolute(ordinal))
+                    .transpose()?;
+                let mut layer = match self.parallel_layout.as_ref() {
+                    Some(layout) => self
+                        .layer_adapter
+                        .new_parallel_layer(unit.group, unit.index, layout, stream)?,
+                    None => self
+                        .layer_adapter
+                        .new_layer(unit.group, unit.index, stream)?,
+                };
+                populate_module_from_lease(
+                    &mut layer,
+                    transfer
+                        .as_ref()
+                        .map(|transfer| transfer.lease())
+                        .or(lease.as_ref())
+                        .expect("placed Gemma residency lease"),
+                )?;
+                let retained = self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, &mut layer, state, execution, stream,
+                )?;
+                synchronize_outputs(retained.iter())?;
+                drop(transfer);
+                drop(lease);
+                if let Some(window) = &mut window {
+                    window.refill()?;
+                } else {
+                    storage.trim_after_absolute(ordinal)?;
+                }
+                retained
+            } else {
+                let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "Gemma placed media unit {ordinal} was not materialized"
+                    ))
+                })?;
+                self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, layer, state, execution, stream,
+                )?
+            };
+            if self.dense_layers.is_none() {
+                eval(retained.iter())?;
+            }
+        }
+        if let Some(storage) = self.dense_layers.as_ref() {
+            storage.complete_forward()?;
+        }
+        if let Some(guard) = group_guard {
+            guard.complete()?;
+        }
+        if let Some(guard) = forward_guard {
+            guard.complete()?;
+        }
+        Ok(())
+    }
+
+    fn package_placed_ingress(
+        &self,
+        prepared: crate::architectures::gemma4::layerwise::Gemma4PipelineIngressOutput,
+        step: PipelineStep,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        if prepared.hidden.dim(0) != step.batch_size
+            || prepared.hidden.dim(1) != step.sequence_length
+        {
+            return Err(Error::Parallel(format!(
+                "Gemma placed ingress produced [{}, {}], scheduled [{}, {}]",
+                prepared.hidden.dim(0),
+                prepared.hidden.dim(1),
+                step.batch_size,
+                step.sequence_length
+            )));
+        }
+        let mut auxiliary = Vec::new();
+        if let Some(per_layer) = prepared.per_layer_inputs {
+            auxiliary.push(per_layer);
+        }
+        if step.sequence_length > 1 {
+            auxiliary.push(
+                prepared
+                    .full_mask
+                    .ok_or_else(|| {
+                        Error::Parallel("Gemma placed ingress omitted its full mask".into())
+                    })?
+                    .try_index_device((0, 0, .., ..), stream)?,
+            );
+            if prepared.sliding_masks.len() != self.multimodal_mask_windows.len() {
+                return Err(Error::Parallel(
+                    "Gemma placed ingress sliding-mask schema mismatch".into(),
+                ));
+            }
+            auxiliary.extend(
+                prepared
+                    .sliding_masks
+                    .into_iter()
+                    .map(|mask| mask.try_index_device((0, 0, .., ..), stream))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(PipelinePayload {
+            hidden: prepared.hidden,
+            auxiliary: PipelineAuxiliaryState::new(auxiliary),
+        })
     }
 
     fn multimodal_mask<'a>(
@@ -19330,6 +20875,7 @@ fn load_deepseek_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
+        source_args.layer_schedule.len(),
         ModelKind::DeepSeekV3,
         source_args.hidden_size,
     );
@@ -20025,7 +21571,7 @@ mod tests {
     }
 
     #[test]
-    fn inkling_pipeline_places_the_vision_root_only_on_stage_zero() {
+    fn inkling_pipeline_partitions_the_vision_root_across_stages() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let config = serde_json::json!({
             "model_type": "inkling_mm_model",
@@ -20077,16 +21623,21 @@ mod tests {
         for rank in 0..2 {
             let topology = topology(2, rank, 2);
             let range = topology.layer_range(3).unwrap();
-            let info = base_info(
+            let mut info = base_info(
                 topology,
                 range.clone(),
+                3,
                 ModelKind::Inkling,
                 args.text_config.hidden_size,
+            );
+            info.placement = Arc::new(
+                multimodal_placement(2, 3, Some(4), None).expect("tiny Inkling placement"),
             );
             let stage =
                 InklingStage::new(args.clone(), range, &info, false, execution.stream()).unwrap();
             assert!(stage.has_multimodal_ingress);
-            assert_eq!(stage.media_units.len(), if rank == 0 { 4 } else { 0 });
+            assert_eq!(stage.media_units.len(), 2);
+            assert_eq!(stage.media_units[0].index, rank * 2);
             assert_eq!(stage.media_layer_count, stage.media_units.len());
             assert!(stage.embedding.is_none());
             assert!(stage.embed_norm.is_none());
@@ -20095,19 +21646,19 @@ mod tests {
 
     #[test]
     fn stage_roles_and_neighbor_ranks_are_explicit() {
-        let first = base_info(topology(3, 0, 3), 0..2, ModelKind::Llama, 8);
+        let first = base_info(topology(3, 0, 3), 0..2, 5, ModelKind::Llama, 8);
         assert!(first.is_first);
         assert!(!first.is_last);
         assert_eq!(first.predecessor_rank, None);
         assert_eq!(first.successor_rank, Some(1));
 
-        let middle = base_info(topology(3, 1, 3), 2..4, ModelKind::Llama, 8);
+        let middle = base_info(topology(3, 1, 3), 2..4, 5, ModelKind::Llama, 8);
         assert!(!middle.is_first);
         assert!(!middle.is_last);
         assert_eq!(middle.predecessor_rank, Some(0));
         assert_eq!(middle.successor_rank, Some(2));
 
-        let last = base_info(topology(3, 2, 3), 4..5, ModelKind::Llama, 8);
+        let last = base_info(topology(3, 2, 3), 4..5, 5, ModelKind::Llama, 8);
         assert!(!last.is_first);
         assert!(last.is_last);
         assert_eq!(last.predecessor_rank, Some(1));
@@ -20116,9 +21667,9 @@ mod tests {
 
     #[test]
     fn boundary_and_tied_embedding_ownership_is_not_replicated() {
-        let first = base_info(topology(3, 0, 3), 0..1, ModelKind::Llama, 8);
-        let middle = base_info(topology(3, 1, 3), 1..2, ModelKind::Llama, 8);
-        let last = base_info(topology(3, 2, 3), 2..3, ModelKind::Llama, 8);
+        let first = base_info(topology(3, 0, 3), 0..1, 3, ModelKind::Llama, 8);
+        let middle = base_info(topology(3, 1, 3), 1..2, 3, ModelKind::Llama, 8);
+        let last = base_info(topology(3, 2, 3), 2..3, 3, ModelKind::Llama, 8);
         assert!(owns_embedding_weight(&first, false));
         assert!(!owns_embedding_weight(&middle, false));
         assert!(!owns_embedding_weight(&last, false));
@@ -20143,7 +21694,7 @@ mod tests {
 
     #[test]
     fn activation_shape_validation_is_role_aware() {
-        let later = base_info(topology(2, 1, 2), 1..2, ModelKind::Llama, 8);
+        let later = base_info(topology(2, 1, 2), 1..2, 2, ModelKind::Llama, 8);
         let step = PipelineStep::new(1, 3).unwrap();
         assert!(validate_hidden_metadata(&later, &[1, 3, 8], Dtype::Float32, step).is_ok());
         assert!(validate_hidden_metadata(&later, &[1, 3, 7], Dtype::Float32, step).is_err());
@@ -24770,12 +26321,14 @@ mod tests {
         let first_info = base_info(
             first_topology,
             0..1,
+            2,
             ModelKind::Llama,
             source.args.hidden_size,
         );
         let last_info = base_info(
             last_topology,
             1..2,
+            2,
             ModelKind::Llama,
             source.args.hidden_size,
         );
@@ -25331,7 +26884,7 @@ mod tests {
         let last_topology = gpu_topology(1);
         let mut first = PipelineModel::from_adapter(
             first_topology,
-            base_info(first_topology, 0..1, ModelKind::DeepSeekV3, 8),
+            base_info(first_topology, 0..1, 2, ModelKind::DeepSeekV3, 8),
             PipelineStage(DeepSeekStage {
                 args: reference.args.clone(),
                 layer_adapter:
@@ -25357,7 +26910,7 @@ mod tests {
         .unwrap();
         let mut last = PipelineModel::from_adapter(
             last_topology,
-            base_info(last_topology, 1..2, ModelKind::DeepSeekV3, 8),
+            base_info(last_topology, 1..2, 2, ModelKind::DeepSeekV3, 8),
             PipelineStage(DeepSeekStage {
                 args: reference.args.clone(),
                 layer_adapter:

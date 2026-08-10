@@ -1441,6 +1441,67 @@ pub struct Gemma4LayerwiseAdapter {
 }
 
 impl Gemma4LayerwiseAdapter {
+    /// Exports all independent image/audio job activations for the next PP owner.
+    pub(crate) fn pipeline_ingress_arrays(&self, state: &Gemma4PipelineIngressState) -> Vec<Array> {
+        state
+            .forward
+            .context
+            .vision_jobs
+            .iter()
+            .map(|job| job.hidden.clone())
+            .chain(
+                state
+                    .forward
+                    .context
+                    .audio_jobs
+                    .iter()
+                    .map(|job| job.hidden.clone()),
+            )
+            .collect()
+    }
+
+    /// Imports independent image/audio job activations from the previous PP owner.
+    pub(crate) fn replace_pipeline_ingress_arrays(
+        &self,
+        state: &mut Gemma4PipelineIngressState,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let vision = state.forward.context.vision_jobs.len();
+        let audio = state.forward.context.audio_jobs.len();
+        if arrays.len() != vision + audio {
+            return Err(Error::Parallel(format!(
+                "Gemma distributed encoder payload has {} jobs, expected {} image plus {} audio jobs",
+                arrays.len(), vision, audio
+            )));
+        }
+        let (vision_arrays, audio_arrays) = arrays.split_at(vision);
+        for (job, hidden) in state
+            .forward
+            .context
+            .vision_jobs
+            .iter_mut()
+            .zip(vision_arrays)
+        {
+            job.hidden = hidden.clone();
+            job.state.working_dtype = hidden.dtype();
+        }
+        for (job, hidden) in state
+            .forward
+            .context
+            .audio_jobs
+            .iter_mut()
+            .zip(audio_arrays)
+        {
+            job.hidden = hidden.clone();
+        }
+        state.forward.hidden = vision_arrays
+            .first()
+            .or_else(|| audio_arrays.first())
+            .cloned()
+            .unwrap_or_else(|| state.forward.hidden.clone());
+        Ok(())
+    }
+
     /// Creates the text-only adapter used by text pipeline stages.
     pub(crate) fn new_text(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         Self::new(args, None, None, None, None, None, stream)
@@ -2136,6 +2197,94 @@ impl Gemma4LayerwiseAdapter {
             _ => self.begin_forward(Gemma4Input::Prefill(input), &mut cache, stream)?,
         };
         Ok(Gemma4PipelineIngressState { cache, forward })
+    }
+
+    /// Builds parameter-free image/audio job state for a downstream PP owner.
+    /// Patch/subsample projections, text embedding, modality projectors, and
+    /// final assembly remain on their placement-declared static owner.
+    pub(crate) fn begin_pipeline_continuation(
+        &self,
+        input: input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Gemma4PipelineIngressState, Error> {
+        input::validate(input)?;
+        let mut vision_jobs = Vec::new();
+        let mut audio_jobs = Vec::new();
+        for part in input.parts {
+            match (part.modality, part.payload) {
+                (
+                    input::Modality::Image | input::Modality::Video,
+                    input::InputPayload::Tensor(pixels),
+                ) => {
+                    let positions = part.metadata.patch_position_ids.ok_or_else(|| {
+                        Error::Parallel(
+                            "Gemma vision continuation omitted patch_position_ids".into(),
+                        )
+                    })?;
+                    let vision = self.vision.as_ref().ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Gemma vision continuation requires vision_config".into(),
+                        )
+                    })?;
+                    vision_jobs.push(Gemma4VisionJob {
+                        hidden: pixels.clone(),
+                        state: vision.continuation_state(pixels, positions, stream)?,
+                    });
+                }
+                (input::Modality::Audio, input::InputPayload::Tensor(features)) => {
+                    let mask = part.metadata.audio_mask.ok_or_else(|| {
+                        Error::Parallel("Gemma audio continuation omitted audio_mask".into())
+                    })?;
+                    if mask.shape().len() != 2
+                        || mask.dim(0) != features.dim(0)
+                        || mask.dim(1) != features.dim(1)
+                    {
+                        return Err(Error::Parallel(format!(
+                            "Gemma audio continuation mask {:?} does not match {:?}",
+                            mask.shape(),
+                            features.shape()
+                        )));
+                    }
+                    let valid_frames = mask.sum(None, stream)?.item::<i32>(stream);
+                    audio_jobs.push(Gemma4AudioJob {
+                        hidden: features.clone(),
+                        valid: (valid_frames + 3) / 4,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let hidden = vision_jobs
+            .first()
+            .map(|job| job.hidden.clone())
+            .or_else(|| audio_jobs.first().map(|job| job.hidden.clone()))
+            .or_else(|| {
+                input.parts.first().map(|part| match part.payload {
+                    input::InputPayload::TokenIds(value)
+                    | input::InputPayload::Tensor(value)
+                    | input::InputPayload::Embeddings(value) => value.clone(),
+                })
+            })
+            .ok_or_else(|| Error::Parallel("Gemma continuation has no payload".into()))?;
+        Ok(Gemma4PipelineIngressState {
+            cache: Cache::new(&self.args),
+            forward: LayerwiseForwardState {
+                hidden,
+                context: Gemma4ForwardContext {
+                    per_layer_inputs: None,
+                    mask: None,
+                    sliding_masks: None,
+                    position_offset: 0,
+                    shared_kv: HashMap::new(),
+                    parts: Vec::new(),
+                    vision_jobs,
+                    audio_jobs,
+                    tokens: None,
+                    needs_assembly: true,
+                    draft_hidden: None,
+                },
+            },
+        })
     }
 
     /// Returns whether a configured media group has work for this input.

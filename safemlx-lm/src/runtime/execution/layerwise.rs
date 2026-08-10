@@ -3988,8 +3988,7 @@ where
 /// expert store is only involved when that residency policy was requested.
 pub(crate) struct PipelineStageQuantizationSelection<'a> {
     static_roles: &'a [&'a str],
-    layer_group: usize,
-    layer_range: Range<usize>,
+    layer_groups: Vec<(usize, Range<usize>)>,
 }
 
 impl<'a> PipelineStageQuantizationSelection<'a> {
@@ -4000,9 +3999,19 @@ impl<'a> PipelineStageQuantizationSelection<'a> {
     ) -> Self {
         Self {
             static_roles,
-            layer_group,
-            layer_range,
+            layer_groups: vec![(layer_group, layer_range)],
         }
+    }
+
+    pub(crate) fn with_layer_group(
+        mut self,
+        layer_group: usize,
+        layer_range: Range<usize>,
+    ) -> Self {
+        if !layer_range.is_empty() {
+            self.layer_groups.push((layer_group, layer_range));
+        }
+        self
     }
 }
 
@@ -4083,19 +4092,16 @@ where
         collect(unit.bindings(), Some(&selected))?;
     }
 
-    for index in selection.layer_range {
-        let source_layer = source_adapter.new_layer(selection.layer_group, index, stream)?;
-        let target_layer = target_adapter.new_layer(selection.layer_group, index, stream)?;
-        let selected = packed_weight_companion_dtypes(&target_layer);
-        collect(
-            &source_adapter.layer_bindings(
-                selection.layer_group,
-                index,
-                &source_layer,
-                store.as_ref(),
-            )?,
-            Some(&selected),
-        )?;
+    for (group, range) in selection.layer_groups {
+        for index in range {
+            let source_layer = source_adapter.new_layer(group, index, stream)?;
+            let target_layer = target_adapter.new_layer(group, index, stream)?;
+            let selected = packed_weight_companion_dtypes(&target_layer);
+            collect(
+                &source_adapter.layer_bindings(group, index, &source_layer, store.as_ref())?,
+                Some(&selected),
+            )?;
+        }
     }
 
     if recipes.is_empty() {

@@ -625,7 +625,7 @@ fn pipeline_ring_worker() {
         return;
     }
 
-    let paged = PagedCacheOptions::new(1, 4096, 4096, 1)
+    let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
         .unwrap()
         .with_full_attention(true);
     let mut cache = model
@@ -1202,7 +1202,7 @@ fn run_microbatch_worker(
 
     let mut scheduler =
         PipelineInferenceScheduler::new(model, SchedulerLimits::new(2, 4).unwrap()).unwrap();
-    let paged = PagedCacheOptions::new(1, 4096, 4096, 1)
+    let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
         .unwrap()
         .with_full_attention(true);
     scheduler
@@ -4725,7 +4725,7 @@ fn ring_four_process_inkling_fully_resident_load_time_quantization() {
     );
 }
 
-/// Runs scheduled Inkling audio/image ingress through TP-sharded stage zero,
+/// Runs scheduled Inkling audio/image ingress through TP-sharded placed groups,
 /// matching-TP pipeline transport, persistence, decode, and generation.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]

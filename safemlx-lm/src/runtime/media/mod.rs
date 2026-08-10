@@ -407,6 +407,112 @@ impl PreparedModelInputIdentity {
         }
         Ok(())
     }
+
+    pub(crate) fn descriptor(&self) -> Result<Vec<u32>, Error> {
+        let mut descriptor = Vec::new();
+        self.encode_descriptor(&mut descriptor)?;
+        Ok(descriptor)
+    }
+
+    pub(crate) fn from_descriptor(descriptor: &[u32]) -> Result<Self, Error> {
+        fn take(cursor: &mut usize, values: &[u32]) -> Result<u32, Error> {
+            let value = values.get(*cursor).copied().ok_or_else(|| {
+                Error::Parallel("prepared-input descriptor ended unexpectedly".into())
+            })?;
+            *cursor += 1;
+            Ok(value)
+        }
+        fn array(cursor: &mut usize, values: &[u32]) -> Result<PreparedArrayIdentity, Error> {
+            let dtype = Dtype::try_from(take(cursor, values)?).map_err(|_| {
+                Error::Parallel("prepared-input descriptor has an invalid dtype".into())
+            })?;
+            let ndim = take(cursor, values)? as usize;
+            if ndim > 8 {
+                return Err(Error::Parallel(
+                    "prepared-input descriptor tensor rank exceeds 8".into(),
+                ));
+            }
+            let shape = (0..ndim)
+                .map(|_| {
+                    i32::try_from(take(cursor, values)?).map_err(|_| {
+                        Error::Parallel("prepared-input descriptor dimension exceeds i32".into())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PreparedArrayIdentity { dtype, shape })
+        }
+        fn optional(
+            cursor: &mut usize,
+            values: &[u32],
+        ) -> Result<Option<PreparedArrayIdentity>, Error> {
+            match take(cursor, values)? {
+                0 => Ok(None),
+                1 => array(cursor, values).map(Some),
+                _ => Err(Error::Parallel(
+                    "prepared-input descriptor has an invalid optional tag".into(),
+                )),
+            }
+        }
+        let mut cursor = 0;
+        let count = take(&mut cursor, descriptor)? as usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let modality = match take(&mut cursor, descriptor)? {
+                0 => Modality::Text,
+                1 => Modality::Image,
+                2 => Modality::Audio,
+                3 => Modality::Video,
+                _ => {
+                    return Err(Error::Parallel(
+                        "prepared-input descriptor has an invalid modality".into(),
+                    ))
+                }
+            };
+            let payload_kind = match take(&mut cursor, descriptor)? {
+                0 => PreparedPayloadKind::TokenIds,
+                1 => PreparedPayloadKind::Tensor,
+                2 => PreparedPayloadKind::Embeddings,
+                _ => {
+                    return Err(Error::Parallel(
+                        "prepared-input descriptor has an invalid payload kind".into(),
+                    ))
+                }
+            };
+            parts.push(PreparedInputPartIdentity {
+                modality,
+                payload_kind,
+                payload: array(&mut cursor, descriptor)?,
+                qwen_grid_thw: optional(&mut cursor, descriptor)?,
+                patch_position_ids: optional(&mut cursor, descriptor)?,
+                audio_mask: optional(&mut cursor, descriptor)?,
+            });
+        }
+        if cursor != descriptor.len() {
+            return Err(Error::Parallel(
+                "prepared-input descriptor has trailing values".into(),
+            ));
+        }
+        Ok(Self { parts })
+    }
+
+    /// Returns payload and metadata array geometry in deterministic wire order.
+    pub(crate) fn wire_arrays(&self) -> Vec<(Dtype, Vec<i32>)> {
+        let mut arrays = Vec::new();
+        for part in &self.parts {
+            arrays.push((part.payload.dtype, part.payload.shape.clone()));
+            for metadata in [
+                part.qwen_grid_thw.as_ref(),
+                part.patch_position_ids.as_ref(),
+                part.audio_mask.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                arrays.push((metadata.dtype, metadata.shape.clone()));
+            }
+        }
+        arrays
+    }
 }
 
 /// Owned runtime input produced by a media processor.
@@ -475,6 +581,62 @@ impl PreparedModelInput {
     pub fn with_model_input<T>(&self, function: impl FnOnce(ModelInput<'_>) -> T) -> T {
         let parts = self.input_parts();
         function(ModelInput::new(&parts))
+    }
+
+    /// Clones payload and metadata arrays in the identity's deterministic wire order.
+    pub(crate) fn wire_arrays(&self) -> Vec<Array> {
+        let mut arrays = Vec::new();
+        for part in &self.parts {
+            arrays.push(match &part.payload {
+                OwnedInputPayload::TokenIds(value)
+                | OwnedInputPayload::Tensor(value)
+                | OwnedInputPayload::Embeddings(value) => value.clone(),
+            });
+            arrays.extend(part.metadata.qwen_grid_thw.iter().cloned());
+            arrays.extend(part.metadata.patch_position_ids.iter().cloned());
+            arrays.extend(part.metadata.audio_mask.iter().cloned());
+        }
+        arrays
+    }
+
+    /// Rebuilds owned prepared ingress from a validated identity and wire arrays.
+    pub(crate) fn from_identity_wire_arrays(
+        identity: &PreparedModelInputIdentity,
+        arrays: Vec<Array>,
+    ) -> Result<Self, Error> {
+        let expected = identity.wire_arrays();
+        if arrays.len() != expected.len()
+            || arrays
+                .iter()
+                .zip(&expected)
+                .any(|(array, (dtype, shape))| array.dtype() != *dtype || array.shape() != shape)
+        {
+            return Err(Error::Parallel(
+                "prepared-input wire payload does not match its identity".into(),
+            ));
+        }
+        let mut arrays = arrays.into_iter();
+        let mut parts = Vec::with_capacity(identity.parts.len());
+        for part in &identity.parts {
+            let payload = arrays.next().expect("validated wire array count");
+            let payload = match part.payload_kind {
+                PreparedPayloadKind::TokenIds => OwnedInputPayload::TokenIds(payload),
+                PreparedPayloadKind::Tensor => OwnedInputPayload::Tensor(payload),
+                PreparedPayloadKind::Embeddings => OwnedInputPayload::Embeddings(payload),
+            };
+            let mut next_optional = |present: bool| present.then(|| arrays.next().unwrap());
+            let metadata = OwnedInputMetadata {
+                qwen_grid_thw: next_optional(part.qwen_grid_thw.is_some()),
+                patch_position_ids: next_optional(part.patch_position_ids.is_some()),
+                audio_mask: next_optional(part.audio_mask.is_some()),
+            };
+            parts.push(PreparedInputPart {
+                modality: part.modality,
+                payload,
+                metadata,
+            });
+        }
+        Ok(Self { parts })
     }
 }
 

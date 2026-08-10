@@ -844,6 +844,12 @@ pub(crate) struct Qwen3VlPipelinePrepared {
     pub(crate) deepstack_features: Vec<Array>,
 }
 
+/// Opaque prepared state routed between placed Qwen3-VL vision owners.
+pub(crate) struct Qwen3VlPipelineIngressState {
+    cache: Cache,
+    forward: LayerwiseForwardState<Qwen3VlForwardContext>,
+}
+
 /// One temporary unit from either the vision or text group.
 pub enum Qwen3VlLayer {
     /// Vision transformer block.
@@ -925,6 +931,214 @@ pub struct Qwen3VlLayerwiseAdapter {
 }
 
 impl Qwen3VlLayerwiseAdapter {
+    /// Starts placed Qwen3-VL ingress before any vision block executes.
+    pub(crate) fn begin_pipeline_ingress(
+        &mut self,
+        typed: input::ModelInput<'_>,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Qwen3VlPipelineIngressState, Error> {
+        let mut cache = Cache::default();
+        let forward = self.prepare_prefill(typed, &mut cache, execution, stream)?;
+        Ok(Qwen3VlPipelineIngressState { cache, forward })
+    }
+
+    /// Rebuilds only parameter-free vision scheduling state on a downstream
+    /// PP owner. Patch/text embeddings and projectors stay on their declared
+    /// static owners; the previous encoder owner supplies the hidden tensor.
+    pub(crate) fn begin_pipeline_continuation(
+        &self,
+        typed: input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Qwen3VlPipelineIngressState, Error> {
+        input::validate(typed)?;
+        let mut pixels = Vec::new();
+        let mut grids = Vec::new();
+        for part in typed.parts {
+            if matches!(
+                part.modality,
+                input::Modality::Image | input::Modality::Video
+            ) {
+                let input::InputPayload::Tensor(tensor) = part.payload else {
+                    return Err(Error::Parallel(
+                        "Qwen3-VL continuation requires tensor media payloads".into(),
+                    ));
+                };
+                let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
+                    Error::Parallel("Qwen3-VL continuation omitted qwen_grid_thw".into())
+                })?;
+                pixels.push(tensor.clone());
+                grids.push(grid.clone());
+            }
+        }
+        if pixels.is_empty() {
+            return Err(Error::Parallel(
+                "Qwen3-VL continuation requires at least one visual payload".into(),
+            ));
+        }
+        let pixel_refs = pixels.iter().collect::<Vec<_>>();
+        let grid_refs = grids.iter().collect::<Vec<_>>();
+        let pixels = concatenate_axis(&pixel_refs, 0, stream)?;
+        let grids = concatenate_axis(&grid_refs, 0, stream)?;
+        let vision = self.vision.continuation_state(&pixels, &grids, stream)?;
+        let hidden = zeros_dtype(
+            &[pixels.dim(0), self.args.vision_config.hidden_size],
+            pixels.dtype(),
+            stream,
+        )?;
+        let empty = zeros_dtype(
+            &[1, 0, self.args.text_config.head_dim],
+            pixels.dtype(),
+            stream,
+        )?;
+        Ok(Qwen3VlPipelineIngressState {
+            cache: Cache::default(),
+            forward: LayerwiseForwardState {
+                hidden,
+                context: Qwen3VlForwardContext {
+                    tokens: Array::from_slice(&[] as &[u32], &[1, 0]),
+                    parts: Vec::new(),
+                    vision: Some(vision),
+                    mask: None,
+                    cos: empty.clone(),
+                    sin: empty,
+                    visual_mask: None,
+                    deepstack_features: Vec::new(),
+                },
+            },
+        })
+    }
+
+    /// Returns whether this request contains model-native visual work.
+    pub(crate) fn pipeline_ingress_active(&self, state: &Qwen3VlPipelineIngressState) -> bool {
+        state.forward.context.vision.is_some()
+    }
+
+    /// Exports variable DeepStack state and the evolving vision activation.
+    pub(crate) fn pipeline_ingress_arrays(
+        &self,
+        state: &Qwen3VlPipelineIngressState,
+    ) -> Vec<Array> {
+        std::iter::once(state.forward.hidden.clone())
+            .chain(
+                state
+                    .forward
+                    .context
+                    .vision
+                    .iter()
+                    .flat_map(QwenVisionLayerwiseState::retained_arrays)
+                    .cloned(),
+            )
+            .collect()
+    }
+
+    /// Imports activation and DeepStack features from the previous PP owner.
+    pub(crate) fn replace_pipeline_ingress_arrays(
+        &self,
+        state: &mut Qwen3VlPipelineIngressState,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let (hidden, features) = arrays.split_first().ok_or_else(|| {
+            Error::Parallel("Qwen3-VL placed ingress omitted vision hidden state".into())
+        })?;
+        state.forward.hidden = hidden.clone();
+        if let Some(vision) = &mut state.forward.context.vision {
+            vision.replace_deepstack_features(features.to_vec());
+        } else if !features.is_empty() {
+            return Err(Error::Parallel(
+                "Qwen3-VL text-only ingress received DeepStack state".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Executes one placed vision block.
+    pub(crate) fn forward_pipeline_vision_layer(
+        &mut self,
+        index: usize,
+        layer: &mut Qwen3VlLayer,
+        state: &mut Qwen3VlPipelineIngressState,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Vec<Array>, Error> {
+        state.forward.hidden = match execution {
+            Some(execution) => self.forward_layer_with_execution(
+                0,
+                index,
+                layer,
+                &state.forward.hidden,
+                &mut state.cache,
+                &mut state.forward.context,
+                execution,
+            )?,
+            None => self.forward_layer(
+                0,
+                index,
+                layer,
+                &state.forward.hidden,
+                &mut state.cache,
+                &mut state.forward.context,
+                stream,
+            )?,
+        };
+        Ok(self.pipeline_ingress_arrays(state))
+    }
+
+    /// Finalizes merger/projector state into decoder-facing payload tensors.
+    pub(crate) fn finish_pipeline_ingress(
+        &mut self,
+        mut state: Qwen3VlPipelineIngressState,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Qwen3VlPipelinePrepared, Error> {
+        let hidden = match execution {
+            Some(execution) => self.begin_execution_group_with_execution(
+                1,
+                &state.forward.hidden,
+                &[state.forward.hidden.clone()],
+                &mut state.cache,
+                &mut state.forward.context,
+                execution,
+            )?,
+            None => self.begin_execution_group(
+                1,
+                &state.forward.hidden,
+                &[state.forward.hidden.clone()],
+                &mut state.cache,
+                &mut state.forward.context,
+                stream,
+            )?,
+        };
+        let deepstack_features = state
+            .forward
+            .context
+            .deepstack_features
+            .iter()
+            .map(|features| {
+                let base = zeros_dtype(hidden.shape(), hidden.dtype(), stream)?;
+                masked_scatter(
+                    &base,
+                    state
+                        .forward
+                        .context
+                        .visual_mask
+                        .as_ref()
+                        .expect("DeepStack visual mask"),
+                    features.try_index_device((0, .., ..), stream)?,
+                    stream,
+                )
+                .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Qwen3VlPipelinePrepared {
+            hidden,
+            cos: state.forward.context.cos,
+            sin: state.forward.context.sin,
+            rope_delta: state.cache.rope_delta,
+            deepstack_features,
+        })
+    }
+
     pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let visual = QwenVisionTransformer::new_deepstack(args.vision_config.clone(), stream)?;
         let text = Decoder::new(&args.text_config, stream)?;
@@ -991,9 +1205,9 @@ impl Qwen3VlLayerwiseAdapter {
         self.parallel_lm_head.as_mut()
     }
 
-    /// Executes stage-zero multimodal ingress and returns only decoder-facing
-    /// state. Vision execution stays architecture-owned while pipeline
-    /// placement and transport remain generic.
+    /// Executes the local multimodal reference path and returns decoder-facing
+    /// state. Distributed execution uses the same architecture-owned methods
+    /// through the generic placement and transport plan.
     pub(crate) fn prepare_pipeline_prefill(
         &mut self,
         typed: input::ModelInput<'_>,
@@ -1006,7 +1220,7 @@ impl Qwen3VlLayerwiseAdapter {
         if state.context.vision.is_some() {
             if vision_layers.len() != self.args.vision_config.layer_count() {
                 return Err(Error::Parallel(format!(
-                    "Qwen3-VL pipeline stage zero owns {} vision blocks, expected {}",
+                    "Qwen3-VL local reference owns {} vision blocks, expected {}",
                     vision_layers.len(),
                     self.args.vision_config.layer_count()
                 )));

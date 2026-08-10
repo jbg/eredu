@@ -1420,6 +1420,46 @@ pub(crate) struct InklingLayerwiseAdapter {
 }
 
 impl InklingLayerwiseAdapter {
+    /// Exports hMLP job state for the next PP owner.
+    pub(crate) fn pipeline_ingress_arrays(
+        &self,
+        state: &InklingPipelineIngressState,
+    ) -> Vec<Array> {
+        state
+            .forward
+            .context
+            .vision_jobs
+            .iter()
+            .map(|job| job.hidden.clone())
+            .collect()
+    }
+
+    /// Imports hMLP job state from the previous PP owner.
+    pub(crate) fn replace_pipeline_ingress_arrays(
+        &self,
+        state: &mut InklingPipelineIngressState,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        if arrays.len() != state.forward.context.vision_jobs.len() {
+            return Err(Error::Parallel(format!(
+                "Inkling distributed vision payload has {} jobs, expected {}",
+                arrays.len(),
+                state.forward.context.vision_jobs.len()
+            )));
+        }
+        for (job, hidden) in state.forward.context.vision_jobs.iter_mut().zip(arrays) {
+            job.hidden = hidden;
+        }
+        state.forward.hidden = state
+            .forward
+            .context
+            .vision_jobs
+            .first()
+            .map(|job| job.hidden.clone())
+            .unwrap_or_else(|| state.forward.hidden.clone());
+        Ok(())
+    }
+
     pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let mtp = InklingMtpModule::new(&args, stream)?;
         let text = &args.text_config;
@@ -1987,6 +2027,51 @@ impl InklingLayerwiseAdapter {
             )?,
         };
         Ok(InklingPipelineIngressState { cache, forward })
+    }
+
+    /// Builds the parameter-free hMLP job skeleton used by downstream PP
+    /// owners. Text embedding, dMel audio ingress, normalization, and modality
+    /// assembly remain on the placement-declared ingress/finalization owner.
+    pub(crate) fn begin_pipeline_continuation(
+        &self,
+        input: input::ModelInput<'_>,
+    ) -> Result<InklingPipelineIngressState, Error> {
+        input::validate(input)?;
+        let vision_jobs = input
+            .parts
+            .iter()
+            .filter_map(|part| match (part.modality, part.payload) {
+                (input::Modality::Image, input::InputPayload::Tensor(pixels)) => Some(VisionJob {
+                    hidden: pixels.clone(),
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let hidden = vision_jobs
+            .first()
+            .map(|job| job.hidden.clone())
+            .or_else(|| {
+                input.parts.first().map(|part| match part.payload {
+                    input::InputPayload::Tensor(value)
+                    | input::InputPayload::Embeddings(value)
+                    | input::InputPayload::TokenIds(value) => value.clone(),
+                })
+            })
+            .ok_or_else(|| Error::Parallel("Inkling continuation has no payload".into()))?;
+        Ok(InklingPipelineIngressState {
+            cache: Cache::new(&self.args.text_config),
+            forward: LayerwiseForwardState {
+                hidden,
+                context: InklingForwardContext {
+                    parts: Vec::new(),
+                    vision_jobs,
+                    needs_assembly: true,
+                    last_token_only: false,
+                    draft_hidden: None,
+                    draft_tokens: None,
+                },
+            },
+        })
     }
 
     /// Returns whether a configured media group has work for this input.

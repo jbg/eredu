@@ -1753,6 +1753,54 @@ pub struct QwenHybridLayerwiseAdapter {
 }
 
 impl QwenHybridLayerwiseAdapter {
+    /// Exports the complete variable-size state needed by a later PP owner.
+    pub(crate) fn pipeline_ingress_arrays(
+        &self,
+        state: &QwenHybridPipelineIngressState,
+    ) -> Vec<Array> {
+        state
+            .vision_jobs
+            .iter()
+            .flat_map(|job| {
+                std::iter::once(job.hidden.clone())
+                    .chain(job.state.retained_arrays().into_iter().cloned())
+            })
+            .collect()
+    }
+
+    /// Imports state produced by an earlier PP owner.
+    pub(crate) fn replace_pipeline_ingress_arrays(
+        &self,
+        state: &mut QwenHybridPipelineIngressState,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        if state.vision_jobs.is_empty() {
+            return if arrays.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::Parallel(
+                    "Qwen3.5 text-only ingress received visual state".into(),
+                ))
+            };
+        }
+        if !arrays.len().is_multiple_of(state.vision_jobs.len()) {
+            return Err(Error::Parallel(
+                "Qwen3.5 distributed vision payload has ambiguous job ownership".into(),
+            ));
+        }
+        let stride = arrays.len() / state.vision_jobs.len();
+        if stride == 0 {
+            return Err(Error::Parallel(
+                "Qwen3.5 distributed vision payload omitted job hidden state".into(),
+            ));
+        }
+        for (job, chunk) in state.vision_jobs.iter_mut().zip(arrays.chunks(stride)) {
+            job.hidden = chunk[0].clone();
+            job.state.replace_deepstack_features(chunk[1..].to_vec());
+        }
+        Ok(())
+    }
+
     /// Creates the canonical text-only binding adapter used by bounded and
     /// pipeline execution.
     pub(crate) fn new_text(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
@@ -2900,7 +2948,7 @@ pub struct QwenHybridForwardContext {
     draft_hidden: Option<Array>,
 }
 
-/// Opaque state retained while stage zero executes the Qwen3.5 vision root.
+/// Opaque state routed while placed owners execute the Qwen3.5 vision root.
 pub(crate) struct QwenHybridPipelineIngressState {
     parts: Vec<QwenHybridPreparedPart>,
     vision_jobs: Vec<QwenHybridVisionJob>,
@@ -2989,6 +3037,46 @@ impl QwenHybridLayerwiseAdapter {
         Ok(QwenHybridPipelineIngressState { parts, vision_jobs })
     }
 
+    /// Reconstructs parameter-free vision scheduling state on a downstream
+    /// PP owner. Patch/text embeddings and final projection remain on the
+    /// placement-declared ingress owner; transported arrays replace the dummy
+    /// hidden values before any local vision block executes.
+    pub(crate) fn begin_pipeline_continuation(
+        &self,
+        input: input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<QwenHybridPipelineIngressState, Error> {
+        input::validate(input)?;
+        let vision = self.vision.as_ref().ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "Qwen3.5 visual continuation requires vision_config".into(),
+            )
+        })?;
+        let mut vision_jobs = Vec::new();
+        for part in input.parts {
+            if !matches!(
+                part.modality,
+                input::Modality::Image | input::Modality::Video
+            ) {
+                continue;
+            }
+            let input::InputPayload::Tensor(pixels) = part.payload else {
+                continue;
+            };
+            let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
+                Error::Parallel("Qwen3.5 continuation omitted qwen_grid_thw".into())
+            })?;
+            vision_jobs.push(QwenHybridVisionJob {
+                hidden: pixels.clone(),
+                state: vision.continuation_state(pixels, grid, stream)?,
+            });
+        }
+        Ok(QwenHybridPipelineIngressState {
+            parts: Vec::new(),
+            vision_jobs,
+        })
+    }
+
     /// Returns whether one configured media group has work for this input.
     pub(crate) fn should_execute_pipeline_group(
         &self,
@@ -3059,14 +3147,18 @@ impl QwenHybridLayerwiseAdapter {
     pub(crate) fn finish_pipeline_ingress(
         &mut self,
         mut state: QwenHybridPipelineIngressState,
-        _execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Array, Error> {
         if let Some(vision) = &mut self.vision {
             for job in &mut state.vision_jobs {
-                job.hidden = vision
-                    .finish(&job.hidden, &mut job.state, stream)?
-                    .embeddings;
+                job.hidden = match execution.and_then(|execution| execution.group()) {
+                    Some(group) => {
+                        vision.finish_tensor_parallel(&job.hidden, &mut job.state, group, stream)?
+                    }
+                    None => vision.finish(&job.hidden, &mut job.state, stream)?,
+                }
+                .embeddings;
             }
         }
         let assembled = state

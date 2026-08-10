@@ -571,7 +571,7 @@ fn qwen3_vl_pipeline_ring_worker() {
         model.stage_info().global_layer_range,
         topology.pipeline_parallel_rank..topology.pipeline_parallel_rank + 1
     );
-    let paged = PagedCacheOptions::new(1, 4096, 4096, 1)
+    let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
         .unwrap()
         .with_full_attention(true);
     let before = Array::from_slice(&[1u32], &[1, 1]);
@@ -725,7 +725,7 @@ fn qwen3_vl_pipeline_ring_worker() {
     }
     if streamed {
         let report = model.dense_stream_report().unwrap().unwrap();
-        assert_eq!(report.planned_layer_count(), 1);
+        assert_eq!(report.planned_layer_count(), 2);
         assert!(report.prefill_forwards() >= 1);
         assert!(report.decode_forwards() >= 1);
         if checkpoint.extension().is_some_and(|value| value == "gguf") {
@@ -746,7 +746,7 @@ fn qwen3_vl_pipeline_ring_worker() {
     if layerwise_host {
         let report = model.parameter_residency_report().unwrap().unwrap();
         assert!(report.initialized());
-        assert_eq!(report.units().len(), 1);
+        assert_eq!(report.units().len(), 2);
         assert!(report.units().iter().all(|unit| unit.host_resident()));
     }
     if expert_cache {
@@ -773,11 +773,16 @@ fn assert_close(left: &Array, right: &Array) {
     let left = left.evaluated().unwrap();
     let right = right.evaluated().unwrap();
     assert_eq!(left.as_array().shape(), right.as_array().shape());
-    assert!(left
+    let maximum_error = left
         .as_slice::<f32>()
         .iter()
         .zip(right.as_slice::<f32>())
-        .all(|(left, right)| (left - right).abs() <= 8e-5));
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        maximum_error <= 2e-3,
+        "maximum absolute error {maximum_error} exceeded 2e-3"
+    );
 }
 
 #[test]

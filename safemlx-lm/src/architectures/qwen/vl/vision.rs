@@ -1096,6 +1096,10 @@ impl QwenVisionLayerwiseState {
     pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
         self.deepstack_features.iter().collect()
     }
+
+    pub(crate) fn replace_deepstack_features(&mut self, features: Vec<Array>) {
+        self.deepstack_features = features;
+    }
 }
 
 impl QwenVisionLayerwiseStatic {
@@ -1128,6 +1132,29 @@ impl QwenVisionLayerwiseStatic {
             stream,
         )?;
         hidden = hidden.add(positions.as_dtype(hidden.dtype(), stream)?, stream)?;
+        let state = self.continuation_state(pixel_values, grid_thw, stream)?;
+        let merge_unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
+        let window_index =
+            Array::from_slice(&state.window_index, &[state.window_index.len() as i32]);
+        hidden = hidden.reshape(&[seq_len / merge_unit, merge_unit, -1], stream)?;
+        hidden = hidden.try_index_device((&window_index, .., ..), stream)?;
+        hidden = hidden.reshape(&[seq_len, -1], stream)?;
+        Ok((hidden, state))
+    }
+
+    /// Reconstructs parameter-free routing and rotary state on a downstream
+    /// pipeline owner. The evolving hidden activation is transported
+    /// separately, so no patch, position, merger, or projector tensor is
+    /// required here.
+    pub(crate) fn continuation_state(
+        &self,
+        pixel_values: &Array,
+        grid_thw: &Array,
+        stream: &Stream,
+    ) -> Result<QwenVisionLayerwiseState, Exception> {
+        let grid = grid_thw_from_array(grid_thw, stream)?;
+        validate_vision_grid(&grid, self.config.spatial_merge_size, pixel_values)?;
+        let seq_len = pixel_values.dim(0);
         let full_chunk_lengths = vision_attention_chunk_lengths(&grid);
         let total: i32 = full_chunk_lengths.iter().sum();
         if total != seq_len {
@@ -1149,9 +1176,6 @@ impl QwenVisionLayerwiseStatic {
             ),
         };
         let window_index_array = Array::from_slice(&window_index, &[window_index.len() as i32]);
-        hidden = hidden.reshape(&[seq_len / merge_unit, merge_unit, -1], stream)?;
-        hidden = hidden.try_index_device((&window_index_array, .., ..), stream)?;
-        hidden = hidden.reshape(&[seq_len, -1], stream)?;
 
         let (cos, sin) = vision_rotary_embeddings(
             &grid,
@@ -1164,17 +1188,14 @@ impl QwenVisionLayerwiseStatic {
                 .try_index_device((&window_index_array, .., ..), stream)?
                 .reshape(&[seq_len, -1], stream)
         };
-        Ok((
-            hidden,
-            QwenVisionLayerwiseState {
-                full_chunk_lengths,
-                window_chunk_lengths,
-                window_index,
-                cos: reorder(cos)?,
-                sin: reorder(sin)?,
-                deepstack_features: Vec::new(),
-            },
-        ))
+        Ok(QwenVisionLayerwiseState {
+            full_chunk_lengths,
+            window_chunk_lengths,
+            window_index,
+            cos: reorder(cos)?,
+            sin: reorder(sin)?,
+            deepstack_features: Vec::new(),
+        })
     }
 
     pub(crate) fn forward_block(

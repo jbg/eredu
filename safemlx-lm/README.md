@@ -577,8 +577,9 @@ folded inputs. Pure text pipeline stages support SafeTensors and canonical
 `inkling` GGUF through the shared KV-plus-fixed-state cache descriptor, with
 fully resident, host-layerwise, or dense disk-streamed local layers. Image/audio
 ingress may be direct or scheduler-owned: collective consensus includes its
-modality and shape identity, stage zero owns dMel/hMLP preparation, and pipeline
-transport connects matching non-PP coordinates. The same semantic bindings
+modality and shape identity, hMLP blocks are balanced across PP owners, dMel
+preparation is an explicit unsplittable group, and planned routes connect
+matching non-PP coordinates. The same semantic bindings
 support bounded affine/MXFP4 materialization before resident, host-layerwise,
 dense-streamed, independent-expert-cache, and Cartesian execution. Expert
 parallelism derives sparse layers and cache policies from the same schedule.
@@ -854,8 +855,8 @@ with the same schedule, prompt-cache identity, and direct or derived
 layer-binding plan.
 Qwen3-VL SafeTensors and canonical `qwen3vl` or `qwen3vlmoe` GGUF use the same
 pipeline shell for dense and MoE text decoders. GGUF combines the main
-checkpoint and sibling mmproj store before rank-local selection. Stage-zero vision ownership,
-typed ingress, MRoPE/DeepStack payload construction, and TP- or EP-local text
+checkpoint and sibling mmproj store before rank-local selection. Placed vision ownership,
+typed ingress, MRoPE/DeepStack routes, and TP- or EP-local text
 layers remain adapter-authored semantics rather than format- or
 topology-specific runtimes.
 Qwen3.5 uses the same Qwen vision groups with its hybrid decoder. Canonical
@@ -1045,33 +1046,26 @@ Nemotron-H preserves rank-local Mamba
 convolution/recurrent state plus GQA cache, and the Qwen hybrid adapter
 preserves rank-local recurrent convolution/delta-rule state plus full-attention
 KV state when composing stage placement with TP or EP ownership.
-Qwen3-VL pins its vision patch/position modules, mergers, and vision blocks on
-stage zero for every non-PP coordinate. Typed image/video ingress is assembled
-there; explicit MRoPE tensors, the persisted position delta, and
-sequence-aligned DeepStack residuals then use the ordinary immutable pipeline
-payload. Later stages execute only their text-layer ranges.
-Qwen3.5 uses the same ownership rule through the shared hybrid semantic
-adapter: stage zero owns its patch/position modules, merger banks, and vision
-blocks, then sends the assembled text-width sequence through matching TP/EP
-pipeline lanes. Vision and recurrent/full-attention decoder units share one
-resident, host-layerwise, or dense-streamed plan; dense and MoE decoders use
-the same scheduled `PreparedModelInput`, cached decode, generation, and
-prompt-cache lifecycle.
-Gemma 4 likewise places configured vision and audio roots on stage zero for
-every TP/EP coordinate. Pooled image/video and subsampled audio outputs are
-assembled through the shared Gemma execution-group adapter; per-layer inputs
-and exact full/sliding multimodal masks then travel as declared immutable
-pipeline auxiliary tensors. Tower and decoder blocks share one resident,
-host-layerwise, or dense-streamed rank-local plan.
-Inkling places its folded hMLP vision root, dMel embedding and normalization,
-text embedding, and media final normalization on stage zero for every TP/EP
-coordinate. Ordered text/image/audio input can be submitted directly or as a
-scheduler-owned `PreparedModelInput`; downstream stages retain only its exact
-modality and shape identity. Matching-coordinate pipeline lanes carry the
-assembled decoder hidden state, while full/sliding KV and all four
-short-convolution histories remain stage-local. SafeTensors and canonical
-`inkling` GGUF plus a sibling combined hMLP/dMel mmproj use the same resident,
-host-layerwise, or dense-streamed semantic plan.
+Multimodal pipeline execution is one placed execution-group DAG. Decoder
+layers, vision/audio blocks, projectors, mergers, and modality finalization
+declare global ranges, ordered PP owner paths, TP/EP activity, static tensor
+owners, payload schemas, checkpoint/residency bindings, and merge destinations.
+The planner balances encoder blocks without splitting dependencies and creates
+explicit routes when an encoder tail, projector, finalizer, and decoder ingress
+are not adjacent. It rejects cycles, disconnected groups, ambiguous ownership,
+schema mismatches, and impossible routes before weight loading.
+
+Qwen3-VL and Qwen3.5 route evolving vision activations and DeepStack state
+between rank-local TP-sharded block ranges, then route projector output to text
+ingress. Gemma 4 independently schedules simultaneous vision and audio roots
+before merging their outputs; per-layer inputs and exact full/sliding masks are
+declared payload fields. Inkling distributes partitionable hMLP blocks while
+keeping dMel preprocessing as an explicit unsplittable ingress group. Requests
+without media skip optional encoder leases and work while retaining global
+distributed consensus. SafeTensors and registered GGUF projector stores use
+the same placement for inspection, preflight, bounded reads, load-time
+quantization, resident execution, host-layerwise execution, and dense disk
+streaming.
 `PipelineModel::prefill_pipeline` and `PipelineModel::prefill_cartesian` perform
 typed prefill, after which cached decode, synchronized sampling, cancellation
 consensus, and prompt-cache persistence use the common pipeline APIs.
@@ -1144,11 +1138,11 @@ formats. Dense families have no EP migration.
 | LFM2-MoE | TP, PP, EP | Complete | None |
 | Nemotron-H dense | TP, PP | TP+PP complete | None; EP does not apply |
 | Nemotron-H-MoE | TP, PP, EP | Complete | None |
-| Qwen3-Next/Qwen3.5 dense | TP, PP | TP+PP complete | None; Qwen3.5 SafeTensors and canonical text-plus-projector GGUF support direct or queued typed image/video ingress with stage-zero TP-sharded vision ownership and all three non-expert residency policies; EP does not apply |
+| Qwen3-Next/Qwen3.5 dense | TP, PP | TP+PP complete | None; Qwen3.5 SafeTensors and canonical text-plus-projector GGUF support direct or queued typed image/video ingress with balanced TP-sharded vision PP ownership and all three non-expert residency policies; EP does not apply |
 | Qwen3-Next/Qwen3.5-MoE | TP, PP, EP | Complete | None; Qwen3.5 SafeTensors and canonical text-plus-projector GGUF multimodal ingress compose with TP+PP, PP+EP, and TP+PP+EP plus resident or independently cached experts |
-| Inkling multimodal | TP, PP, EP | Complete | None; direct or queued text/image/audio ingress, stage-zero hMLP and dMel ownership, SafeTensors and canonical text-plus-mmproj GGUF, cached decode, synchronized generation, prompt-cache persistence, and resident, host-layerwise, dense-streamed, or independently cached expert policies share the Cartesian runtime |
-| Qwen3-VL dense | TP, PP | TP+PP complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP degrees; EP does not apply |
-| Qwen3-VL-MoE | TP, PP, EP | Complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP/EP degrees |
+| Inkling multimodal | TP, PP, EP | Complete | None; direct or queued text/image/audio ingress, distributed hMLP blocks, explicitly placed dMel ingress, SafeTensors and canonical text-plus-mmproj GGUF, cached decode, synchronized generation, prompt-cache persistence, and resident, host-layerwise, dense-streamed, or independently cached expert policies share the Cartesian runtime |
+| Qwen3-VL dense | TP, PP | TP+PP complete | None; vision blocks are balanced across PP ranks and direct or queued typed image/video ingress composes with arbitrary legal TP/PP degrees; EP does not apply |
+| Qwen3-VL-MoE | TP, PP, EP | Complete | None; distributed vision placement and direct or queued typed image/video ingress compose with arbitrary legal TP/PP/EP degrees |
 | Moshi/PersonaPlex | TP | Not applicable | Its temporal/depth runtime has no PP or EP constituent axis |
 
 The remaining global limitations are:
@@ -1302,7 +1296,7 @@ ordinary rank-local stage cache entries; resident experts combine TP-sharded
 intermediates with EP ownership, while independent expert caches compose with
 fully resident, host-layerwise, or dense-streamed non-experts. SafeTensors and
 canonical GGUF use the shared packed/split expert catalog. Qwen3.5 multimodal
-SafeTensors and canonical GGUF add stage-zero vision units to that same
+SafeTensors and canonical GGUF add placed, rank-local vision units to that same
 residency schedule and accept direct or scheduler-owned image/video tensors.
 GGUF discovers a unique sibling Qwen3.5 projector, verifies its family,
 geometry, complete catalog, and packed alignment before materialization, then
@@ -2377,7 +2371,7 @@ the rank-local cache. The architecture-neutral GGUF EP dispatcher and
 type-erased expert cache also serve the registered DeepSeek2, Qwen3-MoE, LFM2-MoE,
 Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE streamed adapters.
 
-Inkling uses the same Cartesian composition for stage-zero hMLP/dMel ingress,
+Inkling uses the same Cartesian composition for distributed hMLP blocks and explicitly placed dMel ingress,
 full/sliding relative attention, four fixed short-convolution states, dense
 transitions, and routed plus shared experts. Resident execution shards media,
 attention, and dense/shared expert intermediates over TP while EP owns routed
@@ -2513,7 +2507,7 @@ host-layerwise, and canonical-GGUF non-experts with independently cached routed
 experts. They also cover EP-inactive TP+PP caching and cached-expert schedule
 failure consensus.
 The Inkling four-process cases cover TP+PP, TP+EP, and PP+EP across scheduled
-text/image/audio ingress, stage-zero dMel projection, full/sliding attention,
+text/image/audio ingress, topology-placed dMel projection, full/sliding attention,
 and dense/sparse transitions. They include rank-local KV and four-way
 convolution state, stage-local or cached routed experts, shared experts,
 dense-streamed bounded reads, prompt-cache reload, synchronized generation,
@@ -2533,8 +2527,8 @@ The GGUF suite additionally exercises two-rank pure EP under resident and
 sparse-cache policies, four-rank TP+EP under resident and dense/sparse-streamed
 policies, sibling-projector telemetry, route-empty participation, and PP+EP
 stage-local layer and expert ownership.
-The Qwen3-VL-MoE eight-process cases compose scheduler-owned stage-zero vision
-and DeepStack ingress with TP-sharded MRoPE attention, matching-coordinate
+The Qwen3-VL-MoE eight-process cases compose scheduler-owned distributed vision
+and DeepStack routes with TP-sharded MRoPE attention, matching-coordinate
 pipeline lanes, EP-scoped routed experts, prompt-cache reload, route-empty
 ranks, and synchronized sampling. Mismatched prepared-input modality or shape
 identity fails global work consensus before pipeline transport. SafeTensors

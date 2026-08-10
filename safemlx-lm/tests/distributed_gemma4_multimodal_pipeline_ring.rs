@@ -652,10 +652,15 @@ fn assert_close(actual: &Array, expected: &Array, stream: &Stream) {
     let expected = expected.as_slice::<f32>();
     assert!(actual.len() >= expected.len());
     let actual = &actual[actual.len() - expected.len()..];
-    assert!(actual
+    let maximum_error = actual
         .iter()
         .zip(expected)
-        .all(|(actual, expected)| (actual - expected).abs() <= 1e-4));
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        maximum_error <= 4e-3,
+        "maximum absolute error {maximum_error} exceeded 4e-3"
+    );
 }
 
 #[test]

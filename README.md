@@ -157,10 +157,11 @@ Gemma 4 tensor parallelism derives text, vision, and audio execution geometry
 from shared semantic partition plans. Uneven GQA, dense/routed intermediate,
 vision patch/MLP, audio head/convolution, and modality ranges therefore flow
 through layer construction and prompt-cache identity without equal-shard
-reconstruction. Gemma pipeline execution uses dependency-safe contiguous text
-stages and stage-zero vision/audio roots for multimodal SafeTensors or
-text-plus-projector GGUF checkpoints. It relays per-layer residual inputs and
-exact multimodal full/sliding masks as immutable auxiliary state. GGUF combines
+reconstruction. Gemma pipeline execution uses a validated placed
+execution-group DAG for dependency-safe text stages and balanced vision/audio
+block ranges across PP ranks. It routes encoder, projector, text-ingress,
+per-layer residual, and exact full/sliding-mask payloads according to declared
+dependencies. GGUF combines
 the language file and sibling dense media projector in the same bounded-read
 residency plan.
 Shared-KV publisher/consumer groups are never split across stages.
@@ -194,8 +195,8 @@ Qwen hybrid stages retain rank-local recurrent convolution/delta-rule state
 alongside full-attention KV state through resident, host-layerwise, and
 dense-streamed execution; independently cached experts use the same
 SafeTensors or canonical GGUF semantic catalog.
-Qwen3.5 SafeTensors and canonical text-plus-projector GGUF can additionally
-place their TP-sharded vision root on stage zero and submit direct or
+Qwen3.5 SafeTensors and canonical text-plus-projector GGUF additionally place
+TP-sharded vision blocks across balanced PP owners and accept direct or
 scheduler-owned image/video tensors through that same Cartesian path. The GGUF
 loader discovers a unique sibling `mmproj-*Qwen3.5*.gguf`, validates its
 `clip`/`qwen3vl_merger` contract before payload reads, and admits dense or
@@ -223,9 +224,10 @@ remain the shared compressed/paged implementations. Inkling's KV and four
 short-convolution histories exercise the combined `KeyValueWithFixedState`
 layout without introducing a family cache variant. Fully resident,
 host-layerwise, and dense disk-streamed stages share each family's bounded
-binding plan. Inkling pins its hMLP vision root, dMel audio projection, and
-media normalization on stage zero; scheduled typed ingress, cached decode,
-generation, and persistence then use the ordinary Cartesian pipeline path.
+binding plan. Inkling hMLP blocks use the common placed DAG; its unsplittable
+dMel ingress and finalization remain explicit static groups. Scheduled typed
+ingress, cached decode, generation, and persistence use the ordinary Cartesian
+pipeline path.
 The pipeline runtime stores one type-erased stage shell and derives ordinary,
 paged, and persisted cache state from its canonical semantic layer schedule.
 All decoder families use the same resident/non-resident layer executor and the
