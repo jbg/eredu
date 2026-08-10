@@ -88,32 +88,35 @@ tiers and requested transfer bytes. They do not claim physical disk bytes:
 mapped pages may be served by the operating-system cache. SafeMLX's immutable
 weight residency manager, expert cache, and paged attention cache use MLX
 completion events to retain transfer sources and order compatible execution
-streams. The core SafeMLX API now exposes typed CPU, Metal-shared, CUDA-pinned,
-and CUDA-managed host-transfer storage, but these residency managers still use
-MLX arrays for host blocks; adopting the new buffer type is separate follow-up
-work. Paged host-to-device promotion runs on a dedicated same-device
-transfer stream. Blockwise key/value and compressed-MLA attention keep a fixed
+streams. Paged attention host blocks use immutable typed host-transfer storage:
+ordinary owned CPU memory, Metal-shared memory, or CUDA-pinned memory. A sealed
+block is represented as exactly one physical variant—device arrays, typed host
+buffers, or disk backing—so incoherent tier/payload combinations cannot be
+constructed. Weight residency and independent expert caching still use MLX
+arrays for their host-planned parameters. Paged host-to-device promotion runs
+on a dedicated same-device transfer stream. Blockwise key/value and
+compressed-MLA attention keep a fixed
 two-block window (current plus next), submit each completed recurrence before
 waiting on the next block, and thereby permit the next promotion to overlap
 current-block attention. A one-block device budget falls back to demand
 promotion rather than exceeding the configured limit. Device-to-host demotion
-must establish independent CPU ownership, so it host-waits only for the exact
-demotion completion before cloning storage; it no longer synchronizes the
-whole transfer stream. This is cache-block pipelining, not general activation
-double buffering. Disk reads and writes use a bounded manager-owned worker
+must establish independent host-buffer ownership, so it host-waits only for
+the two exact block-copy completions; it never synchronizes the whole transfer
+stream or creates CPU MLX arrays. This is cache-block pipelining, not general
+activation double buffering. Disk reads and writes use a bounded manager-owned worker
 queue. Duplicate block operations
 join one shared completion, capacity waits occur without holding cache state,
 and reset or truncation cancels queued work from the prior generation. The
 worker is stopped and joined on drop. Host-to-disk demotion returns after queue
 admission rather than waiting for the write: the block remains readable from
-its host staging arrays until the worker publishes the disk backing.
+its immutable host buffers until the worker publishes the disk backing.
 `in_flight_write_blocks` and `in_flight_write_bytes` report this writeback state,
-and those staging arrays remain included in `current_host_bytes`. A later
+and those staging buffers remain included in `current_host_bytes`. A later
 device-to-host demotion waits for an in-flight write when that write must finish
 to keep the finite host-byte budget; queue-capacity backpressure is enforced
 separately. Demand promotion does not release that host charge while the writer
 still owns the staging allocation. Reset and truncation cancel obsolete work
-but wait for each canceled task to release its arrays before returning, so a
+but wait for each canceled task to release its buffers before returning, so a
 new generation cannot reuse capacity that is still physically occupied.
 Asynchronous write failures are returned by the next
 residency-changing cache operation. Live shard names include a process-unique
@@ -168,8 +171,9 @@ blocks. Arrays are copied from those retained mappings only on demand, and
 suffix tokens append new mutable and sealed blocks without modifying imported
 files. Schema version 4 stores a SHA-256 digest of every exact safetensors
 payload. The digest is checked once against the mapped bytes before the shard is
-converted into MLX arrays, so opening remains mmap-lazy while same-length payload
-corruption cannot be consumed.
+copied into typed host buffers, so opening remains mmap-lazy while same-length
+payload corruption cannot be consumed. Device MLX arrays are created only when
+the block is promoted.
 
 Prompt-cache loading accepts schema version 4. Any other schema version is
 rejected before cache tensors are opened.

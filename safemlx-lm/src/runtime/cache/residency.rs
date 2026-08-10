@@ -22,10 +22,11 @@ use std::{
 
 use memmap2::{Mmap, MmapOptions};
 use safemlx::{
-    ops::zeros_dtype,
     transforms::{async_eval_with_event, eval},
-    Array, Device, DeviceType, Dtype, Event, Stream,
+    Array, Device, DeviceType, Dtype, Event, HostTransferBuffer, HostTransferPolicy,
+    ImmutableHostTransferBuffer, Stream,
 };
+use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -335,77 +336,267 @@ impl CacheBlockArrays {
         let arrays = self.arrays();
         [dtype_name(arrays[0].dtype()), dtype_name(arrays[1].dtype())]
     }
+}
 
-    fn copy_to_stream_with_event(
-        &self,
+#[derive(Debug, Clone)]
+enum HostCacheBlock {
+    KeyValue {
+        keys: Arc<ImmutableHostTransferBuffer>,
+        values: Arc<ImmutableHostTransferBuffer>,
+    },
+    CompressedLatentRotary {
+        latent: Arc<ImmutableHostTransferBuffer>,
+        rotary_key: Arc<ImmutableHostTransferBuffer>,
+    },
+}
+
+impl HostCacheBlock {
+    fn from_device_arrays(
+        arrays: &CacheBlockArrays,
         stream: &Stream,
-        operation: &'static str,
-    ) -> Result<(Self, Event), CacheResidencyError> {
-        let copy = match self {
-            Self::KeyValue { keys, values } => Self::KeyValue {
-                keys: independent_stream_copy(keys, stream, operation)?,
-                values: independent_stream_copy(values, stream, operation)?,
+    ) -> Result<Self, CacheResidencyError> {
+        let [first, second] = arrays.arrays();
+        let first =
+            HostTransferBuffer::copy_from_array(first, HostTransferPolicy::Transfer, stream)
+                .map_err(|source| {
+                    transfer_error("submit first cache block host transfer", source)
+                })?;
+        let second =
+            HostTransferBuffer::copy_from_array(second, HostTransferPolicy::Transfer, stream)
+                .map_err(|source| {
+                    transfer_error("submit second cache block host transfer", source)
+                })?;
+        let first = Arc::new(
+            first
+                .synchronize()
+                .map_err(|source| {
+                    transfer_error("complete first cache block host transfer", source)
+                })?
+                .freeze(),
+        );
+        let second = Arc::new(
+            second
+                .synchronize()
+                .map_err(|source| {
+                    transfer_error("complete second cache block host transfer", source)
+                })?
+                .freeze(),
+        );
+        Ok(match arrays {
+            CacheBlockArrays::KeyValue { .. } => Self::KeyValue {
+                keys: first,
+                values: second,
             },
-            Self::CompressedLatentRotary { latent, rotary_key } => Self::CompressedLatentRotary {
-                latent: independent_stream_copy(latent, stream, operation)?,
-                rotary_key: independent_stream_copy(rotary_key, stream, operation)?,
+            CacheBlockArrays::CompressedLatentRotary { .. } => Self::CompressedLatentRotary {
+                latent: first,
+                rotary_key: second,
             },
-        };
-        let completion = async_eval_with_event(copy.arrays())
-            .map_err(|source| transfer_error(operation, source))?;
-        Ok((copy, completion))
+        })
     }
 
-    fn copy_to_stream_synchronized(
+    fn from_buffers(
+        representation: CacheRepresentation,
+        first: ImmutableHostTransferBuffer,
+        second: ImmutableHostTransferBuffer,
+    ) -> Self {
+        let first = Arc::new(first);
+        let second = Arc::new(second);
+        match representation {
+            CacheRepresentation::KeyValue => Self::KeyValue {
+                keys: first,
+                values: second,
+            },
+            CacheRepresentation::CompressedLatentRotary => Self::CompressedLatentRotary {
+                latent: first,
+                rotary_key: second,
+            },
+        }
+    }
+
+    fn representation(&self) -> CacheRepresentation {
+        match self {
+            Self::KeyValue { .. } => CacheRepresentation::KeyValue,
+            Self::CompressedLatentRotary { .. } => CacheRepresentation::CompressedLatentRotary,
+        }
+    }
+
+    fn buffers(&self) -> [&ImmutableHostTransferBuffer; 2] {
+        match self {
+            Self::KeyValue { keys, values } => [keys, values],
+            Self::CompressedLatentRotary { latent, rotary_key } => [latent, rotary_key],
+        }
+    }
+
+    fn shapes(&self) -> Result<[Vec<i32>; 2], CacheResidencyError> {
+        let [first, second] = self.buffers();
+        Ok([
+            first
+                .shape()
+                .map_err(|source| transfer_error("inspect first host cache shape", source))?,
+            second
+                .shape()
+                .map_err(|source| transfer_error("inspect second host cache shape", source))?,
+        ])
+    }
+
+    fn dtypes(&self) -> Result<[String; 2], CacheResidencyError> {
+        let [first, second] = self.buffers();
+        Ok([
+            dtype_name(
+                first
+                    .dtype()
+                    .map_err(|source| transfer_error("inspect first host cache dtype", source))?,
+            ),
+            dtype_name(
+                second
+                    .dtype()
+                    .map_err(|source| transfer_error("inspect second host cache dtype", source))?,
+            ),
+        ])
+    }
+
+    fn bytes(&self) -> Result<u64, CacheResidencyError> {
+        self.buffers().into_iter().try_fold(0u64, |total, buffer| {
+            let bytes = buffer
+                .nbytes()
+                .map_err(|source| transfer_error("inspect host cache byte length", source))?;
+            Ok(total.saturating_add(bytes as u64))
+        })
+    }
+
+    fn copy_to_device(
         &self,
         stream: &Stream,
-        operation: &'static str,
-    ) -> Result<Self, CacheResidencyError> {
-        let (copy, completion) = self.copy_to_stream_with_event(stream, operation)?;
-        completion
-            .synchronize()
-            .map_err(|source| transfer_error(operation, source))?;
-        // MLX may implement `copy` as an alias when memory is accessible from
-        // both streams (notably with Metal's unified memory). Residency tier
-        // demotions must own independent CPU storage so replacing the record
-        // releases the execution allocation. Promotions stay asynchronous and
-        // retain their source arrays through `CacheBlockLease`.
-        match copy {
-            Self::KeyValue { keys, values } => Ok(Self::KeyValue {
-                keys: keys
-                    .deep_clone()
-                    .map_err(|source| transfer_error(operation, source))?,
-                values: values
-                    .deep_clone()
-                    .map_err(|source| transfer_error(operation, source))?,
-            }),
-            Self::CompressedLatentRotary { latent, rotary_key } => {
-                Ok(Self::CompressedLatentRotary {
-                    latent: latent
-                        .deep_clone()
-                        .map_err(|source| transfer_error(operation, source))?,
-                    rotary_key: rotary_key
-                        .deep_clone()
-                        .map_err(|source| transfer_error(operation, source))?,
-                })
-            }
-        }
+    ) -> Result<(CacheBlockArrays, Vec<Event>), CacheResidencyError> {
+        let [first, second] = self.buffers();
+        let first = first
+            .copy_to_array(stream)
+            .map_err(|source| transfer_error("submit first cache block promotion", source))?;
+        let second = second
+            .copy_to_array(stream)
+            .map_err(|source| transfer_error("submit second cache block promotion", source))?;
+        let (first, first_completion) = first.into_parts();
+        let (second, second_completion) = second.into_parts();
+        let arrays = match self {
+            Self::KeyValue { .. } => CacheBlockArrays::KeyValue {
+                keys: first,
+                values: second,
+            },
+            Self::CompressedLatentRotary { .. } => CacheBlockArrays::CompressedLatentRotary {
+                latent: first,
+                rotary_key: second,
+            },
+        };
+        Ok((arrays, vec![first_completion, second_completion]))
     }
 }
 
-fn independent_stream_copy(
-    source: &Array,
-    stream: &Stream,
-    operation: &'static str,
-) -> Result<Array, CacheResidencyError> {
-    let copied = source
-        .copy(stream)
-        .map_err(|source| transfer_error(operation, source))?;
-    let zeros = zeros_dtype(copied.shape(), copied.dtype(), stream)
-        .map_err(|source| transfer_error(operation, source))?;
-    copied
-        .add(zeros, stream)
-        .map_err(|source| transfer_error(operation, source))
+#[derive(Debug, Clone)]
+enum CacheBlockPhysicalState {
+    Device {
+        arrays: CacheBlockArrays,
+        disk: Option<DiskLocation>,
+    },
+    Host {
+        block: HostCacheBlock,
+        persistence: HostCachePersistence,
+    },
+    Disk {
+        location: DiskLocation,
+        read: DiskCacheReadState,
+    },
+}
+
+/// Persistence state valid while a block is physically host-resident.
+///
+/// A completed backing and an in-flight write are mutually exclusive by
+/// construction. This prevents a host block from simultaneously claiming an
+/// authoritative disk copy and a write that has not published one yet.
+#[derive(Debug, Clone)]
+enum HostCachePersistence {
+    Unbacked,
+    Backed(DiskLocation),
+    Writing(PendingDiskOperation),
+}
+
+/// Read state valid while a block is physically disk-resident.
+#[derive(Debug, Clone)]
+enum DiskCacheReadState {
+    Ready,
+    Reading(PendingDiskOperation),
+}
+
+impl CacheBlockPhysicalState {
+    fn tier(&self) -> CacheTier {
+        match self {
+            Self::Device { .. } => CacheTier::Device,
+            Self::Host { .. } => CacheTier::Host,
+            Self::Disk { .. } => CacheTier::Disk,
+        }
+    }
+
+    fn disk(&self) -> Option<&DiskLocation> {
+        match self {
+            Self::Device { disk, .. } => disk.as_ref(),
+            Self::Host {
+                persistence: HostCachePersistence::Backed(location),
+                ..
+            } => Some(location),
+            Self::Host {
+                persistence: HostCachePersistence::Unbacked | HostCachePersistence::Writing(_),
+                ..
+            } => None,
+            Self::Disk { location, .. } => Some(location),
+        }
+    }
+
+    fn pending(&self) -> Option<&PendingDiskOperation> {
+        match self {
+            Self::Host {
+                persistence: HostCachePersistence::Writing(pending),
+                ..
+            }
+            | Self::Disk {
+                read: DiskCacheReadState::Reading(pending),
+                ..
+            } => Some(pending),
+            Self::Device { .. }
+            | Self::Host { .. }
+            | Self::Disk {
+                read: DiskCacheReadState::Ready,
+                ..
+            } => None,
+        }
+    }
+
+    fn pending_matches(&self, key: &DiskOperationKey) -> bool {
+        self.pending()
+            .is_some_and(|pending| pending.ticket.key == *key)
+    }
+
+    fn clear_pending(&mut self, key: &DiskOperationKey) {
+        match self.clone() {
+            Self::Host {
+                block,
+                persistence: HostCachePersistence::Writing(pending),
+            } if pending.ticket.key == *key => {
+                *self = Self::Host {
+                    block,
+                    persistence: HostCachePersistence::Unbacked,
+                };
+            }
+            Self::Disk {
+                location,
+                read: DiskCacheReadState::Reading(pending),
+            } if pending.ticket.key == *key => {
+                *self = Self::Disk {
+                    location,
+                    read: DiskCacheReadState::Ready,
+                };
+            }
+            Self::Device { .. } | Self::Host { .. } | Self::Disk { .. } => {}
+        }
+    }
 }
 
 fn transfer_error(
@@ -443,7 +634,7 @@ enum DiskTask {
     Write {
         directory: PathBuf,
         id: CacheBlockId,
-        arrays: CacheBlockArrays,
+        block: HostCacheBlock,
         commit: Option<DiskWriteCommit>,
     },
     Read {
@@ -492,7 +683,7 @@ struct HostWriteReservation {
 #[derive(Debug, Clone)]
 enum DiskResult {
     Write(DiskLocation),
-    Read(CacheBlockArrays),
+    Read(HostCacheBlock),
     #[cfg(test)]
     Test,
 }
@@ -517,17 +708,14 @@ impl DiskWriteCommit {
                 let mut transitioned_to_disk = false;
                 let mut bytes = 0;
                 if let Some(record) = state.blocks.get_mut(&self.key.id) {
-                    if record
-                        .pending_disk
-                        .as_ref()
-                        .is_some_and(|pending| pending.ticket.key == self.key)
-                    {
-                        record.disk = Some(location.clone());
-                        record.pending_disk = None;
+                    if record.physical.pending_matches(&self.key) {
                         bytes = record.bytes;
-                        if record.tier == CacheTier::Host && record.leases == 0 {
-                            record.arrays = None;
-                            record.tier = CacheTier::Disk;
+                        if matches!(record.physical, CacheBlockPhysicalState::Host { .. }) {
+                            debug_assert_eq!(record.leases, 0);
+                            record.physical = CacheBlockPhysicalState::Disk {
+                                location: location.clone(),
+                                read: DiskCacheReadState::Ready,
+                            };
                             transitioned_to_disk = true;
                         }
                     }
@@ -559,13 +747,7 @@ impl DiskWriteCommit {
             Err(_) if stale => {}
             Err(error) => {
                 if let Some(record) = state.blocks.get_mut(&self.key.id) {
-                    if record
-                        .pending_disk
-                        .as_ref()
-                        .is_some_and(|pending| pending.ticket.key == self.key)
-                    {
-                        record.pending_disk = None;
-                    }
+                    record.physical.clear_pending(&self.key);
                 }
                 state.counters.report.failures += 1;
                 state.layer_activity_mut(self.key.id.global_layer).failures += 1;
@@ -599,13 +781,7 @@ impl Drop for DiskWriteCommit {
             return;
         }
         if let Some(record) = state.blocks.get_mut(&self.key.id) {
-            if record
-                .pending_disk
-                .as_ref()
-                .is_some_and(|pending| pending.ticket.key == self.key)
-            {
-                record.pending_disk = None;
-            }
+            record.physical.clear_pending(&self.key);
         }
         if state.host_write_reservations.remove(&self.key).is_some() {
             update_report_totals(&mut state);
@@ -887,17 +1063,16 @@ impl DiskWorker {
                                 DiskTask::Write {
                                     directory,
                                     id,
-                                    arrays,
+                                    block,
                                     commit,
                                 } => {
                                     write_commit = commit;
-                                    write_live_block(&directory, &id, &arrays)
-                                        .map(DiskResult::Write)
+                                    write_live_block(&directory, &id, &block).map(DiskResult::Write)
                                 }
                                 DiskTask::Read {
                                     location,
                                     representation,
-                                } => load_block_arrays_direct(&location, representation)
+                                } => load_host_cache_block_direct(&location, representation)
                                     .map(DiskResult::Read),
                                 #[cfg(test)]
                                 DiskTask::Pause { started, release } => {
@@ -1028,7 +1203,7 @@ impl DiskWorker {
         generation: u64,
         directory: &Path,
         id: &CacheBlockId,
-        arrays: &CacheBlockArrays,
+        block: &HostCacheBlock,
         state: Weak<Mutex<CacheManagerState>>,
     ) -> Result<DiskSubmission, CacheResidencyError> {
         let reservation_id = NEXT_HOST_WRITE_RESERVATION_ID.fetch_add(1, Ordering::Relaxed);
@@ -1041,7 +1216,7 @@ impl DiskWorker {
             DiskTask::Write {
                 directory: directory.to_path_buf(),
                 id: id.clone(),
-                arrays: arrays.clone(),
+                block: block.clone(),
                 commit: Some(DiskWriteCommit {
                     state,
                     key: DiskOperationKey {
@@ -1111,9 +1286,7 @@ struct PendingDiskOperation {
 #[derive(Debug, Clone)]
 struct CacheBlockRecord {
     id: CacheBlockId,
-    tier: CacheTier,
-    arrays: Option<CacheBlockArrays>,
-    disk: Option<DiskLocation>,
+    physical: CacheBlockPhysicalState,
     bytes: u64,
     shapes: [Vec<i32>; 2],
     dtypes: [String; 2],
@@ -1122,7 +1295,34 @@ struct CacheBlockRecord {
     access_count: u64,
     last_access: u64,
     protected_prefix: bool,
-    pending_disk: Option<PendingDiskOperation>,
+}
+
+impl CacheBlockRecord {
+    fn tier(&self) -> CacheTier {
+        self.physical.tier()
+    }
+
+    fn disk(&self) -> Option<&DiskLocation> {
+        self.physical.disk()
+    }
+
+    fn pending_disk(&self) -> Option<&PendingDiskOperation> {
+        self.physical.pending()
+    }
+
+    fn device_arrays(&self) -> Option<&CacheBlockArrays> {
+        match &self.physical {
+            CacheBlockPhysicalState::Device { arrays, .. } => Some(arrays),
+            CacheBlockPhysicalState::Host { .. } | CacheBlockPhysicalState::Disk { .. } => None,
+        }
+    }
+
+    fn host_block(&self) -> Option<&HostCacheBlock> {
+        match &self.physical {
+            CacheBlockPhysicalState::Host { block, .. } => Some(block),
+            CacheBlockPhysicalState::Device { .. } | CacheBlockPhysicalState::Disk { .. } => None,
+        }
+    }
 }
 
 /// Maximum number of individually identified layers in a residency report.
@@ -1151,13 +1351,13 @@ pub struct CacheLayerResidencyStats {
     pub disk_blocks: u64,
     /// Current logical device bytes, including mutable tails.
     pub current_device_bytes: u64,
-    /// Current logical host bytes, including arrays retained by in-flight writes.
+    /// Current logical host bytes, including buffers retained by in-flight writes.
     pub current_host_bytes: u64,
     /// Current logical disk bytes.
     pub current_disk_bytes: u64,
     /// Current bytes in mutable tails.
     pub mutable_tail_bytes: u64,
-    /// Blocks whose host staging arrays are owned by background disk writes.
+    /// Blocks whose host buffers are owned by background disk writes.
     pub in_flight_write_blocks: u64,
     /// Logical bytes owned by background disk writes.
     pub in_flight_write_bytes: u64,
@@ -1288,7 +1488,7 @@ pub struct CacheResidencyReport {
     pub current_device_bytes: u64,
     /// Peak successfully admitted logical device bytes.
     pub peak_device_bytes: u64,
-    /// Current logical host bytes, including arrays retained by in-flight writes.
+    /// Current logical host bytes, including buffers retained by in-flight writes.
     pub current_host_bytes: u64,
     /// Peak successfully admitted logical host bytes.
     pub peak_host_bytes: u64,
@@ -1296,7 +1496,7 @@ pub struct CacheResidencyReport {
     pub current_disk_bytes: u64,
     /// Peak successfully admitted logical disk bytes.
     pub peak_disk_bytes: u64,
-    /// Blocks whose host staging arrays are owned by background disk writes.
+    /// Blocks whose host buffers are owned by background disk writes.
     pub in_flight_write_blocks: u64,
     /// Logical bytes owned by background disk writes (included in current host bytes).
     pub in_flight_write_bytes: u64,
@@ -1560,18 +1760,15 @@ impl CacheResidencyManager {
         let bytes = arrays.bytes();
         let record = CacheBlockRecord {
             id: id.clone(),
-            tier: CacheTier::Device,
             shapes: arrays.shapes(),
             dtypes: arrays.dtypes(),
-            arrays: Some(arrays),
-            disk: None,
+            physical: CacheBlockPhysicalState::Device { arrays, disk: None },
             bytes,
             imported: false,
             leases: 0,
             access_count: 0,
             last_access: state.access_clock,
             protected_prefix,
-            pending_disk: None,
         };
         state.blocks.insert(id.clone(), record);
         drop(state);
@@ -1712,7 +1909,7 @@ impl CacheResidencyManager {
             if record.leases != expected_leases {
                 return Err(CacheResidencyError::BlockLeased(id.clone()));
             }
-            if owned_replacement_lease && record.tier != CacheTier::Device {
+            if owned_replacement_lease && record.tier() != CacheTier::Device {
                 return Err(CacheResidencyError::Runtime(
                     "truncated cache replacement lease is not device resident".into(),
                 ));
@@ -1747,18 +1944,15 @@ impl CacheResidencyManager {
             debug_assert_eq!(id.start, old_id.start);
             let record = CacheBlockRecord {
                 id: id.clone(),
-                tier: CacheTier::Device,
                 shapes: arrays.shapes(),
                 dtypes: arrays.dtypes(),
                 bytes: arrays.bytes(),
-                arrays: Some(arrays),
-                disk: None,
+                physical: CacheBlockPhysicalState::Device { arrays, disk: None },
                 imported: false,
                 leases: 0,
                 access_count: 0,
                 last_access: state.access_clock,
                 protected_prefix: end <= protected_prefix_tokens,
-                pending_disk: None,
             };
             let previous = state.blocks.insert(id, record);
             debug_assert!(previous.is_none());
@@ -1804,237 +1998,255 @@ impl CacheResidencyManager {
         loop {
             let mut state = self.lock()?;
             let generation = state.generation;
-            let (tier, source_arrays, disk, pending) = {
-                let record = state
-                    .blocks
-                    .get(id)
-                    .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
-                (
-                    record.tier,
-                    record.arrays.clone(),
-                    record.disk.clone(),
-                    record.pending_disk.clone(),
-                )
-            };
+            let physical = state
+                .blocks
+                .get(id)
+                .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
+                .physical
+                .clone();
 
-            if tier == CacheTier::Disk {
-                let worker = self.disk_worker.as_ref().ok_or_else(|| {
-                    CacheResidencyError::Runtime("cache disk worker is unavailable".into())
-                })?;
-                let (ticket, submission, joined) = if let Some(pending) = pending {
-                    (pending.ticket, None, true)
-                } else {
-                    let location = disk
-                        .as_ref()
-                        .ok_or_else(|| CacheResidencyError::MissingDiskLocation(id.clone()))?;
-                    let submission =
-                        worker.prepare_read(generation, id, location, id.representation)?;
-                    let ticket = submission.ticket.clone();
-                    state
-                        .blocks
-                        .get_mut(id)
-                        .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
-                        .pending_disk = Some(PendingDiskOperation {
-                        ticket: ticket.clone(),
-                    });
-                    (ticket, Some(submission), false)
-                };
-                drop(state);
+            match physical {
+                CacheBlockPhysicalState::Disk { location, read } => {
+                    let worker = self.disk_worker.as_ref().ok_or_else(|| {
+                        CacheResidencyError::Runtime("cache disk worker is unavailable".into())
+                    })?;
+                    let (ticket, submission, joined) = match read {
+                        DiskCacheReadState::Reading(pending) => (pending.ticket, None, true),
+                        DiskCacheReadState::Ready => {
+                            let submission = worker.prepare_read(
+                                generation,
+                                id,
+                                &location,
+                                id.representation,
+                            )?;
+                            let ticket = submission.ticket.clone();
+                            let record = state
+                                .blocks
+                                .get_mut(id)
+                                .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+                            record.physical = CacheBlockPhysicalState::Disk {
+                                location: location.clone(),
+                                read: DiskCacheReadState::Reading(PendingDiskOperation {
+                                    ticket: ticket.clone(),
+                                }),
+                            };
+                            (ticket, Some(submission), false)
+                        }
+                    };
+                    drop(state);
 
-                let outcome = match submission {
-                    Some(submission) => Some(submission.enqueue()?),
-                    None => None,
-                };
-                let result = ticket.wait();
-                let mut state = self.lock()?;
-                if joined || outcome.as_ref().is_some_and(|outcome| outcome.joined) {
-                    state.counters.report.in_flight_waits += 1;
-                    state.layer_activity_mut(id.global_layer).in_flight_waits += 1;
+                    let outcome = match submission {
+                        Some(submission) => Some(submission.enqueue()?),
+                        None => None,
+                    };
+                    let result = ticket.wait();
+                    let mut state = self.lock()?;
+                    if joined || outcome.as_ref().is_some_and(|outcome| outcome.joined) {
+                        state.counters.report.in_flight_waits += 1;
+                        state.layer_activity_mut(id.global_layer).in_flight_waits += 1;
+                    }
+                    if let Some(outcome) = &outcome {
+                        state.counters.report.queue_peak_occupancy = state
+                            .counters
+                            .report
+                            .queue_peak_occupancy
+                            .max(outcome.peak_occupancy);
+                        state.counters.report.queue_backpressure += u64::from(outcome.backpressure);
+                    }
+                    let stale = state.generation != ticket.key.generation;
+                    match result {
+                        Ok(DiskResult::Read(block)) if !stale => {
+                            let shapes = block.shapes()?;
+                            let dtypes = block.dtypes()?;
+                            let bytes = block.bytes()?;
+                            let record = state
+                                .blocks
+                                .get_mut(id)
+                                .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+                            if shapes != record.shapes
+                                || dtypes != record.dtypes
+                                || bytes != record.bytes
+                            {
+                                record.physical.clear_pending(&ticket.key);
+                                drop(state);
+                                worker.retire(&ticket);
+                                return Err(CacheResidencyError::MalformedShard {
+                                    path: location.path,
+                                    reason: "array shape or dtype does not match the manifest"
+                                        .into(),
+                                });
+                            }
+                            if record.physical.pending_matches(&ticket.key) {
+                                record.physical = CacheBlockPhysicalState::Host {
+                                    block,
+                                    persistence: HostCachePersistence::Backed(location),
+                                };
+                            }
+                            loaded_from_disk = true;
+                        }
+                        Ok(DiskResult::Read(_))
+                        | Err(CacheResidencyError::DiskOperationCancelled { .. })
+                            if stale =>
+                        {
+                            drop(state);
+                            worker.retire(&ticket);
+                            return Err(CacheResidencyError::DiskOperationCancelled {
+                                generation: ticket.key.generation,
+                            });
+                        }
+                        Ok(_) => {
+                            drop(state);
+                            worker.retire(&ticket);
+                            return Err(CacheResidencyError::Runtime(
+                                "cache disk worker returned an unexpected operation result".into(),
+                            ));
+                        }
+                        Err(error) => {
+                            if let Some(record) = state.blocks.get_mut(id) {
+                                record.physical.clear_pending(&ticket.key);
+                            }
+                            state.counters.report.failures += 1;
+                            state.layer_activity_mut(id.global_layer).failures += 1;
+                            drop(state);
+                            worker.retire(&ticket);
+                            return Err(error);
+                        }
+                    }
+                    drop(state);
+                    worker.retire(&ticket);
                 }
-                if let Some(outcome) = &outcome {
-                    state.counters.report.queue_peak_occupancy = state
-                        .counters
-                        .report
-                        .queue_peak_occupancy
-                        .max(outcome.peak_occupancy);
-                    state.counters.report.queue_backpressure += u64::from(outcome.backpressure);
-                }
-                let stale = state.generation != ticket.key.generation;
-                match result {
-                    Ok(DiskResult::Read(arrays)) if !stale => {
+                CacheBlockPhysicalState::Host { block, persistence } => {
+                    let disk = match persistence {
+                        HostCachePersistence::Unbacked => None,
+                        HostCachePersistence::Backed(location) => Some(location),
+                        HostCachePersistence::Writing(pending) => {
+                            drop(state);
+                            self.wait_for_host_release(&pending.ticket)?;
+                            continue;
+                        }
+                    };
+                    let (device_arrays, completions) = block.copy_to_device(transfer_stream)?;
+                    if state.generation != generation {
+                        return Err(CacheResidencyError::DiskOperationCancelled { generation });
+                    }
+                    state.access_clock += 1;
+                    let access_clock = state.access_clock;
+                    let bytes = {
                         let record = state
                             .blocks
                             .get_mut(id)
                             .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
-                        if arrays.shapes() != record.shapes || arrays.dtypes() != record.dtypes {
-                            let path = disk.expect("disk-backed record has a location").path;
-                            record.pending_disk = None;
-                            drop(state);
-                            worker.retire(&ticket);
-                            return Err(CacheResidencyError::MalformedShard {
-                                path,
-                                reason: "array shape or dtype does not match the manifest".into(),
-                            });
-                        }
-                        if record
-                            .pending_disk
-                            .as_ref()
-                            .is_some_and(|pending| pending.ticket.key == ticket.key)
-                        {
-                            record.arrays = Some(arrays);
-                            record.tier = CacheTier::Host;
-                            record.pending_disk = None;
-                        }
-                        loaded_from_disk = true;
+                        record.physical = CacheBlockPhysicalState::Device {
+                            arrays: device_arrays.clone(),
+                            disk: disk.clone(),
+                        };
+                        record.leases += 1;
+                        record.access_count += 1;
+                        record.last_access = access_clock;
+                        record.bytes
+                    };
+                    state.counters.report.demand_misses += 1;
+                    if loaded_from_disk {
+                        state.counters.report.disk_promotions += 1;
+                    } else {
+                        state.counters.report.host_promotions += 1;
                     }
-                    Ok(DiskResult::Read(_))
-                    | Err(CacheResidencyError::DiskOperationCancelled { .. })
-                        if stale =>
-                    {
-                        drop(state);
-                        worker.retire(&ticket);
-                        return Err(CacheResidencyError::DiskOperationCancelled {
-                            generation: ticket.key.generation,
-                        });
+                    state.counters.report.transfer_bytes += bytes;
+                    let transfer_wait = started.elapsed();
+                    state.counters.report.transfer_wait += transfer_wait;
+                    let activity = state.layer_activity_mut(id.global_layer);
+                    activity.demand_misses += 1;
+                    if loaded_from_disk {
+                        activity.disk_promotions += 1;
+                    } else {
+                        activity.host_promotions += 1;
                     }
-                    Ok(_) => {
-                        drop(state);
-                        worker.retire(&ticket);
-                        return Err(CacheResidencyError::Runtime(
-                            "cache disk worker returned an unexpected operation result".into(),
-                        ));
-                    }
-                    Err(error) => {
-                        if let Some(record) = state.blocks.get_mut(id) {
-                            if record
-                                .pending_disk
-                                .as_ref()
-                                .is_some_and(|pending| pending.ticket.key == ticket.key)
-                            {
-                                record.pending_disk = None;
+                    activity.transfer_bytes += bytes;
+                    activity.transfer_wait += transfer_wait;
+                    drop(state);
+                    if let Err(error) = self.rebalance(Some(id), true) {
+                        let mut state = self.lock()?;
+                        if state.generation == generation {
+                            if let Some(record) = state.blocks.get_mut(id) {
+                                record.leases = record.leases.saturating_sub(1);
+                                record.physical = CacheBlockPhysicalState::Host {
+                                    block,
+                                    persistence: match disk {
+                                        Some(location) => HostCachePersistence::Backed(location),
+                                        None => HostCachePersistence::Unbacked,
+                                    },
+                                };
                             }
+                            update_report_totals(&mut state);
                         }
-                        state.counters.report.failures += 1;
-                        state.layer_activity_mut(id.global_layer).failures += 1;
-                        drop(state);
-                        worker.retire(&ticket);
                         return Err(error);
                     }
+                    return Ok(CacheBlockLease {
+                        id: id.clone(),
+                        arrays: device_arrays,
+                        manager: self.clone(),
+                        completions,
+                        released: false,
+                    });
                 }
-                drop(state);
-                worker.retire(&ticket);
-                continue;
-            }
-
-            let source_arrays = source_arrays
-                .ok_or_else(|| CacheResidencyError::MissingResidentArrays(id.clone()))?;
-            if tier == CacheTier::Device {
-                drop(state);
-                let completion =
-                    async_eval_with_event(source_arrays.arrays()).map_err(|source| {
-                        transfer_error("submit resident cache block completion", source)
-                    })?;
-                let mut state = self.lock()?;
-                if state.generation != generation {
-                    return Err(CacheResidencyError::DiskOperationCancelled { generation });
-                }
-                state.access_clock += 1;
-                let access_clock = state.access_clock;
-                let record = state
-                    .blocks
-                    .get_mut(id)
-                    .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
-                record.leases += 1;
-                record.access_count += 1;
-                record.last_access = access_clock;
-                state.counters.report.demand_hits += 1;
-                let transfer_wait = started.elapsed();
-                state.counters.report.transfer_wait += transfer_wait;
-                let activity = state.layer_activity_mut(id.global_layer);
-                activity.demand_hits += 1;
-                activity.transfer_wait += transfer_wait;
-                drop(state);
-                if let Err(error) = self.rebalance(Some(id), true) {
-                    if let Ok(mut state) = self.lock() {
+                CacheBlockPhysicalState::Device { arrays, .. } => {
+                    state.access_clock += 1;
+                    let access_clock = state.access_clock;
+                    let record = state
+                        .blocks
+                        .get_mut(id)
+                        .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+                    record.leases += 1;
+                    record.access_count += 1;
+                    record.last_access = access_clock;
+                    drop(state);
+                    let completion = match async_eval_with_event(arrays.arrays()) {
+                        Ok(completion) => completion,
+                        Err(source) => {
+                            if let Ok(mut state) = self.lock() {
+                                if let Some(record) = state.blocks.get_mut(id) {
+                                    record.leases = record.leases.saturating_sub(1);
+                                }
+                                update_report_totals(&mut state);
+                            }
+                            return Err(transfer_error(
+                                "submit resident cache block completion",
+                                source,
+                            ));
+                        }
+                    };
+                    let mut state = self.lock()?;
+                    if state.generation != generation {
                         if let Some(record) = state.blocks.get_mut(id) {
                             record.leases = record.leases.saturating_sub(1);
                         }
-                        update_report_totals(&mut state);
+                        return Err(CacheResidencyError::DiskOperationCancelled { generation });
                     }
-                    return Err(error);
-                }
-                return Ok(CacheBlockLease {
-                    id: id.clone(),
-                    arrays: source_arrays,
-                    manager: self.clone(),
-                    completion: Some(completion),
-                    _retained_source: None,
-                    released: false,
-                });
-            }
-
-            drop(state);
-            let (device_arrays, completion) = source_arrays.copy_to_stream_with_event(
-                transfer_stream,
-                "copy cache block from host to device",
-            )?;
-            let mut state = self.lock()?;
-            if state.generation != generation {
-                return Err(CacheResidencyError::DiskOperationCancelled { generation });
-            }
-            state.access_clock += 1;
-            let access_clock = state.access_clock;
-            let bytes = {
-                let record = state
-                    .blocks
-                    .get_mut(id)
-                    .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
-                record.arrays = Some(device_arrays.clone());
-                record.tier = CacheTier::Device;
-                record.leases += 1;
-                record.access_count += 1;
-                record.last_access = access_clock;
-                record.bytes
-            };
-            state.counters.report.demand_misses += 1;
-            if loaded_from_disk {
-                state.counters.report.disk_promotions += 1;
-            } else {
-                state.counters.report.host_promotions += 1;
-            }
-            state.counters.report.transfer_bytes += bytes;
-            let transfer_wait = started.elapsed();
-            state.counters.report.transfer_wait += transfer_wait;
-            let activity = state.layer_activity_mut(id.global_layer);
-            activity.demand_misses += 1;
-            if loaded_from_disk {
-                activity.disk_promotions += 1;
-            } else {
-                activity.host_promotions += 1;
-            }
-            activity.transfer_bytes += bytes;
-            activity.transfer_wait += transfer_wait;
-            drop(state);
-            if let Err(error) = self.rebalance(Some(id), true) {
-                let mut state = self.lock()?;
-                if state.generation == generation {
-                    if let Some(record) = state.blocks.get_mut(id) {
-                        record.leases = record.leases.saturating_sub(1);
-                        record.tier = CacheTier::Host;
-                        record.arrays = Some(source_arrays);
+                    state.counters.report.demand_hits += 1;
+                    let transfer_wait = started.elapsed();
+                    state.counters.report.transfer_wait += transfer_wait;
+                    let activity = state.layer_activity_mut(id.global_layer);
+                    activity.demand_hits += 1;
+                    activity.transfer_wait += transfer_wait;
+                    drop(state);
+                    if let Err(error) = self.rebalance(Some(id), true) {
+                        if let Ok(mut state) = self.lock() {
+                            if let Some(record) = state.blocks.get_mut(id) {
+                                record.leases = record.leases.saturating_sub(1);
+                            }
+                            update_report_totals(&mut state);
+                        }
+                        return Err(error);
                     }
-                    update_report_totals(&mut state);
+                    return Ok(CacheBlockLease {
+                        id: id.clone(),
+                        arrays,
+                        manager: self.clone(),
+                        completions: vec![completion],
+                        released: false,
+                    });
                 }
-                return Err(error);
             }
-            return Ok(CacheBlockLease {
-                id: id.clone(),
-                arrays: device_arrays,
-                manager: self.clone(),
-                completion: Some(completion),
-                _retained_source: Some(source_arrays),
-                released: false,
-            });
         }
     }
 
@@ -2176,16 +2388,19 @@ impl CacheResidencyManager {
         let Some(record) = state.blocks.get(id) else {
             return Ok(HostDemotionProgress::Retry);
         };
-        if record.tier != CacheTier::Host || record.leases != 0 || record.pending_disk.is_some() {
+        if record.tier() != CacheTier::Host || record.leases != 0 || record.pending_disk().is_some()
+        {
             return Ok(HostDemotionProgress::Retry);
         }
 
         // Persistent prompt-cache blocks and completed live-cache writes can be
         // released immediately; they do not require live writeback to be enabled.
-        if record.disk.is_some() {
+        if let Some(location) = record.disk().cloned() {
             let record = state.blocks.get_mut(id).expect("host block exists");
-            record.arrays = None;
-            record.tier = CacheTier::Disk;
+            record.physical = CacheBlockPhysicalState::Disk {
+                location,
+                read: DiskCacheReadState::Ready,
+            };
             state.counters.report.disk_demotions += 1;
             state.layer_activity_mut(id.global_layer).disk_demotions += 1;
             update_report_totals(&mut state);
@@ -2214,12 +2429,7 @@ impl CacheResidencyManager {
         let live_disk_bytes = state
             .blocks
             .values()
-            .filter(|record| {
-                record
-                    .disk
-                    .as_ref()
-                    .is_some_and(|location| !location.persistent)
-            })
+            .filter(|record| record.disk().is_some_and(|location| !location.persistent))
             .map(|record| record.bytes)
             .sum::<u64>()
             .saturating_add(
@@ -2239,16 +2449,15 @@ impl CacheResidencyManager {
                 budget: budget_bytes,
             });
         }
-        let arrays = record
-            .arrays
-            .as_ref()
+        let block = record
+            .host_block()
             .ok_or_else(|| CacheResidencyError::MissingResidentArrays(id.clone()))?
             .clone();
         let submission = worker.prepare_write(
             state.generation,
             &directory,
             id,
-            &arrays,
+            &block,
             Arc::downgrade(&self.state),
         )?;
         let ticket = submission.ticket.clone();
@@ -2264,11 +2473,12 @@ impl CacheResidencyManager {
                 },
             );
         }
-        state
-            .blocks
-            .get_mut(id)
-            .expect("host block exists")
-            .pending_disk = Some(PendingDiskOperation {
+        let record = state.blocks.get_mut(id).expect("host block exists");
+        let CacheBlockPhysicalState::Host { persistence, .. } = &mut record.physical else {
+            unreachable!("host demotion candidate changed while cache state was locked");
+        };
+        debug_assert!(matches!(persistence, HostCachePersistence::Unbacked));
+        *persistence = HostCachePersistence::Writing(PendingDiskOperation {
             ticket: ticket.clone(),
         });
         update_report_totals(&mut state);
@@ -2280,13 +2490,7 @@ impl CacheResidencyManager {
             Err(error) => {
                 let mut state = self.lock()?;
                 if let Some(record) = state.blocks.get_mut(&ticket.key.id) {
-                    if record
-                        .pending_disk
-                        .as_ref()
-                        .is_some_and(|pending| pending.ticket.key == ticket.key)
-                    {
-                        record.pending_disk = None;
-                    }
+                    record.physical.clear_pending(&ticket.key);
                 }
                 state.counters.report.failures += 1;
                 state
@@ -2398,14 +2602,17 @@ impl CacheResidencyManager {
                         budget: self.options.device_budget_bytes,
                     });
                 };
-                if state
+                if let Some(location) = state
                     .blocks
                     .get(&id)
-                    .is_some_and(|record| record.disk.is_some())
+                    .and_then(CacheBlockRecord::disk)
+                    .cloned()
                 {
                     let record = state.blocks.get_mut(&id).expect("candidate exists");
-                    record.arrays = None;
-                    record.tier = CacheTier::Disk;
+                    record.physical = CacheBlockPhysicalState::Disk {
+                        location,
+                        read: DiskCacheReadState::Ready,
+                    };
                     state.counters.report.disk_demotions += 1;
                     state.layer_activity_mut(id.global_layer).disk_demotions += 1;
                     continue;
@@ -2441,8 +2648,7 @@ impl CacheResidencyManager {
                         .or_else(|| {
                             state.blocks.values().find_map(|record| {
                                 record
-                                    .pending_disk
-                                    .as_ref()
+                                    .pending_disk()
                                     .filter(|pending| {
                                         pending.ticket.key.kind == DiskOperationKind::Write
                                     })
@@ -2483,15 +2689,16 @@ impl CacheResidencyManager {
                 let device_arrays = state
                     .blocks
                     .get(&id)
-                    .and_then(|record| record.arrays.clone())
+                    .and_then(CacheBlockRecord::device_arrays)
+                    .cloned()
                     .ok_or_else(|| CacheResidencyError::MissingResidentArrays(id.clone()))?;
-                let host_arrays = device_arrays.copy_to_stream_synchronized(
-                    &state.host_stream,
-                    "copy cache block from device to host",
-                )?;
+                let host_block =
+                    HostCacheBlock::from_device_arrays(&device_arrays, &state.host_stream)?;
                 let record = state.blocks.get_mut(&id).expect("candidate exists");
-                record.arrays = Some(host_arrays);
-                record.tier = CacheTier::Host;
+                record.physical = CacheBlockPhysicalState::Host {
+                    block: host_block,
+                    persistence: HostCachePersistence::Unbacked,
+                };
                 let bytes = record.bytes;
                 state.counters.report.host_demotions += 1;
                 state.counters.report.transfer_bytes += bytes;
@@ -2517,8 +2724,7 @@ impl CacheResidencyManager {
                     .or_else(|| {
                         state.blocks.values().find_map(|record| {
                             record
-                                .pending_disk
-                                .as_ref()
+                                .pending_disk()
                                 .filter(|pending| {
                                     pending.ticket.key.kind == DiskOperationKind::Write
                                 })
@@ -2669,21 +2875,24 @@ impl CacheResidencyManager {
             let mut manifest_state = Vec::with_capacity(state_arrays.len());
             let mut logical_bytes = 0u64;
             for (index, record) in records.iter().enumerate() {
-                let arrays = match &record.arrays {
-                    Some(arrays) => arrays.clone(),
-                    None => load_block_arrays_direct(
-                        record.disk.as_ref().ok_or_else(|| {
-                            CacheResidencyError::MissingDiskLocation(record.id.clone())
-                        })?,
-                        record.id.representation,
-                    )?,
-                };
                 let shard = format!("block-{index:08}.safetensors");
                 let shard_path = temporary.join(&shard);
-                save_block_arrays(&shard_path, &arrays)?;
+                match &record.physical {
+                    CacheBlockPhysicalState::Device { arrays, .. } => {
+                        save_block_arrays(&shard_path, arrays)?;
+                    }
+                    CacheBlockPhysicalState::Host { block, .. } => {
+                        save_host_cache_block(&shard_path, block)?;
+                    }
+                    CacheBlockPhysicalState::Disk { location, .. } => {
+                        let block =
+                            load_host_cache_block_direct(location, record.id.representation)?;
+                        save_host_cache_block(&shard_path, &block)?;
+                    }
+                }
                 sync_file(&shard_path)?;
                 let payload_sha256 = hash_shard_payload(&shard_path)?;
-                logical_bytes += arrays.bytes();
+                logical_bytes += record.bytes;
                 let names = array_names(record.id.representation);
                 manifest_blocks.push(PromptCacheBlock {
                     global_layer: record.id.global_layer,
@@ -2936,8 +3145,7 @@ pub(crate) struct CacheBlockLease {
     id: CacheBlockId,
     arrays: CacheBlockArrays,
     manager: CacheResidencyManager,
-    completion: Option<Event>,
-    _retained_source: Option<CacheBlockArrays>,
+    completions: Vec<Event>,
     released: bool,
 }
 
@@ -2955,7 +3163,7 @@ impl CacheBlockLease {
     }
 
     fn wait_on(&self, stream: &Stream) -> Result<(), CacheResidencyError> {
-        if let Some(completion) = &self.completion {
+        for completion in &self.completions {
             completion
                 .wait_on(stream)
                 .map_err(|source| transfer_error("wait for cache block promotion", source))?;
@@ -3800,17 +4008,18 @@ pub(crate) fn open_prompt_cache(
             let mapped = map_prompt_cache_shard(&shard)?;
             let record = CacheBlockRecord {
                 id: id.clone(),
-                tier: CacheTier::Disk,
-                arrays: None,
-                disk: Some(DiskLocation {
-                    path: shard,
-                    first_name: block.first_array.clone(),
-                    second_name: block.second_array.clone(),
-                    persistent: true,
-                    mapped: Some(mapped),
-                    payload_sha256: Some(block.payload_sha256.clone()),
-                    payload_verification: Arc::new(OnceLock::new()),
-                }),
+                physical: CacheBlockPhysicalState::Disk {
+                    location: DiskLocation {
+                        path: shard,
+                        first_name: block.first_array.clone(),
+                        second_name: block.second_array.clone(),
+                        persistent: true,
+                        mapped: Some(mapped),
+                        payload_sha256: Some(block.payload_sha256.clone()),
+                        payload_verification: Arc::new(OnceLock::new()),
+                    },
+                    read: DiskCacheReadState::Ready,
+                },
                 bytes: block.logical_bytes,
                 shapes: [block.first_shape.clone(), block.second_shape.clone()],
                 dtypes: [block.first_dtype.clone(), block.second_dtype.clone()],
@@ -3819,7 +4028,6 @@ pub(crate) fn open_prompt_cache(
                 access_count: 0,
                 last_access: 0,
                 protected_prefix: block.end <= manifest.sink_tokens as i64,
-                pending_disk: None,
             };
             if state.blocks.insert(id.clone(), record).is_some() {
                 return Err(CacheResidencyError::DuplicateBlock(id));
@@ -4745,7 +4953,7 @@ fn validate_block_arrays(
 }
 
 fn cancel_record_operation(record: &CacheBlockRecord, report: &mut CacheResidencyReport) {
-    if let Some(pending) = &record.pending_disk {
+    if let Some(pending) = record.pending_disk() {
         if pending.ticket.cancel() {
             report.cancellations += 1;
         }
@@ -4757,13 +4965,13 @@ fn advance_generation_locked(state: &mut CacheManagerState) -> Vec<DiskTicket> {
     state.background_disk_error = None;
     let mut tickets = Vec::new();
     for record in state.blocks.values_mut() {
-        if let Some(pending) = record.pending_disk.as_ref() {
+        if let Some(pending) = record.pending_disk().cloned() {
             if pending.ticket.cancel() {
                 state.counters.report.cancellations += 1;
             }
             tickets.push(pending.ticket.clone());
             if pending.ticket.key.kind != DiskOperationKind::Write {
-                record.pending_disk = None;
+                record.physical.clear_pending(&pending.ticket.key);
             }
         }
     }
@@ -4814,10 +5022,9 @@ fn update_report_totals(state: &mut CacheManagerState) {
             }
         }
         let pending_write = record
-            .pending_disk
-            .as_ref()
+            .pending_disk()
             .is_some_and(|pending| pending.ticket.key.kind == DiskOperationKind::Write);
-        let pending_write_is_reserved = record.pending_disk.as_ref().is_some_and(|pending| {
+        let pending_write_is_reserved = record.pending_disk().is_some_and(|pending| {
             state
                 .host_write_reservations
                 .contains_key(&pending.ticket.key)
@@ -4827,12 +5034,12 @@ fn update_report_totals(state: &mut CacheManagerState) {
             report.in_flight_write_bytes += record.bytes;
             layer_report.in_flight_write_blocks += 1;
             layer_report.in_flight_write_bytes += record.bytes;
-            if record.tier != CacheTier::Host {
+            if record.tier() != CacheTier::Host {
                 report.current_host_bytes += record.bytes;
                 layer_report.current_host_bytes += record.bytes;
             }
         }
-        match record.tier {
+        match record.tier() {
             CacheTier::Device => {
                 report.device_blocks += 1;
                 report.current_device_bytes += record.bytes;
@@ -4871,10 +5078,9 @@ fn update_report_totals(state: &mut CacheManagerState) {
         layer_report.in_flight_write_blocks += 1;
         layer_report.in_flight_write_bytes += reservation.bytes;
         let covered_by_host_record = state.blocks.get(&key.id).is_some_and(|record| {
-            record.tier == CacheTier::Host
+            record.tier() == CacheTier::Host
                 && record
-                    .pending_disk
-                    .as_ref()
+                    .pending_disk()
                     .is_some_and(|pending| pending.ticket.key == *key)
         });
         if !covered_by_host_record {
@@ -4886,7 +5092,7 @@ fn update_report_totals(state: &mut CacheManagerState) {
     for record in state
         .blocks
         .values()
-        .filter(|record| record.tier == CacheTier::Device && !record.protected_prefix)
+        .filter(|record| record.tier() == CacheTier::Device && !record.protected_prefix)
     {
         device_starts
             .entry(record.id.global_layer)
@@ -4955,7 +5161,7 @@ fn eviction_candidate(
 ) -> Option<CacheBlockId> {
     let mut recent = HashMap::<usize, Vec<i64>>::new();
     if tier == CacheTier::Device && recent_per_layer > 0 {
-        for record in state.blocks.values().filter(|record| record.tier == tier) {
+        for record in state.blocks.values().filter(|record| record.tier() == tier) {
             recent
                 .entry(record.id.global_layer)
                 .or_default()
@@ -4970,9 +5176,9 @@ fn eviction_candidate(
         .blocks
         .values()
         .filter(|record| {
-            record.tier == tier
+            record.tier() == tier
                 && record.leases == 0
-                && record.pending_disk.is_none()
+                && record.pending_disk().is_none()
                 && required != Some(&record.id)
                 && !record.protected_prefix
                 && !recent
@@ -4993,11 +5199,11 @@ fn eviction_candidate(
 fn write_live_block(
     directory: &Path,
     id: &CacheBlockId,
-    arrays: &CacheBlockArrays,
+    block: &HostCacheBlock,
 ) -> Result<DiskLocation, CacheResidencyError> {
     let (path, temporary) = live_block_paths(directory, id);
     let mut temporary_guard = TemporaryFileGuard::new(temporary);
-    save_block_arrays(temporary_guard.path(), arrays)?;
+    save_host_cache_block(temporary_guard.path(), block)?;
     sync_file(temporary_guard.path())?;
     publish_live_block_file(temporary_guard.path(), &path)?;
     temporary_guard.disarm();
@@ -5106,6 +5312,94 @@ fn save_block_arrays(path: &Path, arrays: &CacheBlockArrays) -> Result<(), Cache
     )
 }
 
+fn save_host_cache_block(path: &Path, block: &HostCacheBlock) -> Result<(), CacheResidencyError> {
+    let names = array_names(block.representation());
+    let [first, second] = block.buffers();
+    let first_shape = host_shape_to_stored(first)?;
+    let second_shape = host_shape_to_stored(second)?;
+    let first_dtype = host_dtype_to_stored(first)?;
+    let second_dtype = host_dtype_to_stored(second)?;
+    let first_bytes = first
+        .as_bytes()
+        .map_err(|source| transfer_error("read first host cache payload", source))?;
+    let second_bytes = second
+        .as_bytes()
+        .map_err(|source| transfer_error("read second host cache payload", source))?;
+    let first_view = TensorView::new(first_dtype, first_shape, first_bytes).map_err(|source| {
+        CacheResidencyError::Runtime(format!("create first host cache tensor view: {source}"))
+    })?;
+    let second_view =
+        TensorView::new(second_dtype, second_shape, second_bytes).map_err(|source| {
+            CacheResidencyError::Runtime(format!("create second host cache tensor view: {source}"))
+        })?;
+    serialize_to_file([(names.0, first_view), (names.1, second_view)], None, path).map_err(
+        |source| CacheResidencyError::Runtime(format!("save {}: {source}", path.display())),
+    )
+}
+
+fn host_shape_to_stored(
+    buffer: &ImmutableHostTransferBuffer,
+) -> Result<Vec<usize>, CacheResidencyError> {
+    buffer
+        .shape()
+        .map_err(|source| transfer_error("inspect host cache shape", source))?
+        .into_iter()
+        .map(|dimension| {
+            usize::try_from(dimension).map_err(|_| {
+                CacheResidencyError::Runtime(
+                    "host cache shape contains a negative dimension".into(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn host_dtype_to_stored(
+    buffer: &ImmutableHostTransferBuffer,
+) -> Result<StoredDtype, CacheResidencyError> {
+    let dtype = buffer
+        .dtype()
+        .map_err(|source| transfer_error("inspect host cache dtype", source))?;
+    Ok(match dtype {
+        Dtype::Bool => StoredDtype::BOOL,
+        Dtype::Uint8 => StoredDtype::U8,
+        Dtype::Uint16 => StoredDtype::U16,
+        Dtype::Uint32 => StoredDtype::U32,
+        Dtype::Uint64 => StoredDtype::U64,
+        Dtype::Int8 => StoredDtype::I8,
+        Dtype::Int16 => StoredDtype::I16,
+        Dtype::Int32 => StoredDtype::I32,
+        Dtype::Int64 => StoredDtype::I64,
+        Dtype::Float16 => StoredDtype::F16,
+        Dtype::Float32 => StoredDtype::F32,
+        Dtype::Float64 => StoredDtype::F64,
+        Dtype::Bfloat16 => StoredDtype::BF16,
+        Dtype::Complex64 => StoredDtype::C64,
+    })
+}
+
+fn stored_dtype_to_host(dtype: StoredDtype) -> Result<Dtype, CacheResidencyError> {
+    match dtype {
+        StoredDtype::BOOL => Ok(Dtype::Bool),
+        StoredDtype::U8 => Ok(Dtype::Uint8),
+        StoredDtype::U16 => Ok(Dtype::Uint16),
+        StoredDtype::U32 => Ok(Dtype::Uint32),
+        StoredDtype::U64 => Ok(Dtype::Uint64),
+        StoredDtype::I8 => Ok(Dtype::Int8),
+        StoredDtype::I16 => Ok(Dtype::Int16),
+        StoredDtype::I32 => Ok(Dtype::Int32),
+        StoredDtype::I64 => Ok(Dtype::Int64),
+        StoredDtype::F16 => Ok(Dtype::Float16),
+        StoredDtype::F32 => Ok(Dtype::Float32),
+        StoredDtype::F64 => Ok(Dtype::Float64),
+        StoredDtype::BF16 => Ok(Dtype::Bfloat16),
+        StoredDtype::C64 => Ok(Dtype::Complex64),
+        other => Err(CacheResidencyError::ArrayMismatch(format!(
+            "unsupported host cache dtype {other:?}"
+        ))),
+    }
+}
+
 fn hash_shard_payload(path: &Path) -> Result<String, CacheResidencyError> {
     let (_, _, data_start) = read_shard_metadata(path)?;
     let mut file = File::open(path).map_err(|source| CacheResidencyError::Io {
@@ -5175,91 +5469,84 @@ fn verify_disk_payload(location: &DiskLocation) -> Result<(), CacheResidencyErro
         .copied()
 }
 
-fn load_block_arrays_direct(
+fn load_host_cache_block_direct(
     location: &DiskLocation,
     representation: CacheRepresentation,
-) -> Result<CacheBlockArrays, CacheResidencyError> {
+) -> Result<HostCacheBlock, CacheResidencyError> {
     verify_disk_payload(location)?;
-    let stream = cpu_stream();
-    let (mut arrays, _mapped_sources) = if let Some(mapped) = &location.mapped {
-        let tensors = safetensors::SafeTensors::deserialize(mapped.as_ref()).map_err(|error| {
-            CacheResidencyError::MalformedShard {
-                path: location.path.clone(),
-                reason: error.to_string(),
-            }
-        })?;
-        let mut arrays = HashMap::with_capacity(2);
-        let mut sources = Vec::with_capacity(2);
-        for name in [&location.first_name, &location.second_name] {
-            let view =
-                tensors
-                    .tensor(name)
-                    .map_err(|error| CacheResidencyError::MalformedShard {
-                        path: location.path.clone(),
-                        reason: error.to_string(),
-                    })?;
-            // The source array borrows bytes from `mapped`. Copy and evaluate it
-            // before this scope can release the mapping.
-            let source = Array::try_from(view).map_err(|error| {
-                CacheResidencyError::Runtime(format!(
-                    "map {} array {name}: {error}",
-                    location.path.display()
-                ))
-            })?;
-            let copy = source
-                .copy(&stream)
-                .map_err(|error| transfer_error("copy mapped prompt-cache block to host", error))?;
-            arrays.insert(name.clone(), copy);
-            sources.push(source);
-        }
-        (arrays, Some(sources))
+    let owned;
+    let bytes = if let Some(mapped) = &location.mapped {
+        mapped.as_ref()
     } else {
-        (
-            Array::load_safetensors(&location.path, &stream).map_err(|source| {
-                CacheResidencyError::Runtime(format!("load {}: {source}", location.path.display()))
-            })?,
-            None,
-        )
+        owned = fs::read(&location.path).map_err(|source| CacheResidencyError::Io {
+            action: "read cache block shard",
+            path: location.path.clone(),
+            source,
+        })?;
+        owned.as_slice()
     };
-    let first =
-        arrays
-            .remove(&location.first_name)
-            .ok_or_else(|| CacheResidencyError::MalformedShard {
-                path: location.path.clone(),
-                reason: format!("missing array {}", location.first_name),
-            })?;
-    let second = arrays.remove(&location.second_name).ok_or_else(|| {
+    let tensors = safetensors::SafeTensors::deserialize(bytes).map_err(|error| {
         CacheResidencyError::MalformedShard {
             path: location.path.clone(),
-            reason: format!("missing array {}", location.second_name),
+            reason: error.to_string(),
         }
     })?;
-    if !arrays.is_empty() {
+    if tensors.names().len() != 2 {
         return Err(CacheResidencyError::MalformedShard {
             path: location.path.clone(),
             reason: "unexpected extra arrays".into(),
         });
     }
-    let arrays = match representation {
-        CacheRepresentation::KeyValue => CacheBlockArrays::KeyValue {
-            keys: first,
-            values: second,
-        },
-        CacheRepresentation::CompressedLatentRotary => CacheBlockArrays::CompressedLatentRotary {
-            latent: first,
-            rotary_key: second,
-        },
-    };
-    eval(arrays.arrays())
-        .map_err(|source| transfer_error("materialize disk cache block on host", source))?;
-    stream
-        .synchronize()
-        .map_err(|source| transfer_error("materialize disk cache block on host", source))?;
-    Ok(arrays)
+    let first = tensors.tensor(&location.first_name).map_err(|error| {
+        CacheResidencyError::MalformedShard {
+            path: location.path.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+    let second = tensors.tensor(&location.second_name).map_err(|error| {
+        CacheResidencyError::MalformedShard {
+            path: location.path.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(HostCacheBlock::from_buffers(
+        representation,
+        host_buffer_from_view(first)?,
+        host_buffer_from_view(second)?,
+    ))
+}
+
+fn host_buffer_from_view(
+    view: safetensors::tensor::TensorView<'_>,
+) -> Result<ImmutableHostTransferBuffer, CacheResidencyError> {
+    let shape = view
+        .shape()
+        .iter()
+        .map(|dimension| {
+            i32::try_from(*dimension).map_err(|_| {
+                CacheResidencyError::ArrayMismatch(
+                    "cache block dimension exceeds the MLX i32 shape range".into(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let dtype = stored_dtype_to_host(view.dtype())?;
+    let mut buffer = HostTransferBuffer::new(&shape, dtype, HostTransferPolicy::Transfer)
+        .map_err(|source| transfer_error("allocate disk-loaded host cache buffer", source))?;
+    let destination = buffer
+        .as_bytes_mut()
+        .map_err(|source| transfer_error("access disk-loaded host cache buffer", source))?;
+    if destination.len() != view.data().len() {
+        return Err(CacheResidencyError::ArrayMismatch(
+            "cache block payload length does not match its shape and dtype".into(),
+        ));
+    }
+    destination.copy_from_slice(view.data());
+    Ok(buffer.freeze())
 }
 
 fn remove_ephemeral_file(record: &CacheBlockRecord) {
-    if let Some(location) = &record.disk {
+    if let Some(location) = record.disk() {
         if !location.persistent {
             let _ = fs::remove_file(&location.path);
         }
@@ -5833,16 +6120,18 @@ mod tests {
         durable_rename, hash_shard_payload, hash_token_ids, inspect_prompt_cache, live_block_paths,
         map_prompt_cache_shard, open_prompt_cache, publish_live_block_file,
         publish_prompt_cache_generation, safe_shard_path, validate_prompt_cache_model_identity,
-        verify_disk_payload, AttentionPolicy, CacheBlockArrays, CacheBlockId, CacheBlockRecord,
-        CacheLayerResidencyStats, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
-        CacheResidencyManager, CacheTier, DiskLocation, DiskOperationKey, DiskOperationKind,
-        DiskResult, DiskTask, DiskWorker, DiskWriteCommit, HostWriteReservation, LayerCachePolicy,
-        LayerSchedule, PagedCacheOptions, PendingDiskOperation, PromptCacheBlock,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheStateTensor, PromptCacheTopology, StateTensorDimension, StateTensorDtype,
-        StateTensorOwner, StateTensorPolicy, StateTensorRole, TemporaryFileGuard,
-        CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
-        PROMPT_CACHE_GENERATIONS_DIRECTORY, PROMPT_CACHE_SCHEMA_VERSION,
+        verify_disk_payload, AttentionPolicy, CacheBlockArrays, CacheBlockId,
+        CacheBlockPhysicalState, CacheBlockRecord, CacheLayerResidencyStats, CacheRankIdentity,
+        CacheRepresentation, CacheResidencyError, CacheResidencyManager, CacheTier,
+        DiskCacheReadState, DiskLocation, DiskOperationKey, DiskOperationKind, DiskResult,
+        DiskTask, DiskWorker, DiskWriteCommit, HostCacheBlock, HostCachePersistence,
+        HostWriteReservation, LayerCachePolicy, LayerSchedule, PagedCacheOptions,
+        PendingDiskOperation, PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest,
+        PromptCacheModelIdentity, PromptCacheStateTensor, PromptCacheTopology,
+        StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
+        StateTensorRole, TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+        MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_GENERATIONS_DIRECTORY,
+        PROMPT_CACHE_SCHEMA_VERSION,
     };
     use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Stream};
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
@@ -5880,6 +6169,17 @@ mod tests {
         }
     }
 
+    fn test_device_block() -> CacheBlockArrays {
+        CacheBlockArrays::KeyValue {
+            keys: Array::from_slice(&[0.0f32], &[1]),
+            values: Array::from_slice(&[0.0f32], &[1]),
+        }
+    }
+
+    fn test_host_block() -> HostCacheBlock {
+        HostCacheBlock::from_device_arrays(&test_device_block(), &super::cpu_stream()).unwrap()
+    }
+
     fn manager_with_leased_block() -> CacheResidencyManager {
         let manager = CacheResidencyManager::new(
             PagedCacheOptions::new(1, 64, 64, 1)
@@ -5899,9 +6199,10 @@ mod tests {
             id.clone(),
             CacheBlockRecord {
                 id,
-                tier: CacheTier::Host,
-                arrays: None,
-                disk: None,
+                physical: CacheBlockPhysicalState::Host {
+                    block: test_host_block(),
+                    persistence: HostCachePersistence::Unbacked,
+                },
                 bytes: 0,
                 shapes: [vec![1, 1, 1, 1], vec![1, 1, 1, 1]],
                 dtypes: ["Float32".into(), "Float32".into()],
@@ -5910,7 +6211,6 @@ mod tests {
                 access_count: 0,
                 last_access: 0,
                 protected_prefix: false,
-                pending_disk: None,
             },
         );
         manager
@@ -6514,12 +6814,11 @@ mod tests {
         let state = manager.lock().unwrap();
         assert_eq!(state.counters.report.imported_mapped_shards, 1);
         assert!(state.blocks.values().all(|record| record
-            .disk
-            .as_ref()
+            .disk()
             .and_then(|location| location.mapped.as_ref())
             .is_some()));
         for record in state.blocks.values() {
-            verify_disk_payload(record.disk.as_ref().unwrap()).unwrap();
+            verify_disk_payload(record.disk().unwrap()).unwrap();
         }
     }
 
@@ -6998,9 +7297,12 @@ mod tests {
             id.clone(),
             CacheBlockRecord {
                 id,
-                tier: CacheTier::Host,
-                arrays: None,
-                disk: None,
+                physical: CacheBlockPhysicalState::Host {
+                    block: test_host_block(),
+                    persistence: HostCachePersistence::Writing(PendingDiskOperation {
+                        ticket: ticket.clone(),
+                    }),
+                },
                 bytes: 0,
                 shapes: [vec![1], vec![1]],
                 dtypes: ["Float32".into(), "Float32".into()],
@@ -7009,9 +7311,6 @@ mod tests {
                 access_count: 0,
                 last_access: 0,
                 protected_prefix: false,
-                pending_disk: Some(PendingDiskOperation {
-                    ticket: ticket.clone(),
-                }),
             },
         );
         DiskWriteCommit {
@@ -7086,9 +7385,12 @@ mod tests {
                 id.clone(),
                 CacheBlockRecord {
                     id: id.clone(),
-                    tier: CacheTier::Host,
-                    arrays: None,
-                    disk: None,
+                    physical: CacheBlockPhysicalState::Host {
+                        block: test_host_block(),
+                        persistence: HostCachePersistence::Writing(PendingDiskOperation {
+                            ticket: ticket.clone(),
+                        }),
+                    },
                     bytes: 16,
                     shapes: [vec![1], vec![1]],
                     dtypes: ["Float32".into(), "Float32".into()],
@@ -7097,9 +7399,6 @@ mod tests {
                     access_count: 0,
                     last_access: 0,
                     protected_prefix: false,
-                    pending_disk: Some(PendingDiskOperation {
-                        ticket: ticket.clone(),
-                    }),
                 },
             );
         }
@@ -7109,15 +7408,16 @@ mod tests {
         assert_eq!(report.in_flight_write_bytes, 16);
         assert_eq!(report.host_blocks, 1);
 
-        // Demand promotion replaces the record's arrays with device storage,
-        // but the disk task still owns the original host staging allocation.
-        manager.lock().unwrap().blocks.get_mut(&id).unwrap().tier = CacheTier::Device;
-        let report = manager.report().unwrap();
-        assert_eq!(report.device_blocks, 1);
-        assert_eq!(report.host_blocks, 0);
-        assert_eq!(report.current_device_bytes, 16);
-        assert_eq!(report.current_host_bytes, 16);
-        assert_eq!(report.in_flight_write_bytes, 16);
+        // A pending host write is encoded only by the Host variant. Promotion
+        // waits for that write rather than creating an incoherent device block
+        // with an attached host-write operation.
+        assert!(matches!(
+            manager.lock().unwrap().blocks.get(&id).unwrap().physical,
+            CacheBlockPhysicalState::Host {
+                persistence: HostCachePersistence::Writing(_),
+                ..
+            }
+        ));
 
         let clear_manager = manager.clone();
         let (cleared_tx, cleared_rx) = mpsc::channel();
@@ -7168,9 +7468,10 @@ mod tests {
                     id.clone(),
                     CacheBlockRecord {
                         id,
-                        tier: CacheTier::Device,
-                        arrays: None,
-                        disk,
+                        physical: CacheBlockPhysicalState::Device {
+                            arrays: test_device_block(),
+                            disk,
+                        },
                         bytes: 16,
                         shapes: [vec![1], vec![1]],
                         dtypes: ["Float32".into(), "Float32".into()],
@@ -7179,7 +7480,6 @@ mod tests {
                         access_count: 0,
                         last_access: 0,
                         protected_prefix: false,
-                        pending_disk: None,
                     },
                 );
             }
@@ -7187,8 +7487,8 @@ mod tests {
 
         manager.rebalance(None, false).unwrap();
         let state = manager.lock().unwrap();
-        assert_eq!(state.blocks.get(&older).unwrap().tier, CacheTier::Disk);
-        assert_eq!(state.blocks.get(&recent).unwrap().tier, CacheTier::Device);
+        assert_eq!(state.blocks.get(&older).unwrap().tier(), CacheTier::Disk);
+        assert_eq!(state.blocks.get(&recent).unwrap().tier(), CacheTier::Device);
         assert_eq!(state.counters.report.current_host_bytes, 0);
         assert_eq!(state.counters.report.current_device_bytes, 16);
         assert_eq!(state.counters.report.current_disk_bytes, 16);
@@ -7213,6 +7513,23 @@ mod tests {
                     1 => CacheTier::Host,
                     _ => CacheTier::Disk,
                 };
+                let physical = match tier {
+                    CacheTier::Device => CacheBlockPhysicalState::Device {
+                        arrays: test_device_block(),
+                        disk: None,
+                    },
+                    CacheTier::Host => CacheBlockPhysicalState::Host {
+                        block: test_host_block(),
+                        persistence: HostCachePersistence::Unbacked,
+                    },
+                    CacheTier::Disk => CacheBlockPhysicalState::Disk {
+                        location: missing_location(
+                            Path::new("/tmp/safemlx-cache-report-test"),
+                            &format!("layer-{global_layer}.safetensors"),
+                        ),
+                        read: DiskCacheReadState::Ready,
+                    },
+                };
                 let id = CacheBlockId {
                     session_id: manager.session_id,
                     global_layer,
@@ -7225,9 +7542,7 @@ mod tests {
                     id.clone(),
                     CacheBlockRecord {
                         id,
-                        tier,
-                        arrays: None,
-                        disk: None,
+                        physical,
                         bytes: global_layer as u64 + 1,
                         shapes: [vec![1], vec![1]],
                         dtypes: ["Float32".into(), "Float32".into()],
@@ -7236,7 +7551,6 @@ mod tests {
                         access_count: 0,
                         last_access: 0,
                         protected_prefix: global_layer % 5 == 0,
-                        pending_disk: None,
                     },
                 );
                 state
@@ -7495,17 +7809,17 @@ mod tests {
             .blocks
             .get(&ids[0])
             .unwrap()
-            .arrays
-            .clone()
-            .unwrap();
-        let host_arrays = device_arrays
-            .copy_to_stream_synchronized(&host_stream, "stage Metal prefetch test block")
-            .unwrap();
+            .device_arrays()
+            .unwrap()
+            .clone();
+        let host_block = HostCacheBlock::from_device_arrays(&device_arrays, &host_stream).unwrap();
         {
             let mut state = manager.lock().unwrap();
             let record = state.blocks.get_mut(&ids[0]).unwrap();
-            record.arrays = Some(host_arrays);
-            record.tier = CacheTier::Host;
+            record.physical = CacheBlockPhysicalState::Host {
+                block: host_block,
+                persistence: HostCachePersistence::Unbacked,
+            };
             super::update_report_totals(&mut state);
         }
         let ids = vec![ids[0].clone(), ids[2].clone(), ids[1].clone()];
@@ -7517,12 +7831,10 @@ mod tests {
         safemlx::transforms::async_eval([&blocker]).unwrap();
         let direct = manager.prepare_block_transfer(&ids[0], &transfer).unwrap();
         assert!(
-            !direct
-                .completion
-                .as_ref()
-                .expect("prefetched block has a completion")
-                .is_complete()
-                .unwrap(),
+            direct
+                .completions
+                .iter()
+                .any(|completion| !completion.is_complete().unwrap()),
             "paged-cache promotion blocked the host"
         );
         direct.wait_on(&stream).unwrap();
@@ -7716,7 +8028,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires MLX runtime execution"]
-    fn host_demotion_and_promotion_replace_physical_array_copies() {
+    fn host_demotion_uses_typed_buffers_and_promotion_rebuilds_device_arrays() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
         // Two 16-byte blocks fit on the device. A third block forces the oldest
         // one to a distinct CPU allocation while retaining one recent block.
@@ -7737,9 +8049,13 @@ mod tests {
         let first_host_pointers = {
             let state = manager.lock().unwrap();
             let record = state.blocks.get(&first).unwrap();
-            assert_eq!(record.tier, CacheTier::Host);
-            let arrays = record.arrays.as_ref().unwrap();
-            f32_storage_pointers(arrays)
+            assert_eq!(record.tier(), CacheTier::Host);
+            let block = record.host_block().unwrap();
+            let [first, second] = block.buffers();
+            [
+                first.as_bytes().unwrap().as_ptr() as usize,
+                second.as_bytes().unwrap().as_ptr() as usize,
+            ]
         };
         assert_ne!(first_host_pointers, first_device_pointers);
         let report = manager.report().unwrap();
@@ -7761,9 +8077,9 @@ mod tests {
         {
             let state = manager.lock().unwrap();
             let record = state.blocks.get(&first).unwrap();
-            assert_eq!(record.tier, CacheTier::Device);
+            assert_eq!(record.tier(), CacheTier::Device);
             assert_eq!(
-                f32_storage_pointers(record.arrays.as_ref().unwrap()),
+                f32_storage_pointers(record.device_arrays().unwrap()),
                 promoted_pointers
             );
         }

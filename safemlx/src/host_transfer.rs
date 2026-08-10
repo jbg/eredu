@@ -111,6 +111,14 @@ impl HostTransferBuffer {
         })
     }
 
+    /// Convert this exclusively mutable buffer into immutable shareable storage.
+    ///
+    /// Freezing removes mutable byte access and permits the allocation to be
+    /// shared across threads and borrowed by multiple submitted transfers.
+    pub fn freeze(self) -> ImmutableHostTransferBuffer {
+        ImmutableHostTransferBuffer { buffer: self }
+    }
+
     /// Shape recorded by the allocation.
     pub fn shape(&self) -> Result<Vec<i32>> {
         let _guard = runtime_lock::enter();
@@ -260,6 +268,131 @@ impl std::fmt::Debug for HostTransferBuffer {
             .field("policy", &self.policy())
             .field("storage_kind", &self.storage_kind())
             .finish()
+    }
+}
+
+/// Immutable, shareable host-transfer storage.
+///
+/// This is the storage form for host caches and other read-only staging data.
+/// Unlike [`HostTransferBuffer`], it has no mutable byte accessor. A submitted
+/// host-to-device copy retains the native allocation even if every public
+/// handle is dropped before completion.
+pub struct ImmutableHostTransferBuffer {
+    buffer: HostTransferBuffer,
+}
+
+// SAFETY: the wrapper never exposes mutable access to the allocation. Native
+// operations retain the underlying shared storage, and every FFI entry point
+// is serialized by SafeMLX's runtime lock. Const byte slices obey Rust's shared
+// reference rules for the lifetime of this immutable owner.
+unsafe impl Send for ImmutableHostTransferBuffer {}
+// SAFETY: see the `Send` implementation. All methods available through a
+// shared reference are read-only or submit a native copy which retains storage.
+unsafe impl Sync for ImmutableHostTransferBuffer {}
+
+impl ImmutableHostTransferBuffer {
+    /// Shape recorded by the allocation.
+    pub fn shape(&self) -> Result<Vec<i32>> {
+        self.buffer.shape()
+    }
+
+    /// Element dtype recorded by the allocation.
+    pub fn dtype(&self) -> Result<Dtype> {
+        self.buffer.dtype()
+    }
+
+    /// Number of logical elements.
+    pub fn len(&self) -> Result<usize> {
+        self.buffer.len()
+    }
+
+    /// Whether the typed allocation contains no logical elements.
+    pub fn is_empty(&self) -> Result<bool> {
+        self.buffer.is_empty()
+    }
+
+    /// Logical byte length.
+    pub fn nbytes(&self) -> Result<usize> {
+        self.buffer.nbytes()
+    }
+
+    /// Physical allocation capacity in bytes.
+    pub fn capacity(&self) -> Result<usize> {
+        self.buffer.capacity()
+    }
+
+    /// Requested allocation policy.
+    pub fn policy(&self) -> Result<HostTransferPolicy> {
+        self.buffer.policy()
+    }
+
+    /// Backend-selected physical storage kind.
+    pub fn storage_kind(&self) -> Result<HostTransferStorageKind> {
+        self.buffer.storage_kind()
+    }
+
+    /// Read the initialized bytes in this buffer.
+    pub fn as_bytes(&self) -> Result<&[u8]> {
+        self.buffer.as_bytes()
+    }
+
+    /// Submit a host-to-array copy while retaining this immutable allocation.
+    ///
+    /// The returned array must not be consumed on another stream until its
+    /// completion event has been ordered there or synchronized on the host.
+    pub fn copy_to_array(&self, stream: impl AsRef<Stream>) -> Result<SubmittedDeviceTransfer> {
+        let _guard = runtime_lock::enter();
+        let (value, completion) = <(Array, Event)>::try_from_op(|(array, event)| unsafe {
+            safemlx_sys::mlx_copy_from_host(array, event, self.buffer.raw, stream.as_ref().as_ptr())
+        })?;
+        Ok(SubmittedDeviceTransfer { value, completion })
+    }
+}
+
+impl std::fmt::Debug for ImmutableHostTransferBuffer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImmutableHostTransferBuffer")
+            .field("shape", &self.shape())
+            .field("dtype", &self.dtype())
+            .field("nbytes", &self.nbytes())
+            .field("capacity", &self.capacity())
+            .field("policy", &self.policy())
+            .field("storage_kind", &self.storage_kind())
+            .finish()
+    }
+}
+
+/// A submitted immutable-host-to-device transfer.
+///
+/// The native graph retains its host source. Consumers must synchronize the
+/// completion or order it on their execution stream before using `value`.
+#[derive(Debug)]
+pub struct SubmittedDeviceTransfer {
+    value: Array,
+    completion: Event,
+}
+
+impl SubmittedDeviceTransfer {
+    /// The lazily produced device array.
+    pub fn value(&self) -> &Array {
+        &self.value
+    }
+
+    /// Completion token covering the entire copy.
+    pub fn completion(&self) -> &Event {
+        &self.completion
+    }
+
+    /// Decompose the submission for integration with stream-ordered runtimes.
+    pub fn into_parts(self) -> (Array, Event) {
+        (self.value, self.completion)
+    }
+
+    /// Synchronize and return the completed array.
+    pub fn synchronize(self) -> Result<Array> {
+        self.completion.synchronize()?;
+        Ok(self.value)
     }
 }
 

@@ -39,6 +39,11 @@ Safe Rust strengthens that contract:
 - Host-to-array submission consumes the host buffer. The completed operation
   returns both the array and reusable buffer, preventing mutation during an
   in-flight copy.
+- `freeze()` converts an exclusively mutable buffer into
+  `ImmutableHostTransferBuffer`. Frozen storage is shareable and supports
+  repeated borrowed host-to-array submissions; every submission retains the
+  native allocation through its lazy graph and returns its own completion
+  event.
 - Uninitialized buffers expose mutable bytes only through an exclusive Rust
   borrow.
 
@@ -48,8 +53,12 @@ does not make CPU observation safe.
 
 ## Current adoption boundary
 
-This change deliberately stops before residency integration. Language-model
-weight residency and paged cache residency still represent host blocks as MLX
-arrays, so device-to-host demotion still performs its existing completion wait
-and independent clone. Replacing those payloads with `HostTransferBuffer` is
-the next layer of work and does not require another backend API.
+Paged live-cache residency stores sealed host-tier key/value and compressed-MLA
+blocks as immutable typed host-transfer buffers. Its physical block state is a
+sum type: a block is device arrays, host buffers, or disk backing, with only the
+pending operation valid for that state. Disk reads and writes serialize the
+typed host bytes directly, and promotion creates device arrays only on demand.
+
+Immutable weight residency and independent expert caching still represent
+their host-planned parameters as MLX arrays. Moving those stores to typed
+buffers is separate adoption work; it does not require another backend API.

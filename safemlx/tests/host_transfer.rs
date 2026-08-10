@@ -1,7 +1,9 @@
 use safemlx::{
     Array, Device, DeviceType, Dtype, HostTransferBuffer, HostTransferPolicy,
-    HostTransferStorageKind, Stream,
+    HostTransferStorageKind, ImmutableHostTransferBuffer, Stream,
 };
+
+fn assert_send_sync<T: Send + Sync>() {}
 
 #[test]
 fn host_transfer_round_trip_preserves_metadata_and_values() {
@@ -79,6 +81,33 @@ fn noncontiguous_sources_and_empty_buffers_preserve_logical_geometry() {
     assert!(empty.is_empty().unwrap());
     assert_eq!(empty.nbytes().unwrap(), 0);
     assert!(empty.as_bytes().unwrap().is_empty());
+}
+
+#[test]
+fn immutable_buffers_are_shareable_and_support_repeated_submissions() {
+    assert_send_sync::<ImmutableHostTransferBuffer>();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let source = Array::from_slice(&[9u32, 10], &[2]);
+    let immutable =
+        HostTransferBuffer::copy_from_array(&source, HostTransferPolicy::Transfer, &stream)
+            .unwrap()
+            .synchronize()
+            .unwrap()
+            .freeze();
+
+    let first = immutable.copy_to_array(&stream).unwrap();
+    let second = immutable.copy_to_array(&stream).unwrap();
+    drop(immutable);
+    let first = first.synchronize().unwrap();
+    let second = second.synchronize().unwrap();
+    assert_eq!(
+        first.evaluated().unwrap().try_as_slice::<u32>().unwrap(),
+        &[9, 10]
+    );
+    assert_eq!(
+        second.evaluated().unwrap().try_as_slice::<u32>().unwrap(),
+        &[9, 10]
+    );
 }
 
 #[test]

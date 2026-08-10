@@ -103,7 +103,9 @@ Transfers return pending values which retain their storage and completion
 event. Array-to-host bytes are unavailable until `synchronize()` succeeds.
 Host-to-array submission consumes the host buffer and returns it with the
 completed array, preventing safe Rust from mutating source bytes while DMA is
-in flight.
+in flight. A buffer can instead be frozen into immutable shareable storage;
+borrowed submissions from that storage support repeated promotions and each
+return an independently ordered completion event.
 
 ```rust
 use safemlx::{
@@ -122,9 +124,9 @@ let (restored, host) = host.copy_to_array(&stream)?.synchronize()?;
 # Ok::<(), safemlx::error::Exception>(())
 ```
 
-The language-model residency managers do not yet use this storage class; the
-API intentionally lands independently so residency can adopt it without
-changing its backend contract.
+The language-model paged live-cache manager uses frozen buffers for host-tier
+key/value and compressed-MLA blocks. Weight residency and independent expert
+caching have not yet adopted this storage class.
 
 ## Distributed MLX
 
