@@ -1071,7 +1071,9 @@ fn tensor_ring_worker() {
     // rank-local KV-head partition is observed directly, not only via its
     // prompt-cache descriptor. Other fixtures deliberately seal every token.
     let cache_block_size = if family.is_nemotron() { 4 } else { 1 };
-    let paged = PagedCacheOptions::new(cache_block_size, 4096, 4096, 1)
+    // Physical host-transfer allocations are page-rounded; keep the synthetic
+    // cache pool large enough for one complete rank-local block on current MLX.
+    let paged = PagedCacheOptions::new(cache_block_size, 64 * 1024, 64 * 1024, 1)
         .unwrap()
         .with_full_attention(true);
     let mut cache = model.new_paged_cache(paged.clone());

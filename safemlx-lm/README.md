@@ -1498,13 +1498,20 @@ The generalized resident/layerwise engine executes a validated
 dependencies, and one authoritative output; the runtime validates missing or
 duplicate names, unknown or repeated dependencies, cycles, disconnected
 groups, residency-plan identity, and group lengths before materialization.
-Ready groups run in a stable topological order. Root groups receive the initial
-activation, single-input groups receive their dependency output, and adapters
-with multiple inputs must implement an exact merge instead of relying on
-numeric adjacency.
+Ready groups are admitted in stable group order and submitted on independent
+same-thread MLX streams. Root groups receive the initial activation,
+single-input groups receive their dependency output, and adapters with
+multiple inputs must implement an exact merge instead of relying on numeric
+adjacency. Each submitted group records an exact completion event. Consumers
+insert backend stream waits for their declared edges and do not host-wait for
+their producers.
 Completed activations are retained only until their final declared consumer,
 so a chain does not accumulate every prior group output and a branch keeps only
-the roots still needed by its merge.
+the roots still needed by its merge. Layer and transfer leases remain live
+until the exact work using them completes. A ready group whose complete device,
+host, or dense-transfer window cannot be admitted stays ready while other
+groups progress; admission is retried after exact event completion releases a
+conflicting lease.
 
 Gemma multimodal execution declares independent vision and audio roots which
 both feed the text decoder. Qwen3-VL, multimodal Qwen3.5, and Inkling declare a
@@ -1512,8 +1519,8 @@ vision-to-text edge. Their media jobs are finalized and assembled only when the
 text node becomes ready, so skipped media branches and future non-adjacent
 placement cannot change ingress semantics. Ordinary text decoders declare a
 single-node graph; Moshi/PersonaPlex declare temporal-to-depth dependencies.
-Scheduling is currently topological and serial, not concurrent across ready
-roots.
+Replicated and tensor-parallel forwards use this same ready-set executor; TP
+collectives retain stable group submission order on every rank.
 
 `ArchitectureAdapter::execution_graph`, `begin_execution_group`, and
 `complete_execution_group` define group topology and execution boundaries.

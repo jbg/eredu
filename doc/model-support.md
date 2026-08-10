@@ -559,7 +559,9 @@ roots, and the text decoder explicitly depends on both. A root may be skipped
 when its modality is absent, but both dependency outputs are resolved before
 the adapter performs exact token/embedding and mask assembly at the text
 boundary. Execution-group dependencies do not require numeric adjacency, and
-ready roots execute serially.
+ready roots are submitted on independent same-thread MLX streams. Exact
+completion events order only declared dependency edges; media encoders can
+therefore remain in flight concurrently before text assembly.
 
 `ModelArgs::layer_schedule` and `ModelArgs::layer_policy` are the normalized
 layer APIs. JSON callers use `model_args_from_config_value` and

@@ -1873,7 +1873,7 @@ enum PipelineLayerLoadOptions {
 
 enum PipelineLayerController {
     LayerwiseHost(ResidentLayerGroup),
-    DenseDiskStream(Box<DenseStreamController>),
+    DenseDiskStream(Arc<DenseStreamController>),
 }
 
 struct PipelineLayerStorage {
@@ -1938,7 +1938,7 @@ impl PipelineLayerStorage {
         &self,
         indices: impl IntoIterator<Item = usize>,
         prefill: bool,
-    ) -> Result<Option<DenseTransferWindow<'_>>, Error> {
+    ) -> Result<Option<DenseTransferWindow>, Error> {
         match &self.controller {
             PipelineLayerController::LayerwiseHost(_) => Ok(None),
             PipelineLayerController::DenseDiskStream(controller) => controller
@@ -6243,7 +6243,7 @@ where
             ResidentLayerGroup::new("pipeline_stage", units.clone(), device_depth)?,
         ),
         PipelineLayerLoadOptions::DenseDiskStream(options) => {
-            PipelineLayerController::DenseDiskStream(Box::new(DenseStreamController::new(
+            PipelineLayerController::DenseDiskStream(Arc::new(DenseStreamController::new(
                 &residency,
                 options,
                 units.len(),

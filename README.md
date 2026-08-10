@@ -250,7 +250,9 @@ rather than a flat architecture-specific sequence. Gemma vision and audio are
 independent ingress roots feeding text; Qwen-VL, multimodal Qwen3.5, and
 Inkling declare vision-to-text dependencies. Media assembly happens at the
 text-node boundary, and invalid, cyclic, disconnected, or unmerged graphs fail
-before execution.
+before execution. Independent ready roots use separate same-thread MLX streams;
+declared edges are ordered with exact completion events rather than host
+synchronization.
 Llama and Mistral normalize Hugging Face and GGUF scalar metadata into
 `LayerSchedule<AttentionPolicy>`; resident, bounded, paged, tensor,
 pipeline, cache-identity, and memory paths then use the exact policy at each

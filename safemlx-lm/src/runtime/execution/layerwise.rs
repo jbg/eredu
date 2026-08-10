@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use safemlx::{module::ModuleParameters, transforms::async_eval_with_event, Array, Stream};
+use safemlx::{module::ModuleParameters, transforms::async_eval_with_event, Array, Event, Stream};
 
 use crate::{
     error::Error,
@@ -884,14 +884,14 @@ impl DenseStreamController {
         })
     }
 
-    pub(crate) fn transfer_window<'a>(
-        &'a self,
-        manager: &'a ResidencyManager,
+    pub(crate) fn transfer_window(
+        self: &Arc<Self>,
+        manager: &ResidencyManager,
         group: impl Into<String>,
-        units: &'a [OffloadUnitId],
+        units: &[OffloadUnitId],
         indices: impl IntoIterator<Item = usize>,
         prefill: bool,
-    ) -> Result<DenseTransferWindow<'a>, Error> {
+    ) -> Result<DenseTransferWindow, Error> {
         let indices = indices.into_iter().collect::<VecDeque<_>>();
         let mut prior = None;
         for &index in &indices {
@@ -905,15 +905,19 @@ impl DenseStreamController {
             prior = Some(index);
         }
         let mut window = DenseTransferWindow {
-            controller: self,
-            manager,
+            controller: Arc::clone(self),
+            manager: manager.clone(),
             group: group.into(),
-            units,
+            units: units.to_vec(),
             pending: indices,
             ready: VecDeque::new(),
             prefill,
         };
-        window.refill()?;
+        if let Err(error) = window.refill() {
+            if window.ready.is_empty() || !is_temporary_residency_contention(&error) {
+                return Err(error);
+            }
+        }
         Ok(window)
     }
 
@@ -1034,11 +1038,11 @@ impl DenseStreamController {
         Ok(())
     }
 
-    pub(crate) fn forward_guard<'a>(
-        &'a self,
+    pub(crate) fn forward_guard(
+        self: &Arc<Self>,
         prefill: bool,
-        manager: &'a ResidencyManager,
-    ) -> Result<DenseStreamForwardGuard<'a>, Error> {
+        manager: &ResidencyManager,
+    ) -> Result<DenseStreamForwardGuard, Error> {
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
         let mut state = self.pass.lock().map_err(|_| {
             crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
@@ -1057,8 +1061,8 @@ impl DenseStreamController {
             peaks: DensePassReport::default(),
         });
         Ok(DenseStreamForwardGuard {
-            controller: self,
-            manager,
+            controller: Arc::clone(self),
+            manager: manager.clone(),
             armed: true,
         })
     }
@@ -1099,14 +1103,14 @@ impl DenseStreamController {
         }
     }
 
-    pub(crate) fn group_guard<'a>(
-        &'a self,
-        manager: &'a ResidencyManager,
+    pub(crate) fn group_guard(
+        self: &Arc<Self>,
+        manager: &ResidencyManager,
         group: &str,
-    ) -> DenseStreamGroupGuard<'a> {
+    ) -> DenseStreamGroupGuard {
         DenseStreamGroupGuard {
-            controller: self,
-            manager,
+            controller: Arc::clone(self),
+            manager: manager.clone(),
             group: group.to_string(),
             armed: true,
         }
@@ -1251,17 +1255,25 @@ impl DenseStreamController {
 /// thread supported by MLX events. A window submits at most two device copies.
 /// Callers consume one entry, evaluate and synchronize its compute work, drop
 /// that entry, and then call [`Self::refill`] to submit the following layer.
-pub(crate) struct DenseTransferWindow<'a> {
-    controller: &'a DenseStreamController,
-    manager: &'a ResidencyManager,
+pub(crate) struct DenseTransferWindow {
+    controller: Arc<DenseStreamController>,
+    manager: ResidencyManager,
     group: String,
-    units: &'a [OffloadUnitId],
+    units: Vec<OffloadUnitId>,
     pending: VecDeque<usize>,
     ready: VecDeque<DensePreparedTransfer>,
     prefill: bool,
 }
 
-impl DenseTransferWindow<'_> {
+impl DenseTransferWindow {
+    fn has_ready(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.ready.is_empty() && self.pending.is_empty()
+    }
+
     /// Takes the next transfer after ordering `consumer` behind its event.
     pub(crate) fn next(&mut self, consumer: &Stream) -> Result<DensePreparedTransfer, Error> {
         let transfer = self.ready.pop_front().ok_or({
@@ -1320,7 +1332,7 @@ impl DenseTransferWindow<'_> {
             }
         }
         while self.ready.len() < DENSE_TRANSFER_WINDOW {
-            let Some(index) = self.pending.pop_front() else {
+            let Some(&index) = self.pending.front() else {
                 break;
             };
             let id = &self.units[index];
@@ -1336,12 +1348,19 @@ impl DenseTransferWindow<'_> {
             let transfer = self
                 .manager
                 .acquire_many_with_transfer(&[(id.clone(), 1)], MemoryTier::Device)?;
+            self.pending.pop_front();
             self.ready
                 .push_back(DensePreparedTransfer { index, transfer });
         }
         self.controller
-            .observe_group(self.manager, &self.group, self.prefill)?;
+            .observe_group(&self.manager, &self.group, self.prefill)?;
         Ok(())
+    }
+}
+
+impl Drop for DenseTransferWindow {
+    fn drop(&mut self) {
+        let _ = self.controller.clear_group(&self.manager, &self.group);
     }
 }
 
@@ -1366,15 +1385,15 @@ impl DensePreparedTransfer {
     }
 }
 
-pub(crate) struct DenseStreamForwardGuard<'a> {
-    controller: &'a DenseStreamController,
-    manager: &'a ResidencyManager,
+pub(crate) struct DenseStreamForwardGuard {
+    controller: Arc<DenseStreamController>,
+    manager: ResidencyManager,
     armed: bool,
 }
 
-impl DenseStreamForwardGuard<'_> {
+impl DenseStreamForwardGuard {
     pub(crate) fn complete(mut self) -> Result<(), Error> {
-        let result = self.controller.commit_forward(self.manager);
+        let result = self.controller.commit_forward(&self.manager);
         if result.is_ok() {
             self.armed = false;
         }
@@ -1382,7 +1401,7 @@ impl DenseStreamForwardGuard<'_> {
     }
 }
 
-impl Drop for DenseStreamForwardGuard<'_> {
+impl Drop for DenseStreamForwardGuard {
     fn drop(&mut self) {
         if self.armed {
             self.controller.abort_forward();
@@ -1390,28 +1409,28 @@ impl Drop for DenseStreamForwardGuard<'_> {
     }
 }
 
-pub(crate) struct DenseStreamGroupGuard<'a> {
-    controller: &'a DenseStreamController,
-    manager: &'a ResidencyManager,
+pub(crate) struct DenseStreamGroupGuard {
+    controller: Arc<DenseStreamController>,
+    manager: ResidencyManager,
     group: String,
     armed: bool,
 }
 
-impl DenseStreamGroupGuard<'_> {
+impl DenseStreamGroupGuard {
     pub(crate) fn complete(mut self) -> Result<(), Error> {
         let result = self
             .controller
-            .clear_group(self.manager, &self.group)
+            .clear_group(&self.manager, &self.group)
             .and_then(|()| self.controller.record_group_execution(&self.group));
         self.armed = false;
         result
     }
 }
 
-impl Drop for DenseStreamGroupGuard<'_> {
+impl Drop for DenseStreamGroupGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.controller.clear_group(self.manager, &self.group);
+            let _ = self.controller.clear_group(&self.manager, &self.group);
         }
     }
 }
@@ -1610,6 +1629,7 @@ impl ExecutionGroupSpec {
 pub struct ExecutionGroupDag {
     groups: Vec<ExecutionGroupSpec>,
     dependencies: Vec<Vec<usize>>,
+    dependents: Vec<Vec<usize>>,
     execution_order: Vec<usize>,
     output: usize,
 }
@@ -1703,6 +1723,7 @@ impl ExecutionGroupDag {
         Ok(Self {
             groups,
             dependencies,
+            dependents,
             execution_order,
             output,
         })
@@ -1743,6 +1764,11 @@ impl ExecutionGroupDag {
         self.dependencies.get(group).map(Vec::as_slice)
     }
 
+    /// Returns dependent slots in stable architecture declaration order.
+    pub fn dependents(&self, group: usize) -> Option<&[usize]> {
+        self.dependents.get(group).map(Vec::as_slice)
+    }
+
     /// Returns the authoritative output group slot.
     pub const fn output(&self) -> usize {
         self.output
@@ -1756,6 +1782,89 @@ impl ExecutionGroupDag {
             }
         }
         counts
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReadyGroupState {
+    Pending,
+    Ordered,
+    Failed,
+    #[cfg(test)]
+    Cancelled,
+    Blocked,
+}
+
+/// Deterministic dependency bookkeeping for the same-thread multi-stream executor.
+///
+/// A group becomes ready when all dependency completion events have been recorded.
+/// `ordered` therefore means that consumers can insert backend event waits; it does
+/// not imply a host synchronization. Failures and cancellation close the affected
+/// subgraph before any newly ready dependent can be submitted.
+#[derive(Debug)]
+struct ExecutionGroupReadySet<'a> {
+    graph: &'a ExecutionGroupDag,
+    remaining_dependencies: Vec<usize>,
+    states: Vec<ReadyGroupState>,
+    ready: BTreeSet<usize>,
+}
+
+impl<'a> ExecutionGroupReadySet<'a> {
+    fn new(graph: &'a ExecutionGroupDag) -> Self {
+        let remaining_dependencies = graph.dependencies.iter().map(Vec::len).collect::<Vec<_>>();
+        let ready = remaining_dependencies
+            .iter()
+            .enumerate()
+            .filter_map(|(group, &remaining)| (remaining == 0).then_some(group))
+            .collect();
+        Self {
+            graph,
+            remaining_dependencies,
+            states: vec![ReadyGroupState::Pending; graph.groups.len()],
+            ready,
+        }
+    }
+
+    fn ready_groups(&self) -> impl Iterator<Item = usize> + '_ {
+        self.ready.iter().copied()
+    }
+
+    fn ordered(&mut self, group: usize) {
+        debug_assert_eq!(self.states[group], ReadyGroupState::Pending);
+        self.ready.remove(&group);
+        self.states[group] = ReadyGroupState::Ordered;
+        for &dependent in &self.graph.dependents[group] {
+            if self.states[dependent] != ReadyGroupState::Pending {
+                continue;
+            }
+            self.remaining_dependencies[dependent] -= 1;
+            if self.remaining_dependencies[dependent] == 0 {
+                self.ready.insert(dependent);
+            }
+        }
+    }
+
+    fn fail(&mut self, group: usize) {
+        self.close_subgraph(group, ReadyGroupState::Failed);
+    }
+
+    #[cfg(test)]
+    fn cancel(&mut self, group: usize) {
+        self.close_subgraph(group, ReadyGroupState::Cancelled);
+    }
+
+    fn close_subgraph(&mut self, group: usize, terminal: ReadyGroupState) {
+        self.ready.remove(&group);
+        self.states[group] = terminal;
+        let mut pending = self.graph.dependents[group].clone();
+        while let Some(dependent) = pending.pop() {
+            if self.states[dependent] != ReadyGroupState::Pending {
+                continue;
+            }
+            self.ready.remove(&dependent);
+            self.states[dependent] = ReadyGroupState::Blocked;
+            pending.extend(self.graph.dependents[dependent].iter().copied());
+        }
     }
 }
 
@@ -2393,34 +2502,99 @@ pub struct LayerwiseModel<A: ArchitectureAdapter> {
     resident_layers: Option<Vec<Vec<A::Layer>>>,
     // Keep every populated layer's source arrays protected for the model lifetime.
     _resident_layer_leases: Vec<Vec<ResidentUnitLease>>,
-    dense_stream: Option<DenseStreamController>,
+    dense_stream: Option<Arc<DenseStreamController>>,
     sample_mlx_memory: bool,
     sample_process_memory: bool,
     metadata: LayerwiseModelMetadata,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     parallel_topology: Option<crate::runtime::distributed::topology::ParallelTopology>,
     parallel_info: Option<ParallelModelInfo>,
+    #[cfg(test)]
+    force_serial_execution: bool,
+    #[cfg(test)]
+    last_ready_set_trace: ReadySetExecutionTrace,
 }
 
-enum PreparedExecutionLayer<'a, L> {
-    Resident(&'a mut L),
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ReadySetExecutionTrace {
+    submissions: Vec<(usize, usize, i32)>,
+    independent_group_events: Vec<(usize, usize)>,
+}
+
+#[cfg(test)]
+impl ReadySetExecutionTrace {
+    pub(crate) fn submissions(&self) -> &[(usize, usize, i32)] {
+        &self.submissions
+    }
+
+    pub(crate) fn independent_group_events(&self) -> &[(usize, usize)] {
+        &self.independent_group_events
+    }
+}
+
+enum RetainedExecutionLayer<L> {
     Leased {
-        layer: L,
-        _device: ResidentUnitLease,
+        _layer: L,
+        _transfer: ResidentTransfer,
     },
     Transferred {
-        layer: L,
+        _layer: L,
         _transfer: DensePreparedTransfer,
     },
 }
 
-impl<L> PreparedExecutionLayer<'_, L> {
-    fn layer_mut(&mut self) -> &mut L {
-        match self {
-            Self::Resident(layer) => layer,
-            Self::Leased { layer, .. } | Self::Transferred { layer, .. } => layer,
+struct GroupExecutionState<L> {
+    stream: Stream,
+    hidden: Option<Array>,
+    next_layer: usize,
+    completion: Option<Event>,
+    retained_layer: Option<RetainedExecutionLayer<L>>,
+    dense_window: Option<DenseTransferWindow>,
+    dense_guard: Option<DenseStreamGroupGuard>,
+    started: bool,
+    ordered: bool,
+    completed: bool,
+    execute: bool,
+}
+
+impl<L> GroupExecutionState<L> {
+    fn new(stream: Stream) -> Self {
+        Self {
+            stream,
+            hidden: None,
+            next_layer: 0,
+            completion: None,
+            retained_layer: None,
+            dense_window: None,
+            dense_guard: None,
+            started: false,
+            ordered: false,
+            completed: false,
+            execute: false,
         }
     }
+}
+
+impl<L> Drop for GroupExecutionState<L> {
+    fn drop(&mut self) {
+        // Normal completion clears this event before releasing retained state.
+        // On failure or cancellation, drain independently submitted work on the
+        // same host thread so its layers and transfer sources cannot unwind early.
+        if let Some(completion) = &self.completion {
+            let _ = completion.synchronize();
+        }
+    }
+}
+
+fn is_temporary_residency_contention(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Residency(ResidencyError::BudgetExhausted { .. })
+            | Error::LayerwiseModel(LayerwiseModelError::Residency(
+                ResidencyError::BudgetExhausted { .. }
+            ))
+    )
 }
 
 impl<A: ArchitectureAdapter> LayerwiseModel<A> {
@@ -2489,7 +2663,21 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             parallel_layout: None,
             parallel_topology: None,
             parallel_info: None,
+            #[cfg(test)]
+            force_serial_execution: false,
+            #[cfg(test)]
+            last_ready_set_trace: ReadySetExecutionTrace::default(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_serial_reference(&mut self, force: bool) {
+        self.force_serial_execution = force;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_set_trace(&self) -> &ReadySetExecutionTrace {
+        &self.last_ready_set_trace
     }
 
     fn materialize_resident_layers(&mut self, stream: &Stream) -> Result<(), Error> {
@@ -2893,12 +3081,16 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         })
     }
 
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn forward_tensor_parallel_with_hooks<'a, F, H>(
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::type_complexity,
+        clippy::needless_range_loop
+    )]
+    fn forward_ready_set_with_hooks<'a, F, H>(
         &mut self,
         input: A::Input<'a>,
         cache: &mut A::Cache,
-        group: &safemlx::distributed::Group,
+        tensor_parallel_group: Option<&safemlx::distributed::Group>,
         stream: &Stream,
         mut executor: F,
         mut hook: H,
@@ -2916,180 +3108,481 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         ) -> Result<Array, Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
     {
-        let topology = self.parallel_topology.ok_or_else(|| {
-            Error::Parallel("layerwise model was not loaded for tensor-parallel execution".into())
-        })?;
-        let execution =
-            crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
-                topology, group, stream,
-            )?;
+        #[cfg(test)]
+        {
+            self.last_ready_set_trace = ReadySetExecutionTrace::default();
+        }
+        let topology = match tensor_parallel_group {
+            Some(_) => Some(self.parallel_topology.ok_or_else(|| {
+                Error::Parallel(
+                    "layerwise model was not loaded for tensor-parallel execution".into(),
+                )
+            })?),
+            None => None,
+        };
+        let initial_execution = match (topology, tensor_parallel_group) {
+            (Some(topology), Some(group)) => {
+                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                    topology, group, stream,
+                )?
+            }
+            (None, None) => {
+                crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(stream)
+            }
+            _ => unreachable!("topology and TP group are created together"),
+        };
         self.adapter.validate_cache(cache)?;
         let LayerwiseForwardState {
             hidden: initial_hidden,
             mut context,
         } = self
             .adapter
-            .begin_forward_with_execution(input, cache, &execution)?;
+            .begin_forward_with_execution(input, cache, &initial_execution)?;
         let prefill = initial_hidden.dim(1) > 1;
         let dense_forward = self
             .dense_stream
             .as_ref()
             .map(|streamer| streamer.forward_guard(prefill, &self.residency))
             .transpose()?;
-        let layout = self
-            .parallel_layout
-            .as_ref()
-            .expect("parallel topology has a layout");
+
+        let mut initial_roots = vec![&initial_hidden];
+        for group_index in 0..self.graph.groups().len() {
+            initial_roots.extend(
+                self.adapter
+                    .retained_context_arrays(&context, group_index, 0),
+            );
+        }
+        let initial_completion = async_eval_with_event(initial_roots)?;
+        let device = stream.get_device()?;
+        let mut states = (0..self.graph.groups().len())
+            .map(|_| {
+                #[cfg(test)]
+                if self.force_serial_execution {
+                    return GroupExecutionState::new(stream.clone());
+                }
+                GroupExecutionState::new(Stream::new_with_device(&device))
+            })
+            .collect::<Vec<GroupExecutionState<A::Layer>>>();
+        let mut ready_set = ExecutionGroupReadySet::new(&self.graph);
         let mut group_outputs: Vec<Option<Array>> = vec![None; self.graph.groups().len()];
         let mut remaining_consumers = self.graph.consumer_counts();
-        for group_index in self.graph.execution_order().iter().copied() {
-            let resident_group = &self.groups[group_index];
-            let dependency_slots = self
-                .graph
-                .dependencies(group_index)
-                .unwrap_or_default()
-                .to_vec();
-            let dependency_outputs = dependency_slots
-                .iter()
-                .map(|&dependency| {
-                    group_outputs[dependency]
-                        .as_ref()
-                        .expect("validated topological dependency")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let mut hidden = self.adapter.begin_execution_group_with_execution(
-                group_index,
-                &initial_hidden,
-                &dependency_outputs,
-                cache,
-                &mut context,
-                &execution,
-            )?;
-            for dependency in dependency_slots {
-                remaining_consumers[dependency] -= 1;
-                if remaining_consumers[dependency] == 0 {
-                    group_outputs[dependency] = None;
+
+        while states.iter().any(|state| !state.completed) {
+            let mut progressed = false;
+
+            // Completion is polled in stable group order. Resources are released
+            // immediately after the exact unit/group event completes.
+            for group_index in 0..states.len() {
+                let complete = match states[group_index].completion.as_ref() {
+                    Some(event) => event.is_complete()?,
+                    None => false,
+                };
+                if !complete {
+                    continue;
                 }
+                states[group_index].completion = None;
+                states[group_index].retained_layer = None;
+                if states[group_index].ordered {
+                    if states[group_index].execute
+                        && self.resident_layers.is_none()
+                        && states[group_index].dense_window.is_none()
+                    {
+                        let resident_group = &self.groups[group_index];
+                        let completed = states[group_index].next_layer - 1;
+                        let end = completed
+                            .saturating_add(resident_group.depth())
+                            .min(resident_group.units().len());
+                        resident_group
+                            .trim_to(&self.residency, &resident_group.units()[completed..end])?;
+                    }
+                    if let Some(guard) = states[group_index].dense_guard.take() {
+                        guard.complete()?;
+                    }
+                    states[group_index].dense_window = None;
+                    states[group_index].completed = true;
+                } else if let Some(window) = &mut states[group_index].dense_window {
+                    match window.refill() {
+                        Ok(()) => {}
+                        Err(error) if is_temporary_residency_contention(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                } else if self.resident_layers.is_none() {
+                    let resident_group = &self.groups[group_index];
+                    let completed = states[group_index].next_layer - 1;
+                    let end = completed
+                        .saturating_add(resident_group.depth())
+                        .min(resident_group.units().len());
+                    resident_group
+                        .trim_to(&self.residency, &resident_group.units()[completed..end])?;
+                }
+                progressed = true;
             }
-            let execute_group = self.adapter.should_execute_group(group_index, &context);
-            let dense_guard = execute_group.then(|| {
-                self.dense_stream
-                    .as_ref()
-                    .map(|streamer| streamer.group_guard(&self.residency, resident_group.id()))
-            });
-            if execute_group {
-                let mut dense_window = self
-                    .dense_stream
-                    .as_ref()
-                    .map(|streamer| {
+
+            // Record waits for every newly ready group before constructing any
+            // consumer graph. Dependency output order is the adapter declaration
+            // order, independent of producer completion order.
+            let newly_ready = ready_set.ready_groups().collect::<Vec<_>>();
+            for group_index in newly_ready {
+                if states[group_index].started {
+                    continue;
+                }
+                let dependency_slots = self
+                    .graph
+                    .dependencies(group_index)
+                    .unwrap_or_default()
+                    .to_vec();
+                if dependency_slots.is_empty() {
+                    initial_completion.wait_on(&states[group_index].stream)?;
+                } else {
+                    for &dependency in &dependency_slots {
+                        if let Some(completion) = &states[dependency].completion {
+                            completion.wait_on(&states[group_index].stream)?;
+                        }
+                    }
+                }
+                let dependency_outputs = dependency_slots
+                    .iter()
+                    .map(|&dependency| {
+                        group_outputs[dependency]
+                            .as_ref()
+                            .expect("ready dependency has an ordered output")
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                let execution = match (topology, tensor_parallel_group) {
+                    (Some(topology), Some(group)) => crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                        topology,
+                        group,
+                        &states[group_index].stream,
+                    )?,
+                    (None, None) => crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(&states[group_index].stream),
+                    _ => unreachable!("topology and TP group are created together"),
+                };
+                let hidden = match self.adapter.begin_execution_group_with_execution(
+                    group_index,
+                    &initial_hidden,
+                    &dependency_outputs,
+                    cache,
+                    &mut context,
+                    &execution,
+                ) {
+                    Ok(hidden) => hidden,
+                    Err(error) => {
+                        ready_set.fail(group_index);
+                        return Err(error);
+                    }
+                };
+                states[group_index].hidden = Some(hidden);
+                states[group_index].started = true;
+                states[group_index].execute =
+                    self.adapter.should_execute_group(group_index, &context);
+                for dependency in dependency_slots {
+                    remaining_consumers[dependency] -= 1;
+                    if remaining_consumers[dependency] == 0 {
+                        group_outputs[dependency] = None;
+                    }
+                }
+                progressed = true;
+            }
+
+            for group_index in 0..states.len() {
+                if !states[group_index].started
+                    || states[group_index].ordered
+                    || states[group_index].completion.is_some()
+                {
+                    continue;
+                }
+                let resident_group = &self.groups[group_index];
+                let layer_count = resident_group.units().len();
+                let group_stream = states[group_index].stream.clone();
+                let execution = match (topology, tensor_parallel_group) {
+                    (Some(topology), Some(group)) => crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                        topology,
+                        group,
+                        &group_stream,
+                    )?,
+                    (None, None) => crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(&group_stream),
+                    _ => unreachable!("topology and TP group are created together"),
+                };
+
+                if !states[group_index].execute {
+                    let hidden = self.adapter.complete_execution_group_with_execution(
+                        group_index,
+                        states[group_index]
+                            .hidden
+                            .as_ref()
+                            .expect("started group has hidden state"),
+                        cache,
+                        &mut context,
+                        &execution,
+                    )?;
+                    let retained_context =
+                        self.adapter
+                            .retained_context_arrays(&context, group_index, layer_count);
+                    let completion =
+                        async_eval_with_event(std::iter::once(&hidden).chain(retained_context))?;
+                    states[group_index].hidden = Some(hidden.clone());
+                    states[group_index].completion = Some(completion);
+                    states[group_index].ordered = true;
+                    group_outputs[group_index] = Some(hidden);
+                    ready_set.ordered(group_index);
+                    progressed = true;
+                    continue;
+                }
+
+                if states[group_index].dense_guard.is_none() {
+                    states[group_index].dense_guard = self
+                        .dense_stream
+                        .as_ref()
+                        .map(|streamer| streamer.group_guard(&self.residency, resident_group.id()));
+                }
+                if states[group_index].dense_window.is_none() {
+                    let result = self.dense_stream.as_ref().map(|streamer| {
                         streamer.transfer_window(
                             &self.residency,
                             resident_group.id(),
                             resident_group.units(),
-                            0..resident_group.units().len(),
+                            states[group_index].next_layer..layer_count,
                             prefill,
                         )
-                    })
-                    .transpose()?;
-                for index in 0..resident_group.units().len() {
-                    let id = &resident_group.units()[index];
-                    {
-                        let mut prepared = if let Some(layers) = &mut self.resident_layers {
-                            PreparedExecutionLayer::Resident(&mut layers[group_index][index])
-                        } else if let Some(window) = &mut dense_window {
-                            let transfer = window.next(stream)?;
-                            debug_assert_eq!(transfer.index(), index);
-                            let mut layer = self.adapter.new_parallel_layer(
-                                group_index,
-                                index,
-                                layout,
-                                stream,
-                            )?;
-                            self.adapter.populate_layer(
-                                group_index,
-                                index,
-                                &mut layer,
-                                transfer.lease(),
-                            )?;
-                            PreparedExecutionLayer::Transferred {
-                                layer,
-                                _transfer: transfer,
-                            }
-                        } else {
-                            resident_group.prepare(&self.residency, index)?;
-                            let lease = self.residency.acquire(id, MemoryTier::Device)?;
-                            let mut layer = self.adapter.new_parallel_layer(
-                                group_index,
-                                index,
-                                layout,
-                                stream,
-                            )?;
-                            self.adapter
-                                .populate_layer(group_index, index, &mut layer, &lease)?;
-                            PreparedExecutionLayer::Leased {
-                                layer,
-                                _device: lease,
-                            }
-                        };
-                        hidden = executor(
-                            &mut self.adapter,
-                            group_index,
-                            index,
-                            prepared.layer_mut(),
-                            &hidden,
-                            cache,
-                            &mut context,
-                            &execution,
-                        )?;
-                        let hook_result = hook(group_index, index, &mut context);
-                        let retained = self.adapter.retained_arrays(cache, group_index, index);
-                        let retained_context =
-                            self.adapter
-                                .retained_context_arrays(&context, group_index, index);
-                        async_eval_with_event(
-                            std::iter::once(&hidden)
-                                .chain(retained)
-                                .chain(retained_context),
-                        )?
-                        .synchronize()?;
-                        hook_result?;
-                    }
-                    if let Some(window) = &mut dense_window {
-                        window.refill()?;
-                    } else if self.resident_layers.is_none() {
-                        let end = index
-                            .saturating_add(resident_group.depth())
-                            .min(resident_group.units().len());
-                        resident_group
-                            .trim_to(&self.residency, &resident_group.units()[index..end])?;
+                    });
+                    match result {
+                        Some(Ok(window)) => states[group_index].dense_window = Some(window),
+                        Some(Err(error)) if is_temporary_residency_contention(&error) => continue,
+                        Some(Err(error)) => return Err(error),
+                        None => {}
                     }
                 }
+
+                let index = states[group_index].next_layer;
+                let mut retained_layer = None;
+                let hidden = states[group_index]
+                    .hidden
+                    .as_ref()
+                    .expect("started group has hidden state")
+                    .clone();
+                let layer_output = if let Some(layers) = &mut self.resident_layers {
+                    executor(
+                        &mut self.adapter,
+                        group_index,
+                        index,
+                        &mut layers[group_index][index],
+                        &hidden,
+                        cache,
+                        &mut context,
+                        &execution,
+                    )?
+                } else if let Some(window) = &mut states[group_index].dense_window {
+                    if !window.has_ready() {
+                        match window.refill() {
+                            Ok(()) => {}
+                            Err(error) if is_temporary_residency_contention(&error) => continue,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if window.is_exhausted() {
+                        return Err(LayerwiseModelError::InvalidDenseTransferWindow {
+                            index,
+                            unit_count: layer_count,
+                        }
+                        .into());
+                    }
+                    let transfer = window.next(&group_stream)?;
+                    debug_assert_eq!(transfer.index(), index);
+                    let mut layer = match self.parallel_layout.as_ref() {
+                        Some(layout) if tensor_parallel_group.is_some() => self
+                            .adapter
+                            .new_parallel_layer(group_index, index, layout, &group_stream)?,
+                        _ => self.adapter.new_layer(group_index, index, &group_stream)?,
+                    };
+                    self.adapter.populate_layer(
+                        group_index,
+                        index,
+                        &mut layer,
+                        transfer.lease(),
+                    )?;
+                    let output = executor(
+                        &mut self.adapter,
+                        group_index,
+                        index,
+                        &mut layer,
+                        &hidden,
+                        cache,
+                        &mut context,
+                        &execution,
+                    )?;
+                    retained_layer = Some(RetainedExecutionLayer::Transferred {
+                        _layer: layer,
+                        _transfer: transfer,
+                    });
+                    output
+                } else {
+                    let end = index
+                        .saturating_add(resident_group.depth())
+                        .min(layer_count);
+                    let requests = resident_group.units()[index..end]
+                        .iter()
+                        .cloned()
+                        .map(|id| (id, 1))
+                        .collect::<Vec<_>>();
+                    let transfer = match self
+                        .residency
+                        .acquire_many_with_transfer(&requests, MemoryTier::Device)
+                    {
+                        Ok(transfer) => transfer,
+                        Err(error @ ResidencyError::BudgetExhausted { .. }) => {
+                            let error = Error::Residency(error);
+                            if states.iter().any(|state| state.completion.is_some()) {
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    transfer.wait_on(&group_stream)?;
+                    let mut layer = match self.parallel_layout.as_ref() {
+                        Some(layout) if tensor_parallel_group.is_some() => self
+                            .adapter
+                            .new_parallel_layer(group_index, index, layout, &group_stream)?,
+                        _ => self.adapter.new_layer(group_index, index, &group_stream)?,
+                    };
+                    self.adapter.populate_layer(
+                        group_index,
+                        index,
+                        &mut layer,
+                        &transfer.leases()[0],
+                    )?;
+                    let output = executor(
+                        &mut self.adapter,
+                        group_index,
+                        index,
+                        &mut layer,
+                        &hidden,
+                        cache,
+                        &mut context,
+                        &execution,
+                    )?;
+                    retained_layer = Some(RetainedExecutionLayer::Leased {
+                        _layer: layer,
+                        _transfer: transfer,
+                    });
+                    output
+                };
+                hook(group_index, index, &mut context)?;
+                states[group_index].next_layer += 1;
+                let final_layer = states[group_index].next_layer == layer_count;
+                let hidden = if final_layer {
+                    self.adapter.complete_execution_group_with_execution(
+                        group_index,
+                        &layer_output,
+                        cache,
+                        &mut context,
+                        &execution,
+                    )?
+                } else {
+                    layer_output
+                };
+                let retained = self.adapter.retained_arrays(cache, group_index, index);
+                let retained_context = self.adapter.retained_context_arrays(
+                    &context,
+                    group_index,
+                    states[group_index].next_layer,
+                );
+                let completion = async_eval_with_event(
+                    std::iter::once(&hidden)
+                        .chain(retained)
+                        .chain(retained_context),
+                )?;
+                #[cfg(test)]
+                {
+                    let stream_index = group_stream.get_index()?;
+                    self.last_ready_set_trace
+                        .submissions
+                        .push((group_index, index, stream_index));
+                    for (other_group, other) in states.iter().enumerate() {
+                        let distinct_event = other_group != group_index
+                            && other.stream.get_index()? != stream_index
+                            && other.completion.is_some();
+                        if distinct_event {
+                            self.last_ready_set_trace
+                                .independent_group_events
+                                .push((other_group, group_index));
+                        }
+                    }
+                }
+                states[group_index].hidden = Some(hidden.clone());
+                states[group_index].completion = Some(completion);
+                states[group_index].retained_layer = retained_layer;
+                if final_layer {
+                    states[group_index].ordered = true;
+                    group_outputs[group_index] = Some(hidden);
+                    ready_set.ordered(group_index);
+                }
+                progressed = true;
             }
-            hidden = self.adapter.complete_execution_group_with_execution(
-                group_index,
-                &hidden,
-                cache,
-                &mut context,
-                &execution,
-            )?;
-            async_eval_with_event([&hidden])?.synchronize()?;
-            if let Some(Some(guard)) = dense_guard {
-                guard.complete()?;
+
+            if !progressed {
+                let Some(event) = states.iter().find_map(|state| state.completion.as_ref()) else {
+                    return Err(Error::Parallel(
+                        "execution-group ready set made no progress without in-flight work".into(),
+                    ));
+                };
+                event.synchronize()?;
             }
-            group_outputs[group_index] = Some(hidden);
         }
+
         let hidden = group_outputs[self.graph.output()]
             .take()
-            .expect("validated execution graph output was executed");
-        let output = self
-            .adapter
-            .finish_with_execution(&hidden, cache, &context, &execution)?;
+            .expect("validated execution graph output was ordered");
+        let final_execution = match (topology, tensor_parallel_group) {
+            (Some(topology), Some(group)) => {
+                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                    topology, group, stream,
+                )?
+            }
+            (None, None) => {
+                crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(stream)
+            }
+            _ => unreachable!("topology and TP group are created together"),
+        };
+        let output =
+            self.adapter
+                .finish_with_execution(&hidden, cache, &context, &final_execution)?;
         async_eval_with_event([&output])?.synchronize()?;
+        if self.dense_stream.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
+            self.residency
+                .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
+        }
         if let Some(guard) = dense_forward {
             guard.complete()?;
         }
         Ok((output, context))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn forward_tensor_parallel_with_hooks<'a, F, H>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        executor: F,
+        hook: H,
+    ) -> Result<(Array, A::ForwardContext), Error>
+    where
+        F: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Layer,
+            &Array,
+            &mut A::Cache,
+            &mut A::ForwardContext,
+            &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        ) -> Result<Array, Error>,
+        H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
+    {
+        self.forward_ready_set_with_hooks(input, cache, Some(group), stream, executor, hook)
     }
 
     /// Runs a generalized forward pass while allowing the caller to replace
@@ -3222,7 +3715,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         cache: &mut A::Cache,
         stream: &Stream,
         mut executor: F,
-        mut hook: H,
+        hook: H,
     ) -> Result<(Array, A::ForwardContext), Error>
     where
         F: FnMut(
@@ -3237,169 +3730,25 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         ) -> Result<Array, Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
     {
-        self.adapter.validate_cache(cache)?;
-        let execution =
-            crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(stream);
-        let LayerwiseForwardState {
-            hidden: initial_hidden,
-            mut context,
-        } = self
-            .adapter
-            .begin_forward_with_execution(input, cache, &execution)?;
-        let prefill = initial_hidden.dim(1) > 1;
-        let dense_forward = self
-            .dense_stream
-            .as_ref()
-            .map(|streamer| streamer.forward_guard(prefill, &self.residency))
-            .transpose()?;
-
-        let mut group_outputs: Vec<Option<Array>> = vec![None; self.graph.groups().len()];
-        let mut remaining_consumers = self.graph.consumer_counts();
-        for group_index in self.graph.execution_order().iter().copied() {
-            let group = &self.groups[group_index];
-            let dependency_slots = self
-                .graph
-                .dependencies(group_index)
-                .unwrap_or_default()
-                .to_vec();
-            let dependency_outputs = dependency_slots
-                .iter()
-                .map(|&dependency| {
-                    group_outputs[dependency]
-                        .as_ref()
-                        .expect("validated topological dependency")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let mut hidden = self.adapter.begin_execution_group_with_execution(
-                group_index,
-                &initial_hidden,
-                &dependency_outputs,
-                cache,
-                &mut context,
-                &execution,
-            )?;
-            for dependency in dependency_slots {
-                remaining_consumers[dependency] -= 1;
-                if remaining_consumers[dependency] == 0 {
-                    group_outputs[dependency] = None;
-                }
-            }
-            let execute_group = self.adapter.should_execute_group(group_index, &context);
-            let dense_guard = execute_group.then(|| {
-                self.dense_stream
-                    .as_ref()
-                    .map(|streamer| streamer.group_guard(&self.residency, group.id()))
-            });
-            if execute_group {
-                let mut dense_window = self
-                    .dense_stream
-                    .as_ref()
-                    .map(|streamer| {
-                        streamer.transfer_window(
-                            &self.residency,
-                            group.id(),
-                            group.units(),
-                            0..group.units().len(),
-                            prefill,
-                        )
-                    })
-                    .transpose()?;
-                for index in 0..group.units().len() {
-                    let id = &group.units()[index];
-                    {
-                        let mut prepared = if let Some(layers) = &mut self.resident_layers {
-                            PreparedExecutionLayer::Resident(&mut layers[group_index][index])
-                        } else if let Some(window) = &mut dense_window {
-                            let transfer = window.next(stream)?;
-                            debug_assert_eq!(transfer.index(), index);
-                            let mut layer = self.adapter.new_layer(group_index, index, stream)?;
-                            self.adapter.populate_layer(
-                                group_index,
-                                index,
-                                &mut layer,
-                                transfer.lease(),
-                            )?;
-                            PreparedExecutionLayer::Transferred {
-                                layer,
-                                _transfer: transfer,
-                            }
-                        } else {
-                            group.prepare(&self.residency, index)?;
-                            let lease = self.residency.acquire(id, MemoryTier::Device)?;
-                            let mut layer = self.adapter.new_layer(group_index, index, stream)?;
-                            self.adapter
-                                .populate_layer(group_index, index, &mut layer, &lease)?;
-                            PreparedExecutionLayer::Leased {
-                                layer,
-                                _device: lease,
-                            }
-                        };
-                        hidden = executor(
-                            &mut self.adapter,
-                            group_index,
-                            index,
-                            prepared.layer_mut(),
-                            &hidden,
-                            cache,
-                            &mut context,
-                            stream,
-                        )?;
-                        let hook_result = hook(group_index, index, &mut context);
-                        let retained = self.adapter.retained_arrays(cache, group_index, index);
-                        let retained_context =
-                            self.adapter
-                                .retained_context_arrays(&context, group_index, index);
-                        async_eval_with_event(
-                            std::iter::once(&hidden)
-                                .chain(retained)
-                                .chain(retained_context),
-                        )?
-                        .synchronize()?;
-                        hook_result?;
-                    }
-                    if let Some(window) = &mut dense_window {
-                        window.refill()?;
-                    } else if self.resident_layers.is_none() {
-                        let end = index.saturating_add(group.depth()).min(group.units().len());
-                        group.trim_to(&self.residency, &group.units()[index..end])?;
-                    }
-                }
-            }
-            hidden = self.adapter.complete_execution_group_with_execution(
-                group_index,
-                &hidden,
-                cache,
-                &mut context,
-                &execution,
-            )?;
-            let retained_context =
-                self.adapter
-                    .retained_context_arrays(&context, group_index, group.units().len());
-            async_eval_with_event(std::iter::once(&hidden).chain(retained_context))?
-                .synchronize()?;
-            if let Some(Some(guard)) = dense_guard {
-                guard.complete()?;
-            }
-            group_outputs[group_index] = Some(hidden);
-        }
-
-        let hidden = group_outputs[self.graph.output()]
-            .take()
-            .expect("validated execution graph output was executed");
-
-        let output = self
-            .adapter
-            .finish_with_execution(&hidden, cache, &context, &execution)?;
-        async_eval_with_event([&output])?.synchronize()?;
-        if self.dense_stream.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
-            self.residency
-                .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
-        }
-        if let Some(guard) = dense_forward {
-            guard.complete()?;
-        }
-        Ok((output, context))
+        self.forward_ready_set_with_hooks(
+            input,
+            cache,
+            None,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, execution| {
+                executor(
+                    adapter,
+                    group,
+                    index,
+                    layer,
+                    hidden,
+                    cache,
+                    context,
+                    execution.stream(),
+                )
+            },
+            hook,
+        )
     }
 
     /// Clears one named execution group without affecting other groups.
@@ -4079,7 +4428,7 @@ where
             .iter()
             .map(|group| (group.id().to_string(), group.units().to_vec()))
             .collect::<Vec<_>>();
-        model.dense_stream = Some(DenseStreamController::new(
+        model.dense_stream = Some(Arc::new(DenseStreamController::new(
             &model.residency,
             dense,
             planned_layer_count,
@@ -4087,7 +4436,7 @@ where
             maximum_host_layer_bytes,
             static_device_bytes,
             execution_groups,
-        )?);
+        )?));
     }
     Ok(model)
 }
@@ -4365,7 +4714,7 @@ where
             .iter()
             .map(|group| (group.id().to_string(), group.units().to_vec()))
             .collect::<Vec<_>>();
-        model.dense_stream = Some(DenseStreamController::new(
+        model.dense_stream = Some(Arc::new(DenseStreamController::new(
             &model.residency,
             dense,
             planned_layer_count,
@@ -4373,7 +4722,7 @@ where
             maximum_host_layer_bytes,
             static_device_bytes,
             execution_groups,
-        )?);
+        )?));
     }
     Ok(model)
 }
@@ -5081,6 +5430,161 @@ mod tests {
             disconnected,
             Error::LayerwiseModel(LayerwiseModelError::DisconnectedExecutionGroups { .. })
         ));
+    }
+
+    fn shared_and_disjoint_consumer_graph() -> ExecutionGroupDag {
+        ExecutionGroupDag::new(
+            vec![
+                ExecutionGroupSpec::root("vision"),
+                ExecutionGroupSpec::root("audio"),
+                ExecutionGroupSpec::root("retrieval"),
+                ExecutionGroupSpec::with_dependencies("shared", ["vision", "audio"]),
+                ExecutionGroupSpec::with_dependencies("vision_only", ["vision"]),
+                ExecutionGroupSpec::with_dependencies("audio_only", ["audio"]),
+                ExecutionGroupSpec::with_dependencies(
+                    "join",
+                    ["shared", "vision_only", "audio_only", "retrieval"],
+                ),
+            ],
+            "join",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ready_set_orders_two_roots_before_join_and_preserves_merge_order() {
+        let graph = ExecutionGroupDag::new(
+            vec![
+                ExecutionGroupSpec::root("vision"),
+                ExecutionGroupSpec::root("audio"),
+                ExecutionGroupSpec::with_dependencies("text", ["vision", "audio"]),
+            ],
+            "text",
+        )
+        .unwrap();
+        let mut ready = ExecutionGroupReadySet::new(&graph);
+        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [0, 1]);
+        ready.ordered(1);
+        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [0]);
+        ready.ordered(0);
+        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [2]);
+        assert_eq!(graph.dependencies(2), Some([0, 1].as_slice()));
+    }
+
+    #[test]
+    fn ready_set_accepts_three_root_completion_orders_without_changing_identity() {
+        let graph = ExecutionGroupDag::new(
+            vec![
+                ExecutionGroupSpec::root("first"),
+                ExecutionGroupSpec::root("second"),
+                ExecutionGroupSpec::root("third"),
+                ExecutionGroupSpec::with_dependencies("join", ["first", "second", "third"]),
+            ],
+            "join",
+        )
+        .unwrap();
+        for completion_order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
+            let mut ready = ExecutionGroupReadySet::new(&graph);
+            for group in completion_order {
+                ready.ordered(group);
+            }
+            assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [3]);
+            assert_eq!(graph.groups()[3].id(), "join");
+        }
+    }
+
+    #[test]
+    fn ready_set_handles_multiple_shared_and_disjoint_consumers() {
+        let graph = shared_and_disjoint_consumer_graph();
+        assert_eq!(graph.consumer_counts(), [2, 2, 1, 1, 1, 1, 0]);
+        let mut ready = ExecutionGroupReadySet::new(&graph);
+        ready.ordered(0);
+        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [1, 2, 4]);
+        ready.ordered(1);
+        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [2, 3, 4, 5]);
+        for group in [2, 3, 4, 5] {
+            ready.ordered(group);
+        }
+        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [6]);
+    }
+
+    #[test]
+    fn skipped_root_orders_dependents_without_losing_its_stable_slot() {
+        let graph = ExecutionGroupDag::new(
+            vec![
+                ExecutionGroupSpec::root("optional_vision"),
+                ExecutionGroupSpec::with_dependencies("text", ["optional_vision"]),
+            ],
+            "text",
+        )
+        .unwrap();
+        let mut ready = ExecutionGroupReadySet::new(&graph);
+        // Skipping still records an exact pass-through group completion.
+        ready.ordered(0);
+        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [1]);
+        assert_eq!(graph.groups()[0].id(), "optional_vision");
+    }
+
+    #[test]
+    fn failed_or_cancelled_root_blocks_only_its_downstream_subgraph() {
+        let graph = shared_and_disjoint_consumer_graph();
+        let mut failed = ExecutionGroupReadySet::new(&graph);
+        failed.fail(0);
+        assert_eq!(failed.states[0], ReadyGroupState::Failed);
+        assert_eq!(failed.states[3], ReadyGroupState::Blocked);
+        assert_eq!(failed.states[4], ReadyGroupState::Blocked);
+        assert_eq!(failed.states[6], ReadyGroupState::Blocked);
+        assert_eq!(failed.ready_groups().collect::<Vec<_>>(), [1, 2]);
+
+        let mut cancelled = ExecutionGroupReadySet::new(&graph);
+        cancelled.cancel(1);
+        assert_eq!(cancelled.states[1], ReadyGroupState::Cancelled);
+        assert_eq!(cancelled.states[3], ReadyGroupState::Blocked);
+        assert_eq!(cancelled.states[5], ReadyGroupState::Blocked);
+        assert_eq!(cancelled.ready_groups().collect::<Vec<_>>(), [0, 2]);
+    }
+
+    #[test]
+    fn ready_residency_contention_defers_without_deadlock_and_releases_exactly_once() {
+        let graph = ExecutionGroupDag::new(
+            vec![
+                ExecutionGroupSpec::root("large"),
+                ExecutionGroupSpec::root("small"),
+                ExecutionGroupSpec::with_dependencies("join", ["large", "small"]),
+            ],
+            "join",
+        )
+        .unwrap();
+        let mut ready = ExecutionGroupReadySet::new(&graph);
+        let mut available = 1usize;
+        let mut leases = [0usize; 3];
+        let mut publication = Vec::new();
+        for group in ready.ready_groups().collect::<Vec<_>>() {
+            if available == 0 {
+                continue;
+            }
+            available -= 1;
+            leases[group] += 1;
+            publication.push(group);
+        }
+        assert_eq!(publication, [0]);
+        leases[0] -= 1;
+        available += 1;
+        ready.ordered(0);
+        for group in ready.ready_groups().collect::<Vec<_>>() {
+            if group == 1 && available != 0 {
+                available -= 1;
+                leases[group] += 1;
+                publication.push(group);
+            }
+        }
+        leases[1] -= 1;
+        available += 1;
+        ready.ordered(1);
+        assert_eq!(publication, [0, 1]);
+        assert_eq!(leases, [0, 0, 0]);
+        assert_eq!(available, 1);
+        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [2]);
     }
 
     fn load_layerwise_llama(

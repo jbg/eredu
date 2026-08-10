@@ -4413,6 +4413,7 @@ mod tests {
                 parallel::{ParallelBuildContext, ShardingPolicy},
                 topology::{DeviceAssignment, ParallelTopology},
             },
+            execution::inspection::ActivationRecorder,
             execution::layerwise::{
                 ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
                 LoadTimeQuantizableAdapter,
@@ -4475,7 +4476,7 @@ mod tests {
             head_dim: 8,
             patch_size: 2,
             pooling_kernel_size: 2,
-            position_embedding_size: 4,
+            position_embedding_size: 4096,
             rms_norm_eps: 1e-6,
             hidden_activation: "gelu_pytorch_tanh".into(),
             standardize: false,
@@ -4640,7 +4641,7 @@ mod tests {
             "head_dim": 8,
             "patch_size": 2,
             "pooling_kernel_size": 2,
-            "position_embedding_size": 4,
+            "position_embedding_size": 4096,
             "rms_norm_eps": 1e-6,
             "hidden_activation": "gelu_pytorch_tanh",
             "standardize": false
@@ -5218,6 +5219,14 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
+        let mut serial = load_gemma4_layerwise_model(
+            dir.path(),
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        serial.execution.force_serial_reference(true);
         let graph = layerwise.execution.execution_graph();
         assert_eq!(
             graph
@@ -5230,8 +5239,11 @@ mod tests {
         assert_eq!(graph.dependencies(2), Some([0, 1].as_slice()));
         assert_eq!(graph.output(), 2);
         let text = runtime_input::token_ids_array(&[1, 2], gpu.stream()).unwrap();
-        let pixels = Array::zeros::<f32>(&[1, 4, 12], gpu.stream()).unwrap();
-        let positions = Array::from_slice(&[0i32, 0, 0, 1, 1, 0, 1, 1], &[1, 4, 2]);
+        let pixels = Array::zeros::<f32>(&[1, 4096, 12], gpu.stream()).unwrap();
+        let positions = (0..64)
+            .flat_map(|row| (0..64).flat_map(move |column| [row, column]))
+            .collect::<Vec<i32>>();
+        let positions = Array::from_slice(&positions, &[1, 4096, 2]);
         let audio_features = Array::zeros::<f32>(&[1, 8, 128], gpu.stream()).unwrap();
         let audio_mask = Array::from_slice(&[true; 8], &[1, 8]);
         let parts = [
@@ -5248,13 +5260,66 @@ mod tests {
         let typed = runtime_input::ModelInput::new(&parts);
         let mut resident_cache = Cache::default();
         let mut layerwise_cache = layerwise.new_cache();
+        let mut serial_cache = serial.new_cache();
         let expected = resident
             .prefill_input_logits(typed, &mut resident_cache, gpu.stream())
             .unwrap();
         let actual = layerwise
             .prefill_input_logits(typed, &mut layerwise_cache, gpu.stream())
             .unwrap();
+        let trace = layerwise.execution.ready_set_trace();
+        let vision_stream = trace
+            .submissions()
+            .iter()
+            .find_map(|&(group, _, stream)| (group == 0).then_some(stream))
+            .unwrap();
+        let audio_stream = trace
+            .submissions()
+            .iter()
+            .find_map(|&(group, _, stream)| (group == 1).then_some(stream))
+            .unwrap();
+        assert_ne!(vision_stream, audio_stream);
+        assert!(trace
+            .independent_group_events()
+            .iter()
+            .any(|&(producer, consumer)| [producer, consumer] == [0, 1]));
+        let serial_actual = serial
+            .prefill_input_logits(typed, &mut serial_cache, gpu.stream())
+            .unwrap();
         assert_close(&actual, &expected);
+        assert_close(&actual, &serial_actual);
+        let mut concurrent_observer = ActivationRecorder::default();
+        let mut serial_observer = ActivationRecorder::default();
+        let mut concurrent_observer_cache = layerwise.new_cache();
+        let mut serial_observer_cache = serial.new_cache();
+        layerwise
+            .prefill_input_with_observer(
+                typed,
+                &mut concurrent_observer_cache,
+                gpu.stream(),
+                &mut concurrent_observer,
+            )
+            .unwrap();
+        serial
+            .prefill_input_with_observer(
+                typed,
+                &mut serial_observer_cache,
+                gpu.stream(),
+                &mut serial_observer,
+            )
+            .unwrap();
+        assert_eq!(
+            concurrent_observer
+                .activations()
+                .iter()
+                .map(|activation| activation.name.as_str())
+                .collect::<Vec<_>>(),
+            serial_observer
+                .activations()
+                .iter()
+                .map(|activation| activation.name.as_str())
+                .collect::<Vec<_>>()
+        );
         let report = layerwise.residency_report().unwrap();
         assert!(report
             .units()
@@ -5264,6 +5329,32 @@ mod tests {
             .units()
             .iter()
             .any(|unit| unit.id().as_str().starts_with("gemma4.audio.")));
+
+        let dense_options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
+        let mut dense = load_gemma4_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::DenseDiskStream(dense_options),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut dense_cache = dense.new_cache();
+        let dense_actual = dense
+            .prefill_input_logits(typed, &mut dense_cache, gpu.stream())
+            .unwrap();
+        assert_close(&dense_actual, &expected);
+        assert!(dense
+            .execution
+            .ready_set_trace()
+            .independent_group_events()
+            .iter()
+            .any(|&(producer, consumer)| [producer, consumer] == [0, 1]));
+        let dense_report = dense.dense_stream_report().unwrap().unwrap();
+        assert_eq!(dense_report.prefill_forwards(), 1);
+        assert!(dense_report
+            .execution_groups()
+            .iter()
+            .all(|group| group.completed_executions() == 1));
 
         let group = Group::init(false, Backend::Any).unwrap();
         assert_eq!(group.size(), 1);
