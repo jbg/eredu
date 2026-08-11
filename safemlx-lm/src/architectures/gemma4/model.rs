@@ -16,15 +16,16 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
     native_quantization::{
-        native_grouped_linear, NativeQuantizationFormat, NativeQuantizationStats,
-        NativeQuantizedTensor,
+        native_grouped_linear, native_selected_down_reduce, native_selected_gate_up,
+        NativeQuantizationFormat, NativeQuantizationStats, NativeQuantizedTensor,
     },
     nn,
     ops::{
         concatenate_axis, dequantize_with_mode, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt, tanh,
-        topk_route_plan, GgufCheckpoint, GgufEndian, GgufMetadataValue, GgufType, QuantizationMode,
+        mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt,
+        sum_axis, tanh, topk_route_plan, GgufCheckpoint, GgufEndian, GgufMetadataValue, GgufType,
+        QuantizationMode,
     },
     quantization::MaybeQuantized,
     transforms::{async_eval_with_event, eval},
@@ -2123,17 +2124,7 @@ impl ExpertProjection {
         sorted_indices: bool,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        if let Some(native) = &self.native {
-            return native_grouped_linear(hidden_states, native, group_ids, stream);
-        }
-        if let Some(iquant) = self.iquant {
-            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
-            let native = NativeQuantizedTensor::from_iq_array(
-                self.weight.value.clone(),
-                &[self.weight.dim(0), self.output_dim, self.input_dim],
-                ggml_type,
-                endian,
-            )?;
+        if let Some(native) = self.native_view()? {
             return native_grouped_linear(hidden_states, &native, group_ids, stream);
         }
         if let Some(quantization) = self.quantization {
@@ -2160,6 +2151,29 @@ impl ExpertProjection {
                 stream,
             )
         }
+    }
+
+    pub(crate) fn native_view(&self) -> Result<Option<NativeQuantizedTensor>, Exception> {
+        if let Some(native) = &self.native {
+            return Ok(Some(native.clone()));
+        }
+        let Some(iquant) = self.iquant else {
+            return Ok(None);
+        };
+        let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+        Ok(Some(NativeQuantizedTensor::from_iq_array(
+            self.weight.value.clone(),
+            &[self.weight.dim(0), self.output_dim, self.input_dim],
+            ggml_type,
+            endian,
+        )?))
+    }
+
+    pub(crate) fn cache_native_view(&mut self) -> Result<(), Exception> {
+        if self.native.is_none() {
+            self.native = self.native_view()?;
+        }
+        Ok(())
     }
 }
 
@@ -2235,7 +2249,37 @@ impl GemmaExperts {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
-        // Use the same grouped expert path for decode and block verification.
+        if num_tokens == 1 {
+            let gate = self.switch_glu.gate_proj.native_view()?;
+            let up = self.switch_glu.up_proj.native_view()?;
+            if let (Some(gate), Some(up)) = (gate, up) {
+                let expert_ids = top_k_index.reshape(&[-1], stream)?;
+                let route_weights = top_k_weights.reshape(&[-1], stream)?;
+                let activated =
+                    native_selected_gate_up(hidden_states, &gate, &up, &expert_ids, stream)?;
+                if let Some(down) = self.switch_glu.down_proj.native_view()? {
+                    return native_selected_down_reduce(
+                        &activated,
+                        &down,
+                        &expert_ids,
+                        &route_weights,
+                        stream,
+                    );
+                }
+                let output = self.switch_glu.down_proj.forward_with_sorted(
+                    &activated,
+                    &expert_ids,
+                    false,
+                    stream,
+                )?;
+                return sum_axis(
+                    output.multiply(route_weights.reshape(&[-1, 1], stream)?, stream)?,
+                    0,
+                    true,
+                    stream,
+                );
+            }
+        }
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         let gate = self

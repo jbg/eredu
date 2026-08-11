@@ -1402,6 +1402,7 @@ pub(crate) fn execute_acquired_gemma_experts(
                 .optional_compact_binding(&format!("{projection}.biases"), stream)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         );
+        target.cache_native_view()?;
     }
     cache
         .record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())
@@ -4015,14 +4016,26 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         lease: &ResidentUnitLease,
     ) -> Result<(), Error> {
         if self.external_experts && self.execution_group_name(group)? == "text_decoder" {
-            Ok(populate_module_from_lease_excluding(
-                layer,
-                lease,
-                |name| name.starts_with("experts."),
-            )?)
+            populate_module_from_lease_excluding(layer, lease, |name| {
+                name.starts_with("experts.")
+            })?;
         } else {
-            Ok(populate_module_from_lease(layer, lease)?)
+            populate_module_from_lease(layer, lease)?;
         }
+        if !self.external_experts {
+            if let Gemma4Layer::Text(block) = layer {
+                if let Some(experts) = &mut block.experts {
+                    for projection in [
+                        &mut experts.switch_glu.gate_proj,
+                        &mut experts.switch_glu.up_proj,
+                        &mut experts.switch_glu.down_proj,
+                    ] {
+                        projection.cache_native_view()?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {

@@ -22,7 +22,7 @@ use std::{cell::RefCell, collections::HashMap, fmt::Write, sync::Arc};
 use crate::{
     error::Exception,
     fast::{MetalKernel, MetalKernelConfig},
-    ops::matmul,
+    ops::{broadcast_to, matmul, sum_axis},
     transforms::eval,
     Array, DeviceType, Dtype, Stream,
 };
@@ -45,14 +45,18 @@ thread_local! {
     static Q4K_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q4K_SELECTED_GATE_UP_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q4K_SELECTED_DOWN_REDUCE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q5_1_SELECTED_DOWN_REDUCE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q8_0_SELECTED_DOWN_REDUCE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static IQ_LINEAR_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =
         RefCell::new(HashMap::new());
     static IQ_BATCH_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =
@@ -946,6 +950,115 @@ pub fn native_grouped_linear(
     native_grouped_linear_cpu(input, weight, group_ids, stream)
 }
 
+/// Applies selected native gate and up expert banks to one input row.
+///
+/// Gate and up are separate views so callers do not need to preserve a
+/// checkpoint-specific fused physical layout. The result has shape
+/// `[routes, intermediate]` in the original `expert_ids` order.
+pub fn native_selected_gate_up(
+    hidden: &Array,
+    gate: &NativeQuantizedTensor,
+    up: &NativeQuantizedTensor,
+    expert_ids: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if hidden.ndim() != 2
+        || hidden.dim(0) != 1
+        || expert_ids.ndim() != 1
+        || hidden.dim(1) != gate.columns
+        || gate.columns != up.columns
+        || gate.rows != up.rows
+        || gate.matrix_count != up.matrix_count
+        || gate.format() != up.format()
+    {
+        return Err(Exception::custom(format!(
+            "native selected gate/up shape mismatch: hidden {:?}, ids {:?}, gate {:?}, up {:?}",
+            hidden.shape(),
+            expert_ids.shape(),
+            gate.shape(),
+            up.shape()
+        )));
+    }
+    if native_execution_backend(stream)? == NativeExecutionBackend::Metal
+        && gate.format() == NativeQuantizationFormat::GgufQ4K
+    {
+        return q4k_selected_gate_up_metal(hidden, gate, up, expert_ids, stream);
+    }
+
+    let routes = expert_ids.dim(0);
+    let routed_hidden = broadcast_to(hidden, &[routes, gate.columns], stream)?;
+    let gate = native_grouped_linear(&routed_hidden, gate, expert_ids, stream)?;
+    let up = native_grouped_linear(&routed_hidden, up, expert_ids, stream)?;
+    crate::nn::gelu_approximate(gate, stream)?.multiply(up, stream)
+}
+
+/// Applies selected native down experts, route weights, and route reduction.
+///
+/// The result retains a leading singleton token dimension and therefore has
+/// shape `[1, output]`.
+pub fn native_selected_down_reduce(
+    activated: &Array,
+    down: &NativeQuantizedTensor,
+    expert_ids: &Array,
+    route_weights: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if activated.ndim() != 2
+        || expert_ids.ndim() != 1
+        || activated.dim(0) != expert_ids.dim(0)
+        || route_weights.size() != expert_ids.size()
+        || activated.dim(1) != down.columns
+    {
+        return Err(Exception::custom(format!(
+            "native selected down shape mismatch: activated {:?}, ids {:?}, route weights {:?}, down {:?}",
+            activated.shape(),
+            expert_ids.shape(),
+            route_weights.shape(),
+            down.shape()
+        )));
+    }
+    if native_execution_backend(stream)? == NativeExecutionBackend::Metal {
+        match down.format() {
+            NativeQuantizationFormat::GgufQ4K => {
+                return q4k_selected_down_reduce_metal(
+                    activated,
+                    down,
+                    expert_ids,
+                    route_weights,
+                    stream,
+                );
+            }
+            NativeQuantizationFormat::GgufQ5_1 => {
+                return q5_1_selected_down_reduce_metal(
+                    activated,
+                    down,
+                    expert_ids,
+                    route_weights,
+                    stream,
+                );
+            }
+            NativeQuantizationFormat::GgufQ8_0 => {
+                return q8_0_selected_down_reduce_metal(
+                    activated,
+                    down,
+                    expert_ids,
+                    route_weights,
+                    stream,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let projected = native_grouped_linear(activated, down, expert_ids, stream)?;
+    sum_axis(
+        projected.multiply(route_weights.reshape(&[-1, 1], stream)?, stream)?,
+        0,
+        true,
+        stream,
+    )
+}
+
 fn is_gpu(stream: &Stream) -> Result<bool, Exception> {
     Ok(stream.get_device()?.get_type()? == DeviceType::Gpu)
 }
@@ -1065,6 +1178,120 @@ fn q4k_grouped_metal(
             .as_ref()
             .expect("Q4_K grouped kernel initialized")
             .apply_one_device([input, view.storage.bytes(), group_ids], &config, stream)
+    })
+}
+
+fn q4k_selected_gate_up_metal(
+    hidden: &Array,
+    gate: &NativeQuantizedTensor,
+    up: &NativeQuantizedTensor,
+    expert_ids: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let dtype = validate_activation_dtype(hidden)?;
+    let routes = expert_ids.dim(0);
+    let config = q4k_config(routes, gate, routes, gate.rows, dtype)
+        .with_template_arg_int("GATE_PHYSICAL_ROWS", gate.physical_rows)
+        .with_template_arg_int("GATE_ROW_START", gate.row_start)
+        .with_template_arg_int("UP_PHYSICAL_ROWS", up.physical_rows)
+        .with_template_arg_int("UP_ROW_START", up.row_start)
+        .with_template_arg_int("MATRIX_COUNT", gate.matrix_count);
+    Q4K_SELECTED_GATE_UP_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(q4k_selected_gate_up_kernel()?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("Q4_K selected gate/up kernel initialized")
+            .apply_one_device(
+                [hidden, gate.storage.bytes(), up.storage.bytes(), expert_ids],
+                &config,
+                stream,
+            )
+    })
+}
+
+fn q4k_selected_down_reduce_metal(
+    activated: &Array,
+    down: &NativeQuantizedTensor,
+    expert_ids: &Array,
+    route_weights: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let dtype = validate_activation_dtype(activated)?;
+    let routes = expert_ids.dim(0);
+    let config = q4k_config(1, down, 1, down.rows, dtype)
+        .with_template_arg_int("ROUTES", routes)
+        .with_template_arg_int("MATRIX_COUNT", down.matrix_count);
+    Q4K_SELECTED_DOWN_REDUCE_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(q4k_selected_down_reduce_kernel()?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("Q4_K selected down/reduce kernel initialized")
+            .apply_one_device(
+                [activated, down.storage.bytes(), expert_ids, route_weights],
+                &config,
+                stream,
+            )
+    })
+}
+
+fn q5_1_selected_down_reduce_metal(
+    activated: &Array,
+    down: &NativeQuantizedTensor,
+    expert_ids: &Array,
+    route_weights: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let dtype = validate_activation_dtype(activated)?;
+    let routes = expert_ids.dim(0);
+    let config = q5_1_config(1, down, 1, down.rows, dtype)
+        .with_template_arg_int("ROUTES", routes)
+        .with_template_arg_int("MATRIX_COUNT", down.matrix_count);
+    Q5_1_SELECTED_DOWN_REDUCE_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(q5_1_selected_down_reduce_kernel()?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("Q5_1 selected down/reduce kernel initialized")
+            .apply_one_device(
+                [activated, down.storage.bytes(), expert_ids, route_weights],
+                &config,
+                stream,
+            )
+    })
+}
+
+fn q8_0_selected_down_reduce_metal(
+    activated: &Array,
+    down: &NativeQuantizedTensor,
+    expert_ids: &Array,
+    route_weights: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let dtype = validate_activation_dtype(activated)?;
+    let routes = expert_ids.dim(0);
+    let out_tile = q8_0_out_tile(down.rows);
+    let out_grid = ((down.rows + out_tile - 1) / out_tile) * out_tile;
+    let config = q8_0_config(down, 1, down.rows, dtype)
+        .with_template_arg_int("ROUTES", routes)
+        .with_template_arg_int("MATRIX_COUNT", down.matrix_count)
+        .with_grid([REDUCTION_TILE, out_grid, 1]);
+    Q8_0_SELECTED_DOWN_REDUCE_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(q8_0_selected_down_reduce_kernel()?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("Q8_0 selected down/reduce kernel initialized")
+            .apply_one_device(
+                [activated, down.storage.bytes(), expert_ids, route_weights],
+                &config,
+                stream,
+            )
     })
 }
 
@@ -1734,6 +1961,120 @@ fn q4k_grouped_kernel() -> Result<MetalKernel, Exception> {
     )
 }
 
+fn q4k_selected_gate_up_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_q4k_selected_gate_up_separate",
+        ["input", "gate_weight", "up_weight", "expert_ids"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint route = thread_position_in_grid.y / OUT_GRID;",
+            "uint out_col = thread_position_in_grid.y % OUT_GRID;",
+            "float gate_acc = 0.0f;",
+            "float up_acc = 0.0f;",
+            "if (out_col < OUT_DIM) {",
+            " uint expert = uint(expert_ids[route]);",
+            " uint gate_row = expert * GATE_PHYSICAL_ROWS + GATE_ROW_START + out_col;",
+            " uint up_row = expert * UP_PHYSICAL_ROWS + UP_ROW_START + out_col;",
+            " uint gate_base = gate_row * BLOCKS * 144;",
+            " uint up_base = up_row * BLOCKS * 144;",
+            " for (uint block = 0; block < BLOCKS; ++block) {",
+            "  uint gb = gate_base + block * 144;",
+            "  uint ub = up_base + block * 144;",
+            "  uint input_block = block * 256;",
+            "  for (uint g = 0; g < 8; ++g) {",
+            "   for (uint i = lane; i < 32; i += REDUCTION_TILE) {",
+            "    float x = float(input[input_block + g * 32 + i]);",
+            "    gate_acc += x * q4k_value(gate_weight, gb, g, i);",
+            "    up_acc += x * q4k_value(up_weight, ub, g, i);",
+            "   }",
+            "  }",
+            " }",
+            "}",
+            "float gate = simd_sum(gate_acc);",
+            "float up = simd_sum(up_acc);",
+            "if (lane == 0 && out_col < OUT_DIM) {",
+            " float c = 0.7978845608028654f;",
+            " float activated = 0.5f * gate * (1.0f + metal::tanh(c * (gate + 0.044715f * gate * gate * gate)));",
+            " out[route * OUT_DIM + out_col] = T(activated * up);",
+            "}"
+        ),
+        Q4K_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+fn q4k_selected_down_reduce_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_q4k_selected_down_reduce",
+        ["input", "weight", "expert_ids", "route_weights"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint out_col = thread_position_in_grid.y % OUT_GRID;",
+            "float acc = 0.0f;",
+            "if (out_col < OUT_DIM) {",
+            " for (uint route = 0; route < ROUTES; ++route) {",
+            "  uint expert = uint(expert_ids[route]);",
+            "  uint physical_row = expert * PHYSICAL_ROWS + ROW_START + out_col;",
+            "  uint matrix_base = physical_row * BLOCKS * 144;",
+            "  float route_acc = 0.0f;",
+            "  for (uint block = 0; block < BLOCKS; ++block) {",
+            "   uint base = matrix_base + block * 144;",
+            "   uint input_block = route * IN_DIM + block * 256;",
+            "   for (uint g = 0; g < 8; ++g) {",
+            "    for (uint i = lane; i < 32; i += REDUCTION_TILE) {",
+            "     route_acc += float(input[input_block + g * 32 + i]) * q4k_value(weight, base, g, i);",
+            "    }",
+            "   }",
+            "  }",
+            "  acc += route_acc * float(route_weights[route]);",
+            " }",
+            "}",
+            "float total = simd_sum(acc);",
+            "if (lane == 0 && out_col < OUT_DIM) out[out_col] = T(total);"
+        ),
+        Q4K_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+fn q5_1_selected_down_reduce_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_q5_1_selected_down_reduce",
+        ["input", "weight", "expert_ids", "route_weights"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint out_col = thread_position_in_grid.y % OUT_GRID;",
+            "float acc = 0.0f;",
+            "if (out_col < OUT_DIM) {",
+            " for (uint route = 0; route < ROUTES; ++route) {",
+            "  uint expert = uint(expert_ids[route]);",
+            "  uint physical_row = expert * PHYSICAL_ROWS + ROW_START + out_col;",
+            "  uint matrix_base = physical_row * BLOCKS * 24;",
+            "  float route_acc = 0.0f;",
+            "  for (uint block = lane; block < BLOCKS; block += REDUCTION_TILE) {",
+            "   uint base = matrix_base + block * 24;",
+            "   uint input_block = route * IN_DIM + block * 32;",
+            "   for (uint i = 0; i < 32; ++i) {",
+            "    route_acc += float(input[input_block + i]) * q5_1_value(weight, base, i);",
+            "   }",
+            "  }",
+            "  acc += route_acc * float(route_weights[route]);",
+            " }",
+            "}",
+            "float total = simd_sum(acc);",
+            "if (lane == 0 && out_col < OUT_DIM) out[out_col] = T(total);"
+        ),
+        Q5_1_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
 fn q5_1_grouped_kernel() -> Result<MetalKernel, Exception> {
     MetalKernel::new(
         "native_q5_1_grouped",
@@ -1808,6 +2149,39 @@ fn q4k_embedding_kernel() -> Result<MetalKernel, Exception> {
             "out[elem] = q4k_value(weight, base, g, i);"
         ),
         Q4K_METAL_HEADER,
+        true,
+        false,
+    )
+}
+
+fn q8_0_selected_down_reduce_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_q8_0_selected_down_reduce",
+        ["input", "weight", "expert_ids", "route_weights"],
+        ["out"],
+        concat!(
+            "uint lane = thread_position_in_grid.x;",
+            "uint out_col = thread_position_in_grid.y;",
+            "float acc = 0.0f;",
+            "if (out_col < OUT_DIM) {",
+            " for (uint route = 0; route < ROUTES; ++route) {",
+            "  uint expert = uint(expert_ids[route]);",
+            "  uint physical_row = expert * PHYSICAL_ROWS + ROW_START + out_col;",
+            "  uint matrix_base = physical_row * BLOCKS * 34;",
+            "  float route_acc = 0.0f;",
+            "  for (uint block = 0; block < BLOCKS; ++block) {",
+            "   uint base = matrix_base + block * 34;",
+            "   float d = q8_0_scale(weight, base);",
+            "   int q = q8_0_quant(weight, base + 2 + lane);",
+            "   route_acc += float(input[route * IN_DIM + block * 32 + lane]) * d * float(q);",
+            "  }",
+            "  acc += route_acc * float(route_weights[route]);",
+            " }",
+            "}",
+            "float total = simd_sum(acc);",
+            "if (lane == 0 && out_col < OUT_DIM) out[out_col] = T(total);"
+        ),
+        Q8_0_METAL_HEADER,
         true,
         false,
     )
@@ -2889,6 +3263,188 @@ mod tests {
         let expected = dense.try_index_device(&ids, &stream).unwrap();
         assert!(actual
             .all_close(&expected, Some(1e-6), Some(1e-6), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Metal device"]
+    fn q4k_metal_selected_experts_with_separate_banks_match_float() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
+        let experts = 3;
+        let intermediate = 256;
+        let hidden = 256;
+        let output = 5;
+        let gate = NativeQuantizedTensor::from_q4k_bytes(
+            &repeated_blocks((experts * intermediate) as usize),
+            &[experts, intermediate, hidden],
+            &stream,
+        )
+        .unwrap();
+        let up = NativeQuantizedTensor::from_q4k_bytes(
+            &repeated_blocks((experts * intermediate) as usize),
+            &[experts, intermediate, hidden],
+            &stream,
+        )
+        .unwrap();
+        let down = NativeQuantizedTensor::from_q4k_bytes(
+            &repeated_blocks((experts * output) as usize),
+            &[experts, output, intermediate],
+            &stream,
+        )
+        .unwrap();
+        let hidden_state = Array::from_slice(
+            &(0..hidden)
+                .map(|index| (index as f32 % 23.0 - 11.0) / 12.0)
+                .collect::<Vec<_>>(),
+            &[1, hidden],
+        )
+        .copy(&stream)
+        .unwrap();
+        let ids = Array::from_slice(&[2i32, 0, 2], &[3])
+            .copy(&stream)
+            .unwrap();
+        let weights = Array::from_slice(&[0.2f32, 0.3, 0.5], &[3])
+            .copy(&stream)
+            .unwrap();
+
+        let activated = native_selected_gate_up(&hidden_state, &gate, &up, &ids, &stream).unwrap();
+        let actual =
+            native_selected_down_reduce(&activated, &down, &ids, &weights, &stream).unwrap();
+
+        let repeated = broadcast_to(&hidden_state, &[ids.dim(0), hidden], &stream).unwrap();
+        let gate_ref = native_grouped_linear(&repeated, &gate, &ids, &stream).unwrap();
+        let up_ref = native_grouped_linear(&repeated, &up, &ids, &stream).unwrap();
+        let activated_ref = crate::nn::gelu_approximate(gate_ref, &stream)
+            .unwrap()
+            .multiply(up_ref, &stream)
+            .unwrap();
+        let projected = native_grouped_linear(&activated_ref, &down, &ids, &stream).unwrap();
+        let expected = sum_axis(
+            projected
+                .multiply(weights.reshape(&[-1, 1], &stream).unwrap(), &stream)
+                .unwrap(),
+            0,
+            true,
+            &stream,
+        )
+        .unwrap();
+        assert!(activated
+            .all_close(&activated_ref, Some(5e-3), Some(5e-3), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
+        assert!(actual
+            .all_close(&expected, Some(5e-3), Some(5e-3), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Metal device"]
+    fn mixed_q4k_gate_up_q5_1_down_selected_experts_match_float() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
+        let experts = 3;
+        let intermediate = 64;
+        let hidden = 256;
+        let output = 5;
+        let gate = NativeQuantizedTensor::from_q4k_bytes(
+            &repeated_blocks((experts * intermediate) as usize),
+            &[experts, intermediate, hidden],
+            &stream,
+        )
+        .unwrap();
+        let up = NativeQuantizedTensor::from_q4k_bytes(
+            &repeated_blocks((experts * intermediate) as usize),
+            &[experts, intermediate, hidden],
+            &stream,
+        )
+        .unwrap();
+        let mut down_raw = Vec::new();
+        for index in 0..(experts * output * intermediate / 32) {
+            let mut block = sample_q5_1_block();
+            block[8] = block[8].wrapping_add(index as u8);
+            down_raw.extend(block);
+        }
+        let down = NativeQuantizedTensor::from_q5_1_bytes(
+            &down_raw,
+            &[experts, output, intermediate],
+            &stream,
+        )
+        .unwrap();
+        let hidden_state = Array::from_slice(&vec![0.0001f32; hidden as usize], &[1, hidden])
+            .copy(&stream)
+            .unwrap();
+        let ids = Array::from_slice(&[2i32, 0, 2], &[3])
+            .copy(&stream)
+            .unwrap();
+        let weights = Array::from_slice(&[0.2f32, 0.3, 0.5], &[3])
+            .copy(&stream)
+            .unwrap();
+
+        let activated = native_selected_gate_up(&hidden_state, &gate, &up, &ids, &stream).unwrap();
+        let actual =
+            native_selected_down_reduce(&activated, &down, &ids, &weights, &stream).unwrap();
+        let projected = native_grouped_linear(&activated, &down, &ids, &stream).unwrap();
+        let expected = sum_axis(
+            projected
+                .multiply(weights.reshape(&[-1, 1], &stream).unwrap(), &stream)
+                .unwrap(),
+            0,
+            true,
+            &stream,
+        )
+        .unwrap();
+        assert!(actual
+            .all_close(&expected, Some(5e-3), Some(5e-3), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Metal device"]
+    fn q8_0_metal_selected_down_reduce_matches_grouped_reference() {
+        let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
+        let experts = 3;
+        let output = 5;
+        let input_dim = 64;
+        let routes = 4;
+        let mut raw = Vec::new();
+        for index in 0..(experts * output * input_dim / 32) {
+            let mut block = sample_q8_0_block();
+            block[2] = block[2].wrapping_add(index as u8);
+            raw.extend(block);
+        }
+        let down =
+            NativeQuantizedTensor::from_q8_0_bytes(&raw, &[experts, output, input_dim], &stream)
+                .unwrap();
+        let input = Array::from_slice(
+            &(0..routes * input_dim)
+                .map(|index| (index as f32 % 37.0 - 18.0) / 190.0)
+                .collect::<Vec<_>>(),
+            &[routes, input_dim],
+        )
+        .copy(&stream)
+        .unwrap();
+        let ids = Array::from_slice(&[2i32, 0, 2, 1], &[routes])
+            .copy(&stream)
+            .unwrap();
+        let weights = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[routes])
+            .copy(&stream)
+            .unwrap();
+
+        let actual = native_selected_down_reduce(&input, &down, &ids, &weights, &stream).unwrap();
+        let projected = native_grouped_linear(&input, &down, &ids, &stream).unwrap();
+        let expected = sum_axis(
+            projected
+                .multiply(weights.reshape(&[-1, 1], &stream).unwrap(), &stream)
+                .unwrap(),
+            0,
+            true,
+            &stream,
+        )
+        .unwrap();
+        assert!(actual
+            .all_close(&expected, Some(2e-3), Some(2e-3), None, &stream)
             .unwrap()
             .item::<bool>(&stream));
     }
