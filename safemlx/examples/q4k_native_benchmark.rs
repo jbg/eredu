@@ -9,12 +9,14 @@ use std::time::{Duration, Instant};
 use half::f16;
 use safemlx::{
     memory,
-    native_quantization::NativeQuantizedTensor,
+    native_quantization::{
+        native_selected_down_reduce, native_selected_gate_up, NativeQuantizedTensor,
+    },
     ops::{quantized_matmul_with_mode, QuantizationMode},
     transforms::eval,
     Array, Device, DeviceType, Dtype, Stream,
 };
-use safemlx_gguf::{ConvertedTensor, GgmlType, Reader, TensorInput, Writer};
+use safemlx_gguf::{convert_affine, Endian, GgmlType, Reader, TensorInput, Writer};
 
 fn q4k_block(seed: usize) -> Vec<u8> {
     let mut block = vec![0u8; 144];
@@ -38,6 +40,24 @@ fn q4k_matrix(rows: i32, columns: i32) -> Vec<u8> {
     raw
 }
 
+fn q5_1_matrix(matrices: i32, rows: i32, columns: i32) -> Vec<u8> {
+    let blocks = (matrices * rows * columns / 32) as usize;
+    let mut raw = Vec::with_capacity(blocks * 24);
+    for seed in 0..blocks {
+        raw.extend(f16::from_f32(0.015625).to_bits().to_le_bytes());
+        raw.extend(f16::from_f32(-0.125).to_bits().to_le_bytes());
+        for index in 0..20 {
+            raw.push(
+                (seed as u8)
+                    .wrapping_mul(31)
+                    .wrapping_add((index as u8).wrapping_mul(17))
+                    .wrapping_add(7),
+            );
+        }
+    }
+    raw
+}
+
 fn converted_affine(
     raw: &[u8],
     rows: i32,
@@ -57,11 +77,9 @@ fn converted_affine(
             }],
         )
         .unwrap();
-    let mut reader = Reader::new(std::io::Cursor::new(file)).unwrap();
+    let reader = Reader::new(std::io::Cursor::new(file)).unwrap();
     let descriptor = reader.tensors()[0].clone();
-    let ConvertedTensor::Affine(affine) = reader.read_tensor(&descriptor).unwrap() else {
-        panic!("Q4_K conversion did not return affine storage")
-    };
+    let affine = convert_affine(&descriptor, raw, Endian::Little).unwrap();
     let packed = affine.weights.len() * 4 + affine.scales.len() * 2 + affine.biases.len() * 2;
     let weights = Array::from_slice(
         &affine.weights,
@@ -96,6 +114,90 @@ fn converted_affine(
     .unwrap();
     eval([&weights, &scales, &biases]).unwrap();
     (weights, scales, biases, packed)
+}
+
+fn benchmark_selected_gate_up(stream: &Stream) {
+    let experts = 128;
+    let intermediate = 704;
+    let hidden = 2816;
+    let top_k = 8;
+    let raw = q4k_matrix(experts * 2 * intermediate, hidden);
+    let native =
+        NativeQuantizedTensor::from_q4k_bytes(&raw, &[experts, 2 * intermediate, hidden], stream)
+            .unwrap();
+    let gate = native.row_view(0, intermediate).unwrap();
+    let up = native.row_view(intermediate, intermediate).unwrap();
+    let input = Array::from_slice(
+        &(0..hidden)
+            .map(|index| (index as f32 % 41.0 - 20.0) / 21.0)
+            .collect::<Vec<_>>(),
+        &[1, hidden],
+    )
+    .copy(stream)
+    .unwrap();
+    let ids = Array::from_slice(&[127i32, 3, 88, 3, 41, 9, 76, 1], &[top_k])
+        .copy(stream)
+        .unwrap();
+    let elapsed = time_average(20, stream, || {
+        native_selected_gate_up(&input, &gate, &up, &ids, stream).unwrap()
+    });
+    let selected_bytes = raw.len() / experts as usize * top_k as usize;
+    println!(
+        "selected gate/up experts={experts} top_k={top_k} hidden={hidden} intermediate={intermediate}: {:.3} ms, {:.1} GB/s, selected_bytes={selected_bytes}",
+        elapsed.as_secs_f64() * 1e3,
+        selected_bytes as f64 / elapsed.as_secs_f64() / 1e9,
+    );
+
+    let gate_raw = q4k_matrix(experts * intermediate, hidden);
+    let up_raw = q4k_matrix(experts * intermediate, hidden);
+    let gate =
+        NativeQuantizedTensor::from_q4k_bytes(&gate_raw, &[experts, intermediate, hidden], stream)
+            .unwrap();
+    let up =
+        NativeQuantizedTensor::from_q4k_bytes(&up_raw, &[experts, intermediate, hidden], stream)
+            .unwrap();
+    let elapsed = time_average(20, stream, || {
+        native_selected_gate_up(&input, &gate, &up, &ids, stream).unwrap()
+    });
+    println!(
+        "selected separate gate/up experts={experts} top_k={top_k} hidden={hidden} intermediate={intermediate}: {:.3} ms, {:.1} GB/s, selected_bytes={selected_bytes}",
+        elapsed.as_secs_f64() * 1e3,
+        selected_bytes as f64 / elapsed.as_secs_f64() / 1e9,
+    );
+}
+
+fn benchmark_selected_down_reduce(stream: &Stream) {
+    let experts = 128;
+    let intermediate = 704;
+    let hidden = 2816;
+    let top_k = 8;
+    let raw = q5_1_matrix(experts, hidden, intermediate);
+    let native =
+        NativeQuantizedTensor::from_q5_1_bytes(&raw, &[experts, hidden, intermediate], stream)
+            .unwrap();
+    let activated = Array::from_slice(
+        &(0..top_k * intermediate)
+            .map(|index| (index as f32 % 41.0 - 20.0) / 210.0)
+            .collect::<Vec<_>>(),
+        &[top_k, intermediate],
+    )
+    .copy(stream)
+    .unwrap();
+    let ids = Array::from_slice(&[127i32, 3, 88, 3, 41, 9, 76, 1], &[top_k])
+        .copy(stream)
+        .unwrap();
+    let weights = Array::from_slice(&[0.2f32, 0.1, 0.15, 0.05, 0.1, 0.1, 0.2, 0.1], &[top_k])
+        .copy(stream)
+        .unwrap();
+    let elapsed = time_average(30, stream, || {
+        native_selected_down_reduce(&activated, &native, &ids, &weights, stream).unwrap()
+    });
+    let selected_bytes = raw.len() / experts as usize * top_k as usize;
+    println!(
+        "selected Q5_1 down/reduce experts={experts} top_k={top_k} hidden={hidden} intermediate={intermediate}: {:.3} ms, {:.1} GB/s, selected_bytes={selected_bytes}",
+        elapsed.as_secs_f64() * 1e3,
+        selected_bytes as f64 / elapsed.as_secs_f64() / 1e9,
+    );
 }
 
 fn time_average(
@@ -204,6 +306,8 @@ fn main() {
     ] {
         benchmark_shape(rows, columns, batch, iterations, &stream);
     }
+    benchmark_selected_gate_up(&stream);
+    benchmark_selected_down_reduce(&stream);
     stream.synchronize().unwrap();
     println!(
         "mlx_active_bytes={} mlx_peak_bytes={}",

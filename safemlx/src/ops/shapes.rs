@@ -9,6 +9,11 @@ use crate::{
 };
 
 impl Array {
+    /// Materializes this array with contiguous physical storage.
+    pub fn contiguous(&self, allow_col_major: bool, stream: impl AsRef<Stream>) -> Result<Array> {
+        contiguous(self, allow_col_major, stream)
+    }
+
     /// See [`expand_dims()`].
     pub fn expand_dims(&self, axis: i32, stream: impl AsRef<Stream>) -> Result<Array> {
         expand_dims(self, axis, stream)
@@ -109,6 +114,28 @@ impl Array {
     pub fn transpose(&self, stream: impl AsRef<Stream>) -> Result<Array> {
         transpose(self, stream)
     }
+}
+
+/// Materializes an array with contiguous physical storage.
+///
+/// When `allow_col_major` is false, the result is guaranteed to use row-major
+/// strides. This is useful for long-lived weights derived through gather or
+/// transpose operations: the layout conversion is paid once instead of being
+/// repeated by every kernel that requires row-contiguous inputs.
+#[generate_macro]
+pub fn contiguous(
+    a: impl AsRef<Array>,
+    allow_col_major: bool,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        safemlx_sys::mlx_contiguous(
+            res,
+            a.as_ref().as_ptr(),
+            allow_col_major,
+            stream.as_ref().as_ptr(),
+        )
+    })
 }
 
 fn resolve_strides(

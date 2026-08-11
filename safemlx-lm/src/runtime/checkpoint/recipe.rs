@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use safemlx::{
-    ops::{concatenate_axis, stack_axis},
+    ops::{concatenate_axis, contiguous, stack_axis},
     transforms::async_eval_with_event,
     Array, Dtype, Stream,
 };
@@ -536,6 +536,11 @@ impl DerivedWeightRecipe {
         self.infer(store)?;
         let mut sources = Vec::new();
         let output = self.materialize_inner(store, source_stream, &mut sources, borrow_sources)?;
+        // Derived recipe outputs are immutable and may be reused across forwards.
+        // Detach gathers/transposes into their final row-major representation
+        // once here so consumers do not silently repack a full weight on every
+        // kernel invocation.
+        let output = contiguous(output, false, source_stream)?;
         Ok(PendingWeightRecipe { output, sources })
     }
 
@@ -2050,6 +2055,23 @@ mod tests {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let output = recipe.materialize(store.as_ref(), &stream).unwrap();
         assert_eq!(output.evaluated().unwrap().as_slice::<i32>(), &[2]);
+    }
+
+    #[test]
+    fn materialized_recipe_selection_has_row_major_storage() {
+        let (_dir, store) = fixture();
+        let recipe = DerivedWeightRecipe::Select {
+            input: Box::new(source("cube")),
+            selection: TensorSelection::Indices {
+                axis: 1,
+                indices: vec![1, 0],
+            },
+        };
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let output = recipe.materialize(store.as_ref(), &stream).unwrap();
+        assert_eq!(output.shape(), &[2, 2, 2]);
+        assert_eq!(output.strides(), &[4, 2, 1]);
+        output.evaluated().unwrap();
     }
 
     #[test]
