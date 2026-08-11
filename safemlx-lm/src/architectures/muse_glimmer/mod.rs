@@ -749,8 +749,9 @@ impl Attention {
             stream,
         )?;
 
-        // The official GGUF conversion synthesizes unit Q/K RMSNorm scales.
-        // Safetensors remains weightless and must not invent parameters.
+        // The official GGUF conversion synthesizes Q/K RMSNorm weights: the
+        // query weight absorbs qk_scale_factor and the key weight is unity.
+        // Safetensors remains weightless and applies the query scale below.
         let q_norm = matches!(args.weight_convention, WeightConvention::Gguf)
             .then(|| nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream))
             .transpose()?;
@@ -793,12 +794,12 @@ impl Attention {
     fn normalize_query(&mut self, value: Array, stream: &Stream) -> Result<Array, Exception> {
         let dtype = value.dtype();
         let value = match self.q_norm.as_mut() {
+            // GGUF's synthesized Q-norm weight already owns qk_scale_factor.
             Some(norm) => norm.forward(&value, stream)?,
-            None => rms_norm_without_scale(&value, self.qk_norm_eps, stream)?,
+            None => rms_norm_without_scale(&value, self.qk_norm_eps, stream)?
+                .multiply(Array::from_f32(self.qk_scale_factor), stream)?,
         };
-        value
-            .multiply(Array::from_f32(self.qk_scale_factor), stream)?
-            .as_dtype(dtype, stream)
+        value.as_dtype(dtype, stream)
     }
 
     fn normalize_key(&mut self, value: Array, stream: &Stream) -> Result<Array, Exception> {
@@ -4139,6 +4140,40 @@ mod tests {
                     "rotary coordinate mismatch at {offset}+{hf_index}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gguf_folded_query_scale_matches_safetensors_runtime_scale() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let hf_args = config_from_hf_value(&tiny_config()).unwrap();
+        let mut gguf_args = hf_args.clone();
+        gguf_args.weight_convention = WeightConvention::Gguf;
+
+        let mut hf_attention = Attention::new_for_layer(&hf_args, 0, stream).unwrap();
+        let mut gguf_attention = Attention::new_for_layer(&gguf_args, 0, stream).unwrap();
+        *gguf_attention.q_norm.as_mut().unwrap().weight.as_mut() = Array::from_slice(
+            &vec![gguf_args.qk_scale_factor; gguf_args.head_dim as usize],
+            &[gguf_args.head_dim],
+        );
+
+        let query = Array::from_slice(
+            &[0.25_f32, -0.5, 1.25, 2.0, -1.0, 0.75, 0.5, -0.25],
+            &[1, 2, 1, 4],
+        );
+        let hf = hf_attention.normalize_query(query.clone(), stream).unwrap();
+        let gguf = gguf_attention.normalize_query(query, stream).unwrap();
+        safemlx::transforms::eval([&hf, &gguf]).unwrap();
+
+        let hf_evaluated = hf.evaluated().unwrap();
+        let gguf_evaluated = gguf.evaluated().unwrap();
+        for (hf, gguf) in hf_evaluated
+            .as_slice::<f32>()
+            .iter()
+            .zip(gguf_evaluated.as_slice::<f32>())
+        {
+            assert!((hf - gguf).abs() < 1e-5, "{hf} != {gguf}");
         }
     }
 
