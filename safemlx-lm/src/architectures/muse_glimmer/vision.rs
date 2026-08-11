@@ -359,7 +359,8 @@ impl CenteredLayerNorm {
                 stream,
             )?
             .multiply(&*self.weight, stream)?
-            .add(&*self.bias, stream)
+            .add(&*self.bias, stream)?
+            .as_dtype(input.dtype(), stream)
     }
 }
 
@@ -1107,9 +1108,5 @@ fn pixel_shuffle(
 }
 
 fn weightless_rms_norm(hidden: &Array, eps: f32, stream: &Stream) -> Result<Array, Exception> {
-    let variance = mean_axis(&hidden.square(stream)?, -1, true, stream)?;
-    hidden.multiply(
-        rsqrt(variance.add(Array::from_f32(eps), stream)?, stream)?,
-        stream,
-    )
+    super::rms_norm_without_scale(hidden, eps, stream)
 }

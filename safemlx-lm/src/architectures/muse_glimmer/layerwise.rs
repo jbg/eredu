@@ -744,14 +744,7 @@ pub(crate) struct DFlashTargetOutput {
 }
 
 fn weightless_rms(value: &Array, eps: f32, stream: &Stream) -> Result<Array, Exception> {
-    value.multiply(
-        safemlx::ops::rsqrt(
-            safemlx::ops::mean_axis(&value.square(stream)?, -1, true, stream)?
-                .add(Array::from_f32(eps), stream)?,
-            stream,
-        )?,
-        stream,
-    )
+    resident::rms_norm_without_scale(value, eps, stream)
 }
 
 fn forward_sparse_with_executor<C, F>(

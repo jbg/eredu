@@ -575,11 +575,16 @@ pub(crate) fn rms_norm_without_scale(
     eps: f32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    let dtype = x.dtype();
     let variance = mean_axis(&x.square(stream)?, -1, true, stream)?;
     x.multiply(
         rsqrt(variance.add(Array::from_f32(eps), stream)?, stream)?,
         stream,
-    )
+    )?
+    // The release implementation accumulates RMSNorm in float32, then
+    // returns to the input dtype. Keeping the promoted value here turns every
+    // following BF16 projection into an FP32 GEMV/GEMM.
+    .as_dtype(dtype, stream)
 }
 
 fn forward_layer_norm(
@@ -588,11 +593,15 @@ fn forward_layer_norm(
     x: &Array,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    if !centered {
-        return norm.forward(x, stream);
-    }
-    let scale = norm.weight.as_ref().add(Array::from_f32(1.0), stream)?;
-    safemlx::fast::rms_norm(x, &scale, norm.eps, stream)
+    let output = if centered {
+        let scale = norm.weight.as_ref().add(Array::from_f32(1.0), stream)?;
+        safemlx::fast::rms_norm(x, &scale, norm.eps, stream)?
+    } else {
+        norm.forward(x, stream)?
+    };
+    // Transformers' MuseGlimmerTextCenteredRMSNorm explicitly applies
+    // type_as(x) after its float32 norm/scale calculation.
+    output.as_dtype(x.dtype(), stream)
 }
 
 pub(crate) fn scale_logits(
@@ -772,11 +781,14 @@ impl Attention {
     }
 
     fn normalize_query(&mut self, value: Array, stream: &Stream) -> Result<Array, Exception> {
+        let dtype = value.dtype();
         let value = match self.q_norm.as_mut() {
             Some(norm) => norm.forward(&value, stream)?,
             None => rms_norm_without_scale(&value, self.qk_norm_eps, stream)?,
         };
-        value.multiply(Array::from_f32(self.qk_scale_factor), stream)
+        value
+            .multiply(Array::from_f32(self.qk_scale_factor), stream)?
+            .as_dtype(dtype, stream)
     }
 
     fn normalize_key(&mut self, value: Array, stream: &Stream) -> Result<Array, Exception> {
@@ -4142,6 +4154,63 @@ mod tests {
         {
             assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn bfloat16_norms_preserve_activation_dtype() {
+        use half::bf16;
+
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let input = Array::from_slice(
+            &[
+                bf16::from_f32(1.0),
+                bf16::from_f32(-2.0),
+                bf16::from_f32(3.0),
+                bf16::from_f32(-4.0),
+            ],
+            &[1, 1, 4],
+        );
+
+        let weightless = rms_norm_without_scale(&input, 1e-6, stream).unwrap();
+        assert_eq!(weightless.dtype(), Dtype::Bfloat16);
+
+        let mut centered = nn::RmsNorm::new(4).unwrap();
+        centered.eps = 1e-6;
+        *centered.weight.as_mut() = Array::from_slice(&[bf16::from_f32(0.0); 4], &[4]);
+        let centered = forward_layer_norm(&mut centered, true, &input, stream).unwrap();
+        assert_eq!(centered.dtype(), Dtype::Bfloat16);
+    }
+
+    #[test]
+    fn bfloat16_block_preserves_activation_dtype() {
+        use half::bf16;
+
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let args = config_from_hf_value(&tiny_config()).unwrap();
+        let mut block = TransformerBlock::new_for_layer(&args, 0, stream).unwrap();
+        for parameter in block.parameters_mut().flatten().values_mut() {
+            let shape = parameter.shape().to_vec();
+            **parameter = Array::from_slice(&vec![bf16::from_f32(1.0); parameter.size()], &shape);
+        }
+        let input = Array::from_slice(
+            &(0..args.hidden_size)
+                .map(|index| bf16::from_f32((index as f32 - 11.0) / 7.0))
+                .collect::<Vec<_>>(),
+            &[1, 1, args.hidden_size],
+        );
+        let output = block
+            .forward(
+                AttentionInput::<ConcatKeyValueCache> {
+                    x: &input,
+                    mask: None,
+                    cache: None,
+                },
+                stream,
+            )
+            .unwrap();
+        assert_eq!(output.dtype(), Dtype::Bfloat16);
     }
 }
 
