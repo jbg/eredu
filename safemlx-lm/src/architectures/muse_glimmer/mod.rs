@@ -3620,7 +3620,7 @@ pub(crate) fn config_from_gguf_catalog(
         .map(|policy| policy.window().is_some())
         .collect::<Vec<_>>();
     let args = DecoderConfig {
-        model_type: "muse_glimmer".to_string(),
+        model_type: "muse_glimmer_text".to_string(),
         hidden_size,
         num_hidden_layers,
         intermediate_size: if is_moe {
@@ -4020,6 +4020,74 @@ mod tests {
                 .get(&std::num::NonZeroU32::new(16).unwrap()),
             Some(&3)
         );
+    }
+
+    #[test]
+    fn parses_gguf_as_text_decoder_config() {
+        let arrays = HashMap::<String, Array>::new();
+        let metadata = HashMap::from([
+            (
+                "muse-glimmer.embedding_length".into(),
+                GgufMetadataValue::Uint32(24),
+            ),
+            (
+                "muse-glimmer.block_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "muse-glimmer.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(48),
+            ),
+            (
+                "muse-glimmer.attention.head_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "muse-glimmer.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "muse-glimmer.attention.key_length".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "muse-glimmer.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-5),
+            ),
+            (
+                "muse-glimmer.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            (
+                "muse-glimmer.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(16),
+            ),
+            (
+                "muse-glimmer.attention.sliding_window_pattern".into(),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![
+                    true, true, true, false,
+                ])),
+            ),
+            (
+                "muse-glimmer.logit_scale".into(),
+                GgufMetadataValue::Float32(0.19611613),
+            ),
+            (
+                "muse-glimmer.final_logit_softcapping".into(),
+                GgufMetadataValue::Float32(20.0),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::String(vec![
+                    "token"
+                        .into();
+                    32
+                ])),
+            ),
+        ]);
+
+        let args = config_from_gguf_catalog(&arrays, &metadata, "muse-glimmer", false).unwrap();
+        assert_eq!(args.model_type, "muse_glimmer_text");
     }
 
     #[test]
