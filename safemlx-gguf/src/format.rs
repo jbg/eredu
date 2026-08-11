@@ -385,6 +385,15 @@ impl GgmlType {
                 | Self::IQ1M
         )
     }
+
+    /// Whether safemlx has a checkpoint-native execution backend for this
+    /// block encoding.
+    ///
+    /// These formats remain packed when converted instead of being expanded
+    /// into the generic affine weight/scales/biases representation.
+    pub fn has_native_execution(self) -> bool {
+        matches!(self, Self::Q4K | Self::Q5_1 | Self::Q8_0) || self.is_iq()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

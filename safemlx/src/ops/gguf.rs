@@ -122,7 +122,7 @@ impl GgufAffineTensor {
     }
 }
 
-/// One checkpoint-native nonlinear GGML IQ tensor.
+/// One checkpoint-native GGML block tensor.
 #[derive(Debug)]
 pub struct GgufIQuantTensor {
     physical_name: String,

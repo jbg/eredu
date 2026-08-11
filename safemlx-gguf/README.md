@@ -3,7 +3,7 @@
 `safemlx-gguf` is safemlx's framework-independent, pure-Rust GGUF backend. It
 parses GGUF v1-v3 in either byte order, exposes typed metadata and validated
 tensor descriptors, reads one payload at a time, converts affine-compatible
-GGML blocks, retains nonlinear IQ blocks explicitly, and writes
+GGML blocks, retains native-executable quantization blocks explicitly, and writes
 deterministic seekable GGUF files.
 `Checkpoint` discovers canonical shards, validates the complete descriptor
 set, exposes converted logical tensor layouts without reading payload bytes, and

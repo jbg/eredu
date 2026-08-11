@@ -93,9 +93,12 @@ pub enum NativeQuantizationFormat {
 }
 
 impl NativeQuantizationFormat {
-    /// Maps a canonical GGML IQ type to native execution metadata.
+    /// Maps a native-executable GGML type to its execution metadata.
     pub fn from_ggml_type(ty: GgmlType) -> Option<Self> {
         Some(match ty {
+            GgmlType::Q4K => Self::GgufQ4K,
+            GgmlType::Q5_1 => Self::GgufQ5_1,
+            GgmlType::Q8_0 => Self::GgufQ8_0,
             GgmlType::IQ2XXS => Self::GgufIQ2XXS,
             GgmlType::IQ2XS => Self::GgufIQ2XS,
             GgmlType::IQ3XXS => Self::GgufIQ3XXS,
@@ -109,9 +112,12 @@ impl NativeQuantizationFormat {
         })
     }
 
-    /// Returns the GGML type for an IQ format.
+    /// Returns the GGML type for this native format.
     pub fn ggml_type(self) -> Option<GgmlType> {
         Some(match self {
+            Self::GgufQ4K => GgmlType::Q4K,
+            Self::GgufQ5_1 => GgmlType::Q5_1,
+            Self::GgufQ8_0 => GgmlType::Q8_0,
             Self::GgufIQ2XXS => GgmlType::IQ2XXS,
             Self::GgufIQ2XS => GgmlType::IQ2XS,
             Self::GgufIQ3XXS => GgmlType::IQ3XXS,
@@ -121,7 +127,6 @@ impl NativeQuantizationFormat {
             Self::GgufIQ2S => GgmlType::IQ2S,
             Self::GgufIQ4XS => GgmlType::IQ4XS,
             Self::GgufIQ1M => GgmlType::IQ1M,
-            _ => return None,
         })
     }
 
@@ -377,7 +382,7 @@ impl NativeQuantizedTensor {
         )
     }
 
-    /// Retains an already materialized MLX byte array as an IQ tensor.
+    /// Retains an already materialized MLX byte array in native GGML blocks.
     pub fn from_iq_array(
         bytes: Array,
         shape: &[i32],
@@ -385,7 +390,7 @@ impl NativeQuantizedTensor {
         endian: GgufEndian,
     ) -> Result<Self, Exception> {
         let format = NativeQuantizationFormat::from_ggml_type(ty)
-            .ok_or_else(|| Exception::custom(format!("{ty:?} is not an IQ encoding")))?;
+            .ok_or_else(|| Exception::custom(format!("{ty:?} has no native execution support")))?;
         let (block_values, block_bytes) = format.block_geometry();
         Self::from_native_array(bytes, shape, format, block_values, block_bytes, endian)
     }
@@ -2629,25 +2634,8 @@ mod tests {
             data_offset: 0,
             byte_len: 144,
         };
-        let mut file = Vec::new();
-        safemlx_gguf::Writer::default()
-            .write(
-                std::io::Cursor::new(&mut file),
-                &std::collections::BTreeMap::new(),
-                &[safemlx_gguf::TensorInput {
-                    name: &descriptor.name,
-                    dimensions: &descriptor.dimensions,
-                    ggml_type: descriptor.ggml_type,
-                    data: &raw,
-                }],
-            )
-            .unwrap();
-        let mut reader = safemlx_gguf::Reader::new(std::io::Cursor::new(file)).unwrap();
-        let desc = reader.tensors()[0].clone();
-        let safemlx_gguf::ConvertedTensor::Affine(reference) = reader.read_tensor(&desc).unwrap()
-        else {
-            panic!("expected affine reference")
-        };
+        let reference =
+            safemlx_gguf::convert_affine(&descriptor, &raw, safemlx_gguf::Endian::Little).unwrap();
         let expected = reference.dequantize();
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(expected) {
@@ -2724,26 +2712,16 @@ mod tests {
         let actual = native.dequantize(&stream).unwrap();
         let actual = actual.evaluated().unwrap();
 
-        let mut file = Vec::new();
-        safemlx_gguf::Writer::default()
-            .write(
-                std::io::Cursor::new(&mut file),
-                &std::collections::BTreeMap::new(),
-                &[safemlx_gguf::TensorInput {
-                    name: "test.weight",
-                    dimensions: &[32, 1],
-                    ggml_type: safemlx_gguf::GgmlType::Q5_1,
-                    data: &raw,
-                }],
-            )
-            .unwrap();
-        let mut reader = safemlx_gguf::Reader::new(std::io::Cursor::new(file)).unwrap();
-        let descriptor = reader.tensors()[0].clone();
-        let safemlx_gguf::ConvertedTensor::Affine(reference) =
-            reader.read_tensor(&descriptor).unwrap()
-        else {
-            panic!("expected affine reference")
+        let descriptor = safemlx_gguf::TensorDescriptor {
+            name: "test.weight".into(),
+            dimensions: vec![32, 1],
+            ggml_type: safemlx_gguf::GgmlType::Q5_1,
+            relative_offset: 0,
+            data_offset: 0,
+            byte_len: raw.len() as u64,
         };
+        let reference =
+            safemlx_gguf::convert_affine(&descriptor, &raw, safemlx_gguf::Endian::Little).unwrap();
         for (actual, expected) in actual.as_slice::<f32>().iter().zip(reference.dequantize()) {
             assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
         }
@@ -2824,26 +2802,16 @@ mod tests {
         let actual = native.dequantize(&stream).unwrap();
         let actual = actual.evaluated().unwrap();
 
-        let mut file = Vec::new();
-        safemlx_gguf::Writer::default()
-            .write(
-                std::io::Cursor::new(&mut file),
-                &std::collections::BTreeMap::new(),
-                &[safemlx_gguf::TensorInput {
-                    name: "test.weight",
-                    dimensions: &[32, 2],
-                    ggml_type: safemlx_gguf::GgmlType::Q8_0,
-                    data: &raw,
-                }],
-            )
-            .unwrap();
-        let mut reader = safemlx_gguf::Reader::new(std::io::Cursor::new(file)).unwrap();
-        let descriptor = reader.tensors()[0].clone();
-        let safemlx_gguf::ConvertedTensor::Affine(reference) =
-            reader.read_tensor(&descriptor).unwrap()
-        else {
-            panic!("expected affine reference")
+        let descriptor = safemlx_gguf::TensorDescriptor {
+            name: "test.weight".into(),
+            dimensions: vec![32, 2],
+            ggml_type: safemlx_gguf::GgmlType::Q8_0,
+            relative_offset: 0,
+            data_offset: 0,
+            byte_len: raw.len() as u64,
         };
+        let reference =
+            safemlx_gguf::convert_affine(&descriptor, &raw, safemlx_gguf::Endian::Little).unwrap();
         for (actual, expected) in actual.as_slice::<f32>().iter().zip(reference.dequantize()) {
             assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
         }

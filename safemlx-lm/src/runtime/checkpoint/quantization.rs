@@ -149,9 +149,9 @@ pub enum WeightQuantization {
     Affine(AffineQuantization),
     /// Microscaling FP4 with E2M1 values and E8M0 scales.
     MxFp4,
-    /// Checkpoint-native nonlinear GGML IQ blocks.
+    /// Checkpoint-native GGML quantization blocks.
     GgufIQuant {
-        /// Canonical IQ tensor encoding.
+        /// Native-executable GGML tensor encoding.
         ggml_type: GgufType,
         /// Byte order declared by the containing GGUF file.
         endian: GgufEndian,
@@ -170,7 +170,7 @@ impl WeightQuantization {
             Self::Affine(config) => config.group_size,
             Self::MxFp4 => Self::MXFP4_GROUP_SIZE,
             Self::GgufIQuant { ggml_type, .. } => {
-                ggml_type.block_and_bytes().expect("canonical IQ type").0 as i32
+                ggml_type.block_and_bytes().expect("native GGML type").0 as i32
             }
         }
     }
@@ -181,7 +181,7 @@ impl WeightQuantization {
             Self::Affine(config) => config.bits,
             Self::MxFp4 => Self::MXFP4_BITS,
             Self::GgufIQuant { ggml_type, .. } => {
-                ggml_type.block_and_bytes().expect("canonical IQ type").1 as i32
+                ggml_type.block_and_bytes().expect("native GGML type").1 as i32
             }
         }
     }
@@ -192,7 +192,7 @@ impl WeightQuantization {
             Self::Affine(_) => ops::QuantizationMode::Affine,
             Self::MxFp4 => ops::QuantizationMode::MxFp4,
             Self::GgufIQuant { .. } => {
-                panic!("GGML IQ executes through checkpoint-native kernels")
+                panic!("native GGML blocks execute through checkpoint-native kernels")
             }
         }
     }
@@ -212,14 +212,14 @@ impl WeightQuantization {
                     .map(|_| ())
                     .ok_or_else(|| {
                         Error::Quantization(format!(
-                            "{ggml_type:?} is not a canonical GGML IQ encoding"
+                            "{ggml_type:?} has no checkpoint-native execution support"
                         ))
                     })
             }
         }
     }
 
-    /// Returns checkpoint-native IQ metadata when present.
+    /// Returns checkpoint-native GGML block metadata when present.
     pub const fn gguf_iquant(self) -> Option<(GgufType, GgufEndian)> {
         match self {
             Self::GgufIQuant { ggml_type, endian } => Some((ggml_type, endian)),

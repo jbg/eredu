@@ -3321,6 +3321,35 @@ mod tests {
     }
 
     #[test]
+    fn native_affine_store_bytes_equal_checkpoint_payload_bytes() {
+        for ty in [GgmlType::Q4K, GgmlType::Q5_1, GgmlType::Q8_0] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("model.gguf");
+            let (block_values, block_bytes) = ty.block_and_bytes().unwrap();
+            let payload = vec![0; (2 * block_bytes) as usize];
+            Writer::default()
+                .write(
+                    std::fs::File::create(&path).unwrap(),
+                    &BTreeMap::new(),
+                    &[TensorInput {
+                        name: "bank.weight",
+                        dimensions: &[block_values, 2],
+                        ggml_type: ty,
+                        data: &payload,
+                    }],
+                )
+                .unwrap();
+            let store =
+                GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), str::to_string).unwrap();
+            let metadata = store.metadata("bank.weight").unwrap();
+            assert_eq!(metadata.shape, [2, block_bytes as usize], "{ty:?}");
+            assert_eq!(metadata.stored_dtype, StoredDtype::U8, "{ty:?}");
+            assert_eq!(metadata.logical_byte_len, payload.len(), "{ty:?}");
+            assert_eq!(store.keys(), ["bank.weight"], "{ty:?}");
+        }
+    }
+
+    #[test]
     fn gguf_dense_contiguous_span_reads_only_the_reshaped_interval() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");

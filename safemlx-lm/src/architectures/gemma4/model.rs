@@ -71,8 +71,8 @@ use crate::{
     },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
-        load_safetensors_quantized_strict, load_safetensors_strict, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
+        load_named_iq_array_strict, load_safetensors_quantized_strict, load_safetensors_strict,
+        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::ActivationObserver,
@@ -4930,15 +4930,22 @@ fn load_gemma4_gguf_weights(
                 continue;
             }
         }
-        for (name, value) in materializer.converted_tensor(physical_name)?.into_arrays() {
-            load_named_array_strict(
-                model,
-                translate_gguf_weight_name(&name),
-                value,
-                quantization.map(|value| (value, stream)),
-                config,
-                report,
-            )?;
+        let converted = materializer.converted_tensor(physical_name)?;
+        let native_blocks = matches!(&converted, safemlx::ops::GgufTensor::IQuant(_));
+        for (name, value) in converted.into_arrays() {
+            let name = translate_gguf_weight_name(&name);
+            if native_blocks {
+                load_named_iq_array_strict(model, name, value, config, report);
+            } else {
+                load_named_array_strict(
+                    model,
+                    name,
+                    value,
+                    quantization.map(|value| (value, stream)),
+                    config,
+                    report,
+                )?;
+            }
         }
     }
 
@@ -5066,7 +5073,11 @@ fn attach_native_linear(
         return Ok(false);
     };
     let expected_output = linear.inner.weight.dim(0);
-    let expected_input = linear.scales.dim(1) * linear.group_size;
+    let expected_input = if linear.native_format.is_some() {
+        linear.native_columns
+    } else {
+        linear.scales.dim(1) * linear.group_size
+    };
     if native.shape() != [expected_output, expected_input] {
         return Err(Error::UnsupportedArchitecture(format!(
             "native tensor {target:?} has shape {:?}; expected [{expected_output}, {expected_input}]",
@@ -5092,7 +5103,7 @@ fn attach_native_expert_projection(
     native: NativeQuantizedTensor,
     report: &mut StrictLoadReport,
 ) -> Result<bool, Error> {
-    if projection.quantization.is_none() {
+    if projection.quantization.is_none() && projection.iquant.is_none() {
         return Ok(false);
     }
     let expected = [

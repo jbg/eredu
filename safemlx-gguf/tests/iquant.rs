@@ -17,6 +17,21 @@ const IQ_TYPES: [GgmlType; 9] = [
     GgmlType::IQ1M,
 ];
 
+const NATIVE_TYPES: [GgmlType; 12] = [
+    GgmlType::Q4K,
+    GgmlType::Q5_1,
+    GgmlType::Q8_0,
+    GgmlType::IQ2XXS,
+    GgmlType::IQ2XS,
+    GgmlType::IQ3XXS,
+    GgmlType::IQ1S,
+    GgmlType::IQ4NL,
+    GgmlType::IQ3S,
+    GgmlType::IQ2S,
+    GgmlType::IQ4XS,
+    GgmlType::IQ1M,
+];
+
 fn unhex(value: &str) -> Vec<u8> {
     value
         .as_bytes()
@@ -126,6 +141,20 @@ fn zero_blocks_have_no_nonzero_decoded_values() {
 }
 
 #[test]
+fn native_affine_blocks_remain_packed_and_support_portable_dequantization() {
+    for ty in [GgmlType::Q4K, GgmlType::Q5_1, GgmlType::Q8_0] {
+        let (_, bytes) = ty.block_and_bytes().unwrap();
+        let decoded = converted(ty, 1, &vec![0; bytes as usize], Endian::Little);
+        assert!(
+            decoded.chunks_exact(2).all(|pair| {
+                half::f16::from_bits(u16::from_ne_bytes(pair.try_into().unwrap())).to_f32() == 0.0
+            }),
+            "{ty:?}"
+        );
+    }
+}
+
+#[test]
 fn iq_multibyte_fields_obey_declared_gguf_byte_order() {
     let mut little = vec![0xff; 18];
     little[..2].copy_from_slice(&half::f16::from_f32(-0.75).to_bits().to_le_bytes());
@@ -151,8 +180,8 @@ fn iq_multibyte_fields_obey_declared_gguf_byte_order() {
 }
 
 #[test]
-fn writer_preserves_every_iq_payload_byte_for_byte() {
-    for ty in IQ_TYPES {
+fn writer_preserves_every_native_payload_byte_for_byte() {
+    for ty in NATIVE_TYPES {
         let (block, bytes) = ty.block_and_bytes().unwrap();
         let raw = (0..bytes)
             .map(|index| (index * 37 + 11) as u8)
@@ -178,22 +207,22 @@ fn writer_preserves_every_iq_payload_byte_for_byte() {
 }
 
 #[test]
-fn catalog_exposes_iq_as_one_packed_u8_logical_tensor() {
+fn catalog_exposes_native_formats_as_one_packed_u8_logical_tensor() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("catalog.gguf");
-    let payloads = IQ_TYPES
+    let payloads = NATIVE_TYPES
         .iter()
         .map(|ty| vec![0; ty.block_and_bytes().unwrap().1 as usize])
         .collect::<Vec<_>>();
-    let dimensions = IQ_TYPES
+    let dimensions = NATIVE_TYPES
         .iter()
         .map(|ty| [ty.block_and_bytes().unwrap().0])
         .collect::<Vec<_>>();
-    let names = IQ_TYPES
+    let names = NATIVE_TYPES
         .iter()
         .map(|ty| format!("{ty:?}.weight"))
         .collect::<Vec<_>>();
-    let inputs = IQ_TYPES
+    let inputs = NATIVE_TYPES
         .iter()
         .enumerate()
         .map(|(index, ty)| TensorInput {
@@ -212,7 +241,7 @@ fn catalog_exposes_iq_as_one_packed_u8_logical_tensor() {
         .unwrap();
     let checkpoint = Checkpoint::open(path).unwrap();
     for tensor in checkpoint.tensors() {
-        assert!(tensor.descriptor().ggml_type.is_iq());
+        assert!(tensor.descriptor().ggml_type.has_native_execution());
         assert_eq!(tensor.affine(), None);
         assert_eq!(tensor.outputs().len(), 1);
         assert_eq!(tensor.outputs()[0].name, tensor.descriptor().name);

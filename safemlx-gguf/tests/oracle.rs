@@ -1,4 +1,6 @@
-use safemlx_gguf::{ConvertedTensor, GgmlType, Reader, TensorInput, Writer};
+use safemlx_gguf::{
+    convert_affine, ConvertedTensor, Endian, GgmlType, Reader, TensorInput, Writer,
+};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -46,7 +48,11 @@ fn matches_patched_mlx_v032_oracle_byte_for_byte() {
             .unwrap();
         let mut reader = Reader::new(Cursor::new(encoded.into_inner())).unwrap();
         let desc = reader.tensors()[0].clone();
-        let converted = reader.read_tensor(&desc).unwrap();
+        let converted = if ty.has_native_execution() {
+            ConvertedTensor::Affine(convert_affine(&desc, &raw, Endian::Little).unwrap())
+        } else {
+            reader.read_tensor(&desc).unwrap()
+        };
         match converted {
             ConvertedTensor::Affine(a) => {
                 if matches!(ty, GgmlType::Q5_0 | GgmlType::Q5_1) {
@@ -158,12 +164,9 @@ fn read_q5(ty: GgmlType, blocks: &[Vec<u8>]) -> safemlx_gguf::AffineTensor {
             }],
         )
         .unwrap();
-    let mut reader = Reader::new(Cursor::new(file.into_inner())).unwrap();
+    let reader = Reader::new(Cursor::new(file.into_inner())).unwrap();
     let descriptor = reader.tensors()[0].clone();
-    let ConvertedTensor::Affine(affine) = reader.read_tensor(&descriptor).unwrap() else {
-        panic!("Q5 tensors must remain packed affine tensors");
-    };
-    affine
+    convert_affine(&descriptor, &raw, Endian::Little).unwrap()
 }
 
 fn unpack_codes(weights: &[u32], count: usize) -> Vec<u8> {
@@ -256,11 +259,9 @@ fn boundary_blocks_cover_zero_and_extreme_codes() {
                 }],
             )
             .unwrap();
-        let mut r = Reader::new(Cursor::new(file.into_inner())).unwrap();
+        let r = Reader::new(Cursor::new(file.into_inner())).unwrap();
         let d = r.tensors()[0].clone();
-        let ConvertedTensor::Affine(a) = r.read_tensor(&d).unwrap() else {
-            panic!()
-        };
+        let a = convert_affine(&d, &raw, Endian::Little).unwrap();
         assert!(a.weights.iter().all(|&w| w == word));
         assert_eq!(a.dequantize().len(), block as usize);
     }

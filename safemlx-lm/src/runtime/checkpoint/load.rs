@@ -7,6 +7,7 @@ use std::{
 use memmap2::MmapOptions;
 use safemlx::{
     module::{FlattenedModuleParamMut, ModuleParameters},
+    native_quantization::NativeQuantizationFormat,
     ops::{concatenate_axis, stack_axis, GgufCheckpoint, GgufMetadataValue, GgufTensor},
     transforms::async_eval_with_event,
     Array, Stream,
@@ -111,7 +112,7 @@ where
     Ok(configs)
 }
 
-/// Exact per-weight runtime formats for mixed affine and nonlinear GGUF files.
+/// Exact per-weight runtime formats for mixed affine and native-block GGUF files.
 pub(crate) fn gguf_quantization_configs<F>(
     checkpoint: &GgufCheckpoint,
     mut translate: F,
@@ -138,7 +139,9 @@ where
                 }
                 continue;
             }
-            if !descriptor.ggml_type.is_iq() {
+            if tensor.affine().is_some()
+                || NativeQuantizationFormat::from_ggml_type(descriptor.ggml_type).is_none()
+            {
                 continue;
             }
             let weight_name = translate(&descriptor.name);
@@ -177,7 +180,7 @@ where
             if is_iq {
                 if quantization.is_some() {
                     return Err(Error::Quantization(
-                        "requantizing checkpoint-native GGML IQ tensors on load is unsupported"
+                        "requantizing checkpoint-native GGML block tensors on load is unsupported"
                             .into(),
                     ));
                 }
@@ -573,8 +576,25 @@ pub(crate) fn load_array_strict(
             let expected_shape = param.shape().to_vec();
             let actual_shape = value.shape().to_vec();
             if expected_shape == actual_shape {
+                let checkpoint_native_blocks = value.dtype() == safemlx::Dtype::Uint8;
                 **param = value;
-                report.record_loaded(candidate);
+                report.record_loaded(candidate.clone());
+                if checkpoint_native_blocks {
+                    let prefix = candidate
+                        .strip_suffix(".inner.weight")
+                        .or_else(|| candidate.strip_suffix(".weight"));
+                    if let Some(prefix) = prefix {
+                        let scales = format!("{prefix}.scales");
+                        if params
+                            .get(scales.as_str())
+                            .is_some_and(|scales| scales.shape() == [1])
+                        {
+                            // Native-block modules retain a one-element unloaded
+                            // scale placeholder solely for parameter compatibility.
+                            report.record_loaded(scales);
+                        }
+                    }
+                }
             } else {
                 report.record_shape_mismatch(key, candidate, expected_shape, actual_shape);
             }
@@ -1249,7 +1269,7 @@ fn pack_split_relu2_expert_prefix(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1257,6 +1277,7 @@ mod tests {
         macros::ModuleParameters, module::Param, quantization::MaybeQuantized, Array, Device,
         DeviceType, Dtype, ExecutionContext,
     };
+    use safemlx_gguf::{Endian, GgmlType, TensorInput, Writer, WriterOptions};
 
     use crate::{
         nn::linear::unloaded_maybe_quantized_linear,
@@ -1266,9 +1287,84 @@ mod tests {
     };
 
     use super::{
-        load_arrays_quantized_strict, load_safetensors_quantized_strict,
+        gguf_quantization_configs, load_arrays_quantized_strict, load_safetensors_quantized_strict,
         parse_split_swiglu_expert_projection_key, StrictLoadConfig, StrictLoadReport,
     };
+
+    #[test]
+    fn gguf_runtime_configs_preserve_every_native_affine_format() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native.gguf");
+        let formats = [GgmlType::Q4K, GgmlType::Q5_1, GgmlType::Q8_0];
+        let names = formats
+            .iter()
+            .map(|format| format!("{format:?}.weight"))
+            .collect::<Vec<_>>();
+        let dimensions = formats
+            .iter()
+            .map(|format| [format.block_and_bytes().unwrap().0])
+            .collect::<Vec<_>>();
+        let payloads = formats
+            .iter()
+            .map(|format| vec![0; format.block_and_bytes().unwrap().1 as usize])
+            .collect::<Vec<_>>();
+        let tensors = formats
+            .iter()
+            .enumerate()
+            .map(|(index, format)| TensorInput {
+                name: &names[index],
+                dimensions: &dimensions[index],
+                ggml_type: *format,
+                data: &payloads[index],
+            })
+            .collect::<Vec<_>>();
+        Writer::default()
+            .write(
+                std::fs::File::create(&path).unwrap(),
+                &BTreeMap::new(),
+                &tensors,
+            )
+            .unwrap();
+
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(path).unwrap();
+        let configs = gguf_quantization_configs(&checkpoint, str::to_string).unwrap();
+        for (name, expected) in names.iter().zip(formats) {
+            assert!(matches!(
+                configs[name],
+                WeightQuantization::GgufIQuant { ggml_type, .. } if ggml_type == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn big_endian_native_affine_format_keeps_portable_runtime_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("big-endian.gguf");
+        let payload = vec![0; GgmlType::Q4K.block_and_bytes().unwrap().1 as usize];
+        Writer::new(WriterOptions {
+            endian: Endian::Big,
+            ..WriterOptions::default()
+        })
+        .unwrap()
+        .write(
+            std::fs::File::create(&path).unwrap(),
+            &BTreeMap::new(),
+            &[TensorInput {
+                name: "projection.weight",
+                dimensions: &[256],
+                ggml_type: GgmlType::Q4K,
+                data: &payload,
+            }],
+        )
+        .unwrap();
+
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(path).unwrap();
+        let configs = gguf_quantization_configs(&checkpoint, str::to_string).unwrap();
+        assert!(matches!(
+            configs["projection.weight"],
+            WeightQuantization::Affine(config) if config.group_size == 32 && config.bits == 4
+        ));
+    }
 
     #[test]
     fn parses_split_swiglu_expert_names() {

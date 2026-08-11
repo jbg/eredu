@@ -23,7 +23,7 @@ pub struct DenseTensor {
     pub data: Vec<u8>,
 }
 
-/// One nonlinear GGML IQ tensor retained in its checkpoint-native block layout.
+/// One GGML tensor retained in its checkpoint-native block layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IQuantTensor {
     pub shape: Vec<u64>,
@@ -38,10 +38,21 @@ impl IQuantTensor {
         iquant_packed_shape(&self.shape, self.ggml_type)
     }
 
-    /// Canonically dequantize the tensor for differential testing and generic
-    /// execution backends. Model loading does not call this method.
+    /// Canonically dequantize native GGML blocks for differential testing and
+    /// generic execution backends. Model loading does not call this method.
     pub fn dequantize_f32(&self) -> Result<Vec<f32>> {
-        crate::iquant::decode_f32(self.ggml_type, &self.data, self.endian)
+        if self.ggml_type.is_iq() {
+            return crate::iquant::decode_f32(self.ggml_type, &self.data, self.endian);
+        }
+        let descriptor = TensorDescriptor {
+            name: "<native blocks>".to_string(),
+            dimensions: self.shape.iter().rev().copied().collect(),
+            ggml_type: self.ggml_type,
+            relative_offset: 0,
+            data_offset: 0,
+            byte_len: self.data.len() as u64,
+        };
+        Ok(convert_affine(&descriptor, &self.data, self.endian)?.dequantize())
     }
 }
 
@@ -101,7 +112,7 @@ pub enum ConvertedTensor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConversionKind {
     Dense(DenseDtype),
-    /// Nonlinear IQ codebook blocks retained without conversion.
+    /// GGML blocks supported by checkpoint-native execution.
     IQuant,
     /// MXFP4 weights plus one E8M0 byte per 32-value group.
     MxFp4,
@@ -111,26 +122,33 @@ pub(crate) enum ConversionKind {
     },
 }
 
-pub(crate) fn conversion_kind(ty: GgmlType) -> Result<ConversionKind> {
+pub(crate) fn conversion_kind(ty: GgmlType, endian: Endian) -> Result<ConversionKind> {
     if let Some(dtype) = dense_dtype(ty) {
         return Ok(ConversionKind::Dense(dtype));
     }
-    if ty.is_iq() {
+    if ty.is_iq() || (endian == Endian::Little && ty.has_native_execution()) {
         return Ok(ConversionKind::IQuant);
     }
     if ty == GgmlType::MxFp4 {
         return Ok(ConversionKind::MxFp4);
     }
-    let (bits, group_size) = match ty {
+    let (bits, group_size) = match affine_config(ty) {
+        Some(config) => config,
+        None => return Err(Error::UnsupportedTensorType(ty.code())),
+    };
+    Ok(ConversionKind::Affine { bits, group_size })
+}
+
+fn affine_config(ty: GgmlType) -> Option<(u8, u32)> {
+    Some(match ty {
         GgmlType::Q2K => (2, 16),
         GgmlType::Q3K => (3, 16),
         GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q4K => (4, 32),
         GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q5K => (5, 32),
         GgmlType::Q6K => (6, 16),
         GgmlType::Q8_0 => (8, 32),
-        other => return Err(Error::UnsupportedTensorType(other.code())),
-    };
-    Ok(ConversionKind::Affine { bits, group_size })
+        _ => return None,
+    })
 }
 
 pub(crate) fn affine_shapes(
@@ -204,7 +222,7 @@ pub(crate) fn convert(
             "payload length does not match descriptor",
         ));
     }
-    match conversion_kind(desc.ggml_type)? {
+    match conversion_kind(desc.ggml_type, endian)? {
         ConversionKind::Dense(dtype) => {
             return Ok(ConvertedTensor::Dense(DenseTensor {
                 shape: desc.mlx_shape(),
@@ -292,13 +310,24 @@ fn normalize_dense(raw: &[u8], dtype: DenseDtype, endian: Endian) -> Vec<u8> {
     out
 }
 
-fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineTensor> {
-    let ConversionKind::Affine { bits, group_size } = conversion_kind(desc.ggml_type)? else {
+/// Converts a GGML affine-compatible encoding into MLX's generic packed
+/// weight/scales/biases representation.
+///
+/// Native-capable formats normally bypass this expansion. This explicit
+/// conversion remains available to portable backends and differential tests.
+pub fn convert_affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineTensor> {
+    if raw.len() as u64 != desc.byte_len {
         return Err(Error::tensor(
             &desc.name,
-            "dense, IQ, or MXFP4 tensor was sent to affine conversion",
+            "payload length does not match descriptor",
         ));
-    };
+    }
+    affine(desc, raw, endian)
+}
+
+fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineTensor> {
+    let (bits, group_size) = affine_config(desc.ggml_type)
+        .ok_or_else(|| Error::tensor(&desc.name, "tensor encoding has no affine conversion"))?;
     let (weight_shape, scale_shape) = affine_shapes(desc, bits, group_size)?;
     let groups = scale_shape.iter().try_fold(1u64, |a, &b| {
         a.checked_mul(b)

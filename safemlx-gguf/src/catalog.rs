@@ -69,7 +69,7 @@ impl CatalogTensor {
         &self.outputs
     }
 
-    /// Packed affine `(bits, group_size)`, or `None` for dense and IQ outputs.
+    /// Packed affine `(bits, group_size)`, or `None` for dense and native-block outputs.
     pub fn affine(&self) -> Option<(u8, u32)> {
         self.affine
     }
@@ -283,7 +283,7 @@ impl Checkpoint {
         let metadata = first.metadata().clone();
         let split_count = split_value(&metadata, SPLIT_COUNT)?.unwrap_or(0);
         if split_count <= 1 {
-            let tensors = catalog_tensors(first.tensors())?;
+            let tensors = catalog_tensors(first.tensors(), first.endian())?;
             if let Some(split_no) = split_value(&metadata, SPLIT_NO)? {
                 if split_no != 0 {
                     return Err(shard_error(format!(
@@ -327,7 +327,7 @@ impl Checkpoint {
         let paths = shard_paths(path, split_count)?;
         let mut shards = Vec::with_capacity(split_count);
         let mut names = HashMap::<String, PathBuf>::new();
-        let first_tensors = catalog_tensors(first.tensors())?;
+        let first_tensors = catalog_tensors(first.tensors(), first.endian())?;
         for tensor in &first_tensors {
             names.insert(tensor.descriptor.name.clone(), path.to_path_buf());
         }
@@ -373,7 +373,7 @@ impl Checkpoint {
                 )));
             }
 
-            let tensors = catalog_tensors(reader.tensors())?;
+            let tensors = catalog_tensors(reader.tensors(), reader.endian())?;
             for tensor in &tensors {
                 let source = tensor.descriptor.name.clone();
                 if let Some(previous) = names.insert(source.clone(), shard_path.clone()) {
@@ -747,12 +747,15 @@ fn validate_reopened_shard(
     }
 }
 
-fn catalog_tensors(descriptors: &[TensorDescriptor]) -> Result<Vec<CatalogTensor>> {
-    descriptors.iter().map(catalog_tensor).collect()
+fn catalog_tensors(descriptors: &[TensorDescriptor], endian: Endian) -> Result<Vec<CatalogTensor>> {
+    descriptors
+        .iter()
+        .map(|descriptor| catalog_tensor(descriptor, endian))
+        .collect()
 }
 
-fn catalog_tensor(descriptor: &TensorDescriptor) -> Result<CatalogTensor> {
-    let kind = conversion_kind(descriptor.ggml_type)?;
+fn catalog_tensor(descriptor: &TensorDescriptor, endian: Endian) -> Result<CatalogTensor> {
+    let kind = conversion_kind(descriptor.ggml_type, endian)?;
     if let ConversionKind::IQuant = kind {
         return Ok(CatalogTensor {
             descriptor: descriptor.clone(),

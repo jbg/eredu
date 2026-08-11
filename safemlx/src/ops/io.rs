@@ -513,7 +513,7 @@ mod tests {
         let (arrays, _) = collect_gguf(&path);
         for (name, ty) in &formats {
             let prefix = name.strip_suffix(".weight").unwrap();
-            if ty.is_iq() {
+            if ty.has_native_execution() {
                 assert_eq!(arrays[*name].dtype(), crate::Dtype::Uint8);
                 assert_eq!(
                     arrays[*name].size(),

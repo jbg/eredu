@@ -4,9 +4,9 @@
 //! parses descriptors with configurable resource limits and reads one tensor at
 //! a time. [`Checkpoint`] validates complete single-file or sharded checkpoints
 //! without reading tensor payloads and then streams their conversion. [`Writer`]
-//! emits deterministic GGUF v3 files to seekable outputs. Canonical nonlinear
-//! IQ encodings remain in their native block representation through conversion
-//! and can be executed directly by IQ-aware runtimes.
+//! emits deterministic GGUF v3 files to seekable outputs. Encodings with native
+//! execution support remain in their checkpoint block representation through
+//! conversion so runtimes can execute them without affine expansion.
 
 mod catalog;
 mod convert;
@@ -24,7 +24,8 @@ pub use catalog::{
     TranslatedTensorLayout,
 };
 pub use convert::{
-    AffineTensor, ConvertedTensor, DenseDtype, DenseTensor, IQuantTensor, MxFp4Tensor,
+    convert_affine, AffineTensor, ConvertedTensor, DenseDtype, DenseTensor, IQuantTensor,
+    MxFp4Tensor,
 };
 pub use error::{Error, Result};
 pub use format::{
