@@ -2007,6 +2007,11 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         self.args.quantization.or(self.args.quantization_config)
     }
 
+    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+        let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+        quantizes_static_target(self.args.vision_config.as_ref(), target)
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::ParallelTopology>,
@@ -3092,6 +3097,17 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
     }
 }
 
+fn quantizes_static_target(vision: Option<&VisionConfig>, target: &str) -> bool {
+    let target = target.strip_prefix("model.").unwrap_or(target);
+    if target.starts_with("vision_tower.")
+        || target.starts_with("vision_adapter.")
+        || target.starts_with("vision_projection.")
+    {
+        return vision.is_some_and(|config| config.quantized_weight_configs.contains_key(target));
+    }
+    true
+}
+
 impl MuseGlimmerLayerwiseAdapter {
     fn prepare_multimodal_prefill(
         &mut self,
@@ -3663,4 +3679,61 @@ fn split_expert_key(
                 projections
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::runtime::checkpoint::quantization::AffineQuantization;
+
+    #[test]
+    fn load_time_quantization_skips_unaligned_static_vision_weights() {
+        let mut vision = VisionConfig::from_hf_value(
+            &json!({
+                "model_type": "muse_glimmer_vision",
+                "hidden_act": "gelu",
+                "hidden_size": 1024,
+                "intermediate_size": 4096,
+                "num_attention_heads": 16,
+                "num_hidden_layers": 1,
+                "patch_size": 14,
+                "patch_temporal": 2,
+                "merge_size": 2,
+                "pos_emb_height": 32,
+                "pos_emb_width": 32,
+                "max_position_embeddings": 1024,
+                "layer_norm_eps": 1e-5,
+                "layer_types": ["full_attention"],
+                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+            }),
+            6656,
+        )
+        .unwrap();
+        vision.apply_load_time_quantization(WeightQuantization::Affine(
+            AffineQuantization::new(64, 4).unwrap(),
+        ));
+
+        assert!(!quantizes_static_target(
+            Some(&vision),
+            "model.vision_tower.patch_embedder.patch_embedding.weight",
+        ));
+        assert!(quantizes_static_target(
+            Some(&vision),
+            "model.vision_adapter.fc1.weight",
+        ));
+        assert!(quantizes_static_target(
+            Some(&vision),
+            "model.vision_projection.weight",
+        ));
+        assert!(!quantizes_static_target(
+            Some(&vision),
+            "model.vision_tower.patch_embedder.position_embedding_table.weight",
+        ));
+        assert!(quantizes_static_target(
+            Some(&vision),
+            "model.language_model.embed_tokens.weight",
+        ));
+    }
 }
