@@ -590,11 +590,15 @@ pub(crate) fn rms_norm_without_scale(
 fn forward_layer_norm(
     norm: &mut nn::RmsNorm,
     centered: bool,
+    centered_scale: &mut Option<Array>,
     x: &Array,
     stream: &Stream,
 ) -> Result<Array, Exception> {
     let output = if centered {
-        let scale = norm.weight.as_ref().add(Array::from_f32(1.0), stream)?;
+        let scale = match centered_scale {
+            Some(scale) => scale,
+            slot @ None => slot.insert(norm.weight.as_ref().add(Array::from_f32(1.0), stream)?),
+        };
         safemlx::fast::rms_norm(x, &scale, norm.eps, stream)?
     } else {
         norm.forward(x, stream)?
@@ -1538,6 +1542,12 @@ pub struct TransformerBlock {
     pub post_feedforward_layernorm: nn::RmsNorm,
     /// Whether checkpoint layer-norm weights are centered around zero.
     pub centered_norm_weights: bool,
+    // The release's four centered norms store (scale - 1). Materialize each
+    // effective scale once instead of rebuilding it for every decoded token.
+    input_layernorm_centered_scale: Option<Array>,
+    post_attention_layernorm_centered_scale: Option<Array>,
+    pre_feedforward_layernorm_centered_scale: Option<Array>,
+    post_feedforward_layernorm_centered_scale: Option<Array>,
 }
 
 impl TransformerBlock {
@@ -1575,6 +1585,10 @@ impl TransformerBlock {
             pre_feedforward_layernorm,
             post_feedforward_layernorm,
             centered_norm_weights: args.weight_convention == WeightConvention::HuggingFace,
+            input_layernorm_centered_scale: None,
+            post_attention_layernorm_centered_scale: None,
+            pre_feedforward_layernorm_centered_scale: None,
+            post_feedforward_layernorm_centered_scale: None,
         })
     }
 
@@ -1582,6 +1596,7 @@ impl TransformerBlock {
         forward_layer_norm(
             &mut self.input_layernorm,
             self.centered_norm_weights,
+            &mut self.input_layernorm_centered_scale,
             x,
             stream,
         )
@@ -1591,6 +1606,7 @@ impl TransformerBlock {
         forward_layer_norm(
             &mut self.post_attention_layernorm,
             self.centered_norm_weights,
+            &mut self.post_attention_layernorm_centered_scale,
             x,
             stream,
         )
@@ -1604,6 +1620,7 @@ impl TransformerBlock {
         forward_layer_norm(
             &mut self.pre_feedforward_layernorm,
             self.centered_norm_weights,
+            &mut self.pre_feedforward_layernorm_centered_scale,
             x,
             stream,
         )
@@ -1617,6 +1634,7 @@ impl TransformerBlock {
         forward_layer_norm(
             &mut self.post_feedforward_layernorm,
             self.centered_norm_weights,
+            &mut self.post_feedforward_layernorm_centered_scale,
             x,
             stream,
         )
@@ -4178,7 +4196,7 @@ mod tests {
         let mut centered = nn::RmsNorm::new(4).unwrap();
         centered.eps = 1e-6;
         *centered.weight.as_mut() = Array::from_slice(&[bf16::from_f32(0.0); 4], &[4]);
-        let centered = forward_layer_norm(&mut centered, true, &input, stream).unwrap();
+        let centered = forward_layer_norm(&mut centered, true, &mut None, &input, stream).unwrap();
         assert_eq!(centered.dtype(), Dtype::Bfloat16);
     }
 
