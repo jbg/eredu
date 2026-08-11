@@ -63,6 +63,16 @@ Chat templates are applied automatically. Use `--raw` for an untemplated text
 completion. `--thinking on|off` overrides templates that expose the standard
 thinking control; `auto` preserves the checkpoint's default.
 
+Use `--timing` to print load time, generation time, time to first token, and
+token throughput to standard error without enabling the other `--verbose`
+diagnostics:
+
+```sh
+cargo run --release -q -p safemlx-lm-cli -- \
+  --model /path/to/model --timing \
+  "Explain speculative decoding."
+```
+
 ## Loading and memory
 
 Eligible dense checkpoints can be quantized while loading:

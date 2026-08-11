@@ -464,6 +464,10 @@ struct Cli {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Print load and generation timing statistics to stderr.
+    #[arg(long)]
+    timing: bool,
+
     /// Synchronize Gemma 4 component boundaries and report component timings.
     ///
     /// This changes scheduling and should be used for diagnosis, not headline
@@ -522,6 +526,52 @@ fn stop_reason(output_ids: &[u32], eos_token_ids: &[u32], max_tokens: usize) -> 
 
 fn should_report_stop_reason(stop_reason: StopReason, verbose: bool) -> bool {
     verbose || stop_reason == StopReason::MaxTokens
+}
+
+fn write_timing_report(
+    stderr: &mut impl Write,
+    load_elapsed: std::time::Duration,
+    generation_elapsed: std::time::Duration,
+    time_to_first_token: Option<std::time::Duration>,
+    generated_tokens: usize,
+    total_elapsed: std::time::Duration,
+) -> Result<()> {
+    let token_rate = if generation_elapsed.is_zero() {
+        0.0
+    } else {
+        generated_tokens as f64 / generation_elapsed.as_secs_f64()
+    };
+    writeln!(stderr, "load_time: {:.3} s", load_elapsed.as_secs_f64())?;
+    writeln!(
+        stderr,
+        "generation_time: {:.3} s",
+        generation_elapsed.as_secs_f64()
+    )?;
+    match time_to_first_token {
+        Some(elapsed) => {
+            writeln!(
+                stderr,
+                "time_to_first_token: {:.3} s",
+                elapsed.as_secs_f64()
+            )?;
+            let decode_tokens = generated_tokens.saturating_sub(1);
+            let decode_elapsed = generation_elapsed.saturating_sub(elapsed);
+            let decode_token_rate = if decode_elapsed.is_zero() {
+                0.0
+            } else {
+                decode_tokens as f64 / decode_elapsed.as_secs_f64()
+            };
+            writeln!(stderr, "decode_token_rate: {decode_token_rate:.2} tokens/s")?;
+        }
+        None => writeln!(stderr, "time_to_first_token: n/a")?,
+    }
+    writeln!(stderr, "token_rate: {token_rate:.2} tokens/s")?;
+    writeln!(
+        stderr,
+        "total_execution_time: {:.3} s",
+        total_elapsed.as_secs_f64()
+    )?;
+    Ok(())
 }
 
 fn write_streamed_token(
@@ -1264,19 +1314,20 @@ fn main() -> Result<()> {
         let active_memory = safemlx::memory::active_memory()?;
         let cache_memory = safemlx::memory::cache_memory()?;
         let total_elapsed = total_started.elapsed();
-        let token_rate = if generation_elapsed.is_zero() {
-            0.0
-        } else {
-            output_ids.len() as f64 / generation_elapsed.as_secs_f64()
-        };
         eprintln!(
             "model_type: {}, prompt_tokens: {}, generated_tokens: {}",
             model.model_type(),
             tokens.shape()[1],
             output_ids.len(),
         );
-        eprintln!("load_time: {:.3} s", load_elapsed.as_secs_f64());
-        eprintln!("generation_time: {:.3} s", generation_elapsed.as_secs_f64());
+        write_timing_report(
+            &mut io::stderr().lock(),
+            load_elapsed,
+            generation_elapsed,
+            time_to_first_token,
+            output_ids.len(),
+            total_elapsed,
+        )?;
         if let Some(stats) = &mtp_stats {
             eprintln!("mtp_stream_topology: {}", stats.stream_topology);
             eprintln!(
@@ -1304,22 +1355,6 @@ fn main() -> Result<()> {
             );
             eprintln!("mtp_accept_lens: {:?}", stats.accept_lens);
         }
-        match time_to_first_token {
-            Some(elapsed) => {
-                eprintln!("time_to_first_token: {:.3} s", elapsed.as_secs_f64());
-                let decode_tokens = output_ids.len().saturating_sub(1);
-                let decode_elapsed = generation_elapsed.saturating_sub(elapsed);
-                let decode_token_rate = if decode_elapsed.is_zero() {
-                    0.0
-                } else {
-                    decode_tokens as f64 / decode_elapsed.as_secs_f64()
-                };
-                eprintln!("decode_token_rate: {decode_token_rate:.2} tokens/s");
-            }
-            None => eprintln!("time_to_first_token: n/a"),
-        }
-        eprintln!("token_rate: {token_rate:.2} tokens/s");
-        eprintln!("total_execution_time: {:.3} s", total_elapsed.as_secs_f64());
         eprintln!("mlx_peak_memory: {}", format_bytes(peak_memory));
         eprintln!("mlx_active_memory: {}", format_bytes(active_memory));
         eprintln!("mlx_cache_memory: {}", format_bytes(cache_memory));
@@ -1435,6 +1470,16 @@ fn main() -> Result<()> {
                 | StopReason::Cancelled => {}
             }
         }
+    } else if args.timing {
+        stream.synchronize()?;
+        write_timing_report(
+            &mut io::stderr().lock(),
+            load_elapsed,
+            generation_elapsed,
+            time_to_first_token,
+            output_ids.len(),
+            total_started.elapsed(),
+        )?;
     }
 
     Ok(())
@@ -2161,10 +2206,10 @@ mod tests {
         requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
         should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
-        validate_args, validate_artifact_pair, write_semantic_event, Array, CachedGgufRole, Cli,
-        CliDevice, CliToolChoice, DeviceType, MtpDraftDevice, MtpExecutionStreams,
-        MtpSchedulerOptions, NativeToolSupport, ReasoningStream, ResolvedModel, SemanticEvent,
-        SemanticSupport, StopReason, WeightQuantization,
+        validate_args, validate_artifact_pair, write_semantic_event, write_timing_report, Array,
+        CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType, MtpDraftDevice,
+        MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport, ReasoningStream,
+        ResolvedModel, SemanticEvent, SemanticSupport, StopReason, WeightQuantization,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -2192,6 +2237,38 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_timing_without_enabling_verbose_output() {
+        let args = Cli::try_parse_from(["safemlx-lm", "--model", "model-id", "--timing", "prompt"])
+            .unwrap();
+        assert!(args.timing);
+        assert!(!args.verbose);
+    }
+
+    #[test]
+    fn timing_report_contains_only_timing_statistics() {
+        let mut stderr = Vec::new();
+        write_timing_report(
+            &mut stderr,
+            Duration::from_millis(1250),
+            Duration::from_millis(2000),
+            Some(Duration::from_millis(500)),
+            7,
+            Duration::from_millis(4000),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "load_time: 1.250 s\n\
+             generation_time: 2.000 s\n\
+             time_to_first_token: 0.500 s\n\
+             decode_token_rate: 4.00 tokens/s\n\
+             token_rate: 3.50 tokens/s\n\
+             total_execution_time: 4.000 s\n"
+        );
     }
 
     #[test]
