@@ -2350,6 +2350,10 @@ pub struct Gemma4Embedding {
     pub weight: Param<Array>,
     /// Optional checkpoint-native embedding storage.
     pub native: Option<NativeQuantizedTensor>,
+    /// Checkpoint-native format stored directly in `weight`.
+    pub native_format: Option<NativeQuantizationFormat>,
+    /// Byte order of checkpoint-native blocks stored in `weight`.
+    pub native_endian: GgufEndian,
     #[param]
     /// Optional quantization scales.
     pub scales: Param<Option<Array>>,
@@ -2366,6 +2370,40 @@ pub struct Gemma4Embedding {
     pub bits: i32,
     /// Quantized weight encoding.
     pub mode: QuantizationMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeEmbeddingLayout {
+    format: NativeQuantizationFormat,
+    endian: GgufEndian,
+    block_values: i32,
+    block_bytes: i32,
+    packed_dim: i32,
+}
+
+fn native_embedding_layout(
+    hidden_size: i32,
+    quantization: Option<WeightQuantization>,
+) -> Result<Option<NativeEmbeddingLayout>, Exception> {
+    let Some(WeightQuantization::GgufIQuant { ggml_type, endian }) = quantization else {
+        return Ok(None);
+    };
+    let format = NativeQuantizationFormat::from_ggml_type(ggml_type).ok_or_else(|| {
+        Exception::custom(format!("{ggml_type:?} has no native execution support"))
+    })?;
+    let (block_values, block_bytes) = format.block_geometry();
+    if hidden_size <= 0 || hidden_size % block_values != 0 {
+        return Err(Exception::custom(format!(
+            "native embedding width {hidden_size} is not divisible by {block_values}"
+        )));
+    }
+    Ok(Some(NativeEmbeddingLayout {
+        format,
+        endian,
+        block_values,
+        block_bytes,
+        packed_dim: hidden_size / block_values * block_bytes,
+    }))
 }
 
 impl Gemma4Embedding {
@@ -2388,6 +2426,25 @@ impl Gemma4Embedding {
         quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        if let Some(native) = native_embedding_layout(hidden_size, quantization)? {
+            return Ok(Self {
+                native: None,
+                native_format: Some(native.format),
+                native_endian: native.endian,
+                weight: Param::<Array>::unloaded(
+                    &[vocab_size, native.packed_dim],
+                    Dtype::Uint8,
+                    stream,
+                )?,
+                scales: Param::new(None),
+                biases: Param::new(None),
+                quantized: true,
+                mode: QuantizationMode::Affine,
+                hidden_size,
+                group_size: native.block_values,
+                bits: native.block_bytes,
+            });
+        }
         let quantized = quantization.is_some();
         let group_size = quantization.map_or(64, WeightQuantization::group_size);
         let bits = quantization.map_or(4, WeightQuantization::bits);
@@ -2395,6 +2452,8 @@ impl Gemma4Embedding {
         let packed_dim = quantized_packed_dimension(hidden_size, bits);
         Ok(Self {
             native: None,
+            native_format: None,
+            native_endian: GgufEndian::Little,
             weight: if quantized {
                 Param::<Array>::unloaded(&[vocab_size, packed_dim], Dtype::Uint32, stream)?
             } else {
@@ -2440,6 +2499,8 @@ impl Gemma4Embedding {
     ) -> Result<Self, Exception> {
         Ok(Self {
             native: None,
+            native_format: None,
+            native_endian: GgufEndian::Little,
             weight: Param::new(if quantized {
                 Array::from_slice(
                     &vec![
@@ -2480,6 +2541,15 @@ impl Gemma4Embedding {
         if let Some(native) = &self.native {
             return native.embedding(input, stream);
         }
+        if let Some(format) = self.native_format {
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.weight.value.clone(),
+                &[self.weight.dim(0), self.hidden_size],
+                format.ggml_type().expect("native GGML format"),
+                self.native_endian,
+            )?;
+            return native.embedding(input, stream);
+        }
         if !self.quantized {
             return self.weight.try_index_device(input, stream);
         }
@@ -2517,6 +2587,15 @@ impl Gemma4Embedding {
     /// Applies the embedding table as a tied language-model head.
     pub fn as_linear(&self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
         if let Some(native) = &self.native {
+            return native.linear(x, true, stream);
+        }
+        if let Some(format) = self.native_format {
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.weight.value.clone(),
+                &[self.weight.dim(0), self.hidden_size],
+                format.ggml_type().expect("native GGML format"),
+                self.native_endian,
+            )?;
             return native.linear(x, true, stream);
         }
         if self.quantized {
@@ -5142,7 +5221,11 @@ fn attach_native_embedding(
         )));
     }
     embedding.native = Some(native);
-    embedding.weight.value = Array::from_slice(&[] as &[u32], &[0]);
+    embedding.weight.value = if embedding.native_format.is_some() {
+        Array::from_slice(&[] as &[u8], &[0])
+    } else {
+        Array::from_slice(&[] as &[u32], &[0])
+    };
     embedding.scales.value = None;
     embedding.biases.value = None;
     report.record_loaded(target.to_string());
@@ -6608,13 +6691,14 @@ mod tests {
 
     use safemlx::{
         module::ModuleParameters,
-        ops::{zeros_dtype, GgufMetadataValue},
+        ops::{zeros_dtype, GgufEndian, GgufMetadataValue, GgufType},
         Array, Device, DeviceType, ExecutionContext, Stream,
     };
 
     use super::{
-        load_gemma4_model, needs_generated_sliding_mask, partial_rotary_dims, Attention, Cache,
-        FeedForwardPolicy, FloatOrString, KeyValuePolicy, LayerPolicy, ModelArgs, ValuePolicy,
+        load_gemma4_model, native_embedding_layout, needs_generated_sliding_mask,
+        partial_rotary_dims, Attention, Cache, FeedForwardPolicy, FloatOrString, KeyValuePolicy,
+        LayerPolicy, ModelArgs, ValuePolicy,
     };
     use crate::api::{
         common::generation::CausalLm,
@@ -6624,6 +6708,39 @@ mod tests {
     use crate::runtime::checkpoint::load::{
         load_arrays_strict, StrictLoadConfig, StrictLoadReport,
     };
+    use crate::runtime::checkpoint::quantization::WeightQuantization;
+
+    #[test]
+    fn native_gguf_embedding_layout_never_enters_affine_mode() {
+        let formats = [
+            GgufType::Q4K,
+            GgufType::Q5_1,
+            GgufType::Q8_0,
+            GgufType::IQ2XXS,
+            GgufType::IQ2XS,
+            GgufType::IQ3XXS,
+            GgufType::IQ1S,
+            GgufType::IQ4NL,
+            GgufType::IQ3S,
+            GgufType::IQ2S,
+            GgufType::IQ4XS,
+            GgufType::IQ1M,
+        ];
+        for ggml_type in formats {
+            let (block_values, block_bytes) = ggml_type.block_and_bytes().unwrap();
+            let layout = native_embedding_layout(
+                block_values as i32,
+                Some(WeightQuantization::GgufIQuant {
+                    ggml_type,
+                    endian: GgufEndian::Little,
+                }),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(layout.block_values, block_values as i32, "{ggml_type:?}");
+            assert_eq!(layout.packed_dim, block_bytes as i32, "{ggml_type:?}");
+        }
+    }
 
     fn test_stream() -> Stream {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
