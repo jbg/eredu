@@ -29,7 +29,7 @@ use safemlx_lm::{
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
-    runtime::checkpoint::quantization::AffineQuantization,
+    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::layerwise::{
         LayerwiseLoadOptions, NonExpertWeightResidency, WeightResidency,
     },
@@ -64,6 +64,13 @@ enum ThinkingMode {
     On,
     /// Ask a compatible chat template to disable thinking/reasoning.
     Off,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+enum LoadQuantizationMode {
+    #[default]
+    Affine,
+    Mxfp4,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
@@ -353,6 +360,10 @@ struct Cli {
     /// Quantize eligible dense weights to this bit width while loading.
     #[arg(long, value_name = "BITS")]
     quantize: Option<i32>,
+
+    /// Encoding used for load-time quantization. MXFP4 requires --quantize 4.
+    #[arg(long, value_enum, default_value_t = LoadQuantizationMode::Affine)]
+    quantization_mode: LoadQuantizationMode,
 
     /// Number of adjacent weights sharing quantization parameters.
     #[arg(long, default_value_t = 64, value_name = "WEIGHTS")]
@@ -646,6 +657,22 @@ fn execution_contexts(
     (execution, draft)
 }
 
+fn requested_load_quantization(args: &Cli) -> Result<Option<WeightQuantization>> {
+    match (args.quantize, args.quantization_mode) {
+        (Some(bits), LoadQuantizationMode::Affine) => Ok(Some(
+            AffineQuantization::new(args.quantization_group_size, bits)?.into(),
+        )),
+        (Some(4), LoadQuantizationMode::Mxfp4) => Ok(Some(WeightQuantization::MxFp4)),
+        (Some(_), LoadQuantizationMode::Mxfp4) => {
+            bail!("--quantization-mode mxfp4 requires --quantize 4")
+        }
+        (None, LoadQuantizationMode::Mxfp4) => {
+            bail!("--quantization-mode requires --quantize")
+        }
+        (None, LoadQuantizationMode::Affine) => Ok(None),
+    }
+}
+
 fn main() -> Result<()> {
     let total_started = Instant::now();
     let args = Cli::parse();
@@ -698,13 +725,10 @@ fn main() -> Result<()> {
         safemlx::memory::reset_peak_memory()?;
     }
     let load_started = Instant::now();
-    let mut load_options = match args.quantize {
-        Some(bits) => ModelLoadOptions::with_quantization(AffineQuantization::new(
-            args.quantization_group_size,
-            bits,
-        )?),
-        None => ModelLoadOptions::default(),
-    };
+    let mut load_options = requested_load_quantization(&args)?.map_or_else(
+        ModelLoadOptions::default,
+        ModelLoadOptions::with_quantization,
+    );
     let dense_options = || -> Result<DenseDiskStreamLoadOptions> {
         let defaults = DenseDiskStreamLoadOptions::default();
         let mut options = DenseDiskStreamLoadOptions::new(
@@ -792,13 +816,10 @@ fn main() -> Result<()> {
     let mut drafter = draft_model_path
         .as_ref()
         .map(|path| {
-            let options = match args.quantize {
-                Some(bits) => ModelLoadOptions::with_quantization(AffineQuantization::new(
-                    args.quantization_group_size,
-                    bits,
-                )?),
-                None => ModelLoadOptions::default(),
-            };
+            let options = requested_load_quantization(&args)?.map_or_else(
+                ModelLoadOptions::default,
+                ModelLoadOptions::with_quantization,
+            );
             LoadedDrafter::load_with_options(path, options, draft_stream, weights.stream())
                 .with_context(|| format!("failed to load draft model from {}", path.display()))
         })
@@ -1625,9 +1646,7 @@ fn validate_args(args: &Cli) -> Result<()> {
     if !args.frequency_penalty.is_finite() || !args.presence_penalty.is_finite() {
         bail!("frequency and presence penalties must be finite numbers");
     }
-    if let Some(bits) = args.quantize {
-        AffineQuantization::new(args.quantization_group_size, bits)?;
-    }
+    requested_load_quantization(args)?;
     if args.layerwise_host && args.quantize.is_some() {
         bail!("--quantize is not supported with --layerwise-host; use matching checkpoint-native quantization");
     }
@@ -2139,12 +2158,13 @@ mod tests {
 
     use super::{
         eval, execution_contexts, format_bytes, format_weight_store_diagnostics,
-        select_cached_gguf_from_revisions, select_cached_gguf_pair_from_revisions,
-        select_cached_gguf_path, select_revision, should_report_stop_reason, split_hf_model_spec,
-        stop_reason, use_semantic_generation, validate_args, validate_artifact_pair,
-        write_semantic_event, Array, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType,
-        MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport,
-        ReasoningStream, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
+        requested_load_quantization, select_cached_gguf_from_revisions,
+        select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
+        should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
+        validate_args, validate_artifact_pair, write_semantic_event, Array, CachedGgufRole, Cli,
+        CliDevice, CliToolChoice, DeviceType, MtpDraftDevice, MtpExecutionStreams,
+        MtpSchedulerOptions, NativeToolSupport, ReasoningStream, ResolvedModel, SemanticEvent,
+        SemanticSupport, StopReason, WeightQuantization,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -2393,6 +2413,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("bits must be one of"));
+
+        let mxfp4 = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--quantize",
+            "4",
+            "--quantization-mode",
+            "mxfp4",
+            "prompt",
+        ])
+        .unwrap();
+        validate_args(&mxfp4).unwrap();
+        assert_eq!(
+            requested_load_quantization(&mxfp4).unwrap(),
+            Some(WeightQuantization::MxFp4)
+        );
+
+        let invalid_mxfp4 = Cli {
+            quantize: Some(3),
+            ..mxfp4
+        };
+        assert!(validate_args(&invalid_mxfp4)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --quantize 4"));
     }
 
     #[test]
