@@ -5464,8 +5464,8 @@ mod tests {
     }
 
     #[test]
-    fn loads_dense_and_mixed_affine_deepseek2_gguf_checkpoints() {
-        use crate::runtime::checkpoint::quantization::AffineQuantization;
+    fn loads_dense_and_mixed_quantized_deepseek2_gguf_checkpoints() {
+        use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
         use safemlx_gguf::GgmlType;
         let context = test_context();
         let stream = context.stream();
@@ -5552,7 +5552,14 @@ mod tests {
             .experts
             .clone();
         assert_eq!(experts.gate_affine.unwrap().bits(), 4);
-        assert_eq!(experts.up_affine.unwrap().bits(), 8);
+        assert!(experts.up_affine.is_none());
+        assert!(matches!(
+            experts.up_iquant,
+            Some(WeightQuantization::GgufIQuant {
+                ggml_type: GgmlType::Q8_0,
+                ..
+            })
+        ));
         assert_eq!(experts.down_affine.unwrap().bits(), 4);
         let logits = quantized
             .forward(
