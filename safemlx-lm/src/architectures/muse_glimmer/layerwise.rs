@@ -82,6 +82,39 @@ const EMBEDDING_UNIT: &str = "muse_glimmer.static.embedding";
 const NORM_UNIT: &str = "muse_glimmer.static.norm";
 const HEAD_UNIT: &str = "muse_glimmer.static.output";
 const VISION_STATIC_UNIT: &str = "muse_glimmer.static.vision";
+const VISION_PATCH_WEIGHT: &str = "vision_tower.patch_embedder.patch_embedding.weight";
+
+fn vision_static_bindings(
+    vision: &VisionStatic,
+    store: &dyn WeightStore,
+) -> Result<Vec<WeightBinding>, Error> {
+    let checkpoint_key = format!("model.{VISION_PATCH_WEIGHT}");
+    let mut recipes = BTreeMap::new();
+    if store
+        .metadata(&checkpoint_key)
+        .is_ok_and(|metadata| metadata.shape.len() == 4)
+    {
+        recipes.insert(
+            VISION_PATCH_WEIGHT.into(),
+            DerivedWeightRecipe::Reshape {
+                input: Box::new(DerivedWeightRecipe::source(
+                    checkpoint_key,
+                    TensorSelection::Full,
+                )),
+                shape: vec![
+                    vision.config.hidden_size as usize,
+                    (vision.config.temporal_patch_size
+                        * 3
+                        * vision.config.patch_size
+                        * vision.config.patch_size) as usize,
+                ],
+            },
+        );
+    }
+    Ok(build_module_bindings_with_recipes(
+        vision, "model", store, recipes,
+    )?)
+}
 
 /// Architecture-owned KV cache accepted by the canonical Muse-Glimmer adapter.
 pub enum MuseGlimmerLayerwiseCache {
@@ -2265,7 +2298,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             if let Some(vision) = &self.vision {
                 units.push(StaticUnitBindings::new(
                     VISION_STATIC_UNIT,
-                    build_module_bindings(vision, "model", store)?,
+                    vision_static_bindings(vision, store)?,
                 )?);
             }
         }
@@ -3686,7 +3719,81 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::runtime::checkpoint::quantization::AffineQuantization;
+    use crate::runtime::checkpoint::{quantization::AffineQuantization, store::MemoryWeightStore};
+
+    fn tiny_vision_config() -> VisionConfig {
+        VisionConfig::from_hf_value(
+            &json!({
+                "model_type": "muse_glimmer_vision",
+                "hidden_act": "gelu",
+                "hidden_size": 4,
+                "intermediate_size": 8,
+                "num_attention_heads": 1,
+                "num_hidden_layers": 1,
+                "patch_size": 2,
+                "patch_temporal": 1,
+                "merge_size": 2,
+                "pos_emb_height": 2,
+                "pos_emb_width": 2,
+                "max_position_embeddings": 4,
+                "layer_norm_eps": 1e-5,
+                "layer_types": ["full_attention"],
+                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+            }),
+            24,
+        )
+        .unwrap()
+    }
+
+    fn vision_store(vision: &VisionStatic, patch_weight: Array) -> MemoryWeightStore {
+        let mut arrays = vision
+            .parameters()
+            .flatten()
+            .into_iter()
+            .map(|(name, value)| (format!("model.{name}"), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert!(arrays
+            .insert(format!("model.{VISION_PATCH_WEIGHT}"), patch_weight)
+            .is_some());
+        MemoryWeightStore::new(arrays).unwrap()
+    }
+
+    #[test]
+    fn vision_static_binding_flattens_collapsed_gguf_patch_kernel() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let vision = VisionStatic::new(tiny_vision_config(), 8, stream).unwrap();
+
+        let flat = zeros_dtype(&[4, 12], Dtype::Float32, stream).unwrap();
+        let flat_store = vision_store(&vision, flat);
+        let flat_bindings = vision_static_bindings(&vision, &flat_store).unwrap();
+        assert!(flat_bindings
+            .iter()
+            .find(|binding| binding.name() == VISION_PATCH_WEIGHT)
+            .unwrap()
+            .recipe()
+            .is_none());
+
+        let collapsed = zeros_dtype(&[4, 3, 2, 2], Dtype::Float32, stream).unwrap();
+        let collapsed_store = vision_store(&vision, collapsed);
+        let collapsed_bindings = vision_static_bindings(&vision, &collapsed_store).unwrap();
+        let binding = collapsed_bindings
+            .iter()
+            .find(|binding| binding.name() == VISION_PATCH_WEIGHT)
+            .unwrap();
+        assert!(matches!(
+            binding.recipe(),
+            Some(DerivedWeightRecipe::Reshape { shape, .. }) if shape == &[4, 12]
+        ));
+        assert_eq!(
+            binding
+                .source_recipe()
+                .infer(&collapsed_store)
+                .unwrap()
+                .shape(),
+            &[4, 12]
+        );
+    }
 
     #[test]
     fn load_time_quantization_skips_unaligned_static_vision_weights() {
