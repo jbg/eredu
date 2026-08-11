@@ -2486,6 +2486,17 @@ impl LoadTimeQuantizableAdapter for Gemma4LayerwiseAdapter {
     }
 }
 
+fn ignores_gemma4_checkpoint_key(key: &str) -> bool {
+    key.starts_with("rope_freqs.")
+        || [
+            "multi_modal_projector.",
+            "model.multi_modal_projector.",
+            "model.vision_embedder.",
+        ]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+}
+
 impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
     type Input<'a> = Gemma4Input<'a>;
     type Cache = Cache;
@@ -4587,13 +4598,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
     }
 
     fn ignores_checkpoint_key(&self, key: &str) -> bool {
-        [
-            "multi_modal_projector.",
-            "model.multi_modal_projector.",
-            "model.vision_embedder.",
-        ]
-        .iter()
-        .any(|prefix| key.starts_with(prefix))
+        ignores_gemma4_checkpoint_key(key)
     }
 }
 
@@ -4666,6 +4671,14 @@ mod tests {
                 "final_logit_softcapping": 4.0
             }
         })
+    }
+
+    #[test]
+    fn strict_layerwise_loading_ignores_auxiliary_gguf_rope_frequencies() {
+        assert!(super::ignores_gemma4_checkpoint_key("rope_freqs.weight"));
+        assert!(!super::ignores_gemma4_checkpoint_key(
+            "model.language_model.layers.0.self_attn.q_proj.weight"
+        ));
     }
 
     #[test]
