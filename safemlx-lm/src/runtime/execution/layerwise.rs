@@ -2531,6 +2531,7 @@ pub struct LayerwiseModel<A: ArchitectureAdapter> {
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     parallel_topology: Option<crate::runtime::distributed::topology::ParallelTopology>,
     parallel_info: Option<ParallelModelInfo>,
+    execution_streams: Vec<Stream>,
     #[cfg(test)]
     force_serial_execution: bool,
     #[cfg(test)]
@@ -2541,6 +2542,7 @@ pub struct LayerwiseModel<A: ArchitectureAdapter> {
 #[derive(Debug, Default)]
 pub(crate) struct ReadySetExecutionTrace {
     submissions: Vec<(usize, usize, i32)>,
+    completion_boundaries: Vec<(usize, usize)>,
     independent_group_events: Vec<(usize, usize)>,
 }
 
@@ -2548,6 +2550,10 @@ pub(crate) struct ReadySetExecutionTrace {
 impl ReadySetExecutionTrace {
     pub(crate) fn submissions(&self) -> &[(usize, usize, i32)] {
         &self.submissions
+    }
+
+    pub(crate) fn completion_boundaries(&self) -> &[(usize, usize)] {
+        &self.completion_boundaries
     }
 
     pub(crate) fn independent_group_events(&self) -> &[(usize, usize)] {
@@ -2685,6 +2691,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             parallel_layout: None,
             parallel_topology: None,
             parallel_info: None,
+            execution_streams: Vec::new(),
             #[cfg(test)]
             force_serial_execution: false,
             #[cfg(test)]
@@ -2727,6 +2734,25 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         self.resident_layers = Some(resident_layers);
         self._resident_layer_leases = resident_layer_leases;
         Ok(())
+    }
+
+    fn group_execution_streams(&mut self, stream: &Stream) -> Result<Vec<Stream>, Error> {
+        #[cfg(test)]
+        if self.force_serial_execution {
+            return Ok((0..self.graph.groups().len())
+                .map(|_| stream.clone())
+                .collect());
+        }
+        if self.graph.groups().len() == 1 {
+            return Ok(vec![stream.clone()]);
+        }
+        if self.execution_streams.is_empty() {
+            let device = stream.get_device()?;
+            self.execution_streams = (0..self.graph.groups().len())
+                .map(|_| Stream::new_with_device(&device))
+                .collect();
+        }
+        Ok(self.execution_streams.clone())
     }
 
     /// Enables optional allocator and process-memory samples after forward.
@@ -2956,6 +2982,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             input,
             cache,
             stream,
+            true,
             |adapter, group, index, layer, hidden, cache, context, stream| {
                 let execution =
                     crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(
@@ -2978,11 +3005,17 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        self.forward_tensor_parallel_with_context_hook(
+        self.forward_tensor_parallel_with_hooks(
             input,
             cache,
             group,
             stream,
+            true,
+            |adapter, group, index, layer, hidden, cache, context, execution| {
+                adapter.forward_layer_with_execution(
+                    group, index, layer, hidden, cache, context, execution,
+                )
+            },
             |_, _, _| Ok(()),
         )
         .map(|(output, _)| output)
@@ -3005,6 +3038,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             cache,
             group,
             stream,
+            false,
             |adapter, group, index, layer, hidden, cache, context, execution| {
                 adapter.forward_layer_with_execution(
                     group, index, layer, hidden, cache, context, execution,
@@ -3041,9 +3075,15 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         ) -> Result<Array, Error>,
     {
-        self.forward_tensor_parallel_with_hooks(input, cache, group, stream, executor, |_, _, _| {
-            Ok(())
-        })
+        self.forward_tensor_parallel_with_hooks(
+            input,
+            cache,
+            group,
+            stream,
+            false,
+            executor,
+            |_, _, _| Ok(()),
+        )
         .map(|(output, _)| output)
     }
 
@@ -3065,6 +3105,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             cache,
             group,
             stream,
+            true,
             |adapter, group, index, layer, hidden, cache, context, execution| {
                 adapter.forward_layer_with_execution(
                     group, index, layer, hidden, cache, context, execution,
@@ -3098,9 +3139,15 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         ) -> Result<Array, Error>,
     {
-        self.forward_tensor_parallel_with_hooks(input, cache, group, stream, executor, |_, _, _| {
-            Ok(())
-        })
+        self.forward_tensor_parallel_with_hooks(
+            input,
+            cache,
+            group,
+            stream,
+            false,
+            executor,
+            |_, _, _| Ok(()),
+        )
     }
 
     #[allow(
@@ -3114,6 +3161,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         cache: &mut A::Cache,
         tensor_parallel_group: Option<&safemlx::distributed::Group>,
         stream: &Stream,
+        batch_resident_groups: bool,
         mut executor: F,
         mut hook: H,
     ) -> Result<(Array, A::ForwardContext), Error>
@@ -3175,16 +3223,12 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             );
         }
         let initial_completion = async_eval_with_event(initial_roots)?;
-        let device = stream.get_device()?;
-        let mut states = (0..self.graph.groups().len())
-            .map(|_| {
-                #[cfg(test)]
-                if self.force_serial_execution {
-                    return GroupExecutionState::new(stream.clone());
-                }
-                GroupExecutionState::new(Stream::new_with_device(&device))
-            })
+        let mut states = self
+            .group_execution_streams(stream)?
+            .into_iter()
+            .map(GroupExecutionState::new)
             .collect::<Vec<GroupExecutionState<A::Layer>>>();
+        let batch_resident_groups = batch_resident_groups && self.resident_layers.is_some();
         let mut ready_set = ExecutionGroupReadySet::new(&self.graph);
         let mut group_outputs: Vec<Option<Array>> = vec![None; self.graph.groups().len()];
         let mut remaining_consumers = self.graph.consumer_counts();
@@ -3343,6 +3387,10 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                             .retained_context_arrays(&context, group_index, layer_count);
                     let completion =
                         async_eval_with_event(std::iter::once(&hidden).chain(retained_context))?;
+                    #[cfg(test)]
+                    self.last_ready_set_trace
+                        .completion_boundaries
+                        .push((group_index, layer_count));
                     states[group_index].hidden = Some(hidden.clone());
                     states[group_index].completion = Some(completion);
                     states[group_index].ordered = true;
@@ -3374,6 +3422,84 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                         Some(Err(error)) => return Err(error),
                         None => {}
                     }
+                }
+
+                if batch_resident_groups {
+                    let mut hidden = states[group_index]
+                        .hidden
+                        .take()
+                        .expect("started group has hidden state");
+                    let start = states[group_index].next_layer;
+                    for index in start..layer_count {
+                        hidden = executor(
+                            &mut self.adapter,
+                            group_index,
+                            index,
+                            &mut self
+                                .resident_layers
+                                .as_mut()
+                                .expect("resident batching requires materialized layers")
+                                [group_index][index],
+                            &hidden,
+                            cache,
+                            &mut context,
+                            &execution,
+                        )?;
+                        hook(group_index, index, &mut context)?;
+                        #[cfg(test)]
+                        self.last_ready_set_trace.submissions.push((
+                            group_index,
+                            index,
+                            group_stream.get_index()?,
+                        ));
+                    }
+                    states[group_index].next_layer = layer_count;
+                    hidden = self.adapter.complete_execution_group_with_execution(
+                        group_index,
+                        &hidden,
+                        cache,
+                        &mut context,
+                        &execution,
+                    )?;
+                    let retained = (0..layer_count)
+                        .flat_map(|index| self.adapter.retained_arrays(cache, group_index, index))
+                        .collect::<Vec<_>>();
+                    let retained_context =
+                        self.adapter
+                            .retained_context_arrays(&context, group_index, layer_count);
+                    let completion = async_eval_with_event(
+                        std::iter::once(&hidden)
+                            .chain(retained)
+                            .chain(retained_context),
+                    )?;
+                    #[cfg(test)]
+                    {
+                        self.last_ready_set_trace
+                            .completion_boundaries
+                            .push((group_index, layer_count));
+                        let stream_index = group_stream.get_index()?;
+                        for (other_group, other) in states.iter().enumerate() {
+                            let distinct_event = other_group != group_index
+                                && other.stream.get_index()? != stream_index
+                                && other.completion.is_some();
+                            if distinct_event {
+                                self.last_ready_set_trace
+                                    .independent_group_events
+                                    .push((other_group, group_index));
+                            }
+                        }
+                    }
+                    states[group_index].hidden = Some(hidden.clone());
+                    states[group_index].completion = Some(completion);
+                    states[group_index].ordered = true;
+                    // Resident parameters need no completion-gated lease release.
+                    // Keep the event only as an on-device dependency for consumers;
+                    // the final output synchronization covers the whole graph.
+                    states[group_index].completed = true;
+                    group_outputs[group_index] = Some(hidden);
+                    ready_set.ordered(group_index);
+                    progressed = true;
+                    continue;
                 }
 
                 let index = states[group_index].next_layer;
@@ -3517,6 +3643,9 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                 )?;
                 #[cfg(test)]
                 {
+                    self.last_ready_set_trace
+                        .completion_boundaries
+                        .push((group_index, states[group_index].next_layer));
                     let stream_index = group_stream.get_index()?;
                     self.last_ready_set_trace
                         .submissions
@@ -3556,6 +3685,9 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         let hidden = group_outputs[self.graph.output()]
             .take()
             .expect("validated execution graph output was ordered");
+        if let Some(completion) = states[self.graph.output()].completion.as_ref() {
+            completion.wait_on(stream)?;
+        }
         let final_execution = match (topology, tensor_parallel_group) {
             (Some(topology), Some(group)) => {
                 crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
@@ -3588,6 +3720,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         cache: &mut A::Cache,
         group: &safemlx::distributed::Group,
         stream: &Stream,
+        batch_resident_groups: bool,
         executor: F,
         hook: H,
     ) -> Result<(Array, A::ForwardContext), Error>
@@ -3604,7 +3737,15 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         ) -> Result<Array, Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
     {
-        self.forward_ready_set_with_hooks(input, cache, Some(group), stream, executor, hook)
+        self.forward_ready_set_with_hooks(
+            input,
+            cache,
+            Some(group),
+            stream,
+            batch_resident_groups,
+            executor,
+            hook,
+        )
     }
 
     /// Runs a generalized forward pass while allowing the caller to replace
@@ -3634,7 +3775,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             &Stream,
         ) -> Result<Array, Error>,
     {
-        self.forward_with_hooks(input, cache, stream, executor, |_, _, _| Ok(()))
+        self.forward_with_hooks(input, cache, stream, false, executor, |_, _, _| Ok(()))
             .map(|(output, _)| output)
     }
 
@@ -3695,7 +3836,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             &Stream,
         ) -> Result<Array, Error>,
     {
-        self.forward_with_hooks(input, cache, stream, executor, |_, _, _| Ok(()))
+        self.forward_with_hooks(input, cache, stream, false, executor, |_, _, _| Ok(()))
     }
 
     /// Runs a generalized forward pass and invokes `hook` after each execution unit.
@@ -3717,6 +3858,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             input,
             cache,
             stream,
+            false,
             |adapter, group, index, layer, hidden, cache, context, stream| {
                 let execution =
                     crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(
@@ -3736,6 +3878,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         input: A::Input<'a>,
         cache: &mut A::Cache,
         stream: &Stream,
+        batch_resident_groups: bool,
         mut executor: F,
         hook: H,
     ) -> Result<(Array, A::ForwardContext), Error>
@@ -3757,6 +3900,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             cache,
             None,
             stream,
+            batch_resident_groups,
             |adapter, group, index, layer, hidden, cache, context, execution| {
                 executor(
                     adapter,
@@ -5998,6 +6142,73 @@ mod tests {
                 )
                 .unwrap();
             assert_close(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn fully_resident_execution_batches_a_group_behind_one_completion_boundary() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let model_args = args("llama", false, None);
+        let mut reference = llama::ResidentModel::new(model_args.clone(), stream).unwrap();
+        initialize(&mut reference, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &reference);
+
+        let adapter =
+            crate::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(model_args, stream)
+                .unwrap();
+        let mut layerwise = load_safetensors_layerwise_model(
+            dir.path(),
+            adapter,
+            LayerWeightResidency::FullyResident,
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut reference_cache = reference.new_cache();
+        let mut layerwise_cache = LlamaCache::Device(reference.new_cache());
+
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = reference
+                .forward(
+                    llama::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut reference_cache,
+                    },
+                    stream,
+                )
+                .unwrap();
+            let actual = layerwise
+                .forward(
+                    crate::architectures::llama::layerwise::LlamaAdapterInput {
+                        inputs: &tokens,
+                        mask: None,
+                    },
+                    &mut layerwise_cache,
+                    stream,
+                )
+                .unwrap();
+
+            assert_close(&actual, &expected);
+            assert_eq!(
+                layerwise
+                    .ready_set_trace()
+                    .submissions()
+                    .iter()
+                    .map(|&(group, layer, _)| (group, layer))
+                    .collect::<Vec<_>>(),
+                [(0, 0), (0, 1), (0, 2)]
+            );
+            assert_eq!(
+                layerwise.ready_set_trace().completion_boundaries(),
+                &[(0, 3)]
+            );
         }
     }
 
