@@ -1144,7 +1144,7 @@ fn muse_gguf_store(
     if let Some(mmproj) = mmproj {
         builder = builder.add_checkpoint(
             mmproj.checkpoint.clone(),
-            resident::translate_mmproj_weight_name,
+            resident::translate_mmproj_store_weight_name,
         )?;
     }
     Ok(Arc::new(builder.build()?))
@@ -1602,10 +1602,16 @@ impl MuseGlimmerLayerwiseAdapter {
         execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        Ok(match (&mut self.parallel_embedding, execution) {
+        let hidden = match (&mut self.parallel_embedding, execution) {
             (Some(embedding), Some(execution)) => embedding.forward(tokens, execution)?,
             _ => self.embedding.forward(tokens, stream)?,
-        })
+        };
+        let stream = execution.map_or(stream, |execution| execution.stream());
+        Ok(resident::rms_norm_without_scale(
+            &hidden,
+            self.args.rms_norm_eps,
+            stream,
+        )?)
     }
 
     pub(crate) fn finish_pipeline_text(
@@ -2164,6 +2170,8 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         match input {
             MuseGlimmerAdapterInput::Decode { inputs, mask } => {
                 let hidden = self.embedding.forward(inputs, stream)?;
+                let hidden =
+                    resident::rms_norm_without_scale(&hidden, self.args.rms_norm_eps, stream)?;
                 Ok(LayerwiseForwardState {
                     hidden,
                     context: MuseGlimmerForwardContext {
@@ -2195,6 +2203,11 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
                     Some(embedding) => embedding.forward(inputs, execution)?,
                     None => self.embedding.forward(inputs, execution.stream())?,
                 };
+                let hidden = resident::rms_norm_without_scale(
+                    &hidden,
+                    self.args.rms_norm_eps,
+                    execution.stream(),
+                )?;
                 Ok(LayerwiseForwardState {
                     hidden,
                     context: MuseGlimmerForwardContext {
@@ -3111,6 +3124,8 @@ impl MuseGlimmerLayerwiseAdapter {
                         }
                         _ => self.embedding.forward(tokens, stream)?,
                     };
+                    let hidden =
+                        resident::rms_norm_without_scale(&hidden, self.args.rms_norm_eps, stream)?;
                     parts.push(MusePreparedPart::Text(hidden));
                 }
                 (

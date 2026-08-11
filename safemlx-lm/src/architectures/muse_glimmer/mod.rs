@@ -64,7 +64,7 @@ use crate::{
     },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
-        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, GgufTensorNames,
+        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, GgufTensorNames,
         StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
@@ -570,7 +570,11 @@ fn quantization_for(
     }
 }
 
-fn rms_norm_without_scale(x: &Array, eps: f32, stream: &Stream) -> Result<Array, Exception> {
+pub(crate) fn rms_norm_without_scale(
+    x: &Array,
+    eps: f32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     let variance = mean_axis(&x.square(stream)?, -1, true, stream)?;
     x.multiply(
         rsqrt(variance.add(Array::from_f32(eps), stream)?, stream)?,
@@ -2291,7 +2295,7 @@ where
     ) -> Result<Self::Output, Self::Error> {
         let AttentionInput { x, mask, cache } = input;
 
-        let normed = self.input_layernorm.forward(x, stream)?;
+        let normed = self.normalize_input(x, stream)?;
         let self_attn_input = AttentionInput {
             x: &normed,
             mask,
@@ -3303,6 +3307,10 @@ pub(crate) fn translate_mmproj_weight_name(name: &str) -> String {
     name.into()
 }
 
+pub(crate) fn translate_mmproj_store_weight_name(name: &str) -> String {
+    format!("model.{}", translate_mmproj_weight_name(name))
+}
+
 /// Loads a Muse-Glimmer GGUF checkpoint.
 ///
 /// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
@@ -3920,6 +3928,27 @@ mod tests {
         json!({
             "architectures": ["MuseGlimmerForConditionalGeneration"],
             "model_type": "muse_glimmer",
+            "image_token_id": 30,
+            "video_token_id": 29,
+            "out_hidden_size": 16,
+            "projector_hidden_size": 8,
+            "vision_config": {
+                "model_type": "muse_glimmer_vision",
+                "hidden_act": "gelu",
+                "hidden_size": 4,
+                "intermediate_size": 8,
+                "num_attention_heads": 1,
+                "num_hidden_layers": 1,
+                "patch_size": 2,
+                "patch_temporal": 2,
+                "merge_size": 2,
+                "pos_emb_height": 2,
+                "pos_emb_width": 2,
+                "max_position_embeddings": 4,
+                "layer_norm_eps": 1e-5,
+                "layer_types": ["full_attention"],
+                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+            },
             "text_config": {
                 "model_type": "muse_glimmer_text",
                 "hidden_size": 24,
@@ -4005,22 +4034,113 @@ mod tests {
         let cases = [
             (
                 "v.patch_embd.weight",
-                "model.vision_tower.patch_embedder.patch_embedding.weight",
+                "vision_tower.patch_embedder.patch_embedding.weight",
             ),
             (
                 "v.blk.49.attn_q.weight",
-                "model.vision_tower.layers.49.attn.q_proj.weight",
+                "vision_tower.layers.49.attn.q_proj.weight",
             ),
             (
                 "v.blk.7.ffn_down.weight",
-                "model.vision_tower.layers.7.mlp.fc2.weight",
+                "vision_tower.layers.7.mlp.fc2.weight",
             ),
-            ("mm.0.weight", "model.vision_adapter.fc1.weight"),
-            ("mm.1.weight", "model.vision_adapter.fc2.weight"),
-            ("mm.2.weight", "model.vision_projection.weight"),
+            ("mm.0.weight", "vision_adapter.fc1.weight"),
+            ("mm.1.weight", "vision_adapter.fc2.weight"),
+            ("mm.2.weight", "vision_projection.weight"),
         ];
         for (source, expected) in cases {
             assert_eq!(translate_mmproj_weight_name(source), expected);
+        }
+        assert_eq!(
+            translate_mmproj_store_weight_name("mm.2.weight"),
+            "model.vision_projection.weight"
+        );
+    }
+
+    #[test]
+    fn strictly_binds_release_safetensors_text_namespace() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let args = config_from_hf_value(&tiny_config()).unwrap();
+        let source = Model::new(args.clone(), stream).unwrap();
+        let mut checkpoint = source
+            .parameters()
+            .flatten()
+            .into_iter()
+            .map(|(name, value)| {
+                let name = name.strip_prefix("model.").map_or_else(
+                    || name.to_string(),
+                    |rest| format!("model.language_model.{rest}"),
+                );
+                (name, value.clone())
+            })
+            .collect::<HashMap<_, _>>();
+        checkpoint.insert(
+            "model.vision_projection.weight".into(),
+            Array::from_slice(&[0.0_f32], &[1]),
+        );
+
+        let mut loaded = Model::new(args, stream).unwrap();
+        let config = safetensors_strict_load_config();
+        let mut report = StrictLoadReport::default();
+        crate::runtime::checkpoint::load::load_arrays_strict(
+            &mut loaded,
+            checkpoint,
+            &config,
+            &mut report,
+        )
+        .unwrap();
+        report.finish(&loaded, &config).unwrap();
+    }
+
+    #[test]
+    fn ordinary_block_matches_observed_centered_norm_execution() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let args = config_from_hf_value(&tiny_config()).unwrap();
+        let mut direct = TransformerBlock::new_for_layer(&args, 0, stream).unwrap();
+        for parameter in direct.parameters_mut().flatten().values_mut() {
+            let shape = parameter.shape().to_vec();
+            let dtype = parameter.dtype();
+            **parameter = safemlx::ops::ones_dtype(&shape, dtype, stream).unwrap();
+        }
+        let mut observed = direct.clone();
+        let values = (0..args.hidden_size)
+            .map(|index| (index as f32 - 11.0) / 7.0)
+            .collect::<Vec<_>>();
+        let input = Array::from_slice(&values, &[1, 1, args.hidden_size]);
+
+        let actual = direct
+            .forward(
+                AttentionInput::<ConcatKeyValueCache> {
+                    x: &input,
+                    mask: None,
+                    cache: None,
+                },
+                stream,
+            )
+            .unwrap();
+        let expected = observed
+            .forward_with_observer::<ConcatKeyValueCache>(
+                AttentionInput {
+                    x: &input,
+                    mask: None,
+                    cache: None,
+                },
+                stream,
+                "model.language_model.layers.0",
+                &mut crate::runtime::execution::inspection::NoopObserver,
+            )
+            .unwrap();
+        safemlx::transforms::eval([&actual, &expected]).unwrap();
+        for (actual, expected) in actual
+            .evaluated()
+            .unwrap()
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected.evaluated().unwrap().as_slice::<f32>())
+        {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
         }
     }
 }
@@ -4061,8 +4181,10 @@ pub fn load_safetensors(
         crate::api::ModelLoadOptions::default(),
     )?;
     let mut model = Model::new(model_args, stream)?;
-
-    load_safetensors_dir_lenient(&mut model, model_dir, weights_stream)?;
+    let config = safetensors_strict_load_config();
+    let mut report = StrictLoadReport::default();
+    load_safetensors_dir_strict(&mut model, model_dir, weights_stream, &config, &mut report)?;
+    report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
     Ok(model)
@@ -4091,7 +4213,7 @@ pub fn load_safetensors_quantized(
     }
     model_args.quantization = Some(quantization);
     let mut model = Model::new(model_args, stream)?;
-    let config = StrictLoadConfig::default();
+    let config = safetensors_strict_load_config();
     let mut report = StrictLoadReport::default();
     load_safetensors_dir_quantized_strict(
         &mut model,
@@ -4105,6 +4227,16 @@ pub fn load_safetensors_quantized(
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(model)
+}
+
+fn safetensors_strict_load_config() -> StrictLoadConfig {
+    StrictLoadConfig::default()
+        .rewrite_prefix("model.language_model.", "model.")
+        // The resident causal-LM object owns only the text model. The processor's
+        // architecture adapter loads these independently for multimodal requests.
+        .allow_unused_prefix("model.vision_tower.")
+        .allow_unused_prefix("model.vision_adapter.")
+        .allow_unused_prefix("model.vision_projection.")
 }
 
 impl<C> CausalLm<Vec<Option<C>>> for Model
