@@ -45,7 +45,6 @@ thread_local! {
     static Q4K_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
-    static Q4K_SELECTED_GATE_UP_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_SELECTED_DOWN_REDUCE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
@@ -979,12 +978,10 @@ pub fn native_selected_gate_up(
             up.shape()
         )));
     }
-    if native_execution_backend(stream)? == NativeExecutionBackend::Metal
-        && gate.format() == NativeQuantizationFormat::GgufQ4K
-    {
-        return q4k_selected_gate_up_metal(hidden, gate, up, expert_ids, stream);
-    }
-
+    // Compose the independently validated grouped kernels here. Combining both
+    // projections and GELU in one Metal kernel changes long-running decode
+    // numerics enough to destabilize real Q4_K expert checkpoints, even when
+    // small synthetic outputs satisfy a loose all-close comparison.
     let routes = expert_ids.dim(0);
     let routed_hidden = broadcast_to(hidden, &[routes, gate.columns], stream)?;
     let gate = native_grouped_linear(&routed_hidden, gate, expert_ids, stream)?;
@@ -1178,36 +1175,6 @@ fn q4k_grouped_metal(
             .as_ref()
             .expect("Q4_K grouped kernel initialized")
             .apply_one_device([input, view.storage.bytes(), group_ids], &config, stream)
-    })
-}
-
-fn q4k_selected_gate_up_metal(
-    hidden: &Array,
-    gate: &NativeQuantizedTensor,
-    up: &NativeQuantizedTensor,
-    expert_ids: &Array,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    let dtype = validate_activation_dtype(hidden)?;
-    let routes = expert_ids.dim(0);
-    let config = q4k_config(routes, gate, routes, gate.rows, dtype)
-        .with_template_arg_int("GATE_PHYSICAL_ROWS", gate.physical_rows)
-        .with_template_arg_int("GATE_ROW_START", gate.row_start)
-        .with_template_arg_int("UP_PHYSICAL_ROWS", up.physical_rows)
-        .with_template_arg_int("UP_ROW_START", up.row_start)
-        .with_template_arg_int("MATRIX_COUNT", gate.matrix_count);
-    Q4K_SELECTED_GATE_UP_KERNEL.with(|cell| -> Result<_, Exception> {
-        if cell.borrow().is_none() {
-            *cell.borrow_mut() = Some(q4k_selected_gate_up_kernel()?);
-        }
-        cell.borrow()
-            .as_ref()
-            .expect("Q4_K selected gate/up kernel initialized")
-            .apply_one_device(
-                [hidden, gate.storage.bytes(), up.storage.bytes(), expert_ids],
-                &config,
-                stream,
-            )
     })
 }
 
@@ -1955,50 +1922,6 @@ fn q4k_grouped_kernel() -> Result<MetalKernel, Exception> {
             Q4K_TILED_EPILOGUE,
         ]
         .concat(),
-        Q4K_METAL_HEADER,
-        true,
-        false,
-    )
-}
-
-fn q4k_selected_gate_up_kernel() -> Result<MetalKernel, Exception> {
-    MetalKernel::new(
-        "native_q4k_selected_gate_up_separate",
-        ["input", "gate_weight", "up_weight", "expert_ids"],
-        ["out"],
-        concat!(
-            "uint lane = thread_position_in_grid.x;",
-            "uint route = thread_position_in_grid.y / OUT_GRID;",
-            "uint out_col = thread_position_in_grid.y % OUT_GRID;",
-            "float gate_acc = 0.0f;",
-            "float up_acc = 0.0f;",
-            "if (out_col < OUT_DIM) {",
-            " uint expert = uint(expert_ids[route]);",
-            " uint gate_row = expert * GATE_PHYSICAL_ROWS + GATE_ROW_START + out_col;",
-            " uint up_row = expert * UP_PHYSICAL_ROWS + UP_ROW_START + out_col;",
-            " uint gate_base = gate_row * BLOCKS * 144;",
-            " uint up_base = up_row * BLOCKS * 144;",
-            " for (uint block = 0; block < BLOCKS; ++block) {",
-            "  uint gb = gate_base + block * 144;",
-            "  uint ub = up_base + block * 144;",
-            "  uint input_block = block * 256;",
-            "  for (uint g = 0; g < 8; ++g) {",
-            "   for (uint i = lane; i < 32; i += REDUCTION_TILE) {",
-            "    float x = float(input[input_block + g * 32 + i]);",
-            "    gate_acc += x * q4k_value(gate_weight, gb, g, i);",
-            "    up_acc += x * q4k_value(up_weight, ub, g, i);",
-            "   }",
-            "  }",
-            " }",
-            "}",
-            "float gate = simd_sum(gate_acc);",
-            "float up = simd_sum(up_acc);",
-            "if (lane == 0 && out_col < OUT_DIM) {",
-            " float c = 0.7978845608028654f;",
-            " float activated = 0.5f * gate * (1.0f + metal::tanh(c * (gate + 0.044715f * gate * gate * gate)));",
-            " out[route * OUT_DIM + out_col] = T(activated * up);",
-            "}"
-        ),
         Q4K_METAL_HEADER,
         true,
         false,
