@@ -80,6 +80,12 @@ pub enum WeightConvention {
     Gguf,
 }
 
+impl WeightConvention {
+    const fn uses_traditional_rope(self) -> bool {
+        matches!(self, Self::Gguf)
+    }
+}
+
 /// Builds the authoritative per-layer paged KV layout for any Muse-Glimmer
 /// execution route.
 pub(crate) fn new_paged_cache_with_manager(
@@ -755,7 +761,7 @@ impl Attention {
         let rope = initialize_rope(
             head_dim,
             args.rope_theta,
-            false,
+            args.weight_convention.uses_traditional_rope(),
             &args.rope_scaling,
             args.max_position_embeddings,
             stream,
@@ -4088,6 +4094,52 @@ mod tests {
 
         let args = config_from_gguf_catalog(&arrays, &metadata, "muse-glimmer", false).unwrap();
         assert_eq!(args.model_type, "muse_glimmer_text");
+    }
+
+    #[test]
+    fn gguf_qk_permutation_preserves_rotary_coordinates() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let mut hf_rope = initialize_rope(
+            4,
+            10_000.0,
+            WeightConvention::HuggingFace.uses_traditional_rope(),
+            &None,
+            128,
+            stream,
+        )
+        .unwrap();
+        let mut gguf_rope = initialize_rope(
+            4,
+            10_000.0,
+            WeightConvention::Gguf.uses_traditional_rope(),
+            &None,
+            128,
+            stream,
+        )
+        .unwrap();
+
+        let hf = Array::from_slice(&[0.1_f32, 0.2, 0.3, 0.4, 1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 4]);
+        // GGUF interleaves the two halves of each projected Q/K head.
+        let gguf = Array::from_slice(&[0.1_f32, 0.3, 0.2, 0.4, 1.0, 3.0, 2.0, 4.0], &[1, 1, 2, 4]);
+        let hf = hf_rope.forward(nn::RopeInput::new(&hf), stream).unwrap();
+        let gguf = gguf_rope
+            .forward(nn::RopeInput::new(&gguf), stream)
+            .unwrap();
+        safemlx::transforms::eval([&hf, &gguf]).unwrap();
+
+        let hf_evaluated = hf.evaluated().unwrap();
+        let gguf_evaluated = gguf.evaluated().unwrap();
+        let hf = hf_evaluated.as_slice::<f32>();
+        let gguf = gguf_evaluated.as_slice::<f32>();
+        for offset in [0, 4] {
+            for (hf_index, gguf_index) in [(0, 0), (1, 2), (2, 1), (3, 3)] {
+                assert!(
+                    (hf[offset + hf_index] - gguf[offset + gguf_index]).abs() < 1e-5,
+                    "rotary coordinate mismatch at {offset}+{hf_index}"
+                );
+            }
+        }
     }
 
     #[test]
