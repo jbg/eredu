@@ -511,6 +511,10 @@ mod tests {
             )
             .unwrap();
         let (arrays, _) = collect_gguf(&path);
+        let expected_array_count = formats
+            .iter()
+            .map(|(_, ty)| if ty.has_native_execution() { 1 } else { 3 })
+            .sum::<usize>();
         for (name, ty) in &formats {
             let prefix = name.strip_suffix(".weight").unwrap();
             if ty.has_native_execution() {
@@ -533,7 +537,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(arrays.len(), 39);
+        assert_eq!(arrays.len(), expected_array_count);
 
         #[cfg(feature = "metal")]
         if crate::metal::is_available().unwrap_or(false) {
