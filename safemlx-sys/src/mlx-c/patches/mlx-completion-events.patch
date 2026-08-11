@@ -332,7 +332,7 @@ index 00000000..1b002a68
 +  std::optional<Event> event_;
 +  std::optional<Device> device_;
 +
-+  friend Completion async_eval_with_completion(std::vector<array> outputs);
++  friend MLX_API Completion async_eval_with_completion(std::vector<array> outputs);
 +};
 +
 +} // namespace mlx::core

@@ -1104,7 +1104,7 @@ index 000000000..a49cd0a0c
 +
 +  friend class CopyToHostTransfer;
 +  friend class CopyFromHostTransfer;
-+  friend DeviceTransfer copy_from_host(
++  friend MLX_API DeviceTransfer copy_from_host(
 +      const HostTransferBuffer& source,
 +      StreamOrDevice stream);
 +};
