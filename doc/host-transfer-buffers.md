@@ -1,94 +1,67 @@
 # Host-transfer buffers
 
-SafeMLX carries `mlx-host-transfer-buffer.patch` against pinned MLX 0.32.0 and
-exposes the resulting storage through MLX-C and safe Rust. This is a storage and
-copy primitive, not a second execution runtime: transfers are MLX primitives,
-are submitted through the ordinary lazy evaluator, and return the existing
-single-shot completion type.
+`HostTransferBuffer` is typed, host-addressable storage for explicit
+array-to-host and host-to-array transfers. It is separate from ordinary MLX
+arrays and uses the normal lazy evaluator and completion events for ordering.
 
-## Storage contract
+## Storage policies
 
-`HostTransferPolicy::Transfer` means transfer-ready, host-addressable storage:
+`HostTransferPolicy::Transfer` selects the backend's transfer-ready storage:
 
-- CPU-only MLX uses owned CPU allocation.
-- Metal uses `MTL::StorageModeShared`. It is transfer-ready but remains Apple
-  unified memory and does not create capacity separate from system RAM.
-- CUDA uses explicit page-locked storage from `cudaMallocHost`.
+| Backend | Storage kind |
+| --- | --- |
+| CPU | owned CPU allocation |
+| Metal | shared Metal storage |
+| CUDA | page-locked host storage |
 
-`HostTransferPolicy::Managed` selects `cudaMallocManaged` explicitly. CPU and
-Metal reject it rather than silently mapping it to a different allocation. A
-buffer reports its actual `HostTransferStorageKind`, shape, dtype, logical byte
-length, and allocation capacity.
+`HostTransferPolicy::Managed` explicitly selects CUDA managed memory. CPU and
+Metal reject it rather than silently substituting another storage kind.
 
-Transfer storage has a dedicated allocation path instead of borrowing a
-possibly larger entry from MLX's ordinary buffer cache. CPU storage uses an
-anonymous OS page allocation whose charged extent includes the allocator
-header. Metal rounds every non-empty shared buffer to the VM page size. CUDA
-rounds pinned and managed requests to a conservative 64 KiB backing extent
-before calling the runtime allocator. The backend publishes the same charged
-extent before allocation and from the resulting buffer, so a residency manager
-can reserve it before allocating without a transient overcommit. Logical copy
-lengths remain the tensor's `nbytes`; unused backing capacity is never copied.
+A buffer reports its actual storage kind, shape, dtype, logical byte length,
+and allocation capacity. Capacity can exceed logical length because backend
+allocations are page- or granularity-rounded. Copy operations transfer only the
+logical bytes.
 
-`host_transfer_memory_stats` reports process-wide active and peak physical
-bytes and allocation counts independently for CPU, Metal shared, CUDA pinned,
-and CUDA managed storage. Resetting a peak is race-safe with concurrent
-allocation. This includes every allocation owned by this primitive, including
-CUDA memory returned by `cudaMallocHost`, even though pinned bytes are outside
-MLX's device allocator counters. It intentionally does not claim visibility
-into opaque bookkeeping owned internally by a platform driver; the direct
-`cudaMemcpyAsync` path has no MLX-owned payload staging allocation, and backend
-tests check the device allocator independently for accidental staging.
+`host_transfer_capacity_upper_bound` lets a residency manager reserve a safe
+capacity before allocation. `host_transfer_memory_stats` reports active and
+peak owned bytes and allocation counts separately for CPU, Metal shared, CUDA
+pinned, and CUDA managed storage. Those counters do not claim visibility into
+opaque driver bookkeeping.
 
-CUDA copies use `cudaMemcpyAsync` on the MLX command encoder. When CUDA graphs
-are enabled, the encoder records a dependency-tracked memcpy node. Metal uses
-its existing GPU copy path into a distinct shared allocation. CPU copies are
-queued on the selected CPU stream. Noncontiguous inputs are made contiguous in
-the same evaluated graph before transfer.
+## Ownership and byte access
 
-## Ownership and ordering
+The safe Rust API prevents access while a transfer is incomplete:
 
-Native buffers use shared allocation ownership internally, so destroying a
-public handle does not invalidate submitted work. MLX-C exposes opaque owning
-handles and returns an `mlx_event` with every submitted copy.
+- `PendingHostTransfer` exposes its destination bytes only after a successful
+  completion wait.
+- Host-to-array submission consumes a mutable buffer and returns it with the
+  completed array, so safe code cannot mutate an in-flight source.
+- `freeze()` creates immutable, shareable storage. Each borrowed promotion from
+  a frozen buffer has an independent completion event and retains the native
+  allocation until that submission finishes.
+- Uninitialized bytes require an exclusive mutable borrow.
 
-Safe Rust strengthens that contract:
+Ordering a GPU consumer stream makes the buffer safe for that consumer, but it
+does not make the bytes safe for CPU observation. Host access still requires a
+successful synchronization.
 
-- `PendingHostTransfer` does not expose its destination bytes before a
-  successful completion wait.
-- Host-to-array submission consumes the host buffer. The completed operation
-  returns both the array and reusable buffer, preventing mutation during an
-  in-flight copy.
-- `freeze()` converts an exclusively mutable buffer into
-  `ImmutableHostTransferBuffer`. Frozen storage is shareable and supports
-  repeated borrowed host-to-array submissions; every submission retains the
-  native allocation through its lazy graph and returns its own completion
-  event.
-- Uninitialized buffers expose mutable bytes only through an exclusive Rust
-  borrow.
+```rust
+use safemlx::{
+    Array, Device, DeviceType, HostTransferBuffer, HostTransferPolicy, Stream,
+};
 
-Events remain available on pending transfers for completion queries. Host byte
-access still requires synchronization; ordering a GPU consumer stream alone
-does not make CPU observation safe.
+let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+let source = Array::from_slice(&[1.0f32, 2.0], &[2]);
+let host = HostTransferBuffer::copy_from_array(
+    &source,
+    HostTransferPolicy::Transfer,
+    &stream,
+)?.synchronize()?;
+let (restored, host) = host.copy_to_array(&stream)?.synchronize()?;
+# let _ = (restored, host);
+# Ok::<(), safemlx::error::Exception>(())
+```
 
-## Current adoption boundary
-
-Paged live-cache residency stores sealed host-tier key/value and compressed-MLA
-blocks as immutable typed host-transfer buffers. Its physical block state is a
-sum type: a block is device arrays, host buffers, or disk backing, with only the
-pending operation valid for that state. Disk reads and writes serialize the
-typed host bytes directly, and promotion creates device arrays only on demand.
-Device demotion is a fourth, explicitly transitional variant: a dedicated
-worker creates a task-local stream on the cache's bound execution device and
-retains the device arrays and pending typed destinations through both completion
-events. Residency accounting charges logical device bytes and the destination's
-physical host capacity simultaneously until immutable host ownership is
-published. Disk reads reserve their host capacity before the worker allocates
-and retain that charge through cancellation and resource retirement.
-
-Immutable weight residency and independent expert caching use the same typed
-host-transfer storage for every host-planned parameter binding. Host leases
-expose immutable buffers rather than executable arrays; device promotion
-submits one buffer-to-array copy per binding and retains the host owners and
-their events through the manager's aggregate completion. Device-resident
-bindings remain ordinary MLX arrays.
+SafeMLX uses frozen buffers for host-resident model weights, expert-cache
+bindings, and sealed live-cache blocks. A residency report charges the buffer's
+physical capacity, not only its logical tensor length.

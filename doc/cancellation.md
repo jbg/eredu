@@ -1,97 +1,60 @@
 # Cancellation and bounded execution
 
-SafeMLX cancellation is cooperative at scheduler submission boundaries. It
-does not claim to interrupt an executing Metal kernel or a committed Metal
-command buffer. The current MLX/Metal event API can query, wait for, and order
-an exact completion; it does not expose physical cancellation of work already
-submitted to Metal.
+SafeMLX schedulers cancel cooperatively at submission and publication
+boundaries. They do not claim to interrupt an executing kernel or a committed
+Metal, CUDA, CPU, or distributed operation.
 
-## Transition lifecycle
+## Work lifecycle
 
-The architecture-neutral `FairScheduler` is authoritative for every decoder
-pipeline microbatch and Moshi/PersonaPlex frame:
+A scheduled transition moves through these states:
 
-- `Queued`: accepted, but no descriptor or state branch exists.
-- `Prepared`: the descriptor and a semantic state branch exist, but no backend
-  work has been issued.
-- `Submitted`: the branch, output, retained arrays and leases, request/work
-  identity, deadline, disposition, and exact backend completion are owned by
-  one transition.
-- `Completing`: the exact completion succeeded and publication is being
-  resolved.
-- `Committed`: the branch became canonical and its output became visible.
-- `Abandoned`: cancellation won before publication. Submitted resources remain
-  retained until the exact completion resolves, then branch-local deltas are
-  rolled back and dropped.
-- `Failed`: preparation, submission, asynchronous execution, rollback, or
-  commit failed.
+1. `Queued`: accepted, but no request-state branch or backend descriptor exists.
+2. `Prepared`: a branch and descriptor exist, but no backend work was issued.
+3. `Submitted`: the transition owns its branch, output arrays, leases, and
+   exact completion event.
+4. `Completing`: backend execution succeeded and publication is being resolved.
+5. `Committed`, `Abandoned`, or `Failed`: the branch is published, rolled back,
+   or rejected.
 
-Queued cancellation does not construct a descriptor. Prepared cancellation
-drops the branch without encoding or submission. Submitted cancellation marks
-the transition abandoned and returns without waiting for it or unrelated
-stream work. A completion racing cancellation has one winner: completion
-polled first can commit; cancellation recorded first prevents publication.
+Queued cancellation avoids preparation. Prepared cancellation drops the branch
+without submission. Submitted cancellation marks the transition abandoned and
+returns without waiting; the transition keeps its arrays and resource leases
+until its exact completion resolves, then rolls back the branch. Abandoned
+output is never published.
 
-Request-local execution failures fail that request and leave unrelated
-requests schedulable. The whole scheduler is poisoned only when descriptor,
-completion, cancellation, or failure consensus proves that shared distributed
-operation ordering is unsafe.
+If completion and cancellation race, the first recorded disposition wins:
+completion may publish only when it wins before cancellation.
 
-## State transactions
+## Transactional request state
 
-`SemanticStateTransaction` branches semantic request state and supplies the
-only commit boundary. Branches share immutable MLX array backing and copy
-mutable metadata; complete model caches are not deep-copied. Pipeline cache
-branches use the same checkpoint/restore operations as speculative execution.
-Resident tails and state slots are structurally cloned. Paged KV, compressed
-latent, and embedded-predictor cache deltas are removed from their shared
-residency managers when an abandoned exact completion releases the branch.
+`SemanticStateTransaction` is the commit boundary for decoder and realtime
+requests. A branch shares immutable array backing where safe and copies mutable
+metadata. Cache deltas, sampler state, PRNG state, delayed audio frames, and
+semantic events remain branch-local until commit. Cancellation therefore
+returns exactly the already committed prefix.
 
-Realtime branches include temporal and depth caches, delayed-stream frames,
-text and audio samplers, and the request PRNG state. None of those objects is
-canonical until the output event succeeds. Abandoned sampled tokens and
-delayed frames are never returned.
+Request-local failures fail that request. The scheduler is poisoned only when
+descriptor, completion, cancellation, or distributed failure consensus shows
+that shared operation ordering can no longer be trusted.
 
-## Bounds and the physical backend interval
+## Bounds and latency
 
-`SchedulerLimits` configures:
+`SchedulerLimits` bounds accepted work, active requests, new submissions per
+turn, submitted transitions, and the program-defined work slice represented by
+one transition. Decoder work reports its microbatch sequence length; realtime
+work reports one frame.
 
-- maximum accepted work and active requests;
-- maximum newly submitted work per turn;
-- maximum submitted transitions globally and per request; and
-- the maximum program-defined execution slice represented by one transition.
+Before submission, cancellation latency is bounded by scheduler progress and no
+backend work is issued. After submission, the non-preemptible interval lasts
+from backend submission until that transition's completion event resolves.
+Queue and slice limits constrain how much work enters this interval; they do
+not shorten already submitted work.
 
-Pipeline work reports its microbatch sequence length as its slice size.
-Realtime work reports one frame. Autoregressive state rejects parallel branches
-even when the numerical per-request bound is larger. A program may permit
-multiple branches only when its branch deltas are independently mergeable.
+Distributed transitions compare descriptors before transport or collective
+payload operations. Cancellation, failure, and completion use topology-scoped
+consensus so every rank retains resources and publishes the same disposition.
 
-Cancellation latency has two components. Before submission it is bounded by
-one scheduler turn and no backend work is issued. After submission the
-unavoidable non-preemptible interval is exactly from that transition's backend
-submission until its exact completion event resolves. Submission-turn and
-slice bounds limit how much additional work can enter that interval; they do
-not shorten an executing kernel or committed command buffer.
-
-## Distributed ordering
-
-Distributed schedule descriptors are compared before point-to-point or
-collective payload operations begin. Cancellation and deadline dispositions
-use topology-scoped exact consensus. Completion polling compares the same
-in-flight work identities and publishes only after all ranks report successful
-exact completion. An abandoned distributed transition retains transport
-endpoints and cache/resource leases until every rank can release it safely.
-No cancellation path performs whole-stream synchronization.
-
-## Capabilities and telemetry
-
-`SchedulerCapabilities` reports configured bounds, observed completion
-backends, physical-preemption support, and the exact non-preemptible interval.
-For current Metal completions, `executing_work_physically_preemptible` is
-`false`.
-
-`SchedulerReport` separates queued, prepared, submitted, completing,
-committed, abandoned, and failed work. It also reports current and peak
-in-flight occupancy, cancellation before and after submission, resources held
-by abandoned work, abandoned release count, deadline expiry, configured turn
-and slice bounds, and last/maximum observed cancellation-to-release latency.
+`SchedulerCapabilities` reports configured bounds and whether a backend offers
+physical preemption. `SchedulerReport` separates lifecycle counts, occupancy,
+cancellation before and after submission, resources held by abandoned work,
+deadline expiry, and cancellation-to-release latency.

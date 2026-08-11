@@ -1,40 +1,9 @@
-## Build the Docs
+# MLX C API documentation sources
 
-### Setup
+This directory contains the Doxygen configuration and supporting files for the
+vendored MLX C API reference. It is not the SafeMLX user guide and is not built
+as part of a normal Cargo build.
 
-Install Doxygen:
-
-```
-brew install doxygen
-```
-
-Install Python packages:
-
-```
-pip install -r requirements.txt
-```
-
-### Build
-
-Build the docs from `mlx-c/docs/`
-
-```
-doxygen && make html
-```
-
-View the docs by running a server in `mlx-c/docs/`:
-
-```
-python -m http.server <port>
-```
-
-and point your browser to `http://localhost:<port>`.
-
-### Push to GitHub Pages
-
-Check-out the `gh-pages` branch (`git switch gh-pages`) and build
-the docs. Then force add the `build/html` directory:
-
-`git add -f build/html`
-
-Commit and push the changes to the `gh-pages` branch.
+Rust users should consult `safemlx` Rustdoc and the [SafeMLX documentation
+index](../../../../doc/README.md). The rendered upstream C reference is
+available from the [MLX C documentation](https://ml-explore.github.io/mlx-c/).

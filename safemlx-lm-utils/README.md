@@ -1,24 +1,23 @@
 # safemlx-lm-utils
 
-`safemlx-lm-utils` contains utility code for MLX language model runtimes.
+`safemlx-lm-utils` contains tokenizer and chat-template utilities for Rust MLX
+language-model runtimes. It supports structured messages, system roles, tool
+metadata, Jinja chat templates, and the tokenizer backends used by
+[`safemlx-lm`](../safemlx-lm/).
 
-The crate is derived from the `mlx-lm-utils` crate in
-[`oxideai/mlx-rs`](https://github.com/oxideai/mlx-rs), introduced upstream in
-[`oxideai/mlx-rs#281`](https://github.com/oxideai/mlx-rs/pull/281), merged as
-commit `7c667cb7`.
-
-The original implementation and authorship belong to the `oxideai/mlx-rs`
-contributors.
-
-This fork adds chat-template support including structured JSON messages, system
-roles, and tool metadata passed into Jinja templates.
-
-## Usage
+Most applications should depend on `safemlx-lm`, which exposes these
+capabilities through its higher-level loading and generation APIs. Use this
+crate directly when integrating the tokenizer or template layer into another
+runtime.
 
 ```toml
 [dependencies]
 safemlx-lm-utils = "0.1"
 ```
+
+Default features enable the Oniguruma and fast SentencePiece-compatible
+tokenizer paths. Consult the crate features in `Cargo.toml` when a smaller or
+more portable build is required.
 
 ## License
 

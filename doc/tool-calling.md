@@ -1,0 +1,139 @@
+# Native tool calling
+
+SafeMLX native tool calling accepts OpenAI-shaped function definitions and
+emits protocol-neutral semantic events. Applications do not need to build a
+grammar, inspect tokenizer internals, or parse a checkpoint-specific wire
+format.
+
+The entry point is `LoadedModel::prepare_chat`, followed by one of the
+`generate_prepared_chat*` methods. The complete example is
+[`safemlx-lm/examples/native_tool_calling.rs`](../safemlx-lm/examples/native_tool_calling.rs).
+
+## Capability gating
+
+Tool support is behavioral and fail-closed. SafeMLX selects a template, checks
+the tokenizer's required special tokens, renders bounded conversations, and
+independently verifies:
+
+- tool-definition rendering;
+- reasoning and visible-text framing;
+- tool-call parsing;
+- argument constraints; and
+- stop behavior.
+
+A repository name, model ID, architecture, template hash, or protocol-looking
+substring does not grant support. An ordinary chat template can remain usable
+for text even when native tool generation is unavailable.
+
+`PreparedChat::native_tool_support()` exposes the result and the recognized
+format identity. `PreparedChat` owns the rendered prompt and private executable
+response plan; callers do not receive dialect parser or grammar state.
+
+## Function schemas
+
+Every preparation validates the entire tool envelope before model execution.
+Function names must be unique, 1–64 bytes long, and contain ASCII letters,
+digits, `_`, or `-`. Parameters must resolve to an object schema.
+
+The supported subset includes:
+
+- nested objects and arrays;
+- required and optional properties;
+- string, number, integer, boolean, and null values;
+- enums; and
+- local, non-recursive `$ref` values.
+
+External or recursive references, unsupported composition keywords, malformed
+bounds, and undeclared additional fields fail during preparation. Tool schemas
+are compiled per request, so independent requests on one loaded model can use
+different tools without sharing mutable parser state.
+
+## Generation APIs
+
+Choose one cohesive generation call:
+
+- `generate_prepared_chat` for ordinary constrained generation;
+- `generate_prepared_chat_mtp` for an external assistant;
+- `generate_prepared_chat_embedded_mtp` for checkpoint prediction heads; or
+- the corresponding batch methods for independently scheduled requests.
+
+All paths use the same tokenizer-aware byte decoder, stop matcher, constraint
+engine, and semantic event pipeline. Speculation and scheduler interleaving can
+change uncommitted work and diagnostics, but not committed tokens, event order,
+or finish reason.
+
+Multimodal requests bind processed media to the complete placeholder emitted by
+the selected checkpoint template. SafeMLX validates placeholder count and
+order, then lets the architecture processor insert its own boundary tokens and
+media tensors. Applications should not manually insert architecture media token
+IDs into rendered text.
+
+## Semantic events
+
+Callbacks receive:
+
+- reasoning deltas;
+- visible-text deltas;
+- tool-call start events;
+- argument fragments keyed by call index;
+- tool-call end events; and
+- exactly one finished event.
+
+Argument fragments may split at arbitrary token boundaries; accumulate them by
+call index. An incomplete or malformed call never receives a synthetic end
+event.
+
+```rust,ignore
+let mut events = Vec::new();
+let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
+    input: PreparedChatInput::rendered_prompt(&prepared),
+    cache: &mut cache,
+    sampling_policy: DefaultSampler,
+    settings: PreparedChatGenerationSettings::default(),
+    caller_stop_sequences: &[],
+    stream,
+    cancellation: GenerationCancellationToken::new(),
+    on_event: |event| events.push(event),
+})?;
+```
+
+Finish reasons distinguish decoded stop sequences, grammar completion,
+checkpoint EOS, maximum tokens, and cancellation. When several conditions
+occur on one committed token, precedence is stop sequence, grammar completion,
+EOS, then maximum tokens.
+
+## Cancellation and backpressure
+
+Each request has a cloneable `GenerationCancellationToken`; each batch lane has
+its own token. Event callbacks are synchronous, so writing to a bounded channel
+naturally applies backpressure. If the downstream consumer closes, the callback
+can cancel its request.
+
+Cancellation emits a final cancelled event and returns exactly the committed
+token prefix. It does not flush hidden stop-sequence lookbehind or partial
+parser state, and it does not publish events from speculative branches. A
+verification already submitted to a backend is retained until its exact safe
+cache boundary, as described in [Cancellation and bounded
+execution](cancellation.md).
+
+## Recognized wire-format families
+
+Reusable profiles cover declarative JSON object/list formats, XML-wrapped JSON,
+named JSON arguments, structural-token JSON, Gemma structural channels,
+Inkling message frames, OpenAI Harmony channels, and LFM2-style Python call
+lists. Multiple model architectures can share a profile when their observable
+byte protocol is equivalent.
+
+Regardless of wire format, the public result is the same semantic event
+vocabulary. Unsupported behavior returns a capability error rather than
+falling back to unconstrained text.
+
+## Raw generation
+
+Raw prompts and `generate_input*` iterators intentionally bypass prepared chat.
+Use them for plain completions and parity work. They do not provide native-tool
+constraints or semantic tool events and should not be used as a fallback after
+a tool-capability failure.
+
+Maintainers extending the recognized protocol set should follow [Adding a
+native tool protocol](tool-protocol-development.md).

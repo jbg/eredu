@@ -1,217 +1,37 @@
 # safemlx-sys
 
-Rust bindings to the mlx-c API. Generated using bindgen.
+`safemlx-sys` provides low-level Rust bindings and native build integration for
+the MLX C API used by `safemlx`. Most applications should use the safe
+[`safemlx`](../safemlx/) crate instead.
 
-## Vendored MLX patches
+The crate vendors MLX C, fetches the compatible MLX source during the native
+build, and exposes checked-in bindings. Its native surface includes SafeMLX's
+completion events, typed host-transfer storage, variable-count all-to-all, and
+packed-quantization support.
 
-The vendored MLX-C build pins MLX 0.32.0 and applies the reviewable patches in
-`src/mlx-c/patches/` idempotently. The inventory covers Apple mobile platforms,
-CUDA command-encoder lifetime, group-16 affine quantization, completion events,
-typed host-transfer storage, and variable-count all-to-all. No generated
-FetchContent source is edited.
+## Backends
 
-`mlx-completion-events.patch` exposes a move-only C++ `Completion`
-around MLX's existing internal `Event`; it does not introduce a SafeMLX-side
-backend runtime or modify FetchContent output. It also makes CPU scheduler and
-backend event errors persistent for repeated completion observation.
+| Target | Backend selection |
+| --- | --- |
+| macOS and supported Apple device targets | Accelerate and Metal through the default features |
+| x86-64 Linux | CPU by default; optional CUDA and NCCL |
+| x86-64 Windows MSVC | CPU by default; optional CUDA |
 
-`mlx-variable-all-to-all.patch` adds the lazy `distributed::all_to_all_v`
-primitive from the public C++ operation through CPU/CUDA evaluation and every
-MLX 0.32 distributed backend. MPI uses checked byte `MPI_Alltoallv`; NCCL uses
-grouped `ncclSend`/`ncclRecv` on MLX's CUDA stream; JACCL mesh performs direct
-personalized transfers; and TCP Ring plus JACCL Ring use deterministic
-clockwise store-and-forward packets which stop at their destinations. Ring
-therefore moves exact endpoint payloads without global replication, although
-physical hop bytes can exceed useful logical bytes. Counts, byte layout,
-backend integer limits, noncontiguous copies, autodiff, vmap, empty routes, and
-singleton identity are handled in the MLX layer.
+Native compilers, CMake, platform libraries, CUDA/cuDNN setup, Apple deployment
+targets, and `mlx.metallib` bundling are covered in [Platform
+setup](../doc/platforms.md).
 
-`mlx-host-transfer-buffer.patch` adds a typed C++ `HostTransferBuffer` and
-completion-returning array-to-host and host-to-array operations. CPU builds use
-owned CPU storage, Metal uses shared buffers, and CUDA's transfer policy uses
-explicit `cudaMallocHost` storage with stream- or CUDA-graph-ordered memcpy
-nodes. CUDA managed memory is a separately named policy rather than an implicit
-fallback. Metal promotions use the contiguous vector-copy primitive because a
-typed host-transfer buffer preserves the source's contiguous logical layout.
-Shape, dtype, capacity, policy, physical storage identity, ownership, and
-completion lifetime pass through MLX-C and the checked-in Rust bindings. The
-patch also exposes the backend's charged backing-allocation bound and
-process-wide active/peak charged-byte and allocation counters for each
-host-transfer storage kind, including CUDA pinned storage outside the device
-allocator. CPU and Metal charges are OS/VM-page rounded; CUDA requests and
-charges a conservative 64 KiB-granular extent.
+## Features
 
-The MLX-C headers expose opaque `mlx_event` ownership, async evaluation with an
-event, stream wait, host synchronize, query, and identity accessors. The
-checked-in `src/bindings.rs` is regenerated from those headers with:
+- `accelerate`: build the Accelerate backend on Apple platforms.
+- `metal`: build the Metal backend on Apple platforms.
+- `cuda`: build MLX with CUDA support on x86-64 Linux or Windows.
+- `nccl`: enable MLX's optional NCCL distributed backend on Linux.
 
-```console
-SAFEMLX_SYS_GENERATE_BINDINGS=1 \
-  cargo check -p safemlx-sys --features generate-bindings
-```
+Applications normally select these features through `safemlx` rather than
+depending on `safemlx-sys` directly.
 
-Linux CPU CI executes the no-GPU event implementation. macOS CI compiles the
-Metal event integration tests, and Linux/Windows CUDA CI compiles the same
-integration target with the CUDA-specific handoff test enabled. Metal and CUDA
-runtime handoff tests remain explicit and ignored because no GPU runners are
-currently configured.
+## License
 
-MLX's direct completion, host-transfer, and all-to-all-v tests are deliberately
-separate from normal Cargo builds. Run the generalized opt-in CMake target
-through:
-
-```console
-bash safemlx-sys/scripts/test-mlx-patches.sh
-```
-
-The dedicated CI workflow is path-scoped to the vendored patches, their CMake
-harness, and this script. Runtime MPI, JACCL, and NCCL coverage still requires
-the corresponding launcher and hardware.
-
-## Linux and CUDA
-
-CPU-only Linux builds require Git, a C++20 compiler, CMake 3.25 or newer, and
-the BLAS, LAPACK, and LAPACKE development packages. The first build fetches the
-pinned MLX source. On Ubuntu these dependencies can be installed with:
-
-```sh
-sudo apt-get install git cmake build-essential libblas-dev liblapack-dev liblapacke-dev
-```
-
-The optional `cuda` feature additionally requires a CUDA 12 or supported CUDA
-13 toolkit and cuDNN 9 development files. The NVIDIA GPU must have compute
-capability 7.5 or newer. Follow the pinned MLX version's
-[source-build requirements](https://ml-explore.github.io/mlx/build/html/install.html#cuda),
-then build with:
-
-```sh
-cargo build --release -p safemlx --features cuda
-```
-
-MLX detects the current GPU architecture during configuration. For builds on a
-machine without an accessible GPU, or to produce a binary for a different GPU,
-set a semicolon-separated CMake architecture list explicitly:
-
-```sh
-SAFEMLX_CUDA_ARCHITECTURES=80 cargo build --release -p safemlx --features cuda
-```
-
-The build also honors `CMAKE_CUDA_COMPILER`, `CUDAToolkit_ROOT`,
-`CUDNN_INCLUDE_PATH`, and `CUDNN_LIBRARY_PATH`. CUDA and cuDNN shared libraries
-must remain discoverable by the system dynamic loader when the Rust executable
-runs.
-
-NCCL is disabled by default so installing it cannot silently change the native
-link requirements. Enable the `nccl` feature and, if necessary, set
-`NCCL_ROOT_DIR`, `NCCL_INCLUDE_DIR`, and `NCCL_LIB_DIR`.
-
-## Native Windows x86-64 CUDA
-
-Native Windows builds use the stable Rust MSVC target, Visual Studio 2022, MLX
-v0.32.0, and cuDNN 9. The pinned MLX/CUTLASS combination is covered in CI with
-CUDA 12.9 and CUDA 13.0. CUDA 12.6 is not supported on Windows by this MLX
-version. Install these prerequisites:
-
-- 64-bit Windows and the `x86_64-pc-windows-msvc` Rust toolchain.
-- Visual Studio 2022 Build Tools with the Desktop development with C++ workload.
-- Git, CMake 3.25 or newer, and Ninja.
-- CUDA Toolkit 12.9 or 13.0 and the corresponding cuDNN 9 development archive.
-
-From a Visual Studio x64 developer PowerShell, point CMake at the toolkit and
-cuDNN installation and build a final executable:
-
-```powershell
-$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
-$env:CUDA_HOME = $env:CUDA_PATH
-$env:CUDAToolkit_ROOT = $env:CUDA_PATH
-$env:CMAKE_CUDA_COMPILER = "$env:CUDA_PATH\bin\nvcc.exe"
-$env:CUDNN_INCLUDE_PATH = "C:\tools\cudnn\include"
-$env:CUDNN_LIBRARY_PATH = "C:\tools\cudnn\lib\x64"
-$env:SAFEMLX_CUDA_ARCHITECTURES = "75"
-$env:CMAKE_GENERATOR = "Ninja"
-$env:PATH = "$env:CUDA_PATH\bin;C:\tools\cudnn\bin\x64;$env:PATH"
-
-cargo build --release -p safemlx --features cuda --example cuda_smoke --no-default-features
-cargo build --release -p safemlx-lm-cli --features cuda
-```
-
-`CUDAToolkit_ROOT`, `CUDA_HOME`, and `CUDA_PATH` are searched in that order
-after an explicit `CMAKE_CUDA_COMPILER`; standard versioned CUDA installations
-and `nvcc.exe` on `PATH` are also detected. `MLX_CUDA_ARCHITECTURES` is honored,
-and `SAFEMLX_CUDA_ARCHITECTURES` overrides it. Use a semicolon-separated list
-for a multi-architecture binary.
-
-On Windows, safemlx builds `mlx` and `mlxc` as DLLs. This keeps CMake in charge
-of the CUDA, cuDNN, OpenBLAS, dlfcn-win32, MSVC runtime, `delayimp`, and
-`/DELAYLOAD` dependency graph. The build stages `mlx.dll`, `mlxc.dll`, and the
-fetched OpenBLAS DLL next to Cargo binaries, examples, and test executables.
-Upstream MLX's delay-load hook records the configured CUDA and cuDNN binary
-directories; keep those installations at the same paths. When relocating a
-build, add the CUDA and cuDNN `bin` directories to `PATH` before starting it.
-
-Common configuration failures are usually resolved as follows:
-
-- Missing `nvcc.exe`: set `CMAKE_CUDA_COMPILER` and `CUDAToolkit_ROOT` to the
-  same toolkit installation.
-- Missing CUDA import libraries: install the cuBLAS, cuFFT, NVRTC, and runtime
-  development components, and verify `CUDA_PATH\lib\x64` exists.
-- Missing cuDNN headers or `.lib` files: set `CUDNN_INCLUDE_PATH` to the
-  directory containing `cudnn.h` and `CUDNN_LIBRARY_PATH` to `lib\x64`.
-- Startup DLL errors: restore the build-time CUDA/cuDNN locations or add their
-  `bin` directories to `PATH`; do not copy only the import libraries.
-- Unsupported compute capability: set `SAFEMLX_CUDA_ARCHITECTURES` to the GPU's
-  architecture. MLX v0.32.0 requires compute capability 7.5 or newer.
-- Non-ASCII NumPy or SafeTensors paths: the pinned MLX file-path overloads use
-  the Windows narrow-character runtime. Use an ASCII path for these two native
-  formats. Rust-backed GGUF I/O supports native Unicode Windows paths.
-
-Windows ARM CUDA and Windows NCCL are intentionally unsupported. Metal and
-Accelerate remain Apple-only. Hosted CI proves MSVC compilation and final
-linkage without a GPU; Windows CUDA runtime behavior remains experimental until
-the optional self-hosted Windows NVIDIA workflow has passed on real hardware.
-
-## Apple platform targets
-
-The crate builds MLX with Accelerate and Metal for these Rust targets on a
-macOS host with Xcode installed:
-
-| Platform | Device target | Apple Silicon simulator target | Minimum OS |
-| --- | --- | --- | --- |
-| iOS / iPadOS | `aarch64-apple-ios` | `aarch64-apple-ios-sim` | 17.0 |
-| tvOS | `aarch64-apple-tvos` | `aarch64-apple-tvos-sim` | 17.0 |
-| visionOS | `aarch64-apple-visionos` | `aarch64-apple-visionos-sim` | 1.0 |
-
-Install a target and build in the usual way:
-
-```sh
-rustup target add aarch64-apple-ios
-cargo build -p safemlx --release --target aarch64-apple-ios
-```
-
-On Xcode versions which ship Metal as a separately downloadable component,
-install it once with:
-
-```sh
-xcodebuild -downloadComponent MetalToolchain
-```
-
-The build exports `mlx.metallib` to
-`target/<rust-target>/<profile>/safemlx-resources/mlx.metallib`. Add that file
-to the Xcode target's **Copy Bundle Resources** phase, preserving the name
-`mlx.metallib`. MLX automatically searches the application bundle for it.
-
-An Xcode Run Script phase can instead make Cargo stage the file directly in
-the product's resource directory:
-
-```sh
-export SAFEMLX_METALLIB_OUTPUT_DIR="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
-cargo build --manifest-path "$SRCROOT/path/to/Cargo.toml" \
-  --release --target "$SAFEMLX_RUST_TARGET"
-```
-
-Set `SAFEMLX_RUST_TARGET` in the Xcode configuration to the appropriate device
-or simulator triple. The standard `IPHONEOS_DEPLOYMENT_TARGET`,
-`TVOS_DEPLOYMENT_TARGET`, and `XROS_DEPLOYMENT_TARGET` settings are honored;
-the minimum versions in the table are used when they are absent.
-
-Mac Catalyst and watchOS are not currently supported.
+The Rust crate is MIT licensed. Vendored components retain their stated
+licenses and attribution files.
