@@ -1224,6 +1224,55 @@ fn inspect_gguf_projector(
             }
             Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
         },
+        GgufArchitecture::MuseGlimmer => match muse_glimmer::open_sibling_mmproj(path) {
+            Ok(Some(mmproj)) => {
+                let validation = structural::validate_muse_glimmer_projector_gguf(
+                    model_checkpoint,
+                    model_metadata,
+                    &mmproj.checkpoint,
+                    &mmproj.metadata,
+                );
+                let exact = matches!(validation, structural::StructuralValidation::Exact);
+                apply_structural_validation(report, validation, &mmproj.path);
+                report.multimodal = if !exact {
+                    InspectionReadiness::Invalid
+                } else if cfg!(feature = "image-processing") {
+                    InspectionReadiness::Ready
+                } else {
+                    InspectionReadiness::Unsupported
+                };
+                report.requirements.push(InspectionRequirement {
+                    code: InspectionIssueCode::MissingMediaProjector,
+                    readiness: if exact {
+                        InspectionReadiness::Ready
+                    } else {
+                        InspectionReadiness::Invalid
+                    },
+                    detail: if exact {
+                        "validated image-only Muse-Glimmer projector".into()
+                    } else {
+                        "Muse-Glimmer projector is structurally incompatible".into()
+                    },
+                    path: Some(mmproj.path),
+                });
+            }
+            Ok(None) => {
+                report.multimodal = InspectionReadiness::Missing;
+                report.requirements.push(InspectionRequirement {
+                        code: InspectionIssueCode::MissingMediaProjector,
+                        readiness: InspectionReadiness::Missing,
+                        detail: "Muse-Glimmer text loading is available, but image input requires the sibling mmproj-kquant.gguf".into(),
+                        path: None,
+                    });
+                report.issue(
+                    InspectionIssueCode::MissingMediaProjector,
+                    InspectionSeverity::Warning,
+                    "Muse-Glimmer has no sibling projector; text loading remains available",
+                    Some(path.to_path_buf()),
+                );
+            }
+            Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), false),
+        },
         _ => report.multimodal = InspectionReadiness::NotApplicable,
     }
 }
@@ -1314,6 +1363,10 @@ fn modalities_for_safetensors(kind: ModelKind, config: &Value) -> Vec<ArtifactMo
             modalities.insert(ArtifactModality::Image);
             modalities.insert(ArtifactModality::Video);
         }
+        ModelKind::MuseGlimmer => {
+            modalities.insert(ArtifactModality::Image);
+            modalities.insert(ArtifactModality::Video);
+        }
         ModelKind::Qwen35
             if config.get("vision_config").is_some()
                 || config
@@ -1351,6 +1404,7 @@ fn modalities_for_gguf(architecture: GgufArchitecture) -> Vec<ArtifactModality> 
             ArtifactModality::Image,
             ArtifactModality::Video,
         ],
+        GgufArchitecture::MuseGlimmer => vec![ArtifactModality::Text],
         _ => vec![ArtifactModality::Text],
     }
 }

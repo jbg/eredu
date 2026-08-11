@@ -39,6 +39,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
         ModelKind::Inkling => inkling::load_tokenizer(model_dir),
         ModelKind::KimiLinear => kimi_linear::load_tokenizer(model_dir),
         ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
+        ModelKind::MuseGlimmer => muse_glimmer::load_tokenizer(model_dir),
         ModelKind::Lfm2 => lfm2::load_tokenizer(model_dir),
         ModelKind::NemotronH => nemotron_h::load_nemotron_h_tokenizer(model_dir),
         ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(

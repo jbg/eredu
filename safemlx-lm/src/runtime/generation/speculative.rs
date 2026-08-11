@@ -22,6 +22,7 @@ use crate::{
         input::{InputPayload, Modality, ModelInput},
         ModelCache, ModelLoadOptions,
     },
+    architectures::muse_glimmer::assistant::{self as muse_dflash, MuseGlimmerDFlash},
     error::Error,
     runtime::generation::sampler::SpeculativeSampler,
     runtime::generation::streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
@@ -35,6 +36,16 @@ pub struct LoadedDrafter {
 
 enum DrafterModel {
     Gemma4(Gemma4AssistantDraftModel),
+    MuseGlimmerDFlash(MuseGlimmerDFlash),
+}
+
+/// Stable architecture identity for an independently loaded draft model.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DrafterKind {
+    /// Gemma 4 external assistant.
+    Gemma4Assistant,
+    /// Muse-Glimmer anchor-plus-15-mask DFlash assistant.
+    MuseGlimmerDFlash,
 }
 
 /// Target and draft streams used by one MTP generation sequence.
@@ -221,41 +232,116 @@ impl LoadedDrafter {
                 })
                 .transpose()?
         };
-        if source
+        let is_gguf = source
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-        {
-            return Ok(Self {
-                model: DrafterModel::Gemma4(load_gemma4_assistant_gguf_with_options(
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
+        if is_gguf {
+            let checkpoint = safemlx::ops::GgufCheckpoint::open(source)?;
+            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let architecture = metadata
+                .get("general.architecture")
+                .and_then(safemlx::ops::GgufMetadataValue::as_str)
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(
+                        "drafter GGUF requires string general.architecture".into(),
+                    )
+                })?;
+            let model = match architecture {
+                "dflash" => DrafterModel::MuseGlimmerDFlash(muse_dflash::load_with_options(
                     source,
                     options,
                     stream,
                     weights_stream,
                 )?),
+                "gemma4_assistant" | "gemma4-assistant" => {
+                    DrafterModel::Gemma4(load_gemma4_assistant_gguf_with_options(
+                        source,
+                        options,
+                        stream,
+                        weights_stream,
+                    )?)
+                }
+                other => {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "unsupported drafter GGUF architecture {other:?}"
+                    )))
+                }
+            };
+            return Ok(Self {
+                model,
                 tokenizer_fingerprint,
             });
         }
-        Ok(Self {
-            model: DrafterModel::Gemma4(load_gemma4_assistant_model_with_options(
+        let config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(source.join("config.json"))?)?;
+        let model_type = config
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let model = match model_type {
+            "muse_glimmer_assistant" => DrafterModel::MuseGlimmerDFlash(
+                muse_dflash::load_with_options(source, options, stream, weights_stream)?,
+            ),
+            "gemma4_assistant" => DrafterModel::Gemma4(load_gemma4_assistant_model_with_options(
                 source,
                 options,
                 stream,
                 weights_stream,
             )?),
+            other => {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "unsupported safetensors drafter model_type {other:?}"
+                )))
+            }
+        };
+        Ok(Self {
+            model,
             tokenizer_fingerprint,
         })
+    }
+
+    /// Returns the architecture detected from the checkpoint itself.
+    pub const fn kind(&self) -> DrafterKind {
+        match self.model {
+            DrafterModel::Gemma4(_) => DrafterKind::Gemma4Assistant,
+            DrafterModel::MuseGlimmerDFlash(_) => DrafterKind::MuseGlimmerDFlash,
+        }
     }
 
     pub(crate) fn gemma4(&self) -> &Gemma4AssistantDraftModel {
         match &self.model {
             DrafterModel::Gemma4(model) => model,
+            DrafterModel::MuseGlimmerDFlash(_) => {
+                panic!("requested Gemma 4 assistant from Muse-Glimmer DFlash drafter")
+            }
         }
     }
 
     pub(crate) fn gemma4_mut(&mut self) -> &mut Gemma4AssistantDraftModel {
         match &mut self.model {
             DrafterModel::Gemma4(model) => model,
+            DrafterModel::MuseGlimmerDFlash(_) => {
+                panic!("requested Gemma 4 assistant from Muse-Glimmer DFlash drafter")
+            }
+        }
+    }
+
+    pub(crate) fn muse_glimmer(&self) -> &MuseGlimmerDFlash {
+        match &self.model {
+            DrafterModel::MuseGlimmerDFlash(model) => model,
+            DrafterModel::Gemma4(_) => {
+                panic!("requested Muse-Glimmer DFlash from Gemma 4 assistant")
+            }
+        }
+    }
+
+    pub(crate) fn muse_glimmer_mut(&mut self) -> &mut MuseGlimmerDFlash {
+        match &mut self.model {
+            DrafterModel::MuseGlimmerDFlash(model) => model,
+            DrafterModel::Gemma4(_) => {
+                panic!("requested Muse-Glimmer DFlash from Gemma 4 assistant")
+            }
         }
     }
 

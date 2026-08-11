@@ -845,6 +845,105 @@ fn recognize_inkling_protocol(
     })
 }
 
+fn recognize_muse_atem_protocol(
+    tokenizer: &mut ChatTokenizer,
+    selected_template: &ModelChatTemplate,
+    model_id: &str,
+) -> Option<crate::runtime::chat::PreparedFormatProfile> {
+    use crate::runtime::chat::{
+        atem::{self, EOM, EOT, MESSAGE, START},
+        dialect::GenerationPromptBehavior,
+        ReasoningTemplateControl,
+    };
+
+    let structural_tokens = [START, MESSAGE, EOM, EOT].map(str::to_owned).to_vec();
+    resolve_structural_tokens(tokenizer, &structural_tokens).ok()?;
+
+    let rendered = render_reasoning_protocol_probe(tokenizer, selected_template, model_id)?;
+    let expected = concat!(
+        "<|start|>assistant to=self<|message|>__safemlx_reasoning_probe__<|eom|>",
+        "<|start|>assistant to=user<|message|>__safemlx_visible_probe__<|eot|>"
+    );
+    if !rendered.contains(expected) {
+        return None;
+    }
+
+    let generation_messages =
+        vec![serde_json::json!({"role": "user", "content": "__safemlx_atem_prompt__"})];
+    for strength in ["low", "medium", "high", "xhigh"] {
+        let kwargs = serde_json::Map::from_iter([(
+            "reasoning_strength".into(),
+            serde_json::Value::String(strength.into()),
+        )]);
+        let prompt = tokenizer
+            .apply_chat_template_json(
+                selected_template.clone(),
+                [generation_messages.clone()],
+                Some(&[]),
+                model_id,
+                true,
+                Some(&kwargs),
+            )
+            .ok()?
+            .into_iter()
+            .next()?;
+        if !prompt.contains(&format!("Reasoning strength: {strength}."))
+            || !prompt.ends_with("<|start|>assistant")
+        {
+            return None;
+        }
+    }
+
+    let mapping = render_protocol_probe(
+        tokenizer,
+        selected_template,
+        model_id,
+        serde_json::json!({"value": "probe-value"}),
+    );
+    let mapping_tool_arguments = mapping.as_deref().is_some_and(|rendered| {
+        [
+            "<|start|>assistant to=self<|message|>__safemlx_reasoning_probe__<|eom|>",
+            "<|start|>assistant to=safemlx_probe_7c91<|message|>",
+            "<atem:function_calls>",
+            "<atem:invoke name=\"safemlx_probe_7c91\">",
+            "<atem:parameter name=\"value\">probe-value</atem:parameter>",
+            "<|start|>tool safemlx_probe_7c91<|message|><tool_output name=\"safemlx_probe_7c91\">",
+            "__safemlx_tool_result_probe__",
+        ]
+        .iter()
+        .all(|marker| rendered.contains(marker))
+    });
+
+    Some(crate::runtime::chat::PreparedFormatProfile {
+        identity: Some("muse-glimmer.atem.v1".into()),
+        dialect: Some(&atem::ATEM_DIALECT),
+        dialect_parameters: Some(atem::parameters()),
+        tool_dialect: mapping_tool_arguments.then_some(&atem::ATEM_DIALECT),
+        tool_dialect_parameters: mapping_tool_arguments.then_some(atem::parameters()),
+        generation_prompt_behavior: GenerationPromptBehavior::Always,
+        reasoning_template_control: ReasoningTemplateControl::NamedEffort {
+            kwarg: "reasoning_strength",
+            enabled: "high",
+            disabled: "high",
+        },
+        supports_reasoning_parsing: true,
+        supports_tool_reasoning: true,
+        supports_tool_input_rendering: mapping_tool_arguments,
+        supports_mapping_tool_arguments: mapping_tool_arguments,
+        supports_string_tool_arguments: false,
+        native_tool_unavailable_reason: (!mapping_tool_arguments).then(|| {
+            "Muse-Glimmer ATEM channels were recognized, but mapping-valued tool history did not pass the behavioral probe".into()
+        }),
+        required_structural_tokens: structural_tokens.clone(),
+        tool_required_structural_tokens: if mapping_tool_arguments {
+            structural_tokens
+        } else {
+            Vec::new()
+        },
+        stop_sequences: vec![EOT.into()],
+    })
+}
+
 fn render_protocol_probe(
     tokenizer: &mut ChatTokenizer,
     selected_template: &ModelChatTemplate,
@@ -1266,11 +1365,33 @@ pub(super) fn prepare_chat_from_parts(
     };
     let mut profile = prepare_format_profile(selected.template());
     if profile.dialect.is_none() {
-        if let Some(recognized) = recognize_gemma_protocol(tokenizer, &selected_template, model_id)
-            .or_else(|| recognize_inkling_protocol(tokenizer, &selected_template, model_id))
-            .or_else(|| recognize_remaining_protocols(tokenizer, &selected_template, model_id))
+        if let Some(recognized) =
+            recognize_muse_atem_protocol(tokenizer, &selected_template, model_id)
+                .or_else(|| recognize_gemma_protocol(tokenizer, &selected_template, model_id))
+                .or_else(|| recognize_inkling_protocol(tokenizer, &selected_template, model_id))
+                .or_else(|| recognize_remaining_protocols(tokenizer, &selected_template, model_id))
         {
             profile = recognized;
+        }
+    }
+    if profile.identity.as_deref() == Some("muse-glimmer.atem.v1") {
+        if request.enable_thinking == Some(false) {
+            return Err(Error::ToolConstraint(
+                "Muse-Glimmer requires reasoning; enable_thinking=false is not supported".into(),
+            ));
+        }
+        if let Some(value) = request.extra_template_kwargs.get("reasoning_strength") {
+            let Some(strength) = value.as_str() else {
+                return Err(Error::ToolConstraint(
+                    "Muse-Glimmer reasoning_strength must be one of low, medium, high, or xhigh"
+                        .into(),
+                ));
+            };
+            if !matches!(strength, "low" | "medium" | "high" | "xhigh") {
+                return Err(Error::ToolConstraint(format!(
+                    "unsupported Muse-Glimmer reasoning_strength {strength:?}; expected low, medium, high, or xhigh"
+                )));
+            }
         }
     }
     if request.tool_choice != ToolChoice::None
@@ -1429,10 +1550,14 @@ pub(super) fn prepare_chat_from_parts(
         .resolve(add_generation_prompt);
 
     if let Some(enable_thinking) = enable_thinking {
-        let (kwarg, value) = profile
-            .reasoning_template_control
-            .template_entry(enable_thinking);
-        extra_template_kwargs.insert(kwarg.into(), value);
+        let explicit_muse_strength = profile.identity.as_deref() == Some("muse-glimmer.atem.v1")
+            && extra_template_kwargs.contains_key("reasoning_strength");
+        if !explicit_muse_strength {
+            let (kwarg, value) = profile
+                .reasoning_template_control
+                .template_entry(enable_thinking);
+            extra_template_kwargs.insert(kwarg.into(), value);
+        }
     }
 
     let without_generation_prompt = tokenizer

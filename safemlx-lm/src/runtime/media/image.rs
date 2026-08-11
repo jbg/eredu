@@ -180,6 +180,35 @@ pub fn resize_rgb8_bicubic(
     })
 }
 
+/// Resizes an RGB8 image with a Lanczos3 filter.
+pub fn resize_rgb8_lanczos3(
+    image: RgbImageView<'_>,
+    width: u32,
+    height: u32,
+) -> Result<RgbImage, Error> {
+    if width == 0 || height == 0 {
+        return Err(Error::Processor(format!(
+            "resize dimensions must be positive, got {width}x{height}"
+        )));
+    }
+    if width == image.width && height == image.height {
+        return Ok(RgbImage {
+            pixels: image.packed_pixels(),
+            width,
+            height,
+        });
+    }
+    let source =
+        ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(image.width, image.height, image.packed_pixels())
+            .ok_or_else(|| Error::Processor("failed to construct RGB8 image buffer".to_string()))?;
+    let resized = image::imageops::resize(&source, width, height, FilterType::Lanczos3);
+    Ok(RgbImage {
+        pixels: resized.into_raw(),
+        width,
+        height,
+    })
+}
+
 /// Rescales and normalizes RGB8 pixels, returning channel-first data.
 pub fn rescale_and_normalize_rgb8(
     image: RgbImageView<'_>,

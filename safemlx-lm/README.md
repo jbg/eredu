@@ -94,7 +94,7 @@ All ordinary-layer policies
 return the same architecture variant and use the same cache, forward,
 generation, observation, and capability dispatch. DeepSeek-V3/R1, Gemma 4,
 Inkling, Kimi Linear, Llama,
-Mistral, GPT-OSS, LFM2/LFM2.5, Nemotron-H, Qwen2/Qwen2.5 text, Qwen3, Qwen3-Next, Qwen3-VL,
+Mistral, Muse-Glimmer, GPT-OSS, LFM2/LFM2.5, Nemotron-H, Qwen2/Qwen2.5 text, Qwen3, Qwen3-Next, Qwen3-VL,
 Qwen3-VL-MoE, and Qwen3.5 safetensors have registered adapters,
 including dense and MoE variants. Moshi and PersonaPlex use the same engine with
 independent temporal-layer and depth-codebook-slice windows. A requested family without a registered adapter returns
@@ -393,6 +393,30 @@ ordinary/paged/persisted caches, and rank-synchronized generation. Eligible
 dense matrices may be MXFP4-quantized before resident, host-layerwise, or
 dense-streamed stage planning; affine and packed-input transcoding fail closed.
 
+## Muse-Glimmer artifacts and ATEM/DFlash behavior
+
+`meta-models/Muse-Glimmer-30B` supports text, images, and best-effort processor-compatible
+video from SafeTensors. `meta-models/Muse-Glimmer-30B-GGUF` accepts either official text
+file (`muse-glimmer-30B-kquant-17gb.gguf` or
+`muse-glimmer-30B-kquant-dynamic.gguf`) and discovers the unambiguous sibling
+`mmproj-kquant.gguf`. Text-only GGUF loading is valid without that sidecar; image admission
+requires it, and GGUF video is rejected because the released projector collapsed its temporal
+patch weights. Audio, realtime inference, expert caching, and EP do not apply.
+
+The processor and chat runtime preserve `vision_grid_thw` independently from Qwen metadata.
+Muse chat uses behavior-probed ATEM framing: reasoning is mandatory, `<|eom|>` is a channel
+boundary rather than EOS, typed and structured tool parameters are XML-escaped, parallel calls
+are supported, and malformed envelopes fail closed. `enable_thinking=false` is rejected;
+`reasoning_strength` accepts `low`, `medium`, `high`, or `xhigh` and overrides the default
+`high` strength.
+
+`meta-models/Muse-Glimmer-30B-assistant` and the official `dflash-kquant.gguf` are detected as
+`DrafterKind::MuseGlimmerDFlash`. The existing lossless external-drafter APIs cap each round at
+15 proposals and retain their batch, prepared-chat, constrained-tool, cancellation, rollback,
+sampling, and same-device/cross-device stream semantics. The target reports
+`MtpCapability::Ready { checkpoint: Separate }`; no distributed pipeline-stage speculative API
+is added.
+
 ## Gemma 4 and assistant weight residency
 
 Gemma 4 normalizes Hugging Face `layer_types` plus `sliding_window`, or GGUF's
@@ -670,6 +694,7 @@ never replaced by eager loading.
 | Nemotron-H | yes | yes | attention KV and Mamba convolution/SSM state | embedding, norm, tied/untied head | hybrid block | public key rewrite and split ReLU2 expert packing | all four block kinds, split MoE, prefill/decode |
 | Qwen3-Next / Qwen3.5 | yes | yes | full-attention KV, recurrent linear-attention state, transient vision state | Qwen vision patch/position/merger modules, embedding, norm, tied/untied head | optional vision group plus shared hybrid text group | fused QKVZ/BA selection; split SwiGLU and FP8 expert recipes | Qwen3.5 image/text prefill parity; Qwen3-Next dense/split-MoE and Qwen3.5 dense/MoE prefill/decode |
 | Qwen3-VL / Qwen3-VL-MoE | yes | yes | text KV plus multimodal RoPE delta and transient DeepStack state | patch/position embeddings, vision mergers, text embedding/norm/head | independent vision block and dense/MoE text-block groups | direct public DeepStack vision and packed Qwen3 expert trees | image prefill plus multi-step decode for dense/MoE; two depths for dense |
+| Muse-Glimmer | yes | yes | alternating three sliding-RoPE layers and one full NoPE layer, plus transient vision state | temporal patch/position modules, adapter/projection, embedding, norm, untied head | independent 50-block vision and 52-block text groups | centered SafeTensors norms and rotate-half RoPE; native K/IQ GGUF plus affine/MXFP4 on-load targets | text/image prefill, cached decode, image/video processor fixtures, and DFlash proposal geometry |
 | PersonaPlex / Moshi realtime | yes, realtime API | yes, realtime API | temporal KV plus reset-per-frame depth KV and delayed-stream state | text/audio embeddings, temporal norm and heads | independent temporal layers and per-codebook depth slices | native Moshi layout; released PersonaPlex PyTorch norms, packed attention, embeddings, and projections derived lazily | teacher-forced logits, consecutive realtime frames, offline encoded sequence, forced prompt/cache continuity |
 
 ## Linux and CUDA
@@ -1166,6 +1191,7 @@ registered checkpoint formats. EP does not apply to dense families.
 | Inkling multimodal | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and text-plus-mmproj GGUF; distributed hMLP blocks and explicitly placed dMel ingress |
 | Qwen3-VL dense | TP, PP | TP, PP, TP+PP | SafeTensors and canonical GGUF with its projector; vision blocks are balanced across PP ranks |
 | Qwen3-VL-MoE | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and canonical GGUF with its projector; distributed vision placement |
+| Muse-Glimmer | TP, PP | TP, PP, TP+PP | SafeTensors and canonical `muse-glimmer` GGUF; optional `mmproj-kquant.gguf`, distributed vision placement, and no EP/expert cache |
 | Moshi/PersonaPlex | TP | TP | Realtime temporal/depth runtime; PP and EP do not apply |
 
 The remaining global limitations are:
@@ -1930,6 +1956,8 @@ and draft caches, so acceptance lengths and EOS positions may diverge safely.
 | Qwen3 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Qwen3-VL | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Language targets plus aligned vision attention, MLP, merger, and DeepStack projections share the bounded packed overlay; patch convolution, position embeddings, and norms stay dense |
 | Qwen3-VL-MoE | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses Qwen3-VL packed DeepStack/MRoPE vision execution and Qwen3 packed expert-major SwiGLU execution across standalone and Cartesian residency |
+| Muse-Glimmer | yes | MLX affine/MXFP4 and native K/IQ GGUF | yes / yes | `LoadedModel` | Eligible text, vision, adapter, embedding, head, and DFlash linears share the bounded overlay; centered norms, biases, positional tables, and patch operations remain dense; GGUF tensors remain packed |
+| Muse-Glimmer DFlash assistant | yes | MLX affine/MXFP4 and `dflash` GGUF | yes / yes | `LoadedDrafter` | Five normalized target states produce one anchor-plus-15-mask proposal block; target embedding/head snapshots are read-only and proposals use the lossless external-MTP scheduler |
 | Gemma 4 dense / MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Text, routed experts, bridges, and aligned vision/audio projections share resident, layerwise, streamed, and Cartesian materialization; convolution, position, and normalization state stays dense |
 | Gemma 4 assistant | yes | MLX affine/MXFP4 and uniform packed GGUF affine | yes / yes | `LoadedDrafter` with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts plus `gpt-oss` GGUF | no / yes | `LoadedModel` | Canonical GGUF type-39 experts stay packed; mixed dense projections use their exact GGUF formats |
@@ -2014,13 +2042,15 @@ let prepared = model.prepare_input(
 ```
 
 The optional `image-processing` feature enables architecture-dispatched Gemma 4,
-Inkling, and Qwen processors. Shared code owns decoded-image validation, frame sampling,
+Inkling, Muse-Glimmer, and Qwen processors. Shared code owns decoded-image validation, frame sampling,
 and timestamp operations; each processor adds its model-native patch packing,
 prompt format, metadata, and ordered media insertion. Inkling divides images into
 40-pixel patches and feeds its released four-layer hMLP tower. Gemma samples up to
 32 frames by default and encodes each timestamped frame through its vision tower.
-Qwen uses its temporal patch packing and timestamp format. Without the feature,
-callers can still supply Gemma 4, Inkling, or Qwen `Image/Tensor` and `Video/Tensor`
+Qwen uses its temporal patch packing and timestamp format. Muse-Glimmer uses Lanczos
+token-budget resizing, duplicated image temporal patches, paired video patches, uniform
+frame sampling, and native prompt-token expansion. Without the feature,
+callers can still supply Gemma 4, Inkling, Muse-Glimmer, or Qwen `Image/Tensor` and `Video/Tensor`
 inputs directly without depending on the `image` crate.
 
 Gemma 4 audio accepts model-native log-mel tensors and Inkling accepts discrete

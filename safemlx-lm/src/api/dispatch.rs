@@ -16,6 +16,8 @@ pub enum Model {
     Inkling(crate::architectures::inkling::layerwise::InklingLayerwiseModel),
     /// Llama-compatible dense model.
     Llama(crate::architectures::llama::layerwise::LlamaModel),
+    /// Meta Muse-Glimmer dense multimodal model.
+    MuseGlimmer(crate::architectures::muse_glimmer::layerwise::LayerwiseDecoder),
     /// Liquid AI LFM2/LFM2.5 model.
     Lfm2(crate::architectures::lfm2::layerwise::Lfm2LayerwiseModel),
     /// Nemotron-H hybrid model.
@@ -38,6 +40,7 @@ impl Model {
     pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
         match self {
             Self::Llama(model) => model.parallel_info(),
+            Self::MuseGlimmer(model) => model.parallel_info(),
             Self::DeepSeekV3(model) => model.parallel_info(),
             Self::GptOss(model) => model.parallel_info(),
             Self::DenseQwen(model) => model.parallel_info(),
@@ -54,7 +57,7 @@ impl Model {
     /// Reports how this model architecture exposes MTP weights.
     pub fn mtp_capability(&self) -> MtpCapability {
         match self {
-            Self::Gemma4(_) => MtpCapability::Ready {
+            Self::Gemma4(_) | Self::MuseGlimmer(_) => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Separate,
             },
             Self::DeepSeekV3(model) if model.mtp_len() > 0 => MtpCapability::Ready {
@@ -167,9 +170,12 @@ impl Model {
         S: SpeculativeSampler + Clone,
         F: FnMut(u32) -> Result<(), Exception>,
     {
-        let assistant = drafter.gemma4_mut();
-        match (self, cache) {
-            (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
+        match self {
+            Self::Gemma4(target) => {
+                let ModelCache::Gemma4(cache) = cache else {
+                    return Err(Exception::custom("Gemma 4 MTP cache type mismatch"));
+                };
+                let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
                 crate::architectures::gemma4::mtp::generate_with_streams_and_callback_and_options(
                     target,
@@ -184,7 +190,25 @@ impl Model {
                     on_token,
                 )
             }
-            (model, _) => Err(Exception::custom(format!(
+            Self::MuseGlimmer(target) => {
+                let assistant = drafter.muse_glimmer_mut();
+                let mut backend =
+                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
+                        target, assistant,
+                    );
+                crate::runtime::generation::speculative::generate_with_streams_and_callback_and_options(
+                    &mut backend,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    streams,
+                    scheduler_options,
+                    on_token,
+                )
+            }
+            model => Err(Exception::custom(format!(
                 "MTP runtime adapter is unavailable for model type {} ({:?})",
                 model.model_type(),
                 model.mtp_capability()
@@ -211,9 +235,12 @@ impl Model {
         S: SpeculativeSampler + Clone,
         F: FnMut(SemanticEvent),
     {
-        let assistant = drafter.gemma4_mut();
-        match (self, cache) {
-            (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
+        match self {
+            Self::Gemma4(target) => {
+                let ModelCache::Gemma4(cache) = cache else {
+                    return Err(Exception::custom("Gemma 4 MTP cache type mismatch"));
+                };
+                let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
                 crate::architectures::gemma4::mtp::generate_with_semantics_and_options(
                     target,
@@ -230,7 +257,27 @@ impl Model {
                     on_event,
                 )
             }
-            (model, _) => Err(Exception::custom(format!(
+            Self::MuseGlimmer(target) => {
+                let assistant = drafter.muse_glimmer_mut();
+                let mut backend =
+                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
+                        target, assistant,
+                    );
+                crate::runtime::generation::speculative::generate_with_semantics_and_options(
+                    &mut backend,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    semantic,
+                    cancellation,
+                    streams,
+                    scheduler_options,
+                    on_event,
+                )
+            }
+            model => Err(Exception::custom(format!(
                 "MTP runtime adapter is unavailable for model type {} ({:?})",
                 model.model_type(),
                 model.mtp_capability()
@@ -553,6 +600,7 @@ impl Model {
             Self::NemotronH(model) => Ok(Some(model.residency_report()?)),
             Self::Qwen3Next(model) | Self::Qwen35(model) => Ok(Some(model.residency_report()?)),
             Self::DenseQwen(model) => Ok(Some(model.residency_report()?)),
+            Self::MuseGlimmer(model) => Ok(Some(model.residency_report()?)),
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => Ok(Some(model.residency_report()?)),
         }
     }
@@ -572,6 +620,7 @@ impl Model {
             Self::NemotronH(model) => model.dense_stream_report(),
             Self::Qwen3Next(model) | Self::Qwen35(model) => model.dense_stream_report(),
             Self::DenseQwen(model) => model.dense_stream_report(),
+            Self::MuseGlimmer(model) => model.dense_stream_report(),
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => model.dense_stream_report(),
         }
     }
@@ -607,6 +656,7 @@ impl Model {
             Self::Lfm2(model) => &model.args().model_type,
             Self::NemotronH(model) => &model.args().model_type,
             Self::DenseQwen(model) => &model.args().model_type,
+            Self::MuseGlimmer(model) => &model.args().model_type,
             Self::Qwen3Next(model) => &model.args().model_type,
             Self::Qwen3Vl(model) => model.model_type(),
             Self::Qwen3VlMoe(model) => model.model_type(),
@@ -640,6 +690,9 @@ impl Model {
             Self::DenseQwen(model) => Ok(dense_qwen::prompt_cache_architecture_fingerprint(
                 model.args(),
             )),
+            Self::MuseGlimmer(model) => Ok(muse_glimmer::prompt_cache_architecture_fingerprint(
+                model.args(),
+            )),
             Self::NemotronH(model) => Ok(nemotron_h::prompt_cache_architecture_fingerprint(
                 model.args(),
             )),
@@ -659,6 +712,7 @@ impl Model {
             Self::DeepSeekV3(model) => model.prompt_cache_layer_layout(),
             Self::GptOss(model) => model.prompt_cache_layer_layout(),
             Self::DenseQwen(model) => model.prompt_cache_layer_layout(),
+            Self::MuseGlimmer(model) => model.prompt_cache_layer_layout(),
             Self::KimiLinear(model) => model.prompt_cache_layer_layout(),
             Self::Lfm2(model) => model.prompt_cache_layer_layout(),
             Self::NemotronH(model) => model.prompt_cache_layer_layout(),
@@ -703,6 +757,12 @@ impl Model {
                 model.forward_with_observer(input_tokens, mask, cache, stream, observer)
             }
             (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
+                model.forward_paged_with_observer(input_tokens, mask, cache, stream, observer)
+            }
+            (Self::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
+                model.forward_with_observer(input_tokens, mask, cache, stream, observer)
+            }
+            (Self::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
                 model.forward_paged_with_observer(input_tokens, mask, cache, stream, observer)
             }
             (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache))
@@ -772,6 +832,7 @@ impl Model {
             Self::Llama(model) => ModelCache::Llama(model.new_cache()),
             Self::Lfm2(model) => ModelCache::Lfm2(model.new_cache()),
             Self::DenseQwen(model) => ModelCache::KeyValue(model.new_cache()),
+            Self::MuseGlimmer(model) => ModelCache::KeyValue(model.new_cache()),
             Self::Qwen3Next(model) => ModelCache::Qwen3Next(model.new_cache()),
             Self::Qwen3Vl(model) => ModelCache::Qwen3Vl(model.new_cache()),
             Self::Qwen3VlMoe(model) => ModelCache::Qwen3VlMoe(model.new_cache()),
@@ -810,6 +871,15 @@ impl Model {
                         crate::architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache::Paged(caches) => Ok(ModelCache::PagedKeyValue(caches)),
                         _ => Err(Error::UnsupportedArchitecture(
                             "dense-Qwen paged cache construction returned device state".into(),
+                        )),
+                    })
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::MuseGlimmer(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .and_then(|cache| match cache {
+                        crate::architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache::Paged(caches) => Ok(ModelCache::PagedKeyValue(caches)),
+                        _ => Err(Error::UnsupportedArchitecture(
+                            "Muse-Glimmer paged cache construction returned device state".into(),
                         )),
                     })
                     .map_err(|error| Exception::custom(error.to_string())),
@@ -863,6 +933,7 @@ impl Model {
             Self::DeepSeekV3(model) => load!(model, ModelCache::DeepSeekV3),
             Self::GptOss(model) => load!(model, ModelCache::GptOss),
             Self::DenseQwen(model) => load!(model, ModelCache::KeyValue),
+            Self::MuseGlimmer(model) => load!(model, ModelCache::KeyValue),
             Self::KimiLinear(model) => load!(model, ModelCache::KimiLinear),
             Self::Qwen3Next(model) => load!(model, ModelCache::Qwen3Next),
             Self::Qwen35(model) => load!(model, ModelCache::Qwen35),
@@ -923,6 +994,18 @@ impl Model {
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1028,6 +1111,7 @@ impl Model {
             Self::DeepSeekV3(_) => "deepseek_v3",
             Self::GptOss(_) => "gpt_oss",
             Self::DenseQwen(_) => "dense_qwen",
+            Self::MuseGlimmer(_) => "muse_glimmer",
             Self::KimiLinear(_) => "kimi_linear",
             Self::Lfm2(_) => "lfm2",
             Self::NemotronH(_) => "nemotron_h",
@@ -1052,6 +1136,19 @@ impl Model {
             .map_err(|error| Exception::custom(error.to_string()))?;
         match (self, cache) {
             (Self::DenseQwen(_), ModelCache::PagedKeyValue(caches)) => {
+                for cache in caches.iter_mut().flatten() {
+                    cache.finalize()?;
+                }
+                caches
+                    .iter()
+                    .flatten()
+                    .next()
+                    .ok_or_else(|| Exception::custom("cannot persist an empty paged cache"))?
+                    .manager()
+                    .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
+                    .map_err(|error| Exception::custom(error.to_string()))
+            }
+            (Self::MuseGlimmer(_), ModelCache::PagedKeyValue(caches)) => {
                 for cache in caches.iter_mut().flatten() {
                     cache.finalize()?;
                 }
@@ -1100,6 +1197,12 @@ impl Model {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
@@ -1184,6 +1287,16 @@ impl Model {
             }
             (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
                 ModelGenerate::DenseQwenPaged(common::generation::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
+            (Self::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
+                ModelGenerate::MuseGlimmer(common::generation::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
+            (Self::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
+                ModelGenerate::MuseGlimmerPaged(common::generation::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
@@ -1391,6 +1504,24 @@ where
             S,
         >,
     ),
+    /// Muse-Glimmer generation iterator.
+    MuseGlimmer(
+        common::generation::Generate<
+            'a,
+            crate::architectures::muse_glimmer::layerwise::LayerwiseDecoder,
+            Vec<Option<ConcatKeyValueCache>>,
+            S,
+        >,
+    ),
+    /// Muse-Glimmer generation using a paged KV cache.
+    MuseGlimmerPaged(
+        common::generation::Generate<
+            'a,
+            crate::architectures::muse_glimmer::layerwise::LayerwiseDecoder,
+            Vec<Option<PagedKeyValueCache>>,
+            S,
+        >,
+    ),
     /// Qwen3-VL generation iterator.
     Qwen3Vl(crate::architectures::qwen::vl::layerwise::Generate<'a, S>),
     /// Qwen3-VL-MoE generation iterator.
@@ -1422,6 +1553,8 @@ where
             Self::NemotronH(generate) => generate.sampler_mut(),
             Self::DenseQwenPaged(generate) => generate.sampler_mut(),
             Self::DenseQwen(generate) => generate.sampler_mut(),
+            Self::MuseGlimmerPaged(generate) => generate.sampler_mut(),
+            Self::MuseGlimmer(generate) => generate.sampler_mut(),
             Self::Qwen3Vl(generate) => generate.sampler_mut(),
             Self::Qwen3VlMoe(generate) => generate.sampler_mut(),
             Self::Qwen35(generate) => generate.sampler_mut(),
@@ -1448,6 +1581,8 @@ where
             Self::NemotronH(generate) => generate.next(),
             Self::DenseQwenPaged(generate) => generate.next(),
             Self::DenseQwen(generate) => generate.next(),
+            Self::MuseGlimmerPaged(generate) => generate.next(),
+            Self::MuseGlimmer(generate) => generate.next(),
             Self::Qwen3Vl(generate) => generate.next(),
             Self::Qwen3VlMoe(generate) => generate.next(),
             Self::Qwen35(generate) => generate.next(),

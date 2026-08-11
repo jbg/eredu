@@ -42,14 +42,15 @@ use safemlx::{
 use crate::{
     api::{
         common::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
-        deepseek_v3, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, nemotron_h, qwen3_vl,
-        ModelKind, ModelLoadOptions,
+        deepseek_v3, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, muse_glimmer, nemotron_h,
+        qwen3_vl, ModelKind, ModelLoadOptions,
     },
     architectures::{
         gemma4::layerwise::{Gemma4Layer, Gemma4LayerwiseAdapter},
         inkling::layerwise::{InklingLayer, InklingLayerwiseAdapter},
         kimi_linear::layerwise::KimiLinearLayerwiseAdapter,
         lfm2::layerwise::Lfm2LayerwiseAdapter,
+        muse_glimmer::layerwise::{MuseGlimmerLayer, MuseGlimmerLayerwiseAdapter},
         nemotron_h::layerwise::NemotronHLayerwiseAdapter,
         qwen::{
             dense as dense_qwen,
@@ -83,7 +84,9 @@ use crate::{
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
     runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
-    runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
+    runtime::checkpoint::quantization::{
+        quantize_tensor, should_quantize_on_load, WeightQuantization,
+    },
     runtime::checkpoint::store::{GgufWeightStore, WeightStore, WeightStoreDiagnostics},
     runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
     runtime::distributed::expert::{
@@ -1991,6 +1994,17 @@ struct DenseQwenStage {
     routing_statistics: RoutingStatistics,
 }
 
+struct MuseGlimmerStage {
+    args: muse_glimmer::DecoderConfig,
+    layer_adapter: MuseGlimmerLayerwiseAdapter,
+    range: Range<usize>,
+    vision_range: Range<usize>,
+    vision_layers: Vec<MuseGlimmerLayer>,
+    layers: Vec<MuseGlimmerLayer>,
+    dense_layers: Option<PipelineLayerStorage>,
+    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+}
+
 struct Qwen3VlStage {
     args: qwen3_vl::ModelArgs,
     layer_adapter: Qwen3VlLayerwiseAdapter,
@@ -3774,6 +3788,216 @@ impl PipelineStageSemantics for DenseQwenStage {
             }
             _ => self.forward(input, step, mask, cache, stream),
         }
+    }
+}
+
+impl PipelineStageSemantics for MuseGlimmerStage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::MuseGlimmer
+    }
+
+    fn begin_placed_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.layer_adapter
+            .begin_pipeline_ingress(input, execution, stream)
+            .map(|state| Some(Box::new(state) as Box<dyn Any>))
+    }
+
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn Any>>, Error> {
+        self.layer_adapter
+            .begin_pipeline_continuation(input, stream)
+            .map(|state| Some(Box::new(state) as Box<dyn Any>))
+    }
+
+    fn placed_ingress_active(&self, _group: &str, state: &dyn Any) -> Result<bool, Error> {
+        let state = state
+            .downcast_ref::<muse_glimmer::layerwise::MuseGlimmerPipelineIngressState>()
+            .ok_or_else(|| {
+                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
+            })?;
+        Ok(self.layer_adapter.pipeline_ingress_active(state))
+    }
+
+    fn placed_ingress_arrays(&self, _group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
+        let state = state
+            .downcast_ref::<muse_glimmer::layerwise::MuseGlimmerPipelineIngressState>()
+            .ok_or_else(|| {
+                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
+            })?;
+        Ok(self.layer_adapter.pipeline_ingress_arrays(state))
+    }
+
+    fn replace_placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<muse_glimmer::layerwise::MuseGlimmerPipelineIngressState>()
+            .ok_or_else(|| {
+                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
+            })?;
+        self.layer_adapter
+            .replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn merge_placed_ingress_arrays(
+        &self,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<muse_glimmer::layerwise::MuseGlimmerPipelineIngressState>()
+            .ok_or_else(|| {
+                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
+            })?;
+        self.layer_adapter
+            .replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn execute_placed_ingress(
+        &mut self,
+        _group: &str,
+        state: &mut dyn Any,
+        _step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<muse_glimmer::layerwise::MuseGlimmerPipelineIngressState>()
+            .ok_or_else(|| {
+                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
+            })?;
+        self.execute_placed_vision(state, execution, stream)
+    }
+
+    fn finish_placed_ingress(
+        &mut self,
+        state: Box<dyn Any>,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        let state = state
+            .downcast::<muse_glimmer::layerwise::MuseGlimmerPipelineIngressState>()
+            .map_err(|_| {
+                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
+            })?;
+        let prepared = self.layer_adapter.finish_pipeline_ingress(*state, stream)?;
+        Ok(PipelinePayload {
+            hidden: prepared.hidden,
+            auxiliary: PipelineAuxiliaryState::default(),
+        })
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = self
+            .layer_adapter
+            .prompt_cache_model_identity((topology.tensor_parallel_size > 1).then_some(topology))?;
+        let layout = crate::LayerSchedule::new(
+            self.range.len(),
+            complete
+                .layer_layout
+                .iter()
+                .skip(self.range.start)
+                .take(self.range.len())
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "muse_glimmer",
+            &complete.effective_model_type,
+            complete.architecture_fingerprint,
+            self.args.num_hidden_layers as usize,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_decoder(input, step, mask, cache, None, stream)
+    }
+
+    fn prefill(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if expert_group.is_some() {
+            return Err(Error::Parallel(
+                "Muse-Glimmer is dense and does not support expert parallelism".into(),
+            ));
+        }
+        let prepared = self.layer_adapter.prepare_pipeline_prefill(
+            input,
+            &mut self.vision_layers,
+            execution,
+            stream,
+        )?;
+        let payload = PipelinePayload {
+            hidden: prepared.hidden,
+            auxiliary: PipelineAuxiliaryState::default(),
+        };
+        self.forward_decoder(
+            PipelineStageInput::Hidden(&payload),
+            step,
+            mask,
+            cache,
+            execution,
+            stream,
+        )
+    }
+
+    fn forward_with_execution(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if expert_group.is_some() {
+            return Err(Error::Parallel(
+                "Muse-Glimmer is dense and does not support expert parallelism".into(),
+            ));
+        }
+        self.forward_decoder(input, step, mask, cache, execution, stream)
     }
 }
 
@@ -8391,6 +8615,7 @@ pub fn load_pipeline_model_with_options(
                     | crate::api::GgufArchitecture::Qwen35
                     | crate::api::GgufArchitecture::Qwen35Moe
                     | crate::api::GgufArchitecture::Qwen3Next
+                    | crate::api::GgufArchitecture::MuseGlimmer
             )
         {
             return Err(Error::Parallel(format!(
@@ -8431,6 +8656,27 @@ pub fn load_pipeline_model_with_options(
                     )?);
                 load_llama_pipeline(
                     prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            crate::api::GgufArchitecture::MuseGlimmer => {
+                if expert_cache.is_some() {
+                    return Err(Error::Parallel(
+                        "Muse-Glimmer is dense and does not support expert-cache residency".into(),
+                    ));
+                }
+                let (args, store) = muse_glimmer::layerwise::prepare_gguf_pipeline_source(
+                    &checkpoint,
+                    &metadata,
+                    max_mapped_shards,
+                )?;
+                load_muse_glimmer_pipeline(
+                    args,
                     store,
                     topology,
                     options.quantization,
@@ -8820,6 +9066,8 @@ pub fn load_pipeline_model_with_options(
                     | "qwen3_5_text"
                     | "qwen3_5_moe"
                     | "qwen3_5_moe_text"
+                    | "muse_glimmer"
+                    | "muse_glimmer_text"
             )
         )
     {
@@ -8903,6 +9151,28 @@ pub fn load_pipeline_model_with_options(
                 options.quantization,
                 dense_stream,
                 expert_cache,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("muse_glimmer" | "muse_glimmer_text") => {
+            if expert_cache.is_some() {
+                return Err(Error::Parallel(
+                    "Muse-Glimmer is dense and does not support expert-cache residency".into(),
+                ));
+            }
+            let args = muse_glimmer::load_config(model_dir)?;
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::MuseGlimmer,
+                model_dir,
+                options,
+            )?;
+            load_muse_glimmer_pipeline(
+                args,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
                 stream,
                 weights_stream,
             )
@@ -10555,6 +10825,339 @@ fn load_dense_qwen_pipeline(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn load_muse_glimmer_pipeline(
+    source_args: muse_glimmer::DecoderConfig,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    if topology.expert_parallel_size > 1 {
+        return Err(Error::Parallel(
+            "Muse-Glimmer is dense and does not support expert parallelism".into(),
+        ));
+    }
+    let binding_adapter = MuseGlimmerLayerwiseAdapter::new(source_args.clone(), stream)?;
+    topology.preflight(Some(source_args.num_hidden_layers as usize), None)?;
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Muse-Glimmer pipeline",
+                source_args.weight_quantization(),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    let mut target_args = source_args.clone();
+    if let Some(quantization) = quantize_on_load {
+        target_args.quantization = Some(quantization);
+        target_args.quantization_config = None;
+        target_args.quantized_weight_configs = None;
+        if let Some(vision) = &mut target_args.vision_config {
+            vision.apply_load_time_quantization(quantization);
+        }
+    }
+    let target_binding_adapter = MuseGlimmerLayerwiseAdapter::new(target_args.clone(), stream)?;
+    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        source_args.num_hidden_layers as usize,
+        ModelKind::MuseGlimmer,
+        source_args.hidden_size,
+    );
+    info.placement = Arc::new(multimodal_placement(
+        topology.pipeline_parallel_size,
+        source_args.num_hidden_layers as usize,
+        source_args
+            .vision_config
+            .as_ref()
+            .map(muse_glimmer::vision::VisionConfig::layer_count),
+        None,
+    )?);
+    let mut stage = MuseGlimmerStage::new(target_args.clone(), range, &info, stream)?;
+    let parallel_layout = if topology.tensor_parallel_size > 1 {
+        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+        let mut planner = build.planner();
+        binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
+        let (_, layout) = planner.finish()?;
+        stage
+            .layer_adapter
+            .configure_parallel_static(build, &layout, stream)?;
+        Some(layout)
+    } else {
+        None
+    };
+    stage.parallel_layout = parallel_layout.clone();
+    stage.vision_layers = stage
+        .vision_range
+        .clone()
+        .map(|index| {
+            stage.layer_adapter.new_cartesian_layer(
+                0,
+                index,
+                parallel_layout.as_ref(),
+                None,
+                stream,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    stage.layers = stage
+        .range
+        .clone()
+        .map(|index| {
+            stage.layer_adapter.new_cartesian_layer(
+                1,
+                index,
+                parallel_layout.as_ref(),
+                None,
+                stream,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "vision",
+            info.is_first && target_args.vision_config.is_some(),
+        ),
+        (
+            "embedding",
+            info.is_first || (info.is_last && target_args.tie_word_embeddings),
+        ),
+        ("norm", info.is_last),
+        ("output", info.is_last && !target_args.tie_word_embeddings),
+    ]);
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 1, stage.range.clone())
+                    .with_layer_group(0, stage.vision_range.clone()),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
+        }
+        None => (store, None),
+    };
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
+    let mut loaded = PipelineLoadAccumulator::new("Muse-Glimmer");
+    if info.is_first && target_args.vision_config.is_some() {
+        let bindings = pipeline_cartesian_static_bindings(
+            &static_units,
+            "vision",
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
+        loaded.load(
+            stage
+                .layer_adapter
+                .vision_mut()
+                .expect("Muse-Glimmer vision config has static modules"),
+            store.as_ref(),
+            &bindings,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if info.is_first || (info.is_last && target_args.tie_word_embeddings) {
+        let bindings = pipeline_cartesian_static_bindings(
+            &static_units,
+            "embedding",
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
+        if let Some(module) = stage.layer_adapter.parallel_embedding_mut() {
+            loaded.load(
+                module.inner_mut(),
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        } else {
+            loaded.load(
+                stage.layer_adapter.embedding_mut(),
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    if info.is_last {
+        loaded.load(
+            stage.layer_adapter.norm_mut(),
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+        if !target_args.tie_word_embeddings {
+            let bindings = pipeline_cartesian_static_bindings(
+                &static_units,
+                "output",
+                store.as_ref(),
+                parallel_layout.as_ref(),
+            )?;
+            if let Some(module) = stage.layer_adapter.parallel_lm_head_mut() {
+                loaded.load(
+                    module.inner_mut(),
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            } else if let Some(module) = stage.layer_adapter.lm_head_mut() {
+                loaded.load(
+                    module,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
+    if dense_stream.is_none() {
+        for (index, layer) in stage.vision_range.clone().zip(&mut stage.vision_layers) {
+            let bindings = binding_adapter.cartesian_layer_bindings(
+                0,
+                index,
+                layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                None,
+                stream,
+            )?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+        for (index, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let bindings = binding_adapter.cartesian_layer_bindings(
+                1,
+                index,
+                layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                None,
+                stream,
+            )?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    let static_bytes = loaded.finish(&mut info)?;
+    if let Some(options) = dense_stream {
+        let layout = parallel_layout.clone();
+        let adapter = &stage.layer_adapter;
+        let vision_start = stage.vision_range.start;
+        let vision_count = stage.vision_range.len();
+        let text_start = stage.range.start;
+        let unit_count = vision_count + stage.range.len();
+        let dense_layers = build_pipeline_layer_storage(
+            Arc::clone(&store),
+            0..unit_count,
+            options,
+            static_bytes,
+            info.materialization.clone(),
+            stream,
+            weights_stream,
+            |ordinal, stream| {
+                if ordinal < vision_count {
+                    adapter.new_cartesian_layer(
+                        0,
+                        vision_start + ordinal,
+                        layout.as_ref(),
+                        None,
+                        stream,
+                    )
+                } else {
+                    adapter.new_cartesian_layer(
+                        1,
+                        text_start + ordinal - vision_count,
+                        layout.as_ref(),
+                        None,
+                        stream,
+                    )
+                }
+            },
+            |ordinal, layer, store| {
+                if ordinal < vision_count {
+                    binding_adapter.cartesian_layer_bindings(
+                        0,
+                        vision_start + ordinal,
+                        layer,
+                        store,
+                        layout.as_ref(),
+                        None,
+                        stream,
+                    )
+                } else {
+                    binding_adapter.cartesian_layer_bindings(
+                        1,
+                        text_start + ordinal - vision_count,
+                        layer,
+                        store,
+                        layout.as_ref(),
+                        None,
+                        stream,
+                    )
+                }
+            },
+        )?
+        .with_execution_offset(vision_count)?;
+        stage.dense_layers = Some(dense_layers);
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
+        info.planned_owned_parameter_bytes =
+            static_bytes.checked_add(layer_bytes).ok_or_else(|| {
+                Error::Parallel("Muse-Glimmer pipeline planned bytes overflowed".into())
+            })?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    let diagnostics = store.diagnostics()?;
+    info.opened_checkpoint_shards = diagnostics.touched_shard_paths.clone();
+    info.checkpoint_diagnostics = Some(diagnostics);
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn load_qwen3_vl_pipeline(
     source_args: qwen3_vl::ModelArgs,
     store: SharedWeightStore,
@@ -11286,6 +11889,236 @@ impl DenseQwenStage {
             PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
         };
         Ok(output)
+    }
+}
+
+impl MuseGlimmerStage {
+    fn new(
+        args: muse_glimmer::DecoderConfig,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let layer_adapter = MuseGlimmerLayerwiseAdapter::new(args.clone(), stream)?;
+        Ok(Self {
+            args,
+            layer_adapter,
+            range,
+            vision_range: info
+                .placement
+                .group("vision_encoder")
+                .and_then(|group| group.local_units(info.pipeline_stage))
+                .unwrap_or(0..0),
+            vision_layers: Vec::new(),
+            layers: Vec::new(),
+            dense_layers: None,
+            parallel_layout: None,
+        })
+    }
+
+    fn execute_placed_vision(
+        &mut self,
+        state: &mut muse_glimmer::layerwise::MuseGlimmerPipelineIngressState,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        if let Some(storage) = self.dense_layers.as_ref() {
+            let forward_guard = match &storage.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.forward_guard(true, &storage.residency)?)
+                }
+            };
+            let group_guard = match &storage.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.group_guard(&storage.residency, "pipeline_stage"))
+                }
+            };
+            let mut window = storage.transfer_window(0..self.vision_range.len(), true)?;
+            for (ordinal, index) in self.vision_range.clone().enumerate() {
+                let transfer = window
+                    .as_mut()
+                    .map(|window| window.next(stream))
+                    .transpose()?;
+                let lease = transfer
+                    .is_none()
+                    .then(|| storage.prepare_layerwise_absolute(ordinal))
+                    .transpose()?;
+                let mut layer = self.layer_adapter.new_cartesian_layer(
+                    0,
+                    index,
+                    self.parallel_layout.as_ref(),
+                    None,
+                    stream,
+                )?;
+                populate_module_from_lease(
+                    &mut layer,
+                    transfer
+                        .as_ref()
+                        .map(|transfer| transfer.lease())
+                        .or(lease.as_ref())
+                        .expect("Muse-Glimmer placed vision residency lease"),
+                )?;
+                let retained = self
+                    .layer_adapter
+                    .forward_pipeline_vision_layer(index, &mut layer, state, execution, stream)?;
+                synchronize_outputs(retained.iter())?;
+                drop(transfer);
+                drop(lease);
+                if let Some(window) = &mut window {
+                    window.refill()?;
+                } else {
+                    storage.trim_after_absolute(ordinal)?;
+                }
+            }
+            storage.complete_forward()?;
+            if let Some(guard) = group_guard {
+                guard.complete()?;
+            }
+            if let Some(guard) = forward_guard {
+                guard.complete()?;
+            }
+        } else {
+            for (index, layer) in self.vision_range.clone().zip(&mut self.vision_layers) {
+                self.layer_adapter
+                    .forward_pipeline_vision_layer(index, layer, state, execution, stream)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn forward_decoder(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        validate_scheduled_pipeline_kv_cache(
+            "Muse-Glimmer",
+            self.range.clone(),
+            &self.args.attention_schedule,
+            caches,
+        )?;
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => (
+                self.layer_adapter
+                    .prepare_pipeline_tokens(tokens, execution, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let offset = pipeline_kv_offset(caches);
+        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
+            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
+            .transpose()?;
+        let full_mask = explicit_mask.or(generated_mask.as_ref());
+        let args = self.args.clone();
+        let adapter = &self.layer_adapter;
+        let layout = self.parallel_layout.clone();
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                adapter.new_cartesian_layer(1, global_layer, layout.as_ref(), None, stream)
+            },
+            |global_layer, layer, hidden, cache, stream| {
+                let MuseGlimmerLayer::Text(block) = layer else {
+                    return Err(Error::Parallel(format!(
+                        "Muse-Glimmer text range contains a vision unit at layer {global_layer}"
+                    )));
+                };
+                let policy = *args
+                    .attention_schedule
+                    .get(global_layer)
+                    .expect("validated Muse-Glimmer pipeline range");
+                let mask = match explicit_mask {
+                    Some(mask) => Some(mask),
+                    None if policy.window().is_none() => full_mask,
+                    None => None,
+                };
+                let forwarded = match cache {
+                    PipelineLayerCache::KeyValue {
+                        global_layer: cached,
+                        cache: PipelineKeyValueCache::Standard(cache),
+                        ..
+                    } if *cached == global_layer => {
+                        match execution.and_then(ParallelExecutionContext::group) {
+                            Some(group) => block.forward_tensor_parallel(
+                                hidden,
+                                mask,
+                                Some(cache),
+                                group,
+                                stream,
+                            )?,
+                            None => block.forward(
+                                AttentionInput {
+                                    x: hidden,
+                                    mask,
+                                    cache: Some(cache),
+                                },
+                                stream,
+                            )?,
+                        }
+                    }
+                    PipelineLayerCache::KeyValue {
+                        global_layer: cached,
+                        cache: PipelineKeyValueCache::Paged(cache),
+                        ..
+                    } if *cached == global_layer => {
+                        match execution.and_then(ParallelExecutionContext::group) {
+                            Some(group) => block.forward_tensor_parallel(
+                                hidden,
+                                mask,
+                                Some(cache),
+                                group,
+                                stream,
+                            )?,
+                            None => block.forward(
+                                AttentionInput {
+                                    x: hidden,
+                                    mask,
+                                    cache: Some(cache),
+                                },
+                                stream,
+                            )?,
+                        }
+                    }
+                    _ => {
+                        return Err(Error::Parallel(format!(
+                            "Muse-Glimmer stage cache does not match global layer {global_layer}"
+                        )))
+                    }
+                };
+                if execution.is_some_and(ParallelExecutionContext::is_tensor_parallel) {
+                    synchronize_outputs([&forwarded])?;
+                }
+                Ok(forwarded)
+            },
+        )?;
+        if self.range.end == self.args.num_hidden_layers as usize {
+            Ok(PipelineStageOutput::Logits(
+                self.layer_adapter
+                    .finish_pipeline_text(&hidden, execution, stream)?,
+            ))
+        } else {
+            Ok(PipelineStageOutput::Hidden(PipelinePayload {
+                hidden,
+                auxiliary,
+            }))
+        }
     }
 }
 

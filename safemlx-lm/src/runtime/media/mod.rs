@@ -21,6 +21,8 @@ use crate::architectures::gemma4::processor as gemma4;
 pub mod image;
 use crate::architectures::inkling::processor as inkling;
 #[cfg(feature = "image-processing")]
+use crate::architectures::muse_glimmer::processor as muse_glimmer;
+#[cfg(feature = "image-processing")]
 use crate::architectures::qwen::vl::processor as qwen;
 /// Shared decoded-video validation, sampling, and timing operations.
 #[cfg(feature = "image-processing")]
@@ -169,6 +171,7 @@ enum OwnedInputPayload {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OwnedInputMetadata {
     qwen_grid_thw: Option<Array>,
+    vision_grid_thw: Option<Array>,
     patch_position_ids: Option<Array>,
     audio_mask: Option<Array>,
 }
@@ -178,6 +181,14 @@ impl OwnedInputMetadata {
     pub(crate) fn qwen_grid_thw(value: Array) -> Self {
         Self {
             qwen_grid_thw: Some(value),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(feature = "image-processing")]
+    pub(crate) fn vision_grid_thw(value: Array) -> Self {
+        Self {
+            vision_grid_thw: Some(value),
             ..Self::default()
         }
     }
@@ -201,6 +212,7 @@ impl OwnedInputMetadata {
     fn from_input_metadata(metadata: InputMetadata<'_>) -> Self {
         Self {
             qwen_grid_thw: metadata.qwen_grid_thw.cloned(),
+            vision_grid_thw: metadata.vision_grid_thw.cloned(),
             patch_position_ids: metadata.patch_position_ids.cloned(),
             audio_mask: metadata.audio_mask.cloned(),
         }
@@ -249,6 +261,7 @@ impl PreparedInputPart {
             payload,
             metadata: InputMetadata {
                 qwen_grid_thw: self.metadata.qwen_grid_thw.as_ref(),
+                vision_grid_thw: self.metadata.vision_grid_thw.as_ref(),
                 patch_position_ids: self.metadata.patch_position_ids.as_ref(),
                 audio_mask: self.metadata.audio_mask.as_ref(),
             },
@@ -306,6 +319,7 @@ struct PreparedInputPartIdentity {
     payload_kind: PreparedPayloadKind,
     payload: PreparedArrayIdentity,
     qwen_grid_thw: Option<PreparedArrayIdentity>,
+    vision_grid_thw: Option<PreparedArrayIdentity>,
     patch_position_ids: Option<PreparedArrayIdentity>,
     audio_mask: Option<PreparedArrayIdentity>,
 }
@@ -322,6 +336,10 @@ impl PreparedInputPartIdentity {
             payload_kind,
             payload: PreparedArrayIdentity::new(payload),
             qwen_grid_thw: part.metadata.qwen_grid_thw.map(PreparedArrayIdentity::new),
+            vision_grid_thw: part
+                .metadata
+                .vision_grid_thw
+                .map(PreparedArrayIdentity::new),
             patch_position_ids: part
                 .metadata
                 .patch_position_ids
@@ -342,6 +360,7 @@ impl PreparedInputPartIdentity {
         ]);
         self.payload.encode_descriptor(output)?;
         encode_optional_identity(self.qwen_grid_thw.as_ref(), output)?;
+        encode_optional_identity(self.vision_grid_thw.as_ref(), output)?;
         encode_optional_identity(self.patch_position_ids.as_ref(), output)?;
         encode_optional_identity(self.audio_mask.as_ref(), output)
     }
@@ -483,6 +502,7 @@ impl PreparedModelInputIdentity {
                 payload_kind,
                 payload: array(&mut cursor, descriptor)?,
                 qwen_grid_thw: optional(&mut cursor, descriptor)?,
+                vision_grid_thw: optional(&mut cursor, descriptor)?,
                 patch_position_ids: optional(&mut cursor, descriptor)?,
                 audio_mask: optional(&mut cursor, descriptor)?,
             });
@@ -502,6 +522,7 @@ impl PreparedModelInputIdentity {
             arrays.push((part.payload.dtype, part.payload.shape.clone()));
             for metadata in [
                 part.qwen_grid_thw.as_ref(),
+                part.vision_grid_thw.as_ref(),
                 part.patch_position_ids.as_ref(),
                 part.audio_mask.as_ref(),
             ]
@@ -593,6 +614,7 @@ impl PreparedModelInput {
                 | OwnedInputPayload::Embeddings(value) => value.clone(),
             });
             arrays.extend(part.metadata.qwen_grid_thw.iter().cloned());
+            arrays.extend(part.metadata.vision_grid_thw.iter().cloned());
             arrays.extend(part.metadata.patch_position_ids.iter().cloned());
             arrays.extend(part.metadata.audio_mask.iter().cloned());
         }
@@ -627,6 +649,7 @@ impl PreparedModelInput {
             let mut next_optional = |present: bool| present.then(|| arrays.next().unwrap());
             let metadata = OwnedInputMetadata {
                 qwen_grid_thw: next_optional(part.qwen_grid_thw.is_some()),
+                vision_grid_thw: next_optional(part.vision_grid_thw.is_some()),
                 patch_position_ids: next_optional(part.patch_position_ids.is_some()),
                 audio_mask: next_optional(part.audio_mask.is_some()),
             };
@@ -650,6 +673,8 @@ pub struct ModelProcessor {
 enum ProcessorKind {
     Gemma4(gemma4::Gemma4Processor),
     Inkling(inkling::InklingProcessor),
+    #[cfg(feature = "image-processing")]
+    MuseGlimmer(muse_glimmer::MuseGlimmerProcessor),
     #[cfg(feature = "image-processing")]
     Qwen(qwen::QwenProcessor),
 }
@@ -684,6 +709,26 @@ impl ModelProcessor {
         })
     }
 
+    #[cfg(feature = "image-processing")]
+    pub(crate) fn load_muse_glimmer(model_dir: &Path) -> Result<Option<Self>, Error> {
+        muse_glimmer::MuseGlimmerProcessor::load(model_dir).map(|processor| {
+            processor.map(|processor| Self {
+                kind: ProcessorKind::MuseGlimmer(processor),
+            })
+        })
+    }
+
+    #[cfg(feature = "image-processing")]
+    pub(crate) fn load_muse_glimmer_gguf(
+        projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            kind: ProcessorKind::MuseGlimmer(muse_glimmer::MuseGlimmerProcessor::from_gguf(
+                projector_metadata,
+            )?),
+        })
+    }
+
     #[cfg(feature = "media-processing")]
     pub(crate) fn load_inkling_gguf(
         metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
@@ -713,6 +758,8 @@ impl ModelProcessor {
         match &self.kind {
             ProcessorKind::Gemma4(processor) => processor.prepare_input(input, encode_text),
             ProcessorKind::Inkling(processor) => processor.prepare_input(input, encode_text),
+            #[cfg(feature = "image-processing")]
+            ProcessorKind::MuseGlimmer(processor) => processor.prepare_input(input, encode_text),
             #[cfg(feature = "image-processing")]
             ProcessorKind::Qwen(processor) => processor.prepare_input(input, encode_text),
         }
@@ -862,6 +909,16 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
         "inkling_mm_model" => ModelProcessor::load_inkling(model_dir),
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
             ModelProcessor::load_gemma4(model_dir)
+        }
+        "muse_glimmer" | "muse_glimmer_text" => {
+            #[cfg(feature = "image-processing")]
+            {
+                ModelProcessor::load_muse_glimmer(model_dir)
+            }
+            #[cfg(not(feature = "image-processing"))]
+            {
+                Ok(None)
+            }
         }
         "qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text" | "qwen3_5"
         | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {

@@ -600,6 +600,7 @@ impl Model {
         let result = match self {
             Self::Llama(model) => llama_spec(model.args(), false)?,
             Self::DenseQwen(model) => dense_qwen_spec(model.args(), false)?,
+            Self::MuseGlimmer(model) => muse_glimmer_spec(model.args())?,
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
                 dense_qwen_spec(&model.args().text_config, true)?
             }
@@ -796,6 +797,56 @@ fn dense_qwen_spec(
         .collect();
     }
     Ok(spec)
+}
+
+fn muse_glimmer_spec(args: &super::muse_glimmer::DecoderConfig) -> Result<Spec, CapabilityError> {
+    let context = plain_context(args.max_position_embeddings)?;
+    let full_layers = args.attention_schedule.full_layer_count() as u64;
+    let sliding = args
+        .attention_schedule
+        .sliding_windows()
+        .into_iter()
+        .map(|(window, layers)| SlidingWindowLayerCount {
+            window: u64::from(window.get()),
+            layers: layers as u64,
+        })
+        .collect::<Vec<_>>();
+    let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
+    let state_strategy = CacheStateStrategy::MixedKv {
+        full_layers,
+        sliding: sliding.clone(),
+    };
+    let growing = std::iter::once(GrowingState {
+        layers: full_layers,
+        scalars_per_position: scalars,
+        window: None,
+    })
+    .filter(|state| state.layers > 0)
+    .chain(sliding.into_iter().map(|group| GrowingState {
+        layers: group.layers,
+        scalars_per_position: scalars,
+        window: Some(group.window),
+    }))
+    .collect();
+    Ok((
+        context.0,
+        context.1,
+        state_strategy,
+        InputModalities {
+            text: true,
+            image: args.vision_config.is_some(),
+            audio: false,
+            video: args.vision_config.is_some()
+                && args.weight_convention == super::muse_glimmer::WeightConvention::HuggingFace,
+        },
+        ArchitectureEstimate {
+            fixed_scalars_per_batch: 0,
+            growing,
+            hidden_size: positive(args.hidden_size, "hidden_size")?,
+            allocation_granularity: 1,
+            completeness: EstimationCompleteness::Complete,
+        },
+    ))
 }
 
 fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError> {
@@ -2264,6 +2315,117 @@ impl Model {
                 architecture: self.model_type().into(),
                 reason: format!("{} media is not supported", modality.as_str()),
             }),
+            Self::MuseGlimmer(model) => {
+                let config = model.args().vision_config.as_ref().ok_or_else(|| {
+                    CapabilityError::UnsupportedInput {
+                        architecture: self.model_type().into(),
+                        reason: "loaded Muse-Glimmer artifact has no vision projector".into(),
+                    }
+                })?;
+                if modality == Modality::Audio
+                    || (modality == Modality::Video
+                        && model.args().weight_convention
+                            == super::muse_glimmer::WeightConvention::Gguf)
+                {
+                    return Err(CapabilityError::UnsupportedInput {
+                        architecture: self.model_type().into(),
+                        reason: format!(
+                            "loaded Muse-Glimmer artifact does not support {}",
+                            modality.as_str()
+                        ),
+                    });
+                }
+                let grid =
+                    metadata
+                        .vision_grid_thw
+                        .ok_or_else(|| CapabilityError::UnsupportedInput {
+                            architecture: self.model_type().into(),
+                            reason: "Muse-Glimmer media requires vision_grid_thw metadata".into(),
+                        })?;
+                if grid.ndim() != 2 || grid.dim(1) != 3 {
+                    return Err(CapabilityError::UnsupportedInput {
+                        architecture: self.model_type().into(),
+                        reason: format!(
+                            "Muse-Glimmer vision_grid_thw must be [items, 3], got {:?}",
+                            grid.shape()
+                        ),
+                    });
+                }
+                let evaluated = grid
+                    .evaluated()
+                    .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+                let values = evaluated
+                    .try_as_slice::<i32>()
+                    .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+                if values.len() % 3 != 0 {
+                    return Err(CapabilityError::UnsupportedInput {
+                        architecture: self.model_type().into(),
+                        reason: "Muse-Glimmer vision_grid_thw has an incomplete row".into(),
+                    });
+                }
+                let mut patches = 0u64;
+                let mut positions = 0u64;
+                for entry in values.chunks_exact(3) {
+                    if entry.iter().any(|value| *value <= 0)
+                        || entry[1] % config.merge_size != 0
+                        || entry[2] % config.merge_size != 0
+                    {
+                        return Err(CapabilityError::UnsupportedInput {
+                            architecture: self.model_type().into(),
+                            reason:
+                                "Muse-Glimmer vision grids must be positive and merge-divisible"
+                                    .into(),
+                        });
+                    }
+                    let t = entry[0] as u64;
+                    let h = entry[1] as u64;
+                    let w = entry[2] as u64;
+                    patches = checked_add(
+                        patches,
+                        checked_mul(
+                            checked_mul(t, h, "Muse vision t*h")?,
+                            w,
+                            "Muse vision patches",
+                        )?,
+                        "Muse vision patch total",
+                    )?;
+                    positions = checked_add(
+                        positions,
+                        checked_mul(
+                            checked_mul(t, h / config.merge_size as u64, "Muse merged t*h")?,
+                            w / config.merge_size as u64,
+                            "Muse merged positions",
+                        )?,
+                        "Muse merged position total",
+                    )?;
+                }
+                if positive(payload.dim(0), "Muse vision payload patches")? != patches {
+                    return Err(CapabilityError::UnsupportedInput {
+                        architecture: self.model_type().into(),
+                        reason: format!(
+                            "Muse-Glimmer payload has {} patches but metadata describes {patches}",
+                            payload.dim(0)
+                        ),
+                    });
+                }
+                let input = array_bytes(payload, "Muse-Glimmer prepared media bytes")?;
+                let graph = checked_mul(
+                    patches,
+                    positive(config.hidden_size, "Muse vision hidden size")?,
+                    "Muse vision activation scalars",
+                )?;
+                Ok((
+                    positions,
+                    checked_add(
+                        input,
+                        four_byte_scalars(
+                            checked_mul(graph, 8, "Muse vision graph multiplier")?,
+                            "Muse vision graph bytes",
+                        )?,
+                        "Muse total media workspace",
+                    )?,
+                ))
+            }
         }
     }
 }

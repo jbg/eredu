@@ -152,9 +152,15 @@ fn gemma4_mtp_cache(cache: &mut ModelCache) -> Option<&mut gemma4::Cache> {
     }
 }
 
+fn model_mtp_cache(cache: &mut ModelCache) -> Option<&mut ModelCache> {
+    Some(cache)
+}
+
 fn run_external_mtp_batch<'a, B, S>(
     backend: &'a mut B,
     lanes: &'a mut [ModelCache],
+    cache_for_lane: fn(&mut ModelCache) -> Option<&mut B::Cache>,
+    cache_kind: &str,
     prompt_tokens: &Array,
     config: &MtpConfig,
     prng_key: Option<Array>,
@@ -162,17 +168,17 @@ fn run_external_mtp_batch<'a, B, S>(
     streams: MtpExecutionStreams<'a>,
 ) -> Result<MtpBatchOutput, Exception>
 where
-    B: crate::runtime::generation::speculative::MtpBackend<Cache = gemma4::Cache>,
+    B: crate::runtime::generation::speculative::MtpBackend,
     S: SpeculativeSampler + Clone + 'a,
 {
     let mut batch_prng = prng_key.map(RandomState::from_key);
     let mut scheduler = MtpScheduler::new(backend, streams, MtpSchedulerOptions::default())?;
     for (lane, lane_cache) in lanes.iter_mut().enumerate() {
-        let ModelCache::Gemma4(lane_cache) = lane_cache else {
-            return Err(Exception::custom(format!(
-                "scheduled Gemma 4 MTP requires Gemma 4 cache lane {lane}"
-            )));
-        };
+        let lane_cache = cache_for_lane(lane_cache).ok_or_else(|| {
+            Exception::custom(format!(
+                "scheduled {cache_kind} MTP cache type mismatch at lane {lane}"
+            ))
+        })?;
         let row = prompt_tokens.try_index_device((lane as i32, NewAxis, ..), streams.target())?;
         let lane_key = batch_prng
             .as_mut()
@@ -300,12 +306,31 @@ impl LoadedModel {
     /// and the token-id vocabulary mapping when the drafter carries tokenizer
     /// metadata.
     pub fn validate_drafter_compatibility(&self, drafter: &LoadedDrafter) -> Result<(), Error> {
-        let assistant = drafter.gemma4();
-        match &self.model {
-            Model::Gemma4(target) => validate_gemma4_drafter(target.args(), assistant)?,
-            model => {
+        match (&self.model, drafter.kind()) {
+            (Model::Gemma4(target), DrafterKind::Gemma4Assistant) => {
+                validate_gemma4_drafter(target.args(), drafter.gemma4())?
+            }
+            (Model::MuseGlimmer(target), DrafterKind::MuseGlimmerDFlash) => {
+                let assistant = drafter.muse_glimmer();
+                let target_args = target.args();
+                if assistant.config.hidden_size != target_args.hidden_size
+                    || assistant
+                        .config
+                        .target_layer_ids
+                        .iter()
+                        .any(|layer| *layer >= target_args.num_hidden_layers as usize)
+                    || assistant.config.mask_token_id >= target_args.vocab_size as u32
+                    || assistant.config.block_size != 16
+                {
+                    return Err(Error::UnsupportedArchitecture(
+                        "Muse-Glimmer DFlash hidden geometry, layer mapping, mask token, or block size does not match the target"
+                            .into(),
+                    ));
+                }
+            }
+            (model, kind) => {
                 return Err(Error::UnsupportedArchitecture(format!(
-                    "external MTP is unavailable for model type {} ({:?})",
+                    "drafter {kind:?} is incompatible with target {} ({:?})",
                     model.model_type(),
                     model.mtp_capability()
                 )))
@@ -314,8 +339,7 @@ impl LoadedModel {
         if let Some(draft_fingerprint) = drafter.tokenizer_fingerprint() {
             if draft_fingerprint != self.tokenizer_fingerprint {
                 return Err(Error::UnsupportedArchitecture(
-                    "Gemma 4 assistant token-id vocabulary mapping does not match the target"
-                        .into(),
+                    "assistant token-id vocabulary mapping does not match the target".into(),
                 ));
             }
         }
@@ -437,9 +461,9 @@ impl LoadedModel {
         self.validate_drafter_compatibility(drafter)?;
         let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, streams.target())?;
 
-        let assistant = drafter.gemma4_mut();
         match &mut self.model {
             Model::Gemma4(target) => {
+                let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut backend =
                     crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
@@ -448,6 +472,22 @@ impl LoadedModel {
                     prepared_lanes,
                     gemma4_mtp_cache,
                     "Gemma 4",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+            }
+            Model::MuseGlimmer(target) => {
+                let assistant = drafter.muse_glimmer_mut();
+                let mut backend =
+                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
+                        target, assistant,
+                    );
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    model_mtp_cache,
+                    "Muse-Glimmer DFlash",
                     streams,
                     scheduler,
                 )
@@ -1172,15 +1212,35 @@ impl LoadedModel {
         if config.eos_token_ids.is_empty() {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        let assistant = drafter.gemma4_mut();
         match &mut self.model {
             Model::Gemma4(target) => {
+                let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut backend =
                     crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
                 run_external_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
+                    gemma4_mtp_cache,
+                    "Gemma 4",
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    streams,
+                )
+            }
+            Model::MuseGlimmer(target) => {
+                let assistant = drafter.muse_glimmer_mut();
+                let mut backend =
+                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
+                        target, assistant,
+                    );
+                run_external_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    model_mtp_cache,
+                    "Muse-Glimmer DFlash",
                     prompt_tokens,
                     &config,
                     prng_key,
@@ -2003,6 +2063,25 @@ pub(super) fn load_gguf_model_data(
                     )?;
                 (Model::Llama(model), loaded.eos_token_ids)
             }
+            GgufArchitecture::MuseGlimmer => {
+                #[cfg(feature = "image-processing")]
+                if let Some(mmproj) =
+                    crate::architectures::muse_glimmer::open_sibling_mmproj(gguf_file)?
+                {
+                    processor = Some(ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata)?);
+                }
+                let (loaded, eos_token_ids) =
+                    crate::architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
+                        &checkpoint,
+                        &metadata,
+                        &architecture,
+                        options.weight_residency,
+                        Some(quantization),
+                        stream,
+                        weights_stream,
+                    )?;
+                (Model::MuseGlimmer(loaded), eos_token_ids)
+            }
             GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
                 let loaded = lfm2::load_gguf_checkpoint(
                     &checkpoint,
@@ -2210,6 +2289,25 @@ pub(super) fn load_gguf_model_data(
                         weights_stream,
                     )?;
                 (Model::Llama(loaded), eos_token_ids)
+            }
+            GgufArchitecture::MuseGlimmer => {
+                #[cfg(feature = "image-processing")]
+                if let Some(mmproj) =
+                    crate::architectures::muse_glimmer::open_sibling_mmproj(gguf_file)?
+                {
+                    processor = Some(ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata)?);
+                }
+                let (loaded, eos_token_ids) =
+                    crate::architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
+                        &checkpoint,
+                        &metadata,
+                        &architecture,
+                        options.weight_residency,
+                        options.quantization,
+                        stream,
+                        weights_stream,
+                    )?;
+                (Model::MuseGlimmer(loaded), eos_token_ids)
             }
             GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
                 let (loaded, eos_token_ids) =

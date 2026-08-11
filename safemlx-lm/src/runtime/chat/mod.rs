@@ -4,6 +4,7 @@
 //! selected only from registered signatures of the selected template body;
 //! model architecture metadata is deliberately not a fallback.
 
+pub(crate) mod atem;
 pub(crate) mod constraints;
 pub(crate) mod dialect;
 pub(crate) mod gemma;

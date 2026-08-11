@@ -60,8 +60,8 @@ use crate::{
     },
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::generation::speculative::{
-        LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind, MtpConfig,
-        MtpExecutionStreams, MtpScheduler, MtpSchedulerOptions, MtpSchedulerStats,
+        DrafterKind, LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind,
+        MtpConfig, MtpExecutionStreams, MtpScheduler, MtpSchedulerOptions, MtpSchedulerStats,
         MtpSemanticState, MtpStats,
     },
 };
@@ -95,6 +95,8 @@ pub(crate) use crate::architectures::moshi::model as moshi;
 /// It intentionally does not implement audio encoding, decoding, or realtime
 /// device I/O.
 pub(crate) use crate::architectures::moshi::personaplex;
+/// Meta Muse-Glimmer dense multimodal decoder support.
+pub(crate) use crate::architectures::muse_glimmer;
 /// Nemotron-H hybrid Mamba2/attention/MoE config support.
 pub(crate) use crate::architectures::nemotron_h::model as nemotron_h;
 /// Shared Qwen2/Qwen2.5/Qwen3 dense decoder support.
@@ -443,6 +445,15 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
+            ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
+                crate::architectures::muse_glimmer::layerwise::load_safetensors_quantized_residency(
+                    model_dir,
+                    execution,
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
             ModelKind::Lfm2 => Ok(Model::Lfm2(
                 crate::architectures::lfm2::layerwise::execute_transformed_lfm2_model(
                     lfm2::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
@@ -543,6 +554,14 @@ fn load_model_for_kind(
                 crate::architectures::llama::layerwise::LlamaLoadOptions {
                     weight_residency: execution.weight_residency(),
                 },
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
+            crate::architectures::muse_glimmer::layerwise::load_safetensors(
+                model_dir,
+                execution,
                 stream,
                 weights_stream,
             )?,

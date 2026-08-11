@@ -110,6 +110,8 @@ pub enum InputPayload<'a> {
 pub struct InputMetadata<'a> {
     /// Qwen image/video grid metadata shaped as expected by the checkpoint.
     pub qwen_grid_thw: Option<&'a Array>,
+    /// Architecture-neutral `(time, height, width)` vision grids shaped `[items, 3]`.
+    pub vision_grid_thw: Option<&'a Array>,
     /// Image or video-frame patch positions shaped `[batch, patches, 2]`, with negative coordinates for padding.
     pub patch_position_ids: Option<&'a Array>,
     /// Valid-frame mask for model-native audio features.
@@ -126,8 +128,17 @@ impl<'a> InputMetadata<'a> {
     pub fn qwen_grid_thw(grid_thw: &'a Array) -> Self {
         Self {
             qwen_grid_thw: Some(grid_thw),
+            vision_grid_thw: None,
             patch_position_ids: None,
             audio_mask: None,
+        }
+    }
+
+    /// Creates metadata carrying architecture-neutral vision `(t, h, w)` grids.
+    pub fn vision_grid_thw(grid_thw: &'a Array) -> Self {
+        Self {
+            vision_grid_thw: Some(grid_thw),
+            ..Self::default()
         }
     }
 
@@ -135,6 +146,7 @@ impl<'a> InputMetadata<'a> {
     pub fn patch_position_ids(position_ids: &'a Array) -> Self {
         Self {
             qwen_grid_thw: None,
+            vision_grid_thw: None,
             patch_position_ids: Some(position_ids),
             audio_mask: None,
         }
@@ -144,6 +156,7 @@ impl<'a> InputMetadata<'a> {
     pub fn audio_mask(mask: &'a Array) -> Self {
         Self {
             qwen_grid_thw: None,
+            vision_grid_thw: None,
             patch_position_ids: None,
             audio_mask: Some(mask),
         }

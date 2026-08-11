@@ -18,6 +18,8 @@ pub mod lfm2;
 pub mod llama;
 /// Moshi and PersonaPlex realtime-token implementations.
 pub mod moshi;
+/// Meta Muse-Glimmer dense multimodal implementations.
+pub mod muse_glimmer;
 /// Nemotron-H implementations.
 pub mod nemotron_h;
 /// Qwen-family implementations.

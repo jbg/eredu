@@ -18,6 +18,8 @@ pub enum ModelKind {
     KimiLinear,
     /// Llama-compatible dense decoder architecture, including Mistral.
     Llama,
+    /// Meta Muse-Glimmer dense multimodal architecture.
+    MuseGlimmer,
     /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
     Lfm2,
     /// Nemotron-H hybrid Mamba2/attention/MoE architecture.
@@ -130,13 +132,14 @@ impl ModelKind {
     /// Inspection parity tests iterate this list. The exhaustive matches in
     /// the loader and preflight planner remain the compile-time backstop when
     /// a new variant is added.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::DeepSeekV3,
         Self::Gemma4,
         Self::GptOss,
         Self::Inkling,
         Self::KimiLinear,
         Self::Llama,
+        Self::MuseGlimmer,
         Self::Lfm2,
         Self::NemotronH,
         Self::PersonaPlex,
@@ -157,6 +160,7 @@ impl ModelKind {
             Self::Inkling => "inkling_mm_model",
             Self::KimiLinear => "kimi_linear",
             Self::Llama => "llama/mistral",
+            Self::MuseGlimmer => "muse_glimmer",
             Self::Lfm2 => "lfm2/lfm2_moe",
             Self::NemotronH => "nemotron_h",
             Self::PersonaPlex => "personaplex",
@@ -177,6 +181,7 @@ impl ModelKind {
             "inkling_mm_model" => Ok(Self::Inkling),
             "kimi_linear" => Ok(Self::KimiLinear),
             "llama" | "mistral" => Ok(Self::Llama),
+            "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
             "personaplex" => Ok(Self::PersonaPlex),
@@ -206,6 +211,7 @@ pub(crate) enum GgufArchitecture {
     Gemma4,
     Llama,
     Mistral,
+    MuseGlimmer,
     Lfm2,
     Lfm2Moe,
     NemotronH,
@@ -221,7 +227,7 @@ pub(crate) enum GgufArchitecture {
 }
 
 impl GgufArchitecture {
-    pub(crate) const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, gpt-oss, inkling, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen3vlmoe, qwen35, qwen35moe, and qwen3next";
+    pub(crate) const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, gpt-oss, inkling, gemma4, llama, mistral, muse-glimmer, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen3vlmoe, qwen35, qwen35moe, and qwen3next";
 
     pub(crate) fn resolve(name: &str) -> Result<Self, Error> {
         match name {
@@ -232,6 +238,7 @@ impl GgufArchitecture {
             "gemma4" => Ok(Self::Gemma4),
             "llama" => Ok(Self::Llama),
             "mistral" => Ok(Self::Mistral),
+            "muse-glimmer" => Ok(Self::MuseGlimmer),
             "lfm2" => Ok(Self::Lfm2),
             "lfm2moe" => Ok(Self::Lfm2Moe),
             "nemotron_h" => Ok(Self::NemotronH),
@@ -259,6 +266,7 @@ impl GgufArchitecture {
             Self::Inkling => ModelKind::Inkling,
             Self::Gemma4 => ModelKind::Gemma4,
             Self::Llama | Self::Mistral => ModelKind::Llama,
+            Self::MuseGlimmer => ModelKind::MuseGlimmer,
             Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
             Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
             Self::Qwen2 => ModelKind::Qwen2,
@@ -307,6 +315,7 @@ impl GgufArchitecture {
             Self::Gemma4 => "gemma4",
             Self::Llama => "llama",
             Self::Mistral => "mistral",
+            Self::MuseGlimmer => "muse-glimmer",
             Self::Lfm2 => "lfm2",
             Self::Lfm2Moe => "lfm2moe",
             Self::NemotronH => "nemotron_h",
@@ -478,6 +487,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
         ModelKind::Inkling => inkling::validate_model_config_value(config),
         ModelKind::KimiLinear => kimi_linear::validate_model_config_value(config),
         ModelKind::Llama => llama::validate_model_config_value(config),
+        ModelKind::MuseGlimmer => muse_glimmer::validate_model_config_value(config),
         ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
         ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
