@@ -65,12 +65,12 @@ fn main() -> anyhow::Result<()> {
     for step in 0..input_audio.dim(2) {
         let input = input_audio.try_index_device((.., .., step), stream)?;
         scheduler.enqueue(&model, request, RealtimeStepInput::encoded_audio(&input))?;
-        let output = scheduler
-            .run_queued(&mut model, stream)?
-            .pop()
-            .expect("one queued realtime frame")
-            .into_parts()
-            .1;
+        let output = loop {
+            if let Some(output) = scheduler.run_queued(&mut model, stream)?.pop() {
+                break output.into_parts().1;
+            }
+            std::thread::yield_now();
+        };
         if step > 0 {
             let text = output.text_token.squeeze_axes(&[-1], stream)?;
             let text = text.expand_dims(1, stream)?;

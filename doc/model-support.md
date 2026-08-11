@@ -728,8 +728,9 @@ SafeTensors and canonical `qwen3next`/`qwen35`/`qwen35moe` GGUF with fully
 resident or dense disk-streamed local blocks. Linear-attention convolution and
 recurrent arrays become fixed semantic slots while full-attention layers use
 the shared ordinary or paged KV implementation. Qwen3.5 SafeTensors and
-canonical GGUF with a validated sibling projector add a stage-zero vision
-execution group and accept direct or scheduler-owned image/video ingress.
+canonical GGUF with a validated sibling projector add a distributed vision
+execution group whose blocks are balanced over its planned PP owner path and
+accept direct or scheduler-owned image/video ingress.
 
 Qwen3-VL and Qwen3.5 vision blocks use
 `LayerSchedule<architectures::qwen::vl::vision::VisionLayerPolicy>`. Each entry
@@ -877,24 +878,22 @@ its [usage guide](../examples/safemlx-lm-cli/README.md) for concrete commands.
 ## Parallel execution
 
 The language-model crate contains explicit APIs for pure tensor, pipeline, and
-expert parallelism plus tensor + pipeline, tensor + expert, pipeline + expert,
-and Qwen3-MoE/GPT-OSS tensor + pipeline + expert execution. A non-replicated topology
-must be loaded through the matching API; the ordinary complete-model loader
-rejects it. One Cartesian topology owns coordinates and subgroup membership
-for every combination. Qwen3-MoE and GPT-OSS triple-axis execution support
-complete-layer fully resident and dense-disk-streamed SafeTensors and canonical
-GGUF. Their independent expert paths intersect stage-local layers, optional EP
-ownership, and optional TP projection shards. With EP inactive a stage owns every routed
-expert for its local layers and uses collective-free route recombination;
-non-experts may be resident or dense disk-streamed, prompt state remains
-rank-local and persistent, and GGUF uses bounded expert reads.
-Other families fail architecture preflight before checkpoint payload
-materialization until their semantic expert recipes are registered with the
-pipeline adapter.
+expert parallelism plus TP+PP, TP+EP, PP+EP, and TP+PP+EP execution. A
+non-replicated topology must be loaded through the matching API; the ordinary
+complete-model loader rejects it. One Cartesian topology owns coordinates and
+subgroup membership for every combination. Dense families support their pure
+TP and PP modes plus TP+PP. Registered MoE families support every pure,
+pairwise, and triple-axis combination through the same stage-local semantic
+plans. Independent expert paths intersect stage-local layers, optional EP
+ownership, and optional TP projection shards. With EP inactive, a stage owns
+every routed expert for its local layers and uses collective-free route
+recombination. Prompt state remains rank-local and persistent, and GGUF uses
+bounded rank-selective reads. Unsupported family, format, quantization, or
+residency combinations fail preflight before checkpoint payload materialization.
 
-The authoritative family migration backlog and the global versus
-family-specific limitations are maintained in the
-[combined-topology migration ledger](../safemlx-lm/README.md#authoritative-combined-topology-migration-ledger).
+The complete family-by-family combinations and checkpoint/residency coverage
+are listed in the
+[combined-topology support matrix](../safemlx-lm/README.md#combined-topology-support-matrix).
 
 Pure pipeline inference uses the architecture-neutral distributed scheduler.
 That canonical runtime owns request/work identity, isolated per-request program

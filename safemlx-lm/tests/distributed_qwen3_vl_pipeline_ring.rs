@@ -603,12 +603,19 @@ fn qwen3_vl_pipeline_ring_worker() {
         work.with_prepared_input_identity(identity)
     };
     scheduler.enqueue(work).unwrap();
-    let mut completed = match &cartesian {
-        Some(cartesian) => scheduler
-            .run_queued_cartesian(&mut model, cartesian, &stream)
-            .unwrap(),
-        None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
-    };
+    let mut completed = Vec::new();
+    for _ in 0..64 {
+        completed.extend(match &cartesian {
+            Some(cartesian) => scheduler
+                .run_queued_cartesian(&mut model, cartesian, &stream)
+                .unwrap(),
+            None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
+        });
+        if !completed.is_empty() {
+            break;
+        }
+        std::thread::yield_now();
+    }
     assert_eq!(completed.len(), 1);
     let logits = completed.pop().unwrap().into_logits().unwrap();
     let mut cache = scheduler.release_request_cache(request).unwrap();

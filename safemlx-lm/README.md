@@ -1140,34 +1140,33 @@ payload materialization. The ordinary `Model` loader remains a complete
 single-device API and directs non-replicated requests to the explicit pipeline
 loader.
 
-### Authoritative combined-topology migration ledger
+### Combined-topology support matrix
 
-This table is the persistent source of truth for family migration status. A
-family is **complete** only when every applicable pairwise topology and the
-generic TP+PP+EP path support prefill, cached decode, synchronized generation,
-prompt-cache persistence, resident, host-layerwise, and dense-streamed
-non-experts, plus independently cached experts in both registered checkpoint
-formats. Dense families have no EP migration.
+This table lists the executable parallel combinations for each family. Every
+listed combination supports prefill, cached decode, synchronized generation,
+prompt-cache persistence, and fully resident, host-layerwise, or dense-streamed
+non-experts. MoE combinations also support independently cached experts in both
+registered checkpoint formats. EP does not apply to dense families.
 
-| Family | Axes | Status | Remaining family-specific work |
+| Family | Applicable axes | Executable combinations | Checkpoint and residency notes |
 |---|---|---|---|
-| Qwen2/Qwen3 dense | TP, PP | TP+PP complete | None; EP does not apply |
-| Qwen3 MoE | TP, PP, EP | Complete | None |
-| GPT-OSS | TP, PP, EP | Complete | None; native MXFP4 SafeTensors and canonical type-39 GGUF are covered |
-| Llama/Mistral | TP, PP | TP+PP complete | None; EP does not apply |
-| Gemma 4 dense / MoE | TP, PP, EP | Complete | None; routed MoE layers support EP, TP+EP, PP+EP, and TP+PP+EP for SafeTensors and text-plus-projector GGUF, with typed text/image/video/audio ingress, both media towers, cached decode, synchronized generation, prompt-cache persistence, and resident, host-layerwise, or dense-streamed non-experts |
-| DeepSeek-V3/R1 | TP, PP, EP | Complete | None; split, packed-affine, native block-FP8 SafeTensors and canonical DeepSeek2 GGUF recipes share the Cartesian path |
-| Kimi Linear | TP, PP, EP | Complete | None |
-| LFM2 dense | TP, PP | TP+PP complete | None; EP does not apply |
-| LFM2-MoE | TP, PP, EP | Complete | None |
-| Nemotron-H dense | TP, PP | TP+PP complete | None; EP does not apply |
-| Nemotron-H-MoE | TP, PP, EP | Complete | None |
-| Qwen3-Next/Qwen3.5 dense | TP, PP | TP+PP complete | None; Qwen3.5 SafeTensors and canonical text-plus-projector GGUF support direct or queued typed image/video ingress with balanced TP-sharded vision PP ownership and all three non-expert residency policies; EP does not apply |
-| Qwen3-Next/Qwen3.5-MoE | TP, PP, EP | Complete | None; Qwen3.5 SafeTensors and canonical text-plus-projector GGUF multimodal ingress compose with TP+PP, PP+EP, and TP+PP+EP plus resident or independently cached experts |
-| Inkling multimodal | TP, PP, EP | Complete | None; direct or queued text/image/audio ingress, distributed hMLP blocks, explicitly placed dMel ingress, SafeTensors and canonical text-plus-mmproj GGUF, cached decode, synchronized generation, prompt-cache persistence, and resident, host-layerwise, dense-streamed, or independently cached expert policies share the Cartesian runtime |
-| Qwen3-VL dense | TP, PP | TP+PP complete | None; vision blocks are balanced across PP ranks and direct or queued typed image/video ingress composes with arbitrary legal TP/PP degrees; EP does not apply |
-| Qwen3-VL-MoE | TP, PP, EP | Complete | None; distributed vision placement and direct or queued typed image/video ingress compose with arbitrary legal TP/PP/EP degrees |
-| Moshi/PersonaPlex | TP | Not applicable | Its temporal/depth runtime has no PP or EP constituent axis |
+| Qwen2/Qwen3 dense | TP, PP | TP, PP, TP+PP | SafeTensors and canonical Qwen GGUF; all non-expert residency policies |
+| Qwen3 MoE | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and canonical `qwen3moe` GGUF; resident or independently cached experts |
+| GPT-OSS | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | Native MXFP4 SafeTensors and canonical type-39 GGUF |
+| Llama/Mistral | TP, PP | TP, PP, TP+PP | SafeTensors and canonical Llama/Mistral GGUF; all non-expert residency policies |
+| Gemma 4 dense / MoE | TP, PP, EP for MoE | TP, PP, TP+PP; MoE also EP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and text-plus-projector GGUF; typed text/image/video/audio ingress and distributed media towers |
+| DeepSeek-V3/R1 | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | Split, packed-affine, and native block-FP8 SafeTensors plus canonical DeepSeek2 GGUF |
+| Kimi Linear | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and canonical `kimi-linear` GGUF; resident or independently cached experts |
+| LFM2 dense | TP, PP | TP, PP, TP+PP | SafeTensors and canonical `lfm2` GGUF; all non-expert residency policies |
+| LFM2-MoE | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and canonical `lfm2moe` GGUF; resident or independently cached experts |
+| Nemotron-H dense | TP, PP | TP, PP, TP+PP | SafeTensors and canonical `nemotron_h` GGUF; all non-expert residency policies |
+| Nemotron-H-MoE | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and canonical `nemotron_h_moe` GGUF; resident or independently cached experts |
+| Qwen3-Next/Qwen3.5 dense | TP, PP | TP, PP, TP+PP | SafeTensors and canonical text-plus-projector GGUF; balanced TP-sharded vision PP ownership |
+| Qwen3-Next/Qwen3.5-MoE | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and canonical text-plus-projector GGUF; resident or independently cached experts |
+| Inkling multimodal | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and text-plus-mmproj GGUF; distributed hMLP blocks and explicitly placed dMel ingress |
+| Qwen3-VL dense | TP, PP | TP, PP, TP+PP | SafeTensors and canonical GGUF with its projector; vision blocks are balanced across PP ranks |
+| Qwen3-VL-MoE | TP, PP, EP | TP, PP, EP, TP+PP, TP+EP, PP+EP, TP+PP+EP | SafeTensors and canonical GGUF with its projector; distributed vision placement |
+| Moshi/PersonaPlex | TP | TP | Realtime temporal/depth runtime; PP and EP do not apply |
 
 The remaining global limitations are:
 

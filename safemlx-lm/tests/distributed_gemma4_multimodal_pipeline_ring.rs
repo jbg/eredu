@@ -766,12 +766,20 @@ fn gemma4_multimodal_pipeline_ring_worker() {
             work.with_prepared_input_identity(identity)
         })
         .unwrap();
-    let mut completed = match &cartesian {
-        Some(cartesian) => scheduler
-            .run_queued_cartesian(&mut model, cartesian, &stream)
-            .unwrap(),
-        None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
-    };
+    let mut completed = Vec::new();
+    for _ in 0..64 {
+        completed.extend(match &cartesian {
+            Some(cartesian) => scheduler
+                .run_queued_cartesian(&mut model, cartesian, &stream)
+                .unwrap(),
+            None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
+        });
+        if !completed.is_empty() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(completed.len(), 1);
     let schedule = model.placed_ingress_schedule_report();
     let bounded =
         std::env::var_os(DENSE_STREAM).is_some() || std::env::var_os(LAYERWISE_HOST).is_some();

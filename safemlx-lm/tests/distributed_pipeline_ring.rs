@@ -667,12 +667,20 @@ fn pipeline_ring_worker() {
                 work.with_prepared_input_identity(identity)
             })
             .unwrap();
-        let mut completed = match cartesian.as_ref() {
-            Some(cartesian) => scheduler
-                .run_queued_cartesian(&mut model, cartesian, &stream)
-                .unwrap(),
-            None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
-        };
+        let mut completed = Vec::new();
+        for _ in 0..64 {
+            completed.extend(match cartesian.as_ref() {
+                Some(cartesian) => scheduler
+                    .run_queued_cartesian(&mut model, cartesian, &stream)
+                    .unwrap(),
+                None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
+            });
+            if !completed.is_empty() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(completed.len(), 1);
         cache = scheduler.release_request_cache(request).unwrap();
         completed.pop().unwrap().into_logits().unwrap()
     } else {

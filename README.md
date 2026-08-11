@@ -49,8 +49,9 @@ SafeMLX is independent of Apple and is not an official MLX project.
 
 See [model and checkpoint support](doc/model-support.md) for current formats
 and feature gates. The language-model crate's
-[combined-topology migration ledger](safemlx-lm/README.md#authoritative-combined-topology-migration-ledger)
-is the persistent family-by-family backlog and limitations source of truth.
+[combined-topology support matrix](safemlx-lm/README.md#combined-topology-support-matrix)
+lists the executable parallel combinations and checkpoint/residency coverage
+for each model family.
 
 ## Workspace
 

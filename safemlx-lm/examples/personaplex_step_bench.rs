@@ -125,12 +125,12 @@ fn run_steps(
     for _ in 0..frames {
         let start = Instant::now();
         scheduler.enqueue(model, request, RealtimeStepInput::encoded_audio(input))?;
-        let output = scheduler
-            .run_queued(model, stream)?
-            .pop()
-            .expect("one queued realtime frame")
-            .into_parts()
-            .1;
+        let output = loop {
+            if let Some(output) = scheduler.run_queued(model, stream)?.pop() {
+                break output.into_parts().1;
+            }
+            std::thread::yield_now();
+        };
         if let Some(tokens) = &output.output_audio_tokens {
             eval([&output.text_token, &output.sampled_audio_tokens, tokens])?;
             emitted_frames += 1;

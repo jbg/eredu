@@ -57,7 +57,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
     let mut sampler = DefaultSampler;
-    let mut output = scheduler.run_queued(&mut model, &group, &stream)?;
+    let mut output = Vec::with_capacity(requests.len());
+    while output.len() < requests.len() {
+        output.extend(scheduler.run_queued(&mut model, &group, &stream)?);
+        std::thread::yield_now();
+    }
     for generation_step in 0..8 {
         let mut next = Vec::new();
         for completed in &output {
@@ -88,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if next.is_empty() {
             break;
         }
+        let expected = next.len();
         for (request, token) in next {
             let input = PipelineMicrobatchInput::new(
                 request,
@@ -100,7 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input
             })?;
         }
-        output = scheduler.run_queued(&mut model, &group, &stream)?;
+        output.clear();
+        while output.len() < expected {
+            output.extend(scheduler.run_queued(&mut model, &group, &stream)?);
+            std::thread::yield_now();
+        }
     }
     for request in requests {
         if scheduler.request_status(request) == Some(RequestStatus::Active) {
