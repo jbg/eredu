@@ -5,7 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use safemlx::{module::ModuleParameters, Array, Stream};
+use safemlx::{
+    module::{FlattenedModuleParamRef, ModuleParameters},
+    Array, Dtype, Stream,
+};
 
 use crate::{
     error::Error,
@@ -45,13 +48,44 @@ pub(crate) fn packed_companion_checkpoint_name(parameter_name: &str) -> Option<S
         })
 }
 
-/// Returns the full parameter names exposed by `module` under `prefix`.
+/// Whether a flattened module parameter has checkpoint-backed storage.
+///
+/// Native GGML modules expose a one-element `scales` parameter solely to keep
+/// the public quantized-module shape compatible with affine quantization. The
+/// packed `u8` weight contains its own quantization metadata, so that sentinel
+/// must not become a residency or distributed-planning member. Affine packed
+/// weights use a non-`u8` storage dtype and retain their real companions.
+pub(crate) fn is_materialized_module_parameter(
+    name: &str,
+    parameter: &Array,
+    parameters: &FlattenedModuleParamRef<'_>,
+) -> bool {
+    let weight_name = if name == "scales" {
+        Some("inner.weight".to_string())
+    } else {
+        name.strip_suffix(".scales")
+            .map(|prefix| format!("{prefix}.inner.weight"))
+    };
+    let weight_dtype = weight_name
+        .as_deref()
+        .and_then(|weight_name| parameters.get(weight_name))
+        .map(|weight| weight.dtype());
+    !is_native_scale_sentinel(name, parameter.shape(), weight_dtype)
+}
+
+fn is_native_scale_sentinel(name: &str, shape: &[i32], weight_dtype: Option<Dtype>) -> bool {
+    (name == "scales" || name.ends_with(".scales"))
+        && shape == [1]
+        && weight_dtype == Some(Dtype::Uint8)
+}
+
+/// Returns the checkpoint-backed parameter names exposed by `module` under `prefix`.
 pub fn full_parameter_names(module: &impl ModuleParameters, prefix: &str) -> Vec<String> {
-    let mut names = module
-        .parameters()
-        .flatten()
-        .keys()
-        .map(|name| qualify(prefix, name))
+    let parameters = module.parameters().flatten();
+    let mut names = parameters
+        .iter()
+        .filter(|(name, parameter)| is_materialized_module_parameter(name, parameter, &parameters))
+        .map(|(name, _)| qualify(prefix, name))
         .collect::<Vec<_>>();
     names.sort();
     names
@@ -212,12 +246,16 @@ pub(crate) fn populate_module_from_arrays_excluding<F>(
 where
     F: Fn(&str) -> bool,
 {
-    let mut params = module.parameters_mut().flatten();
-    let expected = params
-        .keys()
-        .filter(|name| !excluded(name))
-        .map(|name| name.to_string())
-        .collect::<BTreeSet<_>>();
+    let expected = {
+        let params = module.parameters().flatten();
+        params
+            .iter()
+            .filter(|(name, parameter)| {
+                !excluded(name) && is_materialized_module_parameter(name, parameter, &params)
+            })
+            .map(|(name, _)| name.to_string())
+            .collect::<BTreeSet<_>>()
+    };
     let actual = arrays.keys().cloned().collect::<BTreeSet<_>>();
     let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
     let unexpected = actual.difference(&expected).cloned().collect::<Vec<_>>();
@@ -228,8 +266,9 @@ where
             unexpected,
         });
     }
+    let mut params = module.parameters_mut().flatten();
     for (name, parameter) in &mut params {
-        if excluded(name) {
+        if !expected.contains(name.as_ref()) {
             continue;
         }
         let value = arrays
@@ -290,15 +329,24 @@ pub(crate) fn build_module_bindings_with_recipes_excluding<F>(
 where
     F: Fn(&str) -> bool,
 {
-    recipes.retain(|name, _| !exclude(name));
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
     let mut local_names = params
-        .keys()
-        .map(ToString::to_string)
-        .filter(|name| !exclude(name))
+        .iter()
+        .filter(|(name, parameter)| {
+            !exclude(name) && is_materialized_module_parameter(name, parameter, &params)
+        })
+        .map(|(name, _)| name.to_string())
         .collect::<Vec<_>>();
     local_names.sort();
+    recipes.retain(|name, _| {
+        if exclude(name) {
+            return false;
+        }
+        params
+            .get(name.as_str())
+            .is_none_or(|parameter| is_materialized_module_parameter(name, parameter, &params))
+    });
     let mut claimed = BTreeMap::<String, String>::new();
     let mut bindings = Vec::with_capacity(local_names.len());
 
@@ -434,12 +482,16 @@ where
     F: Fn(&str) -> bool,
 {
     let resident_names = lease.binding_names().collect::<BTreeSet<_>>();
-    let mut params = module.parameters_mut().flatten();
-    let expected_names = params
-        .keys()
-        .filter(|name| !excluded(name))
-        .map(|name| name.to_string())
-        .collect::<BTreeSet<_>>();
+    let expected_names = {
+        let params = module.parameters().flatten();
+        params
+            .iter()
+            .filter(|(name, parameter)| {
+                !excluded(name) && is_materialized_module_parameter(name, parameter, &params)
+            })
+            .map(|(name, _)| name.to_string())
+            .collect::<BTreeSet<_>>()
+    };
 
     let missing = expected_names
         .iter()
@@ -459,8 +511,9 @@ where
         });
     }
 
+    let mut params = module.parameters_mut().flatten();
     for (name, parameter) in &mut params {
-        if excluded(name) {
+        if !expected_names.contains(name.as_ref()) {
             continue;
         }
         let value = lease.array(name)?;
@@ -608,17 +661,23 @@ pub enum ModuleBindingError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::HashMap, fs};
 
     use safemlx::{
-        module::ModuleParameters, nn, Array, Device, DeviceType, Dtype, ExecutionContext,
+        module::{ModuleParameters, Param},
+        native_quantization::NativeQuantizationFormat,
+        nn,
+        ops::GgufCheckpoint,
+        Array, Device, DeviceType, Dtype, ExecutionContext,
     };
+    use safemlx_gguf::GgmlType;
 
     use super::*;
     use crate::{
         nn::linear::unloaded_maybe_quantized_linear,
         runtime::checkpoint::quantization::AffineQuantization,
-        runtime::checkpoint::store::SafetensorsWeightStore,
+        runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore},
+        test_utils::SyntheticGguf,
     };
 
     fn cpu() -> ExecutionContext {
@@ -635,6 +694,31 @@ mod tests {
         assert!(!recipe_dtype_matches(
             &RecipeDtype::F32,
             &RecipeDtype::F8E4M3
+        ));
+    }
+
+    #[test]
+    fn only_native_u8_scale_sentinels_are_non_materialized() {
+        assert!(is_native_scale_sentinel("scales", &[1], Some(Dtype::Uint8)));
+        assert!(is_native_scale_sentinel(
+            "projection.scales",
+            &[1],
+            Some(Dtype::Uint8)
+        ));
+        assert!(!is_native_scale_sentinel(
+            "scales",
+            &[1],
+            Some(Dtype::Uint32)
+        ));
+        assert!(!is_native_scale_sentinel(
+            "scales",
+            &[2],
+            Some(Dtype::Uint8)
+        ));
+        assert!(!is_native_scale_sentinel(
+            "weight_scale_inv",
+            &[1],
+            Some(Dtype::Uint8)
         ));
     }
 
@@ -693,6 +777,48 @@ mod tests {
         assert!(keys.contains("proj.scales"));
         assert!(keys.contains("proj.biases"));
         assert!(keys.contains("proj.bias"));
+    }
+
+    #[test]
+    fn native_q4k_binding_omits_compatibility_scale_sentinel() {
+        let context = cpu();
+        let mut module = nn::QuantizedLinear {
+            group_size: 256,
+            bits: 144,
+            mode: safemlx::ops::QuantizationMode::Affine,
+            native: None,
+            native_format: Some(NativeQuantizationFormat::GgufQ4K),
+            native_endian: safemlx_gguf::Endian::Little,
+            native_columns: 256,
+            scales: Param::new(Array::from_slice(&[0.0f32], &[1])),
+            biases: Param::new(None),
+            inner: nn::Linear {
+                weight: Param::new(Array::from_slice(&[0u8; 288], &[2, 144])),
+                bias: Param::new(None),
+            },
+        };
+        let arrays = HashMap::from([(
+            "proj.weight".to_string(),
+            Array::from_slice(&[0.0f32; 512], &[2, 256]),
+        )]);
+        let fixture = SyntheticGguf::with_packed_tensors(&arrays, &HashMap::new(), |name, _| {
+            (name == "proj.weight").then_some(GgmlType::Q4K)
+        });
+        let checkpoint = GgufCheckpoint::open(fixture.path()).unwrap();
+        let store = GgufWeightStore::new(checkpoint, str::to_string).unwrap();
+
+        assert_eq!(full_parameter_names(&module, "proj"), ["proj.inner.weight"]);
+        let bindings = build_module_bindings(&module, "proj", &store).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].name(), "inner.weight");
+        assert_eq!(bindings[0].checkpoint_key(), "proj.weight");
+
+        let materialized =
+            materialize_module_bindings(&store, &bindings, context.stream(), context.stream())
+                .unwrap();
+        populate_module_from_arrays_excluding(&mut module, &materialized, |_| false).unwrap();
+        assert_eq!(module.inner.weight.value.dtype(), Dtype::Uint8);
+        assert_eq!(module.scales.value.shape(), &[1]);
     }
 
     #[test]

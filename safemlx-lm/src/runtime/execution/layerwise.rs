@@ -21,7 +21,8 @@ use crate::{
         PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     },
     runtime::checkpoint::binding::{
-        binding_bytes, build_module_bindings, populate_module_from_lease, ModuleBindingError,
+        binding_bytes, build_module_bindings, is_materialized_module_parameter,
+        populate_module_from_lease, ModuleBindingError,
     },
     runtime::checkpoint::bounded_quantization::{
         BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
@@ -67,11 +68,15 @@ pub(crate) fn transformed_module_weight_store(
     module: &impl ModuleParameters,
 ) -> Result<SharedWeightStore, Error> {
     let mut arrays = BTreeMap::new();
-    for (parameter_name, value) in module.parameters().flatten() {
+    let parameters = module.parameters().flatten();
+    for (parameter_name, value) in parameters
+        .iter()
+        .filter(|(name, parameter)| is_materialized_module_parameter(name, parameter, &parameters))
+    {
         let checkpoint_name =
-            crate::runtime::checkpoint::binding::canonical_checkpoint_name(&parameter_name);
+            crate::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name);
         if arrays
-            .insert(checkpoint_name.clone(), value.clone())
+            .insert(checkpoint_name.clone(), (*value).clone())
             .is_some()
         {
             return Err(Error::Quantization(format!(
@@ -5091,7 +5096,11 @@ fn build_parallel_module_bindings(
     use crate::runtime::checkpoint::store::TensorSelection;
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
-    let mut names = params.keys().map(ToString::to_string).collect::<Vec<_>>();
+    let mut names = params
+        .iter()
+        .filter(|(name, parameter)| is_materialized_module_parameter(name, parameter, &params))
+        .map(|(name, _)| name.to_string())
+        .collect::<Vec<_>>();
     names.sort();
     let mut bindings = Vec::with_capacity(names.len());
     for local_name in names {

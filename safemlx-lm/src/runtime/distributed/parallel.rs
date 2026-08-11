@@ -18,6 +18,7 @@ use safemlx::{
 
 use crate::{
     error::Error,
+    runtime::checkpoint::binding::is_materialized_module_parameter,
     runtime::distributed::{
         completion::synchronize_outputs,
         topology::{balanced_contiguous_range, ParallelTopology, PlacementPlan, TensorPlacement},
@@ -217,6 +218,9 @@ pub(crate) fn module_parameter_group(
         role,
         parameters
             .iter()
+            .filter(|(name, parameter)| {
+                is_materialized_module_parameter(name, parameter, &parameters)
+            })
             .map(|(name, parameter)| {
                 let shape = parameter
                     .shape()
@@ -245,7 +249,11 @@ pub(crate) fn register_replicated_module(
     module: &impl ModuleParameters,
     prefix: &str,
 ) -> Result<(), Error> {
-    if module.parameters().flatten().is_empty() {
+    let parameters = module.parameters().flatten();
+    if !parameters
+        .iter()
+        .any(|(name, parameter)| is_materialized_module_parameter(name, parameter, &parameters))
+    {
         return Ok(());
     }
     planner.register(module_parameter_group(
@@ -344,7 +352,10 @@ pub(crate) fn partitioned_projection_members<M: ModuleParameters>(
     let mut raw_members = Vec::new();
     let mut units = preferred_units;
     for (module, prefix, placement) in projections {
-        for (name, parameter) in module.parameters().flatten() {
+        let parameters = module.parameters().flatten();
+        for (name, parameter) in parameters.iter().filter(|(name, parameter)| {
+            is_materialized_module_parameter(name, parameter, &parameters)
+        }) {
             let shape = parameter
                 .shape()
                 .iter()
@@ -356,7 +367,7 @@ pub(crate) fn partitioned_projection_members<M: ModuleParameters>(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let axis = projection_partition_axis(prefix, &name, &shape, *placement)?;
+            let axis = projection_partition_axis(prefix, name, &shape, *placement)?;
             if let Some(axis) = axis {
                 units = greatest_common_divisor(units, shape[axis]);
             }
