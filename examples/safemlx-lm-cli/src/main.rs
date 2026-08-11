@@ -255,7 +255,8 @@ struct Cli {
     #[arg(short, long, value_name = "PATH_OR_ID")]
     model: String,
 
-    /// Explicit Gemma assistant directory, GGUF file, or Hugging Face identifier.
+    /// External assistant directory, GGUF file, or cached Hugging Face identifier.
+    /// A bare GGUF repository ID selects its unique draft sidecar.
     #[arg(long, value_name = "PATH_OR_ID")]
     draft_model: Option<String>,
 
@@ -1782,8 +1783,10 @@ fn resolve_model(
     let path = Path::new(spec);
     if path.exists() {
         return Ok(ResolvedModel {
-            path: path
-                .canonicalize()
+            // Keep the logical filename: Hugging Face snapshot files are
+            // symlinks to extensionless blobs, while format dispatch uses the
+            // user-visible extension.
+            path: std::path::absolute(path)
                 .with_context(|| format!("failed to resolve model path {}", path.display()))?,
             repository: None,
             commit_hash: None,
@@ -1842,8 +1845,20 @@ fn resolve_model(
                 select_revision(&repo.revisions, requested_revision).with_context(|| {
                     format!("could not select a cached revision for Hugging Face model {repo_id:?}")
                 })?;
+            let path = if gguf_role == CachedGgufRole::MtpDraft
+                && !revision.files.iter().any(|file| {
+                    file.file_path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("safetensors"))
+                }) {
+                select_unique_cached_gguf(revision, gguf_role)?
+                    .unwrap_or_else(|| revision.snapshot_path.clone())
+            } else {
+                revision.snapshot_path.clone()
+            };
             Ok(ResolvedModel {
-                path: revision.snapshot_path.clone(),
+                path,
                 repository: Some(repo_id.to_owned()),
                 commit_hash: Some(revision.commit_hash.clone()),
             })
@@ -1999,6 +2014,40 @@ fn select_cached_gguf(
     select_cached_gguf_path(&files, quantization, role)
 }
 
+fn select_unique_cached_gguf(
+    revision: &CachedRevisionInfo,
+    role: CachedGgufRole,
+) -> Result<Option<PathBuf>> {
+    let mut candidates = revision
+        .files
+        .iter()
+        .filter_map(|file| {
+            let path = file.file_path.as_path();
+            if !path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+            {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            let (stem, first_shard) = strip_gguf_shard_suffix(stem);
+            (first_shard && gguf_role_matches(stem, role)).then_some(path.to_owned())
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [path] => Ok(Some(path.clone())),
+        _ => bail!(
+            "cached repository contains multiple draft GGUF files: {}; append :QUANT to --draft-model",
+            format_cached_paths(&candidates.iter().map(PathBuf::as_path).collect::<Vec<_>>())
+        ),
+    }
+}
+
 fn select_cached_gguf_from_revisions(
     revisions: &[CachedRevisionInfo],
     requested_revision: Option<&str>,
@@ -2123,7 +2172,10 @@ fn select_cached_gguf_path(
 
 fn gguf_role_matches(stem: &str, role: CachedGgufRole) -> bool {
     let stem = stem.to_ascii_lowercase();
-    let mtp_sidecar = stem.starts_with("mtp-");
+    let mtp_sidecar = stem.starts_with("mtp-")
+        || stem == "dflash"
+        || stem.starts_with("dflash-")
+        || stem.starts_with("dflash_");
     match role {
         CachedGgufRole::Target => !mtp_sidecar && !stem.starts_with("mmproj-"),
         CachedGgufRole::MtpDraft => mtp_sidecar,
@@ -2205,11 +2257,12 @@ mod tests {
         eval, execution_contexts, format_bytes, format_weight_store_diagnostics,
         requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
-        should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
-        validate_args, validate_artifact_pair, write_semantic_event, write_timing_report, Array,
-        CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType, MtpDraftDevice,
-        MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport, ReasoningStream,
-        ResolvedModel, SemanticEvent, SemanticSupport, StopReason, WeightQuantization,
+        select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
+        use_semantic_generation, validate_args, validate_artifact_pair, write_semantic_event,
+        write_timing_report, Array, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType,
+        MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport,
+        ReasoningStream, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
+        WeightQuantization,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -2880,6 +2933,49 @@ mod tests {
             select_cached_gguf_path(&files, "Q8_0", CachedGgufRole::MtpDraft).unwrap(),
             draft
         );
+    }
+
+    #[test]
+    fn selects_muse_dflash_as_the_unique_draft_sidecar() {
+        let mut revision = revision("main", &["main"], 1);
+        revision.files = vec![
+            cached_file("main/muse-glimmer-30B-kquant-17gb.gguf", "blobs/target"),
+            cached_file("main/mmproj-kquant.gguf", "blobs/projector"),
+            cached_file("main/dflash-kquant.gguf", "blobs/dflash"),
+        ];
+
+        assert_eq!(
+            select_unique_cached_gguf(&revision, CachedGgufRole::MtpDraft).unwrap(),
+            Some(Path::new("main/dflash-kquant.gguf").into())
+        );
+        assert_eq!(
+            select_cached_gguf_path(
+                &revision
+                    .files
+                    .iter()
+                    .map(|file| file.file_path.as_path())
+                    .collect::<Vec<_>>(),
+                "dflash-kquant",
+                CachedGgufRole::MtpDraft,
+            )
+            .unwrap(),
+            Path::new("main/dflash-kquant.gguf")
+        );
+    }
+
+    #[test]
+    fn bare_draft_repository_rejects_ambiguous_sidecars() {
+        let mut revision = revision("main", &["main"], 1);
+        revision.files = vec![
+            cached_file("main/dflash-Q4_K.gguf", "blobs/q4"),
+            cached_file("main/dflash-Q8_0.gguf", "blobs/q8"),
+        ];
+
+        let error = select_unique_cached_gguf(&revision, CachedGgufRole::MtpDraft)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("multiple draft GGUF files"));
+        assert!(error.contains("append :QUANT"));
     }
 
     #[test]

@@ -121,6 +121,20 @@ cargo run --release -p safemlx-lm-cli -- \
 canonical no-lookahead comparison. Details and capability limits are in
 [Speculative decoding and MTP](../../doc/speculative-decoding.md).
 
+For a cached GGUF repository containing one recognized draft sidecar, the bare
+repository ID selects it without requiring a local file path. For example:
+
+```sh
+target/release/safemlx-lm \
+  --model 'meta-models/Muse-Glimmer-30B-GGUF:17gb' \
+  --draft-model meta-models/Muse-Glimmer-30B-GGUF \
+  --mtp-draft-tokens 3 \
+  "Explain speculative decoding."
+```
+
+Append a selector such as `:dflash-kquant` when a repository contains more
+than one compatible draft GGUF.
+
 ## Native tool calls
 
 Pass an array of OpenAI-shaped function definitions with `--tools`. Native tool
