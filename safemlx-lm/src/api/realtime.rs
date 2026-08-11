@@ -8,10 +8,11 @@
 use safemlx::{
     ops::{indexing::TryIndexOp, stack_axis},
     random::RandomState,
-    Array, Dtype, Stream,
+    transforms::async_eval_with_event,
+    Array, Dtype, Event, EventBackend, Stream,
 };
 use serde::Deserialize;
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use crate::{
     api::{ensure_executable_load_options, moshi, personaplex, ModelLoadOptions},
@@ -20,8 +21,8 @@ use crate::{
     runtime::checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
     runtime::generation::sampler::{DefaultSampler, Sampler},
     runtime::scheduler::{
-        FairScheduler, RequestId, RequestStatus, SchedulerLimits, SchedulerReport, WorkDescriptor,
-        WorkId,
+        FairScheduler, RequestId, RequestStatus, SchedulerCapabilities, SchedulerLimits,
+        SchedulerReport, SemanticStateTransaction, TransitionOutput, WorkDescriptor, WorkId,
     },
 };
 
@@ -449,6 +450,7 @@ impl LoadedRealtimeModel {
 /// The state carries the immutable checkpoint artifact and normalized
 /// execution identity of the model that created it. A scheduler accepts a
 /// released session only when both identities match its loaded model exactly.
+#[derive(Clone)]
 pub struct RealtimeSession<TS, AS> {
     model_identity: RealtimeModelIdentity,
     generation: moshi::GenerationState,
@@ -456,6 +458,60 @@ pub struct RealtimeSession<TS, AS> {
     audio_samplers: Vec<AS>,
     sampling: RealtimeSampling,
     batch_size: Option<i32>,
+}
+
+impl<TS, AS> SemanticStateTransaction for RealtimeSession<TS, AS>
+where
+    TS: Clone,
+    AS: Clone,
+{
+    type Branch = Self;
+
+    fn branch(&self) -> Result<Self::Branch, Error> {
+        // MLX arrays share immutable graph/backing ownership. Mutable cache
+        // metadata, samplers, delayed streams, and PRNG state are branch-local.
+        Ok(self.clone())
+    }
+
+    fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Error> {
+        *self = branch;
+        Ok(())
+    }
+}
+
+struct RealtimeTransitionOutput {
+    output: RealtimeStepOutput,
+    event: Event,
+    retained: Vec<Array>,
+}
+
+impl RealtimeTransitionOutput {
+    fn submit(output: RealtimeStepOutput) -> Result<Self, Error> {
+        let retained = std::iter::once(output.text_token.clone())
+            .chain(std::iter::once(output.sampled_audio_tokens.clone()))
+            .chain(output.output_audio_tokens.iter().cloned())
+            .collect::<Vec<_>>();
+        let event = async_eval_with_event(retained.iter())?;
+        Ok(Self {
+            output,
+            event,
+            retained,
+        })
+    }
+}
+
+impl TransitionOutput for RealtimeTransitionOutput {
+    fn is_complete(&self) -> Result<bool, Error> {
+        Ok(self.event.is_complete()?)
+    }
+
+    fn backend(&self) -> Result<EventBackend, Error> {
+        Ok(self.event.backend()?)
+    }
+
+    fn retained_resources(&self) -> usize {
+        self.retained.len()
+    }
 }
 
 impl<TS, AS> RealtimeSession<TS, AS> {
@@ -599,15 +655,15 @@ impl RealtimeCompletedStep {
 /// state isolation, lifecycle, cancellation, backpressure, poisoning, and
 /// telemetry. This adapter contributes only realtime input validation and the
 /// temporal/depth execution closure.
-pub struct RealtimeInferenceScheduler<TS, AS> {
+pub struct RealtimeInferenceScheduler<TS: Clone, AS: Clone> {
     model_identity: RealtimeModelIdentity,
-    scheduler: FairScheduler<RealtimeStepInput, RealtimeSession<TS, AS>>,
+    scheduler: FairScheduler<RealtimeStepInput, RealtimeSession<TS, AS>, RealtimeTransitionOutput>,
 }
 
 impl<TS, AS> RealtimeInferenceScheduler<TS, AS>
 where
-    TS: Sampler,
-    AS: Sampler,
+    TS: Sampler + Clone,
+    AS: Sampler + Clone,
 {
     /// Binds an empty scheduler to one loaded realtime artifact and execution identity.
     pub fn new(model: &LoadedRealtimeModel, limits: SchedulerLimits) -> Result<Self, Error> {
@@ -668,10 +724,42 @@ where
         request: RequestId,
         input: RealtimeStepInput,
     ) -> Result<WorkId, Error> {
-        Ok(self
-            .enqueue_batch(model, request, vec![input])?
-            .pop()
-            .expect("one submitted realtime frame"))
+        self.enqueue_with_deadline(model, request, input, None)
+    }
+
+    /// Enqueues one frame with an optional absolute cancellation deadline.
+    pub fn enqueue_with_deadline(
+        &mut self,
+        model: &LoadedRealtimeModel,
+        request: RequestId,
+        input: RealtimeStepInput,
+        deadline: Option<Instant>,
+    ) -> Result<WorkId, Error> {
+        self.validate_model(model)?;
+        validate_realtime_input(model, &input)?;
+        let batch = input.input_audio_tokens.dim(0);
+        let state = self.scheduler.request_state(request).ok_or_else(|| {
+            Error::Parallel(format!(
+                "realtime request {} is not active",
+                request.value()
+            ))
+        })?;
+        if let Some(expected) = state.batch_size {
+            if expected != batch {
+                return Err(Error::Parallel(format!(
+                    "realtime request {} changed batch size from {expected} to {batch}",
+                    request.value()
+                )));
+            }
+        }
+        let work = self
+            .scheduler
+            .enqueue_with_deadline(request, input, deadline)?;
+        self.scheduler
+            .request_state_mut(request)?
+            .batch_size
+            .get_or_insert(batch);
+        Ok(work)
     }
 
     /// Atomically enqueues an ordered batch of encoded or forced prompt frames.
@@ -713,7 +801,7 @@ where
         Ok(work)
     }
 
-    /// Drains queued frames in fair request order on the local model.
+    /// Advances one bounded scheduler turn in fair request order.
     pub fn run_queued(
         &mut self,
         model: &mut LoadedRealtimeModel,
@@ -733,26 +821,45 @@ where
         stream: &Stream,
     ) -> Result<Vec<RealtimeCompletedStep>, Error> {
         self.validate_model(model)?;
-        self.scheduler
-            .drain_local_bounded(max_frames, |_, input, session| {
-                model.execute_realtime_step(
-                    &mut session.generation,
-                    input,
-                    &mut session.text_sampler,
-                    &mut session.audio_samplers,
-                    &mut session.sampling,
-                    stream,
-                )
-            })
+        if max_frames == 0 {
+            return Err(Error::Parallel(
+                "realtime scheduler frame bound must be positive".into(),
+            ));
+        }
+        let now = Instant::now();
+        let mut progress = self.scheduler.poll_completions(now);
+        self.scheduler.prepare_bounded(max_frames, now)?;
+        progress.newly_submitted = self.scheduler.submit_prepared(now, |_, input, session| {
+            let output = model.execute_realtime_step(
+                &mut session.generation,
+                input,
+                &mut session.text_sampler,
+                &mut session.audio_samplers,
+                &mut session.sampling,
+                stream,
+            )?;
+            RealtimeTransitionOutput::submit(output)
+        })?;
+        let completed_now = self.scheduler.poll_completions(now);
+        progress.committed.extend(completed_now.committed);
+        progress.failed.extend(completed_now.failed);
+        if let Some(failure) = progress.failed.first() {
+            return Err(Error::Parallel(format!(
+                "realtime work {:?} failed asynchronously: {}",
+                failure.id, failure.error
+            )));
+        }
+        Ok(progress
+            .committed
+            .into_iter()
             .map(|completed| {
-                completed
-                    .into_iter()
-                    .map(|completed| {
-                        let (work, _, output) = completed.into_parts();
-                        RealtimeCompletedStep { work, output }
-                    })
-                    .collect()
+                let (work, _, output) = completed.into_parts();
+                RealtimeCompletedStep {
+                    work,
+                    output: output.output,
+                }
             })
+            .collect())
     }
 
     /// Completes a request and drops its temporal/depth state and samplers.
@@ -811,6 +918,11 @@ where
     /// Returns generic scheduler occupancy and lifecycle telemetry.
     pub fn report(&self) -> SchedulerReport {
         self.scheduler.report()
+    }
+
+    /// Returns configured bounds, backend identity, and physical-preemption support.
+    pub fn capabilities(&self) -> SchedulerCapabilities {
+        self.scheduler.capabilities()
     }
 
     /// Returns the error that poisoned all request state, if any.
@@ -978,11 +1090,12 @@ pub fn generate_encoded_greedy(
     for frame in 0..input_audio_tokens.dim(2) {
         let input = input_audio_tokens.try_index_device((.., .., frame), stream)?;
         scheduler.enqueue(model, request, RealtimeStepInput::encoded_audio(&input))?;
-        let output = scheduler
-            .run_queued(model, stream)?
-            .pop()
-            .expect("one queued realtime frame")
-            .output;
+        let output = loop {
+            if let Some(completed) = scheduler.run_queued(model, stream)?.pop() {
+                break completed.output;
+            }
+            std::thread::yield_now();
+        };
         text.push(output.text_token.squeeze_axes(&[-1], stream)?);
         if let Some(tokens) = output.output_audio_tokens {
             audio.push(tokens);
@@ -1125,7 +1238,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an MLX runtime with a Metal device"]
-    fn realtime_adapter_uses_generic_capacity_lifecycle_and_state_handoff() {
+    fn realtime_session_handoff_after_cancellation_uses_generic_lifecycle() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         let model = tiny_model(stream);
@@ -1339,8 +1452,8 @@ mod tests {
 
         let first = RequestId::new(11);
         let second = RequestId::new(22);
-        let mut scheduler =
-            RealtimeInferenceScheduler::new(&model, SchedulerLimits::new(2, 6).unwrap()).unwrap();
+        let limits = SchedulerLimits::with_execution_bounds(2, 6, 2, 2, 1, 1).unwrap();
+        let mut scheduler = RealtimeInferenceScheduler::new(&model, limits).unwrap();
         for request in [first, second] {
             scheduler
                 .register_request(
@@ -1370,9 +1483,11 @@ mod tests {
             };
             scheduler.enqueue(&model, request, input).unwrap();
         }
-        let mut output = scheduler.run_bounded(&mut model, 2, stream).unwrap();
-        assert_eq!(scheduler.report().queued_work, 4);
-        output.extend(scheduler.run_queued(&mut model, stream).unwrap());
+        let mut output = Vec::new();
+        while output.len() < 6 {
+            output.extend(scheduler.run_bounded(&mut model, 2, stream).unwrap());
+            std::thread::yield_now();
+        }
         assert_eq!(
             output
                 .iter()
@@ -1388,7 +1503,7 @@ mod tests {
                 stream,
             );
         }
-        assert_eq!(scheduler.report().drain_cycles, 2);
+        assert!((3..=6).contains(&scheduler.report().drain_cycles));
         assert_eq!(scheduler.release_request(first).unwrap().step(), 3);
         assert_eq!(scheduler.release_request(second).unwrap().step(), 3);
     }

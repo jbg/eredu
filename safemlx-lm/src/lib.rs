@@ -67,6 +67,11 @@ pub use runtime::residency::dense_stream::{
     BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError,
 };
 pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
+pub use runtime::scheduler::{
+    CancellationCause, FailedWork, RequestId, RequestStatus, SchedulerCapabilities,
+    SchedulerLimits, SchedulerProgress, SchedulerReport, SemanticStateTransaction,
+    TransitionOutput, WorkId, WorkLifecycle,
+};
 
 use safemlx::Array;
 

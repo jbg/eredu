@@ -245,6 +245,13 @@ transition. Moshi/PersonaPlex is a second adapter over the same scheduler: its
 request state owns temporal/depth caches, delayed streams, samplers, and PRNG
 state, while encoded and forced prompt frames are work items. The two programs
 share lifecycle and queueing without conflating their execution semantics.
+Cancellation is event-tracked and transactional: work not yet submitted is
+discarded, while submitted work that the backend cannot cancel is abandoned,
+retained through its exact completion, and never published. SafeMLX does not
+claim to interrupt executing Metal kernels or committed command buffers. See
+[cancellation and bounded execution](doc/cancellation.md) for lifecycle,
+bounds, distributed consensus, telemetry, and the precise non-preemptible
+interval.
 Realtime session handoff is bound to exact checkpoint-file content plus the
 normalized execution and quantization identity, rather than model geometry.
 Resident/layerwise and placed distributed multimodal execution use the same

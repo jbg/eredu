@@ -1224,7 +1224,15 @@ fn run_microbatch_worker(
         };
         scheduler.enqueue(input).unwrap();
     }
-    let output = scheduler.run_queued(model, group, stream).unwrap();
+    let mut output = Vec::new();
+    for _ in 0..16 {
+        output.extend(scheduler.run_queued(model, group, stream).unwrap());
+        if output.len() == work.len() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(output.len(), work.len());
     assert_eq!(
         output
             .iter()
@@ -1249,7 +1257,9 @@ fn run_microbatch_worker(
     }
     let report = scheduler.report();
     assert_eq!(report.completed_work, 4);
-    assert_eq!(report.drain_cycles, 1);
+    assert_eq!(report.drain_cycles, 4);
+    assert_eq!(report.configured_submission_bound, 1);
+    assert_eq!(report.peak_in_flight_work, 2);
     assert_eq!(report.peak_queued_work, 4);
     assert_eq!(report.active_requests, 2);
     assert!(!report.poisoned);
@@ -1270,7 +1280,9 @@ fn run_microbatch_worker(
         input
     };
     scheduler.enqueue(input).unwrap();
-    scheduler.cancel_request(first_request).unwrap();
+    scheduler
+        .cancel_request_distributed(first_request, group, stream)
+        .unwrap();
     assert_eq!(
         scheduler.request_status(first_request),
         Some(RequestStatus::Cancelled)
@@ -1279,6 +1291,44 @@ fn run_microbatch_worker(
     assert_eq!(report.active_requests, 0);
     assert_eq!(report.queued_work, 0);
     assert_eq!(report.discarded_work, 1);
+
+    let submitted_request = RequestId::new(303);
+    scheduler
+        .register_request(model, submitted_request)
+        .unwrap();
+    let input = PipelineMicrobatchInput::new(
+        submitted_request,
+        PipelineInferencePhase::Prefill,
+        PipelineStep::new(1, 1).unwrap(),
+    );
+    let input = if rank == 0 {
+        input.with_tokens(Array::from_slice(&[0u32], &[1, 1]))
+    } else {
+        input
+    };
+    scheduler.enqueue(input).unwrap();
+    assert!(scheduler
+        .run_queued(model, group, stream)
+        .unwrap()
+        .is_empty());
+    scheduler
+        .cancel_request_distributed(submitted_request, group, stream)
+        .unwrap();
+    assert_eq!(scheduler.report().abandoned_in_flight_work, 1);
+    for _ in 0..16 {
+        assert!(scheduler
+            .run_queued(model, group, stream)
+            .unwrap()
+            .is_empty());
+        if scheduler.report().current_in_flight_work == 0 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let report = scheduler.report();
+    assert_eq!(report.current_in_flight_work, 0);
+    assert_eq!(report.cancellation_after_submission, 1);
+    assert_eq!(report.abandoned_released_work, 1);
 }
 
 fn run_schedule_mismatch_worker(

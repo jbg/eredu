@@ -53,6 +53,14 @@ event; both possible streams must finish before its mmap lease can be released.
 Benchmark timing barriers intentionally continue to drain their measured
 streams, because the whole-stream boundary is the quantity being timed.
 
+Scheduler cancellation does not add a backend cancellation primitive. A
+submitted transition owns its `Event`, branch-local semantic state, output,
+arrays, and leases. Cancellation marks it abandoned and returns immediately;
+those resources are released only after `Event::is_complete` succeeds. Metal
+events cannot interrupt an executing kernel or committed command buffer, so
+the non-preemptible interval is the exact submission-to-event-completion
+interval described in [cancellation and bounded execution](cancellation.md).
+
 The deterministic MLX C++ tests for CPU error retention and poisoned consumer
 streams are built only through the opt-in `mlx-patch-tests` CMake
 target. The path-scoped `mlx-patch-tests.yml` workflow runs that target when the

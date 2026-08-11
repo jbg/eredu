@@ -5,7 +5,7 @@
 //! completes it, so pipeline and collective callers do not need to duplicate
 //! `eval` plus whole-stream synchronization sequences.
 
-use safemlx::{transforms::async_eval_with_event, Array, Event, Stream};
+use safemlx::{transforms::async_eval_with_event, Array, Event, EventBackend, Stream};
 
 use crate::error::Error;
 
@@ -68,6 +68,16 @@ impl<T> DistributedCompletion<T> {
     /// Returns whether the exact distributed operation has completed.
     pub fn is_complete(&self) -> Result<bool, Error> {
         Ok(self.event.is_complete()?)
+    }
+
+    /// Returns the backend which owns this exact completion.
+    pub fn backend(&self) -> Result<EventBackend, Error> {
+        Ok(self.event.backend()?)
+    }
+
+    /// Returns the arrays explicitly retained through exact completion.
+    pub fn retained_resources(&self) -> usize {
+        self._retained.len()
     }
 
     /// Blocks the host for this exact completion, not the remainder of a stream.

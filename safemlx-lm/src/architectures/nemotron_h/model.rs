@@ -3181,6 +3181,26 @@ impl Module<BlockInput<'_>> for TransformerBlock {
 }
 
 impl LayerCache {
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        match (self, checkpoint) {
+            (Self::Attention(cache), Self::Attention(previous)) => {
+                cache.restore_checkpoint(previous, stream)
+            }
+            (Self::Mamba(cache), Self::Mamba(previous)) => {
+                cache.clone_from(previous);
+                Ok(())
+            }
+            (Self::Mlp, Self::Mlp) | (Self::Moe, Self::Moe) => Ok(()),
+            _ => Err(Exception::custom(
+                "Nemotron-H checkpoint changed layer policy",
+            )),
+        }
+    }
+
     pub(crate) fn new(policy: LayerPolicy) -> Self {
         match policy {
             LayerPolicy::Mamba => Self::Mamba(Mamba2Cache::default()),

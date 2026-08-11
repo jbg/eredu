@@ -1249,6 +1249,7 @@ pub struct GenerationStepWithLogits {
 /// Input frames contain only the caller/user side of the Mimi stream. The
 /// generated side, temporal/depth caches, text feedback, and per-codebook
 /// delays remain internal to this state.
+#[derive(Clone)]
 pub struct GenerationState {
     pub(crate) cache: MoshiCache,
     pub(crate) frames: Vec<Vec<Option<Array>>>,

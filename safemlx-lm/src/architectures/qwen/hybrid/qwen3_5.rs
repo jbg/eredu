@@ -1348,6 +1348,25 @@ pub enum LayerCache {
 }
 
 impl LayerCache {
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        match (self, checkpoint) {
+            (Self::FullAttention(cache), Self::FullAttention(previous)) => {
+                cache.restore_checkpoint(previous, stream)
+            }
+            (Self::LinearAttention(cache), Self::LinearAttention(previous)) => {
+                cache.clone_from(previous);
+                Ok(())
+            }
+            _ => Err(Exception::custom(
+                "Qwen hybrid checkpoint changed layer policy",
+            )),
+        }
+    }
+
     pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
         match self {
             Self::FullAttention(cache) => cache.retained_arrays(),

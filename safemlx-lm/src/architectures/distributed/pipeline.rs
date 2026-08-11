@@ -25,6 +25,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use safemlx::{
@@ -119,8 +120,8 @@ use crate::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
     runtime::scheduler::{
-        FairScheduler, RequestId, RequestStatus, SchedulerLimits, SchedulerReport, WorkDescriptor,
-        WorkId,
+        FairScheduler, RequestId, RequestStatus, SchedulerCapabilities, SchedulerLimits,
+        SchedulerReport, SemanticStateTransaction, TransitionOutput, WorkDescriptor, WorkId,
     },
 };
 
@@ -705,9 +706,9 @@ impl PipelineMicrobatchInput {
     }
 }
 
-/// Result metadata and exact backend completion for one submitted microbatch.
+/// Result metadata and exact backend completion for one committed microbatch.
 #[derive(Debug)]
-#[must_use = "pipeline work has been submitted; retain, wait on, or synchronize its completion"]
+#[must_use = "pipeline work completed; consume its result or retain its exact completion"]
 pub struct PipelineMicrobatchOutput {
     work: WorkId,
     phase: PipelineInferencePhase,
@@ -733,9 +734,9 @@ impl PipelineMicrobatchOutput {
 
     /// Returns vocabulary logits on the final rank and `None` elsewhere.
     ///
-    /// The array has been submitted but may still be executing. Host access
-    /// requires [`Self::synchronize`]; a different compatible stream must call
-    /// [`Self::wait_on`] before evaluating dependent work.
+    /// The scheduler publishes this array only after its exact completion has
+    /// succeeded and its request-state branch has committed. The completion is
+    /// retained so callers can still order dependent work onto another stream.
     pub const fn logits(&self) -> Option<&Array> {
         self.completion.logits()
     }
@@ -816,6 +817,20 @@ impl PipelineStageCompletion {
 
     fn into_submitted_logits(self) -> Option<Array> {
         self.inner.value().clone()
+    }
+}
+
+impl TransitionOutput for PipelineStageCompletion {
+    fn is_complete(&self) -> Result<bool, Error> {
+        self.inner.is_complete()
+    }
+
+    fn backend(&self) -> Result<safemlx::EventBackend, Error> {
+        self.inner.backend()
+    }
+
+    fn retained_resources(&self) -> usize {
+        self.inner.retained_resources()
     }
 }
 
@@ -1092,13 +1107,174 @@ impl PipelineCache {
         self.mtp = PipelineMtpCache::None;
         Ok(())
     }
+
+    fn restore_transaction_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        if self.model_kind != checkpoint.model_kind || self.layers.len() != checkpoint.layers.len()
+        {
+            return Err(Error::Parallel(
+                "pipeline transaction checkpoint changed cache layout".into(),
+            ));
+        }
+        for (current, previous) in self.layers.iter_mut().zip(&checkpoint.layers) {
+            match (current, previous) {
+                (
+                    PipelineLayerCache::StateSlots {
+                        global_layer,
+                        slots,
+                    },
+                    PipelineLayerCache::StateSlots {
+                        global_layer: previous_layer,
+                        slots: previous_slots,
+                    },
+                ) if global_layer == previous_layer => slots.clone_from(previous_slots),
+                (
+                    PipelineLayerCache::KeyValue {
+                        global_layer,
+                        cache,
+                        slots,
+                    },
+                    PipelineLayerCache::KeyValue {
+                        global_layer: previous_layer,
+                        cache: previous_cache,
+                        slots: previous_slots,
+                    },
+                ) if global_layer == previous_layer => {
+                    match (cache, previous_cache) {
+                        (
+                            PipelineKeyValueCache::Standard(cache),
+                            PipelineKeyValueCache::Standard(previous),
+                        ) => cache.clone_from(previous),
+                        (
+                            PipelineKeyValueCache::Paged(cache),
+                            PipelineKeyValueCache::Paged(previous),
+                        ) => cache.restore_checkpoint(previous, stream)?,
+                        _ => {
+                            return Err(Error::Parallel(
+                                "pipeline transaction checkpoint changed KV residency".into(),
+                            ));
+                        }
+                    }
+                    slots.clone_from(previous_slots);
+                }
+                (
+                    PipelineLayerCache::CompressedLatent {
+                        global_layer,
+                        cache,
+                        slots,
+                    },
+                    PipelineLayerCache::CompressedLatent {
+                        global_layer: previous_layer,
+                        cache: previous_cache,
+                        slots: previous_slots,
+                    },
+                ) if global_layer == previous_layer => {
+                    cache.restore_checkpoint(previous_cache, stream)?;
+                    slots.clone_from(previous_slots);
+                }
+                _ => {
+                    return Err(Error::Parallel(
+                        "pipeline transaction checkpoint changed layer identity".into(),
+                    ));
+                }
+            }
+        }
+        match (&mut self.mtp, &checkpoint.mtp) {
+            (PipelineMtpCache::None, PipelineMtpCache::None) => {}
+            (PipelineMtpCache::DeepSeek(current), PipelineMtpCache::DeepSeek(previous)) => {
+                if current.len() != previous.len() {
+                    return Err(Error::Parallel(
+                        "pipeline MTP checkpoint length changed".into(),
+                    ));
+                }
+                for (cache, checkpoint) in current.iter_mut().zip(previous) {
+                    cache.restore_checkpoint(checkpoint, stream)?;
+                }
+            }
+            (PipelineMtpCache::Inkling(current), PipelineMtpCache::Inkling(previous)) => {
+                if current.len() != previous.len() {
+                    return Err(Error::Parallel(
+                        "pipeline MTP checkpoint length changed".into(),
+                    ));
+                }
+                for (cache, checkpoint) in current.iter_mut().zip(previous) {
+                    cache.restore_checkpoint(checkpoint, stream)?;
+                }
+            }
+            (PipelineMtpCache::NemotronH(current), PipelineMtpCache::NemotronH(previous)) => {
+                if current.len() != previous.len() {
+                    return Err(Error::Parallel(
+                        "pipeline MTP checkpoint length changed".into(),
+                    ));
+                }
+                for (cache, checkpoint) in current.iter_mut().zip(previous) {
+                    cache.restore_checkpoint(checkpoint, stream)?;
+                }
+            }
+            (PipelineMtpCache::QwenHybrid(current), PipelineMtpCache::QwenHybrid(previous)) => {
+                if current.len() != previous.len() {
+                    return Err(Error::Parallel(
+                        "pipeline MTP checkpoint length changed".into(),
+                    ));
+                }
+                for (cache, checkpoint) in current.iter_mut().zip(previous) {
+                    cache.restore_checkpoint(checkpoint, stream)?;
+                }
+            }
+            _ => {
+                return Err(Error::Parallel(
+                    "pipeline transaction checkpoint changed MTP layout".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PipelineRequestState {
     cache: PipelineCache,
     batch_size: Option<i32>,
     last_phase: Option<PipelineInferencePhase>,
+}
+
+impl SemanticStateTransaction for PipelineRequestState {
+    type Branch = PipelineRequestBranch;
+
+    fn branch(&self) -> Result<Self::Branch, Error> {
+        // Array and sealed-cache backing is shared; only mutable cache tails
+        // and semantic metadata are structurally cloned for this branch.
+        Ok(PipelineRequestBranch {
+            state: self.clone(),
+            checkpoint: self.cache.clone(),
+            stream: None,
+        })
+    }
+
+    fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Error> {
+        *self = branch.state;
+        Ok(())
+    }
+
+    fn discard_branch(mut branch: Self::Branch) -> Result<(), Error> {
+        if let Some(stream) = branch.stream.as_ref() {
+            branch
+                .state
+                .cache
+                .restore_transaction_checkpoint(&branch.checkpoint, stream)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PipelineRequestBranch {
+    state: PipelineRequestState,
+    checkpoint: PipelineCache,
+    stream: Option<Stream>,
 }
 
 #[derive(Debug, Clone)]
@@ -1126,6 +1302,10 @@ impl WorkDescriptor for ScheduledPipelineMicrobatch {
         }
         Ok(())
     }
+
+    fn execution_slice_size(&self) -> usize {
+        self.step.sequence_length() as usize
+    }
 }
 
 /// Bounded, fair inference scheduler for one rank-local pipeline stage.
@@ -1149,7 +1329,8 @@ pub struct PipelineInferenceScheduler {
     global_layer_range: Range<usize>,
     architecture_fingerprint: String,
     cache_pool: Option<CacheResidencyPool>,
-    scheduler: FairScheduler<ScheduledPipelineMicrobatch, PipelineRequestState>,
+    scheduler:
+        FairScheduler<ScheduledPipelineMicrobatch, PipelineRequestState, PipelineStageCompletion>,
 }
 
 impl PipelineInferenceScheduler {
@@ -1248,6 +1429,15 @@ impl PipelineInferenceScheduler {
     /// prefill work is rejected. Decode work always has sequence length one and
     /// every transition for a request must retain its original batch size.
     pub fn enqueue(&mut self, input: PipelineMicrobatchInput) -> Result<WorkId, Error> {
+        self.enqueue_with_deadline(input, None)
+    }
+
+    /// Enqueues one microbatch with an optional absolute cancellation deadline.
+    pub fn enqueue_with_deadline(
+        &mut self,
+        input: PipelineMicrobatchInput,
+        deadline: Option<Instant>,
+    ) -> Result<WorkId, Error> {
         let first_stage = self.topology.pipeline_parallel_rank == 0;
         match &input.ingress {
             ScheduledPipelineIngress::Tokens(Some(tokens)) if first_stage => {
@@ -1332,7 +1522,7 @@ impl PipelineInferenceScheduler {
         let phase = input.phase;
         let batch_size = input.step.batch_size();
         let request_id = input.request;
-        let work = self.scheduler.enqueue(
+        let work = self.scheduler.enqueue_with_deadline(
             request_id,
             ScheduledPipelineMicrobatch {
                 phase: input.phase,
@@ -1340,6 +1530,7 @@ impl PipelineInferenceScheduler {
                 ingress: input.ingress,
                 mask: input.mask,
             },
+            deadline,
         )?;
         let request = self.scheduler.request_state_mut(request_id)?;
         request.batch_size.get_or_insert(batch_size);
@@ -1347,7 +1538,7 @@ impl PipelineInferenceScheduler {
         Ok(work)
     }
 
-    /// Drains the current queue using fair round-robin request ordering.
+    /// Advances one bounded scheduler turn in fair round-robin request order.
     ///
     /// A collective preflight compares every work descriptor exactly across
     /// ranks before any point-to-point send or receive is issued. Stage zero can
@@ -1362,8 +1553,14 @@ impl PipelineInferenceScheduler {
         self.validate_model(model)?;
         model.validate_group(group)?;
         let protocol = 0x5049_5045_0002_0000u64 | self.model_kind as u64;
-        self.scheduler
-            .drain_distributed(protocol, group, stream, |_, work, request| {
+        let progress = self.scheduler.run_distributed_turn(
+            protocol,
+            group,
+            stream,
+            Instant::now(),
+            |_, work, request| {
+                request.stream = Some(stream.clone());
+                let request = &mut request.state;
                 match &work.ingress {
                     ScheduledPipelineIngress::Tokens(tokens) => model.forward_pipeline(
                         tokens.as_ref(),
@@ -1396,24 +1593,30 @@ impl PipelineInferenceScheduler {
                         )
                     }
                 }
-            })
+            },
+        )?;
+        if let Some(failure) = progress.failed.first() {
+            return Err(Error::Parallel(format!(
+                "pipeline work {:?} failed asynchronously: {}",
+                failure.id, failure.error
+            )));
+        }
+        Ok(progress
+            .committed
+            .into_iter()
             .map(|completed| {
-                completed
-                    .into_iter()
-                    .map(|completed| {
-                        let (work, input, completion) = completed.into_parts();
-                        PipelineMicrobatchOutput {
-                            work,
-                            phase: input.phase,
-                            step: input.step,
-                            completion,
-                        }
-                    })
-                    .collect()
+                let (work, input, completion) = completed.into_parts();
+                PipelineMicrobatchOutput {
+                    work,
+                    phase: input.phase,
+                    step: input.step,
+                    completion,
+                }
             })
+            .collect())
     }
 
-    /// Drains the current queue over topology-derived Cartesian subgroups.
+    /// Advances one bounded scheduler turn over Cartesian subgroups.
     ///
     /// Global schedule consensus uses [`crate::CartesianExecution::world`],
     /// pipeline payloads use matching-coordinate PP lanes, and stage-local TP
@@ -1433,12 +1636,15 @@ impl PipelineInferenceScheduler {
             )));
         }
         let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
-        self.scheduler
-            .drain_distributed(
-                protocol,
-                cartesian.world(),
-                stream,
-                |_, work, request| match &work.ingress {
+        let progress = self.scheduler.run_distributed_turn(
+            protocol,
+            cartesian.world(),
+            stream,
+            Instant::now(),
+            |_, work, request| {
+                request.stream = Some(stream.clone());
+                let request = &mut request.state;
+                match &work.ingress {
                     ScheduledPipelineIngress::Tokens(tokens) => model.forward_cartesian(
                         tokens.as_ref(),
                         work.step,
@@ -1469,22 +1675,28 @@ impl PipelineInferenceScheduler {
                             stream,
                         )
                     }
-                },
-            )
+                }
+            },
+        )?;
+        if let Some(failure) = progress.failed.first() {
+            return Err(Error::Parallel(format!(
+                "pipeline work {:?} failed asynchronously: {}",
+                failure.id, failure.error
+            )));
+        }
+        Ok(progress
+            .committed
+            .into_iter()
             .map(|completed| {
-                completed
-                    .into_iter()
-                    .map(|completed| {
-                        let (work, input, completion) = completed.into_parts();
-                        PipelineMicrobatchOutput {
-                            work,
-                            phase: input.phase,
-                            step: input.step,
-                            completion,
-                        }
-                    })
-                    .collect()
+                let (work, input, completion) = completed.into_parts();
+                PipelineMicrobatchOutput {
+                    work,
+                    phase: input.phase,
+                    step: input.step,
+                    completion,
+                }
             })
+            .collect())
     }
 
     /// Marks a request complete after EOS and releases its cache.
@@ -1494,9 +1706,41 @@ impl PipelineInferenceScheduler {
         self.scheduler.finish(request)
     }
 
-    /// Cancels a request, releases its cache, and discards its queued work.
+    /// Cancels local work before distributed execution begins.
+    ///
+    /// Once ranks are executing, use [`Self::cancel_request_distributed`] or
+    /// [`Self::cancel_request_cartesian`] so disposition reaches consensus.
     pub fn cancel_request(&mut self, request: RequestId) -> Result<(), Error> {
         self.scheduler.cancel(request)
+    }
+
+    /// Reaches exact group consensus, then cancels or abandons this request.
+    pub fn cancel_request_distributed(
+        &mut self,
+        request: RequestId,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let protocol = 0x5049_5045_0002_0000u64 | self.model_kind as u64;
+        self.scheduler
+            .cancel_distributed(protocol, request, group, stream)
+    }
+
+    /// Reaches world consensus for a Cartesian pipeline cancellation.
+    pub fn cancel_request_cartesian(
+        &mut self,
+        request: RequestId,
+        cartesian: &crate::CartesianExecution<'_>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        if cartesian.topology() != self.topology {
+            return Err(Error::Parallel(
+                "pipeline cancellation Cartesian topology mismatch".into(),
+            ));
+        }
+        let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
+        self.scheduler
+            .cancel_distributed(protocol, request, cartesian.world(), stream)
     }
 
     /// Releases an idle active request and returns its cache to the caller.
@@ -1525,6 +1769,11 @@ impl PipelineInferenceScheduler {
     /// Returns a current observability snapshot.
     pub fn report(&self) -> SchedulerReport {
         self.scheduler.report()
+    }
+
+    /// Returns configured bounds, backend identity, and physical-preemption support.
+    pub fn capabilities(&self) -> SchedulerCapabilities {
+        self.scheduler.capabilities()
     }
 
     /// Returns aggregate cache-pool occupancy for all attached request caches,
@@ -27230,22 +27479,18 @@ mod tests {
             scheduler.request_status(second_request),
             Some(RequestStatus::Finished)
         );
-        assert_eq!(
-            scheduler.report(),
-            SchedulerReport {
-                active_requests: 0,
-                queued_work: 0,
-                peak_queued_work: 4,
-                submitted_work: 4,
-                completed_work: 0,
-                failed_work: 0,
-                discarded_work: 4,
-                finished_requests: 1,
-                cancelled_requests: 1,
-                drain_cycles: 0,
-                poisoned: false,
-            }
-        );
+        let report = scheduler.report();
+        assert_eq!(report.active_requests, 0);
+        assert_eq!(report.queued_work, 0);
+        assert_eq!(report.peak_queued_work, 4);
+        assert_eq!(report.submitted_work, 4);
+        assert_eq!(report.completed_work, 0);
+        assert_eq!(report.failed_work, 0);
+        assert_eq!(report.discarded_work, 4);
+        assert_eq!(report.finished_requests, 1);
+        assert_eq!(report.cancelled_requests, 1);
+        assert_eq!(report.drain_cycles, 0);
+        assert!(!report.poisoned);
         assert_eq!(
             scheduler.forget_terminal_request(second_request).unwrap(),
             RequestStatus::Finished

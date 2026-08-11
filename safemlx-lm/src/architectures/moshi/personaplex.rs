@@ -344,7 +344,7 @@ fn repeated_frame(tokens: &[i32; 8], batch: i32, stream: &Stream) -> Result<Arra
 }
 
 /// Enqueues one forced PersonaPlex prompt frame on an existing request.
-pub fn enqueue_prompt_frame<TS: Sampler, AS: Sampler>(
+pub fn enqueue_prompt_frame<TS: Sampler + Clone, AS: Sampler + Clone>(
     scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
     model: &LoadedRealtimeModel,
     request: RequestId,
@@ -364,7 +364,7 @@ pub fn enqueue_prompt_frame<TS: Sampler, AS: Sampler>(
 /// `voice_prompt_tokens` uses codec layout `[batch, 8, frames]`; the user side
 /// is filled with PersonaPlex's sine-conditioning token frame and text is
 /// forced to the existing text pad id.
-pub fn enqueue_voice_prompt<TS: Sampler, AS: Sampler>(
+pub fn enqueue_voice_prompt<TS: Sampler + Clone, AS: Sampler + Clone>(
     scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
     model: &LoadedRealtimeModel,
     request: RequestId,
@@ -411,7 +411,7 @@ fn voice_prompt_inputs(
 /// from the caller's PersonaPlex-compatible text tokenizer. The generated audio
 /// side is forced to PersonaPlex silence while the user side is filled with the
 /// sine-conditioning frame.
-pub fn enqueue_text_prompt<TS: Sampler, AS: Sampler>(
+pub fn enqueue_text_prompt<TS: Sampler + Clone, AS: Sampler + Clone>(
     scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
     model: &LoadedRealtimeModel,
     request: RequestId,
@@ -459,7 +459,7 @@ fn text_prompt_inputs(
 /// and tokenization stay outside this crate; callers can use
 /// [`wrap_system_prompt`] before tokenizing with a compatible SentencePiece
 /// tokenizer.
-pub fn enqueue_system_prompt<TS: Sampler, AS: Sampler>(
+pub fn enqueue_system_prompt<TS: Sampler + Clone, AS: Sampler + Clone>(
     scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
     model: &LoadedRealtimeModel,
     request: RequestId,
@@ -574,7 +574,11 @@ mod tests {
         let text_prompt =
             Array::full::<i32>(&[1, 2], Array::from_int(TEXT_PADDING_TOKEN), stream).unwrap();
         super::enqueue_text_prompt(&mut scheduler, &model, request, &text_prompt, stream).unwrap();
-        scheduler.run_queued(&mut model, stream).unwrap();
+        let mut prompt_completions = 0;
+        while prompt_completions < 2 {
+            prompt_completions += scheduler.run_queued(&mut model, stream).unwrap().len();
+            std::thread::yield_now();
+        }
 
         let input = super::sine_frame(1, stream).unwrap();
         let mut emitted = None;
@@ -582,13 +586,12 @@ mod tests {
             scheduler
                 .enqueue(&model, request, RealtimeStepInput::encoded_audio(&input))
                 .unwrap();
-            let output = scheduler
-                .run_queued(&mut model, stream)
-                .unwrap()
-                .pop()
-                .unwrap()
-                .into_parts()
-                .1;
+            let output = loop {
+                if let Some(output) = scheduler.run_queued(&mut model, stream).unwrap().pop() {
+                    break output.into_parts().1;
+                }
+                std::thread::yield_now();
+            };
             emitted = output.output_audio_tokens;
         }
         let emitted = emitted.expect("PersonaPlex should emit a delay-aligned frame");

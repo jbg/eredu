@@ -936,6 +936,26 @@ impl LiveKeyValueCache {
         }
     }
 
+    /// Restores an earlier transactional frontier, removing paged deltas.
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        match (self, checkpoint) {
+            (Self::Resident(cache), Self::Resident(previous)) => {
+                cache.clone_from(previous);
+                Ok(())
+            }
+            (Self::Paged(cache), Self::Paged(previous)) => {
+                cache.restore_checkpoint(previous, stream)
+            }
+            _ => Err(Exception::custom(
+                "live key/value checkpoint changed residency mode",
+            )),
+        }
+    }
+
     /// Clears this layer after a model-wide paging manager clear.
     pub fn reset_local_after_manager_clear(&mut self) {
         match self {

@@ -665,6 +665,16 @@ pub struct LayerCache {
 }
 
 impl LayerCache {
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        self.kv.restore_checkpoint(&checkpoint.kv, stream)?;
+        self.convolutions.clone_from(&checkpoint.convolutions);
+        Ok(())
+    }
+
     fn new(policy: AttentionPolicy) -> Self {
         Self {
             kv: match policy.window() {
