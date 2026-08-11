@@ -535,7 +535,7 @@ mod tests {
                 "</atem:invoke>\n</atem:function_calls>"
             ))
             .unwrap();
-        parser.push(EOT).unwrap();
+        parser.push_structural(5, EOT).unwrap();
         parser.finish(FinishReason::StopSequence).unwrap();
         let events = parser.take_events();
         assert!(events.contains(&SemanticEvent::ReasoningDelta("reason".into())));
@@ -566,7 +566,7 @@ mod tests {
             parser.push_structural(4, MESSAGE).unwrap();
             parser.push(&envelope[..split]).unwrap();
             parser.push(&envelope[split..]).unwrap();
-            parser.push(EOT).unwrap();
+            parser.push_structural(5, EOT).unwrap();
             parser.finish(FinishReason::StopSequence).unwrap();
             assert!(parser.take_events().iter().any(|event| matches!(
                 event,
