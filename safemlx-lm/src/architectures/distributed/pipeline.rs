@@ -9487,7 +9487,6 @@ fn load_llama_pipeline(
                 PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -10602,7 +10601,6 @@ fn load_dense_qwen_pipeline(
                 PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -10941,7 +10939,6 @@ fn load_muse_glimmer_pipeline(
                     .with_layer_group(0, stage.vision_range.clone()),
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -11339,7 +11336,6 @@ fn load_qwen3_vl_pipeline(
                     .with_layer_group(0, stage.vision_range.clone()),
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -13098,7 +13094,6 @@ fn load_gpt_oss_pipeline(
                 PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -14095,7 +14090,6 @@ fn load_lfm2_pipeline(
                 PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -15588,7 +15582,6 @@ fn load_nemotron_h_pipeline(
                 PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -16940,7 +16933,6 @@ fn load_qwen_hybrid_pipeline(
                 selection,
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -18454,7 +18446,6 @@ fn load_kimi_linear_pipeline(
                 PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -19575,7 +19566,6 @@ fn load_inkling_pipeline(
                 selection,
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -21196,7 +21186,6 @@ fn load_gemma_pipeline(
                 selection,
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }
@@ -22689,7 +22678,6 @@ fn load_deepseek_pipeline(
                 PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
                 quantization,
                 stream,
-                weights_stream,
             )?;
             (store, Some(report))
         }

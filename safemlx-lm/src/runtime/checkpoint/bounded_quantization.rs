@@ -3,7 +3,7 @@
 //! A [`BoundedQuantizedWeightStore`](crate::runtime::checkpoint::bounded_quantization::BoundedQuantizedWeightStore)
 //! overlays packed tensors on an existing
 //! checkpoint store. Source matrices are selected in row tiles, quantized on
-//! explicit CPU streams, and written directly into temporary SafeTensors
+//! explicit conversion streams, and written directly into temporary SafeTensors
 //! shards. A fixed two-slot completion window overlaps the next tile with the
 //! prior tile's host write when both slots fit the admitted working set, and
 //! otherwise falls back to one slot. The
@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
 };
 
-use safemlx::{memory, transforms::async_eval_with_event, Array, DeviceType, Dtype, Event, Stream};
+use safemlx::{memory, transforms::async_eval_with_event, Array, Dtype, Event, Stream};
 use safetensors::tensor::{Dtype as SafeDtype, TensorInfo};
 use serde::Serialize;
 use tempfile::TempDir;
@@ -251,25 +251,24 @@ impl std::fmt::Debug for BoundedQuantizedWeightStore {
 impl BoundedQuantizedWeightStore {
     /// Executes `plan` without materializing a complete source or destination matrix.
     ///
-    /// `source_stream` must be a CPU stream. A second same-device CPU stream is
-    /// used only when two minimum tiles fit the admitted bound. This prevents
-    /// conversion from consuming model-sized device residency in addition to
-    /// its admitted host working set.
+    /// Conversion runs on the supplied stream's device, allowing model loads
+    /// to use the accelerator quantizer while retaining CPU fallback. Source
+    /// and packed tile storage remain covered by the admitted working set.
+    ///
+    /// A second same-device stream is used only when two minimum tiles fit the
+    /// admitted bound.
     pub fn create(
         source: Arc<dyn WeightStore + Send + Sync>,
         plan: BoundedQuantizationPlan,
-        source_stream: &Stream,
+        conversion_stream: &Stream,
     ) -> Result<Self, Error> {
-        if source_stream.get_device()?.get_type()? != DeviceType::Cpu {
-            return Err(quantization_error(
-                "bounded load-time quantization requires a CPU source stream",
-            ));
-        }
         if !cfg!(target_endian = "little") {
             return Err(quantization_error(
                 "bounded SafeTensors quantization requires a little-endian host",
             ));
         }
+        let device = conversion_stream.get_device()?;
+        let tile_streams = [conversion_stream.clone(), Stream::new_with_device(&device)];
 
         preflight_source_collisions(source.as_ref(), &plan)?;
         let materialized_source_keys = plan
@@ -293,7 +292,7 @@ impl BoundedQuantizedWeightStore {
                 source.as_ref(),
                 target,
                 &plan,
-                source_stream,
+                &tile_streams,
                 &directory.path().join(&shard_name),
                 &mut report,
             )?;
@@ -428,7 +427,7 @@ fn transform_target(
     source: &dyn WeightStore,
     target: &BoundedQuantizationTarget,
     plan: &BoundedQuantizationPlan,
-    source_stream: &Stream,
+    tile_streams: &[Stream; BOUNDED_QUANTIZATION_TILE_BUFFERS],
     path: &Path,
     report: &mut BoundedQuantizationReport,
 ) -> Result<(), Error> {
@@ -516,8 +515,6 @@ fn transform_target(
         1
     };
     let tile_budget = plan.max_working_set_bytes / tile_buffers as u64;
-    let device = source_stream.get_device()?;
-    let tile_streams = [source_stream.clone(), Stream::new_with_device(&device)];
     let payload_offset = create_shard(path, &layouts)?;
     let mut file = OpenOptions::new().write(true).open(path)?;
     let mut pending_tiles = VecDeque::with_capacity(tile_buffers);
@@ -640,8 +637,9 @@ fn transform_target(
         tile.write(&mut file, payload_offset, &layouts)?;
         memory::clear_cache()?;
     }
+    // These shards are process-local scratch data consumed immediately below.
+    // Per-shard durability would serialize hundreds of unnecessary disk syncs.
     file.flush()?;
-    file.sync_data()?;
 
     let output_bytes = layouts.iter().try_fold(0u64, |total, layout| {
         total
@@ -1015,7 +1013,7 @@ fn quantization_error(message: impl Into<String>) -> Error {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use safemlx::{ops::GgufCheckpoint, Device, ExecutionContext};
+    use safemlx::{ops::GgufCheckpoint, Device, DeviceType, ExecutionContext};
     use safetensors::tensor::{serialize_to_file, TensorView};
 
     use super::*;
@@ -1082,6 +1080,56 @@ mod tests {
             .unwrap()
     }
 
+    fn assert_affine_outputs_match_reference(
+        transformed: &BoundedQuantizedWeightStore,
+        values: &[f32],
+        quantization: AffineQuantization,
+        context: &ExecutionContext,
+    ) {
+        let dense = Array::from_slice(values, &[8, 64]);
+        let expected = quantize_tensor(&dense, quantization, context.stream()).unwrap();
+        let weight = materialize(transformed, "model.proj.weight", context.stream());
+        let scales = materialize(transformed, "model.proj.scales", context.stream());
+        let biases = materialize(transformed, "model.proj.biases", context.stream());
+        assert_eq!(
+            weight.evaluated().unwrap().as_slice::<u32>(),
+            expected.weight.evaluated().unwrap().as_slice::<u32>()
+        );
+        assert_eq!(
+            scales.evaluated().unwrap().as_slice::<f32>(),
+            expected.scales.evaluated().unwrap().as_slice::<f32>()
+        );
+        assert_eq!(
+            biases.evaluated().unwrap().as_slice::<f32>(),
+            expected
+                .biases
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+        );
+    }
+
+    fn assert_mxfp4_outputs_match_reference(
+        transformed: &BoundedQuantizedWeightStore,
+        values: &[f32],
+        context: &ExecutionContext,
+    ) {
+        let dense = Array::from_slice(values, &[8, 64]);
+        let expected =
+            quantize_tensor(&dense, WeightQuantization::MxFp4, context.stream()).unwrap();
+        let weight = materialize(transformed, "model.proj.weight", context.stream());
+        let scales = materialize(transformed, "model.proj.scales", context.stream());
+        assert_eq!(
+            weight.evaluated().unwrap().as_slice::<u32>(),
+            expected.weight.evaluated().unwrap().as_slice::<u32>()
+        );
+        assert_eq!(
+            scales.evaluated().unwrap().as_slice::<u8>(),
+            expected.scales.evaluated().unwrap().as_slice::<u8>()
+        );
+    }
+
     #[test]
     fn affine_conversion_is_row_bounded_and_matches_the_canonical_quantizer() {
         let (_directory, source, values) = direct_fixture();
@@ -1136,28 +1184,7 @@ mod tests {
             32
         );
 
-        let dense = Array::from_slice(&values, &[8, 64]);
-        let expected = quantize_tensor(&dense, quantization, context.stream()).unwrap();
-        let weight = materialize(&transformed, "model.proj.weight", context.stream());
-        let scales = materialize(&transformed, "model.proj.scales", context.stream());
-        let biases = materialize(&transformed, "model.proj.biases", context.stream());
-        assert_eq!(
-            weight.evaluated().unwrap().as_slice::<u32>(),
-            expected.weight.evaluated().unwrap().as_slice::<u32>()
-        );
-        assert_eq!(
-            scales.evaluated().unwrap().as_slice::<f32>(),
-            expected.scales.evaluated().unwrap().as_slice::<f32>()
-        );
-        assert_eq!(
-            biases.evaluated().unwrap().as_slice::<f32>(),
-            expected
-                .biases
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<f32>()
-        );
+        assert_affine_outputs_match_reference(&transformed, &values, quantization, &context);
     }
 
     #[test]
@@ -1180,28 +1207,25 @@ mod tests {
         assert_eq!(report.peak_planned_working_set_bytes, 592);
         assert!(report.peak_planned_working_set_bytes <= report.admitted_working_set_bytes);
 
-        let dense = Array::from_slice(&values, &[8, 64]);
-        let expected = quantize_tensor(&dense, quantization, context.stream()).unwrap();
-        let weight = materialize(&transformed, "model.proj.weight", context.stream());
-        let scales = materialize(&transformed, "model.proj.scales", context.stream());
-        let biases = materialize(&transformed, "model.proj.biases", context.stream());
-        assert_eq!(
-            weight.evaluated().unwrap().as_slice::<u32>(),
-            expected.weight.evaluated().unwrap().as_slice::<u32>()
-        );
-        assert_eq!(
-            scales.evaluated().unwrap().as_slice::<f32>(),
-            expected.scales.evaluated().unwrap().as_slice::<f32>()
-        );
-        assert_eq!(
-            biases.evaluated().unwrap().as_slice::<f32>(),
-            expected
-                .biases
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<f32>()
-        );
+        assert_affine_outputs_match_reference(&transformed, &values, quantization, &context);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn affine_gpu_conversion_matches_the_canonical_gpu_quantizer() {
+        let (_directory, source, values) = direct_fixture();
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let quantization = AffineQuantization::default();
+        let plan = BoundedQuantizationPlan::new(
+            quantization,
+            640,
+            [BoundedQuantizationTarget::direct("model.proj.weight").unwrap()],
+        )
+        .unwrap();
+        let transformed =
+            BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+
+        assert_affine_outputs_match_reference(&transformed, &values, quantization, &context);
     }
 
     #[test]
@@ -1539,14 +1563,24 @@ mod tests {
         );
         assert!(!transformed.keys().contains(&"model.proj.biases".into()));
 
-        let dense = Array::from_slice(&values, &[8, 64]);
-        let expected =
-            quantize_tensor(&dense, WeightQuantization::MxFp4, context.stream()).unwrap();
-        let scales = materialize(&transformed, "model.proj.scales", context.stream());
-        assert_eq!(
-            scales.evaluated().unwrap().as_slice::<u8>(),
-            expected.scales.evaluated().unwrap().as_slice::<u8>()
-        );
+        assert_mxfp4_outputs_match_reference(&transformed, &values, &context);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mxfp4_gpu_conversion_matches_the_canonical_gpu_quantizer() {
+        let (_directory, source, values) = direct_fixture();
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let plan = BoundedQuantizationPlan::new(
+            WeightQuantization::MxFp4,
+            580,
+            [BoundedQuantizationTarget::direct("model.proj.weight").unwrap()],
+        )
+        .unwrap();
+        let transformed =
+            BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+
+        assert_mxfp4_outputs_match_reference(&transformed, &values, &context);
     }
 
     #[test]

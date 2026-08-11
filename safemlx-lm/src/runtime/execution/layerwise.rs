@@ -4104,7 +4104,7 @@ where
     let transformed = Arc::new(BoundedQuantizedWeightStore::create(
         Arc::clone(&store),
         BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
-        weights_stream,
+        stream,
     )?);
     let report = transformed.report().clone();
     let transformed: SharedWeightStore = transformed;
@@ -4193,7 +4193,6 @@ pub(crate) fn quantize_pipeline_stage_store<A>(
     selection: PipelineStageQuantizationSelection<'_>,
     quantization: WeightQuantization,
     stream: &Stream,
-    weights_stream: &Stream,
 ) -> Result<(SharedWeightStore, BoundedQuantizationReport), Error>
 where
     A: ArchitectureAdapter,
@@ -4301,7 +4300,7 @@ where
     let transformed = Arc::new(BoundedQuantizedWeightStore::create(
         store,
         BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
-        weights_stream,
+        stream,
     )?);
     let report = transformed.report().clone();
     let transformed: SharedWeightStore = transformed;
