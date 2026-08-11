@@ -490,7 +490,7 @@ pub fn chat_template_variables(
 ) -> Result<BTreeSet<String>, Error> {
     let mut env = Environment::new();
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    let compatible_template = normalize_generation_blocks(model_template);
+    let compatible_template = normalize_chat_template(model_template);
     env.add_template_owned(model_id.to_owned(), compatible_template)?;
     let template = env.get_template(model_id)?;
     Ok(template.undeclared_variables(false).into_iter().collect())
@@ -507,7 +507,7 @@ pub fn chat_template_kwargs(
 ) -> Result<BTreeSet<String>, Error> {
     let mut env = Environment::new();
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    let compatible_template = normalize_generation_blocks(model_template);
+    let compatible_template = normalize_chat_template(model_template);
     env.add_template_owned(model_id.to_owned(), compatible_template)?;
     let template = env.get_template(model_id)?;
     let globals = env
@@ -819,7 +819,7 @@ where
             match env.get_template(&selected_template_id) {
                 Ok(template) => template,
                 Err(_) => {
-                    let compatible_template = normalize_generation_blocks(selected.template());
+                    let compatible_template = normalize_chat_template(selected.template());
                     env.add_template_owned(selected_template_id.clone(), compatible_template)?;
                     env.get_template(&selected_template_id)
                         .expect("Newly added template must be present")
@@ -869,6 +869,257 @@ fn normalize_generation_blocks(template: &str) -> String {
     }
     output.push_str(remaining);
     output
+}
+
+/// Jinja permits a conditional expression directly as a keyword argument,
+/// while MiniJinja requires that expression to be parenthesized. Hugging Face
+/// templates are authored for Jinja, so add the otherwise-semantic no-op
+/// parentheses before compiling them with MiniJinja.
+/// Remove this normalization once https://github.com/mitsuhiko/minijinja/pull/921
+/// is available in the minimum supported MiniJinja release.
+fn normalize_conditional_keyword_arguments(template: &str) -> String {
+    fn is_identifier(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    fn keyword_at(bytes: &[u8], index: usize, keyword: &[u8]) -> bool {
+        bytes.get(index..index + keyword.len()) == Some(keyword)
+            && (index == 0 || !is_identifier(bytes[index - 1]))
+            && bytes
+                .get(index + keyword.len())
+                .is_none_or(|byte| !is_identifier(*byte))
+    }
+
+    fn is_fully_parenthesized(bytes: &[u8], start: usize, end: usize) -> bool {
+        let Some(first) = (start..end).find(|index| !bytes[*index].is_ascii_whitespace()) else {
+            return false;
+        };
+        let Some(last) = (start..end)
+            .rev()
+            .find(|index| !bytes[*index].is_ascii_whitespace())
+        else {
+            return false;
+        };
+        if bytes[first] != b'(' || bytes[last] != b')' {
+            return false;
+        }
+
+        let mut depth = 0usize;
+        let mut quote = None;
+        let mut escaped = false;
+        for (offset, byte) in bytes[first..=last].iter().copied().enumerate() {
+            if let Some(active_quote) = quote {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && first + offset != last {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        depth == 0 && quote.is_none()
+    }
+
+    fn normalize_tag(tag: &str) -> String {
+        let bytes = tag.as_bytes();
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut quote = None;
+        let mut escaped = false;
+        let mut insertions = Vec::new();
+
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            if let Some(active_quote) = quote {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'(' => paren_depth += 1,
+                b')' => paren_depth = paren_depth.saturating_sub(1),
+                b'[' => bracket_depth += 1,
+                b']' => bracket_depth = bracket_depth.saturating_sub(1),
+                b'{' => brace_depth += 1,
+                b'}' => brace_depth = brace_depth.saturating_sub(1),
+                b'=' if paren_depth > 0
+                    && bytes.get(index.wrapping_sub(1)).is_some_and(|byte| {
+                        *byte != b'=' && *byte != b'!' && *byte != b'<' && *byte != b'>'
+                    })
+                    && bytes.get(index + 1) != Some(&b'=') =>
+                {
+                    let Some(lhs_end) = (0..index)
+                        .rev()
+                        .find(|position| !bytes[*position].is_ascii_whitespace())
+                    else {
+                        continue;
+                    };
+                    if !is_identifier(bytes[lhs_end]) {
+                        continue;
+                    }
+
+                    let base_paren = paren_depth;
+                    let base_bracket = bracket_depth;
+                    let base_brace = brace_depth;
+                    let mut scan_paren = paren_depth;
+                    let mut scan_bracket = bracket_depth;
+                    let mut scan_brace = brace_depth;
+                    let mut scan_quote = None;
+                    let mut scan_escaped = false;
+                    let mut found_if = false;
+                    let mut found_else = false;
+                    let mut end = bytes.len();
+                    let mut cursor = index + 1;
+                    while cursor < bytes.len() {
+                        let current = bytes[cursor];
+                        if let Some(active_quote) = scan_quote {
+                            if scan_escaped {
+                                scan_escaped = false;
+                            } else if current == b'\\' {
+                                scan_escaped = true;
+                            } else if current == active_quote {
+                                scan_quote = None;
+                            }
+                            cursor += 1;
+                            continue;
+                        }
+                        match current {
+                            b'\'' | b'"' => scan_quote = Some(current),
+                            b'(' => scan_paren += 1,
+                            b')' if scan_paren == base_paren
+                                && scan_bracket == base_bracket
+                                && scan_brace == base_brace =>
+                            {
+                                end = cursor;
+                                break;
+                            }
+                            b')' => scan_paren = scan_paren.saturating_sub(1),
+                            b'[' => scan_bracket += 1,
+                            b']' => scan_bracket = scan_bracket.saturating_sub(1),
+                            b'{' => scan_brace += 1,
+                            b'}' => scan_brace = scan_brace.saturating_sub(1),
+                            b',' if scan_paren == base_paren
+                                && scan_bracket == base_bracket
+                                && scan_brace == base_brace =>
+                            {
+                                end = cursor;
+                                break;
+                            }
+                            _ if scan_paren == base_paren
+                                && scan_bracket == base_bracket
+                                && scan_brace == base_brace =>
+                            {
+                                if keyword_at(bytes, cursor, b"if") {
+                                    found_if = true;
+                                } else if found_if && keyword_at(bytes, cursor, b"else") {
+                                    found_else = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                        cursor += 1;
+                    }
+
+                    let Some(rhs_start) =
+                        (index + 1..end).find(|position| !bytes[*position].is_ascii_whitespace())
+                    else {
+                        continue;
+                    };
+                    let Some(rhs_end) = (index + 1..end)
+                        .rev()
+                        .find(|position| !bytes[*position].is_ascii_whitespace())
+                        .map(|position| position + 1)
+                    else {
+                        continue;
+                    };
+                    if found_if && found_else && !is_fully_parenthesized(bytes, rhs_start, rhs_end)
+                    {
+                        insertions.push((rhs_start, '('));
+                        insertions.push((rhs_end, ')'));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if insertions.is_empty() {
+            return tag.to_owned();
+        }
+        insertions.sort_unstable_by_key(|(position, character)| {
+            (*position, if *character == ')' { 0 } else { 1 })
+        });
+        let mut output = String::with_capacity(tag.len() + insertions.len());
+        let mut insertion_index = 0usize;
+        for (index, character) in tag.char_indices() {
+            while insertions
+                .get(insertion_index)
+                .is_some_and(|(position, _)| *position == index)
+            {
+                output.push(insertions[insertion_index].1);
+                insertion_index += 1;
+            }
+            output.push(character);
+        }
+        while insertions
+            .get(insertion_index)
+            .is_some_and(|(position, _)| *position == tag.len())
+        {
+            output.push(insertions[insertion_index].1);
+            insertion_index += 1;
+        }
+        output
+    }
+
+    let mut output = String::with_capacity(template.len());
+    let mut cursor = 0usize;
+    while cursor < template.len() {
+        let expression = template[cursor..].find("{{").map(|offset| cursor + offset);
+        let statement = template[cursor..].find("{%").map(|offset| cursor + offset);
+        let Some(start) = (match (expression, statement) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        }) else {
+            output.push_str(&template[cursor..]);
+            break;
+        };
+        output.push_str(&template[cursor..start]);
+        let delimiter = if template[start..].starts_with("{{") {
+            "}}"
+        } else {
+            "%}"
+        };
+        let Some(relative_end) = template[start + 2..].find(delimiter) else {
+            output.push_str(&template[start..]);
+            break;
+        };
+        let end = start + 2 + relative_end + 2;
+        output.push_str(&normalize_tag(&template[start..end]));
+        cursor = end;
+    }
+    output
+}
+
+fn normalize_chat_template(template: &str) -> String {
+    normalize_conditional_keyword_arguments(&normalize_generation_blocks(template))
 }
 
 // TODO: render with assistant indices
@@ -977,8 +1228,9 @@ mod tests {
 
     use crate::tokenizer::{
         apply_chat_template, apply_chat_template_json, load_model_chat_template_from_file,
-        load_model_chat_template_from_str, normalize_generation_blocks, ApplyChatTemplateArgs,
-        ChatTemplateIdentity, Conversation, Role,
+        load_model_chat_template_from_str, normalize_conditional_keyword_arguments,
+        normalize_generation_blocks, ApplyChatTemplateArgs, ChatTemplateIdentity, Conversation,
+        ModelChatTemplate, Role, Tokenizer,
     };
 
     /// Returns the path to test fixtures. Uses TEST_MODEL_DIR env var if set,
@@ -1018,6 +1270,115 @@ mod tests {
         .unwrap();
 
         assert_eq!(kwargs, BTreeSet::from(["custom_flag".to_owned()]));
+    }
+
+    #[test]
+    fn conditional_keyword_arguments_are_parenthesized_for_minijinja() {
+        let template = concat!(
+            "plain namespace(name=value if condition else 'fallback')",
+            "{{ namespace(name=value if condition else 'fallback', keep=other) }}",
+            "{% set wrapped = namespace(name=(value if condition else 'fallback')) %}",
+        );
+        let normalized = normalize_conditional_keyword_arguments(template);
+
+        assert_eq!(
+            normalized,
+            concat!(
+                "plain namespace(name=value if condition else 'fallback')",
+                "{{ namespace(name=(value if condition else 'fallback'), keep=other) }}",
+                "{% set wrapped = namespace(name=(value if condition else 'fallback')) %}",
+            )
+        );
+        let mut env = Environment::new();
+        env.add_template_owned("conditional-kwarg", normalized)
+            .unwrap();
+    }
+
+    #[test]
+    fn released_muse_glimmer_template_renders_reasoning_and_atem_history() {
+        let template = include_str!(
+            "../../safemlx-lm/tests/fixtures/chat_templates/muse-glimmer-30b-97c77dff.jinja"
+        )
+        .strip_suffix('\n')
+        .expect("the fixture-only file terminator is documented");
+        let mut tokenizer = Tokenizer::from_tokenizer(tokenizers::Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::default(),
+        ));
+        tokenizer.set_template_kwargs(serde_json::Map::from_iter([(
+            "bos_token".into(),
+            serde_json::json!(""),
+        )]));
+        let kwargs =
+            serde_json::Map::from_iter([("reasoning_strength".into(), serde_json::json!("xhigh"))]);
+        let rendered = tokenizer
+            .apply_chat_template_json(
+                ModelChatTemplate::Single(template.into()),
+                [vec![
+                    serde_json::json!({"role": "user", "content": "probe"}),
+                ]],
+                Some(&[]),
+                "meta-models/Muse-Glimmer-30B",
+                true,
+                Some(&kwargs),
+            )
+            .unwrap()
+            .remove(0);
+        assert!(rendered.contains("Reasoning strength: xhigh."));
+        assert!(rendered.ends_with("<|start|>assistant"));
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "look up a value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}}
+                }
+            }
+        })];
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "probe"}),
+            serde_json::json!({
+                "role": "assistant",
+                "reasoning_content": "inspect",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": {"value": "probe-value"}
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "name": "lookup",
+                "tool_call_id": "call_1",
+                "content": "result"
+            }),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        let history = tokenizer
+            .apply_chat_template_json(
+                ModelChatTemplate::Single(template.into()),
+                [messages],
+                Some(&tools),
+                "meta-models/Muse-Glimmer-30B",
+                false,
+                None,
+            )
+            .unwrap()
+            .remove(0);
+        assert!(history.contains(concat!(
+            "<|start|>assistant to=self<|message|>inspect<|eom|>",
+            "<|start|>assistant to=lookup<|message|>",
+            "<atem:function_calls>\n<atem:invoke name=\"lookup\">\n",
+            "<atem:parameter name=\"value\">probe-value</atem:parameter>"
+        )));
+        assert!(history
+            .contains("<|start|>tool lookup<|message|><tool_output name=\"lookup\">\nresult"));
     }
 
     #[test]

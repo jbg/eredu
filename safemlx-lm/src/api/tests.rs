@@ -93,6 +93,8 @@ const DEEPSEEK_V31_TOOL_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/deepseek-v3.1-tools-ef1ab230.jinja");
 const INKLING_SMALL_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/inkling-small-8cc5877b.jinja");
+const MUSE_GLIMMER_FIXTURE_WITH_TERMINATOR: &str =
+    include_str!("../../tests/fixtures/chat_templates/muse-glimmer-30b-97c77dff.jinja");
 
 #[test]
 #[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
@@ -443,6 +445,30 @@ fn inkling_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
         6
     );
     ChatTokenizer::from_tokenizer(raw)
+}
+
+fn muse_atem_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+    let mut raw = Tokenizer::new(WordLevel::default());
+    raw.add_tokens(
+        (0..preceding_tokens)
+            .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_eq!(
+        raw.add_special_tokens(
+            ["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
+                .map(|token| AddedToken::from(token, true).normalized(false))
+        )
+        .unwrap(),
+        4
+    );
+    let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+    tokenizer.set_template_kwargs(serde_json::Map::from_iter([(
+        "bos_token".into(),
+        json!(""),
+    )]));
+    tokenizer
 }
 
 fn production_tool(name: &str) -> serde_json::Value {
@@ -3345,6 +3371,51 @@ fn gemma_recognition_accepts_source_refactors_and_splits_tool_capabilities() {
         .tool_input_rendering
         .is_supported());
     assert!(reasoning_only.tool_runtime_plan().is_none());
+}
+
+#[test]
+fn muse_atem_recognition_accepts_jinja_conditional_keyword_arguments() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let mut tokenizer = muse_atem_chat_tokenizer(80);
+    let template = MUSE_GLIMMER_FIXTURE_WITH_TERMINATOR
+        .strip_suffix('\n')
+        .expect("the fixture-only file terminator is documented");
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(template.into()),
+        "behavior-not-model-id-selects-muse",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            tools: vec![production_tool("lookup")],
+            tool_choice: ToolChoice::Required,
+            enable_thinking: Some(true),
+            add_generation_prompt: true,
+            extra_template_kwargs: serde_json::Map::from_iter([(
+                "reasoning_strength".into(),
+                json!("xhigh"),
+            )]),
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.format_profile_identity(),
+        Some("muse-glimmer.atem.v1")
+    );
+    assert!(prepared
+        .rendered_prompt()
+        .contains("Reasoning strength: xhigh."));
+    assert!(prepared.rendered_prompt().ends_with("<|start|>assistant"));
+    assert!(prepared.capabilities().reasoning_parser.is_supported());
+    assert!(prepared.capabilities().tool_input_rendering.is_supported());
+    assert!(prepared
+        .capabilities()
+        .mapping_tool_arguments
+        .is_supported());
+    assert!(prepared.tool_runtime_plan().is_some());
 }
 
 #[test]

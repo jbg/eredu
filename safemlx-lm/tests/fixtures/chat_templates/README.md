@@ -34,6 +34,7 @@ behavior; repository or model metadata is not a support key.
 | `deepseek-v3-tools-7e28c67d.jinja` | `sgl-project/sglang` | `7e28c67d19ddea8c74fca7b7e6dd2e3e3bec3c37` | `examples/chat_template/tool_chat_template_deepseekv3.jinja` |
 | `deepseek-v3.1-tools-ef1ab230.jinja` | `sgl-project/sglang` | `ef1ab2302ab25db09d3bd61da9bded1b71d0d3c8` | `examples/chat_template/tool_chat_template_deepseekv31.jinja` |
 | `inkling-small-8cc5877b.jinja` | `thinkingmachines/Inkling-Small` | `8cc5877b44d343f88b92086aa1fb72897950f06a` | `chat_template.jinja` |
+| `muse-glimmer-30b-97c77dff.jinja` | `meta-models/Muse-Glimmer-30B` | `97c77dff50b2797bcc558fa2d909761dbc575c59` | `chat_template.jinja` |
 
 The Hermes fixture body is also byte-identical to the named `tool_use`
 template in `NousResearch/Hermes-3-Llama-3.1-8B` revision
@@ -64,6 +65,12 @@ assistant turn. Runtime recognition verifies those rendered behaviors and the
 template's `reasoning_effort` control; neither the repository nor model type is
 a support key. Native tool constraints remain fail-closed even though the
 fixture retains the released tool-history rendering surface.
+
+The upstream Muse-Glimmer template has no final line feed. Its fixture carries
+one repository file terminator, which the rendering test removes explicitly.
+The template's unparenthesized conditional expression in a `namespace`
+keyword argument is valid Jinja syntax and is retained verbatim so the
+MiniJinja compatibility normalization remains covered.
 
 The Llama 3.1 fixture is byte-identical to
 `meta-llama/Llama-3.3-70B-Instruct` revision
