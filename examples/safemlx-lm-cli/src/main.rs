@@ -1358,7 +1358,10 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            eprintln!("weight_store: {:?}", report.weight_store());
+            eprintln!(
+                "weight_store: {}",
+                format_weight_store_diagnostics(report.weight_store())
+            );
             if let Some(materialization) = report.materialization() {
                 eprintln!(
                     "ordinary_weight_quantization: {} weights, {} tiles, {} source bytes -> {} packed bytes, {} peak working-set bytes",
@@ -1432,6 +1435,23 @@ fn format_bytes(bytes: usize) -> String {
         (bytes_float, "B")
     };
     format!("{value:.2} {unit} ({bytes} bytes)")
+}
+
+fn format_weight_store_diagnostics(
+    diagnostics: &safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics,
+) -> String {
+    format!(
+        "backend={:?}, mapping_hits={}, mapping_misses={}, evictions={}, currently_mapped_shards={}, touched_shards={}, physical_reads={}, physical_read_bytes={}, coalesced_group_hits={}",
+        diagnostics.backend,
+        diagnostics.mapping_hits,
+        diagnostics.mapping_misses,
+        diagnostics.evictions,
+        diagnostics.currently_mapped_shards,
+        diagnostics.touched_shard_paths.len(),
+        diagnostics.physical_reads,
+        diagnostics.physical_read_bytes,
+        diagnostics.coalesced_group_hits,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2118,13 +2138,13 @@ mod tests {
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
 
     use super::{
-        eval, execution_contexts, format_bytes, select_cached_gguf_from_revisions,
-        select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
-        should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
-        validate_args, validate_artifact_pair, write_semantic_event, Array, CachedGgufRole, Cli,
-        CliDevice, CliToolChoice, DeviceType, MtpDraftDevice, MtpExecutionStreams,
-        MtpSchedulerOptions, NativeToolSupport, ReasoningStream, ResolvedModel, SemanticEvent,
-        SemanticSupport, StopReason,
+        eval, execution_contexts, format_bytes, format_weight_store_diagnostics,
+        select_cached_gguf_from_revisions, select_cached_gguf_pair_from_revisions,
+        select_cached_gguf_path, select_revision, should_report_stop_reason, split_hf_model_spec,
+        stop_reason, use_semantic_generation, validate_args, validate_artifact_pair,
+        write_semantic_event, Array, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType,
+        MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport,
+        ReasoningStream, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -2877,5 +2897,29 @@ mod tests {
             format_bytes(3 * 1024 * 1024 * 1024),
             "3.00 GiB (3221225472 bytes)"
         );
+    }
+
+    #[test]
+    fn concise_weight_store_diagnostics_omit_shard_paths() {
+        let diagnostics = safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
+            backend: safemlx_lm::runtime::checkpoint::store::WeightStoreBackend::Safetensors,
+            mapping_hits: 17,
+            mapping_misses: 2,
+            evictions: 1,
+            currently_mapped_shards: 2,
+            touched_shard_paths: vec![
+                Path::new("/private/checkpoint/model-00001.safetensors").into(),
+                Path::new("/tmp/quantized-00000.safetensors").into(),
+            ],
+            physical_reads: 3,
+            physical_read_bytes: 4096,
+            coalesced_group_hits: 4,
+        };
+
+        let formatted = format_weight_store_diagnostics(&diagnostics);
+        assert!(formatted.contains("backend=Safetensors"));
+        assert!(formatted.contains("touched_shards=2"));
+        assert!(!formatted.contains("model-00001.safetensors"));
+        assert!(!formatted.contains("quantized-00000.safetensors"));
     }
 }
