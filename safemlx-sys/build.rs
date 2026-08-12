@@ -541,6 +541,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SAFEMLX_METALLIB_OUTPUT_DIR");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-changed=src/mlx-c");
+    println!("cargo:rerun-if-changed=vendor");
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     if is_docs_rs() {

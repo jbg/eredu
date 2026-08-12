@@ -4,8 +4,11 @@
 the MLX C API used by `safemlx`. Most applications should use the safe
 [`safemlx`](../safemlx/) crate instead.
 
-The crate vendors MLX C, fetches the compatible MLX source during the native
-build, and exposes checked-in bindings. Its native surface includes SafeMLX's
+The crate vendors MLX C, the compatible MLX source archive, and its common CPU
+and Metal build dependencies, and exposes checked-in bindings. CMake verifies
+each vendored archive's SHA-256 before extracting and patching it in the build
+directory. Source provenance is recorded in
+[`vendor/README.md`](vendor/README.md). The native surface includes SafeMLX's
 completion events, typed host-transfer storage, variable-count all-to-all, and
 packed-quantization support.
 

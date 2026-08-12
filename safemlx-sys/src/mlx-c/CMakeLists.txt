@@ -40,10 +40,32 @@ set(MLX_BUILD_GGUF OFF)
 if(MLX_C_USE_SYSTEM_MLX)
   find_package(MLX REQUIRED)
 else()
-  FetchContent_Declare(
-    mlx
-    GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG v0.32.0
+  # Keep common native builds offline and reproducible. These archives are
+  # shipped in the safemlx-sys crate; Cargo verifies the crate checksum and
+  # CMake verifies each upstream archive before extracting it. FetchContent's
+  # first-declaration-wins rule makes MLX use these local dependency archives.
+  function(safemlx_declare_vendored name filename sha256)
+    set(archive "${CMAKE_CURRENT_LIST_DIR}/../../vendor/${filename}")
+    if(NOT EXISTS "${archive}")
+      message(FATAL_ERROR "Vendored source archive is missing: ${archive}")
+    endif()
+    FetchContent_Declare(${name} URL "${archive}"
+                         URL_HASH "SHA256=${sha256}" ${ARGN})
+  endfunction()
+
+  safemlx_declare_vendored(
+    json json-v3.11.3.tar.xz
+    d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d)
+  safemlx_declare_vendored(
+    fmt fmt-12.1.0.tar.gz
+    ea7de4299689e12b6dddd392f9896f08fb0777ac7168897a244a6d6085043fea
+    EXCLUDE_FROM_ALL)
+  safemlx_declare_vendored(
+    metal_cpp metal-cpp-26.zip
+    4df3c078b9aadcb516212e9cb03004cbc5ce9a3e9c068fa3144d021db585a3a4)
+  safemlx_declare_vendored(
+    mlx mlx-v0.32.0.tar.gz
+    8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec
     PATCH_COMMAND
       ${CMAKE_COMMAND}
       -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-apple-mobile-platforms.patch
