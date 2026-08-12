@@ -36,6 +36,8 @@ const Q8_0_BLOCK_VALUES: i32 = 32;
 const Q8_0_BLOCK_BYTES: i32 = 34;
 const OUT_TILE: i32 = 4;
 const REDUCTION_TILE: i32 = 32;
+const Q4K_DECODE_ROWS_PER_SIMD: i32 = 2;
+const Q4K_DECODE_SIMD_GROUPS: i32 = 2;
 const NATIVE_BATCH_TILE: i32 = 8;
 // A single packed-weight decode is faster for the small tail just above the
 // normal tile. Wider per-thread accumulator arrays lose occupancy, so 11+
@@ -1112,6 +1114,21 @@ fn q4k_config(
         .with_output_arg([output_rows, output_cols], dtype)
 }
 
+fn q4k_decode_config(view: &NativeQuantizedTensor, dtype: Dtype) -> MetalKernelConfig {
+    let output_pairs = (view.rows + Q4K_DECODE_ROWS_PER_SIMD - 1) / Q4K_DECODE_ROWS_PER_SIMD;
+    let pair_grid = ((output_pairs + Q4K_DECODE_SIMD_GROUPS - 1) / Q4K_DECODE_SIMD_GROUPS)
+        * Q4K_DECODE_SIMD_GROUPS;
+    MetalKernelConfig::new()
+        .with_template_arg_dtype("T", dtype)
+        .with_template_arg_int("OUT_DIM", view.rows)
+        .with_template_arg_int("BLOCKS", view.columns / Q4_K_BLOCK_VALUES)
+        .with_template_arg_int("ROW_START", view.row_start)
+        .with_template_arg_int("ROWS_PER_SIMD", Q4K_DECODE_ROWS_PER_SIMD)
+        .with_grid([REDUCTION_TILE, pair_grid, 1])
+        .with_thread_group([REDUCTION_TILE, Q4K_DECODE_SIMD_GROUPS, 1])
+        .with_output_arg([1, view.rows], dtype)
+}
+
 fn validate_activation_dtype(input: &Array) -> Result<Dtype, Exception> {
     let dtype = input.dtype();
     if !matches!(dtype, Dtype::Float16 | Dtype::Float32 | Dtype::Bfloat16) {
@@ -1137,12 +1154,9 @@ fn q4k_linear_metal(
     let dtype = validate_activation_dtype(input)?;
     let outer = input.size() as i32 / view.columns;
     let flat = input.reshape(&[outer, view.columns], stream)?;
-    let out_grid = ((view.rows + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
     let batch_tile = native_batch_tile(outer);
-    let mut config = q4k_config(outer, view, outer, view.rows, dtype)
-        .with_template_arg_int("ROWS", outer)
-        .with_template_arg_int("BATCH_TILE", batch_tile);
     let output = if outer == 1 {
+        let config = q4k_decode_config(view, dtype);
         Q4K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
                 *cell.borrow_mut() = Some(q4k_linear_kernel()?);
@@ -1153,6 +1167,10 @@ fn q4k_linear_metal(
                 .apply_one_device([&flat, view.storage.bytes()], &config, stream)
         })?
     } else {
+        let out_grid = ((view.rows + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
+        let mut config = q4k_config(outer, view, outer, view.rows, dtype)
+            .with_template_arg_int("ROWS", outer)
+            .with_template_arg_int("BATCH_TILE", batch_tile);
         let batch_tiles = (outer + batch_tile - 1) / batch_tile;
         config = config.with_grid([REDUCTION_TILE, out_grid, batch_tiles]);
         Q4K_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
@@ -1800,18 +1818,84 @@ fn iq_grouped_kernel(
 }
 
 fn q4k_linear_kernel() -> Result<MetalKernel, Exception> {
+    // The lane decomposition and two-row SIMD reuse follow llama.cpp's Metal
+    // Q4_K matrix-vector kernel (MIT), adapted to MLX custom-kernel arguments,
+    // activation dtypes, row views, and output allocation.
     MetalKernel::new(
-        "native_q4k_linear",
+        "native_q4k_decode_2row",
         ["input", "weight"],
         ["out"],
-        [
-            Q4K_TILED_PROLOGUE,
-            "uint physical_row = ROW_START + out_col;",
-            "uint matrix_base = physical_row * BLOCKS * 144;",
-            Q4K_ACCUMULATE,
-            Q4K_TILED_EPILOGUE,
-        ]
-        .concat(),
+        concat!(
+            // Four eight-lane quads divide the packed blocks between the SIMD
+            // lanes. Each SIMD group computes two output rows, reusing the
+            // activation values and their sums across both rows.
+            "uint lane = thread_position_in_grid.x;",
+            "uint output_pair = thread_position_in_grid.y;",
+            "uint first_out = output_pair * ROWS_PER_SIMD;",
+            "uint ix = lane / 8u;",
+            "uint it = lane % 8u;",
+            "uint iq = it / 4u;",
+            "uint ir = it % 4u;",
+            "float sums[ROWS_PER_SIMD];",
+            "for (uint row = 0; row < ROWS_PER_SIMD; ++row) sums[row] = 0.0f;",
+            "for (uint block = ix; block < BLOCKS; block += 4u) {",
+            " uint input_base = block * 256u + 64u * iq + 8u * ir;",
+            " float yl[16];",
+            " float yh[16];",
+            " float4 sumy = float4(0.0f);",
+            " for (uint i = 0; i < 8u; ++i) {",
+            "  yl[i] = float(input[input_base + i]);",
+            "  yl[i + 8u] = float(input[input_base + 32u + i]);",
+            "  yh[i] = float(input[input_base + 128u + i]);",
+            "  yh[i + 8u] = float(input[input_base + 160u + i]);",
+            "  sumy[0] += yl[i];",
+            "  sumy[1] += yl[i + 8u];",
+            "  sumy[2] += yh[i];",
+            "  sumy[3] += yh[i + 8u];",
+            " }",
+            " for (uint row = 0; row < ROWS_PER_SIMD; ++row) {",
+            "  uint out_col = first_out + row;",
+            "  if (out_col >= OUT_DIM) continue;",
+            "  uint physical_row = ROW_START + out_col;",
+            "  uint base = (physical_row * BLOCKS + block) * 144u;",
+            "  const device ushort* sc = (const device ushort*)(weight + base + 4u) + iq;",
+            "  const device ushort* q1 = (const device ushort*)(weight + base + 16u) + 16u * iq + 4u * ir;",
+            "  const device ushort* q2 = q1 + 32u;",
+            "  ushort sc16[4];",
+            "  thread uchar* sc8 = (thread uchar*)sc16;",
+            "  sc16[0] = sc[0] & 0x3f3fu;",
+            "  sc16[1] = sc[2] & 0x3f3fu;",
+            "  sc16[2] = ((sc[4] >> 0u) & 0x0f0fu) | ((sc[0] & 0xc0c0u) >> 2u);",
+            "  sc16[3] = ((sc[4] >> 4u) & 0x0f0fu) | ((sc[2] & 0xc0c0u) >> 2u);",
+            "  float4 acc1 = float4(0.0f);",
+            "  float4 acc2 = float4(0.0f);",
+            "  for (uint i = 0; i < 4u; ++i) {",
+            "   acc1[0] += yl[2u*i] * float(q1[i] & 0x000fu);",
+            "   acc1[1] += yl[2u*i + 1u] * float(q1[i] & 0x0f00u);",
+            "   acc1[2] += yl[2u*i + 8u] * float(q1[i] & 0x00f0u);",
+            "   acc1[3] += yl[2u*i + 9u] * float(q1[i] & 0xf000u);",
+            "   acc2[0] += yh[2u*i] * float(q2[i] & 0x000fu);",
+            "   acc2[1] += yh[2u*i + 1u] * float(q2[i] & 0x0f00u);",
+            "   acc2[2] += yh[2u*i + 8u] * float(q2[i] & 0x00f0u);",
+            "   acc2[3] += yh[2u*i + 9u] * float(q2[i] & 0xf000u);",
+            "  }",
+            "  float d = float(*(const device half*)(weight + base));",
+            "  float dm = float(*(const device half*)(weight + base + 2u));",
+            "  sums[row] += d * (",
+            "      (acc1[0] + acc1[1] * (1.0f/256.0f)) * float(sc8[0]) +",
+            "      (acc1[2] + acc1[3] * (1.0f/256.0f)) * float(sc8[1]) * (1.0f/16.0f) +",
+            "      (acc2[0] + acc2[1] * (1.0f/256.0f)) * float(sc8[4]) +",
+            "      (acc2[2] + acc2[3] * (1.0f/256.0f)) * float(sc8[5]) * (1.0f/16.0f)) -",
+            "      dm * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +",
+            "            sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));",
+            " }",
+            "}",
+            "for (uint row = 0; row < ROWS_PER_SIMD; ++row) {",
+            " float total = simd_sum(sums[row]);",
+            " uint out_col = first_out + row;",
+            " if (lane == 0u && out_col < OUT_DIM) out[out_col] = T(total);",
+            "}"
+        ),
         Q4K_METAL_HEADER,
         true,
         false,
@@ -3144,6 +3228,17 @@ mod tests {
         let actual = native.linear(&input, true, &stream).unwrap();
         let dense = native.dequantize(&stream).unwrap();
         let expected = matmul(&input, dense.transpose(&stream).unwrap(), &stream).unwrap();
+        assert!(actual
+            .all_close(&expected, Some(2e-3), Some(2e-3), None, &stream)
+            .unwrap()
+            .item::<bool>(&stream));
+
+        // Decode uses the two-output-row SIMD kernel rather than the batched
+        // prefill path. Keep an odd output width here to cover its partial
+        // final row pair.
+        let decode_input = input.try_index_device(0, &stream).unwrap();
+        let actual = native.linear(&decode_input, true, &stream).unwrap();
+        let expected = matmul(&decode_input, dense.transpose(&stream).unwrap(), &stream).unwrap();
         assert!(actual
             .all_close(&expected, Some(2e-3), Some(2e-3), None, &stream)
             .unwrap()
