@@ -53,13 +53,16 @@ const Q8_LARGE_OUTPUT_ROWS: i32 = 65_536;
 thread_local! {
     static Q4K_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q4K_MATMUL_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_SELECTED_DOWN_REDUCE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5K_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5K_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q5K_MATMUL_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q6K_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q6K_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q6K_MATMUL_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
@@ -100,6 +103,25 @@ fn qk_small_batch_tile(rows: i32) -> i32 {
         10 => 5,
         _ => NATIVE_BATCH_TILE,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KQuantLinearKernelClass {
+    MatrixVector,
+    SmallBatch,
+    MatrixMatrix,
+}
+
+fn k_quant_linear_kernel_class(rows: i32) -> KQuantLinearKernelClass {
+    match rows {
+        1 => KQuantLinearKernelClass::MatrixVector,
+        2..=8 => KQuantLinearKernelClass::SmallBatch,
+        _ => KQuantLinearKernelClass::MatrixMatrix,
+    }
+}
+
+fn k_quant_supports_tiled_matmul(view: &NativeQuantizedTensor) -> bool {
+    view.matrix_count == 1 && view.row_start == 0 && view.rows == view.physical_rows
 }
 
 /// Physical quantization encoding retained from a checkpoint.
@@ -1261,34 +1283,35 @@ fn q4k_linear_metal(
     let dtype = validate_activation_dtype(input)?;
     let outer = input.size() as i32 / view.columns;
     let flat = input.reshape(&[outer, view.columns], stream)?;
-    let batch_tile = native_batch_tile(outer);
-    let output = if outer == 1 {
-        let config = q4k_decode_config(view, dtype);
-        Q4K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(q4k_linear_kernel()?);
-            }
-            cell.borrow()
-                .as_ref()
-                .expect("Q4_K linear kernel initialized")
-                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
-        })?
-    } else {
-        let out_grid = ((view.rows + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
-        let mut config = q4k_config(outer, view, outer, view.rows, dtype)
-            .with_template_arg_int("ROWS", outer)
-            .with_template_arg_int("BATCH_TILE", batch_tile);
-        let batch_tiles = (outer + batch_tile - 1) / batch_tile;
-        config = config.with_grid([REDUCTION_TILE, out_grid, batch_tiles]);
-        Q4K_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(q4k_batch_kernel()?);
-            }
-            cell.borrow()
-                .as_ref()
-                .expect("Q4_K batch kernel initialized")
-                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
-        })?
+    let output = match k_quant_linear_kernel_class(outer) {
+        KQuantLinearKernelClass::MatrixVector => {
+            let config = q4k_decode_config(view, dtype);
+            Q4K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
+                if cell.borrow().is_none() {
+                    *cell.borrow_mut() = Some(q4k_linear_kernel()?);
+                }
+                cell.borrow()
+                    .as_ref()
+                    .expect("Q4_K linear kernel initialized")
+                    .apply_one_device([&flat, view.storage.bytes()], &config, stream)
+            })?
+        }
+        KQuantLinearKernelClass::SmallBatch => {
+            q4k_batch_linear_metal(&flat, view, outer, dtype, stream)?
+        }
+        KQuantLinearKernelClass::MatrixMatrix if k_quant_supports_tiled_matmul(view) => {
+            qk_matmul_metal(
+                &flat,
+                view,
+                outer,
+                dtype,
+                NativeQuantizationFormat::GgufQ4K,
+                stream,
+            )?
+        }
+        KQuantLinearKernelClass::MatrixMatrix => {
+            q4k_batch_linear_metal(&flat, view, outer, dtype, stream)?
+        }
     };
     let mut shape = input.shape()[..input.ndim() - 1].to_vec();
     shape.push(view.rows);
@@ -1310,19 +1333,35 @@ fn q5k_linear_metal(
     let dtype = validate_activation_dtype(input)?;
     let outer = input.size() as i32 / view.columns;
     let flat = input.reshape(&[outer, view.columns], stream)?;
-    let output = if outer == 1 {
-        let config = qk_decode_config(view, dtype, 1);
-        Q5K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(q5k_linear_kernel()?);
-            }
-            cell.borrow()
-                .as_ref()
-                .expect("Q5_K linear kernel initialized")
-                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
-        })?
-    } else {
-        qk_batch_linear_metal(&flat, view, outer, dtype, true, stream)?
+    let output = match k_quant_linear_kernel_class(outer) {
+        KQuantLinearKernelClass::MatrixVector => {
+            let config = qk_decode_config(view, dtype, 1);
+            Q5K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
+                if cell.borrow().is_none() {
+                    *cell.borrow_mut() = Some(q5k_linear_kernel()?);
+                }
+                cell.borrow()
+                    .as_ref()
+                    .expect("Q5_K linear kernel initialized")
+                    .apply_one_device([&flat, view.storage.bytes()], &config, stream)
+            })?
+        }
+        KQuantLinearKernelClass::SmallBatch => {
+            qk_batch_linear_metal(&flat, view, outer, dtype, true, stream)?
+        }
+        KQuantLinearKernelClass::MatrixMatrix if k_quant_supports_tiled_matmul(view) => {
+            qk_matmul_metal(
+                &flat,
+                view,
+                outer,
+                dtype,
+                NativeQuantizationFormat::GgufQ5K,
+                stream,
+            )?
+        }
+        KQuantLinearKernelClass::MatrixMatrix => {
+            qk_batch_linear_metal(&flat, view, outer, dtype, true, stream)?
+        }
     };
     let mut shape = input.shape()[..input.ndim() - 1].to_vec();
     shape.push(view.rows);
@@ -1344,23 +1383,64 @@ fn q6k_linear_metal(
     let dtype = validate_activation_dtype(input)?;
     let outer = input.size() as i32 / view.columns;
     let flat = input.reshape(&[outer, view.columns], stream)?;
-    let output = if outer == 1 {
-        let config = qk_decode_config(view, dtype, 2);
-        Q6K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(q6k_linear_kernel()?);
-            }
-            cell.borrow()
-                .as_ref()
-                .expect("Q6_K linear kernel initialized")
-                .apply_one_device([&flat, view.storage.bytes()], &config, stream)
-        })?
-    } else {
-        qk_batch_linear_metal(&flat, view, outer, dtype, false, stream)?
+    let output = match k_quant_linear_kernel_class(outer) {
+        KQuantLinearKernelClass::MatrixVector => {
+            let config = qk_decode_config(view, dtype, 2);
+            Q6K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
+                if cell.borrow().is_none() {
+                    *cell.borrow_mut() = Some(q6k_linear_kernel()?);
+                }
+                cell.borrow()
+                    .as_ref()
+                    .expect("Q6_K linear kernel initialized")
+                    .apply_one_device([&flat, view.storage.bytes()], &config, stream)
+            })?
+        }
+        KQuantLinearKernelClass::SmallBatch => {
+            qk_batch_linear_metal(&flat, view, outer, dtype, false, stream)?
+        }
+        KQuantLinearKernelClass::MatrixMatrix if k_quant_supports_tiled_matmul(view) => {
+            qk_matmul_metal(
+                &flat,
+                view,
+                outer,
+                dtype,
+                NativeQuantizationFormat::GgufQ6K,
+                stream,
+            )?
+        }
+        KQuantLinearKernelClass::MatrixMatrix => {
+            qk_batch_linear_metal(&flat, view, outer, dtype, false, stream)?
+        }
     };
     let mut shape = input.shape()[..input.ndim() - 1].to_vec();
     shape.push(view.rows);
     output.reshape(&shape, stream)
+}
+
+fn q4k_batch_linear_metal(
+    flat: &Array,
+    view: &NativeQuantizedTensor,
+    rows: i32,
+    dtype: Dtype,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let out_grid = ((view.rows + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
+    let batch_tile = native_batch_tile(rows);
+    let batch_tiles = (rows + batch_tile - 1) / batch_tile;
+    let config = q4k_config(rows, view, rows, view.rows, dtype)
+        .with_template_arg_int("ROWS", rows)
+        .with_template_arg_int("BATCH_TILE", batch_tile)
+        .with_grid([REDUCTION_TILE, out_grid, batch_tiles]);
+    Q4K_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(q4k_batch_kernel()?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("Q4_K batch kernel initialized")
+            .apply_one_device([flat, view.storage.bytes()], &config, stream)
+    })
 }
 
 fn qk_batch_linear_metal(
@@ -1401,6 +1481,65 @@ fn qk_batch_linear_metal(
                 .expect("Q6_K batch kernel initialized")
                 .apply_one_device([flat, view.storage.bytes()], &config, stream)
         })
+    }
+}
+
+fn qk_matmul_metal(
+    flat: &Array,
+    view: &NativeQuantizedTensor,
+    rows: i32,
+    dtype: Dtype,
+    format: NativeQuantizationFormat,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    const OUTPUT_TILE: i32 = 64;
+    const ACTIVATION_TILE: i32 = 32;
+    const SIMD_GROUPS: i32 = 4;
+    debug_assert!(k_quant_supports_tiled_matmul(view));
+    let output_tiles = (view.rows + OUTPUT_TILE - 1) / OUTPUT_TILE;
+    let activation_tiles = (rows + ACTIVATION_TILE - 1) / ACTIVATION_TILE;
+    let config = MetalKernelConfig::new()
+        .with_template_arg_dtype("T", dtype)
+        .with_grid([REDUCTION_TILE, output_tiles * SIMD_GROUPS, activation_tiles])
+        .with_thread_group([REDUCTION_TILE, SIMD_GROUPS, 1])
+        .with_output_arg([rows, view.rows], dtype);
+    match format {
+        NativeQuantizationFormat::GgufQ4K => {
+            Q4K_MATMUL_KERNEL.with(|cell| -> Result<_, Exception> {
+                if cell.borrow().is_none() {
+                    *cell.borrow_mut() = Some(qk_matmul_kernel(format)?);
+                }
+                cell.borrow()
+                    .as_ref()
+                    .expect("Q4_K matrix-matrix kernel initialized")
+                    .apply_one_device([flat, view.storage.bytes()], &config, stream)
+            })
+        }
+        NativeQuantizationFormat::GgufQ5K => {
+            Q5K_MATMUL_KERNEL.with(|cell| -> Result<_, Exception> {
+                if cell.borrow().is_none() {
+                    *cell.borrow_mut() = Some(qk_matmul_kernel(format)?);
+                }
+                cell.borrow()
+                    .as_ref()
+                    .expect("Q5_K matrix-matrix kernel initialized")
+                    .apply_one_device([flat, view.storage.bytes()], &config, stream)
+            })
+        }
+        NativeQuantizationFormat::GgufQ6K => {
+            Q6K_MATMUL_KERNEL.with(|cell| -> Result<_, Exception> {
+                if cell.borrow().is_none() {
+                    *cell.borrow_mut() = Some(qk_matmul_kernel(format)?);
+                }
+                cell.borrow()
+                    .as_ref()
+                    .expect("Q6_K matrix-matrix kernel initialized")
+                    .apply_one_device([flat, view.storage.bytes()], &config, stream)
+            })
+        }
+        _ => Err(Exception::custom(format!(
+            "native tiled matrix-matrix does not support {format:?}"
+        ))),
     }
 }
 
@@ -2261,6 +2400,206 @@ fn q6k_linear_kernel() -> Result<MetalKernel, Exception> {
         true,
         false,
     )
+}
+
+fn qk_matmul_kernel(format: NativeQuantizationFormat) -> Result<MetalKernel, Exception> {
+    let name = match format {
+        NativeQuantizationFormat::GgufQ4K => "native_q4k_matmul_64x32",
+        NativeQuantizationFormat::GgufQ5K => "native_q5k_matmul_64x32",
+        NativeQuantizationFormat::GgufQ6K => "native_q6k_matmul_64x32",
+        _ => {
+            return Err(Exception::custom(format!(
+                "no tiled K-quant kernel for {format:?}"
+            )))
+        }
+    };
+    // This is the architecture-neutral 64x32 GGML Metal tile: four SIMD
+    // groups cooperatively dequantize a 64x32 weight tile and load a 32x32
+    // activation tile, then accumulate eight 8x8 output fragments per SIMD.
+    // The layout follows llama.cpp's MIT-licensed matrix-matrix kernel while
+    // retaining safemlx's raw-byte storage and activation/output dtypes.
+    MetalKernel::new(
+        name,
+        ["input", "weight"],
+        ["out"],
+        concat!(
+            "constexpr uint NR0 = 64u;",
+            "constexpr uint NR1 = 32u;",
+            "constexpr uint NK = 32u;",
+            "uint input_size = 1u;",
+            "for (int dim = 0; dim < input_ndim; ++dim) input_size *= uint(input_shape[dim]);",
+            "uint in_dim = uint(input_shape[input_ndim - 1]);",
+            "uint rows = input_size / in_dim;",
+            "uint blocks = in_dim / 256u;",
+            "uint weight_size = 1u;",
+            "for (int dim = 0; dim < weight_ndim; ++dim) weight_size *= uint(weight_shape[dim]);",
+            "uint out_dim = weight_size / (blocks * QK_BLOCK_BYTES);",
+            "uint tid = uint(thread_index_in_threadgroup);",
+            "uint simd = uint(simdgroup_index_in_threadgroup);",
+            "uint output_tile = uint(threadgroup_position_in_grid.y);",
+            "uint activation_tile = uint(threadgroup_position_in_grid.z);",
+            "uint r0 = output_tile * NR0;",
+            "uint r1 = activation_tile * NR1;",
+            "uint nr0 = min(NR0, out_dim - r0);",
+            "uint nr1 = min(NR1, rows - r1);",
+            "uint il0 = tid & 1u;",
+            "uint lr0 = min(tid >> 1u, nr0 - 1u);",
+            "uint lr1 = min(tid >> 2u, nr1 - 1u);",
+            "uint iy = 8u * (tid & 3u);",
+            "threadgroup half sa[2048];",
+            "threadgroup half sb[1024];",
+            "simdgroup_half8x8 ma[4];",
+            "simdgroup_half8x8 mb[2];",
+            "simdgroup_float8x8 mc[8];",
+            "for (uint i = 0u; i < 8u; ++i) {",
+            " mc[i].thread_elements()[0] = 0.0f;",
+            " mc[i].thread_elements()[1] = 0.0f;",
+            "}",
+            "uint row_base = (r0 + lr0) * blocks * QK_BLOCK_BYTES;",
+            "for (uint loop_k = 0u; loop_k < in_dim; loop_k += NK) {",
+            " half values[16];",
+            " qk_dequantize_16(weight, row_base, (loop_k >> 4u) + il0, values);",
+            " threadgroup_barrier(mem_flags::mem_threadgroup);",
+            " for (uint i = 0u; i < 16u; ++i) {",
+            "  uint sx = 2u * il0 + i / 8u;",
+            "  uint sy = (tid >> 1u) / 8u;",
+            "  uint lx = (tid >> 1u) & 7u;",
+            "  uint ly = i & 7u;",
+            "  uint ib = 8u * sx + sy;",
+            "  sa[64u * ib + 8u * ly + lx] = values[i];",
+            " }",
+            " uint input_base = (r1 + lr1) * in_dim + loop_k + iy;",
+            " for (uint i = 0u; i < 8u; ++i) {",
+            "  uint sx = tid & 3u;",
+            "  uint sy = (tid >> 2u) / 8u;",
+            "  uint ly = (tid >> 2u) & 7u;",
+            "  uint ib = 4u * sx + sy;",
+            "  sb[64u * ib + 8u * ly + i] = half(input[input_base + i]);",
+            " }",
+            " threadgroup_barrier(mem_flags::mem_threadgroup);",
+            " threadgroup const half* lsma = sa + 4u * 64u * (simd & 1u);",
+            " threadgroup const half* lsmb = sb + 2u * 64u * (simd >> 1u);",
+            " for (uint ik = 0u; ik < 4u; ++ik) {",
+            "  simdgroup_barrier(mem_flags::mem_none);",
+            "  for (uint i = 0u; i < 4u; ++i) simdgroup_load(ma[i], lsma + 64u * i, 8u, 0u, false);",
+            "  simdgroup_barrier(mem_flags::mem_none);",
+            "  for (uint i = 0u; i < 2u; ++i) simdgroup_load(mb[i], lsmb + 64u * i, 8u, 0u, false);",
+            "  simdgroup_barrier(mem_flags::mem_none);",
+            "  for (uint i = 0u; i < 8u; ++i)",
+            "   simdgroup_multiply_accumulate(mc[i], mb[i / 4u], ma[i & 3u], mc[i]);",
+            "  lsma += 8u * 64u;",
+            "  lsmb += 4u * 64u;",
+            " }",
+            "}",
+            "uint fragment_r0 = 32u * (simd & 1u);",
+            "uint fragment_r1 = 16u * (simd >> 1u);",
+            " threadgroup float result[2048];",
+            " threadgroup float* tile = result + fragment_r0 + fragment_r1 * NR0;",
+            " for (uint i = 0u; i < 8u; ++i)",
+            "  simdgroup_store(mc[i], tile + 8u * (i & 3u) + 8u * NR0 * (i / 4u), NR0, 0u, false);",
+            " threadgroup_barrier(mem_flags::mem_threadgroup);",
+            " if (simd == 0u) {",
+            "  for (uint index = tid; index < nr0 * nr1; index += 32u) {",
+            "   uint row = index / nr0;",
+            "   uint col = index - row * nr0;",
+            "   out[(r1 + row) * out_dim + r0 + col] = T(result[row * NR0 + col]);",
+            "  }",
+            "}"
+        ),
+        qk_matmul_header(format)?,
+        true,
+        false,
+    )
+}
+
+fn qk_matmul_header(format: NativeQuantizationFormat) -> Result<String, Exception> {
+    let (block_bytes, body) = match format {
+        NativeQuantizationFormat::GgufQ4K => (
+            Q4_K_BLOCK_BYTES,
+            concat!(
+                "uint group = chunk_in_block >> 1u;",
+                "uint scale; uint minv;",
+                "if (group < 4u) {",
+                " scale = uint(weight[base + 4u + group]) & 63u;",
+                " minv = uint(weight[base + 8u + group]) & 63u;",
+                "} else {",
+                " scale = (uint(weight[base + 8u + group]) & 15u) | ((uint(weight[base + group]) >> 6u) << 4u);",
+                " minv = (uint(weight[base + 8u + group]) >> 4u) | ((uint(weight[base + 4u + group]) >> 6u) << 4u);",
+                "}",
+                "float d = qk_half(weight, base); float dm = qk_half(weight, base + 2u);",
+                "for (uint j = 0u; j < 16u; ++j) {",
+                " uint i = (chunk_in_block * 16u + j) & 31u;",
+                " uint packed = uint(weight[base + 16u + (group >> 1u) * 32u + i]);",
+                " uint q = (group & 1u) == 0u ? (packed & 15u) : (packed >> 4u);",
+                " values[j] = half(d * float(scale) * float(q) - dm * float(minv));",
+                "}"
+            ),
+        ),
+        NativeQuantizationFormat::GgufQ5K => (
+            Q5_K_BLOCK_BYTES,
+            concat!(
+                "uint group = chunk_in_block >> 1u;",
+                "uint scale; uint minv;",
+                "if (group < 4u) {",
+                " scale = uint(weight[base + 4u + group]) & 63u;",
+                " minv = uint(weight[base + 8u + group]) & 63u;",
+                "} else {",
+                " scale = (uint(weight[base + 8u + group]) & 15u) | ((uint(weight[base + group]) >> 6u) << 4u);",
+                " minv = (uint(weight[base + 8u + group]) >> 4u) | ((uint(weight[base + 4u + group]) >> 6u) << 4u);",
+                "}",
+                "float d = qk_half(weight, base); float dm = qk_half(weight, base + 2u);",
+                "for (uint j = 0u; j < 16u; ++j) {",
+                " uint i = (chunk_in_block * 16u + j) & 31u;",
+                " uint packed = uint(weight[base + 48u + (group >> 1u) * 32u + i]);",
+                " uint q = (group & 1u) == 0u ? (packed & 15u) : (packed >> 4u);",
+                " q |= ((uint(weight[base + 16u + i]) >> group) & 1u) << 4u;",
+                " values[j] = half(d * float(scale) * float(q) - dm * float(minv));",
+                "}"
+            ),
+        ),
+        NativeQuantizationFormat::GgufQ6K => (
+            Q6_K_BLOCK_BYTES,
+            concat!(
+                "uint section = chunk_in_block >> 3u;",
+                "uint scale_group = chunk_in_block & 7u;",
+                "int scale = int(as_type<char>(weight[base + 192u + section * 8u + scale_group]));",
+                "float d = qk_half(weight, base + 208u);",
+                "for (uint j = 0u; j < 16u; ++j) {",
+                " uint x = chunk_in_block * 16u + j; uint z = x & 127u;",
+                " uint quarter = z >> 5u; uint i = z & 31u;",
+                " uint ql = base + section * 64u; uint high = uint(weight[base + 128u + section * 32u + i]);",
+                " uint q;",
+                " if (quarter == 0u) q = (uint(weight[ql + i]) & 15u) | ((high & 3u) << 4u);",
+                " else if (quarter == 1u) q = (uint(weight[ql + 32u + i]) & 15u) | (((high >> 2u) & 3u) << 4u);",
+                " else if (quarter == 2u) q = (uint(weight[ql + i]) >> 4u) | (((high >> 4u) & 3u) << 4u);",
+                " else q = (uint(weight[ql + 32u + i]) >> 4u) | (((high >> 6u) & 3u) << 4u);",
+                " values[j] = half(d * float(scale) * float(int(q) - 32));",
+                "}"
+            ),
+        ),
+        _ => {
+            return Err(Exception::custom(format!(
+                "no tiled K-quant dequantizer for {format:?}"
+            )))
+        }
+    };
+    Ok(format!(
+        concat!(
+            "#include <metal_simdgroup_matrix>\n",
+            "constant uint QK_BLOCK_BYTES = {block_bytes}u;\n",
+            "float qk_half(const device uint8_t* weight, uint offset) {{",
+            " uint bits = uint(weight[offset]) | (uint(weight[offset + 1u]) << 8u);",
+            " return float(as_type<half>(ushort(bits)));",
+            "}}\n",
+            "void qk_dequantize_16(const device uint8_t* weight, uint row_base, uint chunk, thread half* values) {{",
+            " uint block = chunk >> 4u; uint chunk_in_block = chunk & 15u;",
+            " uint base = row_base + block * QK_BLOCK_BYTES;",
+            " {body}",
+            "}}\n"
+        ),
+        block_bytes = block_bytes,
+        body = body,
+    ))
 }
 
 fn q5k_batch_kernel() -> Result<MetalKernel, Exception> {
@@ -3208,6 +3547,26 @@ mod tests {
     use super::*;
     use crate::ops::indexing::TryIndexOp;
 
+    #[test]
+    fn k_quant_linear_dispatch_uses_shape_specific_kernels() {
+        assert_eq!(
+            k_quant_linear_kernel_class(1),
+            KQuantLinearKernelClass::MatrixVector
+        );
+        for rows in 2..=8 {
+            assert_eq!(
+                k_quant_linear_kernel_class(rows),
+                KQuantLinearKernelClass::SmallBatch
+            );
+        }
+        for rows in [9, 16, 32, 33] {
+            assert_eq!(
+                k_quant_linear_kernel_class(rows),
+                KQuantLinearKernelClass::MatrixMatrix
+            );
+        }
+    }
+
     fn unhex(value: &str) -> Vec<u8> {
         value
             .as_bytes()
@@ -3759,18 +4118,18 @@ mod tests {
             NativeQuantizationFormat::GgufQ6K,
         ] {
             let (_, block_bytes) = format.block_geometry();
-            let raw = repeated_qk_blocks(block_bytes as usize, 5 * 2);
+            let raw = repeated_qk_blocks(block_bytes as usize, 67 * 2);
             let native = match format {
                 NativeQuantizationFormat::GgufQ5K => {
-                    NativeQuantizedTensor::from_q5k_bytes(&raw, &[5, 512], &stream).unwrap()
+                    NativeQuantizedTensor::from_q5k_bytes(&raw, &[67, 512], &stream).unwrap()
                 }
                 NativeQuantizationFormat::GgufQ6K => {
-                    NativeQuantizedTensor::from_q6k_bytes(&raw, &[5, 512], &stream).unwrap()
+                    NativeQuantizedTensor::from_q6k_bytes(&raw, &[67, 512], &stream).unwrap()
                 }
                 _ => unreachable!(),
             };
             let dense = native.dequantize(&stream).unwrap();
-            for batch_rows in [1, 3, 6, 8, 9, 10] {
+            for batch_rows in [1, 3, 8, 9, 15, 16, 17, 32, 33] {
                 let input = Array::from_slice(
                     &(0..batch_rows * 512)
                         .map(|index| (index as f32 % 37.0 - 18.0) / 19.0)
@@ -3783,13 +4142,39 @@ mod tests {
                 let expected = matmul(&input, dense.transpose(&stream).unwrap(), &stream).unwrap();
                 assert!(
                     actual
-                        .all_close(&expected, Some(3e-3), Some(3e-3), None, &stream)
+                        .all_close(
+                            &expected,
+                            Some(if batch_rows > 8 { 3e-2 } else { 3e-3 }),
+                            Some(if batch_rows > 8 { 1.0 } else { 3e-3 }),
+                            None,
+                            &stream,
+                        )
                         .unwrap()
                         .item::<bool>(&stream),
                     "{format:?} batch-{batch_rows} linear mismatch"
                 );
             }
-            let ids = Array::from_slice(&[4u32, 1, 4], &[3])
+            for dtype in [Dtype::Float16, Dtype::Bfloat16] {
+                let input = Array::from_slice(
+                    &(0..32 * 512)
+                        .map(|index| (index as f32 % 37.0 - 18.0) / 19.0)
+                        .collect::<Vec<_>>(),
+                    &[32, 512],
+                )
+                .as_dtype(dtype, &stream)
+                .unwrap();
+                let dense = dense.as_dtype(dtype, &stream).unwrap();
+                let actual = native.linear(&input, true, &stream).unwrap();
+                let expected = matmul(&input, dense.transpose(&stream).unwrap(), &stream).unwrap();
+                assert!(
+                    actual
+                        .all_close(&expected, Some(4e-2), Some(2.0), None, &stream)
+                        .unwrap()
+                        .item::<bool>(&stream),
+                    "{format:?} {dtype:?} tiled linear mismatch"
+                );
+            }
+            let ids = Array::from_slice(&[66u32, 1, 4], &[3])
                 .copy(&stream)
                 .unwrap();
             let actual = native.embedding(&ids, &stream).unwrap();
@@ -3808,8 +4193,8 @@ mod tests {
     #[ignore = "requires an accessible Metal device"]
     fn q4k_metal_linear_prefill_embedding_and_partial_tiles_match_float() {
         let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
-        let raw = repeated_blocks(5 * 2);
-        let native = NativeQuantizedTensor::from_q4k_bytes(&raw, &[5, 512], &stream).unwrap();
+        let raw = repeated_blocks(67 * 2);
+        let native = NativeQuantizedTensor::from_q4k_bytes(&raw, &[67, 512], &stream).unwrap();
         let input = Array::from_slice(
             &(0..3 * 512)
                 .map(|index| (index as f32 % 37.0 - 18.0) / 19.0)
@@ -3826,6 +4211,47 @@ mod tests {
             .unwrap()
             .item::<bool>(&stream));
 
+        for batch_rows in [8, 9, 15, 16, 17, 32, 33] {
+            let tiled_input = Array::from_slice(
+                &(0..batch_rows * 512)
+                    .map(|index| (index as f32 % 37.0 - 18.0) / 19.0)
+                    .collect::<Vec<_>>(),
+                &[batch_rows, 512],
+            )
+            .copy(&stream)
+            .unwrap();
+            let actual = native.linear(&tiled_input, true, &stream).unwrap();
+            let expected =
+                matmul(&tiled_input, dense.transpose(&stream).unwrap(), &stream).unwrap();
+            assert!(
+                actual
+                    .all_close(&expected, Some(3e-2), Some(1.0), None, &stream)
+                    .unwrap()
+                    .item::<bool>(&stream),
+                "Q4_K batch-{batch_rows} linear mismatch"
+            );
+        }
+        for dtype in [Dtype::Float16, Dtype::Bfloat16] {
+            let input = Array::from_slice(
+                &(0..32 * 512)
+                    .map(|index| (index as f32 % 37.0 - 18.0) / 19.0)
+                    .collect::<Vec<_>>(),
+                &[32, 512],
+            )
+            .as_dtype(dtype, &stream)
+            .unwrap();
+            let dense = dense.as_dtype(dtype, &stream).unwrap();
+            let actual = native.linear(&input, true, &stream).unwrap();
+            let expected = matmul(&input, dense.transpose(&stream).unwrap(), &stream).unwrap();
+            assert!(
+                actual
+                    .all_close(&expected, Some(4e-2), Some(2.0), None, &stream)
+                    .unwrap()
+                    .item::<bool>(&stream),
+                "Q4_K {dtype:?} tiled linear mismatch"
+            );
+        }
+
         // Decode uses the two-output-row SIMD kernel rather than the batched
         // prefill path. Keep an odd output width here to cover its partial
         // final row pair.
@@ -3838,8 +4264,8 @@ mod tests {
             .item::<bool>(&stream));
 
         let expert_bank =
-            NativeQuantizedTensor::from_q4k_bytes(&raw, &[5, 1, 512], &stream).unwrap();
-        let group_ids = Array::from_slice(&[4i32, 1, 4], &[3])
+            NativeQuantizedTensor::from_q4k_bytes(&raw, &[67, 1, 512], &stream).unwrap();
+        let group_ids = Array::from_slice(&[66i32, 1, 4], &[3])
             .copy(&stream)
             .unwrap();
         let actual = native_grouped_linear(&input, &expert_bank, &group_ids, &stream).unwrap();
@@ -3861,7 +4287,7 @@ mod tests {
             .unwrap()
             .item::<bool>(&stream));
 
-        let ids = Array::from_slice(&[4u32, 1, 4], &[3])
+        let ids = Array::from_slice(&[66u32, 1, 4], &[3])
             .copy(&stream)
             .unwrap();
         let actual = native.embedding(&ids, &stream).unwrap();
