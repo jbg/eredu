@@ -234,18 +234,9 @@ impl LayerwiseDecoder {
                 .forward_with_observer(input, cache, stream, &mut observer)
         }
         .map_err(|error| Exception::custom(error.to_string()))?;
-        let mut states = Vec::with_capacity(target_layers.len());
-        for &layer in target_layers {
-            let state = captured.remove(&layer).ok_or_else(|| {
-                Exception::custom(format!(
-                    "Muse-Glimmer DFlash did not capture target layer {layer}"
-                ))
-            })?;
-            states.push(weightless_rms(&state, self.args().rms_norm_eps, stream)?);
-        }
         Ok(DFlashTargetOutput {
             logits,
-            states: concatenate_axis(&states, -1, stream)?,
+            states: concatenate_dflash_target_states(&mut captured, target_layers, stream)?,
             device_time,
         })
     }
@@ -800,15 +791,27 @@ impl LayerwiseDecoder {
     }
 }
 
-/// Logits plus the five normalized target-layer states consumed by DFlash.
+/// Logits plus the five raw target-layer residual states consumed by DFlash.
 pub(crate) struct DFlashTargetOutput {
     pub(crate) logits: Array,
     pub(crate) states: Array,
     pub(crate) device_time: Duration,
 }
 
-fn weightless_rms(value: &Array, eps: f32, stream: &Stream) -> Result<Array, Exception> {
-    resident::rms_norm_without_scale(value, eps, stream)
+fn concatenate_dflash_target_states(
+    captured: &mut BTreeMap<usize, Array>,
+    target_layers: &[usize],
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let mut states = Vec::with_capacity(target_layers.len());
+    for &layer in target_layers {
+        states.push(captured.remove(&layer).ok_or_else(|| {
+            Exception::custom(format!(
+                "Muse-Glimmer DFlash did not capture target layer {layer}"
+            ))
+        })?);
+    }
+    concatenate_axis(&states, -1, stream)
 }
 
 fn forward_sparse_with_executor<C, F>(
@@ -3787,6 +3790,24 @@ mod tests {
             .insert(format!("model.{VISION_PATCH_WEIGHT}"), patch_weight)
             .is_some());
         MemoryWeightStore::new(arrays).unwrap()
+    }
+
+    #[test]
+    fn dflash_fuses_raw_target_residuals_in_configured_order() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let first = Array::from_slice(&[3.0_f32, 4.0], &[1, 1, 2]);
+        let second = Array::from_slice(&[12.0_f32, 5.0], &[1, 1, 2]);
+        let mut captured = BTreeMap::from([(1, first), (13, second)]);
+
+        let actual = concatenate_dflash_target_states(&mut captured, &[13, 1], stream).unwrap();
+        let expected = Array::from_slice(&[12.0_f32, 5.0, 3.0, 4.0], &[1, 1, 4]);
+
+        assert!(actual
+            .all_close(&expected, Some(0.0), Some(0.0), None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+        assert!(captured.is_empty());
     }
 
     #[test]

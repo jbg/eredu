@@ -705,7 +705,7 @@ impl MuseGlimmerDFlash {
         Ok((cache, timing))
     }
 
-    /// Runs the anchor-plus-mask block and returns the fifteen proposal states.
+    /// Runs an anchor-plus-mask block up to the released maximum width.
     pub(crate) fn proposal_states(
         &mut self,
         noise_embeds: &Array,
@@ -714,7 +714,16 @@ impl MuseGlimmerDFlash {
         component_timing: bool,
         stream: &Stream,
     ) -> Result<(Array, Option<TimedEvaluation>), Exception> {
-        if noise_embeds.shape() != [1, self.config.block_size as i32, self.config.hidden_size]
+        if noise_embeds.ndim() != 3 {
+            return Err(Exception::custom(
+                "invalid Muse-Glimmer DFlash block/context geometry",
+            ));
+        }
+        let runtime_block_size = noise_embeds.dim(1);
+        if noise_embeds.dim(0) != 1
+            || runtime_block_size < 2
+            || runtime_block_size > self.config.block_size as i32
+            || noise_embeds.dim(2) != self.config.hidden_size
             || context.end != absolute_context_end
             || context.encoded.ndim() != 3
             || context.encoded.dim(0) != 1
@@ -746,7 +755,7 @@ impl MuseGlimmerDFlash {
             )?;
         }
         let hidden = self.norm.forward(&hidden, stream)?;
-        let states = hidden.try_index_device((.., 1..self.config.block_size as i32, ..), stream)?;
+        let states = hidden.try_index_device((.., 1..runtime_block_size, ..), stream)?;
         let timing = component_timing
             .then(|| async_eval_timed([&states], stream))
             .transpose()?;

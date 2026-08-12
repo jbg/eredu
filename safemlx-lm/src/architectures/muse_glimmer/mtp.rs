@@ -224,10 +224,16 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             self.draft_embedding = Some(embedding);
             self.draft_head = Some(head);
         }
-        let block_size = self.assistant.config.block_size;
-        let mut ids = Vec::with_capacity(block_size);
-        ids.push(last_token);
-        ids.resize(block_size, self.assistant.config.mask_token_id);
+        // DFlash was trained with a maximum block size, but inference uses the
+        // requested anchor-plus-proposal width. Attention within the block is
+        // bidirectional, so padding a short request to the maximum changes the
+        // proposal distributions rather than merely doing redundant work.
+        let ids = dflash_block_token_ids(
+            last_token,
+            self.assistant.config.mask_token_id,
+            proposal_capacity,
+        );
+        let block_size = ids.len();
         let block_size = i32::try_from(block_size)
             .map_err(|_| Exception::custom("Muse-Glimmer DFlash block size exceeds i32"))?;
         let ids = Array::from_slice(&ids, &[1, block_size]);
@@ -261,13 +267,6 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
         )?;
         self.component_timings
             .push_draft_assistant(assistant_timing);
-        // DFlash block attention is bidirectional, so removing unused mask
-        // positions changes the retained proposal distributions. Preserve the
-        // released 16-position block and trim only before the expensive raw
-        // vocabulary head.
-        let proposal_end = i32::try_from(proposal_capacity)
-            .map_err(|_| Exception::custom("Muse-Glimmer DFlash proposal capacity exceeds i32"))?;
-        let states = states.try_index_device((.., ..proposal_end, ..), streams.draft())?;
         let logits = self
             .draft_head
             .as_mut()
@@ -291,6 +290,25 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             draft_cache,
             cache_len: state.cache_len,
         })
+    }
+}
+
+fn dflash_block_token_ids(anchor: u32, mask_token: u32, proposal_capacity: usize) -> Vec<u32> {
+    let mut ids = Vec::with_capacity(proposal_capacity + 1);
+    ids.push(anchor);
+    ids.resize(proposal_capacity + 1, mask_token);
+    ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dflash_block_token_ids;
+
+    #[test]
+    fn dflash_runtime_block_contains_only_requested_proposal_positions() {
+        assert_eq!(dflash_block_token_ids(7, 99, 1), [7, 99]);
+        assert_eq!(dflash_block_token_ids(7, 99, 3), [7, 99, 99, 99]);
+        assert_eq!(dflash_block_token_ids(7, 99, 15).len(), 16);
     }
 }
 
