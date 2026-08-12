@@ -40,6 +40,7 @@ use crate::{
 };
 
 const BOUNDED_QUANTIZATION_TILE_BUFFERS: usize = 2;
+const BOUNDED_QUANTIZATION_MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One dense semantic weight that will be replaced by its packed representation.
 ///
@@ -286,7 +287,9 @@ impl BoundedQuantizedWeightStore {
             ..BoundedQuantizationReport::default()
         };
         let mut output_shards = Vec::with_capacity(plan.targets.len());
+        let mut allocator_cache = BoundedAllocatorCache::new(plan.max_working_set_bytes);
         let mut pending_tiles = VecDeque::with_capacity(BOUNDED_QUANTIZATION_TILE_BUFFERS);
+        allocator_cache.begin()?;
 
         for (ordinal, target) in plan.targets.iter().enumerate() {
             let shard_name = format!("quantized-{ordinal:05}.safetensors");
@@ -298,6 +301,7 @@ impl BoundedQuantizedWeightStore {
                 &directory.path().join(&shard_name),
                 &mut output_shards,
                 &mut pending_tiles,
+                &mut allocator_cache,
                 &mut report,
             )?;
             for name in output_names_for(target, plan.quantization)? {
@@ -305,9 +309,10 @@ impl BoundedQuantizedWeightStore {
             }
         }
         while !pending_tiles.is_empty() {
-            write_oldest_tile(&mut pending_tiles, &mut output_shards)?;
+            write_oldest_tile(&mut pending_tiles, &mut output_shards, &mut allocator_cache)?;
         }
         debug_assert!(output_shards.iter().all(|shard| shard.file.is_none()));
+        allocator_cache.finish()?;
 
         write_index(directory.path(), &index, report.output_bytes)?;
         let transformed = SafetensorsWeightStore::open_with_max_mapped_shards(
@@ -439,6 +444,94 @@ struct OutputShard {
     sealed: bool,
 }
 
+struct BoundedAllocatorCache {
+    working_set_limit_bytes: u64,
+    retained_limit_bytes: u64,
+    finished: bool,
+}
+
+impl BoundedAllocatorCache {
+    fn new(working_set_limit_bytes: u64) -> Self {
+        Self {
+            working_set_limit_bytes,
+            retained_limit_bytes: (working_set_limit_bytes / 4)
+                .min(BOUNDED_QUANTIZATION_MAX_CACHE_BYTES),
+            finished: false,
+        }
+    }
+
+    fn begin(&mut self) -> Result<(), Error> {
+        memory::clear_cache()?;
+        Ok(())
+    }
+
+    fn prepare_submission(
+        &mut self,
+        queued_working_set_bytes: u64,
+        incoming_tile_bytes: u64,
+    ) -> Result<(), Error> {
+        let planned_bytes = queued_working_set_bytes
+            .checked_add(incoming_tile_bytes)
+            .ok_or_else(|| quantization_error("conversion submission working-set overflow"))?;
+        if planned_bytes > self.working_set_limit_bytes {
+            return Err(quantization_error(format!(
+                "conversion submission requires {planned_bytes} working-set bytes, but the plan permits {}",
+                self.working_set_limit_bytes
+            )));
+        }
+        self.clear_if_needed(planned_bytes)
+    }
+
+    fn tile_completed(&mut self, queued_working_set_bytes: u64) -> Result<(), Error> {
+        if queued_working_set_bytes > self.working_set_limit_bytes {
+            return Err(quantization_error(format!(
+                "queued conversion tiles require {queued_working_set_bytes} working-set bytes, but the plan permits {}",
+                self.working_set_limit_bytes
+            )));
+        }
+        self.clear_if_needed(queued_working_set_bytes)
+    }
+
+    fn clear_if_needed(&mut self, active_working_set_bytes: u64) -> Result<(), Error> {
+        let cached_bytes = u64::try_from(memory::cache_memory()?)
+            .map_err(|_| quantization_error("allocator-cache bytes are not representable"))?;
+        let available_cache_bytes = self
+            .working_set_limit_bytes
+            .checked_sub(active_working_set_bytes)
+            .expect("validated active conversion working set");
+        if allocator_cache_requires_clear(
+            cached_bytes,
+            self.retained_limit_bytes,
+            available_cache_bytes,
+        ) {
+            memory::clear_cache()?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), Error> {
+        memory::clear_cache()?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+const fn allocator_cache_requires_clear(
+    cached_bytes: u64,
+    retained_limit_bytes: u64,
+    available_cache_bytes: u64,
+) -> bool {
+    cached_bytes > retained_limit_bytes || cached_bytes > available_cache_bytes
+}
+
+impl Drop for BoundedAllocatorCache {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = memory::clear_cache();
+        }
+    }
+}
+
 impl OutputShard {
     fn tile_submitted(&mut self) {
         debug_assert!(!self.sealed);
@@ -482,6 +575,7 @@ fn transform_target(
     path: &Path,
     output_shards: &mut Vec<OutputShard>,
     pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
+    allocator_cache: &mut BoundedAllocatorCache,
     report: &mut BoundedQuantizationReport,
 ) -> Result<(), Error> {
     let metadata = target.source.infer(source)?;
@@ -569,7 +663,7 @@ fn transform_target(
     };
     if tile_buffers == 1 {
         while !pending_tiles.is_empty() {
-            write_oldest_tile(pending_tiles, output_shards)?;
+            write_oldest_tile(pending_tiles, output_shards, allocator_cache)?;
         }
     }
     let tile_budget = plan.max_working_set_bytes / tile_buffers as u64;
@@ -637,6 +731,8 @@ fn transform_target(
                     tile_rows, target.weight_name, tile_peak, tile_budget
                 )));
             }
+            allocator_cache
+                .prepare_submission(queued_working_set_bytes(pending_tiles)?, tile_peak)?;
 
             let tile_stream = &tile_streams[report.source_tiles % tile_buffers];
             let pending = tile_recipe.prepare_borrowed_materialization(source, tile_stream)?;
@@ -681,11 +777,7 @@ fn transform_target(
                 .source_bytes_read
                 .checked_add(tile_metadata.byte_len())
                 .ok_or_else(|| quantization_error("source-read telemetry overflow"))?;
-            let queued_working_set = pending_tiles.iter().try_fold(0u64, |total, tile| {
-                total
-                    .checked_add(tile.planned_working_set_bytes)
-                    .ok_or_else(|| quantization_error("double-buffered working-set overflow"))
-            })?;
+            let queued_working_set = queued_working_set_bytes(pending_tiles)?;
             report.peak_planned_working_set_bytes = report
                 .peak_planned_working_set_bytes
                 .max(queued_working_set);
@@ -696,7 +788,7 @@ fn transform_target(
                 report.largest_output_tile_bytes.max(tile_output_bytes);
 
             if pending_tiles.len() == tile_buffers {
-                write_oldest_tile(pending_tiles, output_shards)?;
+                write_oldest_tile(pending_tiles, output_shards, allocator_cache)?;
             }
             start = end;
         }
@@ -913,6 +1005,7 @@ impl SubmittedQuantizationTile {
 fn write_oldest_tile(
     pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
     output_shards: &mut [OutputShard],
+    allocator_cache: &mut BoundedAllocatorCache,
 ) -> Result<(), Error> {
     let tile = pending_tiles
         .pop_front()
@@ -923,8 +1016,18 @@ fn write_oldest_tile(
         .expect("submitted tile references an existing output shard");
     tile.write(shard)?;
     shard.tile_completed()?;
-    memory::clear_cache()?;
+    allocator_cache.tile_completed(queued_working_set_bytes(pending_tiles)?)?;
     Ok(())
+}
+
+fn queued_working_set_bytes(
+    pending_tiles: &VecDeque<SubmittedQuantizationTile>,
+) -> Result<u64, Error> {
+    pending_tiles.iter().try_fold(0u64, |total, tile| {
+        total
+            .checked_add(tile.planned_working_set_bytes)
+            .ok_or_else(|| quantization_error("double-buffered working-set overflow"))
+    })
 }
 
 impl Drop for SubmittedQuantizationTile {
@@ -1119,6 +1222,13 @@ mod tests {
         (0..matrices * rows * columns)
             .map(|index| (index as f32 - 255.5) / 64.0)
             .collect()
+    }
+
+    #[test]
+    fn allocator_cache_reuse_respects_retained_and_working_set_bounds() {
+        assert!(!allocator_cache_requires_clear(64, 64, 64));
+        assert!(allocator_cache_requires_clear(65, 64, 128));
+        assert!(allocator_cache_requires_clear(65, 128, 64));
     }
 
     fn direct_fixture() -> (TempDir, Arc<SafetensorsWeightStore>, Vec<f32>) {
