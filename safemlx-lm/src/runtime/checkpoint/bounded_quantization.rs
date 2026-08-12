@@ -4,9 +4,9 @@
 //! overlays packed tensors on an existing
 //! checkpoint store. Source matrices are selected in row tiles, quantized on
 //! explicit conversion streams, and written directly into temporary SafeTensors
-//! shards. A fixed two-slot completion window overlaps the next tile with the
-//! prior tile's host write when both slots fit the admitted working set, and
-//! otherwise falls back to one slot. The
+//! shards. A fixed two-slot completion window spans tensor boundaries and
+//! overlaps the next tile with the prior tile's host write when both slots fit
+//! the admitted working set, and otherwise falls back to one slot. The
 //! process never requires a complete dense matrix or a complete packed matrix
 //! in active memory: tile size is admitted against an explicit byte bound. The
 //! ordinary residency machinery subsequently sees only the final packed tensor
@@ -285,6 +285,8 @@ impl BoundedQuantizedWeightStore {
             admitted_working_set_bytes: plan.max_working_set_bytes,
             ..BoundedQuantizationReport::default()
         };
+        let mut output_shards = Vec::with_capacity(plan.targets.len());
+        let mut pending_tiles = VecDeque::with_capacity(BOUNDED_QUANTIZATION_TILE_BUFFERS);
 
         for (ordinal, target) in plan.targets.iter().enumerate() {
             let shard_name = format!("quantized-{ordinal:05}.safetensors");
@@ -294,12 +296,18 @@ impl BoundedQuantizedWeightStore {
                 &plan,
                 &tile_streams,
                 &directory.path().join(&shard_name),
+                &mut output_shards,
+                &mut pending_tiles,
                 &mut report,
             )?;
             for name in output_names_for(target, plan.quantization)? {
                 index.insert(name, shard_name.clone());
             }
         }
+        while !pending_tiles.is_empty() {
+            write_oldest_tile(&mut pending_tiles, &mut output_shards)?;
+        }
+        debug_assert!(output_shards.iter().all(|shard| shard.file.is_none()));
 
         write_index(directory.path(), &index, report.output_bytes)?;
         let transformed = SafetensorsWeightStore::open_with_max_mapped_shards(
@@ -423,12 +431,57 @@ struct OutputLayout {
     data_offset: u64,
 }
 
+struct OutputShard {
+    file: Option<File>,
+    payload_offset: u64,
+    layouts: Vec<OutputLayout>,
+    pending_tiles: usize,
+    sealed: bool,
+}
+
+impl OutputShard {
+    fn tile_submitted(&mut self) {
+        debug_assert!(!self.sealed);
+        self.pending_tiles = self
+            .pending_tiles
+            .checked_add(1)
+            .expect("output shard pending-tile count overflowed");
+    }
+
+    fn tile_completed(&mut self) -> Result<(), Error> {
+        self.pending_tiles = self
+            .pending_tiles
+            .checked_sub(1)
+            .expect("completed output tile was previously submitted");
+        self.close_if_complete()
+    }
+
+    fn seal(&mut self) -> Result<(), Error> {
+        self.sealed = true;
+        self.close_if_complete()
+    }
+
+    fn close_if_complete(&mut self) -> Result<(), Error> {
+        if self.sealed && self.pending_tiles == 0 {
+            // These shards are process-local scratch data consumed immediately
+            // below. Per-shard durability would serialize unnecessary disk syncs.
+            self.file
+                .take()
+                .expect("an incomplete output shard retains its file")
+                .flush()?;
+        }
+        Ok(())
+    }
+}
+
 fn transform_target(
     source: &dyn WeightStore,
     target: &BoundedQuantizationTarget,
     plan: &BoundedQuantizationPlan,
     tile_streams: &[Stream; BOUNDED_QUANTIZATION_TILE_BUFFERS],
     path: &Path,
+    output_shards: &mut Vec<OutputShard>,
+    pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
     report: &mut BoundedQuantizationReport,
 ) -> Result<(), Error> {
     let metadata = target.source.infer(source)?;
@@ -514,10 +567,26 @@ fn transform_target(
     } else {
         1
     };
+    if tile_buffers == 1 {
+        while !pending_tiles.is_empty() {
+            write_oldest_tile(pending_tiles, output_shards)?;
+        }
+    }
     let tile_budget = plan.max_working_set_bytes / tile_buffers as u64;
     let payload_offset = create_shard(path, &layouts)?;
-    let mut file = OpenOptions::new().write(true).open(path)?;
-    let mut pending_tiles = VecDeque::with_capacity(tile_buffers);
+    let output_bytes = layouts.iter().try_fold(0u64, |total, layout| {
+        total
+            .checked_add(layout.byte_len)
+            .ok_or_else(|| quantization_error("quantized output telemetry overflow"))
+    })?;
+    let output_shard = output_shards.len();
+    output_shards.push(OutputShard {
+        file: Some(OpenOptions::new().write(true).open(path)?),
+        payload_offset,
+        layouts,
+        pending_tiles: 0,
+        sealed: false,
+    });
     for matrix in 0..leading {
         let mut start = 0usize;
         while start < rows {
@@ -593,7 +662,7 @@ fn transform_target(
                 .checked_mul(rows)
                 .and_then(|offset| offset.checked_add(start))
                 .ok_or_else(|| quantization_error("quantized output row offset overflow"))?;
-            pending_tiles.push_back(SubmittedQuantizationTile {
+            let submitted = SubmittedQuantizationTile {
                 outputs,
                 _dense: dense,
                 source_mappings,
@@ -601,7 +670,10 @@ fn transform_target(
                 output_start,
                 rows: tile_rows,
                 planned_working_set_bytes: tile_peak,
-            });
+                output_shard,
+            };
+            output_shards[output_shard].tile_submitted();
+            pending_tiles.push_back(submitted);
             report.peak_in_flight_tiles = report.peak_in_flight_tiles.max(pending_tiles.len());
 
             report.source_tiles = report.source_tiles.saturating_add(1);
@@ -624,28 +696,12 @@ fn transform_target(
                 report.largest_output_tile_bytes.max(tile_output_bytes);
 
             if pending_tiles.len() == tile_buffers {
-                pending_tiles
-                    .pop_front()
-                    .expect("full tile window has a front")
-                    .write(&mut file, payload_offset, &layouts)?;
-                memory::clear_cache()?;
+                write_oldest_tile(pending_tiles, output_shards)?;
             }
             start = end;
         }
     }
-    while let Some(tile) = pending_tiles.pop_front() {
-        tile.write(&mut file, payload_offset, &layouts)?;
-        memory::clear_cache()?;
-    }
-    // These shards are process-local scratch data consumed immediately below.
-    // Per-shard durability would serialize hundreds of unnecessary disk syncs.
-    file.flush()?;
-
-    let output_bytes = layouts.iter().try_fold(0u64, |total, layout| {
-        total
-            .checked_add(layout.byte_len)
-            .ok_or_else(|| quantization_error("quantized output telemetry overflow"))
-    })?;
+    output_shards[output_shard].seal()?;
     report.transformed_weights = report.transformed_weights.saturating_add(1);
     report.output_bytes = report
         .output_bytes
@@ -819,20 +875,19 @@ struct SubmittedQuantizationTile {
     output_start: usize,
     rows: usize,
     planned_working_set_bytes: u64,
+    output_shard: usize,
 }
 
 impl SubmittedQuantizationTile {
-    fn write(
-        mut self,
-        file: &mut File,
-        payload_offset: u64,
-        layouts: &[OutputLayout],
-    ) -> Result<(), Error> {
+    fn write(mut self, shard: &mut OutputShard) -> Result<(), Error> {
         self.complete()?;
-        for (layout, output) in layouts.iter().zip(&self.outputs) {
+        for (layout, output) in shard.layouts.iter().zip(&self.outputs) {
             write_tile(
-                file,
-                payload_offset,
+                shard
+                    .file
+                    .as_mut()
+                    .expect("a pending output tile retains its shard file"),
+                shard.payload_offset,
                 layout,
                 self.output_start,
                 self.rows,
@@ -853,6 +908,23 @@ impl SubmittedQuantizationTile {
         }
         result.map_err(Error::from)
     }
+}
+
+fn write_oldest_tile(
+    pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
+    output_shards: &mut [OutputShard],
+) -> Result<(), Error> {
+    let tile = pending_tiles
+        .pop_front()
+        .expect("non-empty tile window has a front");
+    let output_shard = tile.output_shard;
+    let shard = output_shards
+        .get_mut(output_shard)
+        .expect("submitted tile references an existing output shard");
+    tile.write(shard)?;
+    shard.tile_completed()?;
+    memory::clear_cache()?;
+    Ok(())
 }
 
 impl Drop for SubmittedQuantizationTile {
@@ -1066,6 +1138,29 @@ mod tests {
         (directory, store, values)
     }
 
+    fn two_target_fixture() -> (TempDir, Arc<SafetensorsWeightStore>, [Vec<f32>; 2]) {
+        let directory = tempfile::tempdir().unwrap();
+        let values = [matrix_values(1, 8, 64), matrix_values(1, 8, 64)];
+        let bytes = values.each_ref().map(|values| float_bytes(values));
+        serialize_to_file(
+            [
+                (
+                    "model.first.weight",
+                    TensorView::new(SafeDtype::F32, vec![8, 64], &bytes[0]).unwrap(),
+                ),
+                (
+                    "model.second.weight",
+                    TensorView::new(SafeDtype::F32, vec![8, 64], &bytes[1]).unwrap(),
+                ),
+            ],
+            None,
+            &directory.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let store = Arc::new(SafetensorsWeightStore::open(directory.path()).unwrap());
+        (directory, store, values)
+    }
+
     fn materialize(store: &dyn WeightStore, name: &str, stream: &Stream) -> Array {
         store
             .acquire_with_policy(
@@ -1208,6 +1303,51 @@ mod tests {
         assert!(report.peak_planned_working_set_bytes <= report.admitted_working_set_bytes);
 
         assert_affine_outputs_match_reference(&transformed, &values, quantization, &context);
+    }
+
+    #[test]
+    fn mxfp4_conversion_double_buffers_across_target_boundaries() {
+        let (_directory, source, values) = two_target_fixture();
+        let context = cpu_context();
+        let quantization = WeightQuantization::MxFp4;
+        // Each complete target needs 2,320 bytes: 2,048 source bytes plus
+        // 272 packed output bytes. Both targets therefore fit as one tile in
+        // the two-slot window, making cross-target overlap observable.
+        let plan = BoundedQuantizationPlan::new(
+            quantization,
+            4_640,
+            [
+                BoundedQuantizationTarget::direct("model.first.weight").unwrap(),
+                BoundedQuantizationTarget::direct("model.second.weight").unwrap(),
+            ],
+        )
+        .unwrap();
+        let transformed =
+            BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+
+        let report = transformed.report();
+        assert_eq!(report.transformed_weights, 2);
+        assert_eq!(report.source_tiles, 2);
+        assert_eq!(report.peak_in_flight_tiles, 2);
+        assert_eq!(report.peak_planned_working_set_bytes, 4_640);
+        assert_eq!(report.source_bytes_read, 4_096);
+        assert_eq!(report.output_bytes, 544);
+
+        for (name, values) in [("model.first", &values[0]), ("model.second", &values[1])] {
+            let dense = Array::from_slice(values, &[8, 64]);
+            let expected = quantize_tensor(&dense, quantization, context.stream()).unwrap();
+            let weight = materialize(&transformed, &format!("{name}.weight"), context.stream());
+            let scales = materialize(&transformed, &format!("{name}.scales"), context.stream());
+            assert_eq!(
+                weight.evaluated().unwrap().as_slice::<u32>(),
+                expected.weight.evaluated().unwrap().as_slice::<u32>()
+            );
+            assert_eq!(
+                scales.evaluated().unwrap().as_slice::<u8>(),
+                expected.scales.evaluated().unwrap().as_slice::<u8>()
+            );
+            assert!(!transformed.keys().contains(&format!("{name}.biases")));
+        }
     }
 
     #[cfg(target_os = "macos")]
