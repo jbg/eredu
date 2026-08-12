@@ -73,6 +73,24 @@ cargo run --release -q -p safemlx-lm-cli -- \
   "Explain speculative decoding."
 ```
 
+Use `--telemetry-json PATH` to write a versioned machine-readable report of the
+concrete execution plan, timings, MLX allocator memory, bounded residency,
+expert-cache occupancy, and speculative-decoding statistics. Generated text
+continues to use standard output and the telemetry file is written only after a
+successful run:
+
+```sh
+cargo run --release -q -p safemlx-lm-cli -- \
+  --model /path/to/model --telemetry-json run.json \
+  "Explain automatic model placement."
+```
+
+The plan and telemetry schemas are public `safemlx-lm` API types. Hardware
+discovery is available through `discover_hardware`, and `inspect_model` reports
+header-only model resource accounting in `ModelInspectionReport::resources`.
+Unknown materialized, per-layer, expert, or device-memory values are represented
+as unavailable rather than zero.
+
 ## Loading and memory
 
 Eligible dense checkpoints can be quantized while loading:

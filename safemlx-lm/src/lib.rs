@@ -26,9 +26,15 @@ pub use api::realtime::{
     RealtimeSampling, RealtimeSession, RealtimeSpeechConfig, RealtimeStepInput, RealtimeStepOutput,
 };
 pub use api::{
-    inspect_model, ArtifactKind, ArtifactModality, ArtifactTensorEncoding, InspectionIssue,
-    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
-    ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions,
+    discover_hardware, inspect_model, AllocatorTelemetry, ArtifactKind, ArtifactModality,
+    ArtifactTensorEncoding, BackendKind, DevicePlan, DraftPlacementPlan, DraftingPlan,
+    DurationSeconds, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
+    ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
+    HardwareProfile, InspectionIssue, InspectionIssueCode, InspectionReadiness,
+    InspectionRequirement, InspectionSeverity, ModelInspectionOptions, ModelInspectionReport,
+    ModelLoadOptions, ModelResourceProfile, ObservationKind, Observed, ParallelismPlan,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
+    TimingTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use architectures::llama::layerwise::{
     load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,

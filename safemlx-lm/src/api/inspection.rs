@@ -26,7 +26,7 @@ pub struct ModelInspectionOptions {
 }
 
 /// Physical artifact selected for inspection.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     /// Hugging Face-style directory containing SafeTensors weights.
@@ -203,6 +203,8 @@ pub struct ModelInspectionReport {
     /// Number of cataloged logical tensors, if established.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tensor_count: Option<usize>,
+    /// Header-only resource accounting for automatic planning.
+    pub resources: ModelResourceProfile,
     /// Every distinct storage encoding observed in checkpoint headers.
     pub tensor_encodings: Vec<ArtifactTensorEncoding>,
     /// Expected input modalities derived from config/architecture metadata.
@@ -258,6 +260,7 @@ impl ModelInspectionReport {
             gguf_versions: None,
             checkpoint_shards: None,
             tensor_count: None,
+            resources: ModelResourceProfile::empty(path.to_path_buf(), artifact_kind),
             tensor_encodings: Vec::new(),
             expected_modalities: Vec::new(),
             container: InspectionReadiness::Unverified,
@@ -303,22 +306,27 @@ pub fn inspect_model(
     options: ModelInspectionOptions,
 ) -> Result<ModelInspectionReport, Error> {
     let path = path.as_ref();
-    if is_gguf_file(path) {
-        Ok(inspect_gguf(path, options))
+    let mut report = if is_gguf_file(path) {
+        inspect_gguf(path, options)
     } else if path.is_dir() {
-        Ok(inspect_safetensors(path, options))
+        inspect_safetensors(path, options)
     } else if !path.exists() {
-        Err(std::io::Error::new(
+        return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("model artifact does not exist: {}", path.display()),
         )
-        .into())
+        .into());
     } else {
-        Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::UnsupportedArchitecture(format!(
             "model artifact must be a SafeTensors directory or .gguf file: {}",
             path.display()
-        )))
-    }
+        )));
+    };
+    report.resources.model_kind = report.model_kind;
+    report.resources.architecture = report.architecture.clone();
+    report.resources.tensor_count = report.tensor_count;
+    report.resources.checkpoint_shards = report.checkpoint_shards;
+    Ok(report)
 }
 
 fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelInspectionReport {
@@ -407,6 +415,8 @@ fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelIns
             let mut encodings = BTreeSet::new();
             let mut shards = BTreeSet::new();
             let mut catalog_error = None;
+            let mut stored_tensor_bytes = Some(0_u64);
+            let mut largest_stored_tensor_bytes = 0_u64;
             for key in &keys {
                 match store.metadata(key) {
                     Ok(metadata) => {
@@ -414,6 +424,10 @@ fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelIns
                         if let Some(shard) = metadata.backing_shard {
                             shards.insert(shard);
                         }
+                        let bytes = metadata.logical_byte_len as u64;
+                        stored_tensor_bytes =
+                            stored_tensor_bytes.and_then(|total| total.checked_add(bytes));
+                        largest_stored_tensor_bytes = largest_stored_tensor_bytes.max(bytes);
                     }
                     Err(error) => {
                         catalog_error = Some(error);
@@ -430,6 +444,23 @@ fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelIns
                     ggml_type_code: None,
                 })
                 .collect();
+            match stored_tensor_bytes {
+                Some(total) if !keys.is_empty() => {
+                    report.resources.stored_tensor_bytes =
+                        Observed::exact(total, "validated SafeTensors tensor headers");
+                    report.resources.largest_stored_tensor_bytes = Observed::exact(
+                        largest_stored_tensor_bytes,
+                        "validated SafeTensors tensor headers",
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    report.resources.stored_tensor_bytes =
+                        Observed::unavailable("SafeTensors payload-byte total overflowed u64");
+                    report.resources.largest_stored_tensor_bytes =
+                        Observed::unavailable("SafeTensors payload-byte catalog was incomplete");
+                }
+            }
             if keys.is_empty() {
                 report.container = InspectionReadiness::Invalid;
                 report.model_loadability = InspectionReadiness::Invalid;
@@ -552,6 +583,29 @@ fn inspect_gguf(path: &Path, options: ModelInspectionOptions) -> ModelInspection
             ggml_type_code: Some(code),
         })
         .collect();
+    let mut stored_tensor_bytes = Some(0_u64);
+    let mut largest_stored_tensor_bytes = 0_u64;
+    for tensor in checkpoint.catalog().tensors() {
+        let bytes = tensor.descriptor().byte_len;
+        stored_tensor_bytes = stored_tensor_bytes.and_then(|total| total.checked_add(bytes));
+        largest_stored_tensor_bytes = largest_stored_tensor_bytes.max(bytes);
+    }
+    match stored_tensor_bytes {
+        Some(total) => {
+            report.resources.stored_tensor_bytes =
+                Observed::exact(total, "validated GGUF tensor descriptors");
+            report.resources.largest_stored_tensor_bytes = Observed::exact(
+                largest_stored_tensor_bytes,
+                "validated GGUF tensor descriptors",
+            );
+        }
+        None => {
+            report.resources.stored_tensor_bytes =
+                Observed::unavailable("GGUF payload-byte total overflowed u64");
+            report.resources.largest_stored_tensor_bytes =
+                Observed::unavailable("GGUF payload-byte catalog was incomplete");
+        }
+    }
 
     let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     let architecture = match metadata.get("general.architecture") {
@@ -6246,6 +6300,11 @@ mod tests {
         assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
         assert_eq!(report.requested_load, InspectionReadiness::Ready);
         assert_eq!(report.tensor_count, Some(1));
+        assert_eq!(
+            report.resources.stored_tensor_bytes,
+            Observed::exact(4, "validated SafeTensors tensor headers")
+        );
+        assert_eq!(report.resources.model_kind, Some(ModelKind::Llama));
         assert_eq!(report.tensor_encodings[0].name, "F32");
         assert!(!report.is_loadable());
         assert!(

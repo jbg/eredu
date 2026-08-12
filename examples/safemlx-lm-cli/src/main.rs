@@ -20,10 +20,14 @@ use safemlx::{
 };
 use safemlx_lm::{
     api::{
-        GenerationCancellationToken, LoadedModel, ModelLoadOptions,
+        discover_hardware, inspect_model, AllocatorTelemetry, BackendKind, DevicePlan,
+        DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionTelemetry, ExpertCachePlan,
+        ExpertCacheTelemetry, GenerationCancellationToken, LoadedModel, ModelInspectionOptions,
+        ModelLoadOptions, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
         PreparedChatEmbeddedMtpGenerationRequest, PreparedChatGenerationRequest,
         PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
-        PreparedChatMtpGenerationRequest, TextDecoder,
+        PreparedChatMtpGenerationRequest, ResidencyPlan, ResidencyTelemetry, TextDecoder,
+        TimingTelemetry, WeightTransformationPlan,
     },
     error::Error as LmError,
     runtime::chat::{
@@ -470,6 +474,10 @@ struct Cli {
     #[arg(long)]
     timing: bool,
 
+    /// Write stable structured execution telemetry to this JSON file.
+    #[arg(long, value_name = "PATH")]
+    telemetry_json: Option<PathBuf>,
+
     /// Synchronize Gemma 4 component boundaries and report component timings.
     ///
     /// This changes scheduling and should be used for diagnosis, not headline
@@ -729,6 +737,7 @@ fn main() -> Result<()> {
     let total_started = Instant::now();
     let args = Cli::parse();
     validate_args(&args)?;
+    let hardware_profile = args.telemetry_json.as_ref().map(|_| discover_hardware());
     if let Some(bytes) = args.mlx_cache_limit_bytes {
         let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
         safemlx::memory::set_cache_limit(bytes)
@@ -772,11 +781,10 @@ fn main() -> Result<()> {
     let draft_stream = draft_execution
         .as_ref()
         .map_or(stream, ExecutionContext::stream);
-    if args.verbose {
+    if args.verbose || args.telemetry_json.is_some() {
         // Capture the complete model-load and generation high-water mark.
         safemlx::memory::reset_peak_memory()?;
     }
-    let load_started = Instant::now();
     let mut load_options = requested_load_quantization(&args)?.map_or_else(
         ModelLoadOptions::default,
         ModelLoadOptions::with_quantization,
@@ -848,6 +856,21 @@ fn main() -> Result<()> {
             },
         ));
     }
+    let resource_profile = if args.telemetry_json.is_some() {
+        Some(
+            inspect_model(
+                &model_path,
+                ModelInspectionOptions {
+                    load: load_options,
+                    chat_request: None,
+                },
+            )?
+            .resources,
+        )
+    } else {
+        None
+    };
+    let load_started = Instant::now();
     let mut model =
         LoadedModel::load_with_options(&model_path, load_options, stream, weights.stream())
             .with_context(|| format!("failed to load model from {}", model_path.display()))?;
@@ -1311,12 +1334,22 @@ fn main() -> Result<()> {
         eprintln!("stop_reason: {}", stop_reason.label());
     }
 
-    if args.verbose {
+    let allocator_telemetry = if args.verbose || args.telemetry_json.is_some() {
         stream.synchronize()?;
-        let peak_memory = safemlx::memory::peak_memory()?;
-        let active_memory = safemlx::memory::active_memory()?;
-        let cache_memory = safemlx::memory::cache_memory()?;
-        let total_elapsed = total_started.elapsed();
+        Some(AllocatorTelemetry {
+            peak_bytes: safemlx::memory::peak_memory()? as u64,
+            active_bytes: safemlx::memory::active_memory()? as u64,
+            cache_bytes: safemlx::memory::cache_memory()? as u64,
+        })
+    } else {
+        None
+    };
+    let total_elapsed = total_started.elapsed();
+
+    if args.verbose {
+        let allocator = allocator_telemetry
+            .as_ref()
+            .expect("verbose execution collected allocator telemetry");
         eprintln!(
             "model_type: {}, prompt_tokens: {}, generated_tokens: {}",
             model.model_type(),
@@ -1367,9 +1400,18 @@ fn main() -> Result<()> {
             }
             eprintln!("mtp_accept_lens: {:?}", stats.accept_lens);
         }
-        eprintln!("mlx_peak_memory: {}", format_bytes(peak_memory));
-        eprintln!("mlx_active_memory: {}", format_bytes(active_memory));
-        eprintln!("mlx_cache_memory: {}", format_bytes(cache_memory));
+        eprintln!(
+            "mlx_peak_memory: {}",
+            format_bytes(allocator.peak_bytes as usize)
+        );
+        eprintln!(
+            "mlx_active_memory: {}",
+            format_bytes(allocator.active_bytes as usize)
+        );
+        eprintln!(
+            "mlx_cache_memory: {}",
+            format_bytes(allocator.cache_bytes as usize)
+        );
         if let Some(stats) = model.native_quantization_stats() {
             eprintln!(
                 "native_quantization: {} tensors / {}, fallback: {} tensors / {} checkpoint bytes",
@@ -1494,11 +1536,136 @@ fn main() -> Result<()> {
             generation_elapsed,
             time_to_first_token,
             output_ids.len(),
-            total_started.elapsed(),
+            total_elapsed,
         )?;
     }
 
+    if let Some(path) = &args.telemetry_json {
+        let plan = cli_execution_plan(&args, draft_model_path.as_deref(), embedded_mtp);
+        let telemetry = ExecutionTelemetry {
+            schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+            model_type: model.model_type().into(),
+            plan: Some(plan),
+            plan_explanation: Some(PlanExplanation {
+                summary: "recorded the concrete execution settings supplied to the CLI".into(),
+                entries: vec![PlanExplanationEntry {
+                    level: PlanExplanationLevel::Decision,
+                    code: "explicit_cli_configuration".into(),
+                    detail: "this run records explicit/default CLI settings; no automatic candidate selection was performed"
+                        .into(),
+                }],
+            }),
+            hardware: hardware_profile,
+            resources: resource_profile,
+            prompt_tokens: tokens.shape()[1] as usize,
+            generated_tokens: output_ids.len(),
+            stop_reason: stop_reason.label().into(),
+            timing: TimingTelemetry::new(
+                load_elapsed,
+                generation_elapsed,
+                time_to_first_token,
+                output_ids.len(),
+                total_elapsed,
+            ),
+            allocator: allocator_telemetry,
+            residency: ResidencyTelemetry::collect(&model)?,
+            expert_cache: ExpertCacheTelemetry::collect(&model)?,
+            mtp: mtp_stats.as_ref().map(Into::into),
+        };
+        let json = serde_json::to_vec_pretty(&telemetry)
+            .context("failed to serialize execution telemetry")?;
+        std::fs::write(path, json)
+            .with_context(|| format!("failed to write telemetry to {}", path.display()))?;
+    }
+
     Ok(())
+}
+
+fn device_plan(device: CliDevice) -> DevicePlan {
+    match device {
+        CliDevice::Cpu => DevicePlan {
+            backend: BackendKind::Cpu,
+            index: 0,
+        },
+        CliDevice::Gpu(index) => DevicePlan {
+            backend: if cfg!(feature = "cuda") {
+                BackendKind::Cuda
+            } else if cfg!(target_os = "macos") {
+                BackendKind::Metal
+            } else {
+                BackendKind::Gpu
+            },
+            index: index as usize,
+        },
+    }
+}
+
+fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool) -> ExecutionPlan {
+    let residency = if args.dense_disk_stream {
+        let defaults = DenseDiskStreamLoadOptions::default();
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes: args
+                .device_budget_bytes
+                .unwrap_or(defaults.device_budget_bytes),
+            host_budget_bytes: args.host_budget_bytes.unwrap_or(defaults.host_budget_bytes),
+            host_lookahead: args.dense_host_lookahead,
+            background_queue: args.dense_background_queue,
+        }
+    } else if args.layerwise_host {
+        ResidencyPlan::LayerwiseHost {
+            device_layer_window: args.device_layer_window,
+            device_budget_bytes: args.device_budget_bytes,
+            host_budget_bytes: args.host_budget_bytes,
+        }
+    } else {
+        ResidencyPlan::FullyResident
+    };
+    let drafting = if let Some(path) = draft_model {
+        let placement = match args.mtp_draft_device {
+            MtpDraftDevice::Target => DraftPlacementPlan::Target,
+            MtpDraftDevice::Device(device) => DraftPlacementPlan::Device {
+                device: device_plan(device),
+            },
+        };
+        DraftingPlan::External {
+            model: path.display().to_string(),
+            placement,
+            max_draft_tokens: args.mtp_draft_tokens,
+            lookahead: !args.disable_mtp_lookahead,
+            adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
+        }
+    } else if embedded_mtp {
+        DraftingPlan::Embedded {
+            max_draft_tokens: args.mtp_draft_tokens,
+            lookahead: !args.disable_mtp_lookahead,
+            adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
+        }
+    } else {
+        DraftingPlan::Disabled
+    };
+    ExecutionPlan {
+        schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+        device: device_plan(args.device),
+        parallelism: Default::default(),
+        residency,
+        weight_transformation: match (args.quantize, args.quantization_mode) {
+            (Some(bits), LoadQuantizationMode::Affine) => WeightTransformationPlan::Affine {
+                bits,
+                group_size: args.quantization_group_size,
+            },
+            (Some(4), LoadQuantizationMode::Mxfp4) => WeightTransformationPlan::MxFp4,
+            _ => WeightTransformationPlan::PreserveCheckpoint,
+        },
+        max_mapped_shards: args.mapped_shards,
+        expert_cache: args.expert_cache.then_some(ExpertCachePlan {
+            device_budget_bytes: args.expert_cache_device_budget_bytes,
+            host_budget_bytes: args.expert_cache_host_budget_bytes,
+            scratch_bytes: args.expert_cache_scratch_bytes,
+            prefill_bank_bytes: args.expert_cache_prefill_bank_bytes,
+        }),
+        drafting,
+        mlx_cache_limit_bytes: args.mlx_cache_limit_bytes,
+    }
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -2269,15 +2436,15 @@ mod tests {
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
 
     use super::{
-        eval, execution_contexts, format_bytes, format_weight_store_diagnostics,
-        requested_load_quantization, select_cached_gguf_from_revisions,
-        select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
-        select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
-        use_semantic_generation, validate_args, validate_artifact_pair, write_semantic_event,
-        write_timing_report, Array, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType,
-        MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport,
-        ReasoningStream, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
-        WeightQuantization,
+        cli_execution_plan, eval, execution_contexts, format_bytes,
+        format_weight_store_diagnostics, requested_load_quantization,
+        select_cached_gguf_from_revisions, select_cached_gguf_pair_from_revisions,
+        select_cached_gguf_path, select_revision, select_unique_cached_gguf,
+        should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
+        validate_args, validate_artifact_pair, write_semantic_event, write_timing_report, Array,
+        CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType, MtpDraftDevice,
+        MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport, ReasoningStream,
+        ResolvedModel, SemanticEvent, SemanticSupport, StopReason, WeightQuantization,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -2313,6 +2480,36 @@ mod tests {
             .unwrap();
         assert!(args.timing);
         assert!(!args.verbose);
+    }
+
+    #[test]
+    fn parses_json_telemetry_path_and_records_concrete_plan() {
+        let args = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--device",
+            "cpu",
+            "--layerwise-host",
+            "--device-layer-window",
+            "2",
+            "--telemetry-json",
+            "run.json",
+            "prompt",
+        ])
+        .unwrap();
+        assert_eq!(args.telemetry_json.as_deref(), Some(Path::new("run.json")));
+
+        let plan = cli_execution_plan(&args, None, false);
+        assert_eq!(plan.device.backend, safemlx_lm::BackendKind::Cpu);
+        assert!(matches!(
+            plan.residency,
+            safemlx_lm::ResidencyPlan::LayerwiseHost {
+                device_layer_window: 2,
+                ..
+            }
+        ));
+        assert_eq!(plan.drafting, safemlx_lm::DraftingPlan::Disabled);
     }
 
     #[test]
