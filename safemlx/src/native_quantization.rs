@@ -19,12 +19,14 @@
 
 use std::{cell::RefCell, collections::HashMap, fmt::Write, sync::Arc};
 
+#[cfg(any(test, not(feature = "cuda")))]
+use crate::DeviceType;
 use crate::{
     error::Exception,
     fast::{MetalKernel, MetalKernelConfig},
     ops::{broadcast_to, matmul, sum_axis},
     transforms::eval,
-    Array, DeviceType, Dtype, Stream,
+    Array, Dtype, Stream,
 };
 use safemlx_gguf::{Endian as GgufEndian, GgmlType};
 
@@ -1180,6 +1182,7 @@ pub fn native_selected_down_reduce(
     )
 }
 
+#[cfg(not(feature = "cuda"))]
 fn is_gpu(stream: &Stream) -> Result<bool, Exception> {
     Ok(stream.get_device()?.get_type()? == DeviceType::Gpu)
 }

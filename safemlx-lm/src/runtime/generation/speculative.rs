@@ -38,8 +38,8 @@ pub struct LoadedDrafter {
 }
 
 enum DrafterModel {
-    Gemma4(Gemma4AssistantDraftModel),
-    MuseGlimmerDFlash(MuseGlimmerDFlash),
+    Gemma4(Box<Gemma4AssistantDraftModel>),
+    MuseGlimmerDFlash(Box<MuseGlimmerDFlash>),
 }
 
 /// Stable architecture identity for an independently loaded draft model.
@@ -251,19 +251,16 @@ impl LoadedDrafter {
                     )
                 })?;
             let model = match architecture {
-                "dflash" => DrafterModel::MuseGlimmerDFlash(muse_dflash::load_with_options(
-                    source,
-                    options,
-                    stream,
-                    weights_stream,
-                )?),
+                "dflash" => DrafterModel::MuseGlimmerDFlash(Box::new(
+                    muse_dflash::load_with_options(source, options, stream, weights_stream)?,
+                )),
                 "gemma4_assistant" | "gemma4-assistant" => {
-                    DrafterModel::Gemma4(load_gemma4_assistant_gguf_with_options(
+                    DrafterModel::Gemma4(Box::new(load_gemma4_assistant_gguf_with_options(
                         source,
                         options,
                         stream,
                         weights_stream,
-                    )?)
+                    )?))
                 }
                 other => {
                     return Err(Error::UnsupportedArchitecture(format!(
@@ -283,15 +280,12 @@ impl LoadedDrafter {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let model = match model_type {
-            "muse_glimmer_assistant" => DrafterModel::MuseGlimmerDFlash(
+            "muse_glimmer_assistant" => DrafterModel::MuseGlimmerDFlash(Box::new(
                 muse_dflash::load_with_options(source, options, stream, weights_stream)?,
-            ),
-            "gemma4_assistant" => DrafterModel::Gemma4(load_gemma4_assistant_model_with_options(
-                source,
-                options,
-                stream,
-                weights_stream,
-            )?),
+            )),
+            "gemma4_assistant" => DrafterModel::Gemma4(Box::new(
+                load_gemma4_assistant_model_with_options(source, options, stream, weights_stream)?,
+            )),
             other => {
                 return Err(Error::UnsupportedArchitecture(format!(
                     "unsupported safetensors drafter model_type {other:?}"

@@ -67,9 +67,9 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
-        SharedWeightStore, StaticUnitBindings, WeightResidency,
+        open_safetensors_weight_store, ArchitectureAdapter, LayerWeightResidency,
+        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, SharedWeightStore,
+        StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -135,10 +135,6 @@ impl LayerwiseDecoder {
     /// Returns the normalized decoder configuration.
     pub fn args(&self) -> &DecoderConfig {
         self.execution.adapter().args()
-    }
-
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
-        self.execution.bind_parallel_topology(topology);
     }
 
     pub(crate) fn dflash_weight_snapshot(
@@ -508,282 +504,6 @@ impl LayerwiseDecoder {
         result
     }
 
-    /// Runs streamed layers while delegating routed experts to a caller.
-    pub(crate) fn forward_with_expert_executor<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Vec<Option<ConcatKeyValueCache>>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut owned = MuseGlimmerLayerwiseCache::Concat(std::mem::take(cache));
-        let result =
-            self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
-        let MuseGlimmerLayerwiseCache::Concat(owned) = owned else {
-            unreachable!("Muse-Glimmer concat cache wrapper changed variants")
-        };
-        *cache = owned;
-        result
-    }
-
-    pub(crate) fn forward_with_sliding_expert_executor<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Vec<Option<SlidingKeyValueCache>>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut owned = MuseGlimmerLayerwiseCache::Sliding(std::mem::take(cache));
-        let result =
-            self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
-        let MuseGlimmerLayerwiseCache::Sliding(owned) = owned else {
-            unreachable!("Muse-Glimmer sliding cache wrapper changed variants")
-        };
-        *cache = owned;
-        result
-    }
-
-    pub(crate) fn forward_with_paged_expert_executor<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Vec<Option<PagedKeyValueCache>>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut owned = MuseGlimmerLayerwiseCache::Paged(std::mem::take(cache));
-        let result =
-            self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
-        let MuseGlimmerLayerwiseCache::Paged(owned) = owned else {
-            unreachable!("Muse-Glimmer paged cache wrapper changed variants")
-        };
-        *cache = owned;
-        result
-    }
-
-    fn forward_with_expert_executor_cache<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut MuseGlimmerLayerwiseCache,
-        execute: &mut F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        self.execution.forward_with_layer_executor(
-            MuseGlimmerAdapterInput::Decode { inputs, mask },
-            cache,
-            stream,
-            |_adapter, group, index, layer, hidden, cache, context, stream| {
-                if group != 1 {
-                    return Err(Error::Parallel(
-                        "expert execution is invalid for Muse-Glimmer vision layers".into(),
-                    ));
-                }
-                let MuseGlimmerLayer::Text(layer) = layer else {
-                    return Err(Error::Parallel(
-                        "Muse-Glimmer expert executor received a vision layer".into(),
-                    ));
-                };
-                match cache {
-                    MuseGlimmerLayerwiseCache::Concat(cache) => forward_sparse_with_executor(
-                        layer,
-                        hidden,
-                        cache[index].as_mut(),
-                        context,
-                        index,
-                        execute,
-                        stream,
-                    ),
-                    MuseGlimmerLayerwiseCache::Sliding(cache) => forward_sparse_with_executor(
-                        layer,
-                        hidden,
-                        cache[index].as_mut(),
-                        context,
-                        index,
-                        execute,
-                        stream,
-                    ),
-                    MuseGlimmerLayerwiseCache::Paged(cache) => forward_sparse_with_executor(
-                        layer,
-                        hidden,
-                        cache[index].as_mut(),
-                        context,
-                        index,
-                        execute,
-                        stream,
-                    ),
-                }
-            },
-        )
-    }
-
-    /// Runs the shared tensor-parallel model while delegating routed experts
-    /// to a topology-scoped expert-parallel executor.
-    pub(crate) fn forward_tensor_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Vec<Option<ConcatKeyValueCache>>,
-        tensor_group: &safemlx::distributed::Group,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut owned = MuseGlimmerLayerwiseCache::Concat(std::mem::take(cache));
-        let result = self.forward_tensor_expert_parallel_cache(
-            inputs,
-            mask,
-            &mut owned,
-            tensor_group,
-            execute,
-            stream,
-        );
-        let MuseGlimmerLayerwiseCache::Concat(owned) = owned else {
-            unreachable!("Muse-Glimmer concat cache wrapper changed variants")
-        };
-        *cache = owned;
-        result
-    }
-
-    pub(crate) fn forward_tensor_expert_parallel_sliding<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Vec<Option<SlidingKeyValueCache>>,
-        tensor_group: &safemlx::distributed::Group,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut owned = MuseGlimmerLayerwiseCache::Sliding(std::mem::take(cache));
-        let result = self.forward_tensor_expert_parallel_cache(
-            inputs,
-            mask,
-            &mut owned,
-            tensor_group,
-            execute,
-            stream,
-        );
-        let MuseGlimmerLayerwiseCache::Sliding(owned) = owned else {
-            unreachable!("Muse-Glimmer sliding cache wrapper changed variants")
-        };
-        *cache = owned;
-        result
-    }
-
-    pub(crate) fn forward_tensor_expert_parallel_paged<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Vec<Option<PagedKeyValueCache>>,
-        tensor_group: &safemlx::distributed::Group,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut owned = MuseGlimmerLayerwiseCache::Paged(std::mem::take(cache));
-        let result = self.forward_tensor_expert_parallel_cache(
-            inputs,
-            mask,
-            &mut owned,
-            tensor_group,
-            execute,
-            stream,
-        );
-        let MuseGlimmerLayerwiseCache::Paged(owned) = owned else {
-            unreachable!("Muse-Glimmer paged cache wrapper changed variants")
-        };
-        *cache = owned;
-        result
-    }
-
-    fn forward_tensor_expert_parallel_cache<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut MuseGlimmerLayerwiseCache,
-        tensor_group: &safemlx::distributed::Group,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        self.execution.forward_tensor_parallel_with_layer_executor(
-            MuseGlimmerAdapterInput::Decode { inputs, mask },
-            cache,
-            tensor_group,
-            stream,
-            |_adapter, group, index, layer, hidden, cache, context, execution| {
-                if group != 1 {
-                    return Err(Error::Parallel(
-                        "TP+EP execution is invalid for Muse-Glimmer vision layers".into(),
-                    ));
-                }
-                let MuseGlimmerLayer::Text(layer) = layer else {
-                    return Err(Error::Parallel(
-                        "Muse-Glimmer TP+EP executor received a vision layer".into(),
-                    ));
-                };
-                let tp_group = execution.group().ok_or_else(|| {
-                    Error::Parallel("TP+EP execution requires an active TP group".into())
-                })?;
-                match cache {
-                    MuseGlimmerLayerwiseCache::Concat(cache) => forward_sparse_tp_with_executor(
-                        layer,
-                        hidden,
-                        cache[index].as_mut(),
-                        context,
-                        index,
-                        tp_group,
-                        &mut execute,
-                        execution.stream(),
-                    ),
-                    MuseGlimmerLayerwiseCache::Sliding(cache) => forward_sparse_tp_with_executor(
-                        layer,
-                        hidden,
-                        cache[index].as_mut(),
-                        context,
-                        index,
-                        tp_group,
-                        &mut execute,
-                        execution.stream(),
-                    ),
-                    MuseGlimmerLayerwiseCache::Paged(cache) => forward_sparse_tp_with_executor(
-                        layer,
-                        hidden,
-                        cache[index].as_mut(),
-                        context,
-                        index,
-                        tp_group,
-                        &mut execute,
-                        execution.stream(),
-                    ),
-                }
-            },
-        )
-    }
-
     /// Clears temporary device decoder copies.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_group("vision_encoder")?;
@@ -812,57 +532,6 @@ fn concatenate_dflash_target_states(
         })?);
     }
     concatenate_axis(&states, -1, stream)
-}
-
-fn forward_sparse_with_executor<C, F>(
-    layer: &mut TransformerBlock,
-    hidden: &Array,
-    cache: Option<&mut C>,
-    context: &MuseGlimmerForwardContext,
-    index: usize,
-    execute: &mut F,
-    stream: &Stream,
-) -> Result<Array, Error>
-where
-    C: KeyValueCache,
-    F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-{
-    Ok(layer.forward_sparse_experts(
-        AttentionInput {
-            x: hidden,
-            mask: context.mask.as_ref(),
-            cache,
-        },
-        stream,
-        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
-    )?)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_sparse_tp_with_executor<C, F>(
-    layer: &mut TransformerBlock,
-    hidden: &Array,
-    cache: Option<&mut C>,
-    context: &MuseGlimmerForwardContext,
-    index: usize,
-    tensor_group: &safemlx::distributed::Group,
-    execute: &mut F,
-    stream: &Stream,
-) -> Result<Array, Error>
-where
-    C: KeyValueCache,
-    F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-{
-    Ok(layer.forward_sparse_experts_tensor_parallel(
-        AttentionInput {
-            x: hidden,
-            mask: context.mask.as_ref(),
-            cache,
-        },
-        tensor_group,
-        stream,
-        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
-    )?)
 }
 
 impl CausalLm<Vec<Option<ConcatKeyValueCache>>> for LayerwiseDecoder {
@@ -990,24 +659,6 @@ pub(crate) fn load_safetensors_quantized_residency(
             source_adapter,
             options,
             Some(quantization),
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    let adapter = MuseGlimmerLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(LayerwiseDecoder {
-        execution: load_layerwise_model(
-            store,
-            adapter,
-            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -1221,97 +872,6 @@ pub(crate) fn prepare_gguf_pipeline_source(
     apply_mmproj_config(checkpoint, metadata, &mut args, mmproj.as_ref())?;
     let store = muse_gguf_store(checkpoint, mmproj.as_ref(), max_mapped_shards)?;
     Ok((args, store))
-}
-
-/// Loads replicated Qwen3-MoE GGUF parameters for sparse expert-parallel
-/// execution without materializing routed experts.
-fn load_qwen3_gguf_sparse_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
-    args: DecoderConfig,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerWeightResidency>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    if !args.is_moe() {
-        return Err(Error::UnsupportedArchitecture(
-            "sparse expert caching requires a Qwen3 sparse-MoE GGUF checkpoint".into(),
-        ));
-    }
-    let adapter = MuseGlimmerLayerwiseAdapter::new_external_experts(args.clone(), stream)?;
-    let mut execution = load_layerwise_model_with_quantization(
-        store,
-        adapter,
-        non_expert,
-        quantization,
-        stream,
-        weights_stream,
-    )?;
-    let checkpoint_store = execution.checkpoint_store_arc();
-    let entries = qwen3_expert_catalog(&args, checkpoint_store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(match quantization {
-        Some(quantization) => ExpertCache::new_quantized_shared(
-            checkpoint_store,
-            entries,
-            options,
-            quantization,
-            weights_stream.clone(),
-            stream.clone(),
-        )?,
-        None => ExpertCache::new_shared(
-            checkpoint_store,
-            entries,
-            options,
-            weights_stream.clone(),
-            stream.clone(),
-        )?,
-    });
-    Ok(LayerwiseDecoder { execution })
-}
-
-/// Builds the streamed nonexpert Qwen3 execution base used by distributed EP.
-pub(crate) fn load_qwen3_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
-    args: DecoderConfig,
-    non_expert: impl Into<LayerWeightResidency>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    if !args.is_moe() {
-        return Err(Error::UnsupportedArchitecture(
-            "streamed sparse expert parallelism requires Qwen3 MoE".into(),
-        ));
-    }
-    let adapter = MuseGlimmerLayerwiseAdapter::new_external_experts(args, stream)?;
-    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
-    Ok(LayerwiseDecoder { execution })
-}
-
-/// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
-pub(crate) fn load_qwen3_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
-    args: DecoderConfig,
-    non_expert: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    if !args.is_moe() {
-        return Err(Error::UnsupportedArchitecture(
-            "combined tensor/expert parallelism requires Qwen3 MoE".into(),
-        ));
-    }
-    let adapter = MuseGlimmerLayerwiseAdapter::new_external_experts(args, stream)?;
-    let execution = load_tensor_parallel_layerwise_model(
-        store,
-        adapter,
-        non_expert,
-        build,
-        stream,
-        weights_stream,
-    )?;
-    Ok(LayerwiseDecoder { execution })
 }
 
 /// Loads sparse Qwen3 with independently cached experts and bounded non-expert units.
@@ -3535,14 +3095,6 @@ pub(crate) fn qwen3_expert_catalog(
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     qwen3_expert_catalog_cartesian(args, store, "model.layers", None)
-}
-
-pub(crate) fn qwen3_expert_catalog_at(
-    args: &DecoderConfig,
-    store: &dyn WeightStore,
-    layer_root: &str,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    qwen3_expert_catalog_cartesian(args, store, layer_root, None)
 }
 
 /// Builds expert-granular bindings under an optional TP semantic layout.

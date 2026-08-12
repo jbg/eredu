@@ -11,6 +11,8 @@ use std::cell::RefCell;
 
 #[cfg(not(feature = "cuda"))]
 use safemlx::fast::{MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel};
+#[cfg(not(feature = "cuda"))]
+use safemlx::DeviceType;
 use safemlx::{
     error::Exception,
     ops::{
@@ -18,7 +20,7 @@ use safemlx::{
         indexing::{NewAxis, TryIndexOp},
         sum_axis, zeros,
     },
-    Array, DeviceType, Dtype, Stream,
+    Array, Dtype, Stream,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -27,8 +29,11 @@ thread_local! {
     static VECTOR_KERNELS: RefCell<Option<RecurrentScanKernel>> = const { RefCell::new(None) };
 }
 
+#[cfg(not(feature = "cuda"))]
 const PREFILL_SHORT_SCAN_TOKENS: i32 = 64;
+#[cfg(not(feature = "cuda"))]
 const PREFILL_MEDIUM_SCAN_TOKENS: i32 = 16;
+#[cfg(not(feature = "cuda"))]
 const PREFILL_LONG_SCAN_TOKENS: i32 = 32;
 
 #[cfg(not(feature = "cuda"))]

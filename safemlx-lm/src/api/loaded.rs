@@ -156,21 +156,38 @@ fn model_mtp_cache(cache: &mut ModelCache) -> Option<&mut ModelCache> {
     Some(cache)
 }
 
-fn run_external_mtp_batch<'a, B, S>(
-    backend: &'a mut B,
+struct ExternalMtpBatch<'a, B, S>
+where
+    B: crate::runtime::generation::speculative::MtpBackend,
+{
     lanes: &'a mut [ModelCache],
     cache_for_lane: fn(&mut ModelCache) -> Option<&mut B::Cache>,
-    cache_kind: &str,
-    prompt_tokens: &Array,
-    config: &MtpConfig,
+    cache_kind: &'static str,
+    prompt_tokens: &'a Array,
+    config: &'a MtpConfig,
     prng_key: Option<Array>,
-    sampler: &S,
+    sampler: &'a S,
     streams: MtpExecutionStreams<'a>,
+}
+
+fn run_external_mtp_batch<'a, B, S>(
+    backend: &'a mut B,
+    batch: ExternalMtpBatch<'a, B, S>,
 ) -> Result<MtpBatchOutput, Exception>
 where
     B: crate::runtime::generation::speculative::MtpBackend,
     S: SpeculativeSampler + Clone + 'a,
 {
+    let ExternalMtpBatch {
+        lanes,
+        cache_for_lane,
+        cache_kind,
+        prompt_tokens,
+        config,
+        prng_key,
+        sampler,
+        streams,
+    } = batch;
     let mut batch_prng = prng_key.map(RandomState::from_key);
     let mut scheduler = MtpScheduler::new(backend, streams, MtpSchedulerOptions::default())?;
     for (lane, lane_cache) in lanes.iter_mut().enumerate() {
@@ -1220,14 +1237,16 @@ impl LoadedModel {
                     crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
                 run_external_mtp_batch(
                     &mut backend,
-                    &mut cache.lanes,
-                    gemma4_mtp_cache,
-                    "Gemma 4",
-                    prompt_tokens,
-                    &config,
-                    prng_key,
-                    sampler,
-                    streams,
+                    ExternalMtpBatch {
+                        lanes: &mut cache.lanes,
+                        cache_for_lane: gemma4_mtp_cache,
+                        cache_kind: "Gemma 4",
+                        prompt_tokens,
+                        config: &config,
+                        prng_key,
+                        sampler,
+                        streams,
+                    },
                 )
             }
             Model::MuseGlimmer(target) => {
@@ -1238,14 +1257,16 @@ impl LoadedModel {
                     );
                 run_external_mtp_batch(
                     &mut backend,
-                    &mut cache.lanes,
-                    model_mtp_cache,
-                    "Muse-Glimmer DFlash",
-                    prompt_tokens,
-                    &config,
-                    prng_key,
-                    sampler,
-                    streams,
+                    ExternalMtpBatch {
+                        lanes: &mut cache.lanes,
+                        cache_for_lane: model_mtp_cache,
+                        cache_kind: "Muse-Glimmer DFlash",
+                        prompt_tokens,
+                        config: &config,
+                        prng_key,
+                        sampler,
+                        streams,
+                    },
                 )
             }
             model => Err(Exception::custom(format!(

@@ -288,7 +288,9 @@ fn parse_attribute(tag: &str, prefix: &str) -> Result<String, String> {
     xml_unescape(value)
 }
 
-fn parse_atem_calls(payload: &str) -> Result<Vec<(String, Map<String, Value>)>, String> {
+type AtemCall = (String, Map<String, Value>);
+
+fn parse_atem_calls(payload: &str) -> Result<Vec<AtemCall>, String> {
     let inner = payload
         .strip_prefix("<atem:function_calls>\n")
         .and_then(|value| value.strip_suffix("\n</atem:function_calls>"))

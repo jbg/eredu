@@ -300,18 +300,6 @@ fn dflash_block_token_ids(anchor: u32, mask_token: u32, proposal_capacity: usize
     ids
 }
 
-#[cfg(test)]
-mod tests {
-    use super::dflash_block_token_ids;
-
-    #[test]
-    fn dflash_runtime_block_contains_only_requested_proposal_positions() {
-        assert_eq!(dflash_block_token_ids(7, 99, 1), [7, 99]);
-        assert_eq!(dflash_block_token_ids(7, 99, 3), [7, 99, 99, 99]);
-        assert_eq!(dflash_block_token_ids(7, 99, 15).len(), 16);
-    }
-}
-
 impl MtpBackend for MuseGlimmerMtpBackend<'_> {
     type Cache = ModelCache;
     type TargetState = MuseTargetState;
@@ -525,5 +513,17 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
             verified_inputs,
             streams.target(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dflash_block_token_ids;
+
+    #[test]
+    fn dflash_runtime_block_contains_only_requested_proposal_positions() {
+        assert_eq!(dflash_block_token_ids(7, 99, 1), [7, 99]);
+        assert_eq!(dflash_block_token_ids(7, 99, 3), [7, 99, 99, 99]);
+        assert_eq!(dflash_block_token_ids(7, 99, 15).len(), 16);
     }
 }

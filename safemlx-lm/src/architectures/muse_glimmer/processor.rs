@@ -456,11 +456,14 @@ fn pack_patches(
     let mut values = Vec::with_capacity(grid_h * grid_w * patch_width);
     for patch_y in 0..grid_h {
         for patch_x in 0..grid_w {
-            for time in 0..temporal {
+            let mut video_frames = frames.iter();
+            for _ in 0..temporal {
                 let frame = if duplicate_image {
                     first
                 } else {
-                    &frames[time]
+                    video_frames
+                        .next()
+                        .expect("video frame count validated above")
                 };
                 for channel in 0..frame.channels() {
                     for y in 0..config.patch_size {
