@@ -37,6 +37,10 @@ const Q8_0_BLOCK_BYTES: i32 = 34;
 const OUT_TILE: i32 = 4;
 const REDUCTION_TILE: i32 = 32;
 const NATIVE_BATCH_TILE: i32 = 8;
+// A single packed-weight decode is faster for the small tail just above the
+// normal tile. Wider per-thread accumulator arrays lose occupancy, so 11+
+// rows remain split across the regular eight-row tiles.
+const NATIVE_SINGLE_TILE_MAX: i32 = 10;
 const Q8_LARGE_OUT_TILE: i32 = 8;
 const Q8_LARGE_OUTPUT_ROWS: i32 = 65_536;
 
@@ -64,6 +68,14 @@ thread_local! {
         RefCell::new(HashMap::new());
     static IQ_EMBEDDING_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =
         RefCell::new(HashMap::new());
+}
+
+fn native_batch_tile(rows: i32) -> i32 {
+    if rows > NATIVE_BATCH_TILE && rows <= NATIVE_SINGLE_TILE_MAX {
+        rows
+    } else {
+        NATIVE_BATCH_TILE
+    }
 }
 
 /// Physical quantization encoding retained from a checkpoint.
@@ -1126,9 +1138,10 @@ fn q4k_linear_metal(
     let outer = input.size() as i32 / view.columns;
     let flat = input.reshape(&[outer, view.columns], stream)?;
     let out_grid = ((view.rows + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
+    let batch_tile = native_batch_tile(outer);
     let mut config = q4k_config(outer, view, outer, view.rows, dtype)
         .with_template_arg_int("ROWS", outer)
-        .with_template_arg_int("BATCH_TILE", NATIVE_BATCH_TILE);
+        .with_template_arg_int("BATCH_TILE", batch_tile);
     let output = if outer == 1 {
         Q4K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
@@ -1140,7 +1153,7 @@ fn q4k_linear_metal(
                 .apply_one_device([&flat, view.storage.bytes()], &config, stream)
         })?
     } else {
-        let batch_tiles = (outer + NATIVE_BATCH_TILE - 1) / NATIVE_BATCH_TILE;
+        let batch_tiles = (outer + batch_tile - 1) / batch_tile;
         config = config.with_grid([REDUCTION_TILE, out_grid, batch_tiles]);
         Q4K_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
@@ -1243,7 +1256,7 @@ fn q8_0_selected_down_reduce_metal(
     let routes = expert_ids.dim(0);
     let out_tile = q8_0_out_tile(down.rows);
     let out_grid = ((down.rows + out_tile - 1) / out_tile) * out_tile;
-    let config = q8_0_config(down, 1, down.rows, dtype)
+    let config = q8_0_config(down, 1, down.rows, dtype, NATIVE_BATCH_TILE)
         .with_template_arg_int("ROUTES", routes)
         .with_template_arg_int("MATRIX_COUNT", down.matrix_count)
         .with_grid([REDUCTION_TILE, out_grid, 1]);
@@ -1303,6 +1316,7 @@ fn iq_linear_metal(
     let kernel_key = (view.format(), big_endian);
     let flat = input.reshape(&[rows, view.columns], stream)?;
     let (_, block_bytes) = view.format().block_geometry();
+    let batch_tile = native_batch_tile(rows);
     let mut config = MetalKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_template_arg_int("ROWS", rows)
@@ -1312,7 +1326,7 @@ fn iq_linear_metal(
         .with_template_arg_int("BLOCK_BYTES", block_bytes)
         .with_template_arg_int("PHYSICAL_ROWS", view.physical_rows)
         .with_template_arg_int("ROW_START", view.row_start)
-        .with_template_arg_int("BATCH_TILE", NATIVE_BATCH_TILE)
+        .with_template_arg_int("BATCH_TILE", batch_tile)
         .with_grid([32, rows * view.rows, 1])
         .with_thread_group([32, 1, 1])
         .with_output_arg([rows, view.rows], dtype);
@@ -1328,7 +1342,7 @@ fn iq_linear_metal(
                 .apply_one_device([&flat, view.storage.bytes()], &config, stream)
         })?
     } else {
-        let batch_tiles = (rows + NATIVE_BATCH_TILE - 1) / NATIVE_BATCH_TILE;
+        let batch_tiles = (rows + batch_tile - 1) / batch_tile;
         config = config.with_grid([32, view.rows, batch_tiles]);
         IQ_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
             let mut kernels = cell.borrow_mut();
@@ -1419,6 +1433,7 @@ fn q8_0_config(
     output_rows: i32,
     output_cols: i32,
     dtype: Dtype,
+    batch_tile: i32,
 ) -> MetalKernelConfig {
     let out_tile = q8_0_out_tile(output_cols);
     let out_grid = ((output_cols + out_tile - 1) / out_tile) * out_tile;
@@ -1432,7 +1447,7 @@ fn q8_0_config(
         .with_template_arg_int("PHYSICAL_ROWS", view.physical_rows)
         .with_template_arg_int("ROW_START", view.row_start)
         .with_template_arg_int("OUT_TILE", out_tile)
-        .with_template_arg_int("BATCH_TILE", NATIVE_BATCH_TILE)
+        .with_template_arg_int("BATCH_TILE", batch_tile)
         .with_thread_group([REDUCTION_TILE, out_tile, 1])
         .with_output_arg([output_rows, output_cols], dtype)
 }
@@ -1482,9 +1497,10 @@ fn q5_1_linear_metal(
     let outer = input.size() as i32 / view.columns;
     let flat = input.reshape(&[outer, view.columns], stream)?;
     let out_grid = ((view.rows + OUT_TILE - 1) / OUT_TILE) * OUT_TILE;
+    let batch_tile = native_batch_tile(outer);
     let mut config = q5_1_config(outer, view, outer, view.rows, dtype)
         .with_template_arg_int("ROWS", outer)
-        .with_template_arg_int("BATCH_TILE", NATIVE_BATCH_TILE);
+        .with_template_arg_int("BATCH_TILE", batch_tile);
     let output = if outer == 1 {
         Q5_1_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
@@ -1496,7 +1512,7 @@ fn q5_1_linear_metal(
                 .apply_one_device([&flat, view.storage.bytes()], &config, stream)
         })?
     } else {
-        let batch_tiles = (outer + NATIVE_BATCH_TILE - 1) / NATIVE_BATCH_TILE;
+        let batch_tiles = (outer + batch_tile - 1) / batch_tile;
         config = config.with_grid([REDUCTION_TILE, out_grid, batch_tiles]);
         Q5_1_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
@@ -1554,7 +1570,8 @@ fn q8_0_linear_metal(
     let flat = input.reshape(&[outer, view.columns], stream)?;
     let out_tile = q8_0_out_tile(view.rows);
     let out_grid = ((view.rows + out_tile - 1) / out_tile) * out_tile;
-    let mut config = q8_0_config(view, outer, view.rows, dtype);
+    let batch_tile = native_batch_tile(outer);
+    let mut config = q8_0_config(view, outer, view.rows, dtype, batch_tile);
     let output = if outer == 1 {
         config = config.with_grid([REDUCTION_TILE, out_grid, 1]);
         Q8_0_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
@@ -1567,7 +1584,7 @@ fn q8_0_linear_metal(
                 .apply_one_device([&flat, view.storage.bytes()], &config, stream)
         })?
     } else {
-        let batch_tiles = (outer + NATIVE_BATCH_TILE - 1) / NATIVE_BATCH_TILE;
+        let batch_tiles = (outer + batch_tile - 1) / batch_tile;
         config = config.with_grid([REDUCTION_TILE, out_grid, batch_tiles]);
         Q8_0_BATCH_KERNEL.with(|cell| -> Result<_, Exception> {
             if cell.borrow().is_none() {
@@ -1594,7 +1611,7 @@ fn q8_0_grouped_metal(
     let routes = input.dim(0);
     let out_tile = q8_0_out_tile(view.rows);
     let out_grid = ((view.rows + out_tile - 1) / out_tile) * out_tile;
-    let config = q8_0_config(view, routes, view.rows, dtype)
+    let config = q8_0_config(view, routes, view.rows, dtype, NATIVE_BATCH_TILE)
         .with_template_arg_int("MATRIX_COUNT", view.matrix_count)
         .with_grid([REDUCTION_TILE, routes * out_grid, 1]);
     Q8_0_GROUPED_KERNEL.with(|cell| -> Result<_, Exception> {
@@ -2147,14 +2164,8 @@ fn q8_0_batch_kernel() -> Result<MetalKernel, Exception> {
             "uint lane = thread_position_in_grid.x;",
             "uint out_col = thread_position_in_grid.y;",
             "uint first_row = thread_position_in_grid.z * BATCH_TILE;",
-            "float acc0 = 0.0f;",
-            "float acc1 = 0.0f;",
-            "float acc2 = 0.0f;",
-            "float acc3 = 0.0f;",
-            "float acc4 = 0.0f;",
-            "float acc5 = 0.0f;",
-            "float acc6 = 0.0f;",
-            "float acc7 = 0.0f;",
+            "float acc[BATCH_TILE];",
+            "for (uint r = 0; r < BATCH_TILE; ++r) acc[r] = 0.0f;",
             "if (out_col < OUT_DIM) {",
             " uint physical_row = ROW_START + out_col;",
             " uint matrix_base = physical_row * BLOCKS * 34;",
@@ -2162,33 +2173,16 @@ fn q8_0_batch_kernel() -> Result<MetalKernel, Exception> {
             "  uint base = matrix_base + block * 34;",
             "  float w = q8_0_scale(weight, base) * float(q8_0_quant(weight, base + 2 + lane));",
             "  uint input_col = block * 32 + lane;",
-            "  if (first_row < ROWS) acc0 += float(input[first_row * IN_DIM + input_col]) * w;",
-            "  if (first_row + 1 < ROWS) acc1 += float(input[(first_row + 1) * IN_DIM + input_col]) * w;",
-            "  if (first_row + 2 < ROWS) acc2 += float(input[(first_row + 2) * IN_DIM + input_col]) * w;",
-            "  if (first_row + 3 < ROWS) acc3 += float(input[(first_row + 3) * IN_DIM + input_col]) * w;",
-            "  if (first_row + 4 < ROWS) acc4 += float(input[(first_row + 4) * IN_DIM + input_col]) * w;",
-            "  if (first_row + 5 < ROWS) acc5 += float(input[(first_row + 5) * IN_DIM + input_col]) * w;",
-            "  if (first_row + 6 < ROWS) acc6 += float(input[(first_row + 6) * IN_DIM + input_col]) * w;",
-            "  if (first_row + 7 < ROWS) acc7 += float(input[(first_row + 7) * IN_DIM + input_col]) * w;",
+            "  for (uint r = 0; r < BATCH_TILE; ++r) {",
+            "   uint row = first_row + r;",
+            "   if (row < ROWS) acc[r] += float(input[row * IN_DIM + input_col]) * w;",
+            "  }",
             " }",
             "}",
-            "float total0 = simd_sum(acc0);",
-            "float total1 = simd_sum(acc1);",
-            "float total2 = simd_sum(acc2);",
-            "float total3 = simd_sum(acc3);",
-            "float total4 = simd_sum(acc4);",
-            "float total5 = simd_sum(acc5);",
-            "float total6 = simd_sum(acc6);",
-            "float total7 = simd_sum(acc7);",
-            "if (lane == 0 && out_col < OUT_DIM) {",
-            " if (first_row < ROWS) out[first_row * OUT_DIM + out_col] = T(total0);",
-            " if (first_row + 1 < ROWS) out[(first_row + 1) * OUT_DIM + out_col] = T(total1);",
-            " if (first_row + 2 < ROWS) out[(first_row + 2) * OUT_DIM + out_col] = T(total2);",
-            " if (first_row + 3 < ROWS) out[(first_row + 3) * OUT_DIM + out_col] = T(total3);",
-            " if (first_row + 4 < ROWS) out[(first_row + 4) * OUT_DIM + out_col] = T(total4);",
-            " if (first_row + 5 < ROWS) out[(first_row + 5) * OUT_DIM + out_col] = T(total5);",
-            " if (first_row + 6 < ROWS) out[(first_row + 6) * OUT_DIM + out_col] = T(total6);",
-            " if (first_row + 7 < ROWS) out[(first_row + 7) * OUT_DIM + out_col] = T(total7);",
+            "for (uint r = 0; r < BATCH_TILE; ++r) {",
+            " float total = simd_sum(acc[r]);",
+            " uint row = first_row + r;",
+            " if (lane == 0 && row < ROWS && out_col < OUT_DIM) out[row * OUT_DIM + out_col] = T(total);",
             "}"
         ),
         Q8_0_METAL_HEADER,
@@ -3384,10 +3378,10 @@ mod tests {
         }
         let native = NativeQuantizedTensor::from_q8_0_bytes(&raw, &[5, 96], &stream).unwrap();
         let input = Array::from_slice(
-            &(0..7 * 96)
+            &(0..9 * 96)
                 .map(|index| (index as f32 % 37.0 - 18.0) / 190.0)
                 .collect::<Vec<_>>(),
-            &[7, 96],
+            &[9, 96],
         )
         .copy(&stream)
         .unwrap();

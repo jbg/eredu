@@ -134,7 +134,7 @@ fn main() {
     )
     .as_dtype(Dtype::Float16, &stream)
     .unwrap();
-    let prefill_rows = 32;
+    let prefill_rows = env_i32("SAFEMLX_BENCH_PREFILL_ROWS", 32);
     let prefill_input = Array::from_slice(
         &(0..prefill_rows * columns)
             .map(|index| (index as f32 % 37.0 - 18.0) / 40.0)
@@ -178,7 +178,7 @@ fn main() {
         );
         let dense_bytes = rows as usize * columns as usize * 2;
         println!(
-            "{name:7} packed={:7.2} MiB dense-f16={:7.2} MiB | decode packed={:8.3} ms dense={:8.3} ms | prefill32 packed={:8.3} ms dense={:8.3} ms",
+            "{name:7} packed={:7.2} MiB dense-f16={:7.2} MiB | decode packed={:8.3} ms dense={:8.3} ms | prefill{prefill_rows} packed={:8.3} ms dense={:8.3} ms",
             packed_bytes as f64 / 1_048_576.0,
             dense_bytes as f64 / 1_048_576.0,
             native_decode.as_secs_f64() * 1e3,
