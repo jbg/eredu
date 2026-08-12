@@ -71,6 +71,23 @@ int mlx_event_get_device(mlx_device* device, mlx_event event);
 /** Return the producer backend. */
 int mlx_event_get_backend(mlx_event_backend* backend, mlx_event event);
 
+/** Return whether this completion event carries timestamp markers. */
+int mlx_event_has_timing(bool* has_timing, mlx_event event);
+
+/**
+ * Resolve elapsed execution-timeline seconds, blocking until completion.
+ * Repeated calls return the same cached value and retained async errors.
+ */
+int mlx_event_elapsed(double* seconds, mlx_event event);
+
+/**
+ * Query elapsed execution-timeline seconds without blocking.
+ *
+ * Sets `ready` false while work is outstanding. When ready, `seconds` receives
+ * the same stable value as `mlx_event_elapsed`.
+ */
+int mlx_event_try_elapsed(double* seconds, bool* ready, mlx_event event);
+
 /**@}*/
 
 #ifdef __cplusplus

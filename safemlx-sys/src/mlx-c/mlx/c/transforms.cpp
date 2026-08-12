@@ -31,6 +31,21 @@ extern "C" int mlx_async_eval_with_event(
   }
   return 0;
 }
+extern "C" int mlx_async_eval_timed(
+    mlx_event* event,
+    const mlx_vector_array outputs,
+    const mlx_stream stream) {
+  try {
+    mlx_event_set_(
+        *event,
+        mlx::core::async_eval_with_timing(
+            mlx_vector_array_get_(outputs), mlx_stream_get_(stream)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_checkpoint(mlx_closure* res, const mlx_closure fun) {
   try {
     mlx_closure_set_(*res, mlx::core::checkpoint(mlx_closure_get_(fun)));

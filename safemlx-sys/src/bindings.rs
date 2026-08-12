@@ -1634,6 +1634,28 @@ extern "C" {
         event: mlx_event,
     ) -> ::std::os::raw::c_int;
 }
+extern "C" {
+    #[doc = " Return whether this completion event carries timestamp markers."]
+    pub fn mlx_event_has_timing(
+        has_timing: *mut bool,
+        event: mlx_event,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Resolve elapsed execution-timeline seconds, blocking until completion."]
+    pub fn mlx_event_elapsed(
+        seconds: *mut f64,
+        event: mlx_event,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Query elapsed execution-timeline seconds without blocking."]
+    pub fn mlx_event_try_elapsed(
+        seconds: *mut f64,
+        ready: *mut bool,
+        event: mlx_event,
+    ) -> ::std::os::raw::c_int;
+}
 #[doc = " An owning, host-addressable transfer allocation."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -4749,6 +4771,14 @@ extern "C" {
     pub fn mlx_async_eval_with_event(
         event: *mut mlx_event,
         outputs: mlx_vector_array,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Submit evaluation between asynchronous timestamp markers on `stream`."]
+    pub fn mlx_async_eval_timed(
+        event: *mut mlx_event,
+        outputs: mlx_vector_array,
+        stream: mlx_stream,
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {

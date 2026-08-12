@@ -53,7 +53,7 @@ use crate::{
     error::{get_and_clear_closure_error, Result},
     module::ModuleParamRef,
     utils::{guard::Guarded, runtime_lock, Closure, VectorArray, SUCCESS},
-    Array, Event,
+    Array, Event, Stream, TimedEvaluation,
 };
 
 pub mod compile;
@@ -129,6 +129,36 @@ pub fn async_eval_with_event<'a>(outputs: impl IntoIterator<Item = &'a Array>) -
     Event::try_from_op(|event| unsafe {
         safemlx_sys::mlx_async_eval_with_event(event, vec.as_ptr())
     })
+}
+
+/// Submit `outputs` asynchronously and measure their execution timeline.
+///
+/// Unlike timing Rust graph construction, this function records a timestamp,
+/// submits the selected lazy MLX graph, and records the ending timestamp on
+/// `stream`. The call does not wait for device execution. Resolve the duration
+/// later with [`TimedEvaluation::try_elapsed`] or [`TimedEvaluation::elapsed`].
+///
+/// The graph's selected output stream must exactly equal `stream`; a different
+/// stream or device is rejected before submission. Dependencies may execute on
+/// other streams and are honored without a host wait. Unrelated work queued on
+/// `stream` before the starting marker is excluded. Graphs large enough to use
+/// multiple command buffers remain inside the measured phase; see
+/// [`TimedEvaluation`] for backend-specific treatment of waits and idle gaps.
+///
+/// Ordinary [`async_eval`] and [`async_eval_with_event`] do not allocate or
+/// record timestamp resources, so timing-disabled execution retains its normal
+/// path and overhead.
+pub fn async_eval_timed<'a>(
+    outputs: impl IntoIterator<Item = &'a Array>,
+    stream: impl AsRef<Stream>,
+) -> Result<TimedEvaluation> {
+    let vec = VectorArray::try_from_iter(outputs.into_iter())?;
+    let stream = stream.as_ref();
+    let _guard = runtime_lock::enter();
+    Event::try_from_op(|event| unsafe {
+        safemlx_sys::mlx_async_eval_timed(event, vec.as_ptr(), stream.c_stream)
+    })
+    .map(TimedEvaluation::from_completion)
 }
 
 /// Asynchronously evaluate a module's parameters.

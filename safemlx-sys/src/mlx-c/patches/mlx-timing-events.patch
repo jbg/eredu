@@ -1,0 +1,752 @@
+diff --git a/mlx/CMakeLists.txt b/mlx/CMakeLists.txt
+index d2d4597..6112222 100644
+--- a/mlx/CMakeLists.txt
++++ b/mlx/CMakeLists.txt
+@@ -16,6 +16,7 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/random.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/stream.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/timing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/transforms.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/linalg.cpp
+diff --git a/mlx/backend/cuda/CMakeLists.txt b/mlx/backend/cuda/CMakeLists.txt
+index 064e1ef..ee6585d 100644
+--- a/mlx/backend/cuda/CMakeLists.txt
++++ b/mlx/backend/cuda/CMakeLists.txt
+@@ -26,6 +26,7 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cu
+           ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/event.cu
++          ${CMAKE_CURRENT_SOURCE_DIR}/timing.cu
+           ${CMAKE_CURRENT_SOURCE_DIR}/fft.cu
+           ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/block_mask.cu
+diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
+index 74ae70b..6409a29 100644
+--- a/mlx/backend/cuda/event.cu
++++ b/mlx/backend/cuda/event.cu
+@@ -103,6 +103,14 @@ void CudaEvent::record(cudaStream_t stream) {
+   CHECK_CUDA_ERROR(cudaEventRecord(event_, stream));
+ }
+ 
++double CudaEvent::elapsed_seconds(const CudaEvent& end) const {
++  event_.device.make_current();
++  float milliseconds = 0.0f;
++  CHECK_CUDA_ERROR(
++      cudaEventElapsedTime(&milliseconds, event_, end.event_));
++  return static_cast<double>(milliseconds) / 1000.0;
++}
++
+ bool CudaEvent::completed() const {
+   // Note: cudaEventQuery can be safely called from any device.
+   auto status = cudaEventQuery(event_);
+diff --git a/mlx/backend/cuda/event.h b/mlx/backend/cuda/event.h
+index 53afeb0..494b133 100644
+--- a/mlx/backend/cuda/event.h
++++ b/mlx/backend/cuda/event.h
+@@ -38,6 +38,7 @@ class CudaEvent {
+   void wait();
+   void wait(cudaStream_t stream);
+   void record(cudaStream_t stream);
++  double elapsed_seconds(const CudaEvent& end) const;
+ 
+   // Return whether the recorded kernels have completed. Note that this method
+   // returns true if record() has not been called.
+diff --git a/mlx/backend/cuda/timing.cu b/mlx/backend/cuda/timing.cu
+new file mode 100644
+index 0000000..4230c7a
+--- /dev/null
++++ b/mlx/backend/cuda/timing.cu
+@@ -0,0 +1,55 @@
++// Copyright © 2026 Apple Inc.
++
++#include "mlx/backend/cuda/device.h"
++#include "mlx/backend/cuda/event.h"
++#include "mlx/backend/gpu/timing.h"
++
++namespace mlx::core::gpu {
++
++namespace {
++
++struct CudaTimerState {
++  explicit CudaTimerState(cu::Device& device)
++      : start(device, cudaEventDefault), stop(device, cudaEventDefault) {}
++
++  cu::CudaEvent start;
++  cu::CudaEvent stop;
++};
++
++} // namespace
++
++std::shared_ptr<void> new_timer(Stream stream) {
++  return std::make_shared<CudaTimerState>(cu::device(stream.device));
++}
++
++void record_timer_start(const std::shared_ptr<void>& state, Stream stream) {
++  auto timer = std::static_pointer_cast<CudaTimerState>(state);
++  auto& encoder = cu::get_command_encoder(stream);
++  // Flush any graph nodes encoded before the marker. Recording is asynchronous
++  // and remains ordered after those nodes on the same native CUDA stream.
++  encoder.commit();
++  timer->start.record(encoder.stream());
++  encoder.add_completed_handler([timer = std::move(timer)]() {});
++  encoder.commit();
++}
++
++void record_timer_stop(const std::shared_ptr<void>& state, Stream stream) {
++  auto timer = std::static_pointer_cast<CudaTimerState>(state);
++  auto& encoder = cu::get_command_encoder(stream);
++  encoder.commit();
++  timer->stop.record(encoder.stream());
++  encoder.add_completed_handler([timer = std::move(timer)]() {});
++  encoder.commit();
++}
++
++double timer_elapsed_seconds(const std::shared_ptr<void>& state) {
++  auto timer = std::static_pointer_cast<CudaTimerState>(state);
++  return timer->start.elapsed_seconds(timer->stop);
++}
++
++std::optional<double> timer_try_elapsed_seconds(
++    const std::shared_ptr<void>& state) {
++  return timer_elapsed_seconds(state);
++}
++
++} // namespace mlx::core::gpu
+diff --git a/mlx/backend/gpu/timing.h b/mlx/backend/gpu/timing.h
+new file mode 100644
+index 0000000..4da55c7
+--- /dev/null
++++ b/mlx/backend/gpu/timing.h
+@@ -0,0 +1,18 @@
++// Copyright © 2026 Apple Inc.
++#pragma once
++
++#include <memory>
++#include <optional>
++
++#include "mlx/stream.h"
++
++namespace mlx::core::gpu {
++
++std::shared_ptr<void> new_timer(Stream stream);
++void record_timer_start(const std::shared_ptr<void>& state, Stream stream);
++void record_timer_stop(const std::shared_ptr<void>& state, Stream stream);
++double timer_elapsed_seconds(const std::shared_ptr<void>& state);
++std::optional<double> timer_try_elapsed_seconds(
++    const std::shared_ptr<void>& state);
++
++} // namespace mlx::core::gpu
+diff --git a/mlx/backend/metal/CMakeLists.txt b/mlx/backend/metal/CMakeLists.txt
+index 31cb535..4da2a97 100644
+--- a/mlx/backend/metal/CMakeLists.txt
++++ b/mlx/backend/metal/CMakeLists.txt
+@@ -165,6 +165,7 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/slicing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/sort.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/timing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/ternary.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 29eecf5..383eb4d 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "mlx/backend/common/utils.h"
+ #include "mlx/backend/metal/device.h"
++#include "mlx/backend/metal/timing.h"
+ #include "mlx/backend/metal/event.h"
+ #include "mlx/backend/metal/metal.h"
+ #include "mlx/backend/metal/utils.h"
+@@ -329,6 +330,23 @@ CommandEncoder::~CommandEncoder() {
+   queue_.reset();
+ }
+ 
++void CommandEncoder::begin_timing(std::shared_ptr<TimerState> timer) {
++  end_encoding();
++  commit();
++  timer_ = std::move(timer);
++}
++
++void CommandEncoder::end_timing(const std::shared_ptr<TimerState>& timer) {
++  if (timer_ != timer) {
++    throw std::invalid_argument(
++        "[DeviceTimer] Metal timer does not belong to this stream.");
++  }
++  end_encoding();
++  commit();
++  timer_->stop_submitting();
++  timer_.reset();
++}
++
+ void CommandEncoder::set_buffer(
+     const MTL::Buffer* buf,
+     int idx,
+@@ -515,11 +533,18 @@ bool CommandEncoder::needs_commit() const {
+ }
+ 
+ void CommandEncoder::commit(std::function<void()> completion) {
++  if (timer_) {
++    timer_->submitted();
++  }
+   buffer_->addCompletedHandler(
+       [&error_ = error_,
++       timer = timer_,
+        wait_events = std::move(wait_events_),
+        signal_events = std::move(signal_events_),
+        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
++        if (timer) {
++          timer->record(cbuf);
++        }
+         if (completion) {
+           completion();
+         }
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 871e95c..ea5bd37 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -22,6 +22,7 @@ using MTLFCList =
+ 
+ class Device;
+ class EventImpl;
++struct TimerState;
+ 
+ class MLX_API CommandEncoder {
+  public:
+@@ -102,6 +103,9 @@ class MLX_API CommandEncoder {
+     return buffer_.get();
+   }
+ 
++  void begin_timing(std::shared_ptr<TimerState> timer);
++  void end_timing(const std::shared_ptr<TimerState>& timer);
++
+  private:
+   MTL::ComputeCommandEncoder* get_command_encoder();
+ 
+@@ -120,6 +124,7 @@ class MLX_API CommandEncoder {
+ 
+   // Error from previous commited command buffer.
+   std::shared_ptr<std::string> error_;
++  std::shared_ptr<TimerState> timer_;
+ 
+   // Encoder for issuing GPU commands.
+   // The members are used within a single ComputeCommandEncoder and will be
+diff --git a/mlx/backend/metal/timing.cpp b/mlx/backend/metal/timing.cpp
+new file mode 100644
+index 0000000..b928e06
+--- /dev/null
++++ b/mlx/backend/metal/timing.cpp
+@@ -0,0 +1,32 @@
++// Copyright © 2026 Apple Inc.
++
++#include "mlx/backend/gpu/timing.h"
++#include "mlx/backend/metal/device.h"
++#include "mlx/backend/metal/timing.h"
++
++namespace mlx::core::gpu {
++
++std::shared_ptr<void> new_timer(Stream) {
++  return std::make_shared<metal::TimerState>();
++}
++
++void record_timer_start(const std::shared_ptr<void>& state, Stream stream) {
++  auto timer = std::static_pointer_cast<metal::TimerState>(state);
++  metal::get_command_encoder(stream).begin_timing(std::move(timer));
++}
++
++void record_timer_stop(const std::shared_ptr<void>& state, Stream stream) {
++  auto timer = std::static_pointer_cast<metal::TimerState>(state);
++  metal::get_command_encoder(stream).end_timing(timer);
++}
++
++double timer_elapsed_seconds(const std::shared_ptr<void>& state) {
++  return std::static_pointer_cast<metal::TimerState>(state)->elapsed();
++}
++
++std::optional<double> timer_try_elapsed_seconds(
++    const std::shared_ptr<void>& state) {
++  return std::static_pointer_cast<metal::TimerState>(state)->try_elapsed();
++}
++
++} // namespace mlx::core::gpu
+diff --git a/mlx/backend/metal/timing.h b/mlx/backend/metal/timing.h
+new file mode 100644
+index 0000000..8b60013
+--- /dev/null
++++ b/mlx/backend/metal/timing.h
+@@ -0,0 +1,62 @@
++// Copyright © 2026 Apple Inc.
++#pragma once
++
++#include <condition_variable>
++#include <mutex>
++#include <optional>
++
++#include <Metal/Metal.hpp>
++
++namespace mlx::core::metal {
++
++struct TimerState {
++  void submitted() {
++    std::lock_guard lock(mutex);
++    pending++;
++  }
++
++  void stop_submitting() {
++    std::lock_guard lock(mutex);
++    stopped = true;
++    if (pending == 0) {
++      ready.notify_all();
++    }
++  }
++
++  void record(MTL::CommandBuffer* command_buffer) {
++    auto start = command_buffer->GPUStartTime();
++    auto stop = command_buffer->GPUEndTime();
++    {
++      std::lock_guard lock(mutex);
++      if (stop >= start) {
++        elapsed_seconds += stop - start;
++      }
++      pending--;
++      if (stopped && pending == 0) {
++        ready.notify_all();
++      }
++    }
++  }
++
++  double elapsed() const {
++    std::unique_lock lock(mutex);
++    ready.wait(lock, [this] { return stopped && pending == 0; });
++    return elapsed_seconds;
++  }
++
++  std::optional<double> try_elapsed() const {
++    std::lock_guard lock(mutex);
++    if (!stopped || pending != 0) {
++      return std::nullopt;
++    }
++    return elapsed_seconds;
++  }
++
++  mutable std::mutex mutex;
++  mutable std::condition_variable ready;
++  size_t pending{0};
++  bool stopped{false};
++  double elapsed_seconds{0.0};
++};
++
++} // namespace mlx::core::metal
+diff --git a/mlx/backend/no_gpu/CMakeLists.txt b/mlx/backend/no_gpu/CMakeLists.txt
+index c777204..aaa46b0 100644
+--- a/mlx/backend/no_gpu/CMakeLists.txt
++++ b/mlx/backend/no_gpu/CMakeLists.txt
+@@ -5,4 +5,5 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/timing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp)
+diff --git a/mlx/backend/no_gpu/timing.cpp b/mlx/backend/no_gpu/timing.cpp
+new file mode 100644
+index 0000000..149e4a5
+--- /dev/null
++++ b/mlx/backend/no_gpu/timing.cpp
+@@ -0,0 +1,25 @@
++// Copyright © 2026 Apple Inc.
++
++#include <stdexcept>
++
++#include "mlx/backend/gpu/timing.h"
++
++namespace mlx::core::gpu {
++
++std::shared_ptr<void> new_timer(Stream) {
++  throw std::runtime_error("GPU timing is unavailable in this MLX build.");
++}
++
++void record_timer_start(const std::shared_ptr<void>&, Stream) {}
++void record_timer_stop(const std::shared_ptr<void>&, Stream) {}
++
++double timer_elapsed_seconds(const std::shared_ptr<void>&) {
++  throw std::runtime_error("GPU timing is unavailable in this MLX build.");
++}
++
++std::optional<double> timer_try_elapsed_seconds(
++    const std::shared_ptr<void>&) {
++  throw std::runtime_error("GPU timing is unavailable in this MLX build.");
++}
++
++} // namespace mlx::core::gpu
+diff --git a/mlx/completion.h b/mlx/completion.h
+index f0fb245..5ad7fdc 100644
+--- a/mlx/completion.h
++++ b/mlx/completion.h
+@@ -9,6 +9,7 @@
+ #include "mlx/device.h"
+ #include "mlx/event.h"
+ #include "mlx/stream.h"
++#include "mlx/timing.h"
+ 
+ namespace mlx::core {
+ 
+@@ -55,6 +56,17 @@ class MLX_API Completion {
+   /** Return true when complete, or rethrow a retained asynchronous error. */
+   bool is_complete() const;
+ 
++  /** Return whether this completion carries device timestamp markers. */
++  bool is_timed() const {
++    return timer_.has_value() || elapsed_seconds_.has_value();
++  }
++
++  /** Block until complete and return the stable measured elapsed seconds. */
++  double elapsed_seconds() const;
++
++  /** Return elapsed seconds when ready without blocking, otherwise nullopt. */
++  std::optional<double> try_elapsed_seconds() const;
++
+   /** The producer device, absent for an identity-free completed token. */
+   const std::optional<Device>& device() const {
+     return device_;
+@@ -67,10 +79,23 @@ class MLX_API Completion {
+   explicit Completion(Event event)
+       : event_(std::move(event)), device_(event_->stream().device) {}
+ 
++  Completion(Event event, DeviceTimer timer)
++      : event_(std::move(event)),
++        device_(event_->stream().device),
++        timer_(std::move(timer)) {}
++
++  explicit Completion(double elapsed_seconds)
++      : elapsed_seconds_(elapsed_seconds) {}
++
+   std::optional<Event> event_;
+   std::optional<Device> device_;
++  std::optional<DeviceTimer> timer_;
++  mutable std::optional<double> elapsed_seconds_;
+ 
+   friend MLX_API Completion async_eval_with_completion(std::vector<array> outputs);
++  friend MLX_API Completion async_eval_with_timing(
++      std::vector<array> outputs,
++      Stream stream);
+ };
+ 
+ } // namespace mlx::core
+diff --git a/mlx/timing.cpp b/mlx/timing.cpp
+new file mode 100644
+index 0000000..04745c3
+--- /dev/null
++++ b/mlx/timing.cpp
+@@ -0,0 +1,82 @@
++// Copyright © 2026 Apple Inc.
++
++#include <chrono>
++#include <mutex>
++#include <stdexcept>
++
++#include "mlx/backend/gpu/timing.h"
++#include "mlx/scheduler.h"
++#include "mlx/timing.h"
++
++namespace mlx::core {
++
++namespace {
++
++using Clock = std::chrono::steady_clock;
++
++struct CpuTimerState {
++  std::mutex mutex;
++  std::optional<Clock::time_point> start;
++  std::optional<Clock::time_point> stop;
++};
++
++} // namespace
++
++DeviceTimer::DeviceTimer(Stream stream) : stream_(stream) {
++  if (stream.device == Device::cpu) {
++    state_ = std::make_shared<CpuTimerState>();
++  } else {
++    state_ = gpu::new_timer(stream);
++  }
++}
++
++void DeviceTimer::start() {
++  if (stream_.device == Device::cpu) {
++    auto state = std::static_pointer_cast<CpuTimerState>(state_);
++    scheduler::enqueue(stream_, [state = std::move(state)]() {
++      std::lock_guard lock(state->mutex);
++      state->start = Clock::now();
++    });
++  } else {
++    gpu::record_timer_start(state_, stream_);
++  }
++}
++
++void DeviceTimer::stop() {
++  if (stream_.device == Device::cpu) {
++    auto state = std::static_pointer_cast<CpuTimerState>(state_);
++    scheduler::enqueue(stream_, [state = std::move(state)]() {
++      std::lock_guard lock(state->mutex);
++      state->stop = Clock::now();
++    });
++  } else {
++    gpu::record_timer_stop(state_, stream_);
++  }
++}
++
++double DeviceTimer::elapsed_seconds() const {
++  if (stream_.device != Device::cpu) {
++    return gpu::timer_elapsed_seconds(state_);
++  }
++  auto state = std::static_pointer_cast<CpuTimerState>(state_);
++  std::lock_guard lock(state->mutex);
++  if (!state->start || !state->stop) {
++    throw std::runtime_error(
++        "[DeviceTimer::elapsed_seconds] Timestamp markers are incomplete.");
++  }
++  return std::chrono::duration<double>(*state->stop - *state->start).count();
++}
++
++std::optional<double> DeviceTimer::try_elapsed_seconds() const {
++  if (stream_.device != Device::cpu) {
++    return gpu::timer_try_elapsed_seconds(state_);
++  }
++  auto state = std::static_pointer_cast<CpuTimerState>(state_);
++  std::lock_guard lock(state->mutex);
++  if (!state->start || !state->stop) {
++    return std::nullopt;
++  }
++  return std::chrono::duration<double>(*state->stop - *state->start).count();
++}
++
++} // namespace mlx::core
+diff --git a/mlx/timing.h b/mlx/timing.h
+new file mode 100644
+index 0000000..a9bf728
+--- /dev/null
++++ b/mlx/timing.h
+@@ -0,0 +1,42 @@
++// Copyright © 2026 Apple Inc.
++#pragma once
++
++#include <memory>
++#include <optional>
++
++#include "mlx/api.h"
++#include "mlx/stream.h"
++
++namespace mlx::core {
++
++/**
++ * A pair of timestamp markers recorded on one execution stream.
++ *
++ * Markers are encoded in stream order and never wait for device work on the
++ * calling thread. The elapsed value is defined only after stop() has executed.
++ */
++class MLX_API DeviceTimer {
++ public:
++  explicit DeviceTimer(Stream stream);
++
++  DeviceTimer(const DeviceTimer&) = delete;
++  DeviceTimer& operator=(const DeviceTimer&) = delete;
++  DeviceTimer(DeviceTimer&&) noexcept = default;
++  DeviceTimer& operator=(DeviceTimer&&) noexcept = default;
++  ~DeviceTimer() = default;
++
++  void start();
++  void stop();
++  double elapsed_seconds() const;
++  std::optional<double> try_elapsed_seconds() const;
++
++  const Stream& stream() const {
++    return stream_;
++  }
++
++ private:
++  Stream stream_;
++  std::shared_ptr<void> state_;
++};
++
++} // namespace mlx::core
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+index e75ac5f..9583dda 100644
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -78,7 +78,10 @@ int& detail::InExportTracing::counter() {
+ }
+ thread_local int detail::RetainGraph::tracing_counter{0};
+ 
+-array eval_impl(std::vector<array> outputs, bool async) {
++array eval_impl(
++    std::vector<array> outputs,
++    bool async,
++    DeviceTimer* timer = nullptr) {
+   std::deque<array> tape;
+ 
+   // Make an effort to choose a good output stream
+@@ -228,6 +231,10 @@ array eval_impl(std::vector<array> outputs, bool async) {
+     }
+   }
+ 
++  if (timer) {
++    timer->start();
++  }
++
+   std::set<Stream> open_streams;
+   while (!tape.empty()) {
+     auto arr = std::move(tape.back());
+@@ -310,6 +317,12 @@ array eval_impl(std::vector<array> outputs, bool async) {
+     }
+   }
+ 
++  // Record the stop timestamp before the completion event. Consequently a
++  // completed timed token also guarantees that both samples are resolvable.
++  if (timer) {
++    timer->stop();
++  }
++
+   // Signal the event in its stream
+   for (auto& s : open_streams) {
+     if (auto e = events.find(s.index); e != events.end()) {
+@@ -357,6 +370,45 @@ Completion async_eval_with_completion(std::vector<array> outputs) {
+   return Completion{synchronizer.event()};
+ }
+ 
++Completion async_eval_with_timing(
++    std::vector<array> outputs,
++    Stream requested_stream) {
++  if (outputs.empty()) {
++    return Completion{0.0};
++  }
++
++  bool needs_evaluation = false;
++  Stream selected_stream = default_stream(default_device());
++  bool selected = false;
++  for (auto& output : outputs) {
++    if (output.status() == array::Status::unscheduled ||
++        !output.is_available()) {
++      needs_evaluation = true;
++    }
++    if (!selected && output.status() == array::Status::unscheduled &&
++        output.has_primitive()) {
++      selected_stream = output.primitive().stream();
++      selected = true;
++    } else if (!selected && output.event().valid()) {
++      selected_stream = output.event().stream();
++      selected = true;
++    }
++  }
++  if (!needs_evaluation) {
++    return Completion{0.0};
++  }
++  if (selected_stream != requested_stream) {
++    std::ostringstream message;
++    message << "[async_eval_with_timing] Requested " << requested_stream
++            << ", but evaluation is rooted on " << selected_stream << ".";
++    throw std::invalid_argument(message.str());
++  }
++
++  DeviceTimer timer(requested_stream);
++  auto synchronizer = eval_impl(std::move(outputs), true, &timer);
++  return Completion{synchronizer.event(), std::move(timer)};
++}
++
+ void Completion::wait() const {
+   if (event_) {
+     event_->wait();
+@@ -382,6 +434,38 @@ bool Completion::is_complete() const {
+   return !event_ || event_->is_signaled();
+ }
+ 
++double Completion::elapsed_seconds() const {
++  if (!is_timed()) {
++    throw std::invalid_argument(
++        "[Completion::elapsed_seconds] Completion has no timestamp markers.");
++  }
++  if (elapsed_seconds_) {
++    return *elapsed_seconds_;
++  }
++  wait();
++  elapsed_seconds_ = timer_->elapsed_seconds();
++  return *elapsed_seconds_;
++}
++
++std::optional<double> Completion::try_elapsed_seconds() const {
++  if (!is_timed()) {
++    throw std::invalid_argument(
++        "[Completion::try_elapsed_seconds] Completion has no timestamp "
++        "markers.");
++  }
++  if (elapsed_seconds_) {
++    return elapsed_seconds_;
++  }
++  if (!is_complete()) {
++    return std::nullopt;
++  }
++  auto elapsed = timer_->try_elapsed_seconds();
++  if (elapsed) {
++    elapsed_seconds_ = *elapsed;
++  }
++  return elapsed;
++}
++
+ CompletionBackend Completion::backend() const {
+   if (!device_) {
+     return CompletionBackend::none;
+diff --git a/mlx/transforms.h b/mlx/transforms.h
+index 896ff59..80815b1 100644
+--- a/mlx/transforms.h
++++ b/mlx/transforms.h
+@@ -22,6 +22,18 @@ MLX_API void async_eval(std::vector<array> outputs);
+  */
+ MLX_API Completion async_eval_with_completion(std::vector<array> outputs);
+ 
++/**
++ * Asynchronously evaluate `outputs` between timestamp markers on `stream`.
++ *
++ * The selected output stream must exactly match `stream`. Work on dependency
++ * streams is allowed; waits encoded on `stream` are part of its measured
++ * execution-timeline interval. Empty and already available output sets return
++ * an immediately ready zero-duration completion.
++ */
++MLX_API Completion async_eval_with_timing(
++    std::vector<array> outputs,
++    Stream stream);
++
+ template <typename... Arrays, typename = enable_for_arrays_t<Arrays...>>
+ void async_eval(Arrays&&... outputs) {
+   async_eval(std::vector<array>{std::forward<Arrays>(outputs)...});
+diff --git a/tests/completion_tests.cpp b/tests/completion_tests.cpp
+index ef7f688..9403a61 100644
+--- a/tests/completion_tests.cpp
++++ b/tests/completion_tests.cpp
+@@ -82,3 +82,25 @@ TEST_CASE("test failed CPU event poisons consumer stream") {
+       "producer poisoned completion",
+       std::runtime_error);
+ }
++
++TEST_CASE("test timed completion retains asynchronous CPU failures") {
++  auto stream = new_thread_unsafe_stream(Device::cpu);
++  scheduler::enqueue(stream, []() {
++    throw std::runtime_error("timed asynchronous producer failure");
++  });
++
++  auto output = add(array(1.0f), array(2.0f), stream);
++  auto completion = async_eval_with_timing({output}, stream);
++  CHECK_THROWS_WITH_AS(
++      completion.elapsed_seconds(),
++      "timed asynchronous producer failure",
++      std::runtime_error);
++  CHECK_THROWS_WITH_AS(
++      completion.elapsed_seconds(),
++      "timed asynchronous producer failure",
++      std::runtime_error);
++  CHECK_THROWS_WITH_AS(
++      completion.try_elapsed_seconds(),
++      "timed asynchronous producer failure",
++      std::runtime_error);
++}

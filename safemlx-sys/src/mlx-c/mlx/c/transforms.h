@@ -39,6 +39,16 @@ int mlx_async_eval(const mlx_vector_array outputs);
 int mlx_async_eval_with_event(
     mlx_event* event,
     const mlx_vector_array outputs);
+/**
+ * Submit evaluation between timestamp markers on `stream`.
+ *
+ * The markers are recorded on the execution timeline without synchronizing
+ * the calling thread. The output graph must be rooted on exactly `stream`.
+ */
+int mlx_async_eval_timed(
+    mlx_event* event,
+    const mlx_vector_array outputs,
+    const mlx_stream stream);
 int mlx_checkpoint(mlx_closure* res, const mlx_closure fun);
 int mlx_custom_function(
     mlx_closure* res,

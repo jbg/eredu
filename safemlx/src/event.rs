@@ -3,6 +3,7 @@ use crate::{
     utils::{guard::Guarded, runtime_lock},
     Device, Stream,
 };
+use std::time::Duration;
 
 /// Execution backend which owns an [`Event`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,95 @@ pub enum EventBackend {
 /// contract.
 pub struct Event {
     pub(crate) c_event: safemlx_sys::mlx_event,
+}
+
+/// An asynchronously submitted evaluation with execution-timeline timestamps.
+///
+/// This token owns the ordinary completion [`Event`] and the backend timestamp
+/// resources recorded by [`crate::transforms::async_eval_timed`]. Submission
+/// never waits for the measured work. [`try_elapsed`](Self::try_elapsed) is
+/// nonblocking; [`elapsed`](Self::elapsed) is the explicit host synchronization
+/// point.
+///
+/// The measured interval begins after earlier work on the selected stream and
+/// ends after the requested lazy graph has executed. It therefore excludes
+/// unrelated work queued before the start marker. Dependencies on other
+/// streams are honored. Metal sums native command-buffer GPU start/end
+/// intervals and therefore excludes gaps when no measured command buffer is
+/// active; CUDA event and CPU marker intervals include waits and idle gaps
+/// between their markers.
+///
+/// Repeated elapsed-time queries return one cached duration. Backend failures
+/// are retained and returned by both completion and timing resolution.
+pub struct TimedEvaluation {
+    completion: Event,
+}
+
+impl TimedEvaluation {
+    pub(crate) fn from_completion(completion: Event) -> Self {
+        Self { completion }
+    }
+
+    /// The completion event for dependency insertion or completion queries.
+    pub fn event(&self) -> &Event {
+        &self.completion
+    }
+
+    /// Query whether the evaluation and both timestamp markers are complete.
+    pub fn is_complete(&self) -> Result<bool> {
+        Ok(self.try_elapsed()?.is_some())
+    }
+
+    /// Block the host until evaluation completes, without resolving duration.
+    pub fn synchronize(&self) -> Result<()> {
+        self.completion.synchronize()
+    }
+
+    /// Return elapsed execution-timeline time, blocking only here if needed.
+    ///
+    /// Metal timestamps have command-buffer accuracy and exclude command-queue
+    /// wait time; CUDA event precision is typically around half a microsecond;
+    /// CPU timing is limited by the platform monotonic clock and scheduler
+    /// dispatch. An empty or already-completed evaluation is defined to take
+    /// zero time.
+    pub fn elapsed(&self) -> Result<Duration> {
+        let _guard = runtime_lock::enter();
+        let seconds = f64::try_from_op(|seconds| unsafe {
+            safemlx_sys::mlx_event_elapsed(seconds, self.completion.c_event)
+        })?;
+        duration_from_seconds(seconds)
+    }
+
+    /// Query elapsed time without blocking the host.
+    ///
+    /// Returns `Ok(None)` while work is outstanding. Once ready, this and
+    /// [`elapsed`](Self::elapsed) return the same stable duration.
+    pub fn try_elapsed(&self) -> Result<Option<Duration>> {
+        let _guard = runtime_lock::enter();
+        let mut seconds = 0.0;
+        let mut ready = false;
+        <() as Guarded>::try_from_op(|_| unsafe {
+            safemlx_sys::mlx_event_try_elapsed(&mut seconds, &mut ready, self.completion.c_event)
+        })?;
+        ready.then(|| duration_from_seconds(seconds)).transpose()
+    }
+}
+
+fn duration_from_seconds(seconds: f64) -> Result<Duration> {
+    Duration::try_from_secs_f64(seconds).map_err(|_| {
+        crate::error::Exception::custom(format!(
+            "backend returned invalid elapsed time: {seconds} seconds"
+        ))
+    })
+}
+
+impl std::fmt::Debug for TimedEvaluation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimedEvaluation")
+            .field("completion", &self.completion)
+            .field("elapsed", &self.try_elapsed())
+            .finish()
+    }
 }
 
 impl Event {

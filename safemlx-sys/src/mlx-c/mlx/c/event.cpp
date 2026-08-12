@@ -102,3 +102,40 @@ extern "C" int mlx_event_get_backend(
   }
   return 0;
 }
+
+extern "C" int mlx_event_has_timing(bool* has_timing, mlx_event event) {
+  try {
+    *has_timing = mlx_event_get_(event).is_timed();
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+
+extern "C" int mlx_event_elapsed(double* seconds, mlx_event event) {
+  try {
+    *seconds = mlx_event_get_(event).elapsed_seconds();
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+
+extern "C" int mlx_event_try_elapsed(
+    double* seconds,
+    bool* ready,
+    mlx_event event) {
+  try {
+    auto elapsed = mlx_event_get_(event).try_elapsed_seconds();
+    *ready = elapsed.has_value();
+    if (elapsed) {
+      *seconds = *elapsed;
+    }
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}

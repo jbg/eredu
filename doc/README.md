@@ -27,6 +27,8 @@ follow the relevant guide here.
   and Windows builds.
 - [Completion events](completion-events.md): graph submission, host observation,
   and same-device stream dependencies.
+- [Asynchronous device timing](device-timing.md): execution-timeline timestamp
+  boundaries, backend accuracy, and nonblocking profiling.
 - [Host-transfer buffers](host-transfer-buffers.md): storage selection,
   ownership, and asynchronous copy rules.
 

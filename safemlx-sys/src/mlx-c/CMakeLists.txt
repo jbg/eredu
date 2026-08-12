@@ -65,6 +65,9 @@ else()
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
       COMMAND ${CMAKE_COMMAND}
       -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-host-transfer-umbrella.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
+      COMMAND ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-timing-events.patch
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake)
   FetchContent_MakeAvailable(mlx)
 endif()

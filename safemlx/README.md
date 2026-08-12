@@ -55,7 +55,8 @@ evaluation, graph transforms, and I/O.
   operations, and variable-count all-to-all.
 
 See the workspace documentation for the [completion-event
-contract](../doc/completion-events.md), [host-transfer
+contract](../doc/completion-events.md), [asynchronous device
+timing](../doc/device-timing.md), [host-transfer
 buffers](../doc/host-transfer-buffers.md), and [platform
 setup](../doc/platforms.md).
 
