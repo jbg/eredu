@@ -577,6 +577,22 @@ pub trait MtpBackend {
         self.begin_draft(state, last_token, streams.draft())
     }
 
+    /// Starts one draft round sized for at most `proposal_capacity` proposals.
+    ///
+    /// Backends whose round setup is independent of proposal count may rely on
+    /// this default. Block-based assistants can override it to avoid computing
+    /// proposal positions that the scheduler will never consume.
+    fn begin_draft_with_capacity(
+        &mut self,
+        state: &Self::TargetState,
+        last_token: u32,
+        proposal_capacity: usize,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Self::DraftState, Exception> {
+        let _ = proposal_capacity;
+        self.begin_draft_with_streams(state, last_token, streams)
+    }
+
     /// Returns raw next-token logits and advances private draft state.
     fn draft_logits(
         &mut self,
@@ -1415,9 +1431,12 @@ where
                 .as_ref()
                 .expect("ready request has target state");
             DraftBlock {
-                state: self
-                    .backend
-                    .begin_draft_with_streams(target_state, last, self.streams)?,
+                state: self.backend.begin_draft_with_capacity(
+                    target_state,
+                    last,
+                    target_count,
+                    self.streams,
+                )?,
                 proposals: Vec::new(),
             }
         };
@@ -2519,6 +2538,7 @@ mod tests {
         bonus_token: u32,
         routes: Vec<(&'static str, DeviceType)>,
         draft_storage: Vec<usize>,
+        draft_capacities: Vec<usize>,
     }
 
     #[derive(Clone)]
@@ -2592,6 +2612,17 @@ mod tests {
                 step: 0,
                 storage: Arc::new(()),
             })
+        }
+
+        fn begin_draft_with_capacity(
+            &mut self,
+            state: &Self::TargetState,
+            last_token: u32,
+            proposal_capacity: usize,
+            streams: MtpExecutionStreams<'_>,
+        ) -> Result<Self::DraftState, Exception> {
+            self.draft_capacities.push(proposal_capacity);
+            self.begin_draft_with_streams(state, last_token, streams)
         }
 
         fn draft_logits(
@@ -2783,7 +2814,47 @@ mod tests {
             bonus_token: 1,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn scheduler_sizes_new_draft_rounds_to_the_available_proposals() {
+        fn capacities(max_tokens: usize) -> Vec<usize> {
+            let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+            let prompt = Array::from_slice(&[7u32], &[1, 1]);
+            let parts = [InputPart::text_token_ids(&prompt)];
+            let mut cache = 0;
+            let mut backend = scripted_backend();
+            let mut scheduler = MtpScheduler::new(
+                &mut backend,
+                MtpExecutionStreams::single(context.stream()),
+                MtpSchedulerOptions::default().with_lookahead(false),
+            )
+            .unwrap();
+            scheduler
+                .submit_with_semantics(
+                    &mut cache,
+                    ModelInput::new(&parts),
+                    MtpConfig {
+                        max_tokens,
+                        max_draft_tokens: 2,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                    None,
+                    CountingSampler::default(),
+                    Box::new(TestSemanticState::default()),
+                    |_| {},
+                )
+                .unwrap();
+            scheduler.run().unwrap();
+            scheduler.finish().unwrap();
+            backend.draft_capacities
+        }
+
+        assert_eq!(capacities(2), [1]);
+        assert_eq!(capacities(3), [2]);
     }
 
     #[test]
@@ -3371,6 +3442,7 @@ mod tests {
                 bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             },
             &mut cache,
             input,
@@ -3414,6 +3486,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
 
@@ -3464,6 +3537,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
         let mut sampler = MirostatV2Sampler::default();
@@ -3511,6 +3585,7 @@ mod tests {
                 bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             },
             &mut cache,
             input,
@@ -3554,6 +3629,7 @@ mod tests {
                 bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             },
             &mut cache,
             input,
@@ -3674,6 +3750,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
@@ -3776,6 +3853,7 @@ mod tests {
                 bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             };
             let mut cache = 0;
             let mut scheduler = MtpScheduler::new(
@@ -3830,6 +3908,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
@@ -3892,6 +3971,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
@@ -3985,6 +4065,7 @@ mod tests {
                 bonus_token: 1,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             };
             let mut cache = 0;
             let mut callback_tokens = Vec::new();
@@ -4065,6 +4146,7 @@ mod tests {
                 bonus_token: 1,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             };
             let mut cache = 0;
             let sampler = GenerationSampler::new()
@@ -4129,6 +4211,7 @@ mod tests {
                 bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             };
             let mut cache_a = 0;
             let mut cache_b = 0;
@@ -4219,6 +4302,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
@@ -4272,6 +4356,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
@@ -4330,6 +4415,7 @@ mod tests {
                 bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             };
             let mut cache = 0;
             let mut scheduler = MtpScheduler::new(
@@ -4387,6 +4473,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
@@ -4434,6 +4521,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache_a = 0;
         let mut cache_b = 0;
@@ -4512,6 +4600,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
@@ -4566,6 +4655,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
@@ -4650,6 +4740,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache_a = 0;
         let mut cache_b = 0;
@@ -4729,6 +4820,7 @@ mod tests {
             bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
+            draft_capacities: Vec::new(),
         };
         let mut cache_a = 0;
         let mut cache_b = 0;
@@ -4791,6 +4883,7 @@ mod tests {
                 bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             };
             let mut cache_a = 0;
             let mut cache_b = 0;
@@ -4860,6 +4953,7 @@ mod tests {
                 bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
+                draft_capacities: Vec::new(),
             };
             let mut cache = 0;
             let mut scheduler = MtpScheduler::new(

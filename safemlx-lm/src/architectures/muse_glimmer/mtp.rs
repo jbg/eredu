@@ -35,6 +35,7 @@ pub(crate) struct MuseTargetState {
 pub(crate) struct MuseDraftState {
     logits: Array,
     cursor: usize,
+    proposal_capacity: usize,
     context: Array,
     cache_len: usize,
 }
@@ -176,6 +177,83 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             cache_len: state.cache_len,
         })
     }
+
+    fn begin_dflash_block(
+        &mut self,
+        state: &MuseTargetState,
+        last_token: u32,
+        proposal_capacity: usize,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<MuseDraftState, Exception> {
+        let maximum = self.max_draft_tokens();
+        if proposal_capacity == 0 || proposal_capacity > maximum {
+            return Err(Exception::custom(format!(
+                "Muse-Glimmer DFlash proposal capacity must be between 1 and {maximum}"
+            )));
+        }
+        let state = Self::state_on_draft_stream(state, streams)?;
+        if self.draft_embedding.is_none() || self.draft_head.is_none() {
+            let (embedding, head) = self
+                .target
+                .dflash_weight_snapshot(streams.draft(), streams.crosses_devices())?;
+            if streams.topology() == MtpStreamTopology::SameDeviceSplit {
+                let embedding_parameters = embedding.parameters().flatten();
+                let head_parameters = head.parameters().flatten();
+                let _ = streams.wait_for_target_outputs(
+                    embedding_parameters
+                        .values()
+                        .copied()
+                        .chain(head_parameters.values().copied()),
+                )?;
+            }
+            self.draft_embedding = Some(embedding);
+            self.draft_head = Some(head);
+        }
+        let block_size = self.assistant.config.block_size;
+        let mut ids = Vec::with_capacity(block_size);
+        ids.push(last_token);
+        ids.resize(block_size, self.assistant.config.mask_token_id);
+        let block_size = i32::try_from(block_size)
+            .map_err(|_| Exception::custom("Muse-Glimmer DFlash block size exceeds i32"))?;
+        let ids = Array::from_slice(&ids, &[1, block_size]);
+        let noise = self
+            .draft_embedding
+            .as_mut()
+            .expect("initialized")
+            .forward(&ids, streams.draft())?;
+        let states = self.assistant.proposal_states(
+            &noise,
+            &state.context,
+            i32::try_from(state.cache_len)
+                .map_err(|_| Exception::custom("Muse-Glimmer DFlash offset exceeds i32"))?,
+            streams.draft(),
+        )?;
+        // DFlash block attention is bidirectional, so removing unused mask
+        // positions changes the retained proposal distributions. Preserve the
+        // released 16-position block and trim only before the expensive raw
+        // vocabulary head.
+        let proposal_end = i32::try_from(proposal_capacity)
+            .map_err(|_| Exception::custom("Muse-Glimmer DFlash proposal capacity exceeds i32"))?;
+        let states = states.try_index_device((.., ..proposal_end, ..), streams.draft())?;
+        let logits = self
+            .draft_head
+            .as_mut()
+            .expect("initialized")
+            .forward(&states, streams.draft())?;
+        let logits = scale_logits(
+            logits,
+            self.target.args().output_multiplier,
+            self.target.args().final_logit_softcapping,
+            streams.draft(),
+        )?;
+        Ok(MuseDraftState {
+            logits,
+            cursor: 0,
+            proposal_capacity,
+            context: state.context,
+            cache_len: state.cache_len,
+        })
+    }
 }
 
 impl MtpBackend for MuseGlimmerMtpBackend<'_> {
@@ -227,7 +305,12 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         last_token: u32,
         stream: &Stream,
     ) -> Result<Self::DraftState, Exception> {
-        self.begin_draft_with_streams(state, last_token, MtpExecutionStreams::single(stream))
+        self.begin_dflash_block(
+            state,
+            last_token,
+            self.max_draft_tokens(),
+            MtpExecutionStreams::single(stream),
+        )
     }
 
     fn begin_draft_with_streams(
@@ -236,60 +319,17 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         last_token: u32,
         streams: MtpExecutionStreams<'_>,
     ) -> Result<Self::DraftState, Exception> {
-        let state = Self::state_on_draft_stream(state, streams)?;
-        if self.draft_embedding.is_none() || self.draft_head.is_none() {
-            let (embedding, head) = self
-                .target
-                .dflash_weight_snapshot(streams.draft(), streams.crosses_devices())?;
-            if streams.topology() == MtpStreamTopology::SameDeviceSplit {
-                let embedding_parameters = embedding.parameters().flatten();
-                let head_parameters = head.parameters().flatten();
-                let _ = streams.wait_for_target_outputs(
-                    embedding_parameters
-                        .values()
-                        .copied()
-                        .chain(head_parameters.values().copied()),
-                )?;
-            }
-            self.draft_embedding = Some(embedding);
-            self.draft_head = Some(head);
-        }
-        let mut ids = Vec::with_capacity(self.assistant.config.block_size);
-        ids.push(last_token);
-        ids.resize(
-            self.assistant.config.block_size,
-            self.assistant.config.mask_token_id,
-        );
-        let ids = Array::from_slice(&ids, &[1, self.assistant.config.block_size as i32]);
-        let noise = self
-            .draft_embedding
-            .as_mut()
-            .expect("initialized")
-            .forward(&ids, streams.draft())?;
-        let states = self.assistant.proposal_states(
-            &noise,
-            &state.context,
-            i32::try_from(state.cache_len)
-                .map_err(|_| Exception::custom("Muse-Glimmer DFlash offset exceeds i32"))?,
-            streams.draft(),
-        )?;
-        let logits = self
-            .draft_head
-            .as_mut()
-            .expect("initialized")
-            .forward(&states, streams.draft())?;
-        let logits = scale_logits(
-            logits,
-            self.target.args().output_multiplier,
-            self.target.args().final_logit_softcapping,
-            streams.draft(),
-        )?;
-        Ok(MuseDraftState {
-            logits,
-            cursor: 0,
-            context: state.context,
-            cache_len: state.cache_len,
-        })
+        self.begin_dflash_block(state, last_token, self.max_draft_tokens(), streams)
+    }
+
+    fn begin_draft_with_capacity(
+        &mut self,
+        state: &Self::TargetState,
+        last_token: u32,
+        proposal_capacity: usize,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Self::DraftState, Exception> {
+        self.begin_dflash_block(state, last_token, proposal_capacity, streams)
     }
 
     fn draft_logits(
@@ -298,7 +338,7 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         _last_token: u32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        if state.cursor >= self.max_draft_tokens() {
+        if state.cursor >= state.proposal_capacity {
             return Err(Exception::custom(
                 "Muse-Glimmer DFlash proposal block is exhausted",
             ));
