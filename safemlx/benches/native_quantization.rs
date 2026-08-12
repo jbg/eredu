@@ -33,6 +33,25 @@ fn sample_q5_1_block() -> Vec<u8> {
     block
 }
 
+fn sample_q5k_block() -> Vec<u8> {
+    let mut block = vec![0u8; 176];
+    block[..2].copy_from_slice(&half::f16::from_f32(0.0078125).to_bits().to_le_bytes());
+    block[2..4].copy_from_slice(&half::f16::from_f32(0.00390625).to_bits().to_le_bytes());
+    for (index, byte) in block[4..].iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(29).wrapping_add(11);
+    }
+    block
+}
+
+fn sample_q6k_block() -> Vec<u8> {
+    let mut block = vec![0u8; 210];
+    for (index, byte) in block[..208].iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(29).wrapping_add(11);
+    }
+    block[208..].copy_from_slice(&half::f16::from_f32(0.0078125).to_bits().to_le_bytes());
+    block
+}
+
 fn sample_q8_0_block() -> Vec<u8> {
     let mut block = vec![0u8; 34];
     block[..2].copy_from_slice(&half::f16::from_f32(0.015625).to_bits().to_le_bytes());
@@ -90,6 +109,8 @@ fn main() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let q4_raw = repeated_blocks(&sample_q4k_block(), (rows * columns / 256) as usize);
     let q5_raw = repeated_blocks(&sample_q5_1_block(), (rows * columns / 32) as usize);
+    let q5k_raw = repeated_blocks(&sample_q5k_block(), (rows * columns / 256) as usize);
+    let q6k_raw = repeated_blocks(&sample_q6k_block(), (rows * columns / 256) as usize);
     let q8_raw = repeated_blocks(&sample_q8_0_block(), (rows * columns / 32) as usize);
     let iq4_raw = repeated_blocks(&sample_iq4_nl_block(), (rows * columns / 32) as usize);
     let iq4_bytes = Array::from_slice(
@@ -108,6 +129,16 @@ fn main() {
             "Q5_1",
             NativeQuantizedTensor::from_q5_1_bytes(&q5_raw, &[rows, columns], &stream).unwrap(),
             q5_raw.len(),
+        ),
+        (
+            "Q5_K",
+            NativeQuantizedTensor::from_q5k_bytes(&q5k_raw, &[rows, columns], &stream).unwrap(),
+            q5k_raw.len(),
+        ),
+        (
+            "Q6_K",
+            NativeQuantizedTensor::from_q6k_bytes(&q6k_raw, &[rows, columns], &stream).unwrap(),
+            q6k_raw.len(),
         ),
         (
             "Q8_0",

@@ -392,7 +392,10 @@ impl GgmlType {
     /// These formats remain packed when converted instead of being expanded
     /// into the generic affine weight/scales/biases representation.
     pub fn has_native_execution(self) -> bool {
-        matches!(self, Self::Q4K | Self::Q5_1 | Self::Q8_0) || self.is_iq()
+        matches!(
+            self,
+            Self::Q4K | Self::Q5K | Self::Q6K | Self::Q5_1 | Self::Q8_0
+        ) || self.is_iq()
     }
 }
 
