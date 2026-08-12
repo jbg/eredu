@@ -37,7 +37,8 @@ use safemlx_lm::{
         DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
     },
     runtime::generation::speculative::{
-        LoadedDrafter, MtpConfig, MtpExecutionStreams, MtpSchedulerOptions, MtpStats,
+        LoadedDrafter, MtpComponentTimingGuard, MtpConfig, MtpExecutionStreams,
+        MtpSchedulerOptions, MtpStats,
     },
     runtime::generation::streaming::{FinishReason, SemanticEvent},
     runtime::media::input::{InputPart, ModelInput},
@@ -1029,6 +1030,7 @@ fn main() -> Result<()> {
                     safemlx_lm::runtime::generation::speculative::MtpCheckpointKind::Embedded
             }
         );
+    let _component_timing_guard = args.verbose.then(MtpComponentTimingGuard::enable);
     let scheduler_options = MtpSchedulerOptions {
         adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
         ..MtpSchedulerOptions::default()
@@ -1354,6 +1356,15 @@ fn main() -> Result<()> {
                 stats.optimistic_draft_time.as_secs_f64(),
                 stats.verification_in_flight_time.as_secs_f64(),
             );
+            if stats.component_timings_collected {
+                eprintln!(
+                    "mtp_draft_context_time: {:.3} s, mtp_draft_assistant_time: {:.3} s, mtp_draft_head_time: {:.3} s, mtp_target_verification_time: {:.3} s",
+                    stats.draft_context_time.as_secs_f64(),
+                    stats.draft_assistant_time.as_secs_f64(),
+                    stats.draft_head_time.as_secs_f64(),
+                    stats.target_verification_time.as_secs_f64(),
+                );
+            }
             eprintln!("mtp_accept_lens: {:?}", stats.accept_lens);
         }
         eprintln!("mlx_peak_memory: {}", format_bytes(peak_memory));
@@ -2750,6 +2761,7 @@ mod tests {
             "draft-id",
             "--disable-mtp-lookahead",
             "--disable-mtp-adaptive-lookahead",
+            "--verbose",
             "prompt",
         ])
         .unwrap();

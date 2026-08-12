@@ -1,7 +1,10 @@
 //! Architecture-independent multi-token prediction and speculative decoding.
 
 use std::{
+    cell::Cell,
+    marker::PhantomData,
     path::Path,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -10,7 +13,7 @@ use safemlx::{
     ops::{indexing::TryIndexOp, maximum, softmax_axis},
     random::{self, RandomState},
     transforms::{async_eval, async_eval_with_event, eval},
-    Array, Event, Stream,
+    Array, Event, Stream, TimedEvaluation,
 };
 
 use crate::{
@@ -450,12 +453,118 @@ pub struct MtpStats {
     ///
     /// This interval includes any deliberately overlapped scheduler work.
     pub verification_in_flight_time: Duration,
+    /// Whether architecture component timings were collected for this request.
+    pub component_timings_collected: bool,
+    /// Device execution time spent encoding committed target context and
+    /// projecting it into assistant K/V state.
+    pub draft_context_time: Duration,
+    /// Device execution time spent executing assistant proposal blocks.
+    pub draft_assistant_time: Duration,
+    /// Device execution time spent projecting proposal states to vocabulary logits.
+    pub draft_head_time: Duration,
+    /// Device execution time spent executing target verification passes.
+    pub target_verification_time: Duration,
     /// Scheduler operations performed for this request.
     pub scheduler_turns: usize,
     /// Times this request was drafted while another request had target work in flight.
     pub cross_request_draft_opportunities: usize,
     /// Wall-clock generation duration.
     pub elapsed: Duration,
+}
+
+/// Component timings accumulated by an architecture-specific MTP backend.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MtpComponentTimings {
+    /// Committed-context encoding and assistant K/V projection.
+    pub draft_context: Duration,
+    /// Assistant proposal-block execution.
+    pub draft_assistant: Duration,
+    /// Raw vocabulary-head projection.
+    pub draft_head: Duration,
+    /// Target verification execution.
+    pub target_verification: Duration,
+}
+
+thread_local! {
+    static COMPONENT_TIMING_ENABLED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Scoped opt-in for device-timeline MTP component profiling.
+///
+/// Schedulers created while this guard is alive collect architecture-level
+/// timings. Timestamp boundaries add profiling overhead, so normal generation
+/// leaves them disabled. The guard is intentionally bound to its creating
+/// thread and restores the previous setting when dropped.
+pub struct MtpComponentTimingGuard {
+    previous: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl MtpComponentTimingGuard {
+    /// Enables component profiling for schedulers created on this thread.
+    pub fn enable() -> Self {
+        let previous = COMPONENT_TIMING_ENABLED.replace(true);
+        Self {
+            previous,
+            _thread_bound: PhantomData,
+        }
+    }
+}
+
+impl Drop for MtpComponentTimingGuard {
+    fn drop(&mut self) {
+        COMPONENT_TIMING_ENABLED.set(self.previous);
+    }
+}
+
+fn component_timing_enabled() -> bool {
+    COMPONENT_TIMING_ENABLED.get()
+}
+
+impl MtpComponentTimings {
+    fn add_to(self, stats: &mut MtpStats) {
+        stats.draft_context_time += self.draft_context;
+        stats.draft_assistant_time += self.draft_assistant;
+        stats.draft_head_time += self.draft_head;
+        stats.target_verification_time += self.target_verification;
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MtpComponentTimingEvaluations {
+    draft_context: Vec<TimedEvaluation>,
+    draft_assistant: Vec<TimedEvaluation>,
+    draft_head: Vec<TimedEvaluation>,
+}
+
+impl MtpComponentTimingEvaluations {
+    pub(crate) fn push_draft_context(&mut self, timing: Option<TimedEvaluation>) {
+        self.draft_context.extend(timing);
+    }
+
+    pub(crate) fn push_draft_assistant(&mut self, timing: Option<TimedEvaluation>) {
+        self.draft_assistant.extend(timing);
+    }
+
+    pub(crate) fn push_draft_head(&mut self, timing: Option<TimedEvaluation>) {
+        self.draft_head.extend(timing);
+    }
+
+    pub(crate) fn resolve(&mut self) -> Result<MtpComponentTimings, Exception> {
+        fn sum(timings: &mut Vec<TimedEvaluation>) -> Result<Duration, Exception> {
+            timings.drain(..).try_fold(
+                Duration::ZERO,
+                |total, timing| Ok(total + timing.elapsed()?),
+            )
+        }
+
+        Ok(MtpComponentTimings {
+            draft_context: sum(&mut self.draft_context)?,
+            draft_assistant: sum(&mut self.draft_assistant)?,
+            draft_head: sum(&mut self.draft_head)?,
+            target_verification: Duration::ZERO,
+        })
+    }
 }
 
 /// Aggregate bounded-scheduler telemetry.
@@ -532,6 +641,27 @@ pub trait MtpBackend {
     /// Maximum proposals supported by this backend in one round.
     fn max_draft_tokens(&self) -> usize {
         usize::MAX
+    }
+
+    /// Enables asynchronous device-timeline component timing for diagnostic runs.
+    fn set_component_timing(&mut self, _enabled: bool) {}
+
+    /// Returns whether this backend exposes synchronized component timings.
+    fn supports_component_timing(&self) -> bool {
+        false
+    }
+
+    /// Resolves and drains draft-component timings recorded since the previous call.
+    fn take_component_timings(&mut self) -> Result<MtpComponentTimings, Exception> {
+        Ok(MtpComponentTimings::default())
+    }
+
+    /// Resolves component timing carried by one target verification result.
+    fn take_verification_component_timings(
+        &mut self,
+        _output: &mut Self::Verification,
+    ) -> Result<MtpComponentTimings, Exception> {
+        Ok(MtpComponentTimings::default())
     }
 
     /// Returns whether a cloned draft state is an exact, discardable frontier
@@ -921,6 +1051,7 @@ pub struct MtpScheduler<'a, B: MtpBackend, S> {
     backend: &'a mut B,
     streams: MtpExecutionStreams<'a>,
     options: MtpSchedulerOptions,
+    component_timing: bool,
     requests: Vec<ScheduledRequest<'a, B, S>>,
     cursor: usize,
     stats: MtpSchedulerStats,
@@ -960,10 +1091,13 @@ where
                 "MTP adaptive_lookahead_min_blocks must be positive",
             ));
         }
+        let component_timing = component_timing_enabled() && backend.supports_component_timing();
+        backend.set_component_timing(component_timing);
         Ok(Self {
             backend,
             streams,
             options,
+            component_timing,
             requests: Vec::new(),
             cursor: 0,
             stats: MtpSchedulerStats {
@@ -1071,6 +1205,7 @@ where
                 draft_rng: None,
                 stats: MtpStats {
                     stream_topology: self.streams.topology(),
+                    component_timings_collected: self.component_timing,
                     ..MtpStats::default()
                 },
                 started,
@@ -1093,6 +1228,7 @@ where
                 draft_rng: None,
                 stats: MtpStats {
                     stream_topology: self.streams.topology(),
+                    component_timings_collected: self.component_timing,
                     ..MtpStats::default()
                 },
                 started,
@@ -1117,6 +1253,7 @@ where
             draft_rng,
             stats: MtpStats {
                 stream_topology: self.streams.topology(),
+                component_timings_collected: self.component_timing,
                 ..MtpStats::default()
             },
             started,
@@ -1430,13 +1567,14 @@ where
                 .target_state
                 .as_ref()
                 .expect("ready request has target state");
+            let state = self.backend.begin_draft_with_capacity(
+                target_state,
+                last,
+                target_count,
+                self.streams,
+            )?;
             DraftBlock {
-                state: self.backend.begin_draft_with_capacity(
-                    target_state,
-                    last,
-                    target_count,
-                    self.streams,
-                )?,
+                state,
                 proposals: Vec::new(),
             }
         };
@@ -1483,6 +1621,9 @@ where
             request.stats.draft_tokens += proposals.len();
             block.proposals.extend(proposals);
         }
+        self.backend
+            .take_component_timings()?
+            .add_to(&mut request.stats);
         if cross_request && additional > 0 {
             request.stats.cross_request_draft_opportunities += 1;
             self.stats.cross_request_draft_opportunities += 1;
@@ -1633,6 +1774,9 @@ where
             .in_flight
             .take()
             .expect("resolving request has an in-flight verification");
+        self.backend
+            .take_verification_component_timings(&mut flight.verification)?
+            .add_to(&mut request.stats);
         request.stats.verification_in_flight_time += flight.submitted.elapsed();
         let DraftBlock {
             state,
@@ -4999,6 +5143,43 @@ mod tests {
     #[test]
     fn empty_stats_have_zero_acceptance_rate() {
         assert_eq!(MtpStats::default().accept_rate(), 0.0);
+    }
+
+    #[test]
+    fn component_timings_accumulate_without_overwriting_scheduler_stats() {
+        let mut stats = MtpStats {
+            rounds: 7,
+            draft_context_time: Duration::from_millis(2),
+            ..MtpStats::default()
+        };
+        MtpComponentTimings {
+            draft_context: Duration::from_millis(3),
+            draft_assistant: Duration::from_millis(5),
+            draft_head: Duration::from_millis(7),
+            target_verification: Duration::from_millis(11),
+        }
+        .add_to(&mut stats);
+
+        assert_eq!(stats.rounds, 7);
+        assert_eq!(stats.draft_context_time, Duration::from_millis(5));
+        assert_eq!(stats.draft_assistant_time, Duration::from_millis(5));
+        assert_eq!(stats.draft_head_time, Duration::from_millis(7));
+        assert_eq!(stats.target_verification_time, Duration::from_millis(11));
+    }
+
+    #[test]
+    fn component_timing_guard_is_scoped_and_nested() {
+        assert!(!component_timing_enabled());
+        {
+            let _outer = MtpComponentTimingGuard::enable();
+            assert!(component_timing_enabled());
+            {
+                let _inner = MtpComponentTimingGuard::enable();
+                assert!(component_timing_enabled());
+            }
+            assert!(component_timing_enabled());
+        }
+        assert!(!component_timing_enabled());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use safemlx::{
     nn,
     ops::indexing::TryIndexOp,
     quantization::MaybeQuantized,
-    transforms::async_eval_with_event,
+    transforms::{async_eval, async_eval_timed, async_eval_with_event},
     Array, Stream,
 };
 
@@ -20,7 +20,8 @@ use crate::{
     runtime::{
         cache::KeyValueCache,
         generation::speculative::{
-            MtpBackend, MtpCommit, MtpExecutionStreams, MtpPrefill, MtpStreamTopology,
+            MtpBackend, MtpCommit, MtpComponentTimingEvaluations, MtpComponentTimings,
+            MtpExecutionStreams, MtpPrefill, MtpStreamTopology,
         },
     },
 };
@@ -51,6 +52,8 @@ pub(crate) struct MuseGlimmerMtpBackend<'a> {
     assistant: &'a mut MuseGlimmerDFlash,
     draft_embedding: Option<MaybeQuantized<nn::Embedding>>,
     draft_head: Option<MaybeQuantized<nn::Linear>>,
+    component_timing: bool,
+    component_timings: MtpComponentTimingEvaluations,
 }
 
 impl<'a> MuseGlimmerMtpBackend<'a> {
@@ -63,6 +66,8 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             assistant,
             draft_embedding: None,
             draft_head: None,
+            component_timing: false,
+            component_timings: MtpComponentTimingEvaluations::default(),
         }
     }
 
@@ -231,20 +236,31 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             .as_mut()
             .expect("initialized")
             .forward(&ids, streams.draft())?;
+        if self.component_timing {
+            // The released target embedding is not part of the assistant body.
+            // Submit it before the assistant timestamp boundary so the
+            // assistant phase measures only the DFlash layers.
+            async_eval([&noise])?;
+        }
         let absolute_context_end = i32::try_from(state.cache_len)
             .map_err(|_| Exception::custom("Muse-Glimmer DFlash offset exceeds i32"))?;
-        let draft_cache = self.assistant.update_context_cache(
+        let (draft_cache, context_timing) = self.assistant.update_context_cache(
             state.draft_cache,
             state.pending_context.as_ref(),
             absolute_context_end,
+            self.component_timing,
             streams.draft(),
         )?;
-        let states = self.assistant.proposal_states(
+        self.component_timings.push_draft_context(context_timing);
+        let (states, assistant_timing) = self.assistant.proposal_states(
             &noise,
             &draft_cache,
             absolute_context_end,
+            self.component_timing,
             streams.draft(),
         )?;
+        self.component_timings
+            .push_draft_assistant(assistant_timing);
         // DFlash block attention is bidirectional, so removing unused mask
         // positions changes the retained proposal distributions. Preserve the
         // released 16-position block and trim only before the expensive raw
@@ -263,6 +279,11 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             self.target.args().final_logit_softcapping,
             streams.draft(),
         )?;
+        let head_timing = self
+            .component_timing
+            .then(|| async_eval_timed([&logits], streams.draft()))
+            .transpose()?;
+        self.component_timings.push_draft_head(head_timing);
         Ok(MuseDraftState {
             logits,
             cursor: 0,
@@ -282,6 +303,29 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
 
     fn max_draft_tokens(&self) -> usize {
         self.assistant.config.block_size.saturating_sub(1).min(15)
+    }
+
+    fn set_component_timing(&mut self, enabled: bool) {
+        self.component_timing = enabled;
+        self.component_timings = MtpComponentTimingEvaluations::default();
+    }
+
+    fn supports_component_timing(&self) -> bool {
+        true
+    }
+
+    fn take_component_timings(&mut self) -> Result<MtpComponentTimings, Exception> {
+        self.component_timings.resolve()
+    }
+
+    fn take_verification_component_timings(
+        &mut self,
+        output: &mut Self::Verification,
+    ) -> Result<MtpComponentTimings, Exception> {
+        Ok(MtpComponentTimings {
+            target_verification: output.output.device_time,
+            ..MtpComponentTimings::default()
+        })
     }
 
     fn prefill(
@@ -379,8 +423,13 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         let input_len = input_tokens.dim(1) as usize;
         let target_layers = self.assistant.config.target_layer_ids.clone();
         let output = Self::with_cache(cache, |cache| {
-            self.target
-                .verify_dflash(input_tokens, cache, &target_layers, stream)
+            self.target.verify_dflash(
+                input_tokens,
+                cache,
+                &target_layers,
+                self.component_timing,
+                stream,
+            )
         })?;
         Ok(MuseVerification { output, input_len })
     }

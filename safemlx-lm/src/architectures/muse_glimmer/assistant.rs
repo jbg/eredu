@@ -13,7 +13,8 @@ use safemlx::{
         GgufMetadataValue,
     },
     quantization::MaybeQuantized,
-    Array, Dtype, Stream,
+    transforms::async_eval_timed,
+    Array, Dtype, Stream, TimedEvaluation,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -619,8 +620,9 @@ impl MuseGlimmerDFlash {
         previous: Option<DFlashContextCache>,
         pending_target_states: Option<&Array>,
         absolute_context_end: i32,
+        component_timing: bool,
         stream: &Stream,
-    ) -> Result<DFlashContextCache, Exception> {
+    ) -> Result<(DFlashContextCache, Option<TimedEvaluation>), Exception> {
         let pending_len = pending_target_states.map_or(0, |states| states.dim(1));
         let pending_start = context_append_start(
             previous.as_ref().map(DFlashContextCache::end),
@@ -628,7 +630,7 @@ impl MuseGlimmerDFlash {
             absolute_context_end,
         )?;
         if pending_len == 0 {
-            return previous.ok_or_else(|| {
+            return previous.map(|cache| (cache, None)).ok_or_else(|| {
                 Exception::custom("Muse-Glimmer DFlash cache cannot start from empty context")
             });
         }
@@ -681,12 +683,26 @@ impl MuseGlimmerDFlash {
             (encoded, layers)
         };
         let retained = encoded.dim(1);
-        Ok(DFlashContextCache {
+        let cache = DFlashContextCache {
             encoded,
             layers,
             start: absolute_context_end - retained,
             end: absolute_context_end,
-        })
+        };
+        let timing = if component_timing {
+            Some(async_eval_timed(
+                std::iter::once(&cache.encoded).chain(
+                    cache
+                        .layers
+                        .iter()
+                        .flat_map(|layer| [&layer.keys, &layer.values]),
+                ),
+                stream,
+            )?)
+        } else {
+            None
+        };
+        Ok((cache, timing))
     }
 
     /// Runs the anchor-plus-mask block and returns the fifteen proposal states.
@@ -695,8 +711,9 @@ impl MuseGlimmerDFlash {
         noise_embeds: &Array,
         context: &DFlashContextCache,
         absolute_context_end: i32,
+        component_timing: bool,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
+    ) -> Result<(Array, Option<TimedEvaluation>), Exception> {
         if noise_embeds.shape() != [1, self.config.block_size as i32, self.config.hidden_size]
             || context.end != absolute_context_end
             || context.encoded.ndim() != 3
@@ -729,7 +746,11 @@ impl MuseGlimmerDFlash {
             )?;
         }
         let hidden = self.norm.forward(&hidden, stream)?;
-        hidden.try_index_device((.., 1..self.config.block_size as i32, ..), stream)
+        let states = hidden.try_index_device((.., 1..self.config.block_size as i32, ..), stream)?;
+        let timing = component_timing
+            .then(|| async_eval_timed([&states], stream))
+            .transpose()?;
+        Ok((states, timing))
     }
 }
 

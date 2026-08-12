@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use safemlx::{
@@ -162,6 +162,7 @@ impl LayerwiseDecoder {
             MuseGlimmerAdapterInput::Prefill(input),
             cache,
             target_layers,
+            false,
             stream,
         )
     }
@@ -171,6 +172,7 @@ impl LayerwiseDecoder {
         tokens: &Array,
         cache: &mut MuseGlimmerLayerwiseCache,
         target_layers: &[usize],
+        component_timing: bool,
         stream: &Stream,
     ) -> Result<DFlashTargetOutput, Exception> {
         self.forward_dflash(
@@ -180,6 +182,7 @@ impl LayerwiseDecoder {
             },
             cache,
             target_layers,
+            component_timing,
             stream,
         )
     }
@@ -189,6 +192,7 @@ impl LayerwiseDecoder {
         input: MuseGlimmerAdapterInput<'_>,
         cache: &mut MuseGlimmerLayerwiseCache,
         target_layers: &[usize],
+        component_timing: bool,
         stream: &Stream,
     ) -> Result<DFlashTargetOutput, Exception> {
         let mut captured = BTreeMap::<usize, Array>::new();
@@ -201,10 +205,35 @@ impl LayerwiseDecoder {
             }
             Ok(())
         };
-        let logits = self
-            .execution
-            .forward_with_observer(input, cache, stream, &mut observer)
-            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut device_time = Duration::ZERO;
+        let logits = if component_timing {
+            let mut observer =
+                crate::runtime::execution::inspection::ActivationObserverProxy(&mut observer);
+            self.execution.forward_with_layer_executor(
+                input,
+                cache,
+                stream,
+                |adapter, group, index, layer, hidden, cache, context, stream| {
+                    let output = adapter.forward_layer_with_observer(
+                        group,
+                        index,
+                        layer,
+                        hidden,
+                        cache,
+                        context,
+                        stream,
+                        &mut observer,
+                    )?;
+                    device_time +=
+                        safemlx::transforms::async_eval_timed([&output], stream)?.elapsed()?;
+                    Ok(output)
+                },
+            )
+        } else {
+            self.execution
+                .forward_with_observer(input, cache, stream, &mut observer)
+        }
+        .map_err(|error| Exception::custom(error.to_string()))?;
         let mut states = Vec::with_capacity(target_layers.len());
         for &layer in target_layers {
             let state = captured.remove(&layer).ok_or_else(|| {
@@ -217,6 +246,7 @@ impl LayerwiseDecoder {
         Ok(DFlashTargetOutput {
             logits,
             states: concatenate_axis(&states, -1, stream)?,
+            device_time,
         })
     }
 
@@ -774,6 +804,7 @@ impl LayerwiseDecoder {
 pub(crate) struct DFlashTargetOutput {
     pub(crate) logits: Array,
     pub(crate) states: Array,
+    pub(crate) device_time: Duration,
 }
 
 fn weightless_rms(value: &Array, eps: f32, stream: &Stream) -> Result<Array, Exception> {
