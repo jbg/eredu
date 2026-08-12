@@ -4,14 +4,28 @@
 //! unavailable data. Automatic planners must not turn a missing device-memory
 //! query or an unknown materialized weight size into a zero-byte value.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
-use super::{available_memory, ArtifactKind, CapabilityValue, ModelKind, PhysicalMemorySemantics};
+use super::{
+    available_memory, inspect_model, ArtifactKind, CapabilityValue, InspectionSeverity,
+    ModelInspectionOptions, ModelKind, ModelLoadOptions, PhysicalMemorySemantics,
+};
+use crate::error::Error;
 use crate::runtime::{
+    checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    execution::layerwise::{LayerwiseLoadOptions, NonExpertWeightResidency, WeightResidency},
     generation::speculative::MtpStats,
-    residency::policy::{MemoryTier, TransferDirection},
+    residency::{
+        dense_stream::DenseDiskStreamLoadOptions,
+        expert_cache::ExpertCacheLoadOptions,
+        policy::{MemoryTier, OffloadConfig, TransferDirection},
+    },
 };
 
 /// Schema version shared by automatic-planning and telemetry documents.
@@ -585,6 +599,205 @@ pub struct ExecutionPlanReport {
     pub explanation: PlanExplanation,
 }
 
+/// Tunable bounds used by [`AutomaticPlanner`].
+///
+/// The defaults implement the conservative single-device policy used by the
+/// example CLI. Applications may persist this value beside planning requests
+/// so later policy changes remain explicit and reproducible.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct AutomaticPlannerPolicy {
+    /// Device budget used when current device availability is unavailable.
+    pub device_memory_fallback_bytes: u64,
+    /// Host budget used when current host availability is unavailable.
+    pub host_memory_fallback_bytes: u64,
+    /// Percentage of observed free memory reserved for runtime state and drift.
+    pub memory_headroom_percent: u8,
+    /// Percentage of bounded residency budgets assigned to routed experts.
+    pub expert_cache_share_percent: u8,
+    /// Repeated execution groups retained in the layerwise device window.
+    pub device_layer_window: usize,
+    /// Maximum simultaneously mapped checkpoint shards or readers.
+    pub max_mapped_shards: usize,
+    /// Maximum proposals used when embedded MTP is available.
+    pub embedded_mtp_draft_tokens: usize,
+    /// Minimum generated-token count for one prior run to influence planning.
+    pub minimum_feedback_tokens: usize,
+}
+
+impl Default for AutomaticPlannerPolicy {
+    fn default() -> Self {
+        Self {
+            device_memory_fallback_bytes: 4 << 30,
+            host_memory_fallback_bytes: 16 << 30,
+            memory_headroom_percent: 30,
+            expert_cache_share_percent: 40,
+            device_layer_window: 1,
+            max_mapped_shards: crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            embedded_mtp_draft_tokens: 3,
+            minimum_feedback_tokens: 1,
+        }
+    }
+}
+
+/// Owned input to one automatic planning session.
+///
+/// `prior_telemetry` is deliberately the same stable telemetry document
+/// emitted by the runtime. A host application can persist completed runs and
+/// submit them on a later launch without translating them into planner-private
+/// scores or cache records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AutomaticPlanRequest {
+    /// Version of this serialized request.
+    pub schema_version: u32,
+    /// Local model directory or GGUF checkpoint to inspect.
+    pub model_path: PathBuf,
+    /// Single execution device to plan for.
+    pub device: DevicePlan,
+    /// Completed runtime observations from earlier sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_telemetry: Vec<ExecutionTelemetry>,
+}
+
+impl AutomaticPlanRequest {
+    /// Creates a request with no historical runtime feedback.
+    pub fn new(model_path: impl Into<PathBuf>, device: DevicePlan) -> Self {
+        Self {
+            schema_version: AUTOMATIC_SCHEMA_VERSION,
+            model_path: model_path.into(),
+            device,
+            prior_telemetry: Vec::new(),
+        }
+    }
+
+    /// Adds completed telemetry for consideration during this planning session.
+    pub fn with_prior_telemetry(
+        mut self,
+        telemetry: impl IntoIterator<Item = ExecutionTelemetry>,
+    ) -> Self {
+        self.prior_telemetry.extend(telemetry);
+        self
+    }
+}
+
+/// Stable automatic planner facade intended for embedding applications.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct AutomaticPlanner {
+    policy: AutomaticPlannerPolicy,
+}
+
+impl AutomaticPlanner {
+    /// Creates a planner with an explicit, serializable policy.
+    pub fn new(policy: AutomaticPlannerPolicy) -> Self {
+        Self { policy }
+    }
+
+    /// Returns the policy used for subsequent planning calls.
+    pub fn policy(&self) -> &AutomaticPlannerPolicy {
+        &self.policy
+    }
+
+    /// Inspects a model and selects one currently loadable execution plan.
+    ///
+    /// Matching prior telemetry is grouped by exact execution plan and ranked
+    /// by median post-first-token decode rate, falling back to overall token
+    /// rate. A historical plan is considered only when its model and stable
+    /// hardware identity still match, it remains within current memory bounds,
+    /// and header-only inspection still admits its load policy.
+    pub fn plan(&self, request: &AutomaticPlanRequest) -> Result<ExecutionPlanReport, Error> {
+        plan_automatic_execution_with_policy(request, &self.policy)
+    }
+}
+
+/// Plans one execution using [`AutomaticPlannerPolicy::default`].
+pub fn plan_automatic_execution(
+    request: &AutomaticPlanRequest,
+) -> Result<ExecutionPlanReport, Error> {
+    AutomaticPlanner::default().plan(request)
+}
+
+/// Converts a serialized execution plan into loader options.
+///
+/// Device selection and speculative decoding streams remain caller-owned;
+/// this conversion applies weight transformation and residency choices.
+pub fn execution_plan_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions, Error> {
+    if plan.schema_version != AUTOMATIC_SCHEMA_VERSION {
+        return Err(Error::AutomaticPlanning(format!(
+            "execution plan schema {} does not match supported schema {}",
+            plan.schema_version, AUTOMATIC_SCHEMA_VERSION
+        )));
+    }
+    if plan.parallelism.tensor != 1
+        || plan.parallelism.pipeline != 1
+        || plan.parallelism.expert != 1
+    {
+        return Err(Error::AutomaticPlanning(
+            "single-device automatic plans require a 1x1x1 parallel topology".into(),
+        ));
+    }
+    let mut load = match plan.weight_transformation {
+        WeightTransformationPlan::PreserveCheckpoint => ModelLoadOptions::default(),
+        WeightTransformationPlan::Affine { bits, group_size } => {
+            ModelLoadOptions::with_quantization(AffineQuantization::new(group_size, bits)?)
+        }
+        WeightTransformationPlan::MxFp4 => {
+            ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+        }
+    };
+    let residency = match &plan.residency {
+        ResidencyPlan::FullyResident => NonExpertWeightResidency::FullyResident,
+        ResidencyPlan::LayerwiseHost {
+            device_layer_window,
+            device_budget_bytes,
+            host_budget_bytes,
+        } => NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions {
+            offload: OffloadConfig::new(
+                *device_budget_bytes,
+                *host_budget_bytes,
+                *device_layer_window,
+            )?,
+            max_mapped_shards: plan.max_mapped_shards,
+            ..LayerwiseLoadOptions::default()
+        }),
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            host_budget_bytes,
+            host_lookahead,
+            background_queue,
+        } => {
+            let mut options = DenseDiskStreamLoadOptions::new(
+                *device_budget_bytes,
+                *host_budget_bytes,
+                *host_lookahead,
+                *background_queue,
+            )?;
+            options.max_mapped_shards = plan.max_mapped_shards;
+            NonExpertWeightResidency::DenseDiskStream(options)
+        }
+    };
+    let residency = if let Some(expert) = &plan.expert_cache {
+        let experts = OffloadConfig::new(expert.device_budget_bytes, expert.host_budget_bytes, 1)?;
+        WeightResidency::with_expert_cache(
+            residency,
+            ExpertCacheLoadOptions::new(experts, expert.scratch_bytes, expert.prefill_bank_bytes)?,
+        )
+    } else {
+        match residency {
+            NonExpertWeightResidency::FullyResident => WeightResidency::fully_resident(),
+            NonExpertWeightResidency::LayerwiseHost(options) => {
+                WeightResidency::layerwise_host(options)
+            }
+            NonExpertWeightResidency::DenseDiskStream(options) => {
+                WeightResidency::dense_disk_stream(options)
+            }
+        }
+    };
+    load = load.with_weight_residency(residency);
+    Ok(load)
+}
+
 /// Timings reported for one CLI or server generation request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimingTelemetry {
@@ -813,6 +1026,730 @@ pub struct ExecutionTelemetry {
     pub mtp: Option<MtpTelemetry>,
 }
 
+#[derive(Debug)]
+struct AutomaticCandidateAdmission {
+    supported: bool,
+    rejection: Option<String>,
+}
+
+fn automatic_observed_u64(value: &Observed<u64>) -> Option<u64> {
+    match value {
+        Observed::Available { value, .. } => Some(*value),
+        Observed::Unsupported { .. } | Observed::Unavailable { .. } => None,
+    }
+}
+
+fn validate_automatic_policy(policy: &AutomaticPlannerPolicy) -> Result<(), Error> {
+    if policy.device_memory_fallback_bytes == 0 || policy.host_memory_fallback_bytes == 0 {
+        return Err(Error::AutomaticPlanning(
+            "automatic fallback memory budgets must be greater than zero".into(),
+        ));
+    }
+    if policy.memory_headroom_percent >= 100 {
+        return Err(Error::AutomaticPlanning(
+            "automatic memory headroom must be less than 100 percent".into(),
+        ));
+    }
+    if policy.expert_cache_share_percent == 0 || policy.expert_cache_share_percent >= 100 {
+        return Err(Error::AutomaticPlanning(
+            "automatic expert-cache share must be between 1 and 99 percent".into(),
+        ));
+    }
+    if policy.device_layer_window == 0
+        || policy.max_mapped_shards == 0
+        || policy.embedded_mtp_draft_tokens == 0
+        || policy.minimum_feedback_tokens == 0
+    {
+        return Err(Error::AutomaticPlanning(
+            "automatic count and token policy values must be greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn automatic_budget(available: Option<u64>, fallback: u64, headroom_percent: u8) -> u64 {
+    available
+        .map(|bytes| bytes.saturating_mul(u64::from(100 - headroom_percent)) / 100)
+        .unwrap_or(fallback)
+        .max(1)
+}
+
+fn selected_device_profile(
+    hardware: &HardwareProfile,
+    device: DevicePlan,
+) -> Option<&HardwareDeviceProfile> {
+    hardware
+        .backends
+        .iter()
+        .find(|backend| backend.kind == device.backend && backend.available)
+        .and_then(|backend| {
+            backend
+                .devices
+                .iter()
+                .find(|candidate| candidate.index == device.index)
+        })
+}
+
+fn validate_automatic_device(hardware: &HardwareProfile, device: DevicePlan) -> Result<(), Error> {
+    let backend = hardware
+        .backends
+        .iter()
+        .find(|backend| backend.kind == device.backend)
+        .ok_or_else(|| {
+            Error::AutomaticPlanning(format!(
+                "hardware discovery did not report the selected {:?} backend",
+                device.backend
+            ))
+        })?;
+    if !backend.available {
+        return Err(Error::AutomaticPlanning(format!(
+            "selected {:?} backend is unavailable: {}",
+            device.backend,
+            backend.detail.as_deref().unwrap_or("no detail reported")
+        )));
+    }
+    if !backend
+        .devices
+        .iter()
+        .any(|candidate| candidate.index == device.index)
+    {
+        return Err(Error::AutomaticPlanning(format!(
+            "hardware discovery did not report {:?} device index {}",
+            device.backend, device.index
+        )));
+    }
+    Ok(())
+}
+
+fn automatic_model_bytes(resources: &ModelResourceProfile) -> Option<(u64, &'static str)> {
+    automatic_observed_u64(&resources.materialized_parameter_bytes)
+        .map(|bytes| (bytes, "materialized parameter estimate"))
+        .or_else(|| {
+            automatic_observed_u64(&resources.stored_tensor_bytes)
+                .map(|bytes| (bytes, "stored checkpoint tensor bytes"))
+        })
+}
+
+fn automatic_base_candidates(
+    device: DevicePlan,
+    device_budget: u64,
+    host_budget: u64,
+    policy: &AutomaticPlannerPolicy,
+) -> [ExecutionPlan; 3] {
+    let mut resident = ExecutionPlan::fully_resident(device);
+    resident.max_mapped_shards = policy.max_mapped_shards;
+    let mut layerwise = resident.clone();
+    layerwise.residency = ResidencyPlan::LayerwiseHost {
+        device_layer_window: policy.device_layer_window,
+        device_budget_bytes: Some(device_budget),
+        host_budget_bytes: Some(host_budget),
+    };
+    let mut disk = resident.clone();
+    disk.residency = ResidencyPlan::DenseDiskStream {
+        device_budget_bytes: device_budget,
+        host_budget_bytes: host_budget,
+        host_lookahead: usize::from(host_budget > 0) * 2,
+        background_queue: usize::from(host_budget > 0) * 2,
+    };
+    [resident, layerwise, disk]
+}
+
+fn inspect_automatic_candidate(
+    model_path: &Path,
+    plan: &ExecutionPlan,
+) -> Result<AutomaticCandidateAdmission, Error> {
+    let report = inspect_model(
+        model_path,
+        ModelInspectionOptions {
+            load: execution_plan_load_options(plan)?,
+            chat_request: None,
+        },
+    )?;
+    let supported = report.is_loadable();
+    let rejection = (!supported).then(|| {
+        report
+            .issues
+            .iter()
+            .find(|issue| issue.severity == InspectionSeverity::Error)
+            .map(|issue| issue.detail.clone())
+            .unwrap_or_else(|| "checkpoint inspection did not admit this load policy".into())
+    });
+    Ok(AutomaticCandidateAdmission {
+        supported,
+        rejection,
+    })
+}
+
+fn automatic_embedded_mtp_count(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in ["mtp_num_hidden_layers", "num_nextn_predict_layers"] {
+                if let Some(count) = object.get(key).and_then(serde_json::Value::as_u64) {
+                    return Some(count);
+                }
+            }
+            object.values().find_map(automatic_embedded_mtp_count)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(automatic_embedded_mtp_count),
+        _ => None,
+    }
+}
+
+fn automatic_embedded_mtp_layers(
+    model_path: &Path,
+    kind: Option<ModelKind>,
+) -> Result<Option<usize>, Error> {
+    if !matches!(
+        kind,
+        Some(
+            ModelKind::DeepSeekV3
+                | ModelKind::Inkling
+                | ModelKind::NemotronH
+                | ModelKind::Qwen3Next
+                | ModelKind::Qwen35
+        )
+    ) {
+        return Ok(Some(0));
+    }
+    if !model_path.is_dir() {
+        return Ok(None);
+    }
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(model_path.join("config.json"))?)?;
+    automatic_embedded_mtp_count(&config)
+        .map(|count| {
+            usize::try_from(count).map_err(|_| {
+                Error::AutomaticPlanning("embedded MTP layer count exceeds usize".into())
+            })
+        })
+        .transpose()
+        .map(|count| Some(count.unwrap_or(0)))
+}
+
+fn automatic_with_expert_cache(
+    mut plan: ExecutionPlan,
+    policy: &AutomaticPlannerPolicy,
+) -> ExecutionPlan {
+    let split = |bytes: u64, percent: u8| bytes.saturating_mul(u64::from(percent)) / 100;
+    let ordinary_share = 100 - policy.expert_cache_share_percent;
+    let (device_budget, host_budget) = match &mut plan.residency {
+        ResidencyPlan::FullyResident => (
+            policy.device_memory_fallback_bytes,
+            policy.host_memory_fallback_bytes,
+        ),
+        ResidencyPlan::LayerwiseHost {
+            device_budget_bytes,
+            host_budget_bytes,
+            ..
+        } => {
+            let device = device_budget_bytes.unwrap_or(policy.device_memory_fallback_bytes);
+            let host = host_budget_bytes.unwrap_or(policy.host_memory_fallback_bytes);
+            *device_budget_bytes = Some(split(device, ordinary_share).max(1));
+            *host_budget_bytes = Some(split(host, ordinary_share).max(1));
+            (device, host)
+        }
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            host_budget_bytes,
+            ..
+        } => {
+            let device = *device_budget_bytes;
+            let host = *host_budget_bytes;
+            *device_budget_bytes = split(device, ordinary_share).max(1);
+            *host_budget_bytes = split(host, ordinary_share).max(1);
+            (device, host)
+        }
+    };
+    let scratch = (1_u64 << 30).min(device_budget.max(1));
+    plan.expert_cache = Some(ExpertCachePlan {
+        device_budget_bytes: Some(split(device_budget, policy.expert_cache_share_percent).max(1)),
+        host_budget_bytes: Some(split(host_budget, policy.expert_cache_share_percent).max(1)),
+        scratch_bytes: scratch,
+        prefill_bank_bytes: scratch,
+    });
+    plan
+}
+
+fn choose_automatic_residency(
+    resident_fits: bool,
+    layerwise_fits: bool,
+    resident_supported: bool,
+    layerwise_supported: bool,
+    disk_supported: bool,
+) -> Option<usize> {
+    if resident_fits && resident_supported {
+        Some(0)
+    } else if layerwise_fits && layerwise_supported {
+        Some(1)
+    } else if disk_supported {
+        Some(2)
+    } else if layerwise_supported {
+        Some(1)
+    } else if resident_supported {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn automatic_plan_resource_admitted(
+    hardware: &HardwareProfile,
+    resources: &ModelResourceProfile,
+    plan: &ExecutionPlan,
+    policy: &AutomaticPlannerPolicy,
+) -> bool {
+    let observed_device = selected_device_profile(hardware, plan.device)
+        .and_then(|device| automatic_observed_u64(&device.available_memory_bytes));
+    let observed_host = automatic_observed_u64(&hardware.available_memory_bytes);
+    let device_limit = automatic_budget(
+        observed_device,
+        policy.device_memory_fallback_bytes,
+        policy.memory_headroom_percent,
+    );
+    let host_limit = automatic_budget(
+        observed_host,
+        policy.host_memory_fallback_bytes,
+        policy.memory_headroom_percent,
+    );
+    if matches!(plan.residency, ResidencyPlan::FullyResident) {
+        return automatic_model_bytes(resources).is_some_and(|(bytes, _)| bytes <= device_limit);
+    }
+    let (mut device_required, mut host_required) = match plan.residency {
+        ResidencyPlan::LayerwiseHost {
+            device_budget_bytes: Some(device),
+            host_budget_bytes: Some(host),
+            ..
+        } => (device, host),
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            host_budget_bytes,
+            ..
+        } => (device_budget_bytes, host_budget_bytes),
+        ResidencyPlan::LayerwiseHost { .. } | ResidencyPlan::FullyResident => return false,
+    };
+    if let Some(expert) = &plan.expert_cache {
+        let (Some(device), Some(host)) = (expert.device_budget_bytes, expert.host_budget_bytes)
+        else {
+            return false;
+        };
+        device_required = device_required.saturating_add(device);
+        host_required = host_required.saturating_add(host);
+    }
+    if hardware.physical_memory_semantics == HardwareMemorySemantics::Unified {
+        let unified_limit = if observed_host.is_some() {
+            host_limit
+        } else if observed_device.is_some() {
+            device_limit
+        } else {
+            host_limit.saturating_add(device_limit)
+        };
+        device_required.saturating_add(host_required) <= unified_limit
+    } else {
+        device_required <= device_limit && host_required <= host_limit
+    }
+}
+
+fn canonical_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn automatic_telemetry_matches(
+    telemetry: &ExecutionTelemetry,
+    hardware: &HardwareProfile,
+    resources: &ModelResourceProfile,
+    device: DevicePlan,
+    minimum_tokens: usize,
+) -> bool {
+    if telemetry.schema_version != AUTOMATIC_SCHEMA_VERSION
+        || telemetry.generated_tokens < minimum_tokens
+    {
+        return false;
+    }
+    let (Some(plan), Some(prior_hardware), Some(prior_resources)) = (
+        telemetry.plan.as_ref(),
+        telemetry.hardware.as_ref(),
+        telemetry.resources.as_ref(),
+    ) else {
+        return false;
+    };
+    if plan.schema_version != AUTOMATIC_SCHEMA_VERSION
+        || plan.device != device
+        || plan.parallelism.tensor != 1
+        || plan.parallelism.pipeline != 1
+        || plan.parallelism.expert != 1
+        || matches!(plan.drafting, DraftingPlan::External { .. })
+    {
+        return false;
+    }
+    let current_total = selected_device_profile(hardware, device)
+        .and_then(|item| automatic_observed_u64(&item.total_memory_bytes));
+    let prior_total = selected_device_profile(prior_hardware, device)
+        .and_then(|item| automatic_observed_u64(&item.total_memory_bytes));
+    canonical_path(&prior_resources.path) == canonical_path(&resources.path)
+        && prior_resources.artifact_kind == resources.artifact_kind
+        && prior_resources.model_kind == resources.model_kind
+        && prior_resources.architecture == resources.architecture
+        && prior_resources.tensor_count == resources.tensor_count
+        && prior_resources.checkpoint_shards == resources.checkpoint_shards
+        && automatic_observed_u64(&prior_resources.stored_tensor_bytes)
+            == automatic_observed_u64(&resources.stored_tensor_bytes)
+        && prior_hardware.operating_system == hardware.operating_system
+        && prior_hardware.architecture == hardware.architecture
+        && prior_hardware.physical_memory_semantics == hardware.physical_memory_semantics
+        && automatic_observed_u64(&prior_hardware.physical_memory_bytes)
+            == automatic_observed_u64(&hardware.physical_memory_bytes)
+        && prior_total == current_total
+}
+
+fn automatic_feedback_rate(telemetry: &ExecutionTelemetry) -> Option<f64> {
+    telemetry
+        .timing
+        .decode_token_rate
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .or_else(|| {
+            let rate = telemetry.timing.token_rate;
+            (rate.is_finite() && rate > 0.0).then_some(rate)
+        })
+}
+
+fn automatic_median(mut values: Vec<f64>) -> Option<f64> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    })
+}
+
+fn automatic_feedback_plan(
+    model_path: &Path,
+    request: &AutomaticPlanRequest,
+    hardware: &HardwareProfile,
+    resources: &ModelResourceProfile,
+    policy: &AutomaticPlannerPolicy,
+    embedded_mtp_layers: Option<usize>,
+) -> Result<Option<(ExecutionPlan, usize, f64)>, Error> {
+    let mut groups: Vec<(ExecutionPlan, Vec<f64>)> = Vec::new();
+    for telemetry in &request.prior_telemetry {
+        if !automatic_telemetry_matches(
+            telemetry,
+            hardware,
+            resources,
+            request.device,
+            policy.minimum_feedback_tokens,
+        ) {
+            continue;
+        }
+        let (Some(plan), Some(rate)) =
+            (telemetry.plan.as_ref(), automatic_feedback_rate(telemetry))
+        else {
+            continue;
+        };
+        if matches!(plan.drafting, DraftingPlan::Embedded { .. }) && embedded_mtp_layers == Some(0)
+        {
+            continue;
+        }
+        if let Some((_, rates)) = groups.iter_mut().find(|(candidate, _)| candidate == plan) {
+            rates.push(rate);
+        } else {
+            groups.push((plan.clone(), vec![rate]));
+        }
+    }
+    let mut admitted = Vec::new();
+    for (plan, rates) in groups {
+        if !automatic_plan_resource_admitted(hardware, resources, &plan, policy)
+            || !matches!(
+                inspect_automatic_candidate(model_path, &plan),
+                Ok(AutomaticCandidateAdmission {
+                    supported: true,
+                    ..
+                })
+            )
+        {
+            continue;
+        }
+        let samples = rates.len();
+        if let Some(median) = automatic_median(rates) {
+            admitted.push((plan, samples, median));
+        }
+    }
+    Ok(admitted
+        .into_iter()
+        .max_by(|left, right| left.2.total_cmp(&right.2)))
+}
+
+fn plan_automatic_execution_with_policy(
+    request: &AutomaticPlanRequest,
+    policy: &AutomaticPlannerPolicy,
+) -> Result<ExecutionPlanReport, Error> {
+    if request.schema_version != AUTOMATIC_SCHEMA_VERSION {
+        return Err(Error::AutomaticPlanning(format!(
+            "automatic request schema {} does not match supported schema {}",
+            request.schema_version, AUTOMATIC_SCHEMA_VERSION
+        )));
+    }
+    validate_automatic_policy(policy)?;
+    let hardware = discover_hardware();
+    validate_automatic_device(&hardware, request.device)?;
+    let resources =
+        inspect_model(&request.model_path, ModelInspectionOptions::default())?.resources;
+    let device_available = selected_device_profile(&hardware, request.device)
+        .and_then(|device| automatic_observed_u64(&device.available_memory_bytes));
+    let host_available = automatic_observed_u64(&hardware.available_memory_bytes);
+    let device_budget = automatic_budget(
+        device_available,
+        policy.device_memory_fallback_bytes,
+        policy.memory_headroom_percent,
+    );
+    let host_budget = automatic_budget(
+        host_available,
+        policy.host_memory_fallback_bytes,
+        policy.memory_headroom_percent,
+    );
+    let model_bytes = automatic_model_bytes(&resources);
+    let candidates = automatic_base_candidates(request.device, device_budget, host_budget, policy);
+    let resident = inspect_automatic_candidate(&request.model_path, &candidates[0])?;
+    let layerwise = inspect_automatic_candidate(&request.model_path, &candidates[1])?;
+    let disk = inspect_automatic_candidate(&request.model_path, &candidates[2])?;
+    let mut entries = vec![PlanExplanationEntry {
+        level: PlanExplanationLevel::Decision,
+        code: "single_device_scope".into(),
+        detail: format!(
+            "automatic planning is restricted to {:?}:{} with {}% memory headroom",
+            request.device.backend, request.device.index, policy.memory_headroom_percent
+        ),
+    }];
+    let resident_fits = match (model_bytes, device_available) {
+        (Some((bytes, basis)), Some(available)) => {
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "resource_basis".into(),
+                detail: format!(
+                    "used {basis} ({bytes} bytes) against {device_budget} usable bytes from {available} currently available bytes"
+                ),
+            });
+            bytes <= device_budget
+        }
+        (Some((bytes, basis)), None) => {
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Warning,
+                code: "device_memory_unavailable".into(),
+                detail: format!(
+                    "device memory is unavailable; used the {}-byte policy fallback against {basis} ({bytes} bytes)",
+                    policy.device_memory_fallback_bytes
+                ),
+            });
+            bytes <= policy.device_memory_fallback_bytes
+        }
+        (None, _) => {
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Warning,
+                code: "model_footprint_unavailable".into(),
+                detail: "no materialized or stored checkpoint size was available; bounded loading is preferred".into(),
+            });
+            false
+        }
+    };
+    let layerwise_fits = model_bytes.is_some_and(|(bytes, _)| {
+        if hardware.physical_memory_semantics == HardwareMemorySemantics::Unified {
+            bytes <= host_budget.saturating_mul(2)
+        } else {
+            bytes <= host_budget
+        }
+    });
+    let selected = choose_automatic_residency(
+        resident_fits,
+        layerwise_fits,
+        resident.supported,
+        layerwise.supported,
+        disk.supported,
+    )
+    .ok_or_else(|| {
+        Error::AutomaticPlanning(format!(
+            "no loadable single-device policy: resident: {}; layerwise: {}; disk-streamed: {}",
+            resident.rejection.as_deref().unwrap_or("not admitted"),
+            layerwise.rejection.as_deref().unwrap_or("not admitted"),
+            disk.rejection.as_deref().unwrap_or("not admitted")
+        ))
+    })?;
+    if selected != 0 {
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Rejection,
+            code: if resident_fits {
+                "resident_unsupported"
+            } else {
+                "resident_exceeds_quick_budget"
+            }
+            .into(),
+            detail: resident.rejection.clone().unwrap_or_else(|| {
+                "fully resident execution exceeds the policy memory budget".into()
+            }),
+        });
+    }
+    if selected == 2 {
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Rejection,
+            code: if layerwise_fits {
+                "layerwise_unsupported"
+            } else {
+                "layerwise_exceeds_host_budget"
+            }
+            .into(),
+            detail: layerwise.rejection.clone().unwrap_or_else(|| {
+                "the checkpoint exceeds the policy host-backed admission budget".into()
+            }),
+        });
+    }
+    if selected == 1 && !layerwise_fits {
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Warning,
+            code: "disk_stream_unsupported".into(),
+            detail: disk
+                .rejection
+                .clone()
+                .unwrap_or_else(|| "dense disk streaming was not admitted".into()),
+        });
+    }
+    if selected == 0 && !resident_fits {
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Warning,
+            code: "bounded_policies_unsupported".into(),
+            detail: "bounded policies were unavailable; fully resident execution may exceed currently available memory".into(),
+        });
+    }
+    let (mut plan, mut summary) = match selected {
+        0 => (
+            candidates[0].clone(),
+            if resident_fits {
+                "selected fully resident execution for the lowest expected latency"
+            } else {
+                "selected fully resident execution as the only admitted policy"
+            }
+            .to_string(),
+        ),
+        1 => (
+            candidates[1].clone(),
+            if layerwise_fits {
+                "selected host-backed layerwise execution with a bounded device window"
+            } else {
+                "selected host-backed layerwise execution as the only admitted bounded policy"
+            }
+            .to_string(),
+        ),
+        2 => (
+            candidates[2].clone(),
+            "selected bounded dense disk streaming because resident and layerwise admission failed"
+                .into(),
+        ),
+        _ => unreachable!("automatic residency candidate index is bounded"),
+    };
+    entries.push(PlanExplanationEntry {
+        level: PlanExplanationLevel::Decision,
+        code: match plan.residency {
+            ResidencyPlan::FullyResident => "fully_resident_selected",
+            ResidencyPlan::LayerwiseHost { .. } => "layerwise_host_selected",
+            ResidencyPlan::DenseDiskStream { .. } => "dense_disk_stream_selected",
+        }
+        .into(),
+        detail: summary.clone(),
+    });
+    if !matches!(plan.residency, ResidencyPlan::FullyResident) {
+        let expert_plan = automatic_with_expert_cache(plan.clone(), policy);
+        let expert = inspect_automatic_candidate(&request.model_path, &expert_plan)?;
+        if expert.supported {
+            plan = expert_plan;
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "expert_cache_selected".into(),
+                detail: format!(
+                    "the checkpoint admits routed-expert caching; {}% of each bounded tier budget was assigned to experts",
+                    policy.expert_cache_share_percent
+                ),
+            });
+        } else {
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Rejection,
+                code: "expert_cache_not_selected".into(),
+                detail: expert
+                    .rejection
+                    .unwrap_or_else(|| "the checkpoint did not admit routed-expert caching".into()),
+            });
+        }
+    }
+    let embedded_mtp_layers =
+        automatic_embedded_mtp_layers(&request.model_path, resources.model_kind)?;
+    match embedded_mtp_layers {
+        Some(layers) if layers > 0 => {
+            plan.drafting = DraftingPlan::Embedded {
+                max_draft_tokens: policy.embedded_mtp_draft_tokens,
+                lookahead: true,
+                adaptive_lookahead: true,
+            };
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "embedded_mtp_selected".into(),
+                detail: format!(
+                    "validated configuration advertises {layers} embedded prediction layer(s); enabled {}-token adaptive lookahead",
+                    policy.embedded_mtp_draft_tokens
+                ),
+            });
+        }
+        Some(_) => entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Decision,
+            code: "embedded_mtp_absent".into(),
+            detail: "the checkpoint configuration does not advertise embedded prediction layers"
+                .into(),
+        }),
+        None => entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Warning,
+            code: "embedded_mtp_unobservable".into(),
+            detail: "embedded MTP capability was not observable from this checkpoint container"
+                .into(),
+        }),
+    }
+    if let Some((feedback_plan, samples, median_rate)) = automatic_feedback_plan(
+        &request.model_path,
+        request,
+        &hardware,
+        &resources,
+        policy,
+        embedded_mtp_layers,
+    )? {
+        plan = feedback_plan;
+        summary = format!(
+            "selected a previously observed plan at {median_rate:.2} median decode tokens/s"
+        );
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Decision,
+            code: "prior_telemetry_selected".into(),
+            detail: format!(
+                "selected the fastest matching, currently admitted plan using {samples} prior runtime sample(s)"
+            ),
+        });
+    } else if !request.prior_telemetry.is_empty() {
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Warning,
+            code: "prior_telemetry_not_applicable".into(),
+            detail: format!(
+                "none of {} prior telemetry document(s) matched this model, hardware, device, and current admission state",
+                request.prior_telemetry.len()
+            ),
+        });
+    }
+    Ok(ExecutionPlanReport {
+        schema_version: AUTOMATIC_SCHEMA_VERSION,
+        hardware,
+        resources,
+        plan,
+        explanation: PlanExplanation { summary, entries },
+    })
+}
+
 impl ResidencyTelemetry {
     /// Collects bounded ordinary-weight residency telemetry from a loaded model.
     pub fn collect(model: &super::LoadedModel) -> Result<Option<Self>, crate::error::Error> {
@@ -879,6 +1816,47 @@ fn transfer_direction_name(direction: TransferDirection) -> &'static str {
 mod tests {
     use super::*;
 
+    fn feedback_fixture(
+        path: PathBuf,
+    ) -> (HardwareProfile, ModelResourceProfile, ExecutionTelemetry) {
+        let hardware = discover_hardware();
+        let device = DevicePlan {
+            backend: BackendKind::Cpu,
+            index: 0,
+        };
+        let mut resources = ModelResourceProfile::empty(path, ArtifactKind::SafeTensorsDirectory);
+        resources.model_kind = Some(ModelKind::Llama);
+        resources.architecture = Some("llama".into());
+        resources.tensor_count = Some(4);
+        resources.checkpoint_shards = Some(1);
+        resources.stored_tensor_bytes = Observed::exact(1024, "fixture");
+        let plan = ExecutionPlan::fully_resident(device);
+        let telemetry = ExecutionTelemetry {
+            schema_version: AUTOMATIC_SCHEMA_VERSION,
+            model_type: "Llama".into(),
+            plan: Some(plan),
+            plan_explanation: None,
+            hardware: Some(hardware.clone()),
+            resources: Some(resources.clone()),
+            prompt_tokens: 8,
+            generated_tokens: 16,
+            stop_reason: "length".into(),
+            timing: TimingTelemetry {
+                load_seconds: 1.0,
+                generation_seconds: 2.0,
+                time_to_first_token_seconds: Some(0.25),
+                total_seconds: 3.0,
+                token_rate: 8.0,
+                decode_token_rate: Some(10.0),
+            },
+            allocator: None,
+            residency: None,
+            expert_cache: None,
+            mtp: None,
+        };
+        (hardware, resources, telemetry)
+    }
+
     #[test]
     fn unavailable_observations_do_not_serialize_as_zero() {
         let value = Observed::<u64>::unavailable("not observable");
@@ -918,5 +1896,71 @@ mod tests {
             .backends
             .iter()
             .any(|backend| backend.kind == BackendKind::Cpu && backend.available));
+    }
+
+    #[test]
+    fn automatic_request_and_policy_are_stable_json_documents() {
+        let (_, _, telemetry) = feedback_fixture("model".into());
+        let request = AutomaticPlanRequest::new(
+            "model",
+            DevicePlan {
+                backend: BackendKind::Cpu,
+                index: 0,
+            },
+        )
+        .with_prior_telemetry([telemetry]);
+        let request_json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AutomaticPlanRequest>(&request_json).unwrap(),
+            request
+        );
+
+        let planner = AutomaticPlanner::default();
+        let policy_json = serde_json::to_string(planner.policy()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AutomaticPlannerPolicy>(&policy_json).unwrap(),
+            *planner.policy()
+        );
+    }
+
+    #[test]
+    fn execution_plan_loader_conversion_rejects_non_singleton_topology() {
+        let mut plan = ExecutionPlan::fully_resident(DevicePlan {
+            backend: BackendKind::Cpu,
+            index: 0,
+        });
+        assert!(execution_plan_load_options(&plan).is_ok());
+        plan.parallelism.tensor = 2;
+        assert!(matches!(
+            execution_plan_load_options(&plan),
+            Err(Error::AutomaticPlanning(_))
+        ));
+    }
+
+    #[test]
+    fn prior_telemetry_requires_matching_model_and_hardware_identity() {
+        let path = std::env::temp_dir().join("safemlx-automatic-feedback-fixture");
+        let (hardware, resources, mut telemetry) = feedback_fixture(path.clone());
+        let device = DevicePlan {
+            backend: BackendKind::Cpu,
+            index: 0,
+        };
+        assert!(automatic_telemetry_matches(
+            &telemetry, &hardware, &resources, device, 1
+        ));
+        telemetry.resources.as_mut().unwrap().path = path.join("different");
+        assert!(!automatic_telemetry_matches(
+            &telemetry, &hardware, &resources, device, 1
+        ));
+    }
+
+    #[test]
+    fn feedback_prefers_decode_rate_and_uses_median() {
+        let (_, _, mut telemetry) = feedback_fixture("model".into());
+        assert_eq!(automatic_feedback_rate(&telemetry), Some(10.0));
+        telemetry.timing.decode_token_rate = None;
+        assert_eq!(automatic_feedback_rate(&telemetry), Some(8.0));
+        assert_eq!(automatic_median(vec![30.0, 10.0, 20.0]), Some(20.0));
+        assert_eq!(automatic_median(vec![40.0, 10.0]), Some(25.0));
     }
 }

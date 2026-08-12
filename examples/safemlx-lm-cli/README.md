@@ -147,6 +147,22 @@ and atomic rename, so an interrupted writer does not leave a partial JSON file.
 Hits are rechecked against current available memory and exact loader admission.
 Each benchmark child is also terminated after the configured timeout.
 
+The CLI delegates heuristic selection and plan-to-loader conversion to the
+public `safemlx-lm` automatic planner. Feed one or more telemetry documents from
+earlier runs back into a later session with `--auto-feedback PATH` (the option
+may be repeated). Each path may contain one `ExecutionTelemetry` object or an
+array. Matching plans are ranked by median decode throughput and revalidated
+against the current artifact, hardware, free memory, and loader admission. A
+feedback request bypasses an existing cache hit and publishes the newly selected
+plan afterward:
+
+```sh
+cargo run --release -q -p safemlx-lm-cli -- \
+  --model /path/to/model --device gpu:0 --auto quick \
+  --auto-feedback previous-run.json --telemetry-json next-run.json \
+  "Explain telemetry-guided planning."
+```
+
 ```sh
 cargo run --release -q -p safemlx-lm-cli -- \
   --model /path/to/model --auto quick \

@@ -26,15 +26,17 @@ pub use api::realtime::{
     RealtimeSampling, RealtimeSession, RealtimeSpeechConfig, RealtimeStepInput, RealtimeStepOutput,
 };
 pub use api::{
-    discover_hardware, inspect_model, AllocatorTelemetry, ArtifactKind, ArtifactModality,
-    ArtifactTensorEncoding, BackendKind, DevicePlan, DraftPlacementPlan, DraftingPlan,
-    DurationSeconds, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
-    ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
-    HardwareProfile, InspectionIssue, InspectionIssueCode, InspectionReadiness,
-    InspectionRequirement, InspectionSeverity, ModelInspectionOptions, ModelInspectionReport,
-    ModelLoadOptions, ModelResourceProfile, ObservationKind, Observed, ParallelismPlan,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
-    TimingTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
+    AllocatorTelemetry, ArtifactKind, ArtifactModality, ArtifactTensorEncoding,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, BackendKind, DevicePlan,
+    DraftPlacementPlan, DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport,
+    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
+    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InspectionIssue,
+    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
+    ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions, ModelResourceProfile,
+    ObservationKind, Observed, ParallelismPlan, PlanExplanation, PlanExplanationEntry,
+    PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry, TimingTelemetry, TransferTelemetry,
+    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use architectures::llama::layerwise::{
     load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,

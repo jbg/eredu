@@ -894,7 +894,7 @@ impl SpeculativeSampler for MirostatV2Sampler {
 
 /// Configurable sampler for text generation.
 ///
-/// The sampler mirrors the common llama.cpp sampling chain used by Goose:
+/// The sampler mirrors a common llama.cpp sampling chain:
 /// repetition/frequency/presence penalties, then top-k, top-p, min-p,
 /// temperature, and finally greedy or categorical token selection.
 #[derive(Debug, Clone)]

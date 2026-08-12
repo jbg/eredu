@@ -60,6 +60,39 @@ Use the high-level `api` module for loading, prepared inputs, generation, cache
 creation, and memory admission. Architecture-specific modules expose lower-level
 construction and distributed adapters when an application needs them.
 
+## Automatic execution planning
+
+Embedding applications can use the same versioned single-device planner as the
+example CLI. The request, policy, selected plan, explanation, and runtime
+telemetry all implement Serde serialization:
+
+```rust,no_run
+use safemlx_lm::{
+    plan_automatic_execution, AutomaticPlanRequest, BackendKind, DevicePlan,
+    ExecutionTelemetry,
+};
+
+let prior_runs: Vec<ExecutionTelemetry> = load_prior_runs();
+let request = AutomaticPlanRequest::new(
+    "/path/to/model",
+    DevicePlan { backend: BackendKind::Metal, index: 0 },
+)
+.with_prior_telemetry(prior_runs);
+let report = plan_automatic_execution(&request)?;
+
+# fn load_prior_runs() -> Vec<ExecutionTelemetry> { Vec::new() }
+# Ok::<(), safemlx_lm::error::Error>(())
+```
+
+Matching prior runs are grouped by exact plan and ranked by median decode
+throughput. Telemetry from a different model, artifact layout, device, stable
+hardware profile, or schema is ignored. Historical plans are also rechecked
+against current available memory and header-only loader admission. Use
+`AutomaticPlanner::new` with an `AutomaticPlannerPolicy` for explicit policy
+bounds, and `execution_plan_load_options` to apply a returned plan to model
+loading. Device creation and speculative-generation orchestration remain owned
+by the embedding application.
+
 ## Inputs and generation
 
 `LoadedModel` owns the model, tokenizer, optional processor, and chat-template

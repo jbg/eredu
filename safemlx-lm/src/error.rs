@@ -59,6 +59,10 @@ pub enum Error {
     #[error("parallel placement error: {0}")]
     Parallel(String),
 
+    /// Invalid or unsatisfied automatic execution-planning request.
+    #[error("automatic planning error: {0}")]
+    AutomaticPlanning(String),
+
     /// Invalid or unsupported checkpoint quantization request.
     #[error("checkpoint quantization error: {0}")]
     Quantization(String),

@@ -249,13 +249,14 @@ pub use config::{ModelKind, ModelLoadOptions};
 
 mod automatic;
 pub use automatic::{
-    discover_hardware, AllocatorTelemetry, BackendKind, DevicePlan, DraftPlacementPlan,
-    DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
-    ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile,
-    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, ObservationKind, Observed,
-    ParallelismPlan, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan,
-    ResidencyTelemetry, TimingTelemetry, TransferTelemetry, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    discover_hardware, execution_plan_load_options, plan_automatic_execution, AllocatorTelemetry,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, BackendKind, DevicePlan,
+    DraftPlacementPlan, DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport,
+    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
+    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, ModelResourceProfile,
+    ObservationKind, Observed, ParallelismPlan, PlanExplanation, PlanExplanationEntry,
+    PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry, TimingTelemetry, TransferTelemetry,
+    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 
 mod capability;
