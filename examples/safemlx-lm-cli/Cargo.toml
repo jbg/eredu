@@ -23,4 +23,8 @@ clap.workspace = true
 hf-hub = { version = "=1.0.0", features = ["blocking"] }
 safemlx.workspace = true
 safemlx-lm.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

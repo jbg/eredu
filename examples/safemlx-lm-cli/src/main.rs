@@ -1,11 +1,12 @@
 use std::{
     collections::HashSet,
-    fmt,
+    fmt, fs,
     io::{self, IsTerminal, Read, Write},
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     str::FromStr,
-    time::Instant,
+    time::{Instant, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
@@ -55,6 +56,7 @@ use safemlx_lm::{
         CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection,
     },
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ExpertCacheEviction {
@@ -85,6 +87,8 @@ enum AutoMode {
     Plan,
     /// Select a low-latency single-device plan and execute it.
     Quick,
+    /// Benchmark admitted plans in isolated child processes and select the fastest.
+    Benchmark,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
@@ -302,6 +306,26 @@ struct Cli {
         ]
     )]
     auto: Option<AutoMode>,
+
+    /// Read or update a reusable automatic-plan cache at this path.
+    #[arg(long, value_name = "PATH", requires = "auto")]
+    auto_cache: Option<PathBuf>,
+
+    /// Generated tokens per isolated automatic benchmark trial.
+    #[arg(long, default_value_t = 32, value_name = "TOKENS", requires = "auto")]
+    auto_benchmark_tokens: usize,
+
+    /// Fresh-process repetitions for each automatic benchmark candidate.
+    #[arg(long, default_value_t = 1, value_name = "RUNS", requires = "auto")]
+    auto_benchmark_runs: usize,
+
+    /// Maximum wall time allowed for one isolated benchmark process.
+    #[arg(long, default_value_t = 300, value_name = "SECONDS", requires = "auto")]
+    auto_benchmark_timeout_seconds: u64,
+
+    /// Internal exact plan passed from an automatic benchmark parent process.
+    #[arg(long, hide = true, value_name = "PATH", conflicts_with = "auto")]
+    auto_trial_plan: Option<PathBuf>,
 
     /// External assistant directory, GGUF file, or cached Hugging Face identifier.
     /// A bare GGUF repository ID selects its unique draft sidecar.
@@ -780,6 +804,82 @@ const AUTO_DEVICE_FALLBACK_BYTES: u64 = 4 << 30;
 const AUTO_HOST_FALLBACK_BYTES: u64 = 16 << 30;
 const AUTO_HEADROOM_PERCENT: u64 = 30;
 const AUTO_EXPERT_SHARE_PERCENT: u64 = 40;
+const AUTO_CACHE_SCHEMA_VERSION: u32 = 1;
+const AUTO_BENCHMARK_SCHEMA_VERSION: u32 = 1;
+const AUTO_BENCHMARK_PROMPT: &str =
+    "Explain in one concise paragraph why reproducible benchmarks matter.";
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct ArtifactFileStamp {
+    path: String,
+    bytes: u64,
+    modified_unix_nanos: Option<u64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct AutoPlanCacheKey {
+    planner_schema_version: u32,
+    model_path: PathBuf,
+    model_architecture: Option<String>,
+    stored_tensor_bytes: Option<u64>,
+    tensor_count: Option<usize>,
+    checkpoint_shards: Option<usize>,
+    artifact_files: Vec<ArtifactFileStamp>,
+    operating_system: String,
+    architecture: String,
+    memory_semantics: String,
+    physical_memory_bytes: Option<u64>,
+    device: DevicePlan,
+    device_total_memory_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutoBenchmarkTrial {
+    run: usize,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timing: Option<TimingTelemetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutoBenchmarkCandidate {
+    plan: ExecutionPlan,
+    trials: Vec<AutoBenchmarkTrial>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    median_token_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    median_time_to_first_token_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutoBenchmarkReport {
+    schema_version: u32,
+    generated_tokens_per_trial: usize,
+    runs_per_candidate: usize,
+    timeout_seconds: u64,
+    selection_metric: String,
+    cache_key: AutoPlanCacheKey,
+    selected: ExecutionPlanReport,
+    candidates: Vec<AutoBenchmarkCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutoPlanCacheEntry {
+    key: AutoPlanCacheKey,
+    report: ExecutionPlanReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    benchmark_token_rate: Option<f64>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AutoPlanCache {
+    schema_version: u32,
+    entries: Vec<AutoPlanCacheEntry>,
+}
 
 #[derive(Debug)]
 struct AutoCandidate {
@@ -792,6 +892,160 @@ fn observed_u64(value: &Observed<u64>) -> Option<u64> {
         Observed::Available { value, .. } => Some(*value),
         Observed::Unsupported { .. } | Observed::Unavailable { .. } => None,
     }
+}
+
+fn artifact_file_stamp(root: &Path, path: &Path) -> Result<ArtifactFileStamp> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect model artifact {}", path.display()))?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+    Ok(ArtifactFileStamp {
+        path: path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned(),
+        bytes: metadata.len(),
+        modified_unix_nanos,
+    })
+}
+
+fn artifact_file_stamps(model_path: &Path) -> Result<Vec<ArtifactFileStamp>> {
+    if model_path.is_file() {
+        return Ok(vec![artifact_file_stamp(model_path, model_path)?]);
+    }
+    let mut paths = fs::read_dir(model_path)
+        .with_context(|| {
+            format!(
+                "failed to enumerate model artifact {}",
+                model_path.display()
+            )
+        })?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    paths.retain(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name == "config.json"
+                    || name == "model.safetensors.index.json"
+                    || name.ends_with(".safetensors")
+                    || name.ends_with(".gguf")
+            })
+    });
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| artifact_file_stamp(model_path, path))
+        .collect()
+}
+
+fn automatic_cache_key(
+    model_path: &Path,
+    report: &ExecutionPlanReport,
+) -> Result<AutoPlanCacheKey> {
+    let device_total_memory_bytes = report
+        .hardware
+        .backends
+        .iter()
+        .find(|backend| backend.kind == report.plan.device.backend)
+        .and_then(|backend| {
+            backend
+                .devices
+                .iter()
+                .find(|device| device.index == report.plan.device.index)
+        })
+        .and_then(|device| observed_u64(&device.total_memory_bytes));
+    Ok(AutoPlanCacheKey {
+        planner_schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+        model_path: fs::canonicalize(model_path).unwrap_or_else(|_| model_path.to_path_buf()),
+        model_architecture: report.resources.architecture.clone(),
+        stored_tensor_bytes: observed_u64(&report.resources.stored_tensor_bytes),
+        tensor_count: report.resources.tensor_count,
+        checkpoint_shards: report.resources.checkpoint_shards,
+        artifact_files: artifact_file_stamps(model_path)?,
+        operating_system: report.hardware.operating_system.clone(),
+        architecture: report.hardware.architecture.clone(),
+        memory_semantics: format!("{:?}", report.hardware.physical_memory_semantics),
+        physical_memory_bytes: observed_u64(&report.hardware.physical_memory_bytes),
+        device: report.plan.device,
+        device_total_memory_bytes,
+    })
+}
+
+fn read_auto_plan_cache(path: &Path) -> Result<AutoPlanCache> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let cache: AutoPlanCache = serde_json::from_slice(&bytes).with_context(|| {
+                format!("failed to parse automatic plan cache {}", path.display())
+            })?;
+            if cache.schema_version != AUTO_CACHE_SCHEMA_VERSION {
+                return Ok(AutoPlanCache {
+                    schema_version: AUTO_CACHE_SCHEMA_VERSION,
+                    entries: Vec::new(),
+                });
+            }
+            Ok(cache)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AutoPlanCache {
+            schema_version: AUTO_CACHE_SCHEMA_VERSION,
+            entries: Vec::new(),
+        }),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to read automatic plan cache {}", path.display())),
+    }
+}
+
+fn cached_automatic_report(
+    path: &Path,
+    key: &AutoPlanCacheKey,
+) -> Result<Option<ExecutionPlanReport>> {
+    Ok(read_auto_plan_cache(path)?
+        .entries
+        .into_iter()
+        .find(|entry| entry.key == *key)
+        .map(|entry| entry.report))
+}
+
+fn write_auto_plan_cache(
+    path: &Path,
+    key: AutoPlanCacheKey,
+    report: ExecutionPlanReport,
+    benchmark_token_rate: Option<f64>,
+) -> Result<()> {
+    let mut cache = read_auto_plan_cache(path)?;
+    cache.entries.retain(|entry| entry.key != key);
+    cache.entries.push(AutoPlanCacheEntry {
+        key,
+        report,
+        benchmark_token_rate,
+    });
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create automatic cache directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let temporary = path.with_extension(format!("auto-cache-tmp-{}", std::process::id()));
+    let json =
+        serde_json::to_vec_pretty(&cache).context("failed to serialize automatic plan cache")?;
+    fs::write(&temporary, json).with_context(|| {
+        format!(
+            "failed to write temporary automatic plan cache {}",
+            temporary.display()
+        )
+    })?;
+    fs::rename(&temporary, path)
+        .with_context(|| format!("failed to publish automatic plan cache {}", path.display()))?;
+    Ok(())
 }
 
 fn automatic_budget(available: Option<u64>, fallback: u64) -> u64 {
@@ -856,7 +1110,65 @@ fn automatic_model_bytes(resources: &ModelResourceProfile) -> Option<(u64, &'sta
         })
 }
 
+fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &ExecutionPlan) -> bool {
+    let available_device = selected_device_available_memory(&observations.hardware, plan.device)
+        .map(|bytes| automatic_budget(Some(bytes), 1));
+    let available_host = observed_u64(&observations.hardware.available_memory_bytes)
+        .map(|bytes| automatic_budget(Some(bytes), 1));
+    let fits = |required: u64, available: Option<u64>| {
+        available.is_none_or(|available| required <= available)
+    };
+    if matches!(&plan.residency, ResidencyPlan::FullyResident) {
+        return automatic_model_bytes(&observations.resources)
+            .is_some_and(|(bytes, _)| fits(bytes, available_device));
+    }
+    let (mut device_required, mut host_required) = match &plan.residency {
+        ResidencyPlan::LayerwiseHost {
+            device_budget_bytes: Some(device),
+            host_budget_bytes: Some(host),
+            ..
+        } => (*device, *host),
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            host_budget_bytes,
+            ..
+        } => (*device_budget_bytes, *host_budget_bytes),
+        ResidencyPlan::LayerwiseHost { .. } | ResidencyPlan::FullyResident => return false,
+    };
+    if let Some(expert) = &plan.expert_cache {
+        let (Some(device), Some(host)) = (expert.device_budget_bytes, expert.host_budget_bytes)
+        else {
+            return false;
+        };
+        device_required = device_required.saturating_add(device);
+        host_required = host_required.saturating_add(host);
+    }
+    if observations.hardware.physical_memory_semantics == HardwareMemorySemantics::Unified {
+        fits(
+            device_required.saturating_add(host_required),
+            available_host.or(available_device),
+        )
+    } else {
+        fits(device_required, available_device) && fits(host_required, available_host)
+    }
+}
+
 fn candidate_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions> {
+    if plan.parallelism.tensor != 1
+        || plan.parallelism.pipeline != 1
+        || plan.parallelism.expert != 1
+    {
+        bail!("single-device automatic plans require a 1x1x1 parallel topology");
+    }
+    let mut load = match plan.weight_transformation {
+        WeightTransformationPlan::PreserveCheckpoint => ModelLoadOptions::default(),
+        WeightTransformationPlan::Affine { bits, group_size } => {
+            ModelLoadOptions::with_quantization(AffineQuantization::new(group_size, bits)?)
+        }
+        WeightTransformationPlan::MxFp4 => {
+            ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+        }
+    };
     let residency = match &plan.residency {
         ResidencyPlan::FullyResident => NonExpertWeightResidency::FullyResident,
         ResidencyPlan::LayerwiseHost {
@@ -904,7 +1216,8 @@ fn candidate_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions> {
             }
         }
     };
-    Ok(ModelLoadOptions::default().with_weight_residency(weight_residency))
+    load = load.with_weight_residency(weight_residency);
+    Ok(load)
 }
 
 fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCandidate> {
@@ -1062,12 +1375,28 @@ fn choose_automatic_residency(
     }
 }
 
-fn automatic_plan(model_path: &Path, device: CliDevice) -> Result<ExecutionPlanReport> {
+fn automatic_observations(model_path: &Path, device: CliDevice) -> Result<ExecutionPlanReport> {
     let hardware = discover_hardware();
     let selected_device = device_plan(device);
     validate_automatic_device(&hardware, selected_device)?;
-    let initial = inspect_model(model_path, ModelInspectionOptions::default())?;
-    let resources = initial.resources;
+    let resources = inspect_model(model_path, ModelInspectionOptions::default())?.resources;
+    Ok(ExecutionPlanReport {
+        schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+        hardware,
+        resources,
+        plan: ExecutionPlan::fully_resident(selected_device),
+        explanation: PlanExplanation {
+            summary: "collected automatic planning inputs".into(),
+            entries: Vec::new(),
+        },
+    })
+}
+
+fn automatic_plan(model_path: &Path, device: CliDevice) -> Result<ExecutionPlanReport> {
+    let observations = automatic_observations(model_path, device)?;
+    let hardware = observations.hardware;
+    let resources = observations.resources;
+    let selected_device = observations.plan.device;
     let device_available = selected_device_available_memory(&hardware, selected_device);
     let host_available = observed_u64(&hardware.available_memory_bytes);
     let device_budget = automatic_budget(device_available, AUTO_DEVICE_FALLBACK_BYTES);
@@ -1284,7 +1613,378 @@ fn automatic_plan(model_path: &Path, device: CliDevice) -> Result<ExecutionPlanR
     })
 }
 
+fn push_unique_plan(
+    plans: &mut Vec<ExecutionPlan>,
+    seen: &mut HashSet<Vec<u8>>,
+    plan: ExecutionPlan,
+) {
+    let encoded = serde_json::to_vec(&plan).expect("execution plans are serializable");
+    if seen.insert(encoded) {
+        plans.push(plan);
+    }
+}
+
+fn automatic_benchmark_candidates(
+    model_path: &Path,
+    heuristic: &ExecutionPlanReport,
+) -> Result<Vec<ExecutionPlan>> {
+    let device_available =
+        selected_device_available_memory(&heuristic.hardware, heuristic.plan.device);
+    let host_available = observed_u64(&heuristic.hardware.available_memory_bytes);
+    let device_budget = automatic_budget(device_available, AUTO_DEVICE_FALLBACK_BYTES);
+    let host_budget = automatic_budget(host_available, AUTO_HOST_FALLBACK_BYTES);
+    let model_bytes = automatic_model_bytes(&heuristic.resources).map(|(bytes, _)| bytes);
+    let resident_fits = model_bytes.is_some_and(|bytes| bytes <= device_budget);
+    let layerwise_fits = model_bytes.is_some_and(|bytes| {
+        if heuristic.hardware.physical_memory_semantics == HardwareMemorySemantics::Unified {
+            bytes <= host_budget.saturating_mul(2)
+        } else {
+            bytes <= host_budget
+        }
+    });
+    let embedded = matches!(heuristic.plan.drafting, DraftingPlan::Embedded { .. });
+    let mut plans = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, plan) in
+        base_automatic_candidates(heuristic.plan.device, device_budget, host_budget)
+            .into_iter()
+            .enumerate()
+    {
+        if (index == 0 && !resident_fits) || (index == 1 && !layerwise_fits) {
+            continue;
+        }
+        if !inspect_candidate(model_path, &plan)?.supported {
+            continue;
+        }
+        let mut residency_plans = vec![plan.clone()];
+        if index != 0 {
+            let expert = with_expert_cache(plan.clone());
+            if inspect_candidate(model_path, &expert)?.supported {
+                residency_plans.push(expert);
+            }
+        }
+        for mut variant in residency_plans {
+            variant.drafting = DraftingPlan::Disabled;
+            push_unique_plan(&mut plans, &mut seen, variant.clone());
+            if embedded {
+                variant.drafting = DraftingPlan::Embedded {
+                    max_draft_tokens: 3,
+                    lookahead: true,
+                    adaptive_lookahead: true,
+                };
+                push_unique_plan(&mut plans, &mut seen, variant);
+            }
+        }
+    }
+    push_unique_plan(&mut plans, &mut seen, heuristic.plan.clone());
+    Ok(plans)
+}
+
+fn cli_device_for_plan(device: DevicePlan) -> Result<CliDevice> {
+    match device.backend {
+        BackendKind::Cpu if device.index == 0 => Ok(CliDevice::Cpu),
+        BackendKind::Metal | BackendKind::Cuda | BackendKind::Gpu => {
+            let index = i32::try_from(device.index).context("planned device index exceeds i32")?;
+            Ok(CliDevice::Gpu(index))
+        }
+        BackendKind::Cpu => bail!("CPU plan device index must be zero"),
+    }
+}
+
+fn temporary_trial_path(label: &str, candidate: usize, run: usize) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "safemlx-auto-{label}-{}-{candidate}-{run}.json",
+        std::process::id()
+    ))
+}
+
+fn isolated_benchmark_trial(
+    model_path: &Path,
+    plan: &ExecutionPlan,
+    candidate: usize,
+    run: usize,
+    tokens: usize,
+    timeout_seconds: u64,
+    prompt: &str,
+) -> AutoBenchmarkTrial {
+    let plan_path = temporary_trial_path("plan", candidate, run);
+    let telemetry_path = temporary_trial_path("telemetry", candidate, run);
+    let stderr_path = temporary_trial_path("stderr", candidate, run);
+    let execute = || -> Result<(TimingTelemetry, Option<u64>)> {
+        let encoded = serde_json::to_vec(plan).context("failed to serialize benchmark plan")?;
+        fs::write(&plan_path, encoded).with_context(|| {
+            format!(
+                "failed to write isolated trial plan {}",
+                plan_path.display()
+            )
+        })?;
+        let executable = std::env::current_exe()
+            .context("failed to locate the current executable for isolated benchmarking")?;
+        let stderr_file = fs::File::create(&stderr_path).with_context(|| {
+            format!(
+                "failed to create isolated trial stderr {}",
+                stderr_path.display()
+            )
+        })?;
+        let mut child = Command::new(executable)
+            .arg("--model")
+            .arg(model_path)
+            .arg("--device")
+            .arg(cli_device_for_plan(plan.device)?.to_string())
+            .arg("--auto-trial-plan")
+            .arg(&plan_path)
+            .arg("--telemetry-json")
+            .arg(&telemetry_path)
+            .arg("--max-tokens")
+            .arg(tokens.to_string())
+            .arg("--raw")
+            .arg(prompt)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
+            .spawn()
+            .context("failed to launch isolated benchmark process")?;
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .context("failed to poll isolated benchmark process")?
+            {
+                break status;
+            }
+            if started.elapsed().as_secs() >= timeout_seconds {
+                child
+                    .kill()
+                    .context("failed to terminate timed-out benchmark process")?;
+                let _ = child.wait();
+                bail!("trial process exceeded {timeout_seconds} second timeout");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        if !status.success() {
+            let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+            let detail = stderr.chars().take(2_000).collect::<String>();
+            bail!(
+                "trial process exited with {}{}{}",
+                status,
+                if detail.is_empty() { "" } else { ": " },
+                detail.trim()
+            );
+        }
+        let bytes = fs::read(&telemetry_path).with_context(|| {
+            format!(
+                "isolated trial did not produce telemetry {}",
+                telemetry_path.display()
+            )
+        })?;
+        let telemetry: ExecutionTelemetry = serde_json::from_slice(&bytes)
+            .context("failed to parse isolated benchmark telemetry")?;
+        if telemetry.generated_tokens == 0 {
+            bail!("isolated benchmark generated no tokens");
+        }
+        Ok((
+            telemetry.timing,
+            telemetry.allocator.map(|allocator| allocator.peak_bytes),
+        ))
+    };
+    let result = execute();
+    let _ = fs::remove_file(&plan_path);
+    let _ = fs::remove_file(&telemetry_path);
+    let _ = fs::remove_file(&stderr_path);
+    match result {
+        Ok((timing, peak_bytes)) => AutoBenchmarkTrial {
+            run,
+            success: true,
+            timing: Some(timing),
+            peak_bytes,
+            error: None,
+        },
+        Err(error) => AutoBenchmarkTrial {
+            run,
+            success: false,
+            timing: None,
+            peak_bytes: None,
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[middle - 1] + values[middle]) / 2.0)
+    } else {
+        Some(values[middle])
+    }
+}
+
+fn benchmark_automatic_plans(
+    model_path: &Path,
+    mut heuristic: ExecutionPlanReport,
+    tokens: usize,
+    runs: usize,
+    timeout_seconds: u64,
+    prompt: &str,
+) -> Result<AutoBenchmarkReport> {
+    let plans = automatic_benchmark_candidates(model_path, &heuristic)?;
+    let candidate_count = plans.len();
+    let mut candidates = Vec::with_capacity(candidate_count);
+    for (candidate, plan) in plans.into_iter().enumerate() {
+        eprintln!(
+            "automatic benchmark: candidate {}/{} ({:?}, {:?})",
+            candidate + 1,
+            candidate_count,
+            plan.residency,
+            plan.drafting
+        );
+        let trials = (0..runs)
+            .map(|run| {
+                isolated_benchmark_trial(
+                    model_path,
+                    &plan,
+                    candidate,
+                    run,
+                    tokens,
+                    timeout_seconds,
+                    prompt,
+                )
+            })
+            .collect::<Vec<_>>();
+        let median_token_rate = median(
+            trials
+                .iter()
+                .filter_map(|trial| trial.timing.as_ref().map(|timing| timing.token_rate))
+                .collect(),
+        );
+        let median_time_to_first_token_seconds = median(
+            trials
+                .iter()
+                .filter_map(|trial| {
+                    trial
+                        .timing
+                        .as_ref()
+                        .and_then(|timing| timing.time_to_first_token_seconds)
+                })
+                .collect(),
+        );
+        candidates.push(AutoBenchmarkCandidate {
+            plan,
+            trials,
+            median_token_rate,
+            median_time_to_first_token_seconds,
+        });
+    }
+    let selected = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| candidate.median_token_rate.map(|rate| (index, rate)))
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(index, _)| index)
+        .context("every isolated automatic benchmark candidate failed")?;
+    let selected_rate = candidates[selected]
+        .median_token_rate
+        .expect("selected benchmark candidate has a rate");
+    heuristic.plan = candidates[selected].plan.clone();
+    heuristic.explanation = PlanExplanation {
+        summary: format!(
+            "selected isolated benchmark candidate {} at {:.2} tokens/s median",
+            selected + 1,
+            selected_rate
+        ),
+        entries: vec![
+            PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "isolated_benchmark_selected".into(),
+                detail: format!(
+                    "selected candidate {} from {} admitted plans using {runs} fresh process run(s) of {tokens} generated tokens",
+                    selected + 1,
+                    candidates.len()
+                ),
+            },
+            PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "benchmark_score".into(),
+                detail: format!("median generation rate was {selected_rate:.2} tokens/s"),
+            },
+        ],
+    };
+    let cache_key = automatic_cache_key(model_path, &heuristic)?;
+    Ok(AutoBenchmarkReport {
+        schema_version: AUTO_BENCHMARK_SCHEMA_VERSION,
+        generated_tokens_per_trial: tokens,
+        runs_per_candidate: runs,
+        timeout_seconds,
+        selection_metric: "median_generation_tokens_per_second".into(),
+        cache_key,
+        selected: heuristic,
+        candidates,
+    })
+}
+
+fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<ExecutionPlanReport> {
+    if plan.schema_version != safemlx_lm::AUTOMATIC_SCHEMA_VERSION {
+        bail!(
+            "exact automatic plan schema {} does not match supported schema {}",
+            plan.schema_version,
+            safemlx_lm::AUTOMATIC_SCHEMA_VERSION
+        );
+    }
+    let hardware = discover_hardware();
+    validate_automatic_device(&hardware, plan.device)?;
+    let inspection = inspect_model(
+        model_path,
+        ModelInspectionOptions {
+            load: candidate_load_options(&plan)?,
+            chat_request: None,
+        },
+    )?;
+    if !inspection.is_loadable() {
+        let detail = inspection
+            .issues
+            .iter()
+            .find(|issue| issue.severity == safemlx_lm::InspectionSeverity::Error)
+            .map(|issue| issue.detail.as_str())
+            .unwrap_or("exact automatic plan was not admitted by checkpoint inspection");
+        bail!("cannot execute exact automatic plan: {detail}");
+    }
+    Ok(ExecutionPlanReport {
+        schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+        hardware,
+        resources: inspection.resources,
+        plan,
+        explanation: PlanExplanation {
+            summary: "executing an exact plan supplied by an isolated benchmark parent".into(),
+            entries: vec![PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "isolated_trial_exact_plan".into(),
+                detail: "the child process applied the serialized candidate without replanning"
+                    .into(),
+            }],
+        },
+    })
+}
+
 fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
+    match plan.weight_transformation {
+        WeightTransformationPlan::PreserveCheckpoint => {
+            args.quantize = None;
+            args.quantization_mode = LoadQuantizationMode::Affine;
+        }
+        WeightTransformationPlan::Affine { bits, group_size } => {
+            args.quantize = Some(bits);
+            args.quantization_mode = LoadQuantizationMode::Affine;
+            args.quantization_group_size = group_size;
+        }
+        WeightTransformationPlan::MxFp4 => {
+            args.quantize = Some(4);
+            args.quantization_mode = LoadQuantizationMode::Mxfp4;
+        }
+    }
     args.mapped_shards = plan.max_mapped_shards;
     args.mlx_cache_limit_bytes = plan.mlx_cache_limit_bytes;
     args.layerwise_host = false;
@@ -1339,6 +2039,40 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
     Ok(())
 }
 
+fn automatic_report_with_cache(
+    model_path: &Path,
+    device: CliDevice,
+    cache_path: Option<&Path>,
+) -> Result<ExecutionPlanReport> {
+    if let Some(path) = cache_path {
+        let observations = automatic_observations(model_path, device)?;
+        let key = automatic_cache_key(model_path, &observations)?;
+        if let Some(mut cached) = cached_automatic_report(path, &key)? {
+            if cached_plan_resource_admitted(&observations, &cached.plan)
+                && inspect_candidate(model_path, &cached.plan)?.supported
+            {
+                cached.explanation.entries.insert(
+                    0,
+                    PlanExplanationEntry {
+                        level: PlanExplanationLevel::Decision,
+                        code: "automatic_plan_cache_hit".into(),
+                        detail: format!(
+                            "reused a hardware- and artifact-matched plan from {}",
+                            path.display()
+                        ),
+                    },
+                );
+                return Ok(cached);
+            }
+        }
+        let heuristic = automatic_plan(model_path, device)?;
+        write_auto_plan_cache(path, key, heuristic.clone(), None)?;
+        Ok(heuristic)
+    } else {
+        automatic_plan(model_path, device)
+    }
+}
+
 fn main() -> Result<()> {
     let total_started = Instant::now();
     let mut args = Cli::parse();
@@ -1360,24 +2094,82 @@ fn main() -> Result<()> {
     }
     let model_path = resolved_model.path;
     let draft_model_path = resolved_draft.map(|artifact| artifact.path);
-    let automatic_report = match args.auto {
-        Some(mode) => {
-            let report = automatic_plan(&model_path, args.device)?;
-            match mode {
+    let exact_trial_report = args
+        .auto_trial_plan
+        .as_ref()
+        .map(|path| {
+            let bytes = fs::read(path)
+                .with_context(|| format!("failed to read exact trial plan {}", path.display()))?;
+            let plan: ExecutionPlan = serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse exact trial plan {}", path.display()))?;
+            if plan.device != device_plan(args.device) {
+                bail!(
+                    "exact trial plan device {:?}:{} does not match --device {}",
+                    plan.device.backend,
+                    plan.device.index,
+                    args.device
+                );
+            }
+            exact_automatic_report(&model_path, plan)
+        })
+        .transpose()?;
+    let automatic_report = if let Some(report) = exact_trial_report {
+        apply_automatic_plan(&mut args, &report.plan)?;
+        Some(report)
+    } else {
+        match args.auto {
+            Some(mode) => match mode {
+                AutoMode::Benchmark => {
+                    let heuristic = automatic_plan(&model_path, args.device)?;
+                    let benchmark = benchmark_automatic_plans(
+                        &model_path,
+                        heuristic,
+                        args.auto_benchmark_tokens,
+                        args.auto_benchmark_runs,
+                        args.auto_benchmark_timeout_seconds,
+                        args.prompt.as_deref().unwrap_or(AUTO_BENCHMARK_PROMPT),
+                    )?;
+                    if let Some(path) = &args.auto_cache {
+                        write_auto_plan_cache(
+                            path,
+                            benchmark.cache_key.clone(),
+                            benchmark.selected.clone(),
+                            benchmark.candidates.iter().find_map(|candidate| {
+                                (candidate.plan == benchmark.selected.plan)
+                                    .then_some(candidate.median_token_rate)
+                                    .flatten()
+                            }),
+                        )?;
+                    }
+                    serde_json::to_writer_pretty(io::stdout().lock(), &benchmark)
+                        .context("failed to serialize automatic benchmark report")?;
+                    println!();
+                    return Ok(());
+                }
                 AutoMode::Plan => {
+                    let report = automatic_report_with_cache(
+                        &model_path,
+                        args.device,
+                        args.auto_cache.as_deref(),
+                    )?;
                     serde_json::to_writer_pretty(io::stdout().lock(), &report)
                         .context("failed to serialize automatic execution plan")?;
                     println!();
                     return Ok(());
                 }
                 AutoMode::Quick => {
+                    let report = automatic_report_with_cache(
+                        &model_path,
+                        args.device,
+                        args.auto_cache.as_deref(),
+                    )?;
                     apply_automatic_plan(&mut args, &report.plan)?;
                     eprintln!("automatic plan: {}", report.explanation.summary);
                     Some(report)
                 }
-            }
+            },
+            None => None,
         }
-        None => None,
     };
     validate_args(&args)?;
     let hardware_profile = automatic_report
@@ -2473,6 +3265,15 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.max_tokens == 0 {
         bail!("--max-tokens must be greater than zero");
     }
+    if args.auto_benchmark_tokens == 0 {
+        bail!("--auto-benchmark-tokens must be greater than zero");
+    }
+    if args.auto_benchmark_runs == 0 {
+        bail!("--auto-benchmark-runs must be greater than zero");
+    }
+    if args.auto_benchmark_timeout_seconds == 0 {
+        bail!("--auto-benchmark-timeout-seconds must be greater than zero");
+    }
     if args.draft_model.is_some() && args.mtp_draft_tokens == 0 {
         bail!("--mtp-draft-tokens must be greater than zero when --draft-model is used");
     }
@@ -3074,17 +3875,19 @@ mod tests {
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
 
     use super::{
-        apply_automatic_plan, base_automatic_candidates, choose_automatic_residency,
-        cli_execution_plan, embedded_mtp_count, eval, execution_contexts, format_bytes,
-        format_weight_store_diagnostics, requested_load_quantization,
+        apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
+        cached_automatic_report, choose_automatic_residency, cli_execution_plan,
+        embedded_mtp_count, eval, execution_contexts, format_bytes,
+        format_weight_store_diagnostics, median, requested_load_quantization,
         select_cached_gguf_from_revisions, select_cached_gguf_pair_from_revisions,
         select_cached_gguf_path, select_revision, select_unique_cached_gguf,
         should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
-        validate_args, validate_artifact_pair, write_semantic_event, write_timing_report, Array,
-        AutoMode, BackendKind, CachedGgufRole, Cli, CliDevice, CliToolChoice, DevicePlan,
-        DeviceType, DraftingPlan, MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions,
-        NativeToolSupport, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
-        SemanticSupport, StopReason, WeightQuantization,
+        validate_args, validate_artifact_pair, write_auto_plan_cache, write_semantic_event,
+        write_timing_report, Array, AutoMode, AutoPlanCacheKey, BackendKind, CachedGgufRole, Cli,
+        CliDevice, CliToolChoice, DevicePlan, DeviceType, DraftingPlan, MtpDraftDevice,
+        MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport, ReasoningStream,
+        ResidencyPlan, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
+        WeightQuantization, WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -3114,6 +3917,107 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(quick.auto, Some(AutoMode::Quick));
+
+        let benchmark = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--auto",
+            "benchmark",
+            "--auto-cache",
+            "plans.json",
+            "--auto-benchmark-runs",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(benchmark.auto, Some(AutoMode::Benchmark));
+        assert_eq!(benchmark.auto_benchmark_runs, 3);
+        assert_eq!(benchmark.auto_benchmark_tokens, 32);
+        assert_eq!(benchmark.auto_benchmark_timeout_seconds, 300);
+    }
+
+    #[test]
+    fn benchmark_statistics_use_the_median() {
+        assert_eq!(median(vec![]), None);
+        assert_eq!(median(vec![9.0, 1.0, 5.0]), Some(5.0));
+        assert_eq!(median(vec![8.0, 2.0, 4.0, 6.0]), Some(5.0));
+        assert_eq!(median(vec![f64::NAN, 7.0]), Some(7.0));
+    }
+
+    #[test]
+    fn artifact_stamp_changes_invalidate_cache_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let weights = directory.path().join("model.safetensors");
+        std::fs::write(&weights, b"first").unwrap();
+        let first = artifact_file_stamps(directory.path()).unwrap();
+        std::fs::write(&weights, b"second-longer").unwrap();
+        let second = artifact_file_stamps(directory.path()).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn plan_cache_round_trips_matching_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_path = directory.path().join("plans.json");
+        let model_path = directory.path().join("model.gguf");
+        std::fs::write(&model_path, b"fixture").unwrap();
+        let device = DevicePlan {
+            backend: BackendKind::Cpu,
+            index: 0,
+        };
+        let hardware = safemlx_lm::discover_hardware();
+        let resources = safemlx_lm::ModelResourceProfile {
+            schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+            path: model_path.clone(),
+            artifact_kind: safemlx_lm::ArtifactKind::GgufCheckpoint,
+            model_kind: None,
+            architecture: Some("fixture".into()),
+            tensor_count: Some(1),
+            checkpoint_shards: Some(1),
+            stored_tensor_bytes: safemlx_lm::Observed::exact(7, "fixture"),
+            largest_stored_tensor_bytes: safemlx_lm::Observed::exact(7, "fixture"),
+            materialized_parameter_bytes: safemlx_lm::Observed::unavailable("fixture"),
+            pinned_parameter_bytes: safemlx_lm::Observed::unavailable("fixture"),
+            largest_execution_group_bytes: safemlx_lm::Observed::unavailable("fixture"),
+            largest_adjacent_execution_groups_bytes: safemlx_lm::Observed::unavailable("fixture"),
+            expert_parameter_bytes: safemlx_lm::Observed::unavailable("fixture"),
+        };
+        let report = safemlx_lm::ExecutionPlanReport {
+            schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+            hardware,
+            resources,
+            plan: safemlx_lm::ExecutionPlan::fully_resident(device),
+            explanation: safemlx_lm::PlanExplanation {
+                summary: "fixture".into(),
+                entries: Vec::new(),
+            },
+        };
+        let key = AutoPlanCacheKey {
+            planner_schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+            model_path,
+            model_architecture: Some("fixture".into()),
+            stored_tensor_bytes: Some(7),
+            tensor_count: Some(1),
+            checkpoint_shards: Some(1),
+            artifact_files: artifact_file_stamps(directory.path()).unwrap(),
+            operating_system: "fixture".into(),
+            architecture: "fixture".into(),
+            memory_semantics: "fixture".into(),
+            physical_memory_bytes: Some(1024),
+            device,
+            device_total_memory_bytes: Some(1024),
+        };
+        write_auto_plan_cache(&cache_path, key.clone(), report.clone(), Some(12.5)).unwrap();
+        assert_eq!(
+            cached_automatic_report(&cache_path, &key).unwrap(),
+            Some(report)
+        );
+
+        let mut miss = key;
+        miss.stored_tensor_bytes = Some(8);
+        assert!(cached_automatic_report(&cache_path, &miss)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -3200,6 +4104,35 @@ mod tests {
             plan.residency,
             ResidencyPlan::LayerwiseHost { .. }
         ));
+    }
+
+    #[test]
+    fn applying_exact_plan_replays_weight_transformation() {
+        let mut args = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--auto",
+            "quick",
+            "prompt",
+        ])
+        .unwrap();
+        let mut plan = safemlx_lm::ExecutionPlan::fully_resident(DevicePlan {
+            backend: BackendKind::Cpu,
+            index: 0,
+        });
+        plan.weight_transformation = WeightTransformationPlan::Affine {
+            bits: 4,
+            group_size: 128,
+        };
+        apply_automatic_plan(&mut args, &plan).unwrap();
+        assert_eq!(args.quantize, Some(4));
+        assert_eq!(args.quantization_group_size, 128);
+
+        plan.weight_transformation = WeightTransformationPlan::MxFp4;
+        apply_automatic_plan(&mut args, &plan).unwrap();
+        assert_eq!(args.quantize, Some(4));
+        assert_eq!(args.quantization_mode, super::LoadQuantizationMode::Mxfp4);
     }
 
     #[test]

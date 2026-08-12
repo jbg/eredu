@@ -2708,7 +2708,9 @@ dependencies = [
  "hf-hub",
  "safemlx",
  "safemlx-lm",
+ "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

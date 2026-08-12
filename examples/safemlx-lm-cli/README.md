@@ -124,6 +124,36 @@ JSON explanation records these fallbacks and every rejected candidate. Explicit
 residency, cache, quantization, and drafting knobs conflict with `--auto`, while
 `--device` remains available to choose the single device being planned.
 
+Use `--auto benchmark` to time every resource-admitted residency, expert-cache,
+and embedded-MTP variant in a fresh child process. A failed or out-of-memory
+candidate is recorded without contaminating the allocator state of later
+trials. The command prints a JSON benchmark report and chooses the plan with the
+highest median generation rate:
+
+```sh
+cargo run --release -q -p safemlx-lm-cli -- \
+  --model /path/to/model --device gpu:0 --auto benchmark \
+  --auto-benchmark-tokens 32 --auto-benchmark-runs 3 \
+  --auto-benchmark-timeout-seconds 300 \
+  --auto-cache .cache/safemlx-plans.json > benchmark.json
+```
+
+The optional `--auto-cache PATH` is shared by all automatic modes. Benchmark
+stores its winner; `plan` and `quick` reuse a matching entry and otherwise
+store their heuristic choice. Cache keys include the planner schema, resolved
+artifact path, checkpoint file sizes and modification times, tensor catalog,
+hardware capacity and selected device. Cache publication uses a temporary file
+and atomic rename, so an interrupted writer does not leave a partial JSON file.
+Hits are rechecked against current available memory and exact loader admission.
+Each benchmark child is also terminated after the configured timeout.
+
+```sh
+cargo run --release -q -p safemlx-lm-cli -- \
+  --model /path/to/model --auto quick \
+  --auto-cache .cache/safemlx-plans.json \
+  "Explain plan caching."
+```
+
 ## Loading and memory
 
 Eligible dense checkpoints can be quantized while loading:
