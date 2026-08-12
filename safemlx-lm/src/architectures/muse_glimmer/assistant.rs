@@ -281,6 +281,34 @@ struct DFlashAttention {
     scale: f32,
 }
 
+#[derive(Debug, Clone)]
+struct DFlashLayerContext {
+    keys: Array,
+    values: Array,
+}
+
+/// Per-request encoded target context and the corresponding assistant K/V.
+///
+/// Only committed target states are appended. Proposal-block K/V remains
+/// transient, so rejecting a proposal leaves this canonical cache unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct DFlashContextCache {
+    encoded: Array,
+    layers: Vec<DFlashLayerContext>,
+    start: i32,
+    end: i32,
+}
+
+impl DFlashContextCache {
+    fn retained_len(&self) -> i32 {
+        self.end - self.start
+    }
+
+    pub(crate) fn end(&self) -> i32 {
+        self.end
+    }
+}
+
 impl DFlashAttention {
     fn new(config: &DFlashConfig, layer: usize, stream: &Stream) -> Result<Self, Exception> {
         let prefix = format!("layers.{layer}.self_attn");
@@ -341,54 +369,79 @@ impl DFlashAttention {
         })
     }
 
+    fn project_context(
+        &mut self,
+        context: &Array,
+        offset: i32,
+        stream: &Stream,
+    ) -> Result<DFlashLayerContext, Exception> {
+        let batch = context.dim(0);
+        let length = context.dim(1);
+        let mut keys = self
+            .k_proj
+            .forward(context, stream)?
+            .reshape(&[batch, length, self.kv_heads, self.head_dim], stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+        let values = self
+            .v_proj
+            .forward(context, stream)?
+            .reshape(&[batch, length, self.kv_heads, self.head_dim], stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+        keys = self.k_norm.forward(&keys, stream)?;
+        keys = self.rope.forward(
+            nn::RopeInputBuilder::new(&keys).offset(offset).build()?,
+            stream,
+        )?;
+        Ok(DFlashLayerContext { keys, values })
+    }
+
     fn forward(
         &mut self,
         hidden: &Array,
-        context: &Array,
+        context: &DFlashLayerContext,
+        context_len: i32,
         absolute_context_end: i32,
         window: i32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let batch = hidden.dim(0);
         let query_len = hidden.dim(1);
-        let kv_input = concatenate_axis(&[context.clone(), hidden.clone()], 1, stream)?;
-        let key_len = kv_input.dim(1);
         let mut q = self
             .q_proj
             .forward(hidden, stream)?
             .reshape(&[batch, query_len, self.heads, self.head_dim], stream)?
             .transpose_axes(&[0, 2, 1, 3], stream)?;
-        let mut k = self
+        let mut block_keys = self
             .k_proj
-            .forward(&kv_input, stream)?
-            .reshape(&[batch, key_len, self.kv_heads, self.head_dim], stream)?
+            .forward(hidden, stream)?
+            .reshape(&[batch, query_len, self.kv_heads, self.head_dim], stream)?
             .transpose_axes(&[0, 2, 1, 3], stream)?;
-        let v = self
+        let block_values = self
             .v_proj
-            .forward(&kv_input, stream)?
-            .reshape(&[batch, key_len, self.kv_heads, self.head_dim], stream)?
+            .forward(hidden, stream)?
+            .reshape(&[batch, query_len, self.kv_heads, self.head_dim], stream)?
             .transpose_axes(&[0, 2, 1, 3], stream)?;
         q = self.q_norm.forward(&q, stream)?;
-        k = self.k_norm.forward(&k, stream)?;
+        block_keys = self.k_norm.forward(&block_keys, stream)?;
         q = self.rope.forward(
             nn::RopeInputBuilder::new(&q)
                 .offset(absolute_context_end)
                 .build()?,
             stream,
         )?;
-        let context_start = absolute_context_end - context.dim(1);
-        k = self.rope.forward(
-            nn::RopeInputBuilder::new(&k)
-                .offset(context_start)
+        block_keys = self.rope.forward(
+            nn::RopeInputBuilder::new(&block_keys)
+                .offset(absolute_context_end)
                 .build()?,
             stream,
         )?;
-        let mask =
-            bidirectional_block_mask(context.dim(1), query_len, absolute_context_end, window)?;
+        let keys = concatenate_axis(&[context.keys.clone(), block_keys], -2, stream)?;
+        let values = concatenate_axis(&[context.values.clone(), block_values], -2, stream)?;
+        let mask = bidirectional_block_mask(context_len, query_len, absolute_context_end, window)?;
         let attended = scaled_dot_product_attention(
             q,
-            k,
-            v,
+            keys,
+            values,
             Option::<crate::runtime::cache::ConcatKeyValueCache>::None,
             self.scale,
             Some(&mask),
@@ -481,7 +534,8 @@ impl DFlashBlock {
     fn forward(
         &mut self,
         hidden: &Array,
-        context: &Array,
+        context: &DFlashLayerContext,
+        context_len: i32,
         offset: i32,
         window: i32,
         stream: &Stream,
@@ -489,7 +543,7 @@ impl DFlashBlock {
         let norm = self.input_layernorm.forward(hidden, stream)?;
         let hidden = hidden.add(
             self.self_attn
-                .forward(&norm, context, offset, window, stream)?,
+                .forward(&norm, context, context_len, offset, window, stream)?,
             stream,
         )?;
         let norm = self.post_attention_layernorm.forward(&hidden, stream)?;
@@ -558,33 +612,117 @@ impl MuseGlimmerDFlash {
         })
     }
 
+    /// Incrementally encodes newly committed target states and appends their
+    /// per-layer K/V projections to the request's canonical draft cache.
+    pub(crate) fn update_context_cache(
+        &mut self,
+        previous: Option<DFlashContextCache>,
+        pending_target_states: Option<&Array>,
+        absolute_context_end: i32,
+        stream: &Stream,
+    ) -> Result<DFlashContextCache, Exception> {
+        let pending_len = pending_target_states.map_or(0, |states| states.dim(1));
+        let pending_start = context_append_start(
+            previous.as_ref().map(DFlashContextCache::end),
+            pending_len,
+            absolute_context_end,
+        )?;
+        if pending_len == 0 {
+            return previous.ok_or_else(|| {
+                Exception::custom("Muse-Glimmer DFlash cache cannot start from empty context")
+            });
+        }
+        let pending = pending_target_states.expect("non-empty pending context");
+        if pending.ndim() != 3
+            || pending.dim(0) != 1
+            || pending.dim(2) != self.config.hidden_size * self.config.target_layer_ids.len() as i32
+        {
+            return Err(Exception::custom(
+                "invalid Muse-Glimmer DFlash target context geometry",
+            ));
+        }
+        let encoded = self
+            .encoder
+            .output_norm_enc
+            .forward(&self.encoder.fc.forward(pending, stream)?, stream)?;
+        let layer_chunks = self
+            .layers
+            .iter_mut()
+            .map(|layer| {
+                layer
+                    .self_attn
+                    .project_context(&encoded, pending_start, stream)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let window = self.config.sliding_window;
+        let (encoded, layers) = if let Some(previous) = previous {
+            if previous.layers.len() != layer_chunks.len()
+                || previous.encoded.dim(1) != previous.retained_len()
+            {
+                return Err(Exception::custom(
+                    "invalid Muse-Glimmer DFlash cached context geometry",
+                ));
+            }
+            let encoded = append_encoded_tail(previous.encoded, encoded, window, stream)?;
+            let layers = previous
+                .layers
+                .into_iter()
+                .zip(layer_chunks)
+                .map(|(previous, chunk)| append_layer_tail(previous, chunk, window, stream))
+                .collect::<Result<Vec<_>, _>>()?;
+            (encoded, layers)
+        } else {
+            let encoded = retain_encoded_tail(encoded, window, stream)?;
+            let layers = layer_chunks
+                .into_iter()
+                .map(|layer| retain_layer_tail(layer, window, stream))
+                .collect::<Result<Vec<_>, _>>()?;
+            (encoded, layers)
+        };
+        let retained = encoded.dim(1);
+        Ok(DFlashContextCache {
+            encoded,
+            layers,
+            start: absolute_context_end - retained,
+            end: absolute_context_end,
+        })
+    }
+
     /// Runs the anchor-plus-mask block and returns the fifteen proposal states.
     pub(crate) fn proposal_states(
         &mut self,
         noise_embeds: &Array,
-        target_context: &Array,
+        context: &DFlashContextCache,
         absolute_context_end: i32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         if noise_embeds.shape() != [1, self.config.block_size as i32, self.config.hidden_size]
-            || target_context.ndim() != 3
-            || target_context.dim(0) != 1
-            || target_context.dim(2)
-                != self.config.hidden_size * self.config.target_layer_ids.len() as i32
+            || context.end != absolute_context_end
+            || context.encoded.ndim() != 3
+            || context.encoded.dim(0) != 1
+            || context.encoded.dim(2) != self.config.hidden_size
+            || context.encoded.dim(1) != context.retained_len()
+            || context.layers.len() != self.layers.len()
         {
             return Err(Exception::custom(
                 "invalid Muse-Glimmer DFlash block/context geometry",
             ));
         }
-        let context = self
-            .encoder
-            .output_norm_enc
-            .forward(&self.encoder.fc.forward(target_context, stream)?, stream)?;
+        let context_len = context.retained_len();
         let mut hidden = noise_embeds.clone();
-        for layer in &mut self.layers {
+        for (layer, layer_context) in self.layers.iter_mut().zip(&context.layers) {
+            if layer_context.keys.dim(-2) != context_len
+                || layer_context.values.dim(-2) != context_len
+            {
+                return Err(Exception::custom(
+                    "invalid Muse-Glimmer DFlash layer-cache geometry",
+                ));
+            }
             hidden = layer.forward(
                 &hidden,
-                &context,
+                layer_context,
+                context_len,
                 absolute_context_end,
                 self.config.sliding_window,
                 stream,
@@ -593,6 +731,75 @@ impl MuseGlimmerDFlash {
         let hidden = self.norm.forward(&hidden, stream)?;
         hidden.try_index_device((.., 1..self.config.block_size as i32, ..), stream)
     }
+}
+
+fn context_append_start(
+    previous_end: Option<i32>,
+    pending_len: i32,
+    absolute_end: i32,
+) -> Result<i32, Exception> {
+    if pending_len < 0 || absolute_end < pending_len {
+        return Err(Exception::custom(
+            "invalid Muse-Glimmer DFlash context range",
+        ));
+    }
+    let start = absolute_end - pending_len;
+    if let Some(previous_end) = previous_end {
+        if previous_end != start {
+            return Err(Exception::custom(format!(
+                "Muse-Glimmer DFlash context/cache frontier mismatch: cached through {previous_end}, pending starts at {start}"
+            )));
+        }
+    }
+    Ok(start)
+}
+
+fn retain_encoded_tail(encoded: Array, window: i32, stream: &Stream) -> Result<Array, Exception> {
+    let start = (encoded.dim(1) - window).max(0);
+    encoded.try_index_device((.., start.., ..), stream)
+}
+
+fn retain_layer_tail(
+    layer: DFlashLayerContext,
+    window: i32,
+    stream: &Stream,
+) -> Result<DFlashLayerContext, Exception> {
+    let start = (layer.keys.dim(-2) - window).max(0);
+    Ok(DFlashLayerContext {
+        keys: layer.keys.try_index_device((.., .., start.., ..), stream)?,
+        values: layer
+            .values
+            .try_index_device((.., .., start.., ..), stream)?,
+    })
+}
+
+fn append_encoded_tail(
+    previous: Array,
+    pending: Array,
+    window: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    retain_encoded_tail(
+        concatenate_axis(&[previous, pending], 1, stream)?,
+        window,
+        stream,
+    )
+}
+
+fn append_layer_tail(
+    previous: DFlashLayerContext,
+    pending: DFlashLayerContext,
+    window: i32,
+    stream: &Stream,
+) -> Result<DFlashLayerContext, Exception> {
+    retain_layer_tail(
+        DFlashLayerContext {
+            keys: concatenate_axis(&[previous.keys, pending.keys], -2, stream)?,
+            values: concatenate_axis(&[previous.values, pending.values], -2, stream)?,
+        },
+        window,
+        stream,
+    )
 }
 
 /// Loads either the official safetensors assistant or `dflash-kquant.gguf`.
@@ -702,7 +909,17 @@ pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{translate_gguf_weight_name, DFlashConfig};
+    use super::{context_append_start, translate_gguf_weight_name, DFlashConfig};
+
+    #[test]
+    fn committed_context_updates_must_continue_the_cached_frontier() {
+        assert_eq!(context_append_start(None, 75, 75).unwrap(), 0);
+        assert_eq!(context_append_start(None, 2048, 4096).unwrap(), 2048);
+        assert_eq!(context_append_start(Some(4096), 3, 4099).unwrap(), 4096);
+
+        assert!(context_append_start(Some(4096), 2, 4099).is_err());
+        assert!(context_append_start(Some(4100), 3, 4099).is_err());
+    }
 
     #[test]
     fn translates_official_dflash_names() {

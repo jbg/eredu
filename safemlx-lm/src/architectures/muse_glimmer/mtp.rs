@@ -4,7 +4,7 @@ use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters},
     nn,
-    ops::{concatenate_axis, indexing::TryIndexOp},
+    ops::indexing::TryIndexOp,
     quantization::MaybeQuantized,
     transforms::async_eval_with_event,
     Array, Stream,
@@ -13,7 +13,7 @@ use safemlx::{
 use crate::{
     api::{input::ModelInput, ModelCache},
     architectures::muse_glimmer::{
-        assistant::MuseGlimmerDFlash,
+        assistant::{DFlashContextCache, MuseGlimmerDFlash},
         layerwise::{DFlashTargetOutput, LayerwiseDecoder, MuseGlimmerLayerwiseCache},
         scale_logits,
     },
@@ -27,7 +27,8 @@ use crate::{
 
 #[derive(Clone)]
 pub(crate) struct MuseTargetState {
-    context: Array,
+    pending_context: Option<Array>,
+    draft_cache: Option<DFlashContextCache>,
     cache_len: usize,
 }
 
@@ -36,7 +37,7 @@ pub(crate) struct MuseDraftState {
     logits: Array,
     cursor: usize,
     proposal_capacity: usize,
-    context: Array,
+    draft_cache: DFlashContextCache,
     cache_len: usize,
 }
 
@@ -146,14 +147,15 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
         }
     }
 
-    fn target_state(
+    fn initial_target_state(
         context: Array,
         cache_len: usize,
         window: i32,
         stream: &Stream,
     ) -> Result<MuseTargetState, Exception> {
         Ok(MuseTargetState {
-            context: Self::retain_context(context, window, stream)?,
+            pending_context: Some(Self::retain_context(context, window, stream)?),
+            draft_cache: None,
             cache_len,
         })
     }
@@ -166,14 +168,22 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             return Ok(state.clone());
         }
         if streams.topology() == MtpStreamTopology::SameDeviceSplit {
-            let _ = streams.wait_for_target_outputs([&state.context])?;
+            if let Some(pending) = state.pending_context.as_ref() {
+                let _ = streams.wait_for_target_outputs([pending])?;
+            }
             return Ok(state.clone());
         }
-        async_eval_with_event([&state.context])?.synchronize()?;
-        let context = state.context.copy(streams.draft())?;
-        async_eval_with_event([&context])?.synchronize()?;
+        let pending_context = if let Some(pending) = state.pending_context.as_ref() {
+            async_eval_with_event([pending])?.synchronize()?;
+            let pending = pending.copy(streams.draft())?;
+            async_eval_with_event([&pending])?.synchronize()?;
+            Some(pending)
+        } else {
+            None
+        };
         Ok(MuseTargetState {
-            context,
+            pending_context,
+            draft_cache: state.draft_cache.clone(),
             cache_len: state.cache_len,
         })
     }
@@ -221,11 +231,18 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             .as_mut()
             .expect("initialized")
             .forward(&ids, streams.draft())?;
+        let absolute_context_end = i32::try_from(state.cache_len)
+            .map_err(|_| Exception::custom("Muse-Glimmer DFlash offset exceeds i32"))?;
+        let draft_cache = self.assistant.update_context_cache(
+            state.draft_cache,
+            state.pending_context.as_ref(),
+            absolute_context_end,
+            streams.draft(),
+        )?;
         let states = self.assistant.proposal_states(
             &noise,
-            &state.context,
-            i32::try_from(state.cache_len)
-                .map_err(|_| Exception::custom("Muse-Glimmer DFlash offset exceeds i32"))?,
+            &draft_cache,
+            absolute_context_end,
             streams.draft(),
         )?;
         // DFlash block attention is bidirectional, so removing unused mask
@@ -250,7 +267,7 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             logits,
             cursor: 0,
             proposal_capacity,
-            context: state.context,
+            draft_cache,
             cache_len: state.cache_len,
         })
     }
@@ -286,7 +303,7 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
             .logits
             .try_index_device((.., sequence - 1, ..), stream)?;
         let cache_len = Self::cache_len(cache);
-        let state = Self::target_state(
+        let state = Self::initial_target_state(
             output.states,
             cache_len,
             self.assistant.config.sliding_window,
@@ -381,10 +398,13 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         verified_inputs: usize,
         stream: &Stream,
     ) -> Result<MtpCommit<Self::TargetState>, Exception> {
-        if draft_state.cache_len != checkpoint {
+        if draft_state.cache_len != checkpoint
+            || usize::try_from(draft_state.draft_cache.end()).ok() != Some(checkpoint)
+        {
             return Err(Exception::custom(format!(
-                "Muse-Glimmer DFlash state/cache checkpoint mismatch: state {}, checkpoint {checkpoint}",
-                draft_state.cache_len
+                "Muse-Glimmer DFlash state/cache checkpoint mismatch: state {}, draft {}, checkpoint {checkpoint}",
+                draft_state.cache_len,
+                draft_state.draft_cache.end()
             )));
         }
         if verified_inputs > output.input_len {
@@ -398,23 +418,23 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         if verified_inputs != output.input_len {
             Self::truncate(cache, retained, stream)?;
         }
-        let context = if verified_inputs == 0 {
-            draft_state.context
+        let pending_context = if verified_inputs == 0 {
+            None
         } else {
             let count = i32::try_from(verified_inputs)
                 .map_err(|_| Exception::custom("DFlash retained input count exceeds i32"))?;
-            let accepted = output
-                .output
-                .states
-                .try_index_device((.., ..count, ..), stream)?;
-            concatenate_axis(&[draft_state.context, accepted], 1, stream)?
+            Some(
+                output
+                    .output
+                    .states
+                    .try_index_device((.., ..count, ..), stream)?,
+            )
         };
-        let state = Self::target_state(
-            context,
-            retained,
-            self.assistant.config.sliding_window,
-            stream,
-        )?;
+        let state = MuseTargetState {
+            pending_context,
+            draft_cache: Some(draft_state.draft_cache),
+            cache_len: retained,
+        };
         Ok(MtpCommit {
             state,
             replayed_tokens: 0,
@@ -424,23 +444,12 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
     fn commit_verification_with_streams(
         &mut self,
         output: Self::Verification,
-        mut draft_state: Self::DraftState,
+        draft_state: Self::DraftState,
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
         streams: MtpExecutionStreams<'_>,
     ) -> Result<MtpCommit<Self::TargetState>, Exception> {
-        match streams.topology() {
-            MtpStreamTopology::Single => {}
-            MtpStreamTopology::SameDeviceSplit => {
-                let _ = streams.wait_for_draft_outputs([&draft_state.context])?;
-            }
-            MtpStreamTopology::CrossDeviceSplit => {
-                async_eval_with_event([&draft_state.context])?.synchronize()?;
-                draft_state.context = draft_state.context.copy(streams.target())?;
-                async_eval_with_event([&draft_state.context])?.synchronize()?;
-            }
-        }
         self.commit_verification(
             output,
             draft_state,
