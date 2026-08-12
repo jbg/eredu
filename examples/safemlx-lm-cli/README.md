@@ -91,6 +91,39 @@ header-only model resource accounting in `ModelInspectionReport::resources`.
 Unknown materialized, per-layer, expert, or device-memory values are represented
 as unavailable rather than zero.
 
+## Automatic single-device planning
+
+Use `--auto plan` to inspect the selected device and checkpoint headers, print a
+versioned `ExecutionPlanReport` as JSON, and exit without loading the model or
+reading a prompt:
+
+```sh
+cargo run --release -q -p safemlx-lm-cli -- \
+  --model /path/to/model --device gpu:0 --auto plan > plan.json
+```
+
+Use `--auto quick` with a prompt to apply that same policy and generate text:
+
+```sh
+cargo run --release -q -p safemlx-lm-cli -- \
+  --model /path/to/model --device gpu:0 --auto quick \
+  "Explain automatic model placement."
+```
+
+The quick policy is intentionally limited to one execution device. It reserves
+30% of currently available memory, prefers fully resident execution, then
+host-backed layerwise execution, then dense disk streaming. Every candidate is
+checked with header-only load-policy inspection before selection. For admitted
+nonresident MoE checkpoints it assigns 40% of each bounded tier budget to the
+independent expert cache. It also enables three-token adaptive drafting when a
+supported SafeTensors configuration advertises embedded MTP layers.
+
+If device memory cannot be observed, the prototype uses a documented 4 GiB
+device budget; if host availability cannot be observed, it uses 16 GiB. The
+JSON explanation records these fallbacks and every rejected candidate. Explicit
+residency, cache, quantization, and drafting knobs conflict with `--auto`, while
+`--device` remains available to choose the single device being planned.
+
 ## Loading and memory
 
 Eligible dense checkpoints can be quantized while loading:

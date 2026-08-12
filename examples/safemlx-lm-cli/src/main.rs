@@ -21,13 +21,14 @@ use safemlx::{
 use safemlx_lm::{
     api::{
         discover_hardware, inspect_model, AllocatorTelemetry, BackendKind, DevicePlan,
-        DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionTelemetry, ExpertCachePlan,
-        ExpertCacheTelemetry, GenerationCancellationToken, LoadedModel, ModelInspectionOptions,
-        ModelLoadOptions, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
-        PreparedChatEmbeddedMtpGenerationRequest, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
-        PreparedChatMtpGenerationRequest, ResidencyPlan, ResidencyTelemetry, TextDecoder,
-        TimingTelemetry, WeightTransformationPlan,
+        DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
+        ExpertCachePlan, ExpertCacheTelemetry, GenerationCancellationToken,
+        HardwareMemorySemantics, HardwareProfile, LoadedModel, ModelInspectionOptions, ModelKind,
+        ModelLoadOptions, ModelResourceProfile, Observed, PlanExplanation, PlanExplanationEntry,
+        PlanExplanationLevel, PreparedChatEmbeddedMtpGenerationRequest,
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
+        ResidencyTelemetry, TextDecoder, TimingTelemetry, WeightTransformationPlan,
     },
     error::Error as LmError,
     runtime::chat::{
@@ -76,6 +77,14 @@ enum LoadQuantizationMode {
     #[default]
     Affine,
     Mxfp4,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum AutoMode {
+    /// Inspect hardware and checkpoint headers, print the selected plan as JSON, and exit.
+    Plan,
+    /// Select a low-latency single-device plan and execute it.
+    Quick,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
@@ -259,6 +268,40 @@ struct Cli {
     /// Append `:QUANT` to select a cached GGUF quantization.
     #[arg(short, long, value_name = "PATH_OR_ID")]
     model: String,
+
+    /// Automatically select a single-device execution plan.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        conflicts_with_all = [
+            "draft_model",
+            "mlx_cache_limit_bytes",
+            "mtp_draft_tokens",
+            "disable_mtp_lookahead",
+            "disable_mtp_adaptive_lookahead",
+            "mtp_draft_device",
+            "quantize",
+            "quantization_mode",
+            "quantization_group_size",
+            "layerwise_host",
+            "dense_disk_stream",
+            "dense_host_lookahead",
+            "dense_background_queue",
+            "expert_cache",
+            "device_layer_window",
+            "device_budget_bytes",
+            "host_budget_bytes",
+            "expert_cache_device_budget_bytes",
+            "expert_cache_host_budget_bytes",
+            "expert_cache_scratch_bytes",
+            "expert_cache_prefill_bank_bytes",
+            "expert_cache_eviction",
+            "expert_cache_benchmark",
+            "mapped_shards"
+        ]
+    )]
+    auto: Option<AutoMode>,
 
     /// External assistant directory, GGUF file, or cached Hugging Face identifier.
     /// A bare GGUF repository ID selects its unique draft sidecar.
@@ -733,17 +776,573 @@ fn requested_load_quantization(args: &Cli) -> Result<Option<WeightQuantization>>
     }
 }
 
+const AUTO_DEVICE_FALLBACK_BYTES: u64 = 4 << 30;
+const AUTO_HOST_FALLBACK_BYTES: u64 = 16 << 30;
+const AUTO_HEADROOM_PERCENT: u64 = 30;
+const AUTO_EXPERT_SHARE_PERCENT: u64 = 40;
+
+#[derive(Debug)]
+struct AutoCandidate {
+    supported: bool,
+    rejection: Option<String>,
+}
+
+fn observed_u64(value: &Observed<u64>) -> Option<u64> {
+    match value {
+        Observed::Available { value, .. } => Some(*value),
+        Observed::Unsupported { .. } | Observed::Unavailable { .. } => None,
+    }
+}
+
+fn automatic_budget(available: Option<u64>, fallback: u64) -> u64 {
+    available
+        .map(|bytes| bytes.saturating_mul(100 - AUTO_HEADROOM_PERCENT) / 100)
+        .unwrap_or(fallback)
+        .max(1)
+}
+
+fn selected_device_available_memory(hardware: &HardwareProfile, device: DevicePlan) -> Option<u64> {
+    hardware
+        .backends
+        .iter()
+        .find(|backend| backend.kind == device.backend && backend.available)
+        .and_then(|backend| {
+            backend
+                .devices
+                .iter()
+                .find(|candidate| candidate.index == device.index)
+        })
+        .and_then(|device| observed_u64(&device.available_memory_bytes))
+}
+
+fn validate_automatic_device(hardware: &HardwareProfile, device: DevicePlan) -> Result<()> {
+    let backend = hardware
+        .backends
+        .iter()
+        .find(|backend| backend.kind == device.backend)
+        .with_context(|| {
+            format!(
+                "automatic planning did not discover the {:?} backend selected by --device",
+                device.backend
+            )
+        })?;
+    if !backend.available {
+        bail!(
+            "automatic planning cannot use unavailable {:?} backend: {}",
+            device.backend,
+            backend.detail.as_deref().unwrap_or("no detail reported")
+        );
+    }
+    if !backend
+        .devices
+        .iter()
+        .any(|candidate| candidate.index == device.index)
+    {
+        bail!(
+            "automatic planning did not discover {:?} device index {}",
+            device.backend,
+            device.index
+        );
+    }
+    Ok(())
+}
+
+fn automatic_model_bytes(resources: &ModelResourceProfile) -> Option<(u64, &'static str)> {
+    observed_u64(&resources.materialized_parameter_bytes)
+        .map(|bytes| (bytes, "materialized parameter estimate"))
+        .or_else(|| {
+            observed_u64(&resources.stored_tensor_bytes)
+                .map(|bytes| (bytes, "stored checkpoint tensor bytes"))
+        })
+}
+
+fn candidate_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions> {
+    let residency = match &plan.residency {
+        ResidencyPlan::FullyResident => NonExpertWeightResidency::FullyResident,
+        ResidencyPlan::LayerwiseHost {
+            device_layer_window,
+            device_budget_bytes,
+            host_budget_bytes,
+        } => NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions {
+            offload: OffloadConfig::new(
+                *device_budget_bytes,
+                *host_budget_bytes,
+                *device_layer_window,
+            )?,
+            max_mapped_shards: plan.max_mapped_shards,
+            ..LayerwiseLoadOptions::default()
+        }),
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            host_budget_bytes,
+            host_lookahead,
+            background_queue,
+        } => {
+            let mut options = DenseDiskStreamLoadOptions::new(
+                *device_budget_bytes,
+                *host_budget_bytes,
+                *host_lookahead,
+                *background_queue,
+            )?;
+            options.max_mapped_shards = plan.max_mapped_shards;
+            NonExpertWeightResidency::DenseDiskStream(options)
+        }
+    };
+    let weight_residency = if let Some(expert) = &plan.expert_cache {
+        let experts = OffloadConfig::new(expert.device_budget_bytes, expert.host_budget_bytes, 1)?;
+        let options =
+            ExpertCacheLoadOptions::new(experts, expert.scratch_bytes, expert.prefill_bank_bytes)?;
+        WeightResidency::with_expert_cache(residency, options)
+    } else {
+        match residency {
+            NonExpertWeightResidency::FullyResident => WeightResidency::fully_resident(),
+            NonExpertWeightResidency::LayerwiseHost(options) => {
+                WeightResidency::layerwise_host(options)
+            }
+            NonExpertWeightResidency::DenseDiskStream(options) => {
+                WeightResidency::dense_disk_stream(options)
+            }
+        }
+    };
+    Ok(ModelLoadOptions::default().with_weight_residency(weight_residency))
+}
+
+fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCandidate> {
+    let report = inspect_model(
+        model_path,
+        ModelInspectionOptions {
+            load: candidate_load_options(plan)?,
+            chat_request: None,
+        },
+    )?;
+    let supported = report.is_loadable();
+    let rejection = (!supported).then(|| {
+        report
+            .issues
+            .iter()
+            .find(|issue| issue.severity == safemlx_lm::InspectionSeverity::Error)
+            .map(|issue| issue.detail.clone())
+            .unwrap_or_else(|| "checkpoint inspection did not admit this load policy".into())
+    });
+    Ok(AutoCandidate {
+        supported,
+        rejection,
+    })
+}
+
+fn base_automatic_candidates(
+    device: DevicePlan,
+    device_budget: u64,
+    host_budget: u64,
+) -> [ExecutionPlan; 3] {
+    let resident = ExecutionPlan::fully_resident(device);
+    let mut layerwise = ExecutionPlan::fully_resident(device);
+    layerwise.residency = ResidencyPlan::LayerwiseHost {
+        device_layer_window: 1,
+        device_budget_bytes: Some(device_budget),
+        host_budget_bytes: Some(host_budget),
+    };
+    let mut disk = ExecutionPlan::fully_resident(device);
+    disk.residency = ResidencyPlan::DenseDiskStream {
+        device_budget_bytes: device_budget,
+        host_budget_bytes: host_budget,
+        host_lookahead: usize::from(host_budget > 0) * 2,
+        background_queue: usize::from(host_budget > 0) * 2,
+    };
+    [resident, layerwise, disk]
+}
+
+fn embedded_mtp_count(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in ["mtp_num_hidden_layers", "num_nextn_predict_layers"] {
+                if let Some(count) = object.get(key).and_then(serde_json::Value::as_u64) {
+                    return Some(count);
+                }
+            }
+            object.values().find_map(embedded_mtp_count)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(embedded_mtp_count),
+        _ => None,
+    }
+}
+
+fn embedded_mtp_layers(model_path: &Path, kind: Option<ModelKind>) -> Result<Option<usize>> {
+    if !matches!(
+        kind,
+        Some(
+            ModelKind::DeepSeekV3
+                | ModelKind::Inkling
+                | ModelKind::NemotronH
+                | ModelKind::Qwen3Next
+                | ModelKind::Qwen35
+        )
+    ) {
+        return Ok(Some(0));
+    }
+    if !model_path.is_dir() {
+        return Ok(None);
+    }
+    let path = model_path.join("config.json");
+    let raw = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "failed to read {} for automatic MTP detection",
+            path.display()
+        )
+    })?;
+    let config: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "failed to parse {} for automatic MTP detection",
+            path.display()
+        )
+    })?;
+
+    embedded_mtp_count(&config)
+        .map(|count| usize::try_from(count).context("embedded MTP layer count exceeds usize"))
+        .transpose()
+        .map(|count| Some(count.unwrap_or(0)))
+}
+
+fn with_expert_cache(mut plan: ExecutionPlan) -> ExecutionPlan {
+    let split = |bytes: u64, percent: u64| bytes.saturating_mul(percent) / 100;
+    let (device_budget, host_budget) = match &mut plan.residency {
+        ResidencyPlan::FullyResident => (AUTO_DEVICE_FALLBACK_BYTES, AUTO_HOST_FALLBACK_BYTES),
+        ResidencyPlan::LayerwiseHost {
+            device_budget_bytes,
+            host_budget_bytes,
+            ..
+        } => {
+            let device = device_budget_bytes.unwrap_or(AUTO_DEVICE_FALLBACK_BYTES);
+            let host = host_budget_bytes.unwrap_or(AUTO_HOST_FALLBACK_BYTES);
+            *device_budget_bytes = Some(split(device, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1));
+            *host_budget_bytes = Some(split(host, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1));
+            (device, host)
+        }
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            host_budget_bytes,
+            ..
+        } => {
+            let device = *device_budget_bytes;
+            let host = *host_budget_bytes;
+            *device_budget_bytes = split(device, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1);
+            *host_budget_bytes = split(host, 100 - AUTO_EXPERT_SHARE_PERCENT).max(1);
+            (device, host)
+        }
+    };
+    let scratch = (1_u64 << 30).min(device_budget.max(1));
+    plan.expert_cache = Some(ExpertCachePlan {
+        device_budget_bytes: Some(split(device_budget, AUTO_EXPERT_SHARE_PERCENT).max(1)),
+        host_budget_bytes: Some(split(host_budget, AUTO_EXPERT_SHARE_PERCENT).max(1)),
+        scratch_bytes: scratch,
+        prefill_bank_bytes: scratch,
+    });
+    plan
+}
+
+fn choose_automatic_residency(
+    resident_fits: bool,
+    layerwise_fits: bool,
+    resident_supported: bool,
+    layerwise_supported: bool,
+    disk_supported: bool,
+) -> Option<usize> {
+    if resident_fits && resident_supported {
+        Some(0)
+    } else if layerwise_fits && layerwise_supported {
+        Some(1)
+    } else if disk_supported {
+        Some(2)
+    } else if layerwise_supported {
+        Some(1)
+    } else if resident_supported {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn automatic_plan(model_path: &Path, device: CliDevice) -> Result<ExecutionPlanReport> {
+    let hardware = discover_hardware();
+    let selected_device = device_plan(device);
+    validate_automatic_device(&hardware, selected_device)?;
+    let initial = inspect_model(model_path, ModelInspectionOptions::default())?;
+    let resources = initial.resources;
+    let device_available = selected_device_available_memory(&hardware, selected_device);
+    let host_available = observed_u64(&hardware.available_memory_bytes);
+    let device_budget = automatic_budget(device_available, AUTO_DEVICE_FALLBACK_BYTES);
+    let host_budget = automatic_budget(host_available, AUTO_HOST_FALLBACK_BYTES);
+    let model_bytes = automatic_model_bytes(&resources);
+    let candidates = base_automatic_candidates(selected_device, device_budget, host_budget);
+    let resident = inspect_candidate(model_path, &candidates[0])?;
+    let layerwise = inspect_candidate(model_path, &candidates[1])?;
+    let disk = inspect_candidate(model_path, &candidates[2])?;
+    let mut entries = vec![PlanExplanationEntry {
+        level: PlanExplanationLevel::Decision,
+        code: "single_device_scope".into(),
+        detail: format!(
+            "automatic quick planning is restricted to {:?}:{} with 30% memory headroom",
+            selected_device.backend, selected_device.index
+        ),
+    }];
+
+    let resident_fits = match (model_bytes, device_available) {
+        (Some((bytes, basis)), Some(available)) => {
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "resource_basis".into(),
+                detail: format!(
+                    "used {basis} ({bytes} bytes) against {device_budget} usable bytes from {available} currently available bytes"
+                ),
+            });
+            bytes <= device_budget
+        }
+        (Some((bytes, basis)), None) => {
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Warning,
+                code: "device_memory_unavailable".into(),
+                detail: format!(
+                    "device memory is unavailable; used the {AUTO_DEVICE_FALLBACK_BYTES}-byte quick-policy fallback against {basis} ({bytes} bytes)"
+                ),
+            });
+            bytes <= AUTO_DEVICE_FALLBACK_BYTES
+        }
+        (None, _) => {
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Warning,
+                code: "model_footprint_unavailable".into(),
+                detail: "no materialized or stored checkpoint size was available; bounded loading is preferred"
+                    .into(),
+            });
+            false
+        }
+    };
+
+    let layerwise_fits =
+        model_bytes.is_some_and(|(bytes, _)| match hardware.physical_memory_semantics {
+            HardwareMemorySemantics::Unified => bytes <= host_budget.saturating_mul(2),
+            HardwareMemorySemantics::SeparateTiers | HardwareMemorySemantics::Unknown => {
+                bytes <= host_budget
+            }
+        });
+
+    let Some(selected) = choose_automatic_residency(
+        resident_fits,
+        layerwise_fits,
+        resident.supported,
+        layerwise.supported,
+        disk.supported,
+    ) else {
+        bail!(
+            "automatic planning found no loadable single-device policy: resident: {}; layerwise: {}; disk-streamed: {}",
+            resident.rejection.unwrap_or_else(|| "not admitted".into()),
+            layerwise.rejection.unwrap_or_else(|| "not admitted".into()),
+            disk.rejection.unwrap_or_else(|| "not admitted".into()),
+        );
+    };
+    if selected != 0 {
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Rejection,
+            code: if resident_fits {
+                "resident_unsupported"
+            } else {
+                "resident_exceeds_quick_budget"
+            }
+            .into(),
+            detail: resident.rejection.clone().unwrap_or_else(|| {
+                "fully resident execution exceeds the quick policy's memory admission budget".into()
+            }),
+        });
+    }
+    if selected == 2 {
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Rejection,
+            code: if layerwise_fits {
+                "layerwise_unsupported"
+            } else {
+                "layerwise_exceeds_host_budget"
+            }
+            .into(),
+            detail: layerwise.rejection.clone().unwrap_or_else(|| {
+                "the checkpoint exceeds the quick policy's host-backed admission budget".into()
+            }),
+        });
+    }
+    if selected == 1 && !layerwise_fits {
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Warning,
+            code: "disk_stream_unsupported".into(),
+            detail: disk
+                .rejection
+                .clone()
+                .unwrap_or_else(|| "dense disk streaming was not admitted".into()),
+        });
+    }
+    if selected == 0 && !resident_fits {
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Warning,
+            code: "bounded_policies_unsupported".into(),
+            detail: "bounded policies were unavailable; fully resident execution may exceed currently available memory"
+                .into(),
+        });
+    }
+    let (mut plan, summary) = match selected {
+        0 => {
+            let summary = if resident_fits {
+                "selected fully resident execution for the lowest expected latency"
+            } else {
+                "selected fully resident execution as the only admitted policy"
+            };
+            (candidates[0].clone(), summary)
+        }
+        1 => {
+            let summary = if layerwise_fits {
+                "selected host-backed layerwise execution with a one-layer device window"
+            } else {
+                "selected host-backed layerwise execution as the only admitted bounded policy"
+            };
+            (candidates[1].clone(), summary)
+        }
+        2 => (
+            candidates[2].clone(),
+            "selected bounded dense disk streaming because resident and layerwise admission failed",
+        ),
+        _ => unreachable!("automatic residency candidate index is bounded"),
+    };
+
+    entries.push(PlanExplanationEntry {
+        level: PlanExplanationLevel::Decision,
+        code: match &plan.residency {
+            ResidencyPlan::FullyResident => "fully_resident_selected",
+            ResidencyPlan::LayerwiseHost { .. } => "layerwise_host_selected",
+            ResidencyPlan::DenseDiskStream { .. } => "dense_disk_stream_selected",
+        }
+        .into(),
+        detail: summary.into(),
+    });
+
+    if !matches!(&plan.residency, ResidencyPlan::FullyResident) {
+        let expert_plan = with_expert_cache(plan.clone());
+        let expert = inspect_candidate(model_path, &expert_plan)?;
+        if expert.supported {
+            plan = expert_plan;
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "expert_cache_selected".into(),
+                detail: "the checkpoint admits independent routed-expert caching; 40% of each bounded tier budget was assigned to experts"
+                    .into(),
+            });
+        } else {
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Rejection,
+                code: "expert_cache_not_selected".into(),
+                detail: expert
+                    .rejection
+                    .unwrap_or_else(|| "the checkpoint did not admit routed-expert caching".into()),
+            });
+        }
+    }
+
+    match embedded_mtp_layers(model_path, resources.model_kind)? {
+        Some(layers) if layers > 0 => {
+            plan.drafting = DraftingPlan::Embedded {
+                max_draft_tokens: 3,
+                lookahead: true,
+                adaptive_lookahead: true,
+            };
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "embedded_mtp_selected".into(),
+                detail: format!(
+                    "validated configuration advertises {layers} embedded prediction layer(s); enabled three-token adaptive lookahead"
+                ),
+            });
+        }
+        Some(_) => entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Decision,
+            code: "embedded_mtp_absent".into(),
+            detail: "the checkpoint configuration does not advertise embedded prediction layers"
+                .into(),
+        }),
+        None => entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Warning,
+            code: "embedded_mtp_unobservable".into(),
+            detail: "embedded MTP capability was not observable from this checkpoint container"
+                .into(),
+        }),
+    }
+
+    Ok(ExecutionPlanReport {
+        schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+        hardware,
+        resources,
+        plan,
+        explanation: PlanExplanation {
+            summary: summary.into(),
+            entries,
+        },
+    })
+}
+
+fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
+    args.mapped_shards = plan.max_mapped_shards;
+    args.mlx_cache_limit_bytes = plan.mlx_cache_limit_bytes;
+    args.layerwise_host = false;
+    args.dense_disk_stream = false;
+    match &plan.residency {
+        ResidencyPlan::FullyResident => {}
+        ResidencyPlan::LayerwiseHost {
+            device_layer_window,
+            device_budget_bytes,
+            host_budget_bytes,
+        } => {
+            args.layerwise_host = true;
+            args.device_layer_window = *device_layer_window;
+            args.device_budget_bytes = *device_budget_bytes;
+            args.host_budget_bytes = *host_budget_bytes;
+        }
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            host_budget_bytes,
+            host_lookahead,
+            background_queue,
+        } => {
+            args.dense_disk_stream = true;
+            args.device_budget_bytes = Some(*device_budget_bytes);
+            args.host_budget_bytes = Some(*host_budget_bytes);
+            args.dense_host_lookahead = *host_lookahead;
+            args.dense_background_queue = *background_queue;
+        }
+    }
+    args.expert_cache = plan.expert_cache.is_some();
+    if let Some(expert) = &plan.expert_cache {
+        args.expert_cache_device_budget_bytes = expert.device_budget_bytes;
+        args.expert_cache_host_budget_bytes = expert.host_budget_bytes;
+        args.expert_cache_scratch_bytes = expert.scratch_bytes;
+        args.expert_cache_prefill_bank_bytes = expert.prefill_bank_bytes;
+    }
+    match plan.drafting {
+        DraftingPlan::Disabled => args.mtp_draft_tokens = 0,
+        DraftingPlan::Embedded {
+            max_draft_tokens,
+            lookahead,
+            adaptive_lookahead,
+        } => {
+            args.mtp_draft_tokens = max_draft_tokens;
+            args.disable_mtp_lookahead = !lookahead;
+            args.disable_mtp_adaptive_lookahead = !adaptive_lookahead;
+        }
+        DraftingPlan::External { .. } => {
+            bail!("single-device automatic planning cannot apply an external drafting plan")
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let total_started = Instant::now();
-    let args = Cli::parse();
+    let mut args = Cli::parse();
     validate_args(&args)?;
-    let hardware_profile = args.telemetry_json.as_ref().map(|_| discover_hardware());
-    if let Some(bytes) = args.mlx_cache_limit_bytes {
-        let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
-        safemlx::memory::set_cache_limit(bytes)
-            .context("failed to set the MLX allocator-cache limit")?;
-    }
-    let prompt = read_prompt(args.prompt.as_deref())?;
     let (resolved_model, resolved_draft) = resolve_model_pair(
         &args.model,
         args.draft_model.as_deref(),
@@ -761,6 +1360,36 @@ fn main() -> Result<()> {
     }
     let model_path = resolved_model.path;
     let draft_model_path = resolved_draft.map(|artifact| artifact.path);
+    let automatic_report = match args.auto {
+        Some(mode) => {
+            let report = automatic_plan(&model_path, args.device)?;
+            match mode {
+                AutoMode::Plan => {
+                    serde_json::to_writer_pretty(io::stdout().lock(), &report)
+                        .context("failed to serialize automatic execution plan")?;
+                    println!();
+                    return Ok(());
+                }
+                AutoMode::Quick => {
+                    apply_automatic_plan(&mut args, &report.plan)?;
+                    eprintln!("automatic plan: {}", report.explanation.summary);
+                    Some(report)
+                }
+            }
+        }
+        None => None,
+    };
+    validate_args(&args)?;
+    let hardware_profile = automatic_report
+        .as_ref()
+        .map(|report| report.hardware.clone())
+        .or_else(|| args.telemetry_json.as_ref().map(|_| discover_hardware()));
+    if let Some(bytes) = args.mlx_cache_limit_bytes {
+        let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
+        safemlx::memory::set_cache_limit(bytes)
+            .context("failed to set the MLX allocator-cache limit")?;
+    }
+    let prompt = read_prompt(args.prompt.as_deref())?;
 
     if args.verbose {
         eprintln!("--- safemlx diagnostics (stderr) ---");
@@ -856,7 +1485,9 @@ fn main() -> Result<()> {
             },
         ));
     }
-    let resource_profile = if args.telemetry_json.is_some() {
+    let resource_profile = if let Some(report) = &automatic_report {
+        Some(report.resources.clone())
+    } else if args.telemetry_json.is_some() {
         Some(
             inspect_model(
                 &model_path,
@@ -1541,12 +2172,12 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = &args.telemetry_json {
-        let plan = cli_execution_plan(&args, draft_model_path.as_deref(), embedded_mtp);
-        let telemetry = ExecutionTelemetry {
-            schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
-            model_type: model.model_type().into(),
-            plan: Some(plan),
-            plan_explanation: Some(PlanExplanation {
+        let plan = automatic_report.as_ref().map_or_else(
+            || cli_execution_plan(&args, draft_model_path.as_deref(), embedded_mtp),
+            |report| report.plan.clone(),
+        );
+        let plan_explanation = automatic_report.as_ref().map_or_else(
+            || PlanExplanation {
                 summary: "recorded the concrete execution settings supplied to the CLI".into(),
                 entries: vec![PlanExplanationEntry {
                     level: PlanExplanationLevel::Decision,
@@ -1554,7 +2185,14 @@ fn main() -> Result<()> {
                     detail: "this run records explicit/default CLI settings; no automatic candidate selection was performed"
                         .into(),
                 }],
-            }),
+            },
+            |report| report.explanation.clone(),
+        );
+        let telemetry = ExecutionTelemetry {
+            schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+            model_type: model.model_type().into(),
+            plan: Some(plan),
+            plan_explanation: Some(plan_explanation),
             hardware: hardware_profile,
             resources: resource_profile,
             prompt_tokens: tokens.shape()[1] as usize,
@@ -2436,15 +3074,17 @@ mod tests {
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
 
     use super::{
-        cli_execution_plan, eval, execution_contexts, format_bytes,
+        apply_automatic_plan, base_automatic_candidates, choose_automatic_residency,
+        cli_execution_plan, embedded_mtp_count, eval, execution_contexts, format_bytes,
         format_weight_store_diagnostics, requested_load_quantization,
         select_cached_gguf_from_revisions, select_cached_gguf_pair_from_revisions,
         select_cached_gguf_path, select_revision, select_unique_cached_gguf,
         should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
         validate_args, validate_artifact_pair, write_semantic_event, write_timing_report, Array,
-        CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType, MtpDraftDevice,
-        MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport, ReasoningStream,
-        ResolvedModel, SemanticEvent, SemanticSupport, StopReason, WeightQuantization,
+        AutoMode, BackendKind, CachedGgufRole, Cli, CliDevice, CliToolChoice, DevicePlan,
+        DeviceType, DraftingPlan, MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions,
+        NativeToolSupport, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
+        SemanticSupport, StopReason, WeightQuantization,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -2456,6 +3096,125 @@ mod tests {
             refs: refs.iter().map(|value| (*value).to_owned()).collect(),
             last_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(modified),
         }
+    }
+
+    #[test]
+    fn parses_auto_modes_without_requiring_a_prompt() {
+        let plan =
+            Cli::try_parse_from(["safemlx-lm", "--model", "model-id", "--auto", "plan"]).unwrap();
+        assert_eq!(plan.auto, Some(AutoMode::Plan));
+
+        let quick = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--auto",
+            "quick",
+            "prompt",
+        ])
+        .unwrap();
+        assert_eq!(quick.auto, Some(AutoMode::Quick));
+    }
+
+    #[test]
+    fn automatic_mode_conflicts_with_explicit_tuning_knobs() {
+        for knob in ["--layerwise-host", "--dense-disk-stream", "--expert-cache"] {
+            assert!(Cli::try_parse_from([
+                "safemlx-lm",
+                "--model",
+                "model-id",
+                "--auto",
+                "quick",
+                knob,
+                "prompt",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn automatic_residency_prefers_speed_then_bounded_fallbacks() {
+        assert_eq!(
+            choose_automatic_residency(true, true, true, true, true),
+            Some(0)
+        );
+        assert_eq!(
+            choose_automatic_residency(false, true, true, true, true),
+            Some(1)
+        );
+        assert_eq!(
+            choose_automatic_residency(false, false, true, true, true),
+            Some(2)
+        );
+        assert_eq!(
+            choose_automatic_residency(false, false, true, true, false),
+            Some(1)
+        );
+        assert_eq!(
+            choose_automatic_residency(false, false, true, false, false),
+            Some(0)
+        );
+        assert_eq!(
+            choose_automatic_residency(false, false, false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn applying_automatic_plan_sets_residency_expert_cache_and_embedded_mtp() {
+        let mut args = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--auto",
+            "quick",
+            "prompt",
+        ])
+        .unwrap();
+        let device = DevicePlan {
+            backend: BackendKind::Cpu,
+            index: 0,
+        };
+        let mut plan = base_automatic_candidates(device, 1 << 30, 2 << 30)[1].clone();
+        plan.expert_cache = Some(super::ExpertCachePlan {
+            device_budget_bytes: Some(256 << 20),
+            host_budget_bytes: Some(512 << 20),
+            scratch_bytes: 128 << 20,
+            prefill_bank_bytes: 64 << 20,
+        });
+        plan.drafting = DraftingPlan::Embedded {
+            max_draft_tokens: 3,
+            lookahead: true,
+            adaptive_lookahead: true,
+        };
+
+        apply_automatic_plan(&mut args, &plan).unwrap();
+        assert!(args.layerwise_host);
+        assert!(!args.dense_disk_stream);
+        assert!(args.expert_cache);
+        assert_eq!(args.device_budget_bytes, Some(1 << 30));
+        assert_eq!(args.expert_cache_device_budget_bytes, Some(256 << 20));
+        assert_eq!(args.mtp_draft_tokens, 3);
+        assert!(!args.disable_mtp_lookahead);
+        assert!(matches!(
+            plan.residency,
+            ResidencyPlan::LayerwiseHost { .. }
+        ));
+    }
+
+    #[test]
+    fn embedded_mtp_detection_accepts_root_and_nested_config_keys() {
+        assert_eq!(
+            embedded_mtp_count(&serde_json::json!({"mtp_num_hidden_layers": 2})),
+            Some(2)
+        );
+        assert_eq!(
+            embedded_mtp_count(&serde_json::json!({
+                "mtp_config": {"num_nextn_predict_layers": 3}
+            })),
+            Some(3)
+        );
+        assert_eq!(embedded_mtp_count(&serde_json::json!({})), None);
     }
 
     fn cached_file(file_path: &str, blob_path: &str) -> CachedFileInfo {
