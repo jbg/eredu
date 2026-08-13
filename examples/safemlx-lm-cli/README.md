@@ -50,8 +50,11 @@ cargo run --release -p safemlx-lm-cli -- \
 
 When the positional prompt is omitted, the command reads it from standard
 input. Generated visible text is streamed to standard output, so it can be
-piped or redirected. Diagnostics, reasoning output in verbose mode, timing,
-memory statistics, and stop reasons are written to standard error.
+piped or redirected. When standard output is a terminal, reasoning is shown on
+standard error before the visible response and dimmed when standard error is
+also a terminal. Reasoning remains hidden when standard output is piped or
+redirected. Diagnostics, verbose reasoning output, timing, memory statistics,
+and stop reasons are also written to standard error.
 
 ```sh
 printf 'Summarize the purpose of MLX.' | \

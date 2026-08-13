@@ -538,7 +538,7 @@ struct Cli {
     #[arg(long)]
     allow_unparsed_reasoning: bool,
 
-    /// Print reasoning content, model resolution, and generation statistics to stderr.
+    /// Print labeled reasoning content, model resolution, and generation statistics to stderr.
     #[arg(short, long)]
     verbose: bool,
 
@@ -676,7 +676,7 @@ fn write_semantic_event(
     stderr: &mut impl Write,
     streamed_text: &mut String,
     reasoning_stream: &mut ReasoningStream,
-    verbose: bool,
+    reasoning_output: ReasoningOutput,
 ) -> Result<()> {
     let visible = match event {
         SemanticEvent::TextDelta(text) => Some(text.clone()),
@@ -688,21 +688,17 @@ fn write_semantic_event(
         SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.clone()),
         SemanticEvent::ToolCallEnd => Some("}}\n".into()),
         SemanticEvent::ReasoningDelta(text) => {
-            if verbose {
-                reasoning_stream.write_delta(stderr, text)?;
-            }
+            reasoning_stream.write_delta(stderr, text, reasoning_output)?;
             None
         }
         SemanticEvent::Finished { .. } => {
-            if verbose {
-                reasoning_stream.close(stderr)?;
-            }
+            reasoning_stream.close(stderr, reasoning_output)?;
             None
         }
     };
     if let Some(visible) = visible {
-        if verbose {
-            reasoning_stream.close(stderr)?;
+        reasoning_stream.close(stderr, reasoning_output)?;
+        if reasoning_output == ReasoningOutput::Verbose {
             reasoning_stream.announce_visible(stderr)?;
         }
         stdout.write_all(visible.as_bytes())?;
@@ -710,6 +706,28 @@ fn write_semantic_event(
         streamed_text.push_str(&visible);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReasoningOutput {
+    Hidden,
+    InteractivePlain,
+    InteractiveDimmed,
+    Verbose,
+}
+
+impl ReasoningOutput {
+    fn for_streams(verbose: bool, stdout_is_terminal: bool, stderr_is_terminal: bool) -> Self {
+        if verbose {
+            Self::Verbose
+        } else if !stdout_is_terminal {
+            Self::Hidden
+        } else if stderr_is_terminal {
+            Self::InteractiveDimmed
+        } else {
+            Self::InteractivePlain
+        }
+    }
 }
 
 #[derive(Default)]
@@ -720,12 +738,23 @@ struct ReasoningStream {
 }
 
 impl ReasoningStream {
-    fn write_delta(&mut self, stderr: &mut impl Write, text: &str) -> Result<()> {
-        if text.is_empty() {
+    fn write_delta(
+        &mut self,
+        stderr: &mut impl Write,
+        text: &str,
+        output: ReasoningOutput,
+    ) -> Result<()> {
+        if text.is_empty() || output == ReasoningOutput::Hidden {
             return Ok(());
         }
         if !self.open {
-            writeln!(stderr, "--- reasoning content (stderr) ---")?;
+            match output {
+                ReasoningOutput::InteractiveDimmed => stderr.write_all(b"\x1b[2m")?,
+                ReasoningOutput::Verbose => {
+                    writeln!(stderr, "--- reasoning content (stderr) ---")?;
+                }
+                ReasoningOutput::Hidden | ReasoningOutput::InteractivePlain => {}
+            }
             self.open = true;
         }
         stderr.write_all(text.as_bytes())?;
@@ -734,14 +763,20 @@ impl ReasoningStream {
         Ok(())
     }
 
-    fn close(&mut self, stderr: &mut impl Write) -> Result<()> {
+    fn close(&mut self, stderr: &mut impl Write, output: ReasoningOutput) -> Result<()> {
         if !self.open {
             return Ok(());
         }
         if !self.ends_with_newline {
             writeln!(stderr)?;
         }
-        writeln!(stderr, "--- end reasoning content (stderr) ---")?;
+        match output {
+            ReasoningOutput::InteractiveDimmed => stderr.write_all(b"\x1b[0m")?,
+            ReasoningOutput::Verbose => {
+                writeln!(stderr, "--- end reasoning content (stderr) ---")?;
+            }
+            ReasoningOutput::Hidden | ReasoningOutput::InteractivePlain => {}
+        }
         stderr.flush()?;
         self.open = false;
         self.ends_with_newline = false;
@@ -2179,12 +2214,14 @@ fn main() -> Result<()> {
     let mut streamed_text = String::new();
     let mut reasoning_stream = ReasoningStream::default();
     let stdout = io::stdout();
+    let stderr = io::stderr();
+    let reasoning_output =
+        ReasoningOutput::for_streams(args.verbose, stdout.is_terminal(), stderr.is_terminal());
     let mut stdout = stdout.lock();
 
     if args.verbose && prepared_chat.is_none() {
         eprintln!("--- generated content (stdout) ---");
     }
-    let stderr = io::stderr();
     let mut stderr = stderr.lock();
 
     let embedded_mtp = args.mtp_draft_tokens > 0
@@ -2239,7 +2276,7 @@ fn main() -> Result<()> {
                             &mut stderr,
                             &mut streamed_text,
                             &mut reasoning_stream,
-                            args.verbose,
+                            reasoning_output,
                         )
                         .err();
                         if semantic_error.is_some() {
@@ -2281,7 +2318,7 @@ fn main() -> Result<()> {
                                 &mut stderr,
                                 &mut streamed_text,
                                 &mut reasoning_stream,
-                                args.verbose,
+                                reasoning_output,
                             )
                             .err();
                             if semantic_error.is_some() {
@@ -2318,7 +2355,7 @@ fn main() -> Result<()> {
                             &mut stderr,
                             &mut streamed_text,
                             &mut reasoning_stream,
-                            args.verbose,
+                            reasoning_output,
                         )
                         .err();
                         if semantic_error.is_some() {
@@ -2442,9 +2479,7 @@ fn main() -> Result<()> {
             current = next.transpose()?;
         }
     }
-    if args.verbose {
-        reasoning_stream.close(&mut stderr)?;
-    }
+    reasoning_stream.close(&mut stderr, reasoning_output)?;
     drop(stderr);
 
     let generation_elapsed = generation_started.elapsed();
@@ -3605,8 +3640,8 @@ mod tests {
         write_semantic_event, write_timing_report, Array, AutoMode, AutoPlanCacheKey, BackendKind,
         CachedGgufRole, Cli, CliDevice, CliToolChoice, DevicePlan, DeviceType, DraftingPlan,
         MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport,
-        ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
-        WeightQuantization, WeightTransformationPlan,
+        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
+        SemanticSupport, StopReason, WeightQuantization, WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -4063,7 +4098,7 @@ mod tests {
             &mut stderr,
             &mut streamed_text,
             &mut reasoning_stream,
-            false,
+            ReasoningOutput::Hidden,
         )
         .unwrap();
         write_semantic_event(
@@ -4072,13 +4107,78 @@ mod tests {
             &mut stderr,
             &mut streamed_text,
             &mut reasoning_stream,
-            false,
+            ReasoningOutput::Hidden,
         )
         .unwrap();
 
         assert_eq!(stdout, b"visible answer");
         assert!(stderr.is_empty());
         assert_eq!(streamed_text, "visible answer");
+    }
+
+    #[test]
+    fn interactive_semantic_output_dims_reasoning_on_terminal_stderr() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut streamed_text = String::new();
+        let mut reasoning_stream = ReasoningStream::default();
+
+        write_semantic_event(
+            &SemanticEvent::ReasoningDelta("private thought".into()),
+            &mut stdout,
+            &mut stderr,
+            &mut streamed_text,
+            &mut reasoning_stream,
+            ReasoningOutput::InteractiveDimmed,
+        )
+        .unwrap();
+        write_semantic_event(
+            &SemanticEvent::TextDelta("visible answer".into()),
+            &mut stdout,
+            &mut stderr,
+            &mut streamed_text,
+            &mut reasoning_stream,
+            ReasoningOutput::InteractiveDimmed,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, b"visible answer");
+        assert_eq!(stderr, b"\x1b[2mprivate thought\n\x1b[0m");
+        assert_eq!(streamed_text, "visible answer");
+
+        let mut plain_stderr = Vec::new();
+        let mut reasoning_stream = ReasoningStream::default();
+        reasoning_stream
+            .write_delta(
+                &mut plain_stderr,
+                "redirected reasoning",
+                ReasoningOutput::InteractivePlain,
+            )
+            .unwrap();
+        reasoning_stream
+            .close(&mut plain_stderr, ReasoningOutput::InteractivePlain)
+            .unwrap();
+        assert_eq!(plain_stderr, b"redirected reasoning\n");
+    }
+
+    #[test]
+    fn reasoning_output_follows_stdout_terminal_and_colors_only_terminal_stderr() {
+        assert_eq!(
+            ReasoningOutput::for_streams(false, false, true),
+            ReasoningOutput::Hidden
+        );
+        assert_eq!(
+            ReasoningOutput::for_streams(false, true, false),
+            ReasoningOutput::InteractivePlain
+        );
+        assert_eq!(
+            ReasoningOutput::for_streams(false, true, true),
+            ReasoningOutput::InteractiveDimmed
+        );
+        assert_eq!(
+            ReasoningOutput::for_streams(true, false, false),
+            ReasoningOutput::Verbose
+        );
     }
 
     #[test]
@@ -4094,7 +4194,7 @@ mod tests {
             &mut stderr,
             &mut streamed_text,
             &mut reasoning_stream,
-            true,
+            ReasoningOutput::Verbose,
         )
         .unwrap();
         assert!(stdout.is_empty());
@@ -4106,7 +4206,7 @@ mod tests {
             &mut stderr,
             &mut streamed_text,
             &mut reasoning_stream,
-            true,
+            ReasoningOutput::Verbose,
         )
         .unwrap();
         assert_eq!(
@@ -4120,7 +4220,7 @@ mod tests {
             &mut stderr,
             &mut streamed_text,
             &mut reasoning_stream,
-            true,
+            ReasoningOutput::Verbose,
         )
         .unwrap();
         assert_eq!(stdout, b"visible answer");
