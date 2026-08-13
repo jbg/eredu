@@ -1534,6 +1534,7 @@ fn parse_unsupported_type_code(detail: &str) -> Option<u32> {
 mod tests {
     use std::io::{Seek, Write};
 
+    use safemlx::module::ModuleParameters;
     use safemlx_gguf::{GgmlType, MetadataArray, MetadataValue, TensorInput, Writer};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use tokenizers::{
@@ -6637,6 +6638,40 @@ mod tests {
             ModelLoadOptions::default(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn lfm2_mlx_shortconv_layout_is_admitted_and_normalized() {
+        let directory = write_complete_lfm2_safetensors_dir(|specs| {
+            let (_, shape) = specs
+                .iter_mut()
+                .find(|(name, _)| name == "model.layers.0.conv.conv.weight")
+                .unwrap();
+            *shape = vec![32, 3, 1];
+        });
+        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        assert!(report.is_loadable(), "{:#?}", report.issues);
+        structural::validate_safetensors_load_path(
+            ModelKind::Lfm2,
+            directory.path(),
+            ModelLoadOptions::default(),
+        )
+        .unwrap();
+
+        let execution =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let model = crate::architectures::lfm2::model::load_model(
+            directory.path(),
+            execution.stream(),
+            weights.stream(),
+        )
+        .unwrap();
+        assert_eq!(
+            model.parameters().flatten()["model.layers.0.conv.conv.weight"].shape(),
+            [32, 1, 3]
+        );
     }
 
     #[test]

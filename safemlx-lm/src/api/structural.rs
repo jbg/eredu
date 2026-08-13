@@ -3672,6 +3672,18 @@ fn validate_lfm2_safetensors(
         Ok(expected) => expected,
         Err(error) => return invalid_geometry(error.to_string()),
     };
+    let mlx_conv_shape = [args.hidden_size as usize, args.conv_l_cache as usize, 1];
+    for tensor in &mut expected {
+        if tensor.safetensors_name.ends_with(".conv.conv.weight")
+            && store
+                .metadata(&tensor.safetensors_name)
+                .is_ok_and(|metadata| metadata.shape == mlx_conv_shape)
+        {
+            // MLX-LM may serialize its native Conv1d layout. The LFM2 loaders
+            // normalize this to SafeMLX's internal checkpoint layout.
+            tensor.safetensors_shape = mlx_conv_shape.to_vec();
+        }
+    }
     if !args.has_sparse_moe_layers() {
         return validate_safetensor_plan_with(store, expected, |name| {
             args.weight_quantization_for(name)

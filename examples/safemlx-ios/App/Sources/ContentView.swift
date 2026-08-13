@@ -70,6 +70,7 @@ struct ContentView: View {
                     Text(store.status)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
             }
             .navigationTitle("SafeMLX")

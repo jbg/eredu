@@ -133,7 +133,8 @@ final class ModelStore: ObservableObject {
             }
             status = "Finished"
         } catch {
-            status = "Generation failed: \(error.localizedDescription)"
+            output = error.localizedDescription
+            status = "Generation failed"
             engine = nil
             loadedSnapshotPath = nil
         }

@@ -74,6 +74,39 @@ const EMBEDDING_UNIT: &str = "lfm2.static.embedding";
 const NORM_UNIT: &str = "lfm2.static.norm";
 const HEAD_UNIT: &str = "lfm2.static.output";
 
+fn lfm2_conv_weight_recipe(
+    checkpoint_key: &str,
+    checkpoint_shape: &[usize],
+    parameter_shape: &[i32],
+) -> Option<DerivedWeightRecipe> {
+    let source = || {
+        Box::new(DerivedWeightRecipe::source(
+            checkpoint_key,
+            TensorSelection::Full,
+        ))
+    };
+    let target_shape = parameter_shape
+        .iter()
+        .map(|dimension| *dimension as usize)
+        .collect::<Vec<_>>();
+    if checkpoint_shape.len() == 2 {
+        Some(DerivedWeightRecipe::Reshape {
+            input: source(),
+            shape: target_shape,
+        })
+    } else if target_shape.len() == 3
+        && checkpoint_shape == [target_shape[0], target_shape[2], target_shape[1]]
+        && checkpoint_shape != target_shape
+    {
+        Some(DerivedWeightRecipe::Transpose {
+            input: source(),
+            axes: vec![0, 2, 1],
+        })
+    } else {
+        None
+    }
+}
+
 fn register_lfm2_layer_parallel_plan(
     planner: &mut ParallelPlanBuilder,
     layer: &DecoderLayer,
@@ -1570,25 +1603,13 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         let prefix = format!("model.layers.{index}");
         let mut recipes = self.split_expert_recipes(index, store)?;
         let conv_key = format!("{prefix}.conv.conv.weight");
-        if store
-            .metadata(&conv_key)
-            .is_ok_and(|metadata| metadata.shape.len() == 2)
-        {
+        if let Ok(metadata) = store.metadata(&conv_key) {
             if let Some(parameter) = layer.parameters().flatten().get("conv.conv.weight") {
-                recipes.insert(
-                    "conv.conv.weight".into(),
-                    DerivedWeightRecipe::Reshape {
-                        input: Box::new(DerivedWeightRecipe::source(
-                            conv_key,
-                            TensorSelection::Full,
-                        )),
-                        shape: parameter
-                            .shape()
-                            .iter()
-                            .map(|dimension| *dimension as usize)
-                            .collect(),
-                    },
-                );
+                if let Some(recipe) =
+                    lfm2_conv_weight_recipe(&conv_key, &metadata.shape, parameter.shape())
+                {
+                    recipes.insert("conv.conv.weight".into(), recipe);
+                }
             }
         }
         let bindings = build_module_bindings_with_recipes(layer, &prefix, store, recipes)?;
@@ -2035,8 +2056,8 @@ mod tests {
     };
 
     use super::{
-        load_lfm2_expert_cache_model, load_lfm2_layerwise_model, Lfm2LayerwiseAdapter,
-        Lfm2LayerwiseModel,
+        lfm2_conv_weight_recipe, load_lfm2_expert_cache_model, load_lfm2_layerwise_model,
+        Lfm2LayerwiseAdapter, Lfm2LayerwiseModel,
     };
     use crate::{
         architectures::lfm2::model::{
@@ -2085,6 +2106,23 @@ mod tests {
             "use_expert_bias": moe
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn mlx_shortconv_layout_uses_a_transpose_recipe() {
+        let recipe = lfm2_conv_weight_recipe(
+            "model.layers.0.conv.conv.weight",
+            &[2048, 3, 1],
+            &[2048, 1, 3],
+        )
+        .unwrap();
+        assert!(matches!(
+            recipe,
+            crate::runtime::checkpoint::recipe::DerivedWeightRecipe::Transpose {
+                axes,
+                ..
+            } if axes == [0, 2, 1]
+        ));
     }
 
     #[test]

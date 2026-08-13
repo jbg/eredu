@@ -58,9 +58,8 @@ use crate::{
     },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
-        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict,
-        load_safetensors_dir_strict_with_split_swiglu_experts, GgufTensorNames, StrictLoadConfig,
-        StrictLoadReport,
+        load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
 };
@@ -2319,6 +2318,26 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     model_args_from_config_value(&value)
 }
 
+fn transform_safetensors_weight(
+    key: String,
+    value: Array,
+    stream: &Stream,
+) -> Result<Vec<(String, Array)>, Error> {
+    let value = if key.ends_with(".conv.conv.weight")
+        && value.shape().len() == 3
+        && value.shape()[1] > 1
+        && value.shape()[2] == 1
+    {
+        // Released MLX-LM LFM2 checkpoints store Conv1d kernels in MLX's
+        // [channels, kernel, 1] layout. SafeMLX keeps the PyTorch checkpoint
+        // layout [channels, 1, kernel] and transposes only at execution time.
+        value.swap_axes(1, 2, stream)?
+    } else {
+        value
+    };
+    Ok(vec![(key, value)])
+}
+
 /// Loads an LFM2 safetensors checkpoint.
 pub fn load_model(
     model_dir: impl AsRef<Path>,
@@ -2335,20 +2354,17 @@ pub fn load_model(
     let mut model = Model::new(args.clone(), stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    if args.has_sparse_moe_layers() {
-        load_safetensors_dir_strict_with_split_swiglu_experts(
-            &mut model,
-            model_dir,
-            weights_stream,
-            stream,
-            None,
-            &config,
-            &mut report,
-            args.num_experts,
-        )?;
-    } else {
-        load_safetensors_dir_strict(&mut model, model_dir, weights_stream, &config, &mut report)?;
-    }
+    load_safetensors_dir_strict_with_split_swiglu_experts_and_transform(
+        &mut model,
+        model_dir,
+        weights_stream,
+        stream,
+        None,
+        &config,
+        &mut report,
+        args.num_experts,
+        |key, value| transform_safetensors_weight(key, value, stream),
+    )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(model)
@@ -2379,28 +2395,17 @@ pub fn load_model_quantized(
     let mut model = Model::new(args.clone(), stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    if args.has_sparse_moe_layers() {
-        load_safetensors_dir_strict_with_split_swiglu_experts(
-            &mut model,
-            model_dir,
-            weights_stream,
-            stream,
-            Some(quantization),
-            &config,
-            &mut report,
-            args.num_experts,
-        )?;
-    } else {
-        load_safetensors_dir_quantized_strict(
-            &mut model,
-            model_dir,
-            weights_stream,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-        )?;
-    }
+    load_safetensors_dir_strict_with_split_swiglu_experts_and_transform(
+        &mut model,
+        model_dir,
+        weights_stream,
+        stream,
+        Some(quantization),
+        &config,
+        &mut report,
+        args.num_experts,
+        |key, value| transform_safetensors_weight(key, value, stream),
+    )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(model)
