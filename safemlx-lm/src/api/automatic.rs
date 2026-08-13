@@ -10,16 +10,20 @@ use std::{
     time::Duration,
 };
 
+use safemlx::{Device, DeviceType, Stream};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    available_memory, inspect_model, ArtifactKind, CapabilityValue, InspectionSeverity,
-    ModelInspectionOptions, ModelKind, ModelLoadOptions, PhysicalMemorySemantics,
+    available_memory, inspect_model, load_model_with_options, ArtifactKind, CapabilityValue,
+    InspectionSeverity, ModelInspectionOptions, ModelKind, ModelLoadOptions,
+    PhysicalMemorySemantics,
 };
 use crate::error::Error;
 use crate::runtime::{
     checkpoint::quantization::{AffineQuantization, WeightQuantization},
-    execution::layerwise::{LayerwiseLoadOptions, NonExpertWeightResidency, WeightResidency},
+    execution::layerwise::{
+        LayerwiseLoadOptions, LayerwiseModelError, NonExpertWeightResidency, WeightResidency,
+    },
     generation::speculative::MtpStats,
     residency::{
         dense_stream::DenseDiskStreamLoadOptions,
@@ -1074,6 +1078,134 @@ fn automatic_budget(available: Option<u64>, fallback: u64, headroom_percent: u8)
         .max(1)
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AutomaticMemoryBasis {
+    Available,
+    UnifiedPhysicalCapacity,
+    PolicyFallback,
+}
+
+fn automatic_memory_basis(
+    available: Option<u64>,
+    physical: Option<u64>,
+    semantics: HardwareMemorySemantics,
+) -> (Option<u64>, AutomaticMemoryBasis) {
+    if let Some(available) = available {
+        (Some(available), AutomaticMemoryBasis::Available)
+    } else if semantics == HardwareMemorySemantics::Unified {
+        physical.map_or((None, AutomaticMemoryBasis::PolicyFallback), |physical| {
+            (
+                Some(physical),
+                AutomaticMemoryBasis::UnifiedPhysicalCapacity,
+            )
+        })
+    } else {
+        (None, AutomaticMemoryBasis::PolicyFallback)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct AutomaticBoundedRequirement {
+    static_bytes: u64,
+    window_bytes: u64,
+    required_bytes: u64,
+    depth: usize,
+}
+
+fn automatic_probe_device(device: DevicePlan) -> Result<Device, Error> {
+    let index = i32::try_from(device.index).map_err(|_| {
+        Error::AutomaticPlanning(format!(
+            "automatic device index {} exceeds the MLX device-index range",
+            device.index
+        ))
+    })?;
+    let kind = match device.backend {
+        BackendKind::Cpu => DeviceType::Cpu,
+        BackendKind::Metal | BackendKind::Cuda | BackendKind::Gpu => DeviceType::Gpu,
+    };
+    Ok(Device::new(kind, index))
+}
+
+fn probe_automatic_bounded_requirement(
+    model_path: &Path,
+    plan: &ExecutionPlan,
+) -> Result<Result<AutomaticBoundedRequirement, String>, Error> {
+    let mut probe = plan.clone();
+    probe.expert_cache = None;
+    match &mut probe.residency {
+        ResidencyPlan::LayerwiseHost {
+            device_budget_bytes,
+            ..
+        } => *device_budget_bytes = Some(1),
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            ..
+        } => *device_budget_bytes = 1,
+        ResidencyPlan::FullyResident => {
+            return Ok(Err(
+                "fully resident execution has no bounded device-window requirement".into(),
+            ));
+        }
+    }
+    let stream = Stream::new_with_device(&automatic_probe_device(probe.device)?);
+    let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    match load_model_with_options(
+        model_path,
+        execution_plan_load_options(&probe)?,
+        &stream,
+        &weights_stream,
+    ) {
+        Err(Error::LayerwiseModel(LayerwiseModelError::DeviceBudgetTooSmall {
+            static_bytes,
+            window_bytes,
+            depth,
+            required,
+            ..
+        })) => Ok(Ok(AutomaticBoundedRequirement {
+            static_bytes,
+            window_bytes,
+            required_bytes: required,
+            depth,
+        })),
+        Err(error) => Ok(Err(error.to_string())),
+        Ok(_) => Ok(Ok(AutomaticBoundedRequirement {
+            static_bytes: 0,
+            window_bytes: 0,
+            required_bytes: 1,
+            depth: 0,
+        })),
+    }
+}
+
+fn apply_automatic_bounded_requirement(
+    admission: &mut AutomaticCandidateAdmission,
+    requirement: Result<AutomaticBoundedRequirement, String>,
+    budget: u64,
+) -> Option<AutomaticBoundedRequirement> {
+    if !admission.supported {
+        return None;
+    }
+    match requirement {
+        Ok(requirement) if requirement.required_bytes <= budget => Some(requirement),
+        Ok(requirement) => {
+            admission.supported = false;
+            admission.rejection = Some(format!(
+                "device budget {budget} bytes cannot contain {} pinned static bytes plus the depth-{} device window ({} bytes, {} total)",
+                requirement.static_bytes,
+                requirement.depth,
+                requirement.window_bytes,
+                requirement.required_bytes,
+            ));
+            Some(requirement)
+        }
+        Err(rejection) => {
+            admission.supported = false;
+            admission.rejection = Some(rejection);
+            None
+        }
+    }
+}
+
 fn selected_device_profile(
     hardware: &HardwareProfile,
     device: DevicePlan,
@@ -1273,6 +1405,7 @@ fn automatic_with_expert_cache(
 fn choose_automatic_residency(
     resident_fits: bool,
     layerwise_fits: bool,
+    disk_fits: bool,
     resident_supported: bool,
     layerwise_supported: bool,
     disk_supported: bool,
@@ -1281,12 +1414,8 @@ fn choose_automatic_residency(
         Some(0)
     } else if layerwise_fits && layerwise_supported {
         Some(1)
-    } else if disk_supported {
+    } else if disk_fits && disk_supported {
         Some(2)
-    } else if layerwise_supported {
-        Some(1)
-    } else if resident_supported {
-        Some(0)
     } else {
         None
     }
@@ -1298,16 +1427,31 @@ fn automatic_plan_resource_admitted(
     plan: &ExecutionPlan,
     policy: &AutomaticPlannerPolicy,
 ) -> bool {
-    let observed_device = selected_device_profile(hardware, plan.device)
-        .and_then(|device| automatic_observed_u64(&device.available_memory_bytes));
+    let selected_device = selected_device_profile(hardware, plan.device);
+    let observed_device =
+        selected_device.and_then(|device| automatic_observed_u64(&device.available_memory_bytes));
     let observed_host = automatic_observed_u64(&hardware.available_memory_bytes);
-    let device_limit = automatic_budget(
+    let physical_device = selected_device
+        .and_then(|device| automatic_observed_u64(&device.total_memory_bytes))
+        .or_else(|| automatic_observed_u64(&hardware.physical_memory_bytes));
+    let physical_host = automatic_observed_u64(&hardware.physical_memory_bytes);
+    let (device_capacity, _) = automatic_memory_basis(
         observed_device,
+        physical_device,
+        hardware.physical_memory_semantics,
+    );
+    let (host_capacity, _) = automatic_memory_basis(
+        observed_host,
+        physical_host,
+        hardware.physical_memory_semantics,
+    );
+    let device_limit = automatic_budget(
+        device_capacity,
         policy.device_memory_fallback_bytes,
         policy.memory_headroom_percent,
     );
     let host_limit = automatic_budget(
-        observed_host,
+        host_capacity,
         policy.host_memory_fallback_bytes,
         policy.memory_headroom_percent,
     );
@@ -1336,14 +1480,8 @@ fn automatic_plan_resource_admitted(
         host_required = host_required.saturating_add(host);
     }
     if hardware.physical_memory_semantics == HardwareMemorySemantics::Unified {
-        let unified_limit = if observed_host.is_some() {
-            host_limit
-        } else if observed_device.is_some() {
-            device_limit
-        } else {
-            host_limit.saturating_add(device_limit)
-        };
-        device_required.saturating_add(host_required) <= unified_limit
+        let unified_limit = device_limit.max(host_limit);
+        device_required <= unified_limit && host_required <= unified_limit
     } else {
         device_required <= device_limit && host_required <= host_limit
     }
@@ -1496,26 +1634,41 @@ fn plan_automatic_execution_with_policy(
     validate_automatic_policy(policy)?;
     let hardware = discover_hardware();
     validate_automatic_device(&hardware, request.device)?;
-    let resources =
+    let mut resources =
         inspect_model(&request.model_path, ModelInspectionOptions::default())?.resources;
-    let device_available = selected_device_profile(&hardware, request.device)
-        .and_then(|device| automatic_observed_u64(&device.available_memory_bytes));
+    let selected_device = selected_device_profile(&hardware, request.device);
+    let device_available =
+        selected_device.and_then(|device| automatic_observed_u64(&device.available_memory_bytes));
     let host_available = automatic_observed_u64(&hardware.available_memory_bytes);
-    let device_budget = automatic_budget(
+    let device_physical = selected_device
+        .and_then(|device| automatic_observed_u64(&device.total_memory_bytes))
+        .or_else(|| automatic_observed_u64(&hardware.physical_memory_bytes));
+    let host_physical = automatic_observed_u64(&hardware.physical_memory_bytes);
+    let (device_capacity, device_memory_basis) = automatic_memory_basis(
         device_available,
+        device_physical,
+        hardware.physical_memory_semantics,
+    );
+    let (host_capacity, _) = automatic_memory_basis(
+        host_available,
+        host_physical,
+        hardware.physical_memory_semantics,
+    );
+    let device_budget = automatic_budget(
+        device_capacity,
         policy.device_memory_fallback_bytes,
         policy.memory_headroom_percent,
     );
     let host_budget = automatic_budget(
-        host_available,
+        host_capacity,
         policy.host_memory_fallback_bytes,
         policy.memory_headroom_percent,
     );
     let model_bytes = automatic_model_bytes(&resources);
     let candidates = automatic_base_candidates(request.device, device_budget, host_budget, policy);
     let resident = inspect_automatic_candidate(&request.model_path, &candidates[0])?;
-    let layerwise = inspect_automatic_candidate(&request.model_path, &candidates[1])?;
-    let disk = inspect_automatic_candidate(&request.model_path, &candidates[2])?;
+    let mut layerwise = inspect_automatic_candidate(&request.model_path, &candidates[1])?;
+    let mut disk = inspect_automatic_candidate(&request.model_path, &candidates[2])?;
     let mut entries = vec![PlanExplanationEntry {
         level: PlanExplanationLevel::Decision,
         code: "single_device_scope".into(),
@@ -1524,29 +1677,43 @@ fn plan_automatic_execution_with_policy(
             request.device.backend, request.device.index, policy.memory_headroom_percent
         ),
     }];
-    let resident_fits = match (model_bytes, device_available) {
-        (Some((bytes, basis)), Some(available)) => {
-            entries.push(PlanExplanationEntry {
-                level: PlanExplanationLevel::Decision,
-                code: "resource_basis".into(),
-                detail: format!(
-                    "used {basis} ({bytes} bytes) against {device_budget} usable bytes from {available} currently available bytes"
+    let resident_fits = match model_bytes {
+        Some((bytes, model_basis)) => {
+            let (level, code, memory_detail) = match device_memory_basis {
+                AutomaticMemoryBasis::Available => (
+                    PlanExplanationLevel::Decision,
+                    "resource_basis",
+                    format!(
+                        "a {device_budget}-byte planning budget derived from {} currently available bytes",
+                        device_capacity.expect("available memory basis has a capacity")
+                    ),
                 ),
+                AutomaticMemoryBasis::UnifiedPhysicalCapacity => (
+                    PlanExplanationLevel::Warning,
+                    "available_memory_unavailable",
+                    format!(
+                        "a {device_budget}-byte planning budget derived from {} bytes of unified physical memory after reserving {}% because live availability was unavailable",
+                        device_capacity.expect("physical memory basis has a capacity"),
+                        policy.memory_headroom_percent
+                    ),
+                ),
+                AutomaticMemoryBasis::PolicyFallback => (
+                    PlanExplanationLevel::Warning,
+                    "device_memory_unavailable",
+                    format!(
+                        "the {}-byte policy fallback because device and unified physical memory were unavailable",
+                        policy.device_memory_fallback_bytes
+                    ),
+                ),
+            };
+            entries.push(PlanExplanationEntry {
+                level,
+                code: code.into(),
+                detail: format!("used {model_basis} ({bytes} bytes) against {memory_detail}"),
             });
             bytes <= device_budget
         }
-        (Some((bytes, basis)), None) => {
-            entries.push(PlanExplanationEntry {
-                level: PlanExplanationLevel::Warning,
-                code: "device_memory_unavailable".into(),
-                detail: format!(
-                    "device memory is unavailable; used the {}-byte policy fallback against {basis} ({bytes} bytes)",
-                    policy.device_memory_fallback_bytes
-                ),
-            });
-            bytes <= policy.device_memory_fallback_bytes
-        }
-        (None, _) => {
+        None => {
             entries.push(PlanExplanationEntry {
                 level: PlanExplanationLevel::Warning,
                 code: "model_footprint_unavailable".into(),
@@ -1555,16 +1722,66 @@ fn plan_automatic_execution_with_policy(
             false
         }
     };
-    let layerwise_fits = model_bytes.is_some_and(|(bytes, _)| {
+    let layerwise_host_fits = model_bytes.is_some_and(|(bytes, _)| {
         if hardware.physical_memory_semantics == HardwareMemorySemantics::Unified {
             bytes <= host_budget.saturating_mul(2)
         } else {
             bytes <= host_budget
         }
     });
+    let mut disk_fits = false;
+    if !(resident_fits && resident.supported) {
+        let layerwise_budget = match &candidates[1].residency {
+            ResidencyPlan::LayerwiseHost {
+                device_budget_bytes: Some(budget),
+                ..
+            } => *budget,
+            _ => 0,
+        };
+        if layerwise.supported {
+            let probe = probe_automatic_bounded_requirement(&request.model_path, &candidates[1])?;
+            if let Some(requirement) =
+                apply_automatic_bounded_requirement(&mut layerwise, probe, layerwise_budget)
+            {
+                resources.pinned_parameter_bytes = Observed::exact(
+                    requirement.static_bytes,
+                    "validated layerwise parameter plan",
+                );
+                resources.largest_execution_group_bytes = Observed::exact(
+                    requirement.window_bytes,
+                    "validated depth-1 layerwise parameter plan",
+                );
+            }
+        }
+        let disk_budget = match &candidates[2].residency {
+            ResidencyPlan::DenseDiskStream {
+                device_budget_bytes,
+                ..
+            } => *device_budget_bytes,
+            _ => 0,
+        };
+        if disk.supported {
+            let probe = probe_automatic_bounded_requirement(&request.model_path, &candidates[2])?;
+            if let Some(requirement) =
+                apply_automatic_bounded_requirement(&mut disk, probe, disk_budget)
+            {
+                resources.pinned_parameter_bytes = Observed::exact(
+                    requirement.static_bytes,
+                    "validated dense-stream parameter plan",
+                );
+                resources.largest_adjacent_execution_groups_bytes = Observed::exact(
+                    requirement.window_bytes,
+                    "validated depth-2 dense-stream parameter plan",
+                );
+            }
+        }
+        disk_fits = disk.supported;
+    }
+    let layerwise_fits = layerwise_host_fits && layerwise.supported;
     let selected = choose_automatic_residency(
         resident_fits,
         layerwise_fits,
+        disk_fits,
         resident.supported,
         layerwise.supported,
         disk.supported,
@@ -1594,52 +1811,21 @@ fn plan_automatic_execution_with_policy(
     if selected == 2 {
         entries.push(PlanExplanationEntry {
             level: PlanExplanationLevel::Rejection,
-            code: if layerwise_fits {
-                "layerwise_unsupported"
-            } else {
-                "layerwise_exceeds_host_budget"
-            }
-            .into(),
+            code: "layerwise_not_admitted".into(),
             detail: layerwise.rejection.clone().unwrap_or_else(|| {
                 "the checkpoint exceeds the policy host-backed admission budget".into()
             }),
         });
     }
-    if selected == 1 && !layerwise_fits {
-        entries.push(PlanExplanationEntry {
-            level: PlanExplanationLevel::Warning,
-            code: "disk_stream_unsupported".into(),
-            detail: disk
-                .rejection
-                .clone()
-                .unwrap_or_else(|| "dense disk streaming was not admitted".into()),
-        });
-    }
-    if selected == 0 && !resident_fits {
-        entries.push(PlanExplanationEntry {
-            level: PlanExplanationLevel::Warning,
-            code: "bounded_policies_unsupported".into(),
-            detail: "bounded policies were unavailable; fully resident execution may exceed currently available memory".into(),
-        });
-    }
     let (mut plan, mut summary) = match selected {
         0 => (
             candidates[0].clone(),
-            if resident_fits {
-                "selected fully resident execution for the lowest expected latency"
-            } else {
-                "selected fully resident execution as the only admitted policy"
-            }
-            .to_string(),
+            "selected fully resident execution for the lowest expected latency".to_string(),
         ),
         1 => (
             candidates[1].clone(),
-            if layerwise_fits {
-                "selected host-backed layerwise execution with a bounded device window"
-            } else {
-                "selected host-backed layerwise execution as the only admitted bounded policy"
-            }
-            .to_string(),
+            "selected host-backed layerwise execution with a validated bounded device window"
+                .to_string(),
         ),
         2 => (
             candidates[2].clone(),
@@ -1660,7 +1846,44 @@ fn plan_automatic_execution_with_policy(
     });
     if !matches!(plan.residency, ResidencyPlan::FullyResident) {
         let expert_plan = automatic_with_expert_cache(plan.clone(), policy);
-        let expert = inspect_automatic_candidate(&request.model_path, &expert_plan)?;
+        let mut expert = inspect_automatic_candidate(&request.model_path, &expert_plan)?;
+        let bounded_required = match &plan.residency {
+            ResidencyPlan::LayerwiseHost { .. } => {
+                automatic_observed_u64(&resources.pinned_parameter_bytes).zip(
+                    automatic_observed_u64(&resources.largest_execution_group_bytes),
+                )
+            }
+            ResidencyPlan::DenseDiskStream { .. } => {
+                automatic_observed_u64(&resources.pinned_parameter_bytes).zip(
+                    automatic_observed_u64(&resources.largest_adjacent_execution_groups_bytes),
+                )
+            }
+            ResidencyPlan::FullyResident => None,
+        }
+        .and_then(|(static_bytes, window_bytes)| static_bytes.checked_add(window_bytes));
+        let ordinary_budget = match &expert_plan.residency {
+            ResidencyPlan::LayerwiseHost {
+                device_budget_bytes,
+                ..
+            } => *device_budget_bytes,
+            ResidencyPlan::DenseDiskStream {
+                device_budget_bytes,
+                ..
+            } => Some(*device_budget_bytes),
+            ResidencyPlan::FullyResident => None,
+        };
+        if expert.supported
+            && bounded_required
+                .zip(ordinary_budget)
+                .is_some_and(|(required, budget)| required > budget)
+        {
+            expert.supported = false;
+            expert.rejection = Some(format!(
+                "expert-cache budget splitting leaves {} ordinary device bytes, below the validated {}-byte non-expert requirement",
+                ordinary_budget.expect("compared ordinary budget is present"),
+                bounded_required.expect("compared bounded requirement is present")
+            ));
+        }
         if expert.supported {
             plan = expert_plan;
             entries.push(PlanExplanationEntry {
@@ -1896,6 +2119,60 @@ mod tests {
             .backends
             .iter()
             .any(|backend| backend.kind == BackendKind::Cpu && backend.available));
+    }
+
+    #[test]
+    fn unified_physical_capacity_replaces_missing_live_availability() {
+        assert_eq!(
+            automatic_memory_basis(None, Some(128 << 30), HardwareMemorySemantics::Unified),
+            (
+                Some(128 << 30),
+                AutomaticMemoryBasis::UnifiedPhysicalCapacity
+            )
+        );
+        assert_eq!(
+            automatic_memory_basis(
+                None,
+                Some(128 << 30),
+                HardwareMemorySemantics::SeparateTiers
+            ),
+            (None, AutomaticMemoryBasis::PolicyFallback)
+        );
+    }
+
+    #[test]
+    fn bounded_admission_rejects_static_plus_window_over_budget() {
+        let mut admission = AutomaticCandidateAdmission {
+            supported: true,
+            rejection: None,
+        };
+        let requirement = AutomaticBoundedRequirement {
+            static_bytes: 5_524_521_984,
+            window_bytes: 1_935_777_792,
+            required_bytes: 7_460_299_776,
+            depth: 2,
+        };
+        assert_eq!(
+            apply_automatic_bounded_requirement(&mut admission, Ok(requirement), 4_294_967_296),
+            Some(requirement)
+        );
+        assert!(!admission.supported);
+        assert!(admission
+            .rejection
+            .as_deref()
+            .is_some_and(|detail| detail.contains("7460299776 total")));
+    }
+
+    #[test]
+    fn automatic_residency_never_uses_a_resource_rejected_fallback() {
+        assert_eq!(
+            choose_automatic_residency(false, false, false, true, true, true),
+            None
+        );
+        assert_eq!(
+            choose_automatic_residency(false, false, true, true, true, true),
+            Some(2)
+        );
     }
 
     #[test]
