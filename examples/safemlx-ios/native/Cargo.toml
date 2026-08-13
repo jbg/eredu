@@ -1,0 +1,14 @@
+[package]
+name = "safemlx-ios"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+safemlx.workspace = true
+safemlx-lm = { path = "../../../safemlx-lm", default-features = false, features = ["fancy-regex"] }
+serde_json.workspace = true

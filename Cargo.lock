@@ -2670,6 +2670,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "safemlx-ios"
+version = "0.1.0"
+dependencies = [
+ "safemlx",
+ "safemlx-lm",
+ "serde_json",
+]
+
+[[package]]
 name = "safemlx-lm"
 version = "0.4.1"
 dependencies = [
