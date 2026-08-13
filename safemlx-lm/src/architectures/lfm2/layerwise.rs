@@ -78,6 +78,7 @@ fn lfm2_conv_weight_recipe(
     checkpoint_key: &str,
     checkpoint_shape: &[usize],
     parameter_shape: &[i32],
+    parameter_dtype: Dtype,
 ) -> Option<DerivedWeightRecipe> {
     let source = || {
         Box::new(DerivedWeightRecipe::source(
@@ -89,22 +90,31 @@ fn lfm2_conv_weight_recipe(
         .iter()
         .map(|dimension| *dimension as usize)
         .collect::<Vec<_>>();
-    if checkpoint_shape.len() == 2 {
-        Some(DerivedWeightRecipe::Reshape {
+    let layout_recipe = if checkpoint_shape.len() == 2 {
+        DerivedWeightRecipe::Reshape {
             input: source(),
             shape: target_shape,
-        })
+        }
     } else if target_shape.len() == 3
         && checkpoint_shape == [target_shape[0], target_shape[2], target_shape[1]]
         && checkpoint_shape != target_shape
     {
-        Some(DerivedWeightRecipe::Transpose {
+        DerivedWeightRecipe::Transpose {
             input: source(),
             axes: vec![0, 2, 1],
-        })
+        }
     } else {
-        None
-    }
+        return None;
+    };
+    // Direct checkpoint bindings adopt the checkpoint dtype when they replace
+    // an unloaded placeholder. Derived bindings validate their output against
+    // the placeholder first, so make that conversion explicit. In particular,
+    // released MLX LFM2 checkpoints use BF16 while DepthwiseConv1d's unloaded
+    // kernel is F32.
+    Some(DerivedWeightRecipe::Cast {
+        input: Box::new(layout_recipe),
+        dtype: parameter_dtype,
+    })
 }
 
 fn register_lfm2_layer_parallel_plan(
@@ -1605,9 +1615,12 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         let conv_key = format!("{prefix}.conv.conv.weight");
         if let Ok(metadata) = store.metadata(&conv_key) {
             if let Some(parameter) = layer.parameters().flatten().get("conv.conv.weight") {
-                if let Some(recipe) =
-                    lfm2_conv_weight_recipe(&conv_key, &metadata.shape, parameter.shape())
-                {
+                if let Some(recipe) = lfm2_conv_weight_recipe(
+                    &conv_key,
+                    &metadata.shape,
+                    parameter.shape(),
+                    parameter.dtype(),
+                ) {
                     recipes.insert("conv.conv.weight".into(), recipe);
                 }
             }
@@ -2052,7 +2065,7 @@ mod tests {
     use safemlx::{
         module::ModuleParameters,
         ops::{indexing::TryIndexOp, ones_dtype, zeros_dtype},
-        Array, Device, DeviceType, ExecutionContext, Stream,
+        Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
     };
 
     use super::{
@@ -2064,7 +2077,7 @@ mod tests {
             self as resident, Cache, FeedForwardPolicy, LayerCache, LayerPolicy, Model, ModelArgs,
             OperatorPolicy,
         },
-        runtime::checkpoint::quantization::AffineQuantization,
+        runtime::checkpoint::{quantization::AffineQuantization, recipe::DerivedWeightRecipe},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
@@ -2114,15 +2127,60 @@ mod tests {
             "model.layers.0.conv.conv.weight",
             &[2048, 3, 1],
             &[2048, 1, 3],
+            Dtype::Float32,
         )
         .unwrap();
+        let DerivedWeightRecipe::Cast { input, dtype } = recipe else {
+            panic!("LFM2 convolution recipe must cast to the parameter dtype")
+        };
+        assert_eq!(dtype, Dtype::Float32);
         assert!(matches!(
-            recipe,
-            crate::runtime::checkpoint::recipe::DerivedWeightRecipe::Transpose {
-                axes,
-                ..
-            } if axes == [0, 2, 1]
+            *input,
+            DerivedWeightRecipe::Transpose { axes, .. } if axes == [0, 2, 1]
         ));
+    }
+
+    #[test]
+    fn bf16_mlx_shortconv_layout_loads_layerwise() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = Model::new(args(false), execution.stream()).unwrap();
+        initialize(&mut fixture, execution.stream());
+        {
+            let mut parameters = fixture.parameters_mut().flatten();
+            for (_, parameter) in &mut parameters {
+                **parameter = parameter
+                    .as_dtype(Dtype::Bfloat16, execution.stream())
+                    .unwrap();
+            }
+            let weight = parameters
+                .get_mut("model.layers.0.conv.conv.weight")
+                .unwrap();
+            **weight = weight.swap_axes(1, 2, execution.stream()).unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        write_fixture(directory.path(), &fixture, execution.stream());
+
+        let options = LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+            OffloadConfig::new(None, None, 1).unwrap(),
+        ));
+        let mut model = load_lfm2_layerwise_model(
+            directory.path(),
+            options,
+            execution.stream(),
+            weights.stream(),
+        )
+        .unwrap();
+        let mut cache = model.new_cache();
+        model
+            .forward(
+                &Array::from_slice(&[1_u32], &[1, 1]),
+                &mut cache,
+                execution.stream(),
+            )
+            .unwrap()
+            .evaluated()
+            .unwrap();
     }
 
     #[test]
