@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use safemlx::{
     error::Exception,
@@ -266,7 +266,7 @@ impl SpeculativeSampler for CliSampler {
 }
 
 /// Generate text with a model supported by safemlx-lm.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Model directory, GGUF file, or cached Hugging Face model identifier.
@@ -274,39 +274,24 @@ struct Cli {
     #[arg(short, long, value_name = "PATH_OR_ID")]
     model: String,
 
-    /// Automatically select a single-device execution plan.
+    /// Automatically select a single-device execution plan. Defaults to quick.
+    #[arg(long, value_enum, value_name = "MODE", default_value = "quick")]
+    auto: Option<AutoMode>,
+
+    /// Disable automatic planning and use explicit/default CLI settings only.
     #[arg(
         long,
-        value_enum,
-        value_name = "MODE",
         conflicts_with_all = [
-            "draft_model",
-            "mlx_cache_limit_bytes",
-            "mtp_draft_tokens",
-            "disable_mtp_lookahead",
-            "disable_mtp_adaptive_lookahead",
-            "mtp_draft_device",
-            "quantize",
-            "quantization_mode",
-            "quantization_group_size",
-            "layerwise_host",
-            "dense_disk_stream",
-            "dense_host_lookahead",
-            "dense_background_queue",
-            "expert_cache",
-            "device_layer_window",
-            "device_budget_bytes",
-            "host_budget_bytes",
-            "expert_cache_device_budget_bytes",
-            "expert_cache_host_budget_bytes",
-            "expert_cache_scratch_bytes",
-            "expert_cache_prefill_bank_bytes",
-            "expert_cache_eviction",
-            "expert_cache_benchmark",
-            "mapped_shards"
+            "auto",
+            "auto_cache",
+            "auto_feedback",
+            "auto_benchmark_tokens",
+            "auto_benchmark_runs",
+            "auto_benchmark_timeout_seconds",
+            "auto_trial_plan"
         ]
     )]
-    auto: Option<AutoMode>,
+    no_auto: bool,
 
     /// Read or update a reusable automatic-plan cache at this path.
     #[arg(long, value_name = "PATH", requires = "auto")]
@@ -556,6 +541,135 @@ struct Cli {
     /// throughput measurements.
     #[arg(long)]
     profile_components: bool,
+}
+
+const AUTOMATIC_OVERRIDE_ARGUMENTS: &[&str] = &[
+    "draft_model",
+    "mlx_cache_limit_bytes",
+    "mtp_draft_tokens",
+    "disable_mtp_lookahead",
+    "disable_mtp_adaptive_lookahead",
+    "mtp_draft_device",
+    "quantize",
+    "quantization_mode",
+    "quantization_group_size",
+    "layerwise_host",
+    "dense_disk_stream",
+    "dense_host_lookahead",
+    "dense_background_queue",
+    "expert_cache",
+    "device_layer_window",
+    "device_budget_bytes",
+    "host_budget_bytes",
+    "expert_cache_device_budget_bytes",
+    "expert_cache_host_budget_bytes",
+    "expert_cache_scratch_bytes",
+    "expert_cache_prefill_bank_bytes",
+    "expert_cache_eviction",
+    "expert_cache_benchmark",
+    "mapped_shards",
+];
+
+#[derive(Debug, Default)]
+struct AutomaticCliOverrides {
+    explicit: HashSet<&'static str>,
+}
+
+impl AutomaticCliOverrides {
+    fn from_matches(matches: &ArgMatches) -> Self {
+        Self {
+            explicit: AUTOMATIC_OVERRIDE_ARGUMENTS
+                .iter()
+                .copied()
+                .filter(|id| matches.value_source(id) == Some(ValueSource::CommandLine))
+                .collect(),
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.explicit.contains(id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.explicit.is_empty()
+    }
+
+    fn restore(&self, args: &mut Cli, original: &Cli) {
+        if self.contains("mlx_cache_limit_bytes") {
+            args.mlx_cache_limit_bytes = original.mlx_cache_limit_bytes;
+        }
+        if self.contains("quantize") {
+            args.quantize = original.quantize;
+        }
+        if self.contains("quantization_mode") {
+            args.quantization_mode = original.quantization_mode;
+        }
+        if self.contains("quantization_group_size") {
+            args.quantization_group_size = original.quantization_group_size;
+        }
+        if self.contains("layerwise_host") || self.contains("dense_disk_stream") {
+            args.layerwise_host = original.layerwise_host;
+            args.dense_disk_stream = original.dense_disk_stream;
+        }
+        if self.contains("dense_host_lookahead") {
+            args.dense_host_lookahead = original.dense_host_lookahead;
+        }
+        if self.contains("dense_background_queue") {
+            args.dense_background_queue = original.dense_background_queue;
+        }
+        if self.contains("device_layer_window") {
+            args.device_layer_window = original.device_layer_window;
+        }
+        if self.contains("device_budget_bytes") {
+            args.device_budget_bytes = original.device_budget_bytes;
+        }
+        if self.contains("host_budget_bytes") {
+            args.host_budget_bytes = original.host_budget_bytes;
+        }
+        if self.contains("expert_cache") {
+            args.expert_cache = original.expert_cache;
+        }
+        if self.contains("expert_cache_device_budget_bytes") {
+            args.expert_cache_device_budget_bytes = original.expert_cache_device_budget_bytes;
+        }
+        if self.contains("expert_cache_host_budget_bytes") {
+            args.expert_cache_host_budget_bytes = original.expert_cache_host_budget_bytes;
+        }
+        if self.contains("expert_cache_scratch_bytes") {
+            args.expert_cache_scratch_bytes = original.expert_cache_scratch_bytes;
+        }
+        if self.contains("expert_cache_prefill_bank_bytes") {
+            args.expert_cache_prefill_bank_bytes = original.expert_cache_prefill_bank_bytes;
+        }
+        if self.contains("expert_cache_eviction") {
+            args.expert_cache_eviction = original.expert_cache_eviction;
+        }
+        if self.contains("expert_cache_benchmark") {
+            args.expert_cache_benchmark = original.expert_cache_benchmark;
+        }
+        if self.contains("mapped_shards") {
+            args.mapped_shards = original.mapped_shards;
+        }
+        if self.contains("draft_model") {
+            args.mtp_draft_tokens = original.mtp_draft_tokens;
+            args.disable_mtp_lookahead = original.disable_mtp_lookahead;
+            args.disable_mtp_adaptive_lookahead = original.disable_mtp_adaptive_lookahead;
+            args.mtp_draft_device = original.mtp_draft_device;
+        } else {
+            if self.contains("mtp_draft_tokens") {
+                args.mtp_draft_tokens = original.mtp_draft_tokens;
+            }
+            if self.contains("disable_mtp_lookahead") {
+                args.disable_mtp_lookahead = original.disable_mtp_lookahead;
+            }
+            if self.contains("disable_mtp_adaptive_lookahead") {
+                args.disable_mtp_adaptive_lookahead = original.disable_mtp_adaptive_lookahead;
+            }
+            if self.contains("mtp_draft_device") {
+                args.mtp_draft_device = original.mtp_draft_device;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1231,7 +1345,6 @@ fn base_automatic_candidates(
     [resident, layerwise, disk]
 }
 
-#[cfg(test)]
 fn embedded_mtp_count(value: &serde_json::Value) -> Option<u64> {
     match value {
         serde_json::Value::Object(object) => {
@@ -1245,6 +1358,15 @@ fn embedded_mtp_count(value: &serde_json::Value) -> Option<u64> {
         serde_json::Value::Array(values) => values.iter().find_map(embedded_mtp_count),
         _ => None,
     }
+}
+
+fn model_advertises_embedded_mtp(model_path: &Path) -> bool {
+    model_path.is_dir()
+        && fs::read(model_path.join("config.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|config| embedded_mtp_count(&config))
+            .is_some_and(|layers| layers > 0)
 }
 
 fn with_expert_cache(mut plan: ExecutionPlan) -> ExecutionPlan {
@@ -1824,9 +1946,52 @@ fn automatic_report_with_cache(
     }
 }
 
+fn apply_automatic_report(
+    args: &mut Cli,
+    original: &Cli,
+    overrides: &AutomaticCliOverrides,
+    mut report: ExecutionPlanReport,
+    model_path: &Path,
+    draft_model_path: Option<&Path>,
+) -> Result<ExecutionPlanReport> {
+    apply_automatic_plan(args, &report.plan)?;
+    overrides.restore(args, original);
+    validate_args(args)?;
+    let embedded_mtp = draft_model_path.is_none()
+        && args.mtp_draft_tokens > 0
+        && model_advertises_embedded_mtp(model_path);
+    report.plan = cli_execution_plan(args, draft_model_path, embedded_mtp);
+    if !overrides.is_empty() {
+        report.explanation.entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Decision,
+            code: "explicit_cli_overrides".into(),
+            detail: format!(
+                "applied explicit CLI overrides after automatic selection: {}",
+                AUTOMATIC_OVERRIDE_ARGUMENTS
+                    .iter()
+                    .copied()
+                    .filter(|id| overrides.contains(id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+        report.explanation.summary = format!(
+            "{}; explicit CLI overrides applied",
+            report.explanation.summary
+        );
+    }
+    Ok(report)
+}
+
 fn main() -> Result<()> {
     let total_started = Instant::now();
-    let mut args = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let automatic_overrides = AutomaticCliOverrides::from_matches(&matches);
+    let mut args = Cli::from_arg_matches(&matches)?;
+    if args.no_auto {
+        args.auto = None;
+    }
+    let original_args = args.clone();
     validate_args(&args)?;
     let (resolved_model, resolved_draft) = resolve_model_pair(
         &args.model,
@@ -1866,12 +2031,23 @@ fn main() -> Result<()> {
         })
         .transpose()?;
     let automatic_report = if let Some(report) = exact_trial_report {
-        apply_automatic_plan(&mut args, &report.plan)?;
-        Some(report)
+        Some(apply_automatic_report(
+            &mut args,
+            &original_args,
+            &automatic_overrides,
+            report,
+            &model_path,
+            draft_model_path.as_deref(),
+        )?)
     } else {
         match args.auto {
             Some(mode) => match mode {
                 AutoMode::Benchmark => {
+                    if !automatic_overrides.is_empty() {
+                        bail!(
+                            "performance overrides are supported by automatic quick execution and plan reporting, not --auto benchmark"
+                        );
+                    }
                     let heuristic = automatic_plan(&model_path, args.device, &automatic_feedback)?;
                     let benchmark = benchmark_automatic_plans(
                         &model_path,
@@ -1905,6 +2081,14 @@ fn main() -> Result<()> {
                         args.auto_cache.as_deref(),
                         &automatic_feedback,
                     )?;
+                    let report = apply_automatic_report(
+                        &mut args,
+                        &original_args,
+                        &automatic_overrides,
+                        report,
+                        &model_path,
+                        draft_model_path.as_deref(),
+                    )?;
                     serde_json::to_writer_pretty(io::stdout().lock(), &report)
                         .context("failed to serialize automatic execution plan")?;
                     println!();
@@ -1917,7 +2101,14 @@ fn main() -> Result<()> {
                         args.auto_cache.as_deref(),
                         &automatic_feedback,
                     )?;
-                    apply_automatic_plan(&mut args, &report.plan)?;
+                    let report = apply_automatic_report(
+                        &mut args,
+                        &original_args,
+                        &automatic_overrides,
+                        report,
+                        &model_path,
+                        draft_model_path.as_deref(),
+                    )?;
                     eprintln!("automatic plan: {}", report.explanation.summary);
                     Some(report)
                 }
@@ -1948,6 +2139,18 @@ fn main() -> Result<()> {
             eprintln!("draft_model: {}", path.display());
             eprintln!("mtp_draft_device: {}", args.mtp_draft_device);
         }
+        let configured_embedded_mtp = draft_model_path.is_none()
+            && args.mtp_draft_tokens > 0
+            && model_advertises_embedded_mtp(&model_path);
+        let execution_plan = automatic_report.as_ref().map_or_else(
+            || cli_execution_plan(&args, draft_model_path.as_deref(), configured_embedded_mtp),
+            |report| report.plan.clone(),
+        );
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "execution_plan:")?;
+        serde_json::to_writer_pretty(&mut stderr, &execution_plan)
+            .context("failed to serialize verbose execution plan")?;
+        writeln!(stderr)?;
     }
 
     let (execution, draft_execution) = execution_contexts(args.device, args.mtp_draft_device);
@@ -3625,23 +3828,24 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use clap::{CommandFactory, Parser};
+    use clap::{CommandFactory, FromArgMatches, Parser};
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
 
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan,
         embedded_mtp_count, eval, execution_contexts, format_bytes,
-        format_weight_store_diagnostics, median, read_automatic_feedback,
-        requested_load_quantization, select_cached_gguf_from_revisions,
+        format_weight_store_diagnostics, median, model_advertises_embedded_mtp,
+        read_automatic_feedback, requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
         select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
         use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
-        write_semantic_event, write_timing_report, Array, AutoMode, AutoPlanCacheKey, BackendKind,
-        CachedGgufRole, Cli, CliDevice, CliToolChoice, DevicePlan, DeviceType, DraftingPlan,
-        MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport,
-        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
-        SemanticSupport, StopReason, WeightQuantization, WeightTransformationPlan,
+        write_semantic_event, write_timing_report, Array, AutoMode, AutoPlanCacheKey,
+        AutomaticCliOverrides, BackendKind, CachedGgufRole, Cli, CliDevice, CliToolChoice,
+        DevicePlan, DeviceType, DraftingPlan, ExecutionPlan, MtpDraftDevice, MtpExecutionStreams,
+        MtpSchedulerOptions, NativeToolSupport, ReasoningOutput, ReasoningStream, ResidencyPlan,
+        ResolvedModel, SemanticEvent, SemanticSupport, StopReason, WeightQuantization,
+        WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -3657,6 +3861,9 @@ mod tests {
 
     #[test]
     fn parses_auto_modes_without_requiring_a_prompt() {
+        let default = Cli::try_parse_from(["safemlx-lm", "--model", "model-id", "prompt"]).unwrap();
+        assert_eq!(default.auto, Some(AutoMode::Quick));
+
         let plan =
             Cli::try_parse_from(["safemlx-lm", "--model", "model-id", "--auto", "plan"]).unwrap();
         assert_eq!(plan.auto, Some(AutoMode::Plan));
@@ -3691,6 +3898,11 @@ mod tests {
         assert_eq!(benchmark.auto_benchmark_tokens, 32);
         assert_eq!(benchmark.auto_benchmark_timeout_seconds, 300);
         assert_eq!(benchmark.auto_feedback, [PathBuf::from("previous.json")]);
+
+        let disabled =
+            Cli::try_parse_from(["safemlx-lm", "--model", "model-id", "--no-auto", "prompt"])
+                .unwrap();
+        assert!(disabled.no_auto);
     }
 
     #[test]
@@ -3786,19 +3998,34 @@ mod tests {
     }
 
     #[test]
-    fn automatic_mode_conflicts_with_explicit_tuning_knobs() {
-        for knob in ["--layerwise-host", "--dense-disk-stream", "--expert-cache"] {
-            assert!(Cli::try_parse_from([
+    fn explicit_tuning_knobs_override_the_automatic_plan() {
+        let matches = Cli::command()
+            .try_get_matches_from([
                 "safemlx-lm",
                 "--model",
                 "model-id",
-                "--auto",
-                "quick",
-                knob,
+                "--dense-disk-stream",
+                "--device-budget-bytes",
+                "1234",
+                "--mapped-shards",
+                "7",
                 "prompt",
             ])
-            .is_err());
-        }
+            .unwrap();
+        let overrides = AutomaticCliOverrides::from_matches(&matches);
+        assert!(!overrides.contains("quantization_group_size"));
+        let original = Cli::from_arg_matches(&matches).unwrap();
+        let mut applied = original.clone();
+        let plan = ExecutionPlan::fully_resident(DevicePlan {
+            backend: BackendKind::Cpu,
+            index: 0,
+        });
+        apply_automatic_plan(&mut applied, &plan).unwrap();
+        overrides.restore(&mut applied, &original);
+        assert!(!applied.layerwise_host);
+        assert!(applied.dense_disk_stream);
+        assert_eq!(applied.device_budget_bytes, Some(1234));
+        assert_eq!(applied.mapped_shards, 7);
     }
 
     #[test]
@@ -3913,6 +4140,14 @@ mod tests {
             Some(3)
         );
         assert_eq!(embedded_mtp_count(&serde_json::json!({})), None);
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("config.json"),
+            br#"{"mtp_num_hidden_layers":2}"#,
+        )
+        .unwrap();
+        assert!(model_advertises_embedded_mtp(directory.path()));
     }
 
     fn cached_file(file_path: &str, blob_path: &str) -> CachedFileInfo {

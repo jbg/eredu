@@ -56,6 +56,12 @@ also a terminal. Reasoning remains hidden when standard output is piped or
 redirected. Diagnostics, verbose reasoning output, timing, memory statistics,
 and stop reasons are also written to standard error.
 
+`--verbose` also writes the complete effective `ExecutionPlan` as JSON before
+model loading. This includes device placement, residency budgets, checkpoint
+transformation, mapped-shard limit, expert-cache allocation, drafting, and the
+MLX allocator-cache limit. The plan remains on standard error, so generated
+output on standard output stays machine-readable or pipeable.
+
 ```sh
 printf 'Summarize the purpose of MLX.' | \
   cargo run --release -q -p safemlx-lm-cli -- \
@@ -105,7 +111,8 @@ cargo run --release -q -p safemlx-lm-cli -- \
   --model /path/to/model --device gpu:0 --auto plan > plan.json
 ```
 
-Use `--auto quick` with a prompt to apply that same policy and generate text:
+Normal generation uses the quick automatic policy by default. `--auto quick`
+is therefore optional and can still be written explicitly:
 
 ```sh
 cargo run --release -q -p safemlx-lm-cli -- \
@@ -115,17 +122,39 @@ cargo run --release -q -p safemlx-lm-cli -- \
 
 The quick policy is intentionally limited to one execution device. It reserves
 30% of currently available memory, prefers fully resident execution, then
-host-backed layerwise execution, then dense disk streaming. Every candidate is
-checked with header-only load-policy inspection before selection. For admitted
-nonresident MoE checkpoints it assigns 40% of each bounded tier budget to the
-independent expert cache. It also enables three-token adaptive drafting when a
-supported SafeTensors configuration advertises embedded MTP layers.
+host-backed layerwise execution, then dense disk streaming. Bounded candidates
+undergo an exact metadata-only capacity probe for pinned parameters and their
+device window before selection. For admitted nonresident MoE checkpoints it
+assigns 40% of each bounded tier budget to the independent expert cache. It also
+enables three-token adaptive drafting when a supported SafeTensors configuration
+advertises embedded MTP layers.
 
-If device memory cannot be observed, the prototype uses a documented 4 GiB
-device budget; if host availability cannot be observed, it uses 16 GiB. The
-JSON explanation records these fallbacks and every rejected candidate. Explicit
-residency, cache, quantization, and drafting knobs conflict with `--auto`, while
-`--device` remains available to choose the single device being planned.
+If live availability cannot be observed on a unified-memory system, the
+prototype derives a budget from physical capacity while retaining the 30%
+headroom. If neither live nor unified physical memory can be observed, it uses
+documented 4 GiB device and 16 GiB host fallbacks. The JSON explanation records
+the chosen basis and every rejected candidate. `--device` chooses the single
+device being planned; the remaining explicit performance knobs are layered over
+the selected plan as described below.
+
+Explicit performance flags are applied after quick selection and take
+precedence over the corresponding planned values. For example, this keeps the
+automatically chosen plan but overrides its mapped-shard limit and, when the
+selected residency uses one, its device budget:
+
+```sh
+cargo run --release -q -p safemlx-lm-cli -- \
+  --model /path/to/model --device-budget-bytes 34359738368 \
+  --mapped-shards 8 "Explain automatic model placement."
+```
+
+An explicit residency flag such as `--layerwise-host` or
+`--dense-disk-stream` replaces the automatically selected residency mode while
+retaining other planned settings unless they are also overridden. Use
+`--no-auto` to bypass planning entirely and recover the explicit/default-only
+CLI behavior. Overrides are reflected in `--auto plan`, verbose plan output,
+and telemetry. Isolated `--auto benchmark` runs reject overrides because each
+candidate must be benchmarked as one exact plan.
 
 Use `--auto benchmark` to time every resource-admitted residency, expert-cache,
 and embedded-MTP variant in a fresh child process. A failed or out-of-memory
