@@ -3,8 +3,6 @@
 //! Tests never download data. Set the named environment variable to a local
 //! model directory or GGUF and run the exact ignored test on a Metal host.
 
-use std::num::NonZeroUsize;
-
 use safemlx::{Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::{
@@ -89,8 +87,11 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
             cache: &mut cache,
             sampling_policy: DefaultSampler,
             settings: PreparedChatGenerationSettings {
-                temperature: 0.0,
-                max_tokens: NonZeroUsize::new(256).unwrap(),
+                overrides: safemlx_lm::api::GenerationConfigOverrides {
+                    temperature: Some(0.0),
+                    max_new_tokens: Some(256),
+                    ..Default::default()
+                },
                 prng_key: None,
             },
             caller_stop_sequences: &[],

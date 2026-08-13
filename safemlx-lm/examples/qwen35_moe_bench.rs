@@ -5,7 +5,7 @@ use safemlx::{
     transforms::eval,
     Array, ExecutionContext, Stream,
 };
-use safemlx_lm::api::{LoadedModel, ModelLoadOptions};
+use safemlx_lm::api::{GenerationConfigOverrides, LoadedModel, ModelLoadOptions};
 use safemlx_lm::architectures::qwen::hybrid::qwen3_5;
 use safemlx_lm::runtime::checkpoint::quantization::AffineQuantization;
 use safemlx_lm::runtime::media::input::{InputPart, ModelInput};
@@ -158,7 +158,16 @@ fn run_case(
     let input_parts = [InputPart::text_token_ids(&prompt_tokens)];
     let input = ModelInput::new(&input_parts);
     let mut cache = model.new_cache();
-    let mut generator = model.generate_input_with_cache(&mut cache, 0.0, input, None, stream);
+    let mut generator = model.generate_input_with_cache(
+        &mut cache,
+        input,
+        GenerationConfigOverrides {
+            temperature: Some(0.0),
+            ..Default::default()
+        },
+        None,
+        stream,
+    )?;
     let mut ids = Vec::with_capacity(decode_tokens);
 
     qwen3_5::set_perf_profiling(profile_components);

@@ -67,7 +67,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let settings = PreparedChatGenerationSettings {
-        max_tokens: NonZeroUsize::new(256).unwrap(),
+        overrides: safemlx_lm::api::GenerationConfigOverrides {
+            max_new_tokens: Some(256),
+            ..Default::default()
+        },
         ..PreparedChatGenerationSettings::default()
     };
     let scheduler = MtpSchedulerOptions {

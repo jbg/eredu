@@ -8,7 +8,7 @@ use safemlx::{
     ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    api::{LoadedModel, ModelCache},
+    api::{GenerationConfigOverrides, LoadedModel, ModelCache},
     error::Error,
     runtime::media::input::{InputPart, ModelInput},
 };
@@ -79,8 +79,16 @@ fn main() -> anyhow::Result<()> {
     {
         let input_parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&input_parts);
-        let mut generator =
-            model.generate_input_with_cache(&mut cache, temp, input, prng_key, stream);
+        let mut generator = model.generate_input_with_cache(
+            &mut cache,
+            input,
+            GenerationConfigOverrides {
+                temperature: Some(temp),
+                ..Default::default()
+            },
+            prng_key,
+            stream,
+        )?;
         for _ in 0..120 {
             let token = match generator.next() {
                 Some(token) => token?,
@@ -118,7 +126,16 @@ fn print_first_token_distribution(
 ) -> anyhow::Result<()> {
     let input_parts = [InputPart::text_token_ids(tokens)];
     let input = ModelInput::new(&input_parts);
-    let mut generator = model.generate_input_with_cache(cache, 0.0, input, None, stream);
+    let mut generator = model.generate_input_with_cache(
+        cache,
+        input,
+        GenerationConfigOverrides {
+            temperature: Some(0.0),
+            ..Default::default()
+        },
+        None,
+        stream,
+    )?;
     let Some(first) = generator.next() else {
         return Ok(());
     };

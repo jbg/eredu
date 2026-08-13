@@ -28,14 +28,15 @@ pub use api::realtime::{
 pub use api::{
     discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
     AllocatorTelemetry, ArtifactKind, ArtifactModality, ArtifactTensorEncoding,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, BackendKind, DevicePlan,
-    DraftPlacementPlan, DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport,
-    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
-    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InspectionIssue,
-    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
-    ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions, ModelResourceProfile,
-    ObservationKind, Observed, ParallelismPlan, PlanExplanation, PlanExplanationEntry,
-    PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry, TimingTelemetry, TransferTelemetry,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, BackendKind,
+    CheckpointGenerationConfig, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
+    ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry,
+    GenerationConfigOverrides, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, InspectionIssue, InspectionIssueCode,
+    InspectionReadiness, InspectionRequirement, InspectionSeverity, ModelInspectionOptions,
+    ModelInspectionReport, ModelLoadOptions, ModelResourceProfile, ObservationKind, Observed,
+    ParallelismPlan, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan,
+    ResidencyTelemetry, ResolvedGenerationConfig, TimingTelemetry, TransferTelemetry,
     WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use architectures::llama::layerwise::{

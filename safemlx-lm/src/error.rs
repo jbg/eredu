@@ -63,6 +63,10 @@ pub enum Error {
     #[error("automatic planning error: {0}")]
     AutomaticPlanning(String),
 
+    /// Invalid checkpoint or request-level text generation settings.
+    #[error("generation configuration error: {0}")]
+    GenerationConfig(String),
+
     /// Invalid or unsupported checkpoint quantization request.
     #[error("checkpoint quantization error: {0}")]
     Quantization(String),

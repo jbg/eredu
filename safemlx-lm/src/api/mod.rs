@@ -37,7 +37,7 @@ use crate::runtime::checkpoint::quantization::WeightQuantization;
 use crate::runtime::distributed::topology::ParallelTopology;
 use crate::runtime::execution::inspection::ActivationObserver;
 use crate::runtime::generation::sampler::{
-    ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler,
+    CheckpointConfiguredSampler, ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler,
 };
 use crate::runtime::generation::streaming::{
     drive_committed_generation_cancellable, CommittedTokenPipeline, CommittedTokenSource,
@@ -136,6 +136,169 @@ struct EosTokenMetadata {
 struct TextEosTokenMetadata {
     #[serde(default)]
     eos_token_id: Option<TokenIdOrIds>,
+}
+
+/// Sampling values declared by a checkpoint's `generation_config.json`.
+///
+/// Missing fields remain distinguishable from explicit values so applications
+/// can layer request overrides without losing provenance.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct CheckpointGenerationConfig {
+    /// Whether the checkpoint recommends stochastic sampling.
+    #[serde(default)]
+    pub do_sample: Option<bool>,
+    /// Recommended sampling temperature.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Recommended top-k cutoff.
+    #[serde(default)]
+    pub top_k: Option<i32>,
+    /// Recommended nucleus-sampling probability.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Recommended minimum-probability filter.
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// Recommended maximum number of newly generated tokens.
+    #[serde(default)]
+    pub max_new_tokens: Option<usize>,
+}
+
+/// Per-request overrides applied to checkpoint generation defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GenerationConfigOverrides {
+    /// Overrides stochastic-versus-greedy selection.
+    pub do_sample: Option<bool>,
+    /// Overrides temperature; zero selects greedy decoding.
+    pub temperature: Option<f32>,
+    /// Overrides top-k filtering; zero disables it.
+    pub top_k: Option<i32>,
+    /// Overrides top-p filtering; one disables it.
+    pub top_p: Option<f32>,
+    /// Overrides min-p filtering; zero disables it.
+    pub min_p: Option<f32>,
+    /// Overrides the maximum number of newly generated tokens.
+    pub max_new_tokens: Option<usize>,
+}
+
+/// Fully resolved generation settings used by SafeMLX samplers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedGenerationConfig {
+    /// Whether the effective policy samples stochastically.
+    pub do_sample: bool,
+    /// Effective sampling temperature.
+    pub temperature: f32,
+    /// Effective top-k cutoff.
+    pub top_k: i32,
+    /// Effective top-p probability.
+    pub top_p: f32,
+    /// Effective min-p probability.
+    pub min_p: f32,
+    /// Effective checkpoint or request token limit, when declared.
+    pub max_new_tokens: Option<usize>,
+}
+
+impl ResolvedGenerationConfig {
+    /// Builds the corresponding configurable SafeMLX sampler.
+    pub fn sampler(self) -> crate::runtime::generation::sampler::GenerationSampler {
+        crate::runtime::generation::sampler::GenerationSampler::new()
+            .top_k(self.top_k)
+            .top_p(self.top_p)
+            .min_p(self.min_p)
+    }
+}
+
+fn read_checkpoint_generation_config(
+    sidecar_dir: &Path,
+) -> Result<Option<CheckpointGenerationConfig>, Error> {
+    let path = sidecar_dir.join("generation_config.json");
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(serde_json::from_reader(file)?))
+}
+
+fn resolve_generation_config(
+    checkpoint: Option<&CheckpointGenerationConfig>,
+    overrides: GenerationConfigOverrides,
+) -> Result<ResolvedGenerationConfig, Error> {
+    let checkpoint_present = checkpoint.is_some();
+    let checkpoint = checkpoint.cloned().unwrap_or_default();
+    let (do_sample, temperature) = if let Some(do_sample) = overrides.do_sample {
+        if do_sample {
+            (
+                true,
+                overrides
+                    .temperature
+                    .or(checkpoint.temperature)
+                    .unwrap_or(1.0),
+            )
+        } else {
+            (false, 0.0)
+        }
+    } else if let Some(temperature) = overrides.temperature {
+        // A request-level temperature is itself an explicit sampling override,
+        // including when the checkpoint recommends greedy decoding.
+        (temperature > 0.0, temperature)
+    } else if checkpoint.do_sample.unwrap_or(false) {
+        (true, checkpoint.temperature.unwrap_or(1.0))
+    } else {
+        (false, 0.0)
+    };
+    let resolved = ResolvedGenerationConfig {
+        do_sample,
+        temperature,
+        top_k: overrides
+            .top_k
+            .or(checkpoint.top_k)
+            .unwrap_or(if checkpoint_present { 50 } else { 40 }),
+        top_p: overrides
+            .top_p
+            .or(checkpoint.top_p)
+            .unwrap_or(if checkpoint_present { 1.0 } else { 0.95 }),
+        min_p: overrides
+            .min_p
+            .or(checkpoint.min_p)
+            .unwrap_or(if checkpoint_present { 0.0 } else { 0.05 }),
+        max_new_tokens: overrides.max_new_tokens.or(checkpoint.max_new_tokens),
+    };
+    if !resolved.temperature.is_finite() || resolved.temperature < 0.0 {
+        return Err(Error::GenerationConfig(format!(
+            "temperature must be finite and non-negative, got {}",
+            resolved.temperature
+        )));
+    }
+    if resolved.do_sample && resolved.temperature == 0.0 {
+        return Err(Error::GenerationConfig(
+            "do_sample=true requires a temperature greater than zero".into(),
+        ));
+    }
+    if resolved.top_k < 0 {
+        return Err(Error::GenerationConfig(format!(
+            "top_k must be non-negative, got {}",
+            resolved.top_k
+        )));
+    }
+    if !resolved.top_p.is_finite() || !(0.0..=1.0).contains(&resolved.top_p) {
+        return Err(Error::GenerationConfig(format!(
+            "top_p must be between zero and one, got {}",
+            resolved.top_p
+        )));
+    }
+    if !resolved.min_p.is_finite() || !(0.0..=1.0).contains(&resolved.min_p) {
+        return Err(Error::GenerationConfig(format!(
+            "min_p must be between zero and one, got {}",
+            resolved.min_p
+        )));
+    }
+    if resolved.max_new_tokens == Some(0) {
+        return Err(Error::GenerationConfig(
+            "max_new_tokens must be positive when supplied".into(),
+        ));
+    }
+    Ok(resolved)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,7 +437,7 @@ pub use dispatch::{Model, ModelCache, ModelGenerate};
 mod request;
 use request::{
     prepare_chat_from_parts, with_prepared_chat_runtime, ModelGenerateTokenSource,
-    PreparedChatSemanticState, PreparedChatTokenDecoder,
+    PreparedChatSemanticState, PreparedChatTokenDecoder, ResolvedPreparedChatGenerationSettings,
 };
 pub use request::{
     PreparedChatEmbeddedMtpBatchRequest, PreparedChatEmbeddedMtpGenerationRequest,

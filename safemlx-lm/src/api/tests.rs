@@ -17,7 +17,7 @@ use crate::{
         AffineQuantization, CheckpointQuantizationOptions, WeightQuantization,
     },
     runtime::execution::inspection::ActivationRecorder,
-    runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
+    runtime::generation::sampler::{ConstrainedSampler, DefaultSampler, GenerationSampler},
     runtime::generation::speculative::{MtpSchedulerOptions, MtpStreamTopology},
     runtime::generation::streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
 };
@@ -689,10 +689,17 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(std::ptr::eq(input.model_input().unwrap(), &model_input));
 
-    let error = with_prepared_chat_runtime(&prepared, DefaultSampler, &[], |_| {
-        execution_calls.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    })
+    let error = with_prepared_chat_runtime(
+        &prepared,
+        DefaultSampler,
+        GenerationSampler::default(),
+        true,
+        &[],
+        |_| {
+            execution_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        },
+    )
     .unwrap_err();
 
     assert!(matches!(
@@ -757,6 +764,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         chat_template: None,
         model_id: "prepared-embedded-batch-test".into(),
         eos_token_ids: vec![2],
+        checkpoint_generation_config: None,
         constraint_compiler: compiler,
     };
 
@@ -4223,6 +4231,94 @@ fn eos_sidecars_load_generation_config_only_ids() {
 
     assert_eq!(eos_token_ids_from_sidecar_dir(&dir).unwrap(), [4, 5]);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn checkpoint_generation_config_resolves_declared_values_and_request_overrides() {
+    let dir = temp_model_dir(r#"{"model_type":"llama"}"#);
+    fs::write(
+        dir.join("generation_config.json"),
+        r#"{
+            "do_sample": true,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 64,
+            "max_new_tokens": 512
+        }"#,
+    )
+    .unwrap();
+
+    let checkpoint = super::read_checkpoint_generation_config(&dir)
+        .unwrap()
+        .unwrap();
+    let resolved = super::resolve_generation_config(
+        Some(&checkpoint),
+        super::GenerationConfigOverrides::default(),
+    )
+    .unwrap();
+    assert!(resolved.do_sample);
+    assert_eq!(resolved.temperature, 1.0);
+    assert_eq!(resolved.top_k, 64);
+    assert_eq!(resolved.top_p, 0.95);
+    assert_eq!(resolved.min_p, 0.0);
+    assert_eq!(resolved.max_new_tokens, Some(512));
+
+    let overridden = super::resolve_generation_config(
+        Some(&checkpoint),
+        super::GenerationConfigOverrides {
+            temperature: Some(0.0),
+            top_k: Some(12),
+            max_new_tokens: Some(32),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!overridden.do_sample);
+    assert_eq!(overridden.temperature, 0.0);
+    assert_eq!(overridden.top_k, 12);
+    assert_eq!(overridden.max_new_tokens, Some(32));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn checkpoint_generation_config_honors_do_sample_false() {
+    let checkpoint = super::CheckpointGenerationConfig {
+        do_sample: Some(false),
+        temperature: Some(0.8),
+        top_k: Some(20),
+        ..Default::default()
+    };
+    let resolved = super::resolve_generation_config(
+        Some(&checkpoint),
+        super::GenerationConfigOverrides::default(),
+    )
+    .unwrap();
+    assert!(!resolved.do_sample);
+    assert_eq!(resolved.temperature, 0.0);
+    assert_eq!(resolved.top_k, 20);
+
+    let temperature_override = super::resolve_generation_config(
+        Some(&checkpoint),
+        super::GenerationConfigOverrides {
+            temperature: Some(0.6),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(temperature_override.do_sample);
+    assert_eq!(temperature_override.temperature, 0.6);
+
+    let greedy_override = super::resolve_generation_config(
+        Some(&checkpoint),
+        super::GenerationConfigOverrides {
+            do_sample: Some(false),
+            temperature: Some(0.6),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!greedy_override.do_sample);
+    assert_eq!(greedy_override.temperature, 0.0);
 }
 
 #[test]

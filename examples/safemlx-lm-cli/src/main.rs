@@ -24,9 +24,9 @@ use safemlx_lm::{
         discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
         AllocatorTelemetry, AutomaticPlanRequest, BackendKind, DevicePlan, DraftPlacementPlan,
         DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
-        ExpertCacheTelemetry, GenerationCancellationToken, HardwareMemorySemantics,
-        HardwareProfile, LoadedModel, ModelInspectionOptions, ModelLoadOptions,
-        ModelResourceProfile, Observed, PlanExplanation, PlanExplanationEntry,
+        ExpertCacheTelemetry, GenerationCancellationToken, GenerationConfigOverrides,
+        HardwareMemorySemantics, HardwareProfile, LoadedModel, ModelInspectionOptions,
+        ModelLoadOptions, ModelResourceProfile, Observed, PlanExplanation, PlanExplanationEntry,
         PlanExplanationLevel, PreparedChatEmbeddedMtpGenerationRequest,
         PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
@@ -368,25 +368,25 @@ struct Cli {
     #[arg(long, conflicts_with = "allow_mixed_revisions")]
     require_same_revision: bool,
 
-    /// Maximum number of tokens to generate. Generation stops earlier at EOS.
-    #[arg(short = 'n', long, default_value_t = 256, value_name = "TOKENS")]
-    max_tokens: usize,
+    /// Maximum generated tokens. Defaults to the checkpoint value, then 256.
+    #[arg(short = 'n', long, value_name = "TOKENS")]
+    max_tokens: Option<usize>,
 
-    /// Sampling temperature. Zero selects greedy decoding.
-    #[arg(short = 't', long, default_value_t = 0.0, value_name = "FLOAT")]
-    temperature: f32,
+    /// Sampling temperature. Defaults to the checkpoint; zero selects greedy decoding.
+    #[arg(short = 't', long, value_name = "FLOAT")]
+    temperature: Option<f32>,
 
-    /// Keep only the K most likely tokens. Zero disables top-k filtering.
-    #[arg(long, default_value_t = 40, value_name = "K")]
-    top_k: i32,
+    /// Keep only the K most likely tokens. Defaults to the checkpoint; zero disables it.
+    #[arg(long, value_name = "K")]
+    top_k: Option<i32>,
 
-    /// Keep the smallest token set with at least this cumulative probability.
-    #[arg(long, default_value_t = 0.95, value_name = "FLOAT")]
-    top_p: f32,
+    /// Nucleus probability. Defaults to the checkpoint's declared value.
+    #[arg(long, value_name = "FLOAT")]
+    top_p: Option<f32>,
 
-    /// Remove tokens below this fraction of the most likely token's probability.
-    #[arg(long, default_value_t = 0.05, value_name = "FLOAT")]
-    min_p: f32,
+    /// Minimum-probability fraction. Defaults to the checkpoint's declared value.
+    #[arg(long, value_name = "FLOAT")]
+    min_p: Option<f32>,
 
     /// Use adaptive Mirostat V2 sampling instead of top-k, top-p, and min-p.
     #[arg(long)]
@@ -2254,6 +2254,33 @@ fn main() -> Result<()> {
     let mut model =
         LoadedModel::load_with_options(&model_path, load_options, stream, weights.stream())
             .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    let resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        min_p: args.min_p,
+        max_new_tokens: args.max_tokens,
+        ..GenerationConfigOverrides::default()
+    })?;
+    let temperature = resolved_generation.temperature;
+    let top_k = resolved_generation.top_k;
+    let top_p = resolved_generation.top_p;
+    let min_p = resolved_generation.min_p;
+    let max_tokens = resolved_generation.max_new_tokens.unwrap_or(256);
+    if args.mirostat_v2 && temperature == 0.0 {
+        bail!("--mirostat-v2 requires an effective temperature greater than zero");
+    }
+    if args.verbose {
+        let source = if model.checkpoint_generation_config().is_some() {
+            "checkpoint plus CLI overrides"
+        } else {
+            "SafeMLX defaults plus CLI overrides"
+        };
+        eprintln!(
+            "generation_config: do_sample={}, temperature={temperature}, top_k={top_k}, top_p={top_p}, min_p={min_p}, max_tokens={max_tokens} ({source})",
+            resolved_generation.do_sample
+        );
+    }
     if draft_model_path.is_some()
         && !matches!(
             model.mtp_capability(),
@@ -2373,9 +2400,9 @@ fn main() -> Result<()> {
     let eos_token_ids = model.eos_token_ids().to_vec();
     let mut cache = model.new_cache();
     let configured_sampler = GenerationSampler::new()
-        .top_k(args.top_k)
-        .top_p(args.top_p)
-        .min_p(args.min_p)
+        .top_k(top_k)
+        .top_p(top_p)
+        .min_p(min_p)
         .penalties(
             args.repeat_penalty,
             args.repeat_last_n,
@@ -2396,15 +2423,15 @@ fn main() -> Result<()> {
                 args.presence_penalty,
             ),
         )
-    } else if args.temperature == 0.0 && !penalties_active {
+    } else if temperature == 0.0 && !penalties_active {
         CliSampler::Greedy(DefaultSampler)
     } else {
         CliSampler::Configured(configured_sampler)
     };
-    let prng_key = (args.temperature != 0.0)
+    let prng_key = (temperature != 0.0)
         .then(|| safemlx::random::key(args.seed))
         .transpose()?;
-    let mut output_ids = Vec::with_capacity(args.max_tokens);
+    let mut output_ids = Vec::with_capacity(max_tokens);
     let profile_gemma4 = args.profile_components && model.model_type() == "gemma4";
     if profile_gemma4 {
         safemlx_lm::architectures::gemma4::model::set_perf_profiling(true);
@@ -2444,8 +2471,11 @@ fn main() -> Result<()> {
     let mut prepared_finish_reason = None;
     if let Some(prepared) = &prepared_chat {
         let settings = PreparedChatGenerationSettings {
-            temperature: args.temperature,
-            max_tokens: NonZeroUsize::new(args.max_tokens).expect("validated non-zero max tokens"),
+            overrides: GenerationConfigOverrides {
+                temperature: Some(temperature),
+                max_new_tokens: Some(max_tokens),
+                ..GenerationConfigOverrides::default()
+            },
             prng_key,
         };
         let mut semantic_error = None;
@@ -2577,9 +2607,9 @@ fn main() -> Result<()> {
         let parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&parts);
         let config = MtpConfig {
-            max_tokens: args.max_tokens,
+            max_tokens,
             max_draft_tokens: args.mtp_draft_tokens,
-            temperature: args.temperature,
+            temperature,
             eos_token_ids: eos_token_ids.clone(),
         };
         let mtp_streams = MtpExecutionStreams::new(stream, draft_stream)?;
@@ -2616,9 +2646,9 @@ fn main() -> Result<()> {
         let parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&parts);
         let config = MtpConfig {
-            max_tokens: args.max_tokens,
+            max_tokens,
             max_draft_tokens: args.mtp_draft_tokens,
-            temperature: args.temperature,
+            temperature,
             eos_token_ids: eos_token_ids.clone(),
         };
         let (tokens, stats) = model.generate_embedded_mtp_input_with_sampler_callback(
@@ -2647,7 +2677,7 @@ fn main() -> Result<()> {
         let input = ModelInput::new(&parts);
         let mut generator = model.generate_input_with_cache_sampler(
             &mut cache,
-            args.temperature,
+            temperature,
             input,
             prng_key,
             stream,
@@ -2655,13 +2685,13 @@ fn main() -> Result<()> {
         );
 
         let mut current = generator.next().transpose()?;
-        for index in 0..args.max_tokens {
+        for index in 0..max_tokens {
             let Some(token) = current.take() else {
                 break;
             };
             // Start the following decode before reading the current token back to
             // the CPU. This mirrors mlx-lm's one-token async evaluation pipeline.
-            let next = if index + 1 < args.max_tokens {
+            let next = if index + 1 < max_tokens {
                 let next = generator.next();
                 if let Some(Ok(next_token)) = next.as_ref() {
                     async_eval([next_token])?;
@@ -2688,7 +2718,7 @@ fn main() -> Result<()> {
     let generation_elapsed = generation_started.elapsed();
     let stop_reason = prepared_finish_reason
         .map(StopReason::from)
-        .unwrap_or_else(|| stop_reason(&output_ids, &eos_token_ids, args.max_tokens));
+        .unwrap_or_else(|| stop_reason(&output_ids, &eos_token_ids, max_tokens));
     if prepared_chat.is_none() && stop_reason == StopReason::Eos {
         output_ids.pop();
     }
@@ -3219,7 +3249,7 @@ fn run_expert_cache_benchmark(
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
-    if args.max_tokens == 0 {
+    if args.max_tokens == Some(0) {
         bail!("--max-tokens must be greater than zero");
     }
     if args.auto_benchmark_tokens == 0 {
@@ -3240,19 +3270,28 @@ fn validate_args(args: &Cli) -> Result<()> {
             args.mtp_draft_device,
         );
     }
-    if !args.temperature.is_finite() || args.temperature < 0.0 {
+    if args
+        .temperature
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
         bail!("--temperature must be a finite, non-negative number");
     }
-    if args.top_k < 0 {
+    if args.top_k.is_some_and(|value| value < 0) {
         bail!("--top-k must be non-negative");
     }
-    if !args.top_p.is_finite() || !(0.0..=1.0).contains(&args.top_p) {
+    if args
+        .top_p
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
         bail!("--top-p must be between zero and one");
     }
-    if !args.min_p.is_finite() || !(0.0..=1.0).contains(&args.min_p) {
+    if args
+        .min_p
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
         bail!("--min-p must be between zero and one");
     }
-    if args.mirostat_v2 && args.temperature == 0.0 {
+    if args.mirostat_v2 && args.temperature == Some(0.0) {
         bail!("--mirostat-v2 requires --temperature greater than zero");
     }
     if !args.mirostat_tau.is_finite() || args.mirostat_tau <= 0.0 {
@@ -4476,6 +4515,16 @@ mod tests {
     }
 
     #[test]
+    fn leaves_generation_options_unspecified_for_checkpoint_defaults() {
+        let args = Cli::try_parse_from(["safemlx-lm", "--model", "model-id", "prompt"]).unwrap();
+        assert_eq!(args.temperature, None);
+        assert_eq!(args.top_k, None);
+        assert_eq!(args.top_p, None);
+        assert_eq!(args.min_p, None);
+        assert_eq!(args.max_tokens, None);
+    }
+
+    #[test]
     fn reports_only_max_tokens_without_verbose_output() {
         assert!(should_report_stop_reason(StopReason::MaxTokens, false));
         assert!(!should_report_stop_reason(StopReason::Eos, false));
@@ -4559,6 +4608,8 @@ mod tests {
             "--model",
             "model-id",
             "--mirostat-v2",
+            "--temperature",
+            "0",
             "prompt",
         ])
         .unwrap();

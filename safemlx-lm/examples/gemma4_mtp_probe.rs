@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Instant};
 
 use safemlx::{transforms::eval, ExecutionContext, Stream};
 use safemlx_lm::{
-    api::LoadedModel,
+    api::{GenerationConfigOverrides, LoadedModel},
     runtime::generation::speculative::{LoadedDrafter, MtpConfig},
     runtime::media::input::{InputPart, ModelInput},
 };
@@ -111,7 +111,16 @@ fn run_greedy(
         let input_parts = [InputPart::text_token_ids(&prompt_tokens)];
         let input = ModelInput::new(&input_parts);
         let generator = loaded
-            .generate_input_with_cache(&mut cache, 0.0, input, None, stream)
+            .generate_input_with_cache(
+                &mut cache,
+                input,
+                GenerationConfigOverrides {
+                    temperature: Some(0.0),
+                    ..Default::default()
+                },
+                None,
+                stream,
+            )?
             .take(max_tokens);
         for token in generator {
             let token = token?;

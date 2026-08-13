@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use safemlx::{Device, DeviceType, ExecutionContext};
-use safemlx_lm::api::LoadedModel;
+use safemlx_lm::api::{GenerationConfigOverrides, LoadedModel};
 use safemlx_lm::runtime::media::input::{InputPart, ModelInput};
 
 fn main() -> anyhow::Result<()> {
@@ -57,8 +57,16 @@ fn main() -> anyhow::Result<()> {
     {
         let input_parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&input_parts);
-        let mut generator =
-            model.generate_input_with_cache(&mut cache, temperature, input, prng_key, stream);
+        let mut generator = model.generate_input_with_cache(
+            &mut cache,
+            input,
+            GenerationConfigOverrides {
+                temperature: Some(temperature),
+                ..Default::default()
+            },
+            prng_key,
+            stream,
+        )?;
         for _ in 0..max_tokens {
             let Some(token) = generator.next() else {
                 break;

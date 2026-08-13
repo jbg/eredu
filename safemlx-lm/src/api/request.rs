@@ -31,23 +31,19 @@ impl TextDecoder {
 }
 
 /// Model sampling and stopping settings for one prepared chat generation.
+#[derive(Default)]
 pub struct PreparedChatGenerationSettings {
-    /// Sampling temperature passed to the selected policy.
-    pub temperature: f32,
-    /// Maximum number of committed generated tokens.
-    pub max_tokens: NonZeroUsize,
-    /// Optional MLX PRNG key required by stochastic policies.
+    /// Typed overrides layered over checkpoint-declared generation settings.
+    pub overrides: GenerationConfigOverrides,
+    /// Optional MLX PRNG key. Stochastic checkpoint defaults use seed zero when omitted.
     pub prng_key: Option<Array>,
 }
 
-impl Default for PreparedChatGenerationSettings {
-    fn default() -> Self {
-        Self {
-            temperature: 0.0,
-            max_tokens: NonZeroUsize::new(256).expect("256 is non-zero"),
-            prng_key: None,
-        }
-    }
+pub(super) struct ResolvedPreparedChatGenerationSettings {
+    pub(super) temperature: f32,
+    pub(super) max_tokens: NonZeroUsize,
+    pub(super) prng_key: Option<Array>,
+    pub(super) checkpoint_sampler: crate::runtime::generation::sampler::GenerationSampler,
 }
 
 /// Explicit prompt source for structured generation from a [`PreparedChat`].
@@ -402,8 +398,12 @@ impl MtpSemanticState for PreparedChatSemanticState {
 pub(super) fn with_prepared_chat_runtime<S, R>(
     prepared_chat: &PreparedChat,
     sampling_policy: S,
+    checkpoint_sampler: crate::runtime::generation::sampler::GenerationSampler,
+    use_checkpoint_sampler: bool,
     caller_stop_sequences: &[String],
-    execute: impl FnOnce(PreparedChatRuntime<S>) -> Result<R, Error>,
+    execute: impl FnOnce(
+        PreparedChatRuntime<crate::runtime::generation::sampler::CheckpointConfiguredSampler<S>>,
+    ) -> Result<R, Error>,
 ) -> Result<R, Error> {
     let semantic_plan = match prepared_chat.semantic_support() {
         SemanticSupport::Supported => prepared_chat
@@ -418,6 +418,12 @@ pub(super) fn with_prepared_chat_runtime<S, R>(
     let generation_plan = prepared_chat
         .generation_runtime_plan()
         .expect("supported prepared chats carry a generation runtime plan");
+    let sampling_policy =
+        crate::runtime::generation::sampler::CheckpointConfiguredSampler::for_sampler(
+            sampling_policy,
+            checkpoint_sampler,
+            use_checkpoint_sampler,
+        );
     let sampler = ConstrainedSampler::from_generation_plan(sampling_policy, generation_plan)
         .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
     let parser = semantic_plan

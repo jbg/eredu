@@ -17,6 +17,7 @@ pub struct LoadedModel {
     pub(super) chat_template: Option<ModelChatTemplate>,
     pub(super) model_id: String,
     pub(super) eos_token_ids: Vec<u32>,
+    pub(super) checkpoint_generation_config: Option<CheckpointGenerationConfig>,
     pub(super) constraint_compiler: Result<ConstraintCompiler, String>,
 }
 
@@ -25,7 +26,7 @@ struct PreparedChatMtpLaneRuntime<'a, S> {
     cache: &'a mut ModelCache,
     config: MtpConfig,
     prng_key: Option<Array>,
-    sampler: ConstrainedSampler<S>,
+    sampler: ConstrainedSampler<CheckpointConfiguredSampler<S>>,
     semantic: Box<dyn MtpSemanticState>,
     cancellation: GenerationCancellationToken,
     on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
@@ -316,6 +317,28 @@ where
 }
 
 impl LoadedModel {
+    fn resolve_prepared_chat_generation_settings(
+        &self,
+        settings: PreparedChatGenerationSettings,
+    ) -> Result<ResolvedPreparedChatGenerationSettings, Error> {
+        let resolved = self.resolve_generation_config(settings.overrides)?;
+        let max_tokens = resolved
+            .max_new_tokens
+            .and_then(NonZeroUsize::new)
+            .unwrap_or_else(|| NonZeroUsize::new(256).expect("256 is non-zero"));
+        let prng_key = match (settings.prng_key, resolved.temperature) {
+            (Some(key), _) => Some(key),
+            (None, 0.0) => None,
+            (None, _) => Some(safemlx::random::key(0)?),
+        };
+        Ok(ResolvedPreparedChatGenerationSettings {
+            temperature: resolved.temperature,
+            max_tokens,
+            prng_key,
+            checkpoint_sampler: resolved.sampler(),
+        })
+    }
+
     /// Validates the observable target/assistant contract used by external MTP.
     ///
     /// Repository names and revisions are deliberately not compatibility keys.
@@ -415,6 +438,14 @@ impl LoadedModel {
             let generation_plan = prepared_chat
                 .generation_runtime_plan()
                 .expect("supported prepared chats carry a generation runtime plan");
+            let use_checkpoint_sampler =
+                SpeculativeSampler::uses_checkpoint_defaults(&sampling_policy);
+            let settings = self.resolve_prepared_chat_generation_settings(settings)?;
+            let sampling_policy = CheckpointConfiguredSampler::for_sampler(
+                sampling_policy,
+                settings.checkpoint_sampler,
+                use_checkpoint_sampler,
+            );
             let sampler =
                 ConstrainedSampler::from_generation_plan(sampling_policy, generation_plan)
                     .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
@@ -658,10 +689,14 @@ impl LoadedModel {
             });
         }
         let prepared_chat = input.prepared_chat();
+        let use_checkpoint_sampler = Sampler::uses_checkpoint_defaults(&sampling_policy);
+        let settings = self.resolve_prepared_chat_generation_settings(settings)?;
 
         with_prepared_chat_runtime(
             prepared_chat,
             sampling_policy,
+            settings.checkpoint_sampler,
+            use_checkpoint_sampler,
             caller_stop_sequences,
             |runtime| {
                 // This closure is the execution boundary: unsupported plans
@@ -740,9 +775,13 @@ impl LoadedModel {
                 )));
             }
         };
+        let use_checkpoint_sampler = SpeculativeSampler::uses_checkpoint_defaults(&sampling_policy);
+        let settings = self.resolve_prepared_chat_generation_settings(settings)?;
         with_prepared_chat_runtime(
             prepared_chat,
             sampling_policy,
+            settings.checkpoint_sampler,
+            use_checkpoint_sampler,
             caller_stop_sequences,
             |runtime| {
                 let decoder = PreparedChatTokenDecoder {
@@ -820,9 +859,13 @@ impl LoadedModel {
                 )));
             }
         };
+        let use_checkpoint_sampler = SpeculativeSampler::uses_checkpoint_defaults(&sampling_policy);
+        let settings = self.resolve_prepared_chat_generation_settings(settings)?;
         with_prepared_chat_runtime(
             prepared_chat,
             sampling_policy,
+            settings.checkpoint_sampler,
+            use_checkpoint_sampler,
             caller_stop_sequences,
             |runtime| {
                 let decoder = PreparedChatTokenDecoder {
@@ -1465,6 +1508,7 @@ impl LoadedModel {
         ensure_executable_load_options(options)?;
         if is_gguf_file(model_dir) {
             let sidecar_dir = gguf_sidecar_dir(model_dir);
+            let checkpoint_generation_config = read_checkpoint_generation_config(sidecar_dir)?;
             let LoadedGgufModel {
                 model,
                 eos_token_ids,
@@ -1492,10 +1536,12 @@ impl LoadedModel {
                 chat_template,
                 model_id: model_dir.display().to_string(),
                 eos_token_ids,
+                checkpoint_generation_config,
                 constraint_compiler,
             });
         }
         let metadata = read_model_metadata(model_dir)?;
+        let checkpoint_generation_config = read_checkpoint_generation_config(model_dir)?;
         let eos_token_ids = eos_token_ids_from_sidecar_dir(model_dir)?;
         let model_type = effective_model_type(&metadata);
         let kind = ModelKind::from_model_type(&model_type)?;
@@ -1524,6 +1570,7 @@ impl LoadedModel {
             chat_template,
             model_id: model_type,
             eos_token_ids,
+            checkpoint_generation_config,
             constraint_compiler,
         })
     }
@@ -1531,6 +1578,19 @@ impl LoadedModel {
     /// Returns the effective runtime model type.
     pub fn model_type(&self) -> &str {
         self.model.model_type()
+    }
+
+    /// Returns sampling values declared by `generation_config.json`, if present.
+    pub fn checkpoint_generation_config(&self) -> Option<&CheckpointGenerationConfig> {
+        self.checkpoint_generation_config.as_ref()
+    }
+
+    /// Resolves request overrides over checkpoint recommendations and SafeMLX fallbacks.
+    pub fn resolve_generation_config(
+        &self,
+        overrides: GenerationConfigOverrides,
+    ) -> Result<ResolvedGenerationConfig, Error> {
+        resolve_generation_config(self.checkpoint_generation_config.as_ref(), overrides)
     }
 
     /// Returns checkpoint-native quantization storage statistics when available.
@@ -1903,17 +1963,30 @@ impl LoadedModel {
         })
     }
 
-    /// Creates a token iterator from typed input using a cache returned by [`LoadedModel::new_cache`].
+    /// Creates a token iterator using checkpoint generation defaults plus typed overrides.
     pub fn generate_input_with_cache<'a>(
         &'a mut self,
         cache: &'a mut ModelCache,
-        temp: f32,
         input: input::ModelInput<'a>,
+        overrides: GenerationConfigOverrides,
         prng_key: Option<Array>,
         stream: &'a Stream,
-    ) -> ModelGenerate<'a> {
-        self.model
-            .generate_input_with_cache(cache, temp, input, prng_key, stream)
+    ) -> Result<ModelGenerate<'a, crate::runtime::generation::sampler::GenerationSampler>, Error>
+    {
+        let resolved = self.resolve_generation_config(overrides)?;
+        let prng_key = match (prng_key, resolved.temperature) {
+            (Some(key), _) => Some(key),
+            (None, 0.0) => None,
+            (None, _) => Some(safemlx::random::key(0)?),
+        };
+        Ok(self.model.generate_input_with_cache_sampler(
+            cache,
+            resolved.temperature,
+            input,
+            prng_key,
+            stream,
+            resolved.sampler(),
+        ))
     }
 
     /// Creates a token iterator from typed input with a caller-provided sampler.
