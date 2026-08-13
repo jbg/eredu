@@ -1377,7 +1377,7 @@ pub(super) fn prepare_chat_from_parts(
     if profile.identity.as_deref() == Some("muse-glimmer.atem.v1") {
         if request.enable_thinking == Some(false) {
             return Err(Error::ToolConstraint(
-                "Muse-Glimmer requires reasoning; enable_thinking=false is not supported".into(),
+                "Muse-Glimmer does not expose a reasoning-disable control; enable_thinking=false is not supported".into(),
             ));
         }
         if let Some(value) = request.extra_template_kwargs.get("reasoning_strength") {

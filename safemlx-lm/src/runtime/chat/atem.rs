@@ -64,15 +64,23 @@ impl AtemDialect {
         let mut grammar = String::new();
         match tool_choice {
             ToolChoice::None => grammar.push_str(&format!(
-                "start: {reasoning} {} {message} ATEM_CHANNEL_TEXT* {eot}\n",
-                json_literal("assistant to=user")
+                "start: {reasoning} visible | direct_visible\n\
+                 visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n\
+                 direct_visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n",
+                json_literal("assistant to=user"),
+                json_literal(" to=user"),
             )),
             ToolChoice::Auto => grammar.push_str(&format!(
-                "start: {reasoning} (visible | tool_collection)\nvisible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n",
-                json_literal("assistant to=user")
+                "start: {reasoning} (visible | tool_collection) | direct_visible | direct_tool_collection\n\
+                 visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n\
+                 direct_visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n",
+                json_literal("assistant to=user"),
+                json_literal(" to=user"),
             )),
             ToolChoice::Required => {
-                grammar.push_str(&format!("start: {reasoning} tool_collection\n"))
+                grammar.push_str(&format!(
+                    "start: {reasoning} tool_collection | direct_tool_collection\n"
+                ))
             }
         }
         grammar.push_str(
@@ -88,9 +96,13 @@ impl AtemDialect {
             return Ok(grammar);
         }
         grammar.push_str(&format!(
-            "tool_call: {}\n",
+            "tool_call: {}\ndirect_tool_call: {}\n",
             (0..tools.len())
                 .map(|index| format!("tool_call_{index}"))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            (0..tools.len())
+                .map(|index| format!("direct_tool_call_{index}"))
                 .collect::<Vec<_>>()
                 .join(" | ")
         ));
@@ -128,7 +140,8 @@ impl AtemDialect {
                 });
             }
             grammar.push_str(&format!(
-                "tool_call_{index}: {} {} {} {}\n",
+                "tool_call_{index}: {} {} {} {}\n\
+                 direct_tool_call_{index}: {} {} {} {}\n",
                 json_literal(&format!("assistant to={}", tool.name)),
                 message,
                 json_literal(&format!(
@@ -137,12 +150,30 @@ impl AtemDialect {
                 )),
                 parameters.join(" ")
                     + " "
-                    + &json_literal("</atem:invoke>\n</atem:function_calls>")
+                    + &json_literal("</atem:invoke>\n</atem:function_calls>"),
+                json_literal(&format!(" to={}", tool.name)),
+                message,
+                json_literal(&format!(
+                    "<atem:function_calls>\n<atem:invoke name=\"{}\">\n",
+                    xml_escape(&tool.name)
+                )),
+                parameters.join(" ")
+                    + " "
+                    + &json_literal("</atem:invoke>\n</atem:function_calls>"),
             ));
         }
         let separator = format!("{eom} {start}");
         let collection = repeated_rule("tool_call", &separator, 1, maximum);
-        grammar.push_str(&format!("tool_collection: {collection} {eot}\n"));
+        let direct_tail = match maximum {
+            Some(0) => return Err("ATEM tool collection requires at least one call".into()),
+            Some(1) => String::new(),
+            Some(maximum) => format!(" ({separator} tool_call){{0,{}}}", maximum - 1),
+            None => format!(" ({separator} tool_call)*"),
+        };
+        grammar.push_str(&format!(
+            "tool_collection: {collection} {eot}\n\
+             direct_tool_collection: direct_tool_call{direct_tail} {eot}\n"
+        ));
         Ok(grammar)
     }
 }
@@ -383,13 +414,12 @@ impl AtemParser {
                 AtemState::Reasoning
             }
             "self" => return Err("ATEM emitted more than one reasoning channel".into()),
-            "user" if self.saw_reasoning => AtemState::Visible,
-            "user" => return Err("ATEM visible text preceded mandatory reasoning".into()),
-            _ if self.saw_reasoning && !recipient.is_empty() => AtemState::Tool {
+            "user" => AtemState::Visible,
+            _ if !recipient.is_empty() => AtemState::Tool {
                 recipient,
                 payload: String::new(),
             },
-            _ => return Err("ATEM tool output preceded mandatory reasoning".into()),
+            _ => return Err("ATEM tool output has an empty recipient".into()),
         };
         Ok(())
     }
@@ -461,9 +491,6 @@ impl ProtocolParser for AtemParser {
     fn stop(&mut self, sequence: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         if sequence != EOT {
             return Err(format!("unexpected ATEM stop sequence {sequence:?}"));
-        }
-        if !self.saw_reasoning {
-            return Err("ATEM turn ended without mandatory reasoning".into());
         }
         match self.state {
             AtemState::Visible | AtemState::Tool { .. } => self.close_channel(sink),
@@ -576,5 +603,23 @@ mod tests {
                     if json_fragment == r#"{"days":3,"units":"metric & SI"}"#
             )));
         }
+    }
+
+    #[test]
+    fn visible_output_does_not_require_a_reasoning_channel() {
+        let mut parser = ToolRuntimeParser::new_with_structural_stops(
+            Box::new(AtemParser::default()),
+            STOPS.iter().copied(),
+            std::iter::empty(),
+            STOPS.iter().copied(),
+        );
+        parser.push(" to=user").unwrap();
+        parser.push_structural(1, MESSAGE).unwrap();
+        parser.push("direct answer").unwrap();
+        parser.push_structural(2, EOT).unwrap();
+        parser.finish(FinishReason::StopSequence).unwrap();
+        assert!(parser
+            .take_events()
+            .contains(&SemanticEvent::TextDelta("direct answer".into())));
     }
 }

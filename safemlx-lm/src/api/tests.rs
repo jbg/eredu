@@ -3424,6 +3424,24 @@ fn muse_atem_recognition_accepts_jinja_conditional_keyword_arguments() {
         .mapping_tool_arguments
         .is_supported());
     assert!(prepared.tool_runtime_plan().is_some());
+
+    let direct = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(template.into()),
+        "behavior-not-model-id-selects-muse",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert!(plan_accepts(
+        direct.generation_runtime_plan().unwrap(),
+        " to=user<|message|>direct answer<|eot|>"
+    ));
 }
 
 #[test]
