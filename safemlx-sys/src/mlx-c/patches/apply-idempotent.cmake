@@ -9,6 +9,12 @@ endif()
 file(SHA256 "${PATCH_FILE}" patch_hash)
 get_filename_component(patch_name "${PATCH_FILE}" NAME)
 set(stamp_file ".safemlx-${patch_name}.stamp")
+
+# URL-backed FetchContent sources have no .git directory. When Cargo's build
+# directory is inside a SafeMLX checkout, a plain `git apply` walks up to the
+# parent repository and silently filters every MLX-relative path out. Bind the
+# work tree explicitly so archive and Git-backed sources behave identically.
+get_filename_component(patch_work_tree "." ABSOLUTE)
 if(EXISTS "${stamp_file}")
   file(READ "${stamp_file}" stamped_hash)
   string(STRIP "${stamped_hash}" stamped_hash)
@@ -18,7 +24,8 @@ if(EXISTS "${stamp_file}")
 endif()
 
 execute_process(
-  COMMAND git apply --recount --reverse --check "${PATCH_FILE}"
+  COMMAND git "--work-tree=${patch_work_tree}" apply --recount --reverse --check
+          "${PATCH_FILE}"
   RESULT_VARIABLE patch_already_applied
   OUTPUT_QUIET
   ERROR_QUIET)
@@ -28,7 +35,8 @@ if(patch_already_applied EQUAL 0)
 endif()
 
 execute_process(
-  COMMAND git apply --recount --check --ignore-whitespace "${PATCH_FILE}"
+  COMMAND git "--work-tree=${patch_work_tree}" apply --recount --check
+          --ignore-whitespace "${PATCH_FILE}"
   RESULT_VARIABLE patch_check
   ERROR_VARIABLE patch_error)
 if(NOT patch_check EQUAL 0)
@@ -36,7 +44,8 @@ if(NOT patch_check EQUAL 0)
 endif()
 
 execute_process(
-  COMMAND git apply --recount --ignore-whitespace "${PATCH_FILE}"
+  COMMAND git "--work-tree=${patch_work_tree}" apply --recount
+          --ignore-whitespace "${PATCH_FILE}"
   RESULT_VARIABLE patch_result
   ERROR_VARIABLE patch_error)
 if(NOT patch_result EQUAL 0)
