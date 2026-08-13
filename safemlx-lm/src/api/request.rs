@@ -415,11 +415,11 @@ pub(super) fn with_prepared_chat_runtime<S, R>(
             )));
         }
     };
-    let sampler = match prepared_chat.tool_runtime_plan() {
-        Some(plan) => ConstrainedSampler::from_tool_plan(sampling_policy, plan)
-            .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?,
-        None => ConstrainedSampler::unconstrained(sampling_policy),
-    };
+    let generation_plan = prepared_chat
+        .generation_runtime_plan()
+        .expect("supported prepared chats carry a generation runtime plan");
+    let sampler = ConstrainedSampler::from_generation_plan(sampling_policy, generation_plan)
+        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
     let parser = semantic_plan
         .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
         .map_err(Error::PreparedChatGeneration)?;
@@ -1408,31 +1408,95 @@ pub(super) fn prepare_chat_from_parts(
         .native_tool_unavailable_reason
         .clone()
         .unwrap_or_else(|| "no semantic protocol was recognized".into());
-    let (mut semantic_runtime_plan, mut preserved_structural_token_ids) =
-        match (profile.dialect, profile.dialect_parameters) {
-            (Some(dialect), Some(parameters)) => {
-                match resolve_structural_tokens(tokenizer, &profile.required_structural_tokens) {
-                    Ok(resolved_ids) => {
-                        let preserved = resolved_ids.clone();
-                        (
-                            Some(SemanticRuntimePlan::new(
-                                dialect,
-                                parameters,
-                                profile.required_structural_tokens.clone(),
-                                resolved_ids,
-                                profile.stop_sequences.clone(),
-                            )),
-                            preserved,
-                        )
-                    }
-                    Err(reason) => {
-                        return Err(Error::ToolConstraint(reason));
-                    }
-                }
-            }
-            _ => (None, Vec::new()),
-        };
-    let semantic_support = if semantic_runtime_plan.is_some() {
+    let tool_surface_requested =
+        !request.tools.is_empty() || request.tool_choice == ToolChoice::Required;
+    let tool_protocol_available = profile.tool_dialect.is_some()
+        && profile.tool_dialect_parameters.is_some()
+        && constraint_compiler.is_some_and(Result::is_ok);
+    let native_tool_support = if tool_protocol_available {
+        NativeToolSupport::Supported
+    } else {
+        NativeToolSupport::Unsupported {
+            reason: profile
+                .native_tool_unavailable_reason
+                .clone()
+                .unwrap_or_else(|| semantic_failure.clone()),
+        }
+    };
+
+    let selected_runtime = if tool_surface_requested && tool_protocol_available {
+        profile
+            .tool_dialect
+            .zip(profile.tool_dialect_parameters)
+            .map(|(dialect, parameters)| {
+                (
+                    dialect,
+                    parameters,
+                    &profile.tool_required_structural_tokens,
+                    true,
+                )
+            })
+    } else {
+        profile
+            .dialect
+            .zip(profile.dialect_parameters)
+            .map(|(dialect, parameters)| {
+                (
+                    dialect,
+                    parameters,
+                    &profile.required_structural_tokens,
+                    false,
+                )
+            })
+    };
+    let generation_runtime_plan = match selected_runtime {
+        Some((dialect, parameters, structural_tokens, has_tool_surface)) => {
+            let resolved_ids = resolve_structural_tokens(tokenizer, structural_tokens)
+                .map_err(Error::ToolConstraint)?;
+            let compiler = constraint_compiler
+                .ok_or_else(|| {
+                    Error::ToolConstraint(
+                        "the loaded model does not have tokenizer constraint data".into(),
+                    )
+                })?
+                .as_ref()
+                .map_err(|error| Error::ToolConstraint(error.clone()))?;
+            Some(
+                compiler
+                    .compile_generation_plan(
+                        dialect,
+                        parameters,
+                        if has_tool_surface {
+                            &request.tools
+                        } else {
+                            &[]
+                        },
+                        if has_tool_surface {
+                            request.tool_choice
+                        } else {
+                            ToolChoice::None
+                        },
+                        request.parallel_tool_calls,
+                        structural_tokens.clone(),
+                        resolved_ids,
+                        profile.stop_sequences.clone(),
+                        has_tool_surface,
+                    )
+                    .map_err(Error::ToolConstraint)?,
+            )
+        }
+        None => None,
+    };
+    let preserved_structural_token_ids = generation_runtime_plan
+        .as_ref()
+        .map(|plan| {
+            plan.semantic_plan()
+                .structural_tokens()
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let semantic_support = if generation_runtime_plan.is_some() {
         SemanticSupport::Supported
     } else {
         SemanticSupport::Unsupported {
@@ -1440,7 +1504,7 @@ pub(super) fn prepare_chat_from_parts(
         }
     };
     if request.enable_thinking == Some(true)
-        && (semantic_runtime_plan.is_none() || !profile.supports_reasoning_parsing)
+        && (generation_runtime_plan.is_none() || !profile.supports_reasoning_parsing)
         && !request.allow_unparsed_reasoning
     {
         return Err(Error::ToolConstraint(format!(
@@ -1448,64 +1512,13 @@ pub(super) fn prepare_chat_from_parts(
         )));
     }
 
-    let tool_surface_requested =
-        !request.tools.is_empty() || request.tool_choice == ToolChoice::Required;
-    let (native_tool_support, tool_runtime_plan) =
-        match (profile.tool_dialect, profile.tool_dialect_parameters) {
-            (Some(dialect), Some(parameters)) if semantic_runtime_plan.is_some() => {
-                if tool_surface_requested {
-                    let tool_structural_token_ids = resolve_structural_tokens(
-                        tokenizer,
-                        &profile.tool_required_structural_tokens,
-                    )
-                    .map_err(Error::ToolConstraint)?;
-                    let compiler = constraint_compiler
-                        .ok_or_else(|| {
-                            Error::ToolConstraint(
-                                "the loaded model does not have tokenizer constraint data".into(),
-                            )
-                        })?
-                        .as_ref()
-                        .map_err(|error| Error::ToolConstraint(error.clone()))?;
-                    let plan = compiler
-                        .compile_tool_plan(
-                            dialect,
-                            parameters,
-                            &request.tools,
-                            request.tool_choice,
-                            request.parallel_tool_calls,
-                            tool_structural_token_ids,
-                        )
-                        .map_err(Error::ToolConstraint)?;
-                    semantic_runtime_plan = Some(plan.semantic_plan().clone());
-                    preserved_structural_token_ids = plan
-                        .semantic_plan()
-                        .structural_tokens()
-                        .map(|(id, _)| id)
-                        .collect();
-                    (NativeToolSupport::Supported, Some(plan))
-                } else {
-                    (NativeToolSupport::Supported, None)
-                }
-            }
-            _ => (
-                NativeToolSupport::Unsupported {
-                    reason: profile
-                        .native_tool_unavailable_reason
-                        .clone()
-                        .unwrap_or(semantic_failure),
-                },
-                None,
-            ),
-        };
-
     let capabilities = ChatCapabilities {
         reasoning_parser: capability(
-            semantic_runtime_plan.is_some() && profile.supports_reasoning_parsing,
+            generation_runtime_plan.is_some() && profile.supports_reasoning_parsing,
             "the selected protocol does not provide a recognized reasoning channel",
         ),
         visible_text_parser: capability(
-            semantic_runtime_plan.is_some(),
+            generation_runtime_plan.is_some(),
             "no semantic visible-text parser was recognized",
         ),
         tool_output_parser: capability(
@@ -1602,8 +1615,7 @@ pub(super) fn prepare_chat_from_parts(
         native_tool_support,
         semantic_support,
         capabilities,
-        semantic_runtime_plan,
-        tool_runtime_plan,
+        generation_runtime_plan,
         eos_token_ids: eos_token_ids.to_vec(),
         preserved_structural_token_ids,
         profile_stop_sequences: profile.stop_sequences,

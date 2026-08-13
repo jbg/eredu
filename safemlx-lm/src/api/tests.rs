@@ -672,8 +672,7 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
                 reason: "synthetic unsupported profile".into(),
             },
         },
-        semantic_runtime_plan: None,
-        tool_runtime_plan: None,
+        generation_runtime_plan: None,
         eos_token_ids: vec![2],
         preserved_structural_token_ids: Vec::new(),
         profile_stop_sequences: Vec::new(),
@@ -2814,6 +2813,15 @@ fn inkling_template_recognition_routes_reasoning_and_visible_text() {
     assert_eq!(
         prepared.profile_stop_sequences(),
         ["<|content_model_end_sampling|>"]
+    );
+    let generation_plan = prepared
+        .generation_runtime_plan()
+        .expect("recognized Inkling chat must compile its generation grammar");
+    assert!(!generation_plan.has_tool_surface());
+    assert!(
+        ConstrainedSampler::from_generation_plan(DefaultSampler, generation_plan)
+            .unwrap()
+            .constraint_is_active()
     );
 
     let plan = prepared

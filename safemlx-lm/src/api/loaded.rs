@@ -412,11 +412,12 @@ impl LoadedModel {
                     )));
                 }
             };
-            let sampler = match prepared_chat.tool_runtime_plan() {
-                Some(plan) => ConstrainedSampler::from_tool_plan(sampling_policy, plan)
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?,
-                None => ConstrainedSampler::unconstrained(sampling_policy),
-            };
+            let generation_plan = prepared_chat
+                .generation_runtime_plan()
+                .expect("supported prepared chats carry a generation runtime plan");
+            let sampler =
+                ConstrainedSampler::from_generation_plan(sampling_policy, generation_plan)
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
             let decoder = PreparedChatTokenDecoder {
                 decoder: self.text_decoder(true),
             };

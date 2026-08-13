@@ -118,10 +118,6 @@ impl PartialEq for GenerationConstraint {
 impl Eq for GenerationConstraint {}
 
 /// A format-protocol-specific semantic parsing plan.
-///
-/// This plan deliberately contains no generation constraint. It can therefore
-/// preserve reasoning and visible-text semantics even when tool rendering or
-/// constrained tool generation is unavailable.
 #[derive(Clone)]
 pub(crate) struct SemanticRuntimePlan {
     dialect: &'static dyn FormatDialect,
@@ -204,19 +200,24 @@ impl PartialEq for SemanticRuntimePlan {
 
 impl Eq for SemanticRuntimePlan {}
 
-/// A format-protocol-specific plan for constrained native tool generation.
+/// A complete format-protocol runtime plan for constrained generation and
+/// semantic parsing.
 ///
-/// The semantic parser is composed rather than implied by the constraint.
+/// Every recognized prepared chat owns one of these plans, including requests
+/// without tools. Tool-capable requests specialize the same plan with schemas
+/// and tool-choice activation semantics.
 #[derive(Clone)]
-pub(crate) struct ToolRuntimePlan {
+pub(crate) struct GenerationRuntimePlan {
     tool_choice: ToolChoice,
+    tool_surface: bool,
     generation_constraint: GenerationConstraint,
     tool_call_trigger: Option<String>,
     semantic: SemanticRuntimePlan,
 }
 
-pub(crate) struct ToolRuntimePlanParts {
+pub(crate) struct GenerationRuntimePlanParts {
     pub(crate) tool_choice: ToolChoice,
+    pub(crate) tool_surface: bool,
     pub(crate) generation_constraint: GenerationConstraint,
     pub(crate) tool_call_trigger: Option<String>,
     pub(crate) dialect: &'static dyn FormatDialect,
@@ -226,8 +227,8 @@ pub(crate) struct ToolRuntimePlanParts {
     pub(crate) profile_stop_sequences: Vec<String>,
 }
 
-impl ToolRuntimePlan {
-    pub(crate) fn new(parts: ToolRuntimePlanParts) -> Self {
+impl GenerationRuntimePlan {
+    pub(crate) fn new(parts: GenerationRuntimePlanParts) -> Self {
         debug_assert_eq!(
             parts.structural_token_spellings.len(),
             parts.resolved_structural_token_ids.len()
@@ -241,6 +242,7 @@ impl ToolRuntimePlan {
         );
         Self {
             tool_choice: parts.tool_choice,
+            tool_surface: parts.tool_surface,
             generation_constraint: parts.generation_constraint,
             tool_call_trigger: parts.tool_call_trigger,
             semantic,
@@ -267,6 +269,10 @@ impl ToolRuntimePlan {
 
     pub(crate) fn tool_choice(&self) -> ToolChoice {
         self.tool_choice
+    }
+
+    pub(crate) fn has_tool_surface(&self) -> bool {
+        self.tool_surface
     }
 
     #[cfg(test)]
@@ -319,26 +325,32 @@ impl ToolRuntimePlan {
     }
 }
 
-impl fmt::Debug for ToolRuntimePlan {
+impl fmt::Debug for GenerationRuntimePlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ToolRuntimePlan")
+            .debug_struct("GenerationRuntimePlan")
             .field("tool_choice", &self.tool_choice)
+            .field("tool_surface", &self.tool_surface)
             .field("semantic", &self.semantic)
             .finish_non_exhaustive()
     }
 }
 
-impl PartialEq for ToolRuntimePlan {
+impl PartialEq for GenerationRuntimePlan {
     fn eq(&self, other: &Self) -> bool {
         self.tool_choice == other.tool_choice
+            && self.tool_surface == other.tool_surface
             && self.generation_constraint == other.generation_constraint
             && self.tool_call_trigger == other.tool_call_trigger
             && self.semantic == other.semantic
     }
 }
 
-impl Eq for ToolRuntimePlan {}
+impl Eq for GenerationRuntimePlan {}
+
+/// Compatibility name for internal dialect tests focused on tool generation.
+#[cfg(test)]
+pub(crate) type ToolRuntimePlan = GenerationRuntimePlan;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedStructuralToken {
@@ -462,8 +474,7 @@ pub struct PreparedChat {
     /// Semantic response parsing capability, independent of tool constraints.
     pub(crate) semantic_support: SemanticSupport,
     pub(crate) capabilities: ChatCapabilities,
-    pub(crate) semantic_runtime_plan: Option<SemanticRuntimePlan>,
-    pub(crate) tool_runtime_plan: Option<ToolRuntimePlan>,
+    pub(crate) generation_runtime_plan: Option<GenerationRuntimePlan>,
     /// Checkpoint EOS token IDs used to stop generation.
     pub(crate) eos_token_ids: Vec<u32>,
     /// Profile-owned structural token IDs that decoding must preserve.
@@ -509,11 +520,20 @@ impl PreparedChat {
     }
 
     pub(crate) fn semantic_runtime_plan(&self) -> Option<&SemanticRuntimePlan> {
-        self.semantic_runtime_plan.as_ref()
+        self.generation_runtime_plan
+            .as_ref()
+            .map(GenerationRuntimePlan::semantic_plan)
     }
 
+    pub(crate) fn generation_runtime_plan(&self) -> Option<&GenerationRuntimePlan> {
+        self.generation_runtime_plan.as_ref()
+    }
+
+    #[cfg(test)]
     pub(crate) fn tool_runtime_plan(&self) -> Option<&ToolRuntimePlan> {
-        self.tool_runtime_plan.as_ref()
+        self.generation_runtime_plan
+            .as_ref()
+            .filter(|plan| plan.has_tool_surface())
     }
 
     /// Returns checkpoint EOS token IDs.

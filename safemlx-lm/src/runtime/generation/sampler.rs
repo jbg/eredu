@@ -10,7 +10,7 @@ use safemlx::{
 
 use crate::{
     runtime::chat::constraints::GrammarState,
-    runtime::chat::{ToolChoice, ToolRuntimePlan},
+    runtime::chat::{GenerationRuntimePlan, ToolChoice},
 };
 
 /// Sampling policy suitable for lossless speculative decoding.
@@ -141,7 +141,6 @@ struct ConstraintCheckpoint<S> {
 }
 
 enum ConstraintRuntime {
-    Inactive,
     Forbidden {
         vocabulary: Arc<Vec<Vec<u8>>>,
         trigger: Vec<u8>,
@@ -159,7 +158,6 @@ enum ConstraintRuntime {
 impl Clone for ConstraintRuntime {
     fn clone(&self) -> Self {
         match self {
-            Self::Inactive => Self::Inactive,
             Self::Forbidden {
                 vocabulary,
                 trigger,
@@ -196,51 +194,57 @@ impl<S: Clone> Clone for ConstrainedSampler<S> {
 }
 
 impl<S> ConstrainedSampler<S> {
-    /// Wraps a policy without a generation constraint while retaining the
-    /// common prepared-chat execution type.
-    pub(crate) fn unconstrained(policy: S) -> Self {
-        Self {
-            policy,
-            runtime: ConstraintRuntime::Inactive,
-            committed_tokens: Vec::new(),
-        }
-    }
-
     /// Wraps `policy` with the constraint and activation semantics in `plan`.
-    pub(crate) fn from_tool_plan(policy: S, plan: &ToolRuntimePlan) -> Result<Self, Exception> {
+    pub(crate) fn from_generation_plan(
+        policy: S,
+        plan: &GenerationRuntimePlan,
+    ) -> Result<Self, Exception> {
         let constraint = plan.generation_constraint().clone();
-        let runtime = match plan.tool_choice() {
-            ToolChoice::None => {
-                let trigger = required_tool_call_trigger(plan.tool_call_trigger(), "forbidden")?;
-                let vocabulary = constraint
-                    .grammar_state()
-                    .token_vocabulary()
-                    .map_err(constraint_error)?;
-                ConstraintRuntime::Forbidden {
-                    vocabulary: Arc::new(vocabulary),
-                    trigger,
-                    pending: Vec::new(),
+        let runtime = if !plan.has_tool_surface() {
+            ConstraintRuntime::Active(constraint.grammar_state())
+        } else {
+            match plan.tool_choice() {
+                ToolChoice::None => {
+                    let trigger =
+                        required_tool_call_trigger(plan.tool_call_trigger(), "forbidden")?;
+                    let vocabulary = constraint
+                        .grammar_state()
+                        .token_vocabulary()
+                        .map_err(constraint_error)?;
+                    ConstraintRuntime::Forbidden {
+                        vocabulary: Arc::new(vocabulary),
+                        trigger,
+                        pending: Vec::new(),
+                    }
                 }
-            }
-            ToolChoice::Auto => {
-                let trigger =
-                    required_tool_call_trigger(plan.auto_activation_trigger(), "automatic")?;
-                let grammar = constraint.grammar_state();
-                let vocabulary = grammar.token_vocabulary().map_err(constraint_error)?;
-                ConstraintRuntime::Auto {
-                    grammar,
-                    vocabulary: Arc::new(vocabulary),
-                    trigger,
-                    pending: Vec::new(),
+                ToolChoice::Auto => {
+                    let trigger =
+                        required_tool_call_trigger(plan.auto_activation_trigger(), "automatic")?;
+                    let grammar = constraint.grammar_state();
+                    let vocabulary = grammar.token_vocabulary().map_err(constraint_error)?;
+                    ConstraintRuntime::Auto {
+                        grammar,
+                        vocabulary: Arc::new(vocabulary),
+                        trigger,
+                        pending: Vec::new(),
+                    }
                 }
+                ToolChoice::Required => ConstraintRuntime::Active(constraint.grammar_state()),
             }
-            ToolChoice::Required => ConstraintRuntime::Active(constraint.grammar_state()),
         };
         Ok(Self {
             policy,
             runtime,
             committed_tokens: Vec::new(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_tool_plan(
+        policy: S,
+        plan: &GenerationRuntimePlan,
+    ) -> Result<Self, Exception> {
+        Self::from_generation_plan(policy, plan)
     }
 
     /// Returns the wrapped sampling policy.
@@ -262,9 +266,7 @@ impl<S> ConstrainedSampler<S> {
     pub fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
         match &mut self.runtime {
             ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
-            ConstraintRuntime::Inactive
-            | ConstraintRuntime::Forbidden { .. }
-            | ConstraintRuntime::Auto { .. } => Ok(false),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
         }
     }
 
@@ -278,9 +280,7 @@ impl<S> ConstrainedSampler<S> {
                 .allowed_tokens()
                 .map(|mask| Some(mask.iter().collect()))
                 .map_err(constraint_error),
-            ConstraintRuntime::Inactive
-            | ConstraintRuntime::Forbidden { .. }
-            | ConstraintRuntime::Auto { .. } => Ok(None),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(None),
         }
     }
 
@@ -309,7 +309,6 @@ impl<S> ConstrainedSampler<S> {
             ));
         }
         let invalid_row = match runtime {
-            ConstraintRuntime::Inactive => return Ok(logits.clone()),
             ConstraintRuntime::Active(grammar) => {
                 let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
                 if allowed.len() != vocab_size {
@@ -412,9 +411,7 @@ impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S>
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
         match &mut self.runtime_at(history)? {
             ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
-            ConstraintRuntime::Inactive
-            | ConstraintRuntime::Forbidden { .. }
-            | ConstraintRuntime::Auto { .. } => Ok(false),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
         }
     }
 
@@ -488,7 +485,6 @@ impl<S: Sampler + Clone> Sampler for ConstrainedSampler<S> {
 
 fn commit_runtime_token(runtime: &mut ConstraintRuntime, token: u32) -> Result<(), Exception> {
     match runtime {
-        ConstraintRuntime::Inactive => Ok(()),
         ConstraintRuntime::Forbidden {
             vocabulary,
             trigger,

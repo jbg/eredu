@@ -19,11 +19,13 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
+#[cfg(test)]
+use crate::runtime::chat::ToolRuntimePlan;
 use crate::{
     runtime::chat::dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
     runtime::chat::{
-        GenerationConstraint, ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan,
-        ToolRuntimePlanParts,
+        GenerationConstraint, GenerationRuntimePlan, GenerationRuntimePlanParts,
+        ParallelToolCallPolicy, ToolChoice,
     },
 };
 
@@ -33,6 +35,7 @@ const MAX_SCHEMA_DEPTH: usize = 64;
 /// every request grammar shares it.
 pub(crate) struct ConstraintCompiler {
     factory: Arc<ParserFactory>,
+    eos_token_ids: Vec<u32>,
     #[cfg(test)]
     tokenizer_analysis_runs: usize,
     #[cfg(test)]
@@ -71,15 +74,16 @@ impl ConstraintCompiler {
         let token_env = byte_tokenizer
             .into_tok_env(Some(tokenizer.get_vocab_size(true)))
             .map_err(|error| format!("failed to build tokenizer trie: {error}"))?;
-        Self::from_tok_env(token_env)
+        Self::from_tok_env(token_env, eos_token_ids.to_vec())
     }
 
-    fn from_tok_env(token_env: TokEnv) -> Result<Self, String> {
+    fn from_tok_env(token_env: TokEnv, eos_token_ids: Vec<u32>) -> Result<Self, String> {
         let mut factory = ParserFactory::new_simple(&token_env)
             .map_err(|error| format!("failed to analyze tokenizer trie: {error}"))?;
         factory.quiet();
         Ok(Self {
             factory: Arc::new(factory),
+            eos_token_ids,
             #[cfg(test)]
             tokenizer_analysis_runs: 1,
             #[cfg(test)]
@@ -89,8 +93,11 @@ impl ConstraintCompiler {
 
     #[cfg(test)]
     pub(crate) fn synthetic_for_tests() -> Self {
-        Self::from_tok_env(llguidance::toktrie::ApproximateTokEnv::single_byte_env())
-            .expect("single-byte tokenizer must support llguidance")
+        Self::from_tok_env(
+            llguidance::toktrie::ApproximateTokEnv::single_byte_env(),
+            vec![255],
+        )
+        .expect("single-byte tokenizer must support llguidance")
     }
 
     #[cfg(test)]
@@ -121,38 +128,58 @@ impl ConstraintCompiler {
             tok_end_of_turn: None,
         };
         let environment = Arc::new(ApproximateTokEnv::new(TokTrie::from(&info, &words)));
-        Self::from_tok_env(environment).expect("synthetic tokenizer must support llguidance")
+        Self::from_tok_env(environment, vec![eos])
+            .expect("synthetic tokenizer must support llguidance")
     }
 
-    pub(crate) fn compile_tool_plan(
+    pub(crate) fn compile_generation_plan(
         &self,
         dialect: &'static dyn FormatDialect,
         parameters: DialectParameters,
         tools: &[Value],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
+        runtime_structural_token_spellings: Vec<String>,
         resolved_structural_token_ids: Vec<u32>,
-    ) -> Result<ToolRuntimePlan, String> {
+        runtime_stop_sequences: Vec<String>,
+        tool_surface: bool,
+    ) -> Result<GenerationRuntimePlan, String> {
         #[cfg(test)]
         self.schema_compilation_runs.fetch_add(1, Ordering::Relaxed);
 
-        let structural_token_spellings = dialect.required_structural_tokens(parameters)?;
-        if structural_token_spellings.len() != resolved_structural_token_ids.len() {
+        let grammar_structural_token_spellings = dialect.required_structural_tokens(parameters)?;
+        if runtime_structural_token_spellings.len() != resolved_structural_token_ids.len()
+            || runtime_structural_token_spellings.len() < grammar_structural_token_spellings.len()
+            || !runtime_structural_token_spellings
+                .iter()
+                .zip(grammar_structural_token_spellings)
+                .all(|(runtime, grammar)| runtime == grammar)
+        {
             return Err(format!(
-                "format dialect declares {} structural tokens but {} tokenizer IDs were resolved",
-                structural_token_spellings.len(),
+                "format dialect declares {} leading structural tokens but {} runtime spellings and {} tokenizer IDs were resolved",
+                grammar_structural_token_spellings.len(),
+                runtime_structural_token_spellings.len(),
                 resolved_structural_token_ids.len()
             ));
         }
-        let profile_stop_sequences = dialect.stop_sequences(parameters)?;
+        let grammar_structural_token_ids =
+            &resolved_structural_token_ids[..grammar_structural_token_spellings.len()];
         dialect.incremental_parser_state(parameters)?;
-        let configuration = dialect.constraint_configuration(
-            parameters,
-            tools,
-            tool_choice,
-            parallel_tool_calls,
-            &resolved_structural_token_ids,
-        )?;
+        let configuration = if tool_surface {
+            dialect.constraint_configuration(
+                parameters,
+                tools,
+                tool_choice,
+                parallel_tool_calls,
+                grammar_structural_token_ids,
+            )?
+        } else {
+            dialect.semantic_constraint_configuration(
+                parameters,
+                grammar_structural_token_ids,
+                &self.eos_token_ids,
+            )?
+        };
         let fingerprint: [u8; 32] = Sha256::digest(
             serde_json::to_vec(&configuration.grammar).expect("grammar configuration serializes"),
         )
@@ -172,8 +199,9 @@ impl ConstraintCompiler {
                 warnings.join("; ")
             ));
         }
-        Ok(ToolRuntimePlan::new(ToolRuntimePlanParts {
+        Ok(GenerationRuntimePlan::new(GenerationRuntimePlanParts {
             tool_choice,
+            tool_surface,
             generation_constraint: GenerationConstraint::new(
                 fingerprint,
                 ConstraintBlueprint { matcher },
@@ -187,16 +215,43 @@ impl ConstraintCompiler {
             },
             dialect,
             dialect_parameters: parameters,
-            structural_token_spellings: structural_token_spellings
-                .iter()
-                .map(|spelling| (*spelling).to_owned())
-                .collect(),
+            structural_token_spellings: runtime_structural_token_spellings,
             resolved_structural_token_ids,
-            profile_stop_sequences: profile_stop_sequences
-                .iter()
-                .map(|sequence| (*sequence).to_owned())
-                .collect(),
+            profile_stop_sequences: runtime_stop_sequences,
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compile_tool_plan(
+        &self,
+        dialect: &'static dyn FormatDialect,
+        parameters: DialectParameters,
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        parallel_tool_calls: ParallelToolCallPolicy,
+        resolved_structural_token_ids: Vec<u32>,
+    ) -> Result<ToolRuntimePlan, String> {
+        let structural_token_spellings = dialect
+            .required_structural_tokens(parameters)?
+            .iter()
+            .map(|spelling| (*spelling).to_owned())
+            .collect();
+        let stop_sequences = dialect
+            .stop_sequences(parameters)?
+            .iter()
+            .map(|sequence| (*sequence).to_owned())
+            .collect();
+        self.compile_generation_plan(
+            dialect,
+            parameters,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
+            structural_token_spellings,
+            resolved_structural_token_ids,
+            stop_sequences,
+            true,
+        )
     }
 
     #[cfg(test)]

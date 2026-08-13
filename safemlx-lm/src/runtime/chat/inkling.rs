@@ -217,6 +217,45 @@ impl FormatDialect for InklingMessageDialect {
         Err("Inkling message semantics do not imply constrained tool generation".into())
     }
 
+    fn semantic_constraint_configuration(
+        &self,
+        parameters: DialectParameters,
+        resolved_structural_token_ids: &[u32],
+        _eos_token_ids: &[u32],
+    ) -> Result<ConstraintConfiguration, String> {
+        Self::parameters(parameters)?;
+        if resolved_structural_token_ids.len() != MESSAGE_STRUCTURAL_TOKENS.len() {
+            return Err(format!(
+                "Inkling messages declare {} structural tokens but {} tokenizer IDs were resolved",
+                MESSAGE_STRUCTURAL_TOKENS.len(),
+                resolved_structural_token_ids.len()
+            ));
+        }
+        let structural = |text: &str| {
+            structural_literal(
+                text,
+                MESSAGE_STRUCTURAL_TOKENS,
+                resolved_structural_token_ids,
+            )
+        };
+        let grammar = format!(
+            "start: reasoning? visible {}\n\
+             reasoning: {} channel_text {} {}\n\
+             visible: {} channel_text {}\n\
+             channel_text: INKLING_TEXT_CHARACTER*\n\
+             INKLING_TEXT_CHARACTER: /[^<]|<[^|]/\n",
+            structural(END_SAMPLING)?,
+            structural(CONTENT_THINKING)?,
+            structural(END_MESSAGE)?,
+            structural(MESSAGE_MODEL)?,
+            structural(CONTENT_TEXT)?,
+            structural(END_MESSAGE)?,
+        );
+        Ok(ConstraintConfiguration {
+            grammar: TopLevelGrammar::from_lark(grammar),
+        })
+    }
+
     fn auto_activation_trigger(
         &self,
         parameters: DialectParameters,

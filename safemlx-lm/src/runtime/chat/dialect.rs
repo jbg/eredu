@@ -108,6 +108,22 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         resolved_structural_token_ids: &[u32],
     ) -> Result<ConstraintConfiguration, String>;
 
+    fn semantic_constraint_configuration(
+        &self,
+        parameters: DialectParameters,
+        resolved_structural_token_ids: &[u32],
+        eos_token_ids: &[u32],
+    ) -> Result<ConstraintConfiguration, String> {
+        let _ = eos_token_ids;
+        self.constraint_configuration(
+            parameters,
+            &[],
+            ToolChoice::None,
+            ParallelToolCallPolicy::Disabled,
+            resolved_structural_token_ids,
+        )
+    }
+
     fn auto_activation_trigger(
         &self,
         parameters: DialectParameters,
@@ -711,6 +727,95 @@ impl DeclarativeDialectSpec {
         }
         Ok(grammar)
     }
+
+    fn semantic_lark_grammar(
+        &self,
+        resolved_structural_token_ids: &[u32],
+        eos_token_ids: &[u32],
+    ) -> Result<String, String> {
+        self.validate()?;
+        if self.required_structural_tokens.len() != resolved_structural_token_ids.len() {
+            return Err(format!(
+                "declarative dialect declares {} structural tokens but {} tokenizer IDs were resolved",
+                self.required_structural_tokens.len(),
+                resolved_structural_token_ids.len()
+            ));
+        }
+        let literal = |text: &str| {
+            structural_literal(
+                text,
+                self.required_structural_tokens,
+                resolved_structural_token_ids,
+            )
+        };
+        let terminal_ids = self
+            .stop_sequences
+            .iter()
+            .filter_map(|stop| {
+                self.required_structural_tokens
+                    .iter()
+                    .position(|token| token == stop)
+                    .map(|index| resolved_structural_token_ids[index])
+            })
+            .chain(eos_token_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        if terminal_ids.is_empty() {
+            return Err(
+                "declarative semantic generation requires a structural stop or EOS token".into(),
+            );
+        }
+
+        let mut grammar = String::from("start: ");
+        if let Some(channel) = self.reasoning_channel {
+            grammar.push_str(if channel.required {
+                "reasoning "
+            } else {
+                "reasoning? "
+            });
+        }
+        if let Some(channel) = self.text_channel {
+            grammar.push_str(if channel.required {
+                "visible_text "
+            } else {
+                "visible_text? "
+            });
+        } else {
+            grammar.push_str("raw_text ");
+        }
+        grammar.push_str("terminal\n");
+
+        if let Some(channel) = self.reasoning_channel {
+            grammar.push_str(&format!(
+                "reasoning: {} channel_text {}\n",
+                literal(if channel.prefix_in_prompt {
+                    ""
+                } else {
+                    channel.prefix
+                })?,
+                literal(channel.suffix)?
+            ));
+        }
+        if let Some(channel) = self.text_channel {
+            grammar.push_str(&format!(
+                "visible_text: {} channel_text {}\n",
+                literal(channel.prefix)?,
+                literal(channel.suffix)?
+            ));
+        } else {
+            grammar.push_str("raw_text: CHANNEL_TEXT_CHARACTER*\n");
+        }
+        grammar.push_str("channel_text: CHANNEL_TEXT_CHARACTER*\n");
+        grammar.push_str("CHANNEL_TEXT_CHARACTER: /[^<]|<[^|]/\n");
+        grammar.push_str(&format!(
+            "terminal: {}\n",
+            terminal_ids
+                .into_iter()
+                .map(|id| format!("<[{}]>", id))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+        Ok(grammar)
+    }
 }
 
 fn literal(text: &str) -> String {
@@ -1071,6 +1176,20 @@ impl FormatDialect for DeclarativeDialect {
         )?;
         Ok(ConstraintConfiguration {
             grammar: TopLevelGrammar::from_lark(grammar),
+        })
+    }
+
+    fn semantic_constraint_configuration(
+        &self,
+        parameters: DialectParameters,
+        resolved_structural_token_ids: &[u32],
+        eos_token_ids: &[u32],
+    ) -> Result<ConstraintConfiguration, String> {
+        let spec = Self::spec(parameters)?;
+        Ok(ConstraintConfiguration {
+            grammar: TopLevelGrammar::from_lark(
+                spec.semantic_lark_grammar(resolved_structural_token_ids, eos_token_ids)?,
+            ),
         })
     }
 

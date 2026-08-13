@@ -1,5 +1,6 @@
 //! Structurally recognized Gemma channel protocol.
 
+use llguidance::api::TopLevelGrammar;
 use serde_json::Value;
 
 use super::{
@@ -123,6 +124,45 @@ impl FormatDialect for GemmaChannelDialect {
         _resolved_structural_token_ids: &[u32],
     ) -> Result<ConstraintConfiguration, String> {
         Err("Gemma channel semantics do not imply constrained tool generation".into())
+    }
+
+    fn semantic_constraint_configuration(
+        &self,
+        _parameters: DialectParameters,
+        resolved_structural_token_ids: &[u32],
+        eos_token_ids: &[u32],
+    ) -> Result<ConstraintConfiguration, String> {
+        if resolved_structural_token_ids.len() < 2 {
+            return Err(format!(
+                "Gemma channels require at least 2 structural tokens but {} tokenizer IDs were resolved",
+                resolved_structural_token_ids.len()
+            ));
+        }
+        let terminal_ids = resolved_structural_token_ids[2..]
+            .iter()
+            .chain(eos_token_ids)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if terminal_ids.is_empty() {
+            return Err("Gemma channel generation requires at least one EOS token".into());
+        }
+        let terminals = terminal_ids
+            .into_iter()
+            .map(|id| format!("<[{}]>", id))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let grammar = format!(
+            "start: reasoning? visible terminal\n\
+             reasoning: <[{}]> \"thought\\n\" channel_text <[{}]>\n\
+             visible: channel_text\n\
+             channel_text: GEMMA_TEXT*\n\
+             GEMMA_TEXT: /[^<]|<[^|]/\n\
+             terminal: {terminals}\n",
+            resolved_structural_token_ids[0], resolved_structural_token_ids[1]
+        );
+        Ok(ConstraintConfiguration {
+            grammar: TopLevelGrammar::from_lark(grammar),
+        })
     }
 
     fn auto_activation_trigger(
