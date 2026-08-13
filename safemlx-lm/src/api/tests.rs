@@ -3453,6 +3453,41 @@ fn muse_atem_recognition_accepts_jinja_conditional_keyword_arguments() {
 }
 
 #[test]
+fn muse_atem_accepts_structural_eot_that_is_also_checkpoint_eos() {
+    // Place ATEM's fourth structural token at ID 255, then configure that ID
+    // as a secondary EOS alias behind a distinct canonical EOS.
+    let mut tokenizer = muse_atem_chat_tokenizer(252);
+    let eot = tokenizer
+        .token_to_id("<|eot|>")
+        .expect("synthetic Muse tokenizer has an EOT token");
+    assert_eq!(eot, 255);
+    let compiler = Ok(ConstraintCompiler::synthetic_with_eos_aliases_for_tests(&[
+        254, eot,
+    ]));
+    let template = MUSE_GLIMMER_FIXTURE_WITH_TERMINATOR
+        .strip_suffix('\n')
+        .expect("the fixture-only file terminator is documented");
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(template.into()),
+        "behavior-not-model-id-selects-muse",
+        &[eot],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+
+    assert!(plan_accepts(
+        prepared.generation_runtime_plan().unwrap(),
+        " to=user<|message|>direct answer<|eot|>"
+    ));
+}
+
+#[test]
 fn gemma_recognition_accepts_self_defaulting_kwargs_and_gguf_added_tokens() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let template = format!(

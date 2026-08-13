@@ -50,6 +50,7 @@ pub(crate) struct ConstraintBlueprint {
 #[allow(dead_code)]
 pub(crate) struct GrammarState {
     matcher: Matcher,
+    terminal_eos_alias_committed: bool,
 }
 
 impl ConstraintCompiler {
@@ -98,6 +99,25 @@ impl ConstraintCompiler {
             vec![255],
         )
         .expect("single-byte tokenizer must support llguidance")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_with_eos_aliases_for_tests(eos_token_ids: &[u32]) -> Self {
+        use llguidance::toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
+
+        let words = (0..=255).map(|byte| vec![byte]).collect::<Vec<_>>();
+        let info = TokRxInfo {
+            vocab_size: words.len() as u32,
+            tok_eos: eos_token_ids[0],
+            tok_bos: None,
+            tok_pad: None,
+            tok_unk: None,
+            tok_end_of_turn: None,
+        };
+        let trie = TokTrie::from(&info, &words).with_eos_tokens(eos_token_ids);
+        let environment = Arc::new(ApproximateTokEnv::new(trie));
+        Self::from_tok_env(environment, eos_token_ids.to_vec())
+            .expect("single-byte tokenizer with EOS aliases must support llguidance")
     }
 
     #[cfg(test)]
@@ -268,6 +288,7 @@ impl ConstraintBlueprint {
     fn state(&self) -> GrammarState {
         GrammarState {
             matcher: self.matcher.deep_clone(),
+            terminal_eos_alias_committed: false,
         }
     }
 }
@@ -277,6 +298,7 @@ impl GrammarState {
     pub(crate) fn fork(&self) -> Self {
         Self {
             matcher: self.matcher.deep_clone(),
+            terminal_eos_alias_committed: self.terminal_eos_alias_committed,
         }
     }
 
@@ -287,10 +309,27 @@ impl GrammarState {
     }
 
     pub(crate) fn commit(&mut self, token: TokenId) -> Result<(), String> {
-        if !self.try_commit(token)? {
-            return Err(format!("token {token} is not allowed by the tool grammar"));
+        if self.terminal_eos_alias_committed {
+            return Err("generation grammar already committed its terminal EOS token".into());
         }
-        Ok(())
+        if self.try_commit(token)? {
+            return Ok(());
+        }
+
+        // llguidance treats the first configured EOS token as canonical, but
+        // secondary EOS aliases cannot be consumed as explicit structural
+        // literals. Checkpoint protocols can legitimately use such an alias
+        // as their required turn terminator (Muse ATEM's <|eot|> is one).
+        // Preserve mask/commit consistency by accepting an EOS alias only
+        // when the grammar mask allowed that exact token at this prefix.
+        if self.is_eos_token(token)? && self.allowed_tokens()?.is_allowed(token) {
+            self.terminal_eos_alias_committed = true;
+            return Ok(());
+        }
+
+        Err(format!(
+            "token {token} is not allowed by the generation grammar"
+        ))
     }
 
     pub(crate) fn try_commit(&mut self, token: TokenId) -> Result<bool, String> {
@@ -323,15 +362,35 @@ impl GrammarState {
     }
 
     pub(crate) fn is_complete(&mut self) -> Result<bool, String> {
+        if self.terminal_eos_alias_committed {
+            return Ok(true);
+        }
         self.matcher
             .is_accepting()
             .map_err(|error| format!("failed to inspect grammar completion: {error}"))
     }
 
     pub(crate) fn rollback(&mut self, token_count: usize) -> Result<(), String> {
+        let token_count = if self.terminal_eos_alias_committed && token_count > 0 {
+            self.terminal_eos_alias_committed = false;
+            token_count - 1
+        } else {
+            token_count
+        };
+        if token_count == 0 {
+            return Ok(());
+        }
         self.matcher
             .rollback(token_count)
             .map_err(|error| format!("failed to roll back grammar state: {error}"))
+    }
+
+    fn is_eos_token(&self, token: TokenId) -> Result<bool, String> {
+        let token_env = self
+            .matcher
+            .tok_env()
+            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
+        Ok(token_env.tok_trie().eos_tokens().contains(&token))
     }
 
     pub(crate) fn token_bytes(&self, token: TokenId) -> Result<Vec<u8>, String> {
