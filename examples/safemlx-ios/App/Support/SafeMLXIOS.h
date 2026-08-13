@@ -22,6 +22,9 @@ int32_t safemlx_model_generate(
     const char *prompt,
     safemlx_text_callback callback,
     void *context,
+    uint64_t *generated_tokens_out,
+    double *ttft_seconds_out,
+    double *tokens_per_second_out,
     char **error_out
 );
 

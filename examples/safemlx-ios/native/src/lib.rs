@@ -6,6 +6,7 @@ use std::{
     ptr,
     sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use safemlx::{transforms::async_eval, Device, DeviceType, ExecutionContext};
@@ -20,12 +21,36 @@ use safemlx_lm::{
 /// Receives one UTF-8 text fragment. The bytes are valid only during the call.
 pub type TextCallback = unsafe extern "C" fn(*const u8, usize, *mut c_void);
 
+#[derive(Debug, Clone, Copy, Default)]
+struct GenerationStats {
+    generated_tokens: u64,
+    ttft_seconds: f64,
+    tokens_per_second: f64,
+}
+
+impl GenerationStats {
+    fn new(generated_tokens: u64, ttft: Option<Duration>, elapsed: Duration) -> Self {
+        let ttft = ttft.unwrap_or(elapsed);
+        let decode_tokens = generated_tokens.saturating_sub(1);
+        let decode_seconds = elapsed.saturating_sub(ttft).as_secs_f64();
+        Self {
+            generated_tokens,
+            ttft_seconds: ttft.as_secs_f64(),
+            tokens_per_second: if decode_tokens > 0 && decode_seconds > 0.0 {
+                decode_tokens as f64 / decode_seconds
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
 enum Command {
     Generate {
         prompt: String,
         callback: TextCallback,
         context: usize,
-        result: Sender<Result<(), String>>,
+        result: Sender<Result<GenerationStats, String>>,
     },
     Shutdown,
 }
@@ -65,7 +90,8 @@ fn generate(
     prompt: &str,
     callback: TextCallback,
     context: usize,
-) -> Result<(), String> {
+) -> Result<GenerationStats, String> {
+    let started = Instant::now();
     let rendered = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({
@@ -118,6 +144,8 @@ fn generate(
         .next()
         .transpose()
         .map_err(|error| error.to_string())?;
+    let mut generated_tokens = 0_u64;
+    let mut ttft = None;
     for index in 0..max_tokens {
         let Some(token) = current.take() else { break };
         let next = if index + 1 < max_tokens {
@@ -133,6 +161,10 @@ fn generate(
         if eos.contains(&token_id) {
             break;
         }
+        generated_tokens += 1;
+        if ttft.is_none() {
+            ttft = Some(started.elapsed());
+        }
         if let Some(fragment) = decoder.step(token_id).map_err(|error| error.to_string())? {
             // SAFETY: callback and context originate from the synchronous C call,
             // which remains active until this worker reports completion.
@@ -140,7 +172,12 @@ fn generate(
         }
         current = next.transpose().map_err(|error| error.to_string())?;
     }
-    stream.synchronize().map_err(|error| error.to_string())
+    stream.synchronize().map_err(|error| error.to_string())?;
+    Ok(GenerationStats::new(
+        generated_tokens,
+        ttft,
+        started.elapsed(),
+    ))
 }
 
 fn worker_main(
@@ -242,11 +279,26 @@ pub extern "C" fn safemlx_model_generate(
     prompt: *const c_char,
     callback: Option<TextCallback>,
     context: *mut c_void,
+    generated_tokens_out: *mut u64,
+    ttft_seconds_out: *mut f64,
+    tokens_per_second_out: *mut f64,
     error_out: *mut *mut c_char,
 ) -> i32 {
     if !error_out.is_null() {
         // SAFETY: checked non-null writable out parameter.
         unsafe { *error_out = ptr::null_mut() };
+    }
+    if !generated_tokens_out.is_null() {
+        // SAFETY: checked non-null writable out parameter.
+        unsafe { *generated_tokens_out = 0 };
+    }
+    if !ttft_seconds_out.is_null() {
+        // SAFETY: checked non-null writable out parameter.
+        unsafe { *ttft_seconds_out = 0.0 };
+    }
+    if !tokens_per_second_out.is_null() {
+        // SAFETY: checked non-null writable out parameter.
+        unsafe { *tokens_per_second_out = 0.0 };
     }
     let result = (|| {
         if handle.is_null() {
@@ -271,7 +323,21 @@ pub extern "C" fn safemlx_model_generate(
             .map_err(|_| "model worker terminated during generation".to_string())?
     })();
     match result {
-        Ok(()) => 0,
+        Ok(stats) => {
+            if !generated_tokens_out.is_null() {
+                // SAFETY: checked non-null writable out parameter.
+                unsafe { *generated_tokens_out = stats.generated_tokens };
+            }
+            if !ttft_seconds_out.is_null() {
+                // SAFETY: checked non-null writable out parameter.
+                unsafe { *ttft_seconds_out = stats.ttft_seconds };
+            }
+            if !tokens_per_second_out.is_null() {
+                // SAFETY: checked non-null writable out parameter.
+                unsafe { *tokens_per_second_out = stats.tokens_per_second };
+            }
+            0
+        }
         Err(error) => {
             publish_error(error_out, error);
             1
@@ -299,5 +365,23 @@ pub extern "C" fn safemlx_string_free(value: *mut c_char) {
     if !value.is_null() {
         // SAFETY: ownership was created with `CString::into_raw` by this library.
         drop(unsafe { CString::from_raw(value) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GenerationStats;
+    use std::time::Duration;
+
+    #[test]
+    fn generation_stats_exclude_ttft_and_first_token_from_decode_rate() {
+        let stats = GenerationStats::new(
+            10,
+            Some(Duration::from_millis(500)),
+            Duration::from_millis(1400),
+        );
+        assert_eq!(stats.generated_tokens, 10);
+        assert_eq!(stats.ttft_seconds, 0.5);
+        assert!((stats.tokens_per_second - 10.0).abs() < f64::EPSILON);
     }
 }

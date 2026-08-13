@@ -44,6 +44,8 @@ Enter a dedicated MLX-format Hugging Face model repository. The downloader
 intentionally fetches model configuration, tokenizer assets, chat templates,
 and SafeTensors weights while excluding unrelated PyTorch weights and GGUF
 variants that may coexist in a repository. Public repositories need no token.
+After generation, the status line reports model load time, time to first token,
+and decode throughput in tokens per second.
 
 ## Architecture
 

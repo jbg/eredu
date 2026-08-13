@@ -54,6 +54,7 @@ final class ModelStore: ObservableObject {
     private let hub: HubClient
     private var engine: SafeMLXEngine?
     private var loadedSnapshotPath: String?
+    private var loadedModelLoadSeconds: TimeInterval?
     private static let recordsKey = "cachedModels.v1"
     private static let downloadedFileExtensions: Set<String> = [
         "json", "safetensors", "jinja", "model", "txt",
@@ -125,6 +126,7 @@ final class ModelStore: ObservableObject {
         if loadedSnapshotPath == snapshotPath {
             engine = nil
             loadedSnapshotPath = nil
+            loadedModelLoadSeconds = nil
         }
         if let repoID = Repo.ID(rawValue: model.repoID) {
             try? FileManager.default.removeItem(at: cache.repoDirectory(repo: repoID, kind: .model))
@@ -156,23 +158,40 @@ final class ModelStore: ObservableObject {
             let snapshotURL = snapshotURL(for: selectedModel)
             if engine == nil || loadedSnapshotPath != snapshotURL.path {
                 status = "Loading \(selectedModel.repoID)…"
+                let loadStartedAt = ProcessInfo.processInfo.systemUptime
                 engine = try await SafeMLXEngine.load(modelAt: snapshotURL)
+                loadedModelLoadSeconds = ProcessInfo.processInfo.systemUptime - loadStartedAt
                 loadedSnapshotPath = snapshotURL.path
             }
             status = "Generating…"
             guard let engine else { return }
-            try await engine.generate(prompt: submittedPrompt) { [weak self] fragment in
+            let stats = try await engine.generate(prompt: submittedPrompt) { [weak self] fragment in
                 Task { @MainActor in
                     self?.output.append(fragment)
                 }
             }
-            status = "Finished"
+            status = Self.finishedStatus(loadSeconds: loadedModelLoadSeconds, stats: stats)
         } catch {
             output = error.localizedDescription
             status = "Generation failed"
             engine = nil
             loadedSnapshotPath = nil
+            loadedModelLoadSeconds = nil
         }
+    }
+
+    private static func finishedStatus(
+        loadSeconds: TimeInterval?,
+        stats: SafeMLXGenerationStats
+    ) -> String {
+        let load = loadSeconds.map { String(format: "%.2fs", $0) } ?? "—"
+        let ttft = stats.generatedTokens > 0
+            ? String(format: "%.2fs", stats.timeToFirstToken)
+            : "—"
+        let throughput = stats.tokensPerSecond > 0
+            ? String(format: "%.1f tok/s", stats.tokensPerSecond)
+            : "—"
+        return "Finished • load \(load) • TTFT \(ttft) • \(throughput)"
     }
 
     private func downloadSnapshot(_ repoID: Repo.ID) async throws -> URL {

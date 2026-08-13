@@ -36,6 +36,12 @@ private func consumeNativeError(_ pointer: UnsafeMutablePointer<CChar>?) -> Stri
     return String(cString: pointer)
 }
 
+struct SafeMLXGenerationStats: Sendable {
+    let generatedTokens: UInt64
+    let timeToFirstToken: TimeInterval
+    let tokensPerSecond: Double
+}
+
 /// Swift owner for the opaque Rust worker. The worker keeps all MLX objects on
 /// one native thread even when Swift tasks resume on different executors.
 final class SafeMLXEngine: @unchecked Sendable {
@@ -70,23 +76,34 @@ final class SafeMLXEngine: @unchecked Sendable {
     func generate(
         prompt: String,
         onText: @escaping @Sendable (String) -> Void
-    ) async throws {
+    ) async throws -> SafeMLXGenerationStats {
         try await Task.detached(priority: .userInitiated) { [self] in
             let streamContext = Unmanaged.passRetained(StreamContext(receive: onText))
             defer { streamContext.release() }
             var nativeError: UnsafeMutablePointer<CChar>?
+            var generatedTokens: UInt64 = 0
+            var timeToFirstToken = 0.0
+            var tokensPerSecond = 0.0
             let status = prompt.withCString { promptPointer in
                 safemlx_model_generate(
                     handle,
                     promptPointer,
                     receiveText,
                     streamContext.toOpaque(),
+                    &generatedTokens,
+                    &timeToFirstToken,
+                    &tokensPerSecond,
                     &nativeError
                 )
             }
             guard status == 0 else {
                 throw SafeMLXEngineError.native(consumeNativeError(nativeError))
             }
+            return SafeMLXGenerationStats(
+                generatedTokens: generatedTokens,
+                timeToFirstToken: timeToFirstToken,
+                tokensPerSecond: tokensPerSecond
+            )
         }.value
     }
 }
