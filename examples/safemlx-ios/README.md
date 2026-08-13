@@ -57,6 +57,9 @@ variants that may coexist in a repository. Public repositories need no token.
 - Model weights are fully resident. This is the normal fast path for the small
   mobile models this demo targets.
 
-The Hugging Face cache is under the application's `Library/Caches` directory,
-so it is private to the app but may be purged by iOS under storage pressure.
-Deleting a model in the UI removes its repository cache.
+The Hugging Face cache is under the application's `Library/Application Support`
+directory and is excluded from device backups. The app discovers complete model
+snapshots from that cache at launch rather than relying on persisted absolute
+sandbox paths. Existing downloads made by earlier demo builds are migrated from
+`Library/Caches` on first launch. Deleting a model in the UI removes its
+repository cache.
