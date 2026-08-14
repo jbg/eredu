@@ -40,10 +40,11 @@ use crate::{
     },
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         packed_companion_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
+    runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -2473,57 +2474,62 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.embedding,
                     "model.embed_tokens",
                     store,
                     self.recipes_for_module(&self.embedding, "model.embed_tokens", store)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(EMBED_NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBED_NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.embed_norm,
                     "model.embed_norm",
                     store,
                     self.recipes_for_module(&self.embed_norm, "model.embed_norm", store)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.norm,
                     "model.norm",
                     store,
                     self.recipes_for_module(&self.norm, "model.norm", store)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             units.push(StaticUnitBindings::new(
                 HEAD_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.lm_head,
                     "lm_head",
                     store,
                     self.recipes_for_module(&self.lm_head, "lm_head", store)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(MTP_UNIT) {
             if let Some(mtp) = &self.mtp {
                 units.push(StaticUnitBindings::new(
                     MTP_UNIT,
-                    build_module_bindings_with_recipes(
+                    build_module_binding_plan_with_recipes(
                         mtp,
                         "mtp",
                         store,
                         self.recipes_for_module(mtp, "mtp", store)?,
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2531,12 +2537,13 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             if let Some(audio) = &self.audio {
                 units.push(StaticUnitBindings::new(
                     AUDIO_UNIT,
-                    build_module_bindings_with_recipes(
+                    build_module_binding_plan_with_recipes(
                         audio,
                         "audio",
                         store,
                         self.recipes_for_module(audio, "audio", store)?,
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2544,12 +2551,13 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             if let Some(norm) = &self.vision_norm {
                 units.push(StaticUnitBindings::new(
                     VISION_NORM_UNIT,
-                    build_module_bindings_with_recipes(
+                    build_module_binding_plan_with_recipes(
                         norm,
                         "visual.final_norm",
                         store,
                         self.recipes_for_module(norm, "visual.final_norm", store)?,
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -3465,15 +3473,16 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
         let recipes = self.recipes_for_module(layer, &prefix, store)?;
-        let bindings = if self.sparse_expert_cache
-            && self.execution_group_name(group)? == "text_decoder"
-        {
-            build_module_bindings_with_recipes_excluding(layer, &prefix, store, recipes, |name| {
-                name.starts_with("moe.experts.")
-            })?
-        } else {
-            build_module_bindings_with_recipes(layer, &prefix, store, recipes)?
-        };
+        let external_experts =
+            self.sparse_expert_cache && self.execution_group_name(group)? == "text_decoder";
+        let bindings = build_module_binding_plan_with_recipes_excluding(
+            layer,
+            &prefix,
+            store,
+            recipes,
+            |name| external_experts && name.starts_with("moe.experts."),
+        )?
+        .build_bindings(store)?;
         bindings
             .into_iter()
             .map(|binding| {
@@ -4018,11 +4027,19 @@ pub(crate) fn inkling_expert_catalog(
                     })?;
                 recipes.push(("down_proj_biases", selected(raw)));
             }
-            let mut bindings = Vec::new();
+            let mut planned = Vec::with_capacity(recipes.len());
             for (name, recipe) in recipes {
-                let bytes = recipe.infer(store)?.byte_len();
-                bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                let metadata = recipe.infer(store)?;
+                planned.push(PlannedBinding {
+                    target_name: name.into(),
+                    expected_shape: metadata.shape().to_vec(),
+                    expected_dtype: metadata.dtype().clone(),
+                    recipe,
+                });
             }
+            let bindings = BindingPlan::new(planned)
+                .and_then(|plan| plan.build_bindings(store))
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
                     Error::UnsupportedArchitecture("Inkling expert byte total overflowed".into())

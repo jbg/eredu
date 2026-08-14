@@ -26,6 +26,7 @@ trait Constraint<E> {
     fn key(&self) -> &str;
     fn aliases(&self) -> &[String];
     fn shape(&self) -> &[usize];
+    fn alternate_shapes(&self) -> &[Vec<usize>];
     fn requirement(&self) -> TensorRequirement;
     fn role(&self) -> TensorRole;
     fn accepts(&self, encoding: &E) -> bool;
@@ -45,6 +46,9 @@ impl Constraint<StoredDtype> for SafetensorsTensorConstraint {
     }
     fn shape(&self) -> &[usize] {
         &self.shape
+    }
+    fn alternate_shapes(&self) -> &[Vec<usize>] {
+        &[]
     }
     fn requirement(&self) -> TensorRequirement {
         self.requirement
@@ -80,6 +84,9 @@ impl Constraint<GgufType> for GgufTensorConstraint {
     }
     fn shape(&self) -> &[usize] {
         &self.shape
+    }
+    fn alternate_shapes(&self) -> &[Vec<usize>] {
+        &self.alternate_shapes
     }
     fn requirement(&self) -> TensorRequirement {
         self.requirement
@@ -184,6 +191,25 @@ pub(crate) fn validate_matching_gguf_encodings(
     pairs: impl IntoIterator<Item = (String, String)>,
     label: &str,
 ) -> Vec<CheckpointIssue> {
+    validate_gguf_encoding_pairs(checkpoint, pairs, label, false)
+}
+
+/// Validates paired encodings while permitting different dense floating
+/// storage types, which share the same dense runtime operation.
+pub(crate) fn validate_dense_or_matching_gguf_encodings(
+    checkpoint: &GgufCheckpoint,
+    pairs: impl IntoIterator<Item = (String, String)>,
+    label: &str,
+) -> Vec<CheckpointIssue> {
+    validate_gguf_encoding_pairs(checkpoint, pairs, label, true)
+}
+
+fn validate_gguf_encoding_pairs(
+    checkpoint: &GgufCheckpoint,
+    pairs: impl IntoIterator<Item = (String, String)>,
+    label: &str,
+    allow_mixed_dense: bool,
+) -> Vec<CheckpointIssue> {
     let catalog = checkpoint
         .catalog()
         .tensors()
@@ -197,19 +223,22 @@ pub(crate) fn validate_matching_gguf_encodings(
         ) else {
             continue;
         };
-        if gate.descriptor().ggml_type != up.descriptor().ggml_type
-            || gate.affine() != up.affine()
-            || gate.is_mxfp4() != up.is_mxfp4()
-        {
+        let gate_type = gate.descriptor().ggml_type;
+        let up_type = up.descriptor().ggml_type;
+        let dense = |encoding| matches!(encoding, GgufType::F32 | GgufType::F16 | GgufType::Bf16);
+        let compatible = (allow_mixed_dense && dense(gate_type) && dense(up_type))
+            || (gate_type == up_type
+                && gate.affine() == up.affine()
+                && gate.is_mxfp4() == up.is_mxfp4());
+        if !compatible {
             issues.push(CheckpointIssue {
                 kind: CheckpointIssueKind::CompanionMismatch,
                 detail: format!(
                     "{label} paired expert tensors {gate_name:?} and {up_name:?} use incompatible encodings {:?} and {:?}",
-                    gate.descriptor().ggml_type,
-                    up.descriptor().ggml_type
+                    gate_type, up_type
                 ),
                 tensor_name: Some(gate_name),
-                tensor_type_code: Some(gate.descriptor().ggml_type.code()),
+                tensor_type_code: Some(gate_type.code()),
                 metadata_key: None,
             });
         }
@@ -443,7 +472,7 @@ fn validate_constraint<E: std::fmt::Debug, T: Constraint<E>>(
     };
 
     if constraint.role() == TensorRole::Companion
-        && (actual.shape != constraint.shape() || !constraint.accepts(&actual.encoding))
+        && (!accepts_shape(constraint, &actual.shape) || !constraint.accepts(&actual.encoding))
     {
         issues.push(companion_issue(
             actual_key,
@@ -459,12 +488,33 @@ fn validate_constraint<E: std::fmt::Debug, T: Constraint<E>>(
         return;
     }
 
-    if actual.shape != constraint.shape() {
-        issues.push(shape_mismatch(
-            actual_key,
-            constraint.shape(),
-            &actual.shape,
-        ));
+    if !accepts_shape(constraint, &actual.shape) {
+        if constraint.alternate_shapes().is_empty() {
+            issues.push(shape_mismatch(
+                actual_key,
+                constraint.shape(),
+                &actual.shape,
+            ));
+        } else {
+            let expected = std::iter::once(constraint.shape())
+                .chain(
+                    constraint
+                        .alternate_shapes()
+                        .iter()
+                        .map(|shape| shape.as_slice()),
+                )
+                .collect::<Vec<_>>();
+            issues.push(CheckpointIssue {
+                kind: CheckpointIssueKind::ShapeMismatch,
+                detail: format!(
+                    "tensor {actual_key:?} expected one of shapes {expected:?}, got {:?}",
+                    actual.shape
+                ),
+                tensor_name: Some(actual_key.into()),
+                tensor_type_code: None,
+                metadata_key: None,
+            });
+        }
     }
     if !constraint.accepts(&actual.encoding) {
         issues.push(CheckpointIssue {
@@ -475,6 +525,14 @@ fn validate_constraint<E: std::fmt::Debug, T: Constraint<E>>(
             metadata_key: None,
         });
     }
+}
+
+fn accepts_shape<E, T: Constraint<E>>(constraint: &T, actual: &[usize]) -> bool {
+    actual == constraint.shape()
+        || constraint
+            .alternate_shapes()
+            .iter()
+            .any(|shape| shape == actual)
 }
 
 fn companion_issue(name: &str, detail: String) -> CheckpointIssue {
@@ -754,6 +812,12 @@ mod tests {
                 GgufTypeConstraint::Exact(GgufType::F32),
             )
             .optional(),
+            GgufTensorConstraint::required(
+                "flexible",
+                vec![2, 2],
+                GgufTypeConstraint::OperationClass(TensorOperation::Dense),
+            )
+            .with_alternate_shapes([vec![2, 1, 2]]),
         ];
         let plan =
             GgufCheckpointPlan::new("test", constraints, Vec::new(), CatalogPolicy::strict())
@@ -771,6 +835,13 @@ mod tests {
                 PhysicalMetadata {
                     shape: vec![2, 2],
                     encoding: GgufType::Q4K,
+                },
+            ),
+            (
+                "flexible".into(),
+                PhysicalMetadata {
+                    shape: vec![2, 1, 2],
+                    encoding: GgufType::F16,
                 },
             ),
         ]);

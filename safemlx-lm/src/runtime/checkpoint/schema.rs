@@ -163,6 +163,9 @@ pub(crate) struct GgufTensorConstraint {
     /// Alternative physical names for the same logical tensor.
     pub(crate) aliases: Vec<String>,
     pub(crate) shape: Vec<usize>,
+    /// Additional accepted physical shapes for encodings with equivalent
+    /// runtime semantics (for example, flattened and singleton-axis kernels).
+    pub(crate) alternate_shapes: Vec<Vec<usize>>,
     pub(crate) encoding: GgufTypeConstraint,
     pub(crate) requirement: TensorRequirement,
     pub(crate) role: TensorRole,
@@ -178,6 +181,7 @@ impl GgufTensorConstraint {
             key: key.into(),
             aliases: Vec::new(),
             shape: shape.into(),
+            alternate_shapes: Vec::new(),
             encoding,
             requirement: TensorRequirement::Required,
             role: TensorRole::Tensor,
@@ -194,6 +198,14 @@ impl GgufTensorConstraint {
         aliases: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.aliases = aliases.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub(crate) fn with_alternate_shapes(
+        mut self,
+        shapes: impl IntoIterator<Item = impl Into<Vec<usize>>>,
+    ) -> Self {
+        self.alternate_shapes = shapes.into_iter().map(Into::into).collect();
         self
     }
 
@@ -287,6 +299,7 @@ trait PhysicalConstraint {
     fn aliases(&self) -> &[String];
     fn aliases_mut(&mut self) -> &mut Vec<String>;
     fn shape(&self) -> &[usize];
+    fn alternate_shapes(&self) -> &[Vec<usize>];
     fn normalize(&mut self);
     fn has_empty_encoding_set(&self) -> bool;
 }
@@ -303,6 +316,9 @@ impl PhysicalConstraint for SafetensorsTensorConstraint {
     }
     fn shape(&self) -> &[usize] {
         &self.shape
+    }
+    fn alternate_shapes(&self) -> &[Vec<usize>] {
+        &[]
     }
     fn normalize(&mut self) {
         self.dtype.normalize();
@@ -325,8 +341,14 @@ impl PhysicalConstraint for GgufTensorConstraint {
     fn shape(&self) -> &[usize] {
         &self.shape
     }
+    fn alternate_shapes(&self) -> &[Vec<usize>] {
+        &self.alternate_shapes
+    }
     fn normalize(&mut self) {
         self.encoding.normalize();
+        self.alternate_shapes.sort();
+        self.alternate_shapes.dedup();
+        self.alternate_shapes.retain(|shape| shape != &self.shape);
     }
     fn has_empty_encoding_set(&self) -> bool {
         matches!(&self.encoding, GgufTypeConstraint::OneOf(types) if types.is_empty())
@@ -355,24 +377,31 @@ fn normalize_plan<T: PhysicalConstraint>(
             });
         }
         // Empty shapes are scalar tensors. A zero-sized dimension is invalid.
-        if tensor.shape().contains(&0) {
-            return Err(CheckpointPlanError::InvalidShape {
-                key: tensor.key().into(),
-                shape: tensor.shape().to_vec(),
-            });
+        let shapes = std::iter::once(tensor.shape()).chain(
+            tensor
+                .alternate_shapes()
+                .iter()
+                .map(|shape| shape.as_slice()),
+        );
+        for shape in shapes {
+            if shape.contains(&0) {
+                return Err(CheckpointPlanError::InvalidShape {
+                    key: tensor.key().into(),
+                    shape: shape.to_vec(),
+                });
+            }
+            shape
+                .iter()
+                .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
+                .ok_or_else(|| CheckpointPlanError::ShapeOverflow {
+                    key: tensor.key().into(),
+                })?;
         }
         if tensor.has_empty_encoding_set() {
             return Err(CheckpointPlanError::EmptyEncodingSet {
                 key: tensor.key().into(),
             });
         }
-        tensor
-            .shape()
-            .iter()
-            .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
-            .ok_or_else(|| CheckpointPlanError::ShapeOverflow {
-                key: tensor.key().into(),
-            })?;
         Ok(())
     };
     let physical_keys = |tensor: &T| {
@@ -589,6 +618,20 @@ mod tests {
                 CatalogPolicy::strict(),
             ),
             Err(CheckpointPlanError::ShapeOverflow { .. })
+        ));
+        assert!(matches!(
+            GgufCheckpointPlan::new(
+                "invalid alternate",
+                vec![GgufTensorConstraint::required(
+                    "a",
+                    vec![1],
+                    GgufTypeConstraint::Exact(GgufType::F32),
+                )
+                .with_alternate_shapes([vec![1, 0]])],
+                Vec::new(),
+                CatalogPolicy::strict(),
+            ),
+            Err(CheckpointPlanError::InvalidShape { .. })
         ));
         assert!(matches!(
             SafetensorsCheckpointPlan::new(
