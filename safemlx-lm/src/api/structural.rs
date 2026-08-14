@@ -1,6 +1,6 @@
 //! Pure checkpoint-structure plans shared by inspection and high-level loading.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
@@ -17,7 +17,7 @@ use crate::{
         kimi_linear::checkpoint as kimi_linear_checkpoint,
         lfm2::checkpoint as lfm2_checkpoint,
         llama::checkpoint as llama_checkpoint,
-        moshi::personaplex,
+        moshi::personaplex_checkpoint,
         muse_glimmer::checkpoint as muse_glimmer_checkpoint,
         nemotron_h::checkpoint as nemotron_h_checkpoint,
         qwen::{
@@ -26,14 +26,7 @@ use crate::{
         },
     },
     error::Error,
-    runtime::checkpoint::{
-        schema::{
-            CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-            StoredDtypeConstraint,
-        },
-        store::{SafetensorsWeightStore, StoredDtype, WeightStore},
-        validation as checkpoint_validation,
-    },
+    runtime::checkpoint::store::SafetensorsWeightStore,
 };
 
 pub(crate) use crate::runtime::checkpoint::contract::{
@@ -120,7 +113,7 @@ pub(crate) fn validate_safetensors(
             ModelKind::Llama => llama_checkpoint::validate_safetensors(config, store),
             ModelKind::MuseGlimmer => muse_glimmer_checkpoint::validate_safetensors(config, store),
             ModelKind::NemotronH => nemotron_h_checkpoint::validate_safetensors(config, store),
-            ModelKind::PersonaPlex => validate_personaplex_safetensors(config, store),
+            ModelKind::PersonaPlex => personaplex_checkpoint::validate_safetensors(config, store),
             ModelKind::Qwen2 => validate_dense_qwen_safetensors(config, store),
             ModelKind::Qwen3 => validate_dense_qwen_safetensors(config, store),
             ModelKind::Qwen3Next => validate_qwen3_next_safetensors(config, store, options),
@@ -262,16 +255,6 @@ fn validate_gpt_oss_safetensors(
     gpt_oss_checkpoint::validate_safetensors(config, store)
 }
 
-fn append_structural_issues(validation: StructuralValidation, issues: &mut Vec<StructuralIssue>) {
-    match validation {
-        StructuralValidation::Exact => {}
-        StructuralValidation::Invalid(found) => issues.extend(found),
-        StructuralValidation::Unverified(_) => {
-            unreachable!("pure tensor plan is always exact or invalid")
-        }
-    }
-}
-
 fn validate_qwen3_next_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
@@ -303,355 +286,6 @@ fn validate_dense_qwen_safetensors(
     dense_qwen_checkpoint::validate_safetensors(config, store)
 }
 
-fn validate_personaplex_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> StructuralValidation {
-    let metadata = match personaplex::model_metadata_from_config_value(config) {
-        Ok(metadata) => metadata,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let mut args = personaplex::model_args_7b_v1();
-    args.quantization = metadata.quantization;
-    if args.num_layers as usize > store.keys().len()
-        || args.depformer_num_layers as usize > store.keys().len()
-    {
-        return invalid_geometry(format!(
-            "configured PersonaPlex temporal/depth layer counts {}/{} exceed the entire {}-tensor checkpoint catalog",
-            args.num_layers,
-            args.depformer_num_layers,
-            store.keys().len()
-        ));
-    }
-
-    let quantization = args.quantization;
-    let dim = args.dim as usize;
-    let depth_dim = args.depformer_dim as usize;
-    let temporal_hidden = moshi_mlp_hidden(dim, args.dim_feedforward.map(|value| value as usize));
-    let depth_hidden = moshi_mlp_hidden(
-        depth_dim,
-        args.depformer_dim_feedforward.map(|value| value as usize),
-    );
-    let mut allowed = BTreeSet::new();
-    let mut issues = Vec::new();
-
-    for (name, shape) in [
-        (
-            "text_emb.weight".to_string(),
-            vec![args.text_card as usize + 1, dim],
-        ),
-        (
-            "text_linear.weight".to_string(),
-            vec![args.text_card as usize, dim],
-        ),
-    ] {
-        validate_personaplex_matrix(
-            store,
-            std::slice::from_ref(&name),
-            name.trim_end_matches(".weight"),
-            &shape,
-            quantization,
-            &mut allowed,
-            &mut issues,
-        );
-    }
-    validate_personaplex_norm(store, "out_norm.alpha", dim, &mut allowed, &mut issues);
-    for codebook in 0..args.n_q as usize {
-        let name = format!("emb.{codebook}.weight");
-        validate_personaplex_matrix(
-            store,
-            std::slice::from_ref(&name),
-            name.trim_end_matches(".weight"),
-            &[args.card as usize + 1, dim],
-            quantization,
-            &mut allowed,
-            &mut issues,
-        );
-    }
-
-    for layer in 0..args.num_layers as usize {
-        let prefix = format!("transformer.layers.{layer}");
-        for norm in ["norm1", "norm2"] {
-            validate_personaplex_norm(
-                store,
-                &format!("{prefix}.{norm}.alpha"),
-                dim,
-                &mut allowed,
-                &mut issues,
-            );
-        }
-        let in_proj = [
-            format!("{prefix}.self_attn.in_proj_weight"),
-            format!("{prefix}.self_attn.in_proj.weight"),
-        ];
-        validate_personaplex_matrix(
-            store,
-            &in_proj,
-            &format!("{prefix}.self_attn.in_proj"),
-            &[3 * dim, dim],
-            quantization,
-            &mut allowed,
-            &mut issues,
-        );
-        for (name, shape) in [
-            (
-                format!("{prefix}.self_attn.out_proj.weight"),
-                vec![dim, dim],
-            ),
-            (
-                format!("{prefix}.gating.linear_in.weight"),
-                vec![2 * temporal_hidden, dim],
-            ),
-            (
-                format!("{prefix}.gating.linear_out.weight"),
-                vec![dim, temporal_hidden],
-            ),
-        ] {
-            validate_personaplex_matrix(
-                store,
-                std::slice::from_ref(&name),
-                name.trim_end_matches(".weight"),
-                &shape,
-                quantization,
-                &mut allowed,
-                &mut issues,
-            );
-        }
-    }
-
-    for slice in 0..args.dep_q as usize {
-        let embedding = if slice == 0 {
-            "depformer_text_emb.weight".to_string()
-        } else {
-            format!("depformer_emb.{}.weight", slice - 1)
-        };
-        let input_vocab = if slice == 0 {
-            args.text_card as usize + 1
-        } else {
-            args.card as usize + 1
-        };
-        validate_personaplex_matrix(
-            store,
-            std::slice::from_ref(&embedding),
-            embedding.trim_end_matches(".weight"),
-            &[input_vocab, depth_dim],
-            quantization,
-            &mut allowed,
-            &mut issues,
-        );
-        for (name, shape) in [
-            (format!("depformer_in.{slice}.weight"), vec![depth_dim, dim]),
-            (
-                format!("linears.{slice}.weight"),
-                vec![args.card as usize, depth_dim],
-            ),
-        ] {
-            validate_personaplex_matrix(
-                store,
-                std::slice::from_ref(&name),
-                name.trim_end_matches(".weight"),
-                &shape,
-                quantization,
-                &mut allowed,
-                &mut issues,
-            );
-        }
-    }
-
-    let depth_slices = args.dep_q as usize;
-    for layer in 0..args.depformer_num_layers as usize {
-        let prefix = format!("depformer.layers.{layer}");
-        for norm in ["norm1", "norm2"] {
-            validate_personaplex_norm(
-                store,
-                &format!("{prefix}.{norm}.alpha"),
-                depth_dim,
-                &mut allowed,
-                &mut issues,
-            );
-        }
-        let in_proj = [
-            format!("{prefix}.self_attn.in_proj_weight"),
-            format!("{prefix}.self_attn.in_proj.weight"),
-        ];
-        validate_personaplex_matrix(
-            store,
-            &in_proj,
-            &format!("{prefix}.self_attn.in_proj"),
-            &[depth_slices * 3 * depth_dim, depth_dim],
-            quantization,
-            &mut allowed,
-            &mut issues,
-        );
-        let out_proj = format!("{prefix}.self_attn.out_proj.weight");
-        validate_personaplex_matrix(
-            store,
-            std::slice::from_ref(&out_proj),
-            out_proj.trim_end_matches(".weight"),
-            &[depth_slices * depth_dim, depth_dim],
-            quantization,
-            &mut allowed,
-            &mut issues,
-        );
-        for slice in 0..depth_slices {
-            for (name, shape) in [
-                (
-                    format!("{prefix}.gating.{slice}.linear_in.weight"),
-                    vec![2 * depth_hidden, depth_dim],
-                ),
-                (
-                    format!("{prefix}.gating.{slice}.linear_out.weight"),
-                    vec![depth_dim, depth_hidden],
-                ),
-            ] {
-                validate_personaplex_matrix(
-                    store,
-                    std::slice::from_ref(&name),
-                    name.trim_end_matches(".weight"),
-                    &shape,
-                    quantization,
-                    &mut allowed,
-                    &mut issues,
-                );
-            }
-        }
-    }
-
-    for key in store.keys() {
-        if !allowed.contains(&key) {
-            issues.push(unexpected_layout(
-                &key,
-                "PersonaPlex released PyTorch SafeTensors",
-            ));
-        }
-    }
-    finish(issues)
-}
-
-fn moshi_mlp_hidden(dim: usize, feed_forward: Option<usize>) -> usize {
-    let feed_forward = feed_forward.unwrap_or(4 * dim);
-    if feed_forward == 4 * dim {
-        11 * dim / 4
-    } else {
-        2 * feed_forward / 3
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_personaplex_matrix(
-    store: &SafetensorsWeightStore,
-    aliases: &[String],
-    companion_prefix: &str,
-    shape: &[usize],
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
-    allowed: &mut BTreeSet<String>,
-    issues: &mut Vec<StructuralIssue>,
-) {
-    allowed.extend(aliases.iter().cloned());
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
-    let present = aliases
-        .iter()
-        .filter(|name| keys.contains(*name))
-        .collect::<Vec<_>>();
-    if present.len() > 1 {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: format!(
-                "PersonaPlex checkpoint contains multiple aliases for {:?}: {present:?}",
-                aliases[0]
-            ),
-            tensor_name: Some(present[1].clone()),
-            tensor_type_code: None,
-            metadata_key: None,
-        });
-    }
-    let Some(name) = present.first().map(|name| name.as_str()) else {
-        issues.push(missing(&aliases[0]));
-        return;
-    };
-    let Some(quantization) = quantization else {
-        validate_safetensor(store, name, shape, false, issues);
-        return;
-    };
-
-    let input = *shape.last().expect("PersonaPlex matrix shape");
-    let group_size = quantization.group_size() as usize;
-    let bits = quantization.bits() as usize;
-    if !input.is_multiple_of(group_size)
-        || !input.is_multiple_of(32)
-        || !input.saturating_mul(bits).is_multiple_of(32)
-    {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::QuantizationCompanionMismatch,
-            detail: format!(
-                "quantized PersonaPlex tensor {name:?} input dimension {input} is incompatible with group size {group_size} and {bits}-bit packing"
-            ),
-            tensor_name: Some(name.into()),
-            tensor_type_code: None,
-            metadata_key: Some("quantization".into()),
-        });
-        return;
-    }
-    let mut packed = shape.to_vec();
-    *packed.last_mut().expect("PersonaPlex matrix shape") = input * bits / 32;
-    validate_safetensor(store, name, &packed, true, issues);
-    let mut companions = shape.to_vec();
-    *companions.last_mut().expect("PersonaPlex matrix shape") = input / group_size;
-    let scales = format!("{companion_prefix}.scales");
-    allowed.insert(scales.clone());
-    validate_quantization_companion(store, &scales, &companions, issues);
-    if quantization.has_biases() {
-        let biases = format!("{companion_prefix}.biases");
-        allowed.insert(biases.clone());
-        validate_quantization_companion(store, &biases, &companions, issues);
-    }
-}
-
-fn validate_personaplex_norm(
-    store: &SafetensorsWeightStore,
-    name: &str,
-    elements: usize,
-    allowed: &mut BTreeSet<String>,
-    issues: &mut Vec<StructuralIssue>,
-) {
-    allowed.insert(name.into());
-    let metadata = match store.metadata(name) {
-        Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
-            issues.push(missing(name));
-            return;
-        }
-        Err(error) => {
-            issues.push(layout(name, error.to_string()));
-            return;
-        }
-    };
-    if metadata.shape.iter().product::<usize>() != elements {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::ShapeMismatch,
-            detail: format!(
-                "PersonaPlex norm tensor {name:?} must contain {elements} elements for loader reshape, got shape {:?}",
-                metadata.shape
-            ),
-            tensor_name: Some(name.into()),
-            tensor_type_code: None,
-            metadata_key: None,
-        });
-    }
-    if !is_float_dtype(&metadata.stored_dtype) {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::UnsupportedEncoding,
-            detail: format!(
-                "tensor {name:?} uses unsupported SafeTensors dtype {:?}",
-                metadata.stored_dtype
-            ),
-            tensor_name: Some(name.into()),
-            tensor_type_code: None,
-            metadata_key: None,
-        });
-    }
-}
-
 fn validate_qwen3_vl_safetensors(
     kind: ModelKind,
     config: &Value,
@@ -664,64 +298,6 @@ fn validate_qwen3_vl_safetensors(
         store,
         !options.weight_residency.is_fully_resident(),
     )
-}
-
-fn validate_safetensor(
-    store: &SafetensorsWeightStore,
-    name: &str,
-    shape: &[usize],
-    packed: bool,
-    issues: &mut Vec<StructuralIssue>,
-) {
-    let dtype = if packed {
-        StoredDtypeConstraint::Exact(StoredDtype::U32)
-    } else {
-        StoredDtypeConstraint::Floating
-    };
-    let plan = SafetensorsCheckpointPlan::new(
-        format!("SafeTensors tensor {name}"),
-        vec![SafetensorsTensorConstraint::required(
-            name,
-            shape.to_vec(),
-            dtype,
-        )],
-        Vec::new(),
-        CatalogPolicy::non_strict(),
-    )
-    .expect("legacy structural tensor constraints are valid");
-    append_structural_issues(
-        checkpoint_validation::validate_safetensors_plan(store, &plan),
-        issues,
-    );
-}
-
-fn validate_quantization_companion(
-    store: &SafetensorsWeightStore,
-    name: &str,
-    shape: &[usize],
-    issues: &mut Vec<StructuralIssue>,
-) {
-    let plan = SafetensorsCheckpointPlan::new(
-        format!("SafeTensors companion {name}"),
-        vec![SafetensorsTensorConstraint::required(
-            name,
-            shape.to_vec(),
-            StoredDtypeConstraint::OneOf(vec![
-                StoredDtype::F16,
-                StoredDtype::BF16,
-                StoredDtype::F32,
-                StoredDtype::U8,
-            ]),
-        )
-        .companion()],
-        Vec::new(),
-        CatalogPolicy::non_strict(),
-    )
-    .expect("legacy companion constraints are valid");
-    append_structural_issues(
-        checkpoint_validation::validate_safetensors_plan(store, &plan),
-        issues,
-    );
 }
 
 fn validate_deepseek2_gguf(
@@ -874,21 +450,6 @@ fn validate_qwen35_gguf(
     )
 }
 
-fn is_float_dtype(dtype: &StoredDtype) -> bool {
-    matches!(
-        dtype,
-        StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32
-    )
-}
-
-fn finish(issues: Vec<StructuralIssue>) -> StructuralValidation {
-    if issues.is_empty() {
-        StructuralValidation::Exact
-    } else {
-        StructuralValidation::Invalid(issues)
-    }
-}
-
 fn invalid_geometry(detail: String) -> StructuralValidation {
     StructuralValidation::Invalid(vec![StructuralIssue {
         kind: StructuralIssueKind::InvalidGeometry,
@@ -899,43 +460,19 @@ fn invalid_geometry(detail: String) -> StructuralValidation {
     }])
 }
 
-fn missing(name: &str) -> StructuralIssue {
-    StructuralIssue {
-        kind: StructuralIssueKind::MissingTensor,
-        detail: format!("checkpoint is missing required tensor {name:?}"),
-        tensor_name: Some(name.into()),
-        tensor_type_code: None,
-        metadata_key: None,
-    }
-}
-
-fn layout(name: &str, detail: String) -> StructuralIssue {
-    StructuralIssue {
-        kind: StructuralIssueKind::ConflictingLayout,
-        detail: format!("could not validate tensor {name:?}: {detail}"),
-        tensor_name: Some(name.into()),
-        tensor_type_code: None,
-        metadata_key: None,
-    }
-}
-
-fn unexpected_layout(name: &str, loader_name: &str) -> StructuralIssue {
-    StructuralIssue {
-        kind: StructuralIssueKind::UnexpectedTensor,
-        detail: format!("{loader_name} catalog contains unexpected tensor {name:?}"),
-        tensor_name: Some(name.into()),
-        tensor_type_code: None,
-        metadata_key: None,
-    }
-}
-
 #[cfg(test)]
 mod admission_policy_tests {
     use super::*;
 
     #[test]
     fn non_strict_catalog_ignores_only_unexpected_tensors() {
-        let unexpected = unexpected_layout("unrelated.weight", "test");
+        let unexpected = StructuralIssue {
+            kind: StructuralIssueKind::UnexpectedTensor,
+            detail: "test catalog contains unexpected tensor \"unrelated.weight\"".into(),
+            tensor_name: Some("unrelated.weight".into()),
+            tensor_type_code: None,
+            metadata_key: None,
+        };
         let malformed =
             crate::runtime::checkpoint::contract::shape_mismatch("model.weight", &[2, 2], &[1]);
         assert_eq!(
@@ -957,6 +494,8 @@ mod admission_policy_tests {
 
 #[cfg(test)]
 mod dense_qwen_tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::architectures::qwen::dense;
 

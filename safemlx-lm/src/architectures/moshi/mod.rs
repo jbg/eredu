@@ -6,3 +6,5 @@ pub mod layerwise;
 pub mod model;
 /// PersonaPlex specialization.
 pub mod personaplex;
+/// Architecture-owned PersonaPlex checkpoint contracts.
+pub(crate) mod personaplex_checkpoint;

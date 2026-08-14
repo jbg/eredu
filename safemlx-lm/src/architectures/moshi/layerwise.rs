@@ -20,7 +20,7 @@ use crate::{
     runtime::cache::KeyValueCache,
     runtime::checkpoint::artifact::LoadedArtifactIdentity,
     runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
+        build_module_binding_plan_with_recipes, build_module_bindings, populate_module_from_lease,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{TensorSelection, WeightStore},
@@ -1934,9 +1934,10 @@ fn pytorch_static_bindings(
         };
         recipes.insert(name.to_string(), source_full(source));
     }
-    Ok(build_module_bindings_with_recipes(
-        module, "", store, recipes,
-    )?)
+    Ok(
+        build_module_binding_plan_with_recipes(module, "", store, recipes)?
+            .build_bindings(store)?,
+    )
 }
 
 fn pytorch_layer_bindings(
@@ -1956,9 +1957,10 @@ fn pytorch_layer_bindings(
         };
         recipes.insert(name.to_string(), recipe);
     }
-    Ok(build_module_bindings_with_recipes(
-        module, "", store, recipes,
-    )?)
+    Ok(
+        build_module_binding_plan_with_recipes(module, "", store, recipes)?
+            .build_bindings(store)?,
+    )
 }
 
 fn temporal_recipe(
