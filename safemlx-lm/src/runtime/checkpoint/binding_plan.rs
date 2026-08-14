@@ -63,7 +63,9 @@ impl BindingPlan {
             if binding.target_name.trim().is_empty() {
                 return Err(BindingPlanError::EmptyTarget);
             }
-            if binding.expected_shape.is_empty() || binding.expected_shape.contains(&0) {
+            // An empty shape is a scalar. Zero-sized tensor dimensions remain
+            // invalid because residency bindings cannot carry zero bytes.
+            if binding.expected_shape.contains(&0) {
                 return Err(BindingPlanError::InvalidTargetShape {
                     target: binding.target_name.clone(),
                     shape: binding.expected_shape.clone(),
@@ -157,10 +159,15 @@ impl BindingPlan {
                     actual: metadata.dtype().clone(),
                 });
             }
-            output.push(
-                WeightBinding::from_recipe(&planned.target_name, recipe, metadata.byte_len())?
-                    .with_logical_target(&planned.target_name)?,
-            );
+            let binding = match recipe {
+                DerivedWeightRecipe::Source { key, selection } => {
+                    WeightBinding::new(&planned.target_name, key, selection, metadata.byte_len())?
+                }
+                recipe => {
+                    WeightBinding::from_recipe(&planned.target_name, recipe, metadata.byte_len())?
+                }
+            };
+            output.push(binding.with_logical_target(&planned.target_name)?);
         }
         Ok(output)
     }
@@ -358,7 +365,13 @@ mod tests {
         assert_eq!(plan.source_keys(), ["source"]);
         let bindings = plan.build_bindings(&store).unwrap();
         assert_eq!(bindings[0].name(), "target");
-        assert!(bindings[0].recipe().is_some());
+        // Direct tensors are represented as source recipes in the plan, but
+        // retain the direct residency binding representation after validation.
+        assert!(matches!(
+            plan.bindings()[0].recipe,
+            DerivedWeightRecipe::Source { .. }
+        ));
+        assert!(bindings[0].recipe().is_none());
     }
 
     #[test]
@@ -479,7 +492,27 @@ mod tests {
 
     #[test]
     fn invalid_recipe_geometry_and_target_overflow_fail_before_materialization() {
-        let store = MetadataStore::new([("matrix", vec![2, 2], StoredDtype::F32)]);
+        let store = MetadataStore::new([
+            ("matrix", vec![2, 2], StoredDtype::F32),
+            ("scalar", vec![], StoredDtype::F32),
+        ]);
+        let scalar = BindingPlan::new(vec![PlannedBinding::direct(
+            "scalar_target",
+            "scalar",
+            vec![],
+            RecipeDtype::F32,
+        )])
+        .unwrap();
+        assert!(scalar.build_bindings(&store).is_ok());
+        assert!(matches!(
+            BindingPlan::new(vec![PlannedBinding::direct(
+                "zero",
+                "matrix",
+                vec![2, 0],
+                RecipeDtype::F32,
+            )]),
+            Err(BindingPlanError::InvalidTargetShape { .. })
+        ));
         let invalid = DerivedWeightRecipe::Reshape {
             input: Box::new(DerivedWeightRecipe::source("matrix", TensorSelection::Full)),
             shape: vec![3],

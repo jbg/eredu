@@ -4,18 +4,21 @@
 //! quantization exclusions live here. The runtime checkpoint engine remains
 //! architecture-neutral and only evaluates the resulting declarative plan.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
+use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
 
 use super::{qwen3_5 as qwen35, qwen3_next};
+use crate::architectures::qwen::vl::model as qwen3_vl;
 use crate::runtime::{
     attention::AttentionPolicy,
     checkpoint::{
         contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
         quantization::WeightQuantization,
         schema::{
-            AlternativeLayoutGroup, CatalogPolicy, LayoutVariant, SafetensorsCheckpointPlan,
+            AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+            GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
             SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
         },
         store::{SafetensorsWeightStore, StoredDtype, WeightStore},
@@ -981,6 +984,615 @@ fn fp8_scale_name(name: &str) -> String {
         || format!("{name}_scale_inv"),
         |prefix| format!("{prefix}.weight_scale_inv"),
     )
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum GgufVariant {
+    Qwen35,
+    Qwen35Moe,
+    Qwen3Next,
+}
+
+impl GgufVariant {
+    const fn metadata_name(self) -> &'static str {
+        match self {
+            Self::Qwen35 => "qwen35",
+            Self::Qwen35Moe => "qwen35moe",
+            Self::Qwen3Next => "qwen3next",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Qwen3Next => "Qwen3-Next",
+            Self::Qwen35 | Self::Qwen35Moe => "Qwen3.5",
+        }
+    }
+
+    const fn is_next(self) -> bool {
+        matches!(self, Self::Qwen3Next)
+    }
+}
+
+pub(crate) fn validate_gguf(
+    variant: GgufVariant,
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    expert_cache: bool,
+) -> CheckpointValidation {
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(qwen35::qwen35_translate_gguf_weight_name)
+    {
+        return CheckpointValidation::Invalid(vec![conflict(error.to_string())]);
+    }
+    let args = match qwen35::qwen35_args_from_gguf_catalog(
+        checkpoint,
+        metadata,
+        variant.metadata_name(),
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if !args.is_moe() && expert_cache {
+        return invalid_geometry(format!(
+            "sparse expert caching requires a {} MoE GGUF checkpoint",
+            variant.label()
+        ));
+    }
+    let plan = match gguf_plan(&args, checkpoint, variant) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    let mut issues = Vec::new();
+    append_issues(
+        validation::validate_gguf_plan(checkpoint, &plan),
+        &mut issues,
+    );
+    if args.is_moe() {
+        issues.extend(validation::validate_matching_gguf_encodings(
+            checkpoint,
+            (0..args.num_hidden_layers as usize).map(|layer| {
+                (
+                    format!("blk.{layer}.ffn_gate_exps.weight"),
+                    format!("blk.{layer}.ffn_up_exps.weight"),
+                )
+            }),
+            &format!("{} MoE", variant.label()),
+        ));
+    }
+    validate_gguf_affine_geometry(&args, checkpoint, variant, &mut issues);
+    CheckpointValidation::from_issues(issues)
+}
+
+pub(crate) fn validate_projector_gguf(
+    model_checkpoint: &GgufCheckpoint,
+    model_metadata: &HashMap<String, GgufMetadataValue>,
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> CheckpointValidation {
+    let architecture = match model_metadata.get("general.architecture") {
+        Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
+        Some(_) => {
+            return invalid_geometry(
+                "GGUF metadata key \"general.architecture\" has the wrong type".into(),
+            )
+        }
+        None => {
+            return invalid_geometry(
+                "GGUF metadata is missing required key \"general.architecture\"".into(),
+            )
+        }
+    };
+    if !matches!(architecture.as_str(), "qwen35" | "qwen35moe") {
+        return invalid_geometry(format!(
+            "Qwen3.5 projector requires qwen35 or qwen35moe text, got {architecture:?}"
+        ));
+    }
+    let text = match qwen35::qwen35_args_from_gguf_catalog(
+        model_checkpoint,
+        model_metadata,
+        &architecture,
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let vision =
+        match qwen3_vl::qwen_vision_config_from_gguf_catalog(checkpoint, metadata, "Qwen3.5") {
+            Ok(vision) => vision,
+            Err(error) => return invalid_geometry(error.to_string()),
+        };
+    if vision.out_hidden_size != text.hidden_size {
+        return invalid_geometry(format!(
+            "Qwen3.5 projector output {} does not match language hidden size {}",
+            vision.out_hidden_size, text.hidden_size
+        ));
+    }
+    if vision.deepstack_layer_count() != 0 {
+        return invalid_geometry(format!(
+            "Qwen3.5 projector declares {} DeepStack outputs; the decoder accepts only the primary merger output",
+            vision.deepstack_layer_count()
+        ));
+    }
+    let deepstack = vision.deepstack_layers();
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(|name| qwen3_vl::translate_qwen3_vl_mmproj_name(name, &deepstack))
+    {
+        return CheckpointValidation::Invalid(vec![conflict(error.to_string())]);
+    }
+    let plan = match projector_gguf_plan(&vision, text.hidden_size) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    validation::validate_gguf_plan(checkpoint, &plan)
+}
+
+fn projector_gguf_plan(
+    vision: &qwen35::VisionConfig,
+    text_hidden_size: i32,
+) -> Result<GgufCheckpointPlan, String> {
+    let hidden = dimension(vision.hidden_size, "vision hidden_size")?;
+    let intermediate = dimension(vision.intermediate_size, "vision intermediate_size")?;
+    let text_hidden = dimension(text_hidden_size, "text hidden size")?;
+    let patch = dimension(vision.patch_size, "vision patch size")?;
+    let merge = dimension(vision.spatial_merge_size, "vision spatial merge size")?;
+    let merger_hidden = checked_mul(
+        hidden,
+        checked_mul(merge, merge, "vision merge area")?,
+        "vision merger width",
+    )?;
+    let dense = |name: String, shape: Vec<usize>| gguf_tensor(name, shape, TensorOperation::Dense);
+    let matrix =
+        |name: String, shape: Vec<usize>| gguf_tensor(name, shape, TensorOperation::Matrix);
+    let mut tensors = vec![
+        dense(
+            "v.position_embd.weight".into(),
+            vec![
+                dimension(vision.num_position_embeddings, "vision positions")?,
+                hidden,
+            ],
+        ),
+        dense("v.patch_embd.weight".into(), vec![hidden, 3, patch, patch]),
+        dense(
+            "v.patch_embd.weight.1".into(),
+            vec![hidden, 3, patch, patch],
+        ),
+        dense("v.patch_embd.bias".into(), vec![hidden]),
+    ];
+    for layer in 0..vision.layer_count() {
+        let prefix = format!("v.blk.{layer}");
+        tensors.extend([
+            dense(format!("{prefix}.ln1.weight"), vec![hidden]),
+            dense(format!("{prefix}.ln1.bias"), vec![hidden]),
+            matrix(
+                format!("{prefix}.attn_qkv.weight"),
+                vec![checked_mul(3, hidden, "vision QKV width")?, hidden],
+            ),
+            dense(
+                format!("{prefix}.attn_qkv.bias"),
+                vec![checked_mul(3, hidden, "vision QKV bias")?],
+            ),
+            matrix(format!("{prefix}.attn_out.weight"), vec![hidden, hidden]),
+            dense(format!("{prefix}.attn_out.bias"), vec![hidden]),
+            dense(format!("{prefix}.ln2.weight"), vec![hidden]),
+            dense(format!("{prefix}.ln2.bias"), vec![hidden]),
+            matrix(
+                format!("{prefix}.ffn_up.weight"),
+                vec![intermediate, hidden],
+            ),
+            dense(format!("{prefix}.ffn_up.bias"), vec![intermediate]),
+            matrix(
+                format!("{prefix}.ffn_down.weight"),
+                vec![hidden, intermediate],
+            ),
+            dense(format!("{prefix}.ffn_down.bias"), vec![hidden]),
+        ]);
+    }
+    tensors.extend([
+        dense("v.post_ln.weight".into(), vec![hidden]),
+        dense("v.post_ln.bias".into(), vec![hidden]),
+        matrix("mm.0.weight".into(), vec![merger_hidden, merger_hidden]),
+        dense("mm.0.bias".into(), vec![merger_hidden]),
+        matrix("mm.2.weight".into(), vec![text_hidden, merger_hidden]),
+        dense("mm.2.bias".into(), vec![text_hidden]),
+    ]);
+    GgufCheckpointPlan::new(
+        "Qwen3.5 projector GGUF",
+        tensors,
+        Vec::new(),
+        CatalogPolicy::strict(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) fn gguf_plan(
+    args: &qwen35::ModelArgs,
+    checkpoint: &GgufCheckpoint,
+    variant: GgufVariant,
+) -> Result<GgufCheckpointPlan, String> {
+    let hidden = dimension(args.hidden_size, "hidden_size")?;
+    let vocab = dimension(args.vocab_size, "vocab_size")?;
+    let query = checked_mul(
+        dimension(args.num_attention_heads, "num_attention_heads")?,
+        dimension(args.head_dim, "head_dim")?,
+        "query width",
+    )?;
+    let key_value = checked_mul(
+        dimension(args.num_key_value_heads, "num_key_value_heads")?,
+        dimension(args.head_dim, "head_dim")?,
+        "key/value width",
+    )?;
+    let key_dim = checked_mul(
+        dimension(args.linear_num_key_heads, "linear_num_key_heads")?,
+        dimension(args.linear_key_head_dim, "linear_key_head_dim")?,
+        "linear key width",
+    )?;
+    let value_dim = checked_mul(
+        dimension(args.linear_num_value_heads, "linear_num_value_heads")?,
+        dimension(args.linear_value_head_dim, "linear_value_head_dim")?,
+        "linear value width",
+    )?;
+    let value_heads = dimension(args.linear_num_value_heads, "linear_num_value_heads")?;
+    let mut tensors = vec![
+        gguf_tensor(
+            "token_embd.weight",
+            vec![vocab, hidden],
+            TensorOperation::Matrix,
+        ),
+        gguf_tensor("output_norm.weight", vec![hidden], TensorOperation::Vector),
+    ];
+    if !args.tie_word_embeddings {
+        tensors.push(gguf_tensor(
+            "output.weight",
+            vec![vocab, hidden],
+            TensorOperation::Matrix,
+        ));
+    }
+    for layer in 0..dimension(args.num_hidden_layers, "num_hidden_layers")? {
+        let gguf = format!("blk.{layer}");
+        tensors.extend([
+            gguf_tensor(
+                format!("{gguf}.attn_norm.weight"),
+                vec![hidden],
+                TensorOperation::Vector,
+            ),
+            gguf_tensor(
+                format!("{gguf}.post_attention_norm.weight"),
+                vec![hidden],
+                TensorOperation::Vector,
+            ),
+        ]);
+        match args.layer_schedule.get(layer) {
+            Some(qwen35::LayerPolicy::SelfAttention(AttentionPolicy::Full)) => {
+                tensors.extend([
+                    gguf_tensor(
+                        format!("{gguf}.attn_q.weight"),
+                        vec![checked_mul(2, query, "gated query width")?, hidden],
+                        TensorOperation::Matrix,
+                    ),
+                    gguf_tensor(
+                        format!("{gguf}.attn_k.weight"),
+                        vec![key_value, hidden],
+                        TensorOperation::Matrix,
+                    ),
+                    gguf_tensor(
+                        format!("{gguf}.attn_v.weight"),
+                        vec![key_value, hidden],
+                        TensorOperation::Matrix,
+                    ),
+                    gguf_tensor(
+                        format!("{gguf}.attn_output.weight"),
+                        vec![hidden, query],
+                        TensorOperation::Matrix,
+                    ),
+                    gguf_tensor(
+                        format!("{gguf}.attn_q_norm.weight"),
+                        vec![dimension(args.head_dim, "head_dim")?],
+                        TensorOperation::Vector,
+                    ),
+                    gguf_tensor(
+                        format!("{gguf}.attn_k_norm.weight"),
+                        vec![dimension(args.head_dim, "head_dim")?],
+                        TensorOperation::Vector,
+                    ),
+                ]);
+                if args.attention_bias {
+                    tensors.extend([
+                        gguf_tensor(
+                            format!("{gguf}.attn_q.bias"),
+                            vec![checked_mul(2, query, "query bias")?],
+                            TensorOperation::Vector,
+                        ),
+                        gguf_tensor(
+                            format!("{gguf}.attn_k.bias"),
+                            vec![key_value],
+                            TensorOperation::Vector,
+                        ),
+                        gguf_tensor(
+                            format!("{gguf}.attn_v.bias"),
+                            vec![key_value],
+                            TensorOperation::Vector,
+                        ),
+                        gguf_tensor(
+                            format!("{gguf}.attn_output.bias"),
+                            vec![hidden],
+                            TensorOperation::Vector,
+                        ),
+                    ]);
+                }
+            }
+            Some(qwen35::LayerPolicy::LinearAttention) => {
+                if variant.is_next() {
+                    tensors.extend([
+                        gguf_tensor(
+                            format!("{gguf}.attn_qkvz.weight"),
+                            vec![
+                                checked_add(
+                                    checked_mul(2, key_dim, "fused key width")?,
+                                    checked_mul(2, value_dim, "fused value width")?,
+                                    "fused QKVZ width",
+                                )?,
+                                hidden,
+                            ],
+                            TensorOperation::Matrix,
+                        ),
+                        gguf_tensor(
+                            format!("{gguf}.ssm_ba.weight"),
+                            vec![checked_mul(2, value_heads, "fused BA width")?, hidden],
+                            TensorOperation::Matrix,
+                        ),
+                    ]);
+                } else {
+                    tensors.extend([
+                        gguf_tensor(
+                            format!("{gguf}.attn_qkv.weight"),
+                            vec![
+                                checked_add(
+                                    checked_mul(2, key_dim, "split key width")?,
+                                    value_dim,
+                                    "split QKV width",
+                                )?,
+                                hidden,
+                            ],
+                            TensorOperation::Matrix,
+                        ),
+                        gguf_tensor(
+                            format!("{gguf}.attn_gate.weight"),
+                            vec![value_dim, hidden],
+                            TensorOperation::Matrix,
+                        ),
+                        gguf_tensor(
+                            format!("{gguf}.ssm_beta.weight"),
+                            vec![value_heads, hidden],
+                            TensorOperation::Matrix,
+                        ),
+                        gguf_tensor(
+                            format!("{gguf}.ssm_alpha.weight"),
+                            vec![value_heads, hidden],
+                            TensorOperation::Matrix,
+                        ),
+                    ]);
+                }
+                tensors.extend([
+                    gguf_tensor(
+                        format!("{gguf}.ssm_conv1d.weight"),
+                        vec![
+                            checked_add(
+                                checked_mul(2, key_dim, "convolution key width")?,
+                                value_dim,
+                                "convolution width",
+                            )?,
+                            dimension(args.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+                        ],
+                        TensorOperation::Dense,
+                    ),
+                    gguf_tensor(
+                        format!("{gguf}.ssm_dt.bias"),
+                        vec![value_heads],
+                        TensorOperation::Vector,
+                    ),
+                    gguf_tensor(
+                        format!("{gguf}.ssm_a"),
+                        vec![value_heads],
+                        TensorOperation::Dense,
+                    ),
+                    gguf_tensor(
+                        format!("{gguf}.ssm_norm.weight"),
+                        vec![dimension(
+                            args.linear_value_head_dim,
+                            "linear_value_head_dim",
+                        )?],
+                        TensorOperation::Vector,
+                    ),
+                    gguf_tensor(
+                        format!("{gguf}.ssm_out.weight"),
+                        vec![hidden, value_dim],
+                        TensorOperation::Matrix,
+                    ),
+                ]);
+            }
+            Some(qwen35::LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. })) => {
+                return Err("Qwen hybrid GGUF does not support sliding self-attention".into());
+            }
+            None => {
+                return Err(format!(
+                    "Qwen hybrid layer schedule is missing layer {layer}"
+                ))
+            }
+        }
+        if args.is_moe() {
+            let experts = dimension(args.num_experts, "num_experts")?;
+            let intermediate = dimension(args.moe_intermediate_size, "moe_intermediate_size")?;
+            let shared = dimension(
+                args.shared_expert_intermediate_size,
+                "shared_expert_intermediate_size",
+            )?;
+            let shared_gate_name = format!("{gguf}.ffn_gate_inp_shexp.weight");
+            let shared_gate_shape = checkpoint
+                .catalog()
+                .tensors()
+                .find(|tensor| tensor.descriptor().name == shared_gate_name)
+                .map(|tensor| tensor.descriptor().mlx_shape())
+                .filter(|shape| shape.as_slice() == [hidden as u64])
+                .map_or_else(|| vec![1, hidden], |_| vec![hidden]);
+            tensors.extend([
+                gguf_tensor(
+                    format!("{gguf}.ffn_gate_inp.weight"),
+                    vec![experts, hidden],
+                    TensorOperation::Matrix,
+                ),
+                gguf_tensor(
+                    format!("{gguf}.ffn_gate_shexp.weight"),
+                    vec![shared, hidden],
+                    TensorOperation::Matrix,
+                ),
+                gguf_tensor(
+                    format!("{gguf}.ffn_up_shexp.weight"),
+                    vec![shared, hidden],
+                    TensorOperation::Matrix,
+                ),
+                gguf_tensor(
+                    format!("{gguf}.ffn_down_shexp.weight"),
+                    vec![hidden, shared],
+                    TensorOperation::Matrix,
+                ),
+                gguf_tensor(shared_gate_name, shared_gate_shape, TensorOperation::Matrix),
+                gguf_tensor(
+                    format!("{gguf}.ffn_gate_exps.weight"),
+                    vec![experts, intermediate, hidden],
+                    TensorOperation::Matrix,
+                ),
+                gguf_tensor(
+                    format!("{gguf}.ffn_up_exps.weight"),
+                    vec![experts, intermediate, hidden],
+                    TensorOperation::Matrix,
+                ),
+                gguf_tensor(
+                    format!("{gguf}.ffn_down_exps.weight"),
+                    vec![experts, hidden, intermediate],
+                    TensorOperation::Matrix,
+                ),
+            ]);
+        } else {
+            let intermediate = dimension(args.intermediate_size, "intermediate_size")?;
+            tensors.extend([
+                gguf_tensor(
+                    format!("{gguf}.ffn_gate.weight"),
+                    vec![intermediate, hidden],
+                    TensorOperation::Matrix,
+                ),
+                gguf_tensor(
+                    format!("{gguf}.ffn_up.weight"),
+                    vec![intermediate, hidden],
+                    TensorOperation::Matrix,
+                ),
+                gguf_tensor(
+                    format!("{gguf}.ffn_down.weight"),
+                    vec![hidden, intermediate],
+                    TensorOperation::Matrix,
+                ),
+            ]);
+        }
+    }
+    let mut policy = CatalogPolicy::strict();
+    policy.allowed_prefixes.push("rope_freqs.".into());
+    for tensor in checkpoint.catalog().tensors() {
+        let name = &tensor.descriptor().name;
+        let unused_block = name
+            .strip_prefix("blk.")
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|index| index.parse::<usize>().ok())
+            .is_some_and(|index| index >= args.num_hidden_layers as usize);
+        if unused_block {
+            policy.explicitly_allowed_keys.insert(name.clone());
+        }
+    }
+    GgufCheckpointPlan::new(
+        format!("{} GGUF", variant.label()),
+        tensors,
+        Vec::new(),
+        policy,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn gguf_tensor(
+    key: impl Into<String>,
+    shape: Vec<usize>,
+    operation: TensorOperation,
+) -> GgufTensorConstraint {
+    GgufTensorConstraint::required(key, shape, GgufTypeConstraint::OperationClass(operation))
+}
+
+fn validate_gguf_affine_geometry(
+    args: &qwen35::ModelArgs,
+    checkpoint: &GgufCheckpoint,
+    variant: GgufVariant,
+    issues: &mut Vec<CheckpointIssue>,
+) {
+    for layer in 0..args.num_hidden_layers as usize {
+        if args.layer_schedule.get(layer) != Some(&qwen35::LayerPolicy::LinearAttention) {
+            continue;
+        }
+        if variant.is_next() {
+            for name in [
+                format!("blk.{layer}.attn_qkvz.weight"),
+                format!("blk.{layer}.ssm_ba.weight"),
+            ] {
+                let Some(tensor) = checkpoint
+                    .catalog()
+                    .tensors()
+                    .find(|tensor| tensor.descriptor().name == name)
+                else {
+                    continue;
+                };
+                let Some((_, group_size)) = tensor.affine() else {
+                    continue;
+                };
+                if !(args.hidden_size as u32).is_multiple_of(group_size) {
+                    issues.push(CheckpointIssue {
+                        kind: CheckpointIssueKind::CompanionMismatch,
+                        detail: format!(
+                            "Qwen3-Next GGUF fused projection {name:?} input dimension {} is not divisible by group size {group_size}",
+                            args.hidden_size
+                        ),
+                        tensor_name: Some(name),
+                        tensor_type_code: Some(tensor.descriptor().ggml_type.code()),
+                        metadata_key: None,
+                    });
+                }
+            }
+            continue;
+        }
+        let name = format!("blk.{layer}.ssm_out.weight");
+        let Some(tensor) = checkpoint
+            .catalog()
+            .tensors()
+            .find(|tensor| tensor.descriptor().name == name)
+        else {
+            continue;
+        };
+        let Some((bits, group_size)) = tensor.affine() else {
+            continue;
+        };
+        let head = args.linear_value_head_dim as u32;
+        if head
+            .checked_mul(u32::from(bits))
+            .is_none_or(|width| !width.is_multiple_of(32))
+            || !head.is_multiple_of(group_size)
+        {
+            issues.push(CheckpointIssue {
+                kind: CheckpointIssueKind::CompanionMismatch,
+                detail: format!(
+                    "Qwen3.5 GGUF tensor {name:?} cannot preserve grouped value-head layout with {bits}-bit groups of {group_size}"
+                ),
+                tensor_name: Some(name),
+                tensor_type_code: Some(tensor.descriptor().ggml_type.code()),
+                metadata_key: None,
+            });
+        }
+    }
 }
 
 fn dimension(value: i32, name: &str) -> Result<usize, String> {

@@ -178,6 +178,45 @@ pub(crate) fn validate_gguf_plan(
     ))
 }
 
+/// Validates that architecture-supplied tensor pairs use identical encodings.
+pub(crate) fn validate_matching_gguf_encodings(
+    checkpoint: &GgufCheckpoint,
+    pairs: impl IntoIterator<Item = (String, String)>,
+    label: &str,
+) -> Vec<CheckpointIssue> {
+    let catalog = checkpoint
+        .catalog()
+        .tensors()
+        .map(|tensor| (tensor.descriptor().name.as_str(), tensor))
+        .collect::<BTreeMap<_, _>>();
+    let mut issues = Vec::new();
+    for (gate_name, up_name) in pairs {
+        let (Some(gate), Some(up)) = (
+            catalog.get(gate_name.as_str()),
+            catalog.get(up_name.as_str()),
+        ) else {
+            continue;
+        };
+        if gate.descriptor().ggml_type != up.descriptor().ggml_type
+            || gate.affine() != up.affine()
+            || gate.is_mxfp4() != up.is_mxfp4()
+        {
+            issues.push(CheckpointIssue {
+                kind: CheckpointIssueKind::CompanionMismatch,
+                detail: format!(
+                    "{label} paired expert tensors {gate_name:?} and {up_name:?} use incompatible encodings {:?} and {:?}",
+                    gate.descriptor().ggml_type,
+                    up.descriptor().ggml_type
+                ),
+                tensor_name: Some(gate_name),
+                tensor_type_code: Some(gate.descriptor().ggml_type.code()),
+                metadata_key: None,
+            });
+        }
+    }
+    issues
+}
+
 fn validate_catalog<E, T>(
     catalog: &BTreeMap<String, PhysicalMetadata<E>>,
     identity: &str,

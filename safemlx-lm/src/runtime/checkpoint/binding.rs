@@ -12,6 +12,7 @@ use safemlx::{
 
 use crate::{
     error::Error,
+    runtime::checkpoint::binding_plan::{BindingPlan, BindingPlanError, PlannedBinding},
     runtime::checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype, WeightRecipeError},
     runtime::checkpoint::store::{
         TensorSelection, WeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreError,
@@ -133,7 +134,41 @@ pub fn build_module_bindings_with_recipes(
     store: &dyn WeightStore,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
-    build_module_bindings_with_recipes_excluding(module, prefix, store, recipes, |_| false)
+    build_module_binding_plan_with_recipes(module, prefix, store, recipes)?.build_bindings(store)
+}
+
+/// A declarative module binding plan plus fully qualified logical targets.
+pub(crate) struct ModuleBindingPlan {
+    plan: BindingPlan,
+    logical_targets: BTreeMap<String, String>,
+}
+
+impl ModuleBindingPlan {
+    pub(crate) fn build_bindings(
+        &self,
+        store: &dyn WeightStore,
+    ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
+        self.plan
+            .build_bindings(store)?
+            .into_iter()
+            .map(|binding| {
+                let logical_target = self
+                    .logical_targets
+                    .get(binding.name())
+                    .expect("module binding plan contains every local target");
+                Ok(binding.with_logical_target(logical_target)?)
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn build_module_binding_plan_with_recipes(
+    module: &impl ModuleParameters,
+    prefix: &str,
+    store: &dyn WeightStore,
+    recipes: BTreeMap<String, DerivedWeightRecipe>,
+) -> Result<ModuleBindingPlan, ModuleBindingError> {
+    build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, |_| false)
 }
 
 /// Materializes a set of direct or derived bindings without constructing a
@@ -323,9 +358,23 @@ pub(crate) fn build_module_bindings_with_recipes_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,
     store: &dyn WeightStore,
-    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
+    recipes: BTreeMap<String, DerivedWeightRecipe>,
     exclude: F,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    F: Fn(&str) -> bool,
+{
+    build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, exclude)?
+        .build_bindings(store)
+}
+
+pub(crate) fn build_module_binding_plan_with_recipes_excluding<F>(
+    module: &impl ModuleParameters,
+    prefix: &str,
+    store: &dyn WeightStore,
+    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
+    exclude: F,
+) -> Result<ModuleBindingPlan, ModuleBindingError>
 where
     F: Fn(&str) -> bool,
 {
@@ -348,13 +397,16 @@ where
             .is_none_or(|parameter| is_materialized_module_parameter(name, parameter, &params))
     });
     let mut claimed = BTreeMap::<String, String>::new();
-    let mut bindings = Vec::with_capacity(local_names.len());
+    let mut planned = Vec::with_capacity(local_names.len());
+    let mut logical_targets = BTreeMap::new();
+    let mut source_claim_counts = BTreeMap::<String, usize>::new();
 
     for local_name in local_names {
         let parameter = params
             .get(local_name.as_str())
             .expect("parameter name came from the same flattened tree");
         let destination = qualify(prefix, &local_name);
+        logical_targets.insert(local_name.clone(), destination.clone());
         let canonical = canonical_checkpoint_name(&destination);
         let authoritative_key = if store.is_authoritative_materialized_key(&destination) {
             Some(destination.clone())
@@ -390,10 +442,15 @@ where
                         actual: metadata.dtype().clone(),
                     });
                 }
-                bindings.push(
-                    WeightBinding::from_recipe(local_name, recipe, metadata.byte_len())?
-                        .with_logical_target(destination)?,
-                );
+                for source in recipe.source_keys() {
+                    *source_claim_counts.entry(source.into()).or_default() += 1;
+                }
+                planned.push(PlannedBinding {
+                    target_name: local_name,
+                    expected_shape,
+                    expected_dtype,
+                    recipe,
+                });
                 continue;
             }
         } else {
@@ -435,20 +492,20 @@ where
                 actual: metadata.shape,
             });
         }
-        let expected_bytes = u64::try_from(metadata.logical_byte_len).map_err(|_| {
-            ModuleBindingError::ArithmeticOverflow {
-                context: "checkpoint tensor byte length",
-            }
-        })?;
-        bindings.push(
-            WeightBinding::new(
-                local_name,
-                metadata.name,
-                TensorSelection::Full,
-                expected_bytes,
-            )?
-            .with_logical_target(destination)?,
-        );
+        // Direct checkpoint tensors retain their stored dtype. Some modules
+        // intentionally use an unloaded placeholder with a different dtype
+        // and adopt the checkpoint representation when the binding is loaded.
+        let expected_dtype = RecipeDtype::from(metadata.stored_dtype.clone());
+        let recipe = DerivedWeightRecipe::source(metadata.name, TensorSelection::Full);
+        for source in recipe.source_keys() {
+            *source_claim_counts.entry(source.into()).or_default() += 1;
+        }
+        planned.push(PlannedBinding {
+            target_name: local_name,
+            expected_shape,
+            expected_dtype,
+            recipe,
+        });
     }
 
     if !recipes.is_empty() {
@@ -457,7 +514,15 @@ where
         });
     }
 
-    Ok(bindings)
+    let shared_source_keys = source_claim_counts
+        .into_iter()
+        .filter_map(|(source, claims)| (claims > 1).then_some(source))
+        .collect();
+    let plan = BindingPlan::allowing_shared_sources(planned, shared_source_keys)?;
+    Ok(ModuleBindingPlan {
+        plan,
+        logical_targets,
+    })
 }
 
 /// Assigns every module parameter from a protected resident unit.
@@ -556,6 +621,9 @@ fn recipe_dtype_matches(expected: &RecipeDtype, actual: &RecipeDtype) -> bool {
 /// Structured module-to-checkpoint binding failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleBindingError {
+    /// The declarative binding plan was invalid or disagreed with source metadata.
+    #[error("checkpoint binding plan is invalid: {0}")]
+    BindingPlan(String),
     /// A recipe override did not name a runtime parameter.
     #[error("derived-weight recipes name unknown local parameters: {parameters:?}")]
     UnknownRecipeParameters {
@@ -657,6 +725,12 @@ pub enum ModuleBindingError {
     /// Residency binding or lookup failed.
     #[error(transparent)]
     Residency(#[from] crate::runtime::residency::manager::ResidencyError),
+}
+
+impl From<BindingPlanError> for ModuleBindingError {
+    fn from(error: BindingPlanError) -> Self {
+        Self::BindingPlan(error.to_string())
+    }
 }
 
 #[cfg(test)]

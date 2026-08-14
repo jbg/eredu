@@ -21,23 +21,19 @@ use crate::{
         muse_glimmer,
         nemotron_h::model as nemotron_h,
         qwen::{
-            dense as dense_qwen,
-            hybrid::{checkpoint as qwen_hybrid_checkpoint, qwen3_5 as qwen35},
+            dense as dense_qwen, hybrid::checkpoint as qwen_hybrid_checkpoint,
             vl::model as qwen3_vl,
         },
     },
     error::Error,
-    runtime::{
-        attention::AttentionPolicy,
-        checkpoint::{
-            schema::{
-                gguf_encoding_supported, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
-                GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
-                SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
-            },
-            store::{SafetensorsWeightStore, StoredDtype, WeightStore},
-            validation as checkpoint_validation,
+    runtime::checkpoint::{
+        schema::{
+            gguf_encoding_supported, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
+            GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
+            SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
         },
+        store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+        validation as checkpoint_validation,
     },
 };
 
@@ -5845,9 +5841,14 @@ fn validate_kimi_linear_gguf(
 
     let mut issues =
         validate_gguf_plan(checkpoint, kimi_linear_expected(&args), "Kimi Linear GGUF");
-    issues.extend(validate_paired_expert_encodings(
+    issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
         checkpoint,
-        0..args.num_hidden_layers as usize,
+        (0..args.num_hidden_layers as usize).map(|layer| {
+            (
+                format!("blk.{layer}.ffn_gate_exps.weight"),
+                format!("blk.{layer}.ffn_up_exps.weight"),
+            )
+        }),
         "Kimi Linear GGUF",
     ));
     for (layer, policy) in args.layer_schedule.iter().enumerate() {
@@ -5987,13 +5988,16 @@ fn validate_lfm2_gguf(
     }
     let mut issues = validate_gguf_plan(checkpoint, expected, "LFM2");
     if is_moe {
-        issues.extend(validate_paired_expert_encodings(
+        issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
             checkpoint,
             args.layer_schedule
                 .iter()
                 .enumerate()
                 .filter_map(|(layer, policy)| {
-                    (policy.feed_forward == lfm2::FeedForwardPolicy::SparseMoe).then_some(layer)
+                    (policy.feed_forward == lfm2::FeedForwardPolicy::SparseMoe).then_some((
+                        format!("blk.{layer}.ffn_gate_exps.weight"),
+                        format!("blk.{layer}.ffn_up_exps.weight"),
+                    ))
                 }),
             "LFM2 MoE",
         ));
@@ -6816,9 +6820,14 @@ fn validate_gpt_oss_gguf(
             issues.push(unexpected_layout(&actual.descriptor().name, "GPT-OSS GGUF"));
         }
     }
-    issues.extend(validate_paired_expert_encodings(
+    issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
         checkpoint,
-        0..args.num_hidden_layers as usize,
+        (0..args.num_hidden_layers as usize).map(|layer| {
+            (
+                format!("blk.{layer}.ffn_gate_exps.weight"),
+                format!("blk.{layer}.ffn_up_exps.weight"),
+            )
+        }),
         "GPT-OSS",
     ));
     finish(issues)
@@ -7120,9 +7129,14 @@ fn validate_dense_qwen_gguf(
         },
     );
     if is_moe {
-        issues.extend(validate_paired_expert_encodings(
+        issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
             checkpoint,
-            0..args.num_hidden_layers as usize,
+            (0..args.num_hidden_layers as usize).map(|layer| {
+                (
+                    format!("blk.{layer}.ffn_gate_exps.weight"),
+                    format!("blk.{layer}.ffn_up_exps.weight"),
+                )
+            }),
             "Qwen3 MoE",
         ));
     }
@@ -7394,9 +7408,14 @@ fn validate_qwen3_vl_gguf(
         .collect::<BTreeSet<_>>();
     let mut issues = validate_gguf_plan(checkpoint, expected, "Qwen3-VL text");
     if is_moe {
-        issues.extend(validate_paired_expert_encodings(
+        issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
             checkpoint,
-            0..args.num_hidden_layers as usize,
+            (0..args.num_hidden_layers as usize).map(|layer| {
+                (
+                    format!("blk.{layer}.ffn_gate_exps.weight"),
+                    format!("blk.{layer}.ffn_up_exps.weight"),
+                )
+            }),
             "Qwen3-VL-MoE",
         ));
     }
@@ -7477,77 +7496,13 @@ pub(crate) fn validate_qwen35_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let architecture = match model_metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
-        Some(_) => {
-            return invalid_geometry(
-                "GGUF metadata key \"general.architecture\" has the wrong type".into(),
-            )
-        }
-        None => {
-            return invalid_geometry(
-                "GGUF metadata is missing required key \"general.architecture\"".into(),
-            )
-        }
-    };
-    if !matches!(architecture.as_str(), "qwen35" | "qwen35moe") {
-        return invalid_geometry(format!(
-            "Qwen3.5 projector requires qwen35 or qwen35moe text, got {architecture:?}"
-        ));
-    }
-    let text = match qwen35::qwen35_args_from_gguf_catalog(
+    qwen_hybrid_checkpoint::validate_projector_gguf(
         model_checkpoint,
         model_metadata,
-        &architecture,
-    ) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let vision =
-        match qwen3_vl::qwen_vision_config_from_gguf_catalog(checkpoint, metadata, "Qwen3.5") {
-            Ok(vision) => vision,
-            Err(error) => return invalid_geometry(error.to_string()),
-        };
-    if vision.out_hidden_size != text.hidden_size {
-        return invalid_geometry(format!(
-            "Qwen3.5 projector output {} does not match language hidden size {}",
-            vision.out_hidden_size, text.hidden_size
-        ));
-    }
-    if vision.deepstack_layer_count() != 0 {
-        return invalid_geometry(format!(
-            "Qwen3.5 projector declares {} DeepStack outputs; the decoder accepts only the primary merger output",
-            vision.deepstack_layer_count()
-        ));
-    }
-    let deepstack = vision.deepstack_layers();
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(|name| qwen3_vl::translate_qwen3_vl_mmproj_name(name, &deepstack))
-    {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let expected = qwen_vision_gguf_expected(&vision, text.hidden_size);
-    let allowed = expected
-        .iter()
-        .map(|tensor| tensor.gguf_name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut issues = validate_gguf_plan(checkpoint, expected, "Qwen3.5 projector");
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if !allowed.contains(name) {
-            issues.push(unexpected_layout(name, "Qwen3.5 projector GGUF"));
-        }
-    }
-    finish(issues)
+        checkpoint,
+        metadata,
+    )
 }
-
 fn qwen_vision_gguf_expected(
     vision: &qwen3_vl::VisionConfig,
     text_hidden_size: i32,
@@ -7633,426 +7588,24 @@ fn qwen_vision_gguf_expected(
     tensors
 }
 
-fn qwen35_gguf_expected(args: &qwen35::ModelArgs) -> Vec<ExpectedTensor> {
-    let hidden = args.hidden_size as usize;
-    let vocab = args.vocab_size as usize;
-    let query = (args.num_attention_heads * args.head_dim) as usize;
-    let key_value = (args.num_key_value_heads * args.head_dim) as usize;
-    let key_dim = (args.linear_num_key_heads * args.linear_key_head_dim) as usize;
-    let value_dim = (args.linear_num_value_heads * args.linear_value_head_dim) as usize;
-    let value_heads = args.linear_num_value_heads as usize;
-    let mut tensors = vec![
-        expected(
-            "model.embed_tokens.weight",
-            "token_embd.weight",
-            [vocab, hidden],
-        ),
-        expected_vector("model.norm.weight", "output_norm.weight", hidden),
-    ];
-    if !args.tie_word_embeddings {
-        tensors.push(expected("lm_head.weight", "output.weight", [vocab, hidden]));
-    }
-    for layer in 0..args.num_hidden_layers as usize {
-        let model = format!("model.layers.{layer}");
-        let gguf = format!("blk.{layer}");
-        tensors.extend([
-            expected_vector(
-                format!("{model}.input_layernorm.weight"),
-                format!("{gguf}.attn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.post_attention_layernorm.weight"),
-                format!("{gguf}.post_attention_norm.weight"),
-                hidden,
-            ),
-        ]);
-        match args
-            .layer_schedule
-            .get(layer)
-            .expect("validated Qwen hybrid layer schedule")
-        {
-            qwen35::LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
-                tensors.extend([
-                    expected(
-                        format!("{model}.self_attn.q_proj.weight"),
-                        format!("{gguf}.attn_q.weight"),
-                        [2 * query, hidden],
-                    ),
-                    expected(
-                        format!("{model}.self_attn.k_proj.weight"),
-                        format!("{gguf}.attn_k.weight"),
-                        [key_value, hidden],
-                    ),
-                    expected(
-                        format!("{model}.self_attn.v_proj.weight"),
-                        format!("{gguf}.attn_v.weight"),
-                        [key_value, hidden],
-                    ),
-                    expected(
-                        format!("{model}.self_attn.o_proj.weight"),
-                        format!("{gguf}.attn_output.weight"),
-                        [hidden, query],
-                    ),
-                    expected_vector(
-                        format!("{model}.self_attn.q_norm.weight"),
-                        format!("{gguf}.attn_q_norm.weight"),
-                        args.head_dim as usize,
-                    ),
-                    expected_vector(
-                        format!("{model}.self_attn.k_norm.weight"),
-                        format!("{gguf}.attn_k_norm.weight"),
-                        args.head_dim as usize,
-                    ),
-                ]);
-                if args.attention_bias {
-                    tensors.extend([
-                        expected_vector(
-                            format!("{model}.self_attn.q_proj.bias"),
-                            format!("{gguf}.attn_q.bias"),
-                            2 * query,
-                        ),
-                        expected_vector(
-                            format!("{model}.self_attn.k_proj.bias"),
-                            format!("{gguf}.attn_k.bias"),
-                            key_value,
-                        ),
-                        expected_vector(
-                            format!("{model}.self_attn.v_proj.bias"),
-                            format!("{gguf}.attn_v.bias"),
-                            key_value,
-                        ),
-                        expected_vector(
-                            format!("{model}.self_attn.o_proj.bias"),
-                            format!("{gguf}.attn_output.bias"),
-                            hidden,
-                        ),
-                    ]);
-                }
-            }
-            qwen35::LayerPolicy::LinearAttention => {
-                if args.model_type == "qwen3_next" {
-                    tensors.extend([
-                        expected(
-                            format!("{model}.linear_attn.in_proj_qkvz.weight"),
-                            format!("{gguf}.attn_qkvz.weight"),
-                            [2 * key_dim + 2 * value_dim, hidden],
-                        ),
-                        expected(
-                            format!("{model}.linear_attn.in_proj_ba.weight"),
-                            format!("{gguf}.ssm_ba.weight"),
-                            [2 * value_heads, hidden],
-                        ),
-                    ]);
-                } else {
-                    tensors.extend([
-                        expected(
-                            format!("{model}.linear_attn.in_proj_qkv.weight"),
-                            format!("{gguf}.attn_qkv.weight"),
-                            [2 * key_dim + value_dim, hidden],
-                        ),
-                        expected(
-                            format!("{model}.linear_attn.in_proj_z.weight"),
-                            format!("{gguf}.attn_gate.weight"),
-                            [value_dim, hidden],
-                        ),
-                        expected(
-                            format!("{model}.linear_attn.in_proj_b.weight"),
-                            format!("{gguf}.ssm_beta.weight"),
-                            [value_heads, hidden],
-                        ),
-                        expected(
-                            format!("{model}.linear_attn.in_proj_a.weight"),
-                            format!("{gguf}.ssm_alpha.weight"),
-                            [value_heads, hidden],
-                        ),
-                    ]);
-                }
-                tensors.extend([
-                    expected_dense_with_gguf_shape(
-                        format!("{model}.linear_attn.conv1d.weight"),
-                        format!("{gguf}.ssm_conv1d.weight"),
-                        vec![
-                            2 * key_dim + value_dim,
-                            1,
-                            args.linear_conv_kernel_dim as usize,
-                        ],
-                        vec![
-                            2 * key_dim + value_dim,
-                            args.linear_conv_kernel_dim as usize,
-                        ],
-                    ),
-                    expected_vector_shape(format!("{gguf}.ssm_dt.bias"), vec![value_heads]),
-                    ExpectedTensor {
-                        safetensors_name: format!("{model}.linear_attn.A_log"),
-                        gguf_name: format!("{gguf}.ssm_a"),
-                        safetensors_shape: vec![value_heads],
-                        gguf_shape: vec![value_heads],
-                        operation: TensorOperation::Dense,
-                    },
-                    expected_vector(
-                        format!("{model}.linear_attn.norm.weight"),
-                        format!("{gguf}.ssm_norm.weight"),
-                        args.linear_value_head_dim as usize,
-                    ),
-                    expected(
-                        format!("{model}.linear_attn.out_proj.weight"),
-                        format!("{gguf}.ssm_out.weight"),
-                        [hidden, value_dim],
-                    ),
-                ]);
-            }
-            qwen35::LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
-                unreachable!("Qwen hybrid validation rejects sliding self-attention")
-            }
-        }
-        if args.is_moe() {
-            let experts = args.num_experts as usize;
-            let intermediate = args.moe_intermediate_size as usize;
-            let shared = args.shared_expert_intermediate_size as usize;
-            tensors.extend([
-                expected(
-                    format!("{model}.mlp.gate.weight"),
-                    format!("{gguf}.ffn_gate_inp.weight"),
-                    [experts, hidden],
-                ),
-                expected(
-                    format!("{model}.mlp.shared_expert.gate_proj.weight"),
-                    format!("{gguf}.ffn_gate_shexp.weight"),
-                    [shared, hidden],
-                ),
-                expected(
-                    format!("{model}.mlp.shared_expert.up_proj.weight"),
-                    format!("{gguf}.ffn_up_shexp.weight"),
-                    [shared, hidden],
-                ),
-                expected(
-                    format!("{model}.mlp.shared_expert.down_proj.weight"),
-                    format!("{gguf}.ffn_down_shexp.weight"),
-                    [hidden, shared],
-                ),
-                expected(
-                    format!("{model}.mlp.shared_expert_gate.weight"),
-                    format!("{gguf}.ffn_gate_inp_shexp.weight"),
-                    [1, hidden],
-                ),
-                expected_rank3(
-                    format!("{model}.mlp.experts.gate_proj"),
-                    format!("{gguf}.ffn_gate_exps.weight"),
-                    [experts, intermediate, hidden],
-                ),
-                expected_rank3(
-                    format!("{model}.mlp.experts.up_proj"),
-                    format!("{gguf}.ffn_up_exps.weight"),
-                    [experts, intermediate, hidden],
-                ),
-                expected_rank3(
-                    format!("{model}.mlp.experts.down_proj"),
-                    format!("{gguf}.ffn_down_exps.weight"),
-                    [experts, hidden, intermediate],
-                ),
-            ]);
-        } else {
-            let intermediate = args.intermediate_size as usize;
-            tensors.extend([
-                expected(
-                    format!("{model}.mlp.gate_proj.weight"),
-                    format!("{gguf}.ffn_gate.weight"),
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{model}.mlp.up_proj.weight"),
-                    format!("{gguf}.ffn_up.weight"),
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{model}.mlp.down_proj.weight"),
-                    format!("{gguf}.ffn_down.weight"),
-                    [hidden, intermediate],
-                ),
-            ]);
-        }
-    }
-    tensors
-}
-
 fn validate_qwen35_gguf(
     architecture: GgufArchitecture,
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    let metadata_name = architecture.metadata_name();
-    let is_next = architecture == GgufArchitecture::Qwen3Next;
-    let loader_name = if is_next { "Qwen3-Next" } else { "Qwen3.5" };
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(qwen35::qwen35_translate_gguf_weight_name)
-    {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args = match qwen35::qwen35_args_from_gguf_catalog(checkpoint, metadata, metadata_name) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
+    let variant = match architecture {
+        GgufArchitecture::Qwen35 => qwen_hybrid_checkpoint::GgufVariant::Qwen35,
+        GgufArchitecture::Qwen35Moe => qwen_hybrid_checkpoint::GgufVariant::Qwen35Moe,
+        GgufArchitecture::Qwen3Next => qwen_hybrid_checkpoint::GgufVariant::Qwen3Next,
+        _ => unreachable!("Qwen hybrid GGUF validator received another architecture"),
     };
-    if !args.is_moe() && options.weight_residency.expert_cache().is_some() {
-        return invalid_geometry(format!(
-            "sparse expert caching requires a {loader_name} MoE GGUF checkpoint"
-        ));
-    }
-    let mut expected = qwen35_gguf_expected(&args);
-    let actual_shapes = checkpoint
-        .catalog()
-        .tensors()
-        .map(|tensor| {
-            (
-                tensor.descriptor().name.as_str(),
-                tensor.descriptor().mlx_shape(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    for tensor in &mut expected {
-        if tensor.gguf_name.ends_with("ffn_gate_inp_shexp.weight")
-            && actual_shapes
-                .get(tensor.gguf_name.as_str())
-                .is_some_and(|shape| shape.as_slice() == [args.hidden_size as u64])
-        {
-            tensor.gguf_shape = vec![args.hidden_size as usize];
-        }
-    }
-    let allowed = expected
-        .iter()
-        .map(|tensor| tensor.gguf_name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut issues = validate_gguf_plan(checkpoint, expected, loader_name);
-    for actual in checkpoint.catalog().tensors() {
-        let name = &actual.descriptor().name;
-        let nextn_or_unused_block = name
-            .strip_prefix("blk.")
-            .and_then(|rest| rest.split('.').next())
-            .and_then(|index| index.parse::<usize>().ok())
-            .is_some_and(|index| index >= args.num_hidden_layers as usize);
-        if allowed.contains(name) || name.starts_with("rope_freqs.") || nextn_or_unused_block {
-            continue;
-        }
-        issues.push(unexpected_layout(name, &format!("{loader_name} GGUF")));
-    }
-    if args.is_moe() {
-        issues.extend(validate_paired_expert_encodings(
-            checkpoint,
-            0..args.num_hidden_layers as usize,
-            &format!("{loader_name} MoE"),
-        ));
-    }
-    for layer in 0..args.num_hidden_layers as usize {
-        if args.layer_schedule.get(layer) != Some(&qwen35::LayerPolicy::LinearAttention) {
-            continue;
-        }
-        if is_next {
-            for name in [
-                format!("blk.{layer}.attn_qkvz.weight"),
-                format!("blk.{layer}.ssm_ba.weight"),
-            ] {
-                let Some(tensor) = checkpoint
-                    .catalog()
-                    .tensors()
-                    .find(|tensor| tensor.descriptor().name == name)
-                else {
-                    continue;
-                };
-                let Some((_, group_size)) = tensor.affine() else {
-                    continue;
-                };
-                if !(args.hidden_size as u32).is_multiple_of(group_size) {
-                    issues.push(StructuralIssue {
-                        kind: StructuralIssueKind::QuantizationCompanionMismatch,
-                        detail: format!(
-                            "Qwen3-Next GGUF fused projection {name:?} input dimension {} is not divisible by group size {group_size}",
-                            args.hidden_size
-                        ),
-                        tensor_name: Some(name),
-                        tensor_type_code: Some(tensor.descriptor().ggml_type.code()),
-                        metadata_key: None,
-                    });
-                }
-            }
-            continue;
-        }
-        let name = format!("blk.{layer}.ssm_out.weight");
-        let Some(tensor) = checkpoint
-            .catalog()
-            .tensors()
-            .find(|tensor| tensor.descriptor().name == name)
-        else {
-            continue;
-        };
-        let Some((bits, group_size)) = tensor.affine() else {
-            continue;
-        };
-        let head = args.linear_value_head_dim as u32;
-        if head
-            .checked_mul(u32::from(bits))
-            .is_none_or(|width| !width.is_multiple_of(32))
-            || !head.is_multiple_of(group_size)
-        {
-            issues.push(StructuralIssue {
-                kind: StructuralIssueKind::QuantizationCompanionMismatch,
-                detail: format!(
-                    "Qwen3.5 GGUF tensor {name:?} cannot preserve grouped value-head layout with {bits}-bit groups of {group_size}"
-                ),
-                tensor_name: Some(name),
-                tensor_type_code: Some(tensor.descriptor().ggml_type.code()),
-                metadata_key: None,
-            });
-        }
-    }
-    finish(issues)
-}
-
-fn validate_paired_expert_encodings(
-    checkpoint: &GgufCheckpoint,
-    layers: impl IntoIterator<Item = usize>,
-    loader_name: &str,
-) -> Vec<StructuralIssue> {
-    let catalog = checkpoint
-        .catalog()
-        .tensors()
-        .map(|tensor| (tensor.descriptor().name.as_str(), tensor))
-        .collect::<BTreeMap<_, _>>();
-    let mut issues = Vec::new();
-    for layer in layers {
-        let gate_name = format!("blk.{layer}.ffn_gate_exps.weight");
-        let up_name = format!("blk.{layer}.ffn_up_exps.weight");
-        let (Some(gate), Some(up)) = (
-            catalog.get(gate_name.as_str()),
-            catalog.get(up_name.as_str()),
-        ) else {
-            continue;
-        };
-        if gate.descriptor().ggml_type != up.descriptor().ggml_type
-            || gate.affine() != up.affine()
-            || gate.is_mxfp4() != up.is_mxfp4()
-        {
-            issues.push(StructuralIssue {
-                kind: StructuralIssueKind::QuantizationCompanionMismatch,
-                detail: format!(
-                    "{loader_name} paired expert tensors {gate_name:?} and {up_name:?} use incompatible encodings {:?} and {:?}",
-                    gate.descriptor().ggml_type,
-                    up.descriptor().ggml_type
-                ),
-                tensor_name: Some(gate_name),
-                tensor_type_code: Some(gate.descriptor().ggml_type.code()),
-                metadata_key: None,
-            });
-        }
-    }
-    issues
+    qwen_hybrid_checkpoint::validate_gguf(
+        variant,
+        checkpoint,
+        metadata,
+        options.weight_residency.expert_cache().is_some(),
+    )
 }
 
 fn validate_gguf_plan(

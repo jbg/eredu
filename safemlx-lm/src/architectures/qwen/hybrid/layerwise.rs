@@ -40,14 +40,15 @@ use crate::{
         PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         canonical_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        populate_module_from_lease_excluding, ModuleBindingPlan,
     },
     runtime::checkpoint::store::{
         GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend,
     },
     runtime::checkpoint::{
+        binding_plan::{BindingPlan, PlannedBinding},
         quantization::{should_quantize_on_load, WeightQuantization},
         recipe::DerivedWeightRecipe,
     },
@@ -2092,13 +2093,13 @@ impl QwenHybridLayerwiseAdapter {
         project_logits_maybe_quantized(&mut self.lm_head, &mut self.embedding, &hidden, stream)
     }
 
-    fn recipes_for_module(
+    fn binding_plan_for_module(
         &self,
         module: &impl ModuleParameters,
         prefix: &str,
         store: &dyn WeightStore,
         layer_index: Option<usize>,
-    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
+    ) -> Result<ModuleBindingPlan, Error> {
         let normalized = normalized_checkpoint_keys(store);
         let keys = store.keys();
         let mut recipes = BTreeMap::new();
@@ -2156,13 +2157,12 @@ impl QwenHybridLayerwiseAdapter {
                 DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
             );
         }
-        Ok(recipes)
+        Ok(build_module_binding_plan_with_recipes(
+            module, prefix, store, recipes,
+        )?)
     }
 
-    fn mtp_recipes(
-        &self,
-        store: &dyn WeightStore,
-    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
+    fn mtp_binding_plan(&self, store: &dyn WeightStore) -> Result<ModuleBindingPlan, Error> {
         let mtp = self.mtp.as_ref().ok_or_else(|| {
             Error::UnsupportedArchitecture("Qwen hybrid model has no MTP module".into())
         })?;
@@ -2203,7 +2203,13 @@ impl QwenHybridLayerwiseAdapter {
                 DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
             );
         }
-        Ok(recipes)
+        Ok(build_module_binding_plan_with_recipes_excluding(
+            mtp,
+            "mtp",
+            store,
+            recipes,
+            |name| self.sparse_expert_cache && name.contains(".mlp.experts."),
+        )?)
     }
 }
 
@@ -2917,8 +2923,16 @@ fn qwen_hybrid_recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 /// Input mode for typed prefill and cached text decode.
@@ -3389,49 +3403,31 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
-                    &self.embedding,
-                    "model.embed_tokens",
-                    store,
-                    self.recipes_for_module(&self.embedding, "model.embed_tokens", store, None)?,
-                )?,
+                self.binding_plan_for_module(&self.embedding, "model.embed_tokens", store, None)?
+                    .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
-                    &self.norm,
-                    "model.norm",
-                    store,
-                    self.recipes_for_module(&self.norm, "model.norm", store, None)?,
-                )?,
+                self.binding_plan_for_module(&self.norm, "model.norm", store, None)?
+                    .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings_with_recipes(
-                        head,
-                        "lm_head",
-                        store,
-                        self.recipes_for_module(head, "lm_head", store, None)?,
-                    )?,
+                    self.binding_plan_for_module(head, "lm_head", store, None)?
+                        .build_bindings(store)?,
                 )?);
             }
         }
         if select(MTP_STATIC_UNIT) {
-            if let Some(mtp) = &self.mtp {
+            if self.mtp.is_some() {
                 units.push(StaticUnitBindings::new(
                     MTP_STATIC_UNIT,
-                    build_module_bindings_with_recipes_excluding(
-                        mtp,
-                        "mtp",
-                        store,
-                        self.mtp_recipes(store)?,
-                        |name| self.sparse_expert_cache && name.contains(".mlp.experts."),
-                    )?,
+                    self.mtp_binding_plan(store)?.build_bindings(store)?,
                 )?);
             }
         }
@@ -3439,12 +3435,8 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             if let Some(vision) = &self.vision {
                 units.push(StaticUnitBindings::new(
                     VISION_STATIC_UNIT,
-                    build_module_bindings_with_recipes(
-                        vision,
-                        "visual",
-                        store,
-                        self.recipes_for_module(vision, "visual", store, None)?,
-                    )?,
+                    self.binding_plan_for_module(vision, "visual", store, None)?
+                        .build_bindings(store)?,
                 )?);
             }
         }
@@ -4088,17 +4080,14 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
-        let bindings = build_module_bindings_with_recipes(
-            layer,
-            &prefix,
-            store,
-            self.recipes_for_module(
+        let bindings = self
+            .binding_plan_for_module(
                 layer,
                 &prefix,
                 store,
                 (self.execution_group_name(group)? == "text_decoder").then_some(index),
-            )?,
-        )?;
+            )?
+            .build_bindings(store)?;
         Ok(
             if self.sparse_expert_cache && self.execution_group_name(group)? == "text_decoder" {
                 bindings
