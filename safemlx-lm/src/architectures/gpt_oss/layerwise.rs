@@ -33,9 +33,10 @@ use crate::{
         PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        build_module_binding_plan_with_recipes_excluding, build_module_bindings,
+        populate_module_from_lease, populate_module_from_lease_excluding,
     },
+    runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -1374,20 +1375,14 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = format!("model.layers.{index}");
-        let bindings = build_module_bindings_with_recipes(
+        Ok(build_module_binding_plan_with_recipes_excluding(
             layer,
             &prefix,
             store,
             self.layer_recipes(index, store)?,
-        )?;
-        Ok(if self.sparse_expert_cache {
-            bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("mlp.experts."))
-                .collect()
-        } else {
-            bindings
-        })
+            |name| self.sparse_expert_cache && name.starts_with("mlp.experts."),
+        )?
+        .build_bindings(store)?)
     }
 
     fn parallel_layer_bindings(
@@ -1716,10 +1711,21 @@ pub(crate) fn gpt_oss_expert_catalog_cartesian(
                 .map(|name| (name, selected(name)))
                 .collect()
             };
+            let mut planned = Vec::with_capacity(recipes.len());
             for (name, recipe) in recipes {
-                let bytes = recipe.infer(store)?.byte_len();
-                bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                let metadata = recipe.infer(store)?;
+                planned.push(PlannedBinding {
+                    target_name: name.into(),
+                    expected_shape: metadata.shape().to_vec(),
+                    expected_dtype: metadata.dtype().clone(),
+                    recipe,
+                });
             }
+            bindings.extend(
+                BindingPlan::new(planned)
+                    .and_then(|plan| plan.build_bindings(store))
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            );
             let bindings = match layout {
                 Some(layout) => crate::runtime::execution::layerwise::shard_layer_bindings(
                     bindings, &prefix, store, layout,

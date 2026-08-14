@@ -12,7 +12,7 @@ use crate::{
         deepseek_v3::checkpoint as deepseek_v3_checkpoint,
         deepseek_v4::checkpoint as deepseek_v4_checkpoint,
         gemma4::{checkpoint as gemma4_checkpoint, model as gemma4},
-        gpt_oss::model as gpt_oss,
+        gpt_oss::checkpoint as gpt_oss_checkpoint,
         inkling::model as inkling,
         kimi_linear::model as kimi_linear,
         lfm2::model as lfm2,
@@ -517,130 +517,6 @@ fn muse_glimmer_expected(config: &Value) -> Result<Vec<ExpectedTensor>, Error> {
     Ok(tensors)
 }
 
-fn gpt_oss_common_expected(args: &gpt_oss::ModelArgs) -> Vec<ExpectedTensor> {
-    let hidden = args.hidden_size as usize;
-    let vocab = args.vocab_size as usize;
-    let query = (args.num_attention_heads * args.head_dim) as usize;
-    let key_value = (args.num_key_value_heads * args.head_dim) as usize;
-    let experts = args.num_local_experts as usize;
-    let mut tensors = vec![
-        expected(
-            "model.embed_tokens.weight",
-            "token_embd.weight",
-            [vocab, hidden],
-        ),
-        expected_vector("model.norm.weight", "output_norm.weight", hidden),
-        expected("lm_head.weight", "output.weight", [vocab, hidden]),
-    ];
-    for layer in 0..args.num_hidden_layers as usize {
-        let model = format!("model.layers.{layer}");
-        let gguf = format!("blk.{layer}");
-        tensors.extend([
-            expected_vector(
-                format!("{model}.input_layernorm.weight"),
-                format!("{gguf}.attn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.post_attention_layernorm.weight"),
-                format!("{gguf}.attn_post_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.self_attn.sinks"),
-                format!("{gguf}.attn_sinks.weight"),
-                args.num_attention_heads as usize,
-            ),
-            expected(
-                format!("{model}.self_attn.q_proj.weight"),
-                format!("{gguf}.attn_q.weight"),
-                [query, hidden],
-            ),
-            expected_vector(
-                format!("{model}.self_attn.q_proj.bias"),
-                format!("{gguf}.attn_q.bias"),
-                query,
-            ),
-            expected(
-                format!("{model}.self_attn.k_proj.weight"),
-                format!("{gguf}.attn_k.weight"),
-                [key_value, hidden],
-            ),
-            expected_vector(
-                format!("{model}.self_attn.k_proj.bias"),
-                format!("{gguf}.attn_k.bias"),
-                key_value,
-            ),
-            expected(
-                format!("{model}.self_attn.v_proj.weight"),
-                format!("{gguf}.attn_v.weight"),
-                [key_value, hidden],
-            ),
-            expected_vector(
-                format!("{model}.self_attn.v_proj.bias"),
-                format!("{gguf}.attn_v.bias"),
-                key_value,
-            ),
-            expected(
-                format!("{model}.self_attn.o_proj.weight"),
-                format!("{gguf}.attn_output.weight"),
-                [hidden, query],
-            ),
-            expected_vector(
-                format!("{model}.self_attn.o_proj.bias"),
-                format!("{gguf}.attn_output.bias"),
-                hidden,
-            ),
-            expected_dense_with_gguf_shape(
-                format!("{model}.mlp.router.weight"),
-                format!("{gguf}.ffn_gate_inp.weight"),
-                vec![experts, hidden],
-                vec![experts, hidden],
-            ),
-            expected_vector(
-                format!("{model}.mlp.router.bias"),
-                format!("{gguf}.ffn_gate_inp.bias"),
-                experts,
-            ),
-        ]);
-    }
-    tensors
-}
-
-fn gpt_oss_gguf_expected(args: &gpt_oss::ModelArgs) -> Vec<ExpectedTensor> {
-    let mut tensors = gpt_oss_common_expected(args);
-    for tensor in &mut tensors {
-        if tensor.gguf_name.ends_with(".ffn_gate_inp.weight") {
-            tensor.operation = TensorOperation::Matrix;
-        }
-    }
-    let hidden = args.hidden_size as usize;
-    let intermediate = args.intermediate_size as usize;
-    let experts = args.num_local_experts as usize;
-    for layer in 0..args.num_hidden_layers as usize {
-        let gguf = format!("blk.{layer}");
-        for projection in ["gate", "up"] {
-            tensors.push(expected_mxfp4_rank3(
-                format!("{gguf}.ffn_{projection}_exps.weight"),
-                [experts, intermediate, hidden],
-            ));
-            tensors.push(expected_vector_shape(
-                format!("{gguf}.ffn_{projection}_exps.bias"),
-                vec![experts, intermediate],
-            ));
-        }
-        tensors.push(expected_mxfp4_rank3(
-            format!("{gguf}.ffn_down_exps.weight"),
-            [experts, hidden, intermediate],
-        ));
-        tensors.push(expected_vector_shape(
-            format!("{gguf}.ffn_down_exps.bias"),
-            vec![experts, hidden],
-        ));
-    }
-    tensors
-}
-
 fn kimi_linear_expected(args: &kimi_linear::ModelArgs) -> Vec<ExpectedTensor> {
     let hidden = args.hidden_size as usize;
     let vocab = args.vocab_size as usize;
@@ -1073,18 +949,6 @@ fn expected_rank3(
         safetensors_shape: shape.clone(),
         gguf_shape: shape,
         operation: TensorOperation::Matrix,
-    }
-}
-
-fn expected_mxfp4_rank3(gguf_name: impl Into<String>, shape: [usize; 3]) -> ExpectedTensor {
-    let name = gguf_name.into();
-    let shape = shape.to_vec();
-    ExpectedTensor {
-        safetensors_name: name.clone(),
-        gguf_name: name,
-        safetensors_shape: shape.clone(),
-        gguf_shape: shape,
-        operation: TensorOperation::MxFp4Matrix,
     }
 }
 
@@ -2349,100 +2213,7 @@ fn validate_gpt_oss_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
 ) -> StructuralValidation {
-    let args = match gpt_oss::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > store.keys().len() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
-            args.num_hidden_layers,
-            store.keys().len()
-        ));
-    }
-    let common = gpt_oss_common_expected(&args);
-    let mut allowed = BTreeSet::new();
-    for tensor in &common {
-        allowed.insert(tensor.safetensors_name.clone());
-        if tensor.operation == TensorOperation::Matrix {
-            if let Some(quantization) = args.quantization {
-                add_safetensors_format_companions(
-                    &mut allowed,
-                    &tensor.safetensors_name,
-                    SafetensorsMatrixFormat::Affine(quantization),
-                );
-            }
-        }
-    }
-    let mut issues = match validate_safetensor_plan(store, common, args.quantization) {
-        StructuralValidation::Exact => Vec::new(),
-        StructuralValidation::Invalid(issues) => issues,
-        StructuralValidation::Unverified(_) => {
-            unreachable!("pure plan is always exact or invalid")
-        }
-    };
-    let experts = args.num_local_experts as usize;
-    let hidden = args.hidden_size as usize;
-    let intermediate = args.intermediate_size as usize;
-    for layer in 0..args.num_hidden_layers as usize {
-        let prefix = format!("model.layers.{layer}.mlp.experts");
-        for suffix in [
-            "gate_up_proj_blocks",
-            "gate_up_proj_scales",
-            "gate_up_proj_bias",
-            "down_proj_blocks",
-            "down_proj_scales",
-            "down_proj_bias",
-        ] {
-            allowed.insert(format!("{prefix}.{suffix}"));
-        }
-        validate_native_mxfp4_tensor(
-            store,
-            &format!("{prefix}.gate_up_proj_blocks"),
-            &[experts, 2 * intermediate, hidden / 32, 16],
-            false,
-            &mut issues,
-        );
-        validate_native_mxfp4_tensor(
-            store,
-            &format!("{prefix}.gate_up_proj_scales"),
-            &[experts, 2 * intermediate, hidden / 32],
-            true,
-            &mut issues,
-        );
-        validate_native_mxfp4_bias(
-            store,
-            &format!("{prefix}.gate_up_proj_bias"),
-            &[experts, 2 * intermediate],
-            &mut issues,
-        );
-        validate_native_mxfp4_tensor(
-            store,
-            &format!("{prefix}.down_proj_blocks"),
-            &[experts, hidden, intermediate / 32, 16],
-            false,
-            &mut issues,
-        );
-        validate_native_mxfp4_tensor(
-            store,
-            &format!("{prefix}.down_proj_scales"),
-            &[experts, hidden, intermediate / 32],
-            true,
-            &mut issues,
-        );
-        validate_native_mxfp4_bias(
-            store,
-            &format!("{prefix}.down_proj_bias"),
-            &[experts, hidden],
-            &mut issues,
-        );
-    }
-    for name in store.keys() {
-        if !allowed.contains(&name) {
-            issues.push(unexpected_layout(&name, "GPT-OSS SafeTensors"));
-        }
-    }
-    finish(issues)
+    gpt_oss_checkpoint::validate_safetensors(config, store)
 }
 
 fn validate_kimi_linear_safetensors(
@@ -2699,80 +2470,6 @@ fn validate_float_element_count(
             tensor_type_code: None,
             metadata_key: None,
         });
-    }
-}
-
-fn validate_native_mxfp4_tensor(
-    store: &SafetensorsWeightStore,
-    name: &str,
-    shape: &[usize],
-    companion: bool,
-    issues: &mut Vec<StructuralIssue>,
-) {
-    let metadata = match store.metadata(name) {
-        Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. })
-            if companion =>
-        {
-            issues.push(quantization_companion_issue(
-                name,
-                format!("native MXFP4 expert weight is missing required companion {name:?}"),
-            ));
-            return;
-        }
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
-            issues.push(missing(name));
-            return;
-        }
-        Err(error) => {
-            issues.push(layout(name, error.to_string()));
-            return;
-        }
-    };
-    if metadata.shape != shape || !matches!(metadata.stored_dtype, StoredDtype::U8) {
-        let detail = format!(
-            "native MXFP4 tensor {name:?} expected shape {shape:?} and U8 storage, got {:?} {:?}",
-            metadata.shape, metadata.stored_dtype
-        );
-        if companion {
-            issues.push(quantization_companion_issue(name, detail));
-        } else {
-            if metadata.shape != shape {
-                issues.push(shape_mismatch(name, shape, &metadata.shape));
-            }
-            if !matches!(metadata.stored_dtype, StoredDtype::U8) {
-                issues.push(StructuralIssue {
-                    kind: StructuralIssueKind::UnsupportedEncoding,
-                    detail,
-                    tensor_name: Some(name.into()),
-                    tensor_type_code: None,
-                    metadata_key: Some("quantization_config.quant_method".into()),
-                });
-            }
-        }
-    }
-}
-
-fn validate_native_mxfp4_bias(
-    store: &SafetensorsWeightStore,
-    name: &str,
-    shape: &[usize],
-    issues: &mut Vec<StructuralIssue>,
-) {
-    match store.metadata(name) {
-        Ok(metadata)
-            if metadata.shape == shape && is_float_dtype(&metadata.stored_dtype) => {}
-        Ok(metadata) => issues.push(quantization_companion_issue(
-            name,
-            format!(
-                "native MXFP4 bias {name:?} expected shape {shape:?} and floating storage, got {:?} {:?}",
-                metadata.shape, metadata.stored_dtype
-            ),
-        )),
-        Err(_) => issues.push(quantization_companion_issue(
-            name,
-            format!("native MXFP4 expert weight is missing required bias {name:?}"),
-        )),
     }
 }
 
@@ -4335,63 +4032,7 @@ fn validate_gpt_oss_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(gpt_oss::translate_gguf_weight_name)
-    {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args = match gpt_oss::args_from_gguf_catalog(checkpoint, metadata) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > checkpoint.catalog().physical_tensor_count() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor GGUF catalog",
-            args.num_hidden_layers,
-            checkpoint.catalog().physical_tensor_count()
-        ));
-    }
-    let mut expected = gpt_oss_gguf_expected(&args);
-    for tensor in &mut expected {
-        if let Some(alias) = tensor.gguf_name.strip_suffix(".attn_sinks.weight") {
-            let alias = format!("{alias}.attn_sinks");
-            if checkpoint
-                .catalog()
-                .tensors()
-                .any(|actual| actual.descriptor().name == alias)
-            {
-                tensor.gguf_name = alias;
-            }
-        }
-    }
-    let allowed = expected
-        .iter()
-        .map(|tensor| tensor.gguf_name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut issues = validate_gguf_plan(checkpoint, expected, "GPT-OSS");
-    for actual in checkpoint.catalog().tensors() {
-        if !allowed.contains(&actual.descriptor().name) {
-            issues.push(unexpected_layout(&actual.descriptor().name, "GPT-OSS GGUF"));
-        }
-    }
-    issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
-        checkpoint,
-        (0..args.num_hidden_layers as usize).map(|layer| {
-            (
-                format!("blk.{layer}.ffn_gate_exps.weight"),
-                format!("blk.{layer}.ffn_up_exps.weight"),
-            )
-        }),
-        "GPT-OSS",
-    ));
-    finish(issues)
+    gpt_oss_checkpoint::validate_gguf(checkpoint, metadata)
 }
 
 fn validate_llama_gguf(
@@ -5126,16 +4767,6 @@ fn unexpected_layout(name: &str, loader_name: &str) -> StructuralIssue {
     }
 }
 
-fn shape_mismatch(name: &str, expected: &[usize], actual: &[usize]) -> StructuralIssue {
-    StructuralIssue {
-        kind: StructuralIssueKind::ShapeMismatch,
-        detail: format!("tensor {name:?} expected shape {expected:?}, got {actual:?}"),
-        tensor_name: Some(name.into()),
-        tensor_type_code: None,
-        metadata_key: None,
-    }
-}
-
 #[cfg(test)]
 mod admission_policy_tests {
     use super::*;
@@ -5143,7 +4774,8 @@ mod admission_policy_tests {
     #[test]
     fn non_strict_catalog_ignores_only_unexpected_tensors() {
         let unexpected = unexpected_layout("unrelated.weight", "test");
-        let malformed = shape_mismatch("model.weight", &[2, 2], &[1]);
+        let malformed =
+            crate::runtime::checkpoint::contract::shape_mismatch("model.weight", &[2, 2], &[1]);
         assert_eq!(
             StructuralValidation::Invalid(vec![unexpected.clone(), malformed.clone()])
                 .with_strict_catalog(false),
