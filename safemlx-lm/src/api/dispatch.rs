@@ -806,6 +806,25 @@ impl Model {
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
+    /// Returns each owned layer's processed-token delta relative to the
+    /// persisted prefix. Ordinary decoder layers use zero; speculative layers
+    /// may trail the target frontier.
+    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Exception> {
+        match self {
+            Self::DeepSeekV4(model) => deepseek_v4::prompt_cache_model_identity(
+                &model.args,
+                crate::PromptCacheTopology::default(),
+            )
+            .map(|identity| identity.layer_prefix_offsets)
+            .map_err(|error| Exception::custom(error.to_string())),
+            Self::DeepSeekV4Layerwise(model) => model
+                .prompt_cache_model_identity()
+                .map(|identity| identity.layer_prefix_offsets)
+                .map_err(|error| Exception::custom(error.to_string())),
+            _ => Ok(vec![0; self.prompt_cache_layer_layout()?.len()]),
+        }
+    }
+
     /// Runs an instrumented pass through the canonical generalized executor.
     pub fn forward_with_observer(
         &mut self,
@@ -1256,6 +1275,7 @@ impl Model {
             global_layer_start: 0,
             global_layer_end: layer_count,
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0; layer_count],
             topology: Default::default(),
             layer_layout,
         };

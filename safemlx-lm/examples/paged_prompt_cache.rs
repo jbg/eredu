@@ -139,6 +139,7 @@ fn main() -> anyhow::Result<()> {
         global_layer_start: 0,
         global_layer_end: layer_count,
         batch_size: 1,
+        layer_prefix_offsets: model.prompt_cache_layer_prefix_offsets()?,
         layer_layout,
         sink_tokens: 0,
         topology: PromptCacheTopology::default(),

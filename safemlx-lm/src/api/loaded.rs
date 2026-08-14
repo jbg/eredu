@@ -1876,6 +1876,11 @@ impl LoadedModel {
         self.model.prompt_cache_layer_layout()
     }
 
+    /// Returns each owned layer's processed-token delta from the persisted prefix.
+    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Exception> {
+        self.model.prompt_cache_layer_prefix_offsets()
+    }
+
     /// Opens a compatible reusable prefix for this loaded model.
     ///
     /// Block-paged families retain mmap-lazy attention shards. Resident hybrid

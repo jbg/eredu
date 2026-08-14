@@ -673,6 +673,7 @@ fn qwen3_vl_pipeline_ring_worker() {
         global_layer_start: topology.pipeline_parallel_rank,
         global_layer_end: topology.pipeline_parallel_rank + 1,
         batch_size: 1,
+        layer_prefix_offsets: vec![0],
         layer_layout: model.prompt_cache_layer_layout().unwrap(),
         sink_tokens: 0,
         topology: PromptCacheTopology {

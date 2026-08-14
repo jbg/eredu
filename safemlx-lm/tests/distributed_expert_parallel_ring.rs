@@ -442,6 +442,7 @@ fn expert_parallel_model_ring_worker() {
             global_layer_start: 0,
             global_layer_end: num_layers,
             batch_size: 1,
+            layer_prefix_offsets: vec![0; num_layers],
             layer_layout: model.prompt_cache_layer_layout().unwrap(),
             sink_tokens: 0,
             topology: PromptCacheTopology {

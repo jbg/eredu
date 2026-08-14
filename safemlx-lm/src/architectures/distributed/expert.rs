@@ -1309,6 +1309,11 @@ impl ExpertParallelModel {
         Ok(self.prompt_cache_model_identity()?.layer_layout)
     }
 
+    /// Returns each owned layer's processed-token delta from the persisted prefix.
+    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_prefix_offsets)
+    }
+
     fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         let layerwise_identity = match &self.architecture {
             ExpertArchitecture::KimiLinearLayerwise(model) => {
@@ -1446,6 +1451,7 @@ impl ExpertParallelModel {
             global_layer_start: 0,
             global_layer_end: layer_count,
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0; layer_count],
             topology: PromptCacheTopology {
                 pipeline: None,
                 tensor_parallel: (self.topology.tensor_parallel_size > 1).then_some((

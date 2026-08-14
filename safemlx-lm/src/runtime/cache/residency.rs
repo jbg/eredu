@@ -36,7 +36,7 @@ use crate::runtime::{
     residency::policy::CacheEvictionPolicy,
 };
 
-const PROMPT_CACHE_SCHEMA_VERSION: u32 = 6;
+const PROMPT_CACHE_SCHEMA_VERSION: u32 = 7;
 const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
 const PROMPT_CACHE_GENERATIONS_DIRECTORY: &str = ".generations";
 const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
@@ -3874,6 +3874,8 @@ impl CacheResidencyManager {
             || descriptor.global_layer_end > descriptor.layer_count
             || descriptor.layer_layout.len()
                 != descriptor.global_layer_end - descriptor.global_layer_start
+            || descriptor.layer_prefix_offsets.len()
+                != descriptor.global_layer_end - descriptor.global_layer_start
             || descriptor.batch_size == 0
             || descriptor.batch_size > i32::MAX as usize
         {
@@ -3988,6 +3990,7 @@ impl CacheResidencyManager {
             }
             validate_state_arrays(
                 &descriptor.layer_layout,
+                &descriptor.layer_prefix_offsets,
                 descriptor.global_layer_start,
                 descriptor.batch_size,
                 prefix_token_ids.len(),
@@ -4039,6 +4042,7 @@ impl CacheResidencyManager {
                 total_prefix_tokens: prefix_token_ids.len(),
                 prefix_sha256: hash_token_ids(prefix_token_ids),
                 layer_layout: descriptor.layer_layout,
+                layer_prefix_offsets: descriptor.layer_prefix_offsets,
                 sink_tokens: descriptor.sink_tokens,
                 topology: descriptor.topology,
                 application_namespace: options.application_namespace.clone(),
@@ -4830,6 +4834,7 @@ fn state_policy(
 
 fn validate_state_arrays(
     layers: &LayerSchedule<LayerCachePolicy>,
+    layer_prefix_offsets: &[i32],
     global_layer_start: usize,
     batch_size: usize,
     prefix_tokens: usize,
@@ -4850,7 +4855,23 @@ fn validate_state_arrays(
                     state.role, state.owner
                 ))
             })?;
-        let expected = resolved_state_shape(policy, batch_size, prefix_tokens)?;
+        let StateTensorOwner::Layer(global_layer) = state.owner;
+        let layer_index = global_layer
+            .checked_sub(global_layer_start)
+            .ok_or_else(|| {
+                CacheResidencyError::MalformedManifest(format!(
+                    "fixed-state tensor owner {global_layer} precedes the owned layer range"
+                ))
+            })?;
+        let layer_tokens = layer_prefix_tokens(
+            prefix_tokens,
+            *layer_prefix_offsets.get(layer_index).ok_or_else(|| {
+                CacheResidencyError::MalformedManifest(format!(
+                    "missing prefix offset for global layer {global_layer}"
+                ))
+            })?,
+        )?;
+        let expected = resolved_state_shape(policy, batch_size, layer_tokens)?;
         if state.array.shape() != expected {
             return Err(CacheResidencyError::MalformedManifest(format!(
                 "fixed-state tensor {:?} for {:?} has shape {:?}, expected {:?}",
@@ -4871,8 +4892,17 @@ fn validate_state_arrays(
     let mut expected = Vec::new();
     for (index, layer) in layers.iter().enumerate() {
         let owner = StateTensorOwner::Layer(global_layer_start + index);
+        let layer_tokens = layer_prefix_tokens(
+            prefix_tokens,
+            *layer_prefix_offsets.get(index).ok_or_else(|| {
+                CacheResidencyError::MalformedManifest(format!(
+                    "missing prefix offset for global layer {}",
+                    global_layer_start + index
+                ))
+            })?,
+        )?;
         for policy in layer.fixed_state() {
-            if policy.is_required_for(prefix_tokens) || seen.contains(&(owner, policy.role)) {
+            if policy.is_required_for(layer_tokens) || seen.contains(&(owner, policy.role)) {
                 expected.push((owner, policy.role));
             }
         }
@@ -4926,6 +4956,9 @@ pub struct PromptCacheDescriptor {
     pub batch_size: usize,
     /// Exact ordered cache state and attention layout for the owned layer range.
     pub layer_layout: LayerSchedule<LayerCachePolicy>,
+    /// Per-owned-layer processed-token delta relative to the persisted prefix.
+    /// Ordinary decoder layers use zero; speculative layers may trail it.
+    pub layer_prefix_offsets: Vec<i32>,
     /// Attention sink or pinned-prefix token count.
     pub sink_tokens: usize,
     /// Distributed rank-local layout.
@@ -4944,6 +4977,7 @@ pub struct PromptCacheModelIdentity {
     pub(crate) sink_tokens: usize,
     pub(crate) topology: PromptCacheTopology,
     pub(crate) layer_layout: LayerSchedule<LayerCachePolicy>,
+    pub(crate) layer_prefix_offsets: Vec<i32>,
 }
 
 impl PromptCacheModelIdentity {
@@ -5005,6 +5039,7 @@ pub(crate) fn validate_prompt_cache_model_identity(
     require_model_equal!(sink_tokens);
     require_model_equal!(topology);
     require_model_equal!(layer_layout);
+    require_model_equal!(layer_prefix_offsets);
     let owned_layers = model
         .global_layer_end
         .checked_sub(model.global_layer_start)
@@ -5017,6 +5052,12 @@ pub(crate) fn validate_prompt_cache_model_identity(
         return Err(CacheResidencyError::IncompatiblePromptCache(format!(
             "loaded model supplied {} cache layouts for {owned_layers} owned layers",
             model.layer_layout.len()
+        )));
+    }
+    if model.layer_prefix_offsets.len() != owned_layers {
+        return Err(CacheResidencyError::IncompatiblePromptCache(format!(
+            "loaded model supplied {} layer prefix offsets for {owned_layers} owned layers",
+            model.layer_prefix_offsets.len()
         )));
     }
     Ok(())
@@ -5144,6 +5185,8 @@ pub struct PromptCacheManifest {
     pub prefix_sha256: String,
     /// Exact ordered cache state, attention policy, and tensor geometry.
     pub layer_layout: LayerSchedule<LayerCachePolicy>,
+    /// Per-owned-layer processed-token delta relative to `total_prefix_tokens`.
+    pub layer_prefix_offsets: Vec<i32>,
     /// Pinned prefix or sink token count.
     pub sink_tokens: usize,
     /// Distributed rank-local representation.
@@ -5731,6 +5774,7 @@ fn validate_compatibility(
     require_equal!(global_layer_end);
     require_equal!(batch_size);
     require_equal!(layer_layout);
+    require_equal!(layer_prefix_offsets);
     require_equal!(sink_tokens);
     require_equal!(topology);
     if manifest.total_prefix_tokens != prefix_token_ids.len()
@@ -5756,6 +5800,8 @@ fn validate_manifest(
         || manifest.global_layer_start >= manifest.global_layer_end
         || manifest.global_layer_end > manifest.layer_count
         || manifest.layer_layout.len() != manifest.global_layer_end - manifest.global_layer_start
+        || manifest.layer_prefix_offsets.len()
+            != manifest.global_layer_end - manifest.global_layer_start
         || manifest.batch_size == 0
         || manifest.batch_size > i32::MAX as usize
         || manifest.total_prefix_tokens == 0
@@ -5763,6 +5809,9 @@ fn validate_manifest(
         return Err(CacheResidencyError::MalformedManifest(
             "invalid global cache dimensions".into(),
         ));
+    }
+    for offset in &manifest.layer_prefix_offsets {
+        layer_prefix_tokens(manifest.total_prefix_tokens, *offset)?;
     }
     for (index, policy) in manifest.layer_layout.iter().enumerate() {
         validate_layer_cache_policy(policy).map_err(|error| {
@@ -5791,7 +5840,11 @@ fn validate_manifest(
             || block.global_layer >= manifest.global_layer_end
             || block.start < 0
             || block.end <= block.start
-            || block.end > manifest.total_prefix_tokens as i64
+            || block.end
+                > layer_prefix_tokens(
+                    manifest.total_prefix_tokens,
+                    manifest.layer_prefix_offsets[block.global_layer - manifest.global_layer_start],
+                )? as i64
             || block.logical_bytes == 0
             || block.first_shape.is_empty()
             || block.second_shape.is_empty()
@@ -5986,8 +6039,12 @@ fn validate_manifest(
     let mut expected_state = Vec::new();
     for (index, layer) in manifest.layer_layout.iter().enumerate() {
         let owner = StateTensorOwner::Layer(manifest.global_layer_start + index);
+        let layer_prefix_tokens = layer_prefix_tokens(
+            manifest.total_prefix_tokens,
+            manifest.layer_prefix_offsets[index],
+        )?;
         for policy in layer.fixed_state() {
-            if policy.is_required_for(manifest.total_prefix_tokens)
+            if policy.is_required_for(layer_prefix_tokens)
                 || actual_state.contains(&(owner, policy.role))
             {
                 expected_state.push((owner, policy));
@@ -6008,9 +6065,15 @@ fn validate_manifest(
                 entry.owner, entry.role
             )));
         }
-        let expected_shape =
-            resolved_state_shape(policy, manifest.batch_size, manifest.total_prefix_tokens)
-                .map_err(|error| CacheResidencyError::MalformedManifest(error.to_string()))?;
+        let layer = match owner {
+            StateTensorOwner::Layer(layer) => layer,
+        };
+        let layer_prefix_tokens = layer_prefix_tokens(
+            manifest.total_prefix_tokens,
+            manifest.layer_prefix_offsets[layer - manifest.global_layer_start],
+        )?;
+        let expected_shape = resolved_state_shape(policy, manifest.batch_size, layer_prefix_tokens)
+            .map_err(|error| CacheResidencyError::MalformedManifest(error.to_string()))?;
         if entry.shape != expected_shape
             || !state_dtype_matches(policy.dtype, &entry.dtype)
             || entry.logical_bytes == 0
@@ -6029,6 +6092,10 @@ fn validate_manifest(
         validate_state_shard_file(&shard, entry)?;
     }
     for layer in manifest.global_layer_start..manifest.global_layer_end {
+        let layer_prefix_tokens = layer_prefix_tokens(
+            manifest.total_prefix_tokens,
+            manifest.layer_prefix_offsets[layer - manifest.global_layer_start],
+        )?;
         let policy = manifest
             .layer_layout
             .get(layer - manifest.global_layer_start)
@@ -6049,14 +6116,17 @@ fn validate_manifest(
             }
             continue;
         }
-        if entries.is_empty() {
+        if entries.is_empty() && layer_prefix_tokens != 0 {
             return Err(CacheResidencyError::MalformedManifest(format!(
                 "missing blocks for global layer {layer}"
             )));
         }
+        if layer_prefix_tokens == 0 {
+            continue;
+        }
         let mut entries = entries;
         entries.sort_by_key(|block| block.start);
-        let required_start = required_persisted_start(policy, manifest.total_prefix_tokens)?;
+        let required_start = required_persisted_start(policy, layer_prefix_tokens)?;
         let mut expected_start = entries[0].start;
         if expected_start > required_start
             || (matches!(policy.attention(), Some(AttentionPolicy::Full)) && expected_start != 0)
@@ -6074,10 +6144,9 @@ fn validate_manifest(
             }
             expected_start = block.end;
         }
-        if expected_start != manifest.total_prefix_tokens as i64 {
+        if expected_start != layer_prefix_tokens as i64 {
             return Err(CacheResidencyError::MalformedManifest(format!(
-                "global layer {layer} ends at {expected_start}, expected {}",
-                manifest.total_prefix_tokens
+                "global layer {layer} ends at {expected_start}, expected {layer_prefix_tokens}",
             )));
         }
     }
@@ -6103,6 +6172,10 @@ fn validate_complete_prefix(
         ));
     }
     for layer in descriptor.global_layer_start..descriptor.global_layer_end {
+        let layer_prefix_tokens = layer_prefix_tokens(
+            prefix_tokens,
+            descriptor.layer_prefix_offsets[layer - descriptor.global_layer_start],
+        )?;
         let policy = descriptor
             .layer_layout
             .get(layer - descriptor.global_layer_start)
@@ -6127,12 +6200,15 @@ fn validate_complete_prefix(
             continue;
         }
         blocks.sort_by_key(|record| record.id.start);
-        if blocks.is_empty() {
+        if blocks.is_empty() && layer_prefix_tokens != 0 {
             return Err(CacheResidencyError::MalformedManifest(format!(
                 "global layer {layer} has no persisted cache blocks"
             )));
         }
-        let required_start = required_persisted_start(policy, prefix_tokens)?;
+        if layer_prefix_tokens == 0 {
+            continue;
+        }
+        let required_start = required_persisted_start(policy, layer_prefix_tokens)?;
         let mut end = blocks[0].id.start;
         if end > required_start
             || (matches!(policy.attention(), Some(AttentionPolicy::Full)) && end != 0)
@@ -6222,9 +6298,9 @@ fn validate_complete_prefix(
             }
             end = block.id.end;
         }
-        if end != prefix_tokens as i64 {
+        if end != layer_prefix_tokens as i64 {
             return Err(CacheResidencyError::MalformedManifest(format!(
-                "global layer {layer} contains {end} tokens, expected {prefix_tokens}"
+                "global layer {layer} contains {end} tokens, expected {layer_prefix_tokens}"
             )));
         }
     }
@@ -6247,6 +6323,22 @@ fn required_persisted_start(
             Ok((total - retained_past).max(0))
         }
     }
+}
+
+fn layer_prefix_tokens(
+    total_prefix_tokens: usize,
+    offset: i32,
+) -> Result<usize, CacheResidencyError> {
+    if offset > 0 {
+        return Err(CacheResidencyError::MalformedManifest(
+            "layer prefix offsets must not advance beyond the persisted prefix".into(),
+        ));
+    }
+    total_prefix_tokens.checked_sub(offset.unsigned_abs() as usize).ok_or_else(|| {
+        CacheResidencyError::MalformedManifest(format!(
+            "layer prefix offset {offset} precedes the start of a {total_prefix_tokens}-token prefix"
+        ))
+    })
 }
 
 fn validate_block_arrays(
@@ -7896,6 +7988,7 @@ mod tests {
             batch_size: 1,
             layer_layout: PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0],
             topology: PromptCacheTopology::default(),
         }
     }
@@ -7922,6 +8015,7 @@ mod tests {
             global_layer_start: descriptor.global_layer_start,
             global_layer_end: descriptor.global_layer_end,
             sink_tokens: descriptor.sink_tokens,
+            layer_prefix_offsets: descriptor.layer_prefix_offsets,
             topology: descriptor.topology,
             layer_layout: descriptor.layer_layout,
         }
@@ -7956,6 +8050,7 @@ mod tests {
             prefix_sha256: hash_token_ids(&[7]),
             layer_layout: descriptor.layer_layout,
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0],
             topology: PromptCacheTopology::default(),
             application_namespace: Some(namespace.into()),
             blocks: vec![PromptCacheBlock {
@@ -8101,6 +8196,49 @@ mod tests {
     }
 
     #[test]
+    fn v7_layer_frontiers_validate_speculative_cache_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = write_prompt_fixture(directory.path(), "speculative-frontier");
+        manifest.layer_count = 2;
+        manifest.global_layer_end = 2;
+        manifest.total_prefix_tokens = 2;
+        manifest.prefix_sha256 = hash_token_ids(&[7, 8]);
+        manifest.layer_layout = key_value_layout([None, None]);
+        manifest.layer_prefix_offsets = vec![0, -1];
+
+        let first = manifest.blocks[0].clone();
+        let mut target_tail = first.clone();
+        target_tail.start = 1;
+        target_tail.end = 2;
+        let mut draft = first;
+        draft.global_layer = 1;
+        manifest.blocks = vec![manifest.blocks[0].clone(), target_tail, draft];
+        fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            inspect_prompt_cache(directory.path())
+                .unwrap()
+                .layer_prefix_offsets,
+            [0, -1]
+        );
+
+        manifest.layer_prefix_offsets = vec![0, 0];
+        fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(inspect_prompt_cache(directory.path())
+            .unwrap_err()
+            .to_string()
+            .contains("ends at 1, expected 2"));
+    }
+
+    #[test]
     fn v5_behavioral_state_layout_round_trips_and_changes_identity() {
         let incoherent = StateTensorPolicy::new(
             StateTensorRole::Recurrent,
@@ -8219,6 +8357,7 @@ mod tests {
                 vec![LayerCachePolicy::fixed_only(vec![policy]).unwrap()],
             )
             .unwrap(),
+            layer_prefix_offsets: vec![0],
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
             application_namespace: None,
@@ -8283,6 +8422,7 @@ mod tests {
         two_layers.layer_count = 2;
         two_layers.global_layer_end = 2;
         two_layers.layer_layout = key_value_layout([None, Some(7)]);
+        two_layers.layer_prefix_offsets = vec![0, 0];
         let mut second = two_layers.blocks[0].clone();
         second.global_layer = 1;
         two_layers.blocks.push(second);
@@ -8575,6 +8715,7 @@ mod tests {
             global_layer_start: 0,
             global_layer_end: 1,
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0],
             topology: PromptCacheTopology::default(),
             layer_layout: PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
         };
@@ -8595,12 +8736,22 @@ mod tests {
             global_layer_start: descriptor.global_layer_start,
             global_layer_end: descriptor.global_layer_end,
             sink_tokens: descriptor.sink_tokens,
+            layer_prefix_offsets: descriptor.layer_prefix_offsets.clone(),
             topology: descriptor.topology.clone(),
             layer_layout: descriptor.layer_layout.clone(),
         };
         descriptor.architecture_fingerprint = "sha256:caller-repeated-stale-value".into();
         let error = validate_prompt_cache_model_identity(&descriptor, &loaded_model).unwrap_err();
         assert!(error.to_string().contains("architecture_fingerprint"));
+    }
+
+    #[test]
+    fn loaded_model_identity_rejects_a_forged_layer_frontier() {
+        let mut descriptor = prompt_descriptor();
+        let loaded_model = prompt_model_identity();
+        descriptor.layer_prefix_offsets = vec![-1];
+        let error = validate_prompt_cache_model_identity(&descriptor, &loaded_model).unwrap_err();
+        assert!(error.to_string().contains("layer_prefix_offsets"));
     }
 
     #[test]

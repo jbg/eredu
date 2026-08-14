@@ -712,6 +712,7 @@ fn pipeline_ring_worker() {
         global_layer_start: family.stage_range(pipeline_rank).start,
         global_layer_end: family.stage_range(pipeline_rank).end,
         batch_size: 1,
+        layer_prefix_offsets: vec![0; family.stage_range(pipeline_rank).len()],
         layer_layout: model.prompt_cache_layer_layout().unwrap(),
         sink_tokens: 0,
         topology: PromptCacheTopology {

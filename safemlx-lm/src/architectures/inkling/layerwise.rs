@@ -2411,6 +2411,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             global_layer_start: 0,
             global_layer_end: layer_count,
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
                 PromptCacheTopology::for_parallel_topology,
@@ -5235,6 +5236,7 @@ mod tests {
             global_layer_start: identity.global_layer_start,
             global_layer_end: identity.global_layer_end,
             batch_size: 1,
+            layer_prefix_offsets: identity.layer_prefix_offsets,
             layer_layout: identity.layer_layout,
             sink_tokens: identity.sink_tokens,
             topology: identity.topology,

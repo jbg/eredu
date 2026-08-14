@@ -1301,10 +1301,11 @@ impl Model {
     pub(crate) fn prompt_cache_layer_layout(
         &self,
     ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
-        prompt_cache_layer_layout(&self.args, 0..self.args.num_hidden_layers as usize)
+        prompt_cache_layer_layout(&self.args, 0..prompt_cache_layer_count(&self.args))
     }
 
-    /// Atomically persists target KV plus compressed pooling/indexer state.
+    /// Atomically persists target and speculative attention state plus
+    /// compressed pooling/indexer state.
     pub fn save_prompt_cache(
         &self,
         cache: &mut Cache,
@@ -1330,7 +1331,8 @@ impl Model {
         )
     }
 
-    /// Restores target KV plus compressed pooling/indexer state exactly.
+    /// Restores target and speculative attention state plus compressed
+    /// pooling/indexer state exactly.
     pub fn load_prompt_cache(
         &self,
         directory: impl AsRef<Path>,
@@ -1469,18 +1471,48 @@ pub(crate) fn prompt_cache_model_identity(
     args: &ModelArgs,
     topology: PromptCacheTopology,
 ) -> Result<PromptCacheModelIdentity, Error> {
-    let layer_count = args.num_hidden_layers as usize;
+    let layer_count = prompt_cache_layer_count(args);
+    prompt_cache_model_identity_for_range(args, topology, 0..layer_count)
+}
+
+pub(crate) fn prompt_cache_model_identity_for_range(
+    args: &ModelArgs,
+    topology: PromptCacheTopology,
+    range: std::ops::Range<usize>,
+) -> Result<PromptCacheModelIdentity, Error> {
+    let layer_count = prompt_cache_layer_count(args);
     Ok(PromptCacheModelIdentity {
         model_family: "deepseek_v4".into(),
         effective_model_type: args.model_type.clone(),
         architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
         layer_count,
-        global_layer_start: 0,
-        global_layer_end: layer_count,
+        global_layer_start: range.start,
+        global_layer_end: range.end,
         sink_tokens: 0,
+        layer_prefix_offsets: prompt_cache_layer_prefix_offsets(args, range.clone()),
         topology,
-        layer_layout: prompt_cache_layer_layout(args, 0..layer_count)?,
+        layer_layout: prompt_cache_layer_layout(args, range)?,
     })
+}
+
+pub(crate) fn prompt_cache_layer_count(args: &ModelArgs) -> usize {
+    args.num_hidden_layers as usize + args.num_nextn_predict_layers.max(0) as usize
+}
+
+pub(crate) fn prompt_cache_layer_prefix_offsets(
+    args: &ModelArgs,
+    range: std::ops::Range<usize>,
+) -> Vec<i32> {
+    let target_count = args.num_hidden_layers as usize;
+    range
+        .map(|layer| {
+            if layer >= target_count && args.dspark.is_none() {
+                -1
+            } else {
+                0
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn save_prompt_cache_with_rank(
@@ -1493,12 +1525,13 @@ pub(crate) fn save_prompt_cache_with_rank(
     stream: &Stream,
 ) -> Result<PromptCacheManifest, Error> {
     if let Some(manager) = cache.residency_manager().cloned() {
-        for layer in &mut cache.layers {
+        for layer in cache.layers.iter_mut().chain(&mut cache.mtp_layers) {
             layer.finalize()?;
         }
         let state = cache
             .layers
             .iter()
+            .chain(&cache.mtp_layers)
             .enumerate()
             .flat_map(|(index, cache)| {
                 cache.prompt_cache_state_arrays(descriptor.global_layer_start + index)
@@ -1508,8 +1541,14 @@ pub(crate) fn save_prompt_cache_with_rank(
             .save_prompt_cache(destination, descriptor, prefix_token_ids, &state, options)
             .map_err(|error| Exception::custom(error.to_string()).into());
     }
+    let caches = cache
+        .layers
+        .iter()
+        .chain(&cache.mtp_layers)
+        .cloned()
+        .collect::<Vec<_>>();
     save_attention_prompt_cache(
-        &cache.layers,
+        &caches,
         destination,
         descriptor,
         prefix_token_ids,
@@ -1528,26 +1567,34 @@ pub(crate) fn save_attention_prompt_cache(
     rank: Option<CacheRankIdentity>,
     stream: &Stream,
 ) -> Result<PromptCacheManifest, Error> {
-    let end = i32::try_from(prefix_token_ids.len())
+    let prefix_end = i32::try_from(prefix_token_ids.len())
         .map_err(|_| Error::UnsupportedArchitecture("V4 prompt length exceeds i32".into()))?;
     if caches.len() != descriptor.layer_layout.len() {
         return Err(Error::UnsupportedArchitecture(format!(
-            "V4 cache contains {} target layers, descriptor contains {}",
+            "V4 cache contains {} layers, descriptor contains {}",
             caches.len(),
             descriptor.layer_layout.len()
         )));
     }
     let mut blocks = Vec::with_capacity(caches.len());
     for (index, layer_cache) in caches.iter().enumerate() {
-        if layer_cache.offset() != end {
+        let end = prefix_end
+            .checked_add(descriptor.layer_prefix_offsets[index])
+            .ok_or_else(|| Error::UnsupportedArchitecture("V4 layer offset overflow".into()))?;
+        if end < 0 || layer_cache.offset() != end {
             return Err(Error::UnsupportedArchitecture(format!(
                 "V4 layer {index} cache offset {} does not match prefix {end}",
                 layer_cache.offset()
             )));
         }
-        let (keys, values) = layer_cache.local_snapshot(stream)?.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!("V4 layer {index} local KV state is missing"))
-        })?;
+        let Some((keys, values)) = layer_cache.local_snapshot(stream)? else {
+            if end == 0 {
+                continue;
+            }
+            return Err(Error::UnsupportedArchitecture(format!(
+                "V4 layer {index} local KV state is missing"
+            )));
+        };
         if values.dim(-1) != 0 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "V4 layer {index} local cache unexpectedly contains value channels"
@@ -1657,14 +1704,22 @@ pub(crate) fn load_prompt_cache_with_identity(
     let mut cache = paged_cache_for_args(
         args,
         manager,
-        prefix_tokens,
+        expected.sink_tokens as i32,
         identity.topology.cache_rank_identity(),
     )?;
-    for (index, layer) in cache.layers.iter_mut().enumerate() {
+    for (index, layer) in cache
+        .layers
+        .iter_mut()
+        .chain(&mut cache.mtp_layers)
+        .enumerate()
+    {
+        let processed_tokens = prefix_tokens
+            .checked_add(identity.layer_prefix_offsets[index])
+            .ok_or_else(|| Error::UnsupportedArchitecture("V4 layer offset overflow".into()))?;
         layer.restore_prompt_cache_state(
             identity.global_layer_start + index,
             &mut state,
-            prefix_tokens,
+            processed_tokens,
         )?;
     }
     if !state.is_empty() {
@@ -1704,6 +1759,11 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
             ("index_head_dim", args.index_head_dim.to_string()),
             ("index_topk", args.index_topk.to_string()),
             ("hc_mult", args.hc_mult.to_string()),
+            (
+                "num_nextn_predict_layers",
+                args.num_nextn_predict_layers.to_string(),
+            ),
+            ("dspark", format!("{:?}", args.dspark)),
             (
                 "native_quantization",
                 format!("{:?}", args.quantization_config),
@@ -2430,8 +2490,9 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 #[cfg(test)]
 mod tests {
     use super::{
-        load_prompt_cache_with_identity, prompt_cache_model_identity, save_prompt_cache_with_rank,
-        AttentionCache, Cache, ModelArgs,
+        empty_cache_for_args, load_prompt_cache_with_identity, prompt_cache_model_identity,
+        prompt_cache_model_identity_for_range, save_prompt_cache_with_rank, AttentionCache, Cache,
+        ModelArgs,
     };
     use crate::runtime::cache::{
         residency::{
@@ -2477,6 +2538,17 @@ mod tests {
         let args = ModelArgs::from_value(minimal_config()).unwrap();
         assert_eq!(args.compress_ratios, [0, 4, 128, 0]);
         assert_eq!(args.num_nextn_predict_layers, 1);
+        let first =
+            prompt_cache_model_identity_for_range(&args, PromptCacheTopology::default(), 0..1)
+                .unwrap();
+        let final_stage =
+            prompt_cache_model_identity_for_range(&args, PromptCacheTopology::default(), 1..4)
+                .unwrap();
+        assert_eq!(first.layer_count, 4);
+        assert_eq!(first.layer_prefix_offsets, [0]);
+        assert_eq!(final_stage.global_layer_start, 1);
+        assert_eq!(final_stage.global_layer_end, 4);
+        assert_eq!(final_stage.layer_prefix_offsets, [0, 0, -1]);
     }
 
     #[test]
@@ -2545,20 +2617,28 @@ mod tests {
     }
 
     fn populated_cache(args: &ModelArgs, prefix: i32, stream: &Stream) -> Cache {
-        let layers = args.compress_ratios[..args.num_hidden_layers as usize]
-            .iter()
-            .map(|ratio| AttentionCache::new_for_ratio(*ratio, args.sliding_window).unwrap())
-            .collect::<Vec<_>>();
-        let mut cache = Cache {
-            layers,
-            mtp_layers: Vec::new(),
-        };
+        let mut cache = empty_cache_for_args(args).unwrap();
         populate_cache(&mut cache, args, prefix, stream);
         cache
     }
 
     fn populate_cache(cache: &mut Cache, args: &ModelArgs, prefix: i32, stream: &Stream) {
-        for cache in &mut cache.layers {
+        populate_cache_layers(&mut cache.layers, args, prefix, stream);
+        let draft_prefix = if args.dspark.is_some() {
+            prefix
+        } else {
+            (prefix - 1).max(0)
+        };
+        populate_cache_layers(&mut cache.mtp_layers, args, draft_prefix, stream);
+    }
+
+    fn populate_cache_layers(
+        caches: &mut [AttentionCache],
+        args: &ModelArgs,
+        prefix: i32,
+        stream: &Stream,
+    ) {
+        for cache in caches {
             let keys = zeros_dtype(&[1, 1, prefix, args.head_dim], Dtype::Float32, stream).unwrap();
             let values = zeros_dtype(&[1, 1, prefix, 0], Dtype::Float32, stream).unwrap();
             match cache {
@@ -2596,6 +2676,7 @@ mod tests {
             global_layer_end: identity.global_layer_end,
             batch_size: 1,
             layer_layout: identity.layer_layout,
+            layer_prefix_offsets: identity.layer_prefix_offsets,
             sink_tokens: identity.sink_tokens,
             topology: identity.topology,
         }
@@ -2623,7 +2704,8 @@ mod tests {
                 &stream,
             )
             .unwrap();
-            assert_eq!(manifest.blocks.len(), 3);
+            assert_eq!(manifest.blocks.len(), 4);
+            assert_eq!(manifest.layer_prefix_offsets, [0, 0, 0, -1]);
             assert_eq!(manifest.state_tensors.len(), expected_total);
 
             let identity =
@@ -2640,10 +2722,11 @@ mod tests {
             .unwrap();
             assert_eq!(restored_manifest, manifest);
             assert_eq!(restored.offset(), length as i32);
+            assert_eq!(restored.mtp_layers[0].offset(), length as i32 - 1);
             let report = restored.residency_report().unwrap().unwrap();
-            assert_eq!(report.disk_blocks, 3);
+            assert_eq!(report.disk_blocks, 4);
             assert_eq!(report.device_blocks, 0);
-            assert_eq!(report.imported_mapped_shards, 3);
+            assert_eq!(report.imported_mapped_shards, 4);
             assert_eq!(
                 restored.layers[1].prompt_cache_state_arrays(1).len(),
                 expected_sparse
@@ -2653,6 +2736,43 @@ mod tests {
                 expected_long
             );
         }
+    }
+
+    #[test]
+    fn one_token_prompt_persists_an_empty_ordinary_mtp_frontier() {
+        let args = ModelArgs::from_value(minimal_config()).unwrap();
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let mut cache = empty_cache_for_args(&args).unwrap();
+        populate_cache_layers(&mut cache.layers, &args, 1, &stream);
+        let destination = TempDir::new().unwrap();
+        let path = destination.path().join("cache");
+        let descriptor = descriptor(&args);
+        let manifest = save_prompt_cache_with_rank(
+            &mut cache,
+            &path,
+            descriptor.clone(),
+            &[7],
+            &PromptCacheOptions::default(),
+            None,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(manifest.layer_prefix_offsets, [0, 0, 0, -1]);
+        assert_eq!(manifest.blocks.len(), 3);
+
+        let identity = prompt_cache_model_identity(&args, PromptCacheTopology::default()).unwrap();
+        let (restored, _) = load_prompt_cache_with_identity(
+            &args,
+            &path,
+            &descriptor,
+            &[7],
+            identity,
+            paged_options(1),
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(restored.offset(), 1);
+        assert_eq!(restored.mtp_layers[0].offset(), 0);
     }
 
     #[test]
@@ -2677,7 +2797,7 @@ mod tests {
             &stream,
         )
         .unwrap();
-        assert_eq!(manifest.blocks.len(), 9);
+        assert_eq!(manifest.blocks.len(), 11);
 
         drop(cache);
         let identity = prompt_cache_model_identity(&args, PromptCacheTopology::default()).unwrap();
@@ -2693,11 +2813,13 @@ mod tests {
         .unwrap();
         assert_eq!(restored_manifest, manifest);
         assert_eq!(restored.offset(), prefix.len() as i32);
+        assert_eq!(restored.mtp_layers[0].offset(), prefix.len() as i32 - 1);
         let report = restored.residency_report().unwrap().unwrap();
-        assert_eq!(report.disk_blocks, 9);
+        assert_eq!(report.disk_blocks, 11);
         assert_eq!(report.device_blocks, 0);
 
-        for layer in &mut restored.layers {
+        for layer in restored.layers.iter_mut().chain(&mut restored.mtp_layers) {
+            let expected = layer.offset() + 1;
             let keys = zeros_dtype(&[1, 1, 1, args.head_dim], Dtype::Float32, &stream).unwrap();
             let values = zeros_dtype(&[1, 1, 1, 0], Dtype::Float32, &stream).unwrap();
             let local = match layer {
@@ -2706,11 +2828,57 @@ mod tests {
                 | AttentionCache::Sparse { local, .. } => local,
             };
             let (visible, sentinel) = local.update_and_fetch(keys, values, &stream).unwrap();
-            assert_eq!(visible.dim(-2), prefix.len() as i32 + 1);
+            assert_eq!(visible.dim(-2), expected);
             assert_eq!(sentinel.dim(-1), 1);
         }
         let report = restored.residency_report().unwrap().unwrap();
         assert!(report.device_blocks > 0);
+    }
+
+    #[test]
+    fn fused_dspark_cache_round_trips_at_the_target_frontier() {
+        let mut config = minimal_config();
+        config["dspark_block_size"] = json!(4);
+        config["dspark_noise_token_id"] = json!(0);
+        config["dspark_target_layer_ids"] = json!([0, 2]);
+        config["dspark_markov_rank"] = json!(8);
+        let args = ModelArgs::from_value(config).unwrap();
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let prefix = [0, 1, 2, 3, 4];
+        let options = paged_options(2);
+        let manager = super::CacheResidencyManager::new(options.clone()).unwrap();
+        let mut cache = super::paged_cache_for_args(&args, manager, 0, None).unwrap();
+        populate_cache(&mut cache, &args, prefix.len() as i32, &stream);
+        let destination = TempDir::new().unwrap();
+        let path = destination.path().join("cache");
+        let descriptor = descriptor(&args);
+        let manifest = save_prompt_cache_with_rank(
+            &mut cache,
+            &path,
+            descriptor.clone(),
+            &prefix,
+            &PromptCacheOptions::default(),
+            None,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(manifest.layer_prefix_offsets, [0, 0, 0, 0]);
+        assert_eq!(manifest.blocks.len(), 12);
+
+        drop(cache);
+        let identity = prompt_cache_model_identity(&args, PromptCacheTopology::default()).unwrap();
+        let (restored, _) = load_prompt_cache_with_identity(
+            &args,
+            &path,
+            &descriptor,
+            &prefix,
+            identity,
+            options,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(restored.offset(), prefix.len() as i32);
+        assert_eq!(restored.mtp_layers[0].offset(), prefix.len() as i32);
     }
 
     #[test]

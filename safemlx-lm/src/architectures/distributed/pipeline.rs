@@ -3168,6 +3168,7 @@ fn pipeline_prompt_cache_identity(
         global_layer_start: range.start,
         global_layer_end: range.end,
         sink_tokens: 0,
+        layer_prefix_offsets: vec![0; layer_layout.len()],
         topology: PromptCacheTopology {
             pipeline: Some((
                 topology.pipeline_parallel_size,
@@ -3799,20 +3800,19 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         &self,
         topology: ParallelTopology,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "deepseek_v4",
-            &self.args.model_type,
-            crate::architectures::deepseek_v4::model::prompt_cache_architecture_fingerprint(
-                &self.args,
-            ),
-            self.args.num_hidden_layers as usize,
-            self.range.clone(),
-            crate::architectures::deepseek_v4::model::prompt_cache_layer_layout(
-                &self.args,
-                self.range.clone(),
-            )?,
-        ))
+        let target_count = self.args.num_hidden_layers as usize;
+        let layer_count =
+            crate::architectures::deepseek_v4::model::prompt_cache_layer_count(&self.args);
+        let range = if self.range.end == target_count {
+            self.range.start..layer_count
+        } else {
+            self.range.clone()
+        };
+        crate::architectures::deepseek_v4::model::prompt_cache_model_identity_for_range(
+            &self.args,
+            PromptCacheTopology::for_parallel_topology(topology),
+            range,
+        )
     }
 
     fn new_cache_layers(
@@ -6385,8 +6385,9 @@ impl PipelineModel {
         }
         let cache_identity = stage.prompt_cache_model_identity(topology)?;
         if cache_identity.global_layer_start != info.global_layer_range.start
-            || cache_identity.global_layer_end != info.global_layer_range.end
-            || cache_identity.layer_layout.len() != info.global_layer_range.len()
+            || cache_identity.global_layer_end < info.global_layer_range.end
+            || cache_identity.layer_layout.len()
+                != cache_identity.global_layer_end - cache_identity.global_layer_start
             || cache_identity.global_layer_end > cache_identity.layer_count
         {
             return Err(Error::Parallel(format!(
@@ -6564,6 +6565,11 @@ impl PipelineModel {
                 }
             }
         }
+        if let PipelineMtpCache::DeepSeekV4(caches) = &mut cache.mtp {
+            for cache in caches {
+                cache.finalize()?;
+            }
+        }
         let expected_offset = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Error::Parallel("pipeline prompt length exceeds i32".into()))?;
         let mut state_arrays = Vec::new();
@@ -6715,7 +6721,18 @@ impl PipelineModel {
                 "persisted pipeline cache contains unexpected fixed state".into(),
             ));
         }
-        let cache = PipelineCache::with_residency_manager(self.info.model_kind, layers, manager);
+        let mut cache =
+            PipelineCache::with_residency_manager(self.info.model_kind, layers, manager.clone());
+        if self.info.is_last {
+            let rank = Some(CacheRankIdentity {
+                pipeline_rank: Some(self.topology.pipeline_parallel_rank),
+                tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
+                    .then_some(self.topology.tensor_parallel_rank),
+                expert_parallel_rank: (self.topology.expert_parallel_size > 1)
+                    .then_some(self.topology.expert_parallel_rank),
+            });
+            cache.mtp = self.stage.new_embedded_mtp_cache(Some((manager, rank)))?;
+        }
         Ok((cache, manifest))
     }
 
@@ -6733,6 +6750,11 @@ impl PipelineModel {
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
         Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+
+    /// Returns each owned layer's processed-token delta from the persisted prefix.
+    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_prefix_offsets)
     }
 
     fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {

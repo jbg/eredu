@@ -173,6 +173,7 @@ impl GptOssLayerwiseModel {
             global_layer_start: 0,
             global_layer_end: layer_count,
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0; layer_count],
             topology: Default::default(),
             layer_layout: PromptCacheModelIdentity::key_value_layouts(
                 args.attention_schedule.iter().map(|policy| {
@@ -1005,6 +1006,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
             global_layer_start: 0,
             global_layer_end: layer_count,
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
                 PromptCacheTopology::for_parallel_topology,

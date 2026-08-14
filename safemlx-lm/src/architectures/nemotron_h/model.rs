@@ -3881,6 +3881,7 @@ impl Model {
             global_layer_start: 0,
             global_layer_end: layer_count,
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0; layer_count],
             topology: Default::default(),
             layer_layout: prompt_cache_layer_layout(args)
                 .map_err(|error| Exception::custom(error.to_string()))?,
@@ -5537,6 +5538,7 @@ mod tests {
             global_layer_start: 0,
             global_layer_end: layout.len(),
             batch_size: 1,
+            layer_prefix_offsets: vec![0; layout.len()],
             layer_layout: layout,
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
@@ -5726,6 +5728,7 @@ mod tests {
             global_layer_start: 0,
             global_layer_end: layout.len(),
             batch_size: 1,
+            layer_prefix_offsets: vec![0; layout.len()],
             layer_layout: layout,
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),

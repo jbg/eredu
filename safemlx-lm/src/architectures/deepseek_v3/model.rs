@@ -3099,6 +3099,7 @@ impl Model {
             global_layer_start: 0,
             global_layer_end: layer_count,
             sink_tokens: 0,
+            layer_prefix_offsets: vec![0; layer_count],
             topology: Default::default(),
             layer_layout: PromptCacheModelIdentity::compressed_layouts(
                 layer_count,

@@ -1399,6 +1399,7 @@ fn tensor_ring_worker() {
         global_layer_start: 0,
         global_layer_end: layer_count,
         batch_size: 1,
+        layer_prefix_offsets: vec![0; layer_count],
         layer_layout: model.prompt_cache_layer_layout(),
         sink_tokens: 0,
         topology: PromptCacheTopology {
