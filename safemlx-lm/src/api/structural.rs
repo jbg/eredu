@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::{GgufArchitecture, ModelKind, ModelLoadOptions};
 use crate::{
     architectures::{
-        deepseek_v3::model as deepseek_v3,
+        deepseek_v3::checkpoint as deepseek_v3_checkpoint,
         deepseek_v4::model as deepseek_v4,
         gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
@@ -199,7 +199,6 @@ fn unverified(architecture: &str) -> StructuralValidation {
 enum SafetensorsMatrixFormat {
     Dense,
     Affine(crate::runtime::checkpoint::quantization::WeightQuantization),
-    Fp8Block128,
 }
 
 #[derive(Debug, Clone)]
@@ -516,173 +515,6 @@ fn muse_glimmer_expected(config: &Value) -> Result<Vec<ExpectedTensor>, Error> {
         expected("model.vision_projection.weight", "", [hidden, projector]),
     ]);
     Ok(tensors)
-}
-
-fn deepseek_v3_expected(args: &deepseek_v3::ModelArgs) -> Vec<ExpectedTensor> {
-    let hidden = args.hidden_size as usize;
-    let vocab = args.vocab_size as usize;
-    let heads = args.num_attention_heads as usize;
-    let query_head = (args.qk_nope_head_dim + args.qk_rope_head_dim) as usize;
-    let mut tensors = vec![
-        expected(
-            "model.embed_tokens.weight",
-            "token_embd.weight",
-            [vocab, hidden],
-        ),
-        expected_vector("model.norm.weight", "output_norm.weight", hidden),
-        expected("lm_head.weight", "output.weight", [vocab, hidden]),
-    ];
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        let prefix = format!("model.layers.{layer}");
-        tensors.extend([
-            expected_vector(format!("{prefix}.input_layernorm.weight"), "", hidden),
-            expected_vector(
-                format!("{prefix}.post_attention_layernorm.weight"),
-                "",
-                hidden,
-            ),
-        ]);
-        if let Some(rank) = args.q_lora_rank {
-            tensors.extend([
-                expected(
-                    format!("{prefix}.self_attn.q_a_proj.weight"),
-                    "",
-                    [rank as usize, hidden],
-                ),
-                expected_vector(
-                    format!("{prefix}.self_attn.q_a_layernorm.weight"),
-                    "",
-                    rank as usize,
-                ),
-                expected(
-                    format!("{prefix}.self_attn.q_b_proj.weight"),
-                    "",
-                    [heads * query_head, rank as usize],
-                ),
-            ]);
-        } else {
-            tensors.push(expected(
-                format!("{prefix}.self_attn.q_proj.weight"),
-                "",
-                [heads * query_head, hidden],
-            ));
-        }
-        tensors.extend([
-            expected(
-                format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),
-                "",
-                [(args.kv_lora_rank + args.qk_rope_head_dim) as usize, hidden],
-            ),
-            expected_vector(
-                format!("{prefix}.self_attn.kv_a_layernorm.weight"),
-                "",
-                args.kv_lora_rank as usize,
-            ),
-            expected(
-                format!("{prefix}.self_attn.kv_b_proj.weight"),
-                "",
-                [
-                    heads * (args.qk_nope_head_dim + args.v_head_dim) as usize,
-                    args.kv_lora_rank as usize,
-                ],
-            ),
-            expected(
-                format!("{prefix}.self_attn.o_proj.weight"),
-                "",
-                [hidden, heads * args.v_head_dim as usize],
-            ),
-        ]);
-        if *policy == deepseek_v3::LayerPolicy::SparseMoe {
-            let experts = args.n_routed_experts as usize;
-            let shared = (args.moe_intermediate_size * args.n_shared_experts) as usize;
-            tensors.extend([
-                expected(format!("{prefix}.mlp.gate.weight"), "", [experts, hidden]),
-                expected_vector(
-                    format!("{prefix}.mlp.gate.e_score_correction_bias"),
-                    "",
-                    experts,
-                ),
-                expected(
-                    format!("{prefix}.mlp.shared_experts.gate_proj.weight"),
-                    "",
-                    [shared, hidden],
-                ),
-                expected(
-                    format!("{prefix}.mlp.shared_experts.up_proj.weight"),
-                    "",
-                    [shared, hidden],
-                ),
-                expected(
-                    format!("{prefix}.mlp.shared_experts.down_proj.weight"),
-                    "",
-                    [hidden, shared],
-                ),
-            ]);
-        } else {
-            let intermediate = args.intermediate_size as usize;
-            tensors.extend([
-                expected(
-                    format!("{prefix}.mlp.gate_proj.weight"),
-                    "",
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{prefix}.mlp.up_proj.weight"),
-                    "",
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{prefix}.mlp.down_proj.weight"),
-                    "",
-                    [hidden, intermediate],
-                ),
-            ]);
-        }
-    }
-    for tensor in &mut tensors {
-        tensor.gguf_name = deepseek_v3_gguf_name(&tensor.safetensors_name);
-    }
-    tensors
-}
-
-fn deepseek_v3_gguf_name(name: &str) -> String {
-    for (runtime, gguf) in [
-        ("model.embed_tokens.weight", "token_embd.weight"),
-        ("model.norm.weight", "output_norm.weight"),
-        ("lm_head.weight", "output.weight"),
-    ] {
-        if name == runtime {
-            return gguf.into();
-        }
-    }
-    let rest = name
-        .strip_prefix("model.layers.")
-        .expect("DeepSeek expected tensor belongs to a decoder layer");
-    let (layer, parameter) = rest
-        .split_once('.')
-        .expect("DeepSeek expected tensor has a layer-local name");
-    let gguf = match parameter {
-        "input_layernorm.weight" => "attn_norm.weight",
-        "post_attention_layernorm.weight" => "ffn_norm.weight",
-        "self_attn.q_proj.weight" => "attn_q.weight",
-        "self_attn.q_a_proj.weight" => "attn_q_a.weight",
-        "self_attn.q_a_layernorm.weight" => "attn_q_a_norm.weight",
-        "self_attn.q_b_proj.weight" => "attn_q_b.weight",
-        "self_attn.kv_a_proj_with_mqa.weight" => "attn_kv_a_mqa.weight",
-        "self_attn.kv_a_layernorm.weight" => "attn_kv_a_norm.weight",
-        "self_attn.kv_b_proj.weight" => "attn_kv_b.weight",
-        "self_attn.o_proj.weight" => "attn_output.weight",
-        "mlp.gate.weight" => "ffn_gate_inp.weight",
-        "mlp.gate.e_score_correction_bias" => "exp_probs_b.bias",
-        "mlp.shared_experts.gate_proj.weight" => "ffn_gate_shexp.weight",
-        "mlp.shared_experts.up_proj.weight" => "ffn_up_shexp.weight",
-        "mlp.shared_experts.down_proj.weight" => "ffn_down_shexp.weight",
-        "mlp.gate_proj.weight" => "ffn_gate.weight",
-        "mlp.up_proj.weight" => "ffn_up.weight",
-        "mlp.down_proj.weight" => "ffn_down.weight",
-        _ => panic!("unmapped DeepSeek expected tensor {name}"),
-    };
-    format!("blk.{layer}.{gguf}")
 }
 
 fn gpt_oss_common_expected(args: &gpt_oss::ModelArgs) -> Vec<ExpectedTensor> {
@@ -3548,194 +3380,11 @@ fn validate_deepseek_v3_safetensors(
     store: &SafetensorsWeightStore,
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    let args = match deepseek_v3::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let affine = match args.affine_quantization() {
-        Ok(affine) => affine,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let mtp_count = args.num_nextn_predict_layers as usize;
-    let mut validation_args = args.clone();
-    if mtp_count > 0 {
-        let mut policies = args.layer_schedule.iter().copied().collect::<Vec<_>>();
-        policies.extend(std::iter::repeat_n(
-            deepseek_v3::LayerPolicy::SparseMoe,
-            mtp_count,
-        ));
-        validation_args.layer_schedule = match crate::LayerSchedule::new(policies.len(), policies) {
-            Ok(schedule) => schedule,
-            Err(error) => return invalid_geometry(error.to_string()),
-        };
-    }
-    let mut expected_tensors = deepseek_v3_expected(&validation_args);
-    for index in 0..mtp_count {
-        let global = args.num_hidden_layers as usize + index;
-        let prefix = format!("model.layers.{global}");
-        expected_tensors.extend([
-            expected_vector(
-                format!("{prefix}.enorm.weight"),
-                "",
-                args.hidden_size as usize,
-            ),
-            expected_vector(
-                format!("{prefix}.hnorm.weight"),
-                "",
-                args.hidden_size as usize,
-            ),
-            expected(
-                format!("{prefix}.eh_proj.weight"),
-                "",
-                [args.hidden_size as usize, args.hidden_size as usize * 2],
-            ),
-            expected_vector(
-                format!("{prefix}.shared_head.norm.weight"),
-                "",
-                args.hidden_size as usize,
-            ),
-            expected(
-                format!("{prefix}.shared_head.head.weight"),
-                "",
-                [args.vocab_size as usize, args.hidden_size as usize],
-            ),
-        ]);
-    }
-    let native_fp8 = args.native_fp8_config().is_some();
-    let deepseek_format = |name: &str| {
-        if name.ends_with(".mlp.gate.weight") {
-            SafetensorsMatrixFormat::Dense
-        } else if native_fp8 && (name == "model.embed_tokens.weight" || name == "lm_head.weight") {
-            // The native FP8 route leaves token embeddings and the output head
-            // unquantized.  Affine checkpoints, however, pass both through the
-            // ordinary MaybeQuantized embedding/linear constructors.
-            SafetensorsMatrixFormat::Dense
-        } else if native_fp8 {
-            SafetensorsMatrixFormat::Fp8Block128
-        } else if let Some(affine) = affine {
-            SafetensorsMatrixFormat::Affine(affine)
-        } else {
-            SafetensorsMatrixFormat::Dense
-        }
-    };
-    let mut allowed = BTreeSet::new();
-    for tensor in &expected_tensors {
-        allowed.insert(tensor.safetensors_name.clone());
-        add_safetensors_format_companions(
-            &mut allowed,
-            &tensor.safetensors_name,
-            deepseek_format(&tensor.safetensors_name),
-        );
-    }
-    let mut issues = Vec::new();
-    append_structural_issues(
-        validate_safetensor_format_plan(store, expected_tensors, deepseek_format),
-        &mut issues,
-    );
-    let allow_packed = !options.weight_residency.is_fully_resident();
-    for (layer, policy) in validation_args.layer_schedule.iter().enumerate() {
-        if *policy != deepseek_v3::LayerPolicy::SparseMoe {
-            continue;
-        }
-        validate_deepseek_experts(
-            store,
-            &format!("model.layers.{layer}.mlp.experts"),
-            args.n_routed_experts as usize,
-            args.hidden_size as usize,
-            args.moe_intermediate_size as usize,
-            allow_packed,
-            if native_fp8 {
-                SafetensorsMatrixFormat::Fp8Block128
-            } else if let Some(affine) = affine {
-                SafetensorsMatrixFormat::Affine(affine)
-            } else {
-                SafetensorsMatrixFormat::Dense
-            },
-            &mut allowed,
-            &mut issues,
-        );
-    }
-
-    for key in store.keys() {
-        if !allowed.contains(&key) {
-            issues.push(unexpected_layout(&key, "DeepSeek-V3 SafeTensors"));
-        }
-    }
-    finish(issues)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_deepseek_experts(
-    store: &SafetensorsWeightStore,
-    prefix: &str,
-    experts: usize,
-    hidden: usize,
-    intermediate: usize,
-    allow_packed: bool,
-    format: SafetensorsMatrixFormat,
-    allowed: &mut BTreeSet<String>,
-    issues: &mut Vec<StructuralIssue>,
-) {
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
-    for (projection, shape, packed_shape) in [
-        (
-            "gate_proj",
-            vec![intermediate, hidden],
-            vec![experts, intermediate, hidden],
-        ),
-        (
-            "up_proj",
-            vec![intermediate, hidden],
-            vec![experts, intermediate, hidden],
-        ),
-        (
-            "down_proj",
-            vec![hidden, intermediate],
-            vec![experts, hidden, intermediate],
-        ),
-    ] {
-        let packed = format!("{prefix}.{projection}");
-        let split = (0..experts)
-            .map(|expert| format!("{prefix}.{expert}.{projection}.weight"))
-            .collect::<Vec<_>>();
-        let present_split = split.iter().filter(|name| keys.contains(*name)).count();
-        if keys.contains(&packed) {
-            allowed.insert(packed.clone());
-            add_safetensors_format_companions(allowed, &packed, format);
-            if !allow_packed {
-                issues.push(StructuralIssue {
-                    kind: StructuralIssueKind::ConflictingLayout,
-                    detail: format!(
-                        "the requested resident DeepSeek-V3 loader requires per-expert {projection} tensors, not packed bank {packed:?}"
-                    ),
-                    tensor_name: Some(packed.clone()),
-                    tensor_type_code: None,
-                    metadata_key: None,
-                });
-            }
-            if present_split > 0 {
-                issues.push(StructuralIssue {
-                    kind: StructuralIssueKind::ConflictingLayout,
-                    detail: format!(
-                        "DeepSeek-V3 expert catalog mixes packed bank {packed:?} with split {projection} tensors"
-                    ),
-                    tensor_name: split.iter().find(|name| keys.contains(*name)).cloned(),
-                    tensor_type_code: None,
-                    metadata_key: None,
-                });
-            }
-            validate_safetensor_format(store, &packed, &packed_shape, format, issues);
-            for name in split.into_iter().filter(|name| keys.contains(name)) {
-                allowed.insert(name);
-            }
-        } else {
-            for name in split {
-                allowed.insert(name.clone());
-                add_safetensors_format_companions(allowed, &name, format);
-                validate_safetensor_format(store, &name, &shape, format, issues);
-            }
-        }
-    }
+    deepseek_v3_checkpoint::validate_safetensors(
+        config,
+        store,
+        !options.weight_residency.is_fully_resident(),
+    )
 }
 
 fn validate_lfm2_safetensors(
@@ -5079,42 +4728,6 @@ fn expand_safetensors_format(
                 );
             }
         }
-        SafetensorsMatrixFormat::Fp8Block128 => {
-            if shape.len() < 2 {
-                issues.push(layout(
-                    name,
-                    format!("native block-FP8 weight must have rank at least two, got {shape:?}"),
-                ));
-                return;
-            }
-            common.push(SafetensorsTensorConstraint::required(
-                name,
-                shape.to_vec(),
-                StoredDtypeConstraint::OneOf(vec![StoredDtype::F8E4M3, StoredDtype::U8]),
-            ));
-            let mut scale_shape = shape.to_vec();
-            let rank = scale_shape.len();
-            scale_shape[rank - 2] = scale_shape[rank - 2].div_ceil(128);
-            scale_shape[rank - 1] = scale_shape[rank - 1].div_ceil(128);
-            let scale = if name.ends_with(".weight") {
-                format!("{}.weight_scale_inv", name.trim_end_matches(".weight"))
-            } else {
-                format!("{name}_scale_inv")
-            };
-            common.push(
-                SafetensorsTensorConstraint::required(
-                    scale,
-                    scale_shape,
-                    StoredDtypeConstraint::OneOf(vec![
-                        StoredDtype::F16,
-                        StoredDtype::BF16,
-                        StoredDtype::F32,
-                        StoredDtype::U8,
-                    ]),
-                )
-                .companion(),
-            );
-        }
     }
 }
 
@@ -5138,14 +4751,6 @@ fn add_safetensors_format_companions(
             if quantization.has_biases() {
                 allowed.insert(format!("{prefix}.biases"));
             }
-        }
-        SafetensorsMatrixFormat::Fp8Block128 => {
-            let companion = if name.ends_with(".weight") {
-                format!("{prefix}.weight_scale_inv")
-            } else {
-                format!("{name}_scale_inv")
-            };
-            allowed.insert(companion);
         }
     }
 }
@@ -5292,77 +4897,7 @@ fn validate_deepseek2_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let args = match deepseek_v3::model_args_from_gguf_catalog(checkpoint, metadata) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let mut expected = deepseek_v3_expected(&args);
-    if args.split_kv_b {
-        expected.retain(|tensor| {
-            !tensor
-                .safetensors_name
-                .ends_with(".self_attn.kv_b_proj.weight")
-        });
-        for layer in 0..args.layer_schedule.len() {
-            expected.extend([
-                expected_rank3(
-                    "",
-                    format!("blk.{layer}.attn_k_b.weight"),
-                    [
-                        args.num_attention_heads as usize,
-                        args.kv_lora_rank as usize,
-                        args.qk_nope_head_dim as usize,
-                    ],
-                ),
-                expected_rank3(
-                    "",
-                    format!("blk.{layer}.attn_v_b.weight"),
-                    [
-                        args.num_attention_heads as usize,
-                        args.v_head_dim as usize,
-                        args.kv_lora_rank as usize,
-                    ],
-                ),
-            ]);
-        }
-    }
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if *policy != deepseek_v3::LayerPolicy::SparseMoe {
-            continue;
-        }
-        let experts = args.n_routed_experts as usize;
-        let hidden = args.hidden_size as usize;
-        let intermediate = args.moe_intermediate_size as usize;
-        expected.extend([
-            expected_rank3(
-                "",
-                format!("blk.{layer}.ffn_gate_exps.weight"),
-                [experts, intermediate, hidden],
-            ),
-            expected_rank3(
-                "",
-                format!("blk.{layer}.ffn_up_exps.weight"),
-                [experts, intermediate, hidden],
-            ),
-            expected_rank3(
-                "",
-                format!("blk.{layer}.ffn_down_exps.weight"),
-                [experts, hidden, intermediate],
-            ),
-        ]);
-    }
-    let allowed = expected
-        .iter()
-        .map(|tensor| tensor.gguf_name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut issues = validate_gguf_plan(checkpoint, expected, "DeepSeek2");
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if !allowed.contains(name) && !name.starts_with("rope_freqs.") {
-            issues.push(unexpected_layout(name, "DeepSeek2 GGUF"));
-        }
-    }
-    finish(issues)
+    deepseek_v3_checkpoint::validate_gguf(checkpoint, metadata)
 }
 
 fn validate_deepseek4_gguf(

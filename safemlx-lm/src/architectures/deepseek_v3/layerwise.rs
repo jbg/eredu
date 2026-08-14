@@ -34,10 +34,11 @@ use crate::{
         PromptCacheTopology,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         canonical_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        populate_module_from_lease_excluding, ModuleBindingPlan,
     },
+    runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -1525,6 +1526,22 @@ impl DeepSeekV3LayerwiseAdapter {
         Ok(recipes)
     }
 
+    fn binding_plan_for_layer(
+        &self,
+        layer: &DecoderLayer,
+        index: usize,
+        store: &dyn WeightStore,
+    ) -> Result<ModuleBindingPlan, Error> {
+        let prefix = format!("model.layers.{index}");
+        Ok(build_module_binding_plan_with_recipes_excluding(
+            layer,
+            &prefix,
+            store,
+            self.recipes_for_layer(layer, index, store)?,
+            |name| self.sparse_expert_cache && name.starts_with("mlp.experts."),
+        )?)
+    }
+
     fn mtp_recipes(
         &self,
         store: &dyn WeightStore,
@@ -1999,47 +2016,51 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.embedding,
                     "model.embed_tokens",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.norm,
                     "model.norm",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             units.push(StaticUnitBindings::new(
                 HEAD_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.lm_head,
                     "lm_head",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(MTP_UNIT) {
             if let Some(mtp) = &self.mtp {
                 units.push(StaticUnitBindings::new(
                     MTP_UNIT,
-                    build_module_bindings_with_recipes_excluding(
+                    build_module_binding_plan_with_recipes_excluding(
                         mtp,
                         "",
                         store,
                         self.mtp_recipes(store)?,
                         |name| self.sparse_expert_cache && name.contains(".decoder.mlp.experts."),
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2517,15 +2538,9 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let prefix = format!("model.layers.{index}");
-        build_module_bindings_with_recipes_excluding(
-            layer,
-            &prefix,
-            store,
-            self.recipes_for_layer(layer, index, store)?,
-            |name| self.sparse_expert_cache && name.starts_with("mlp.experts."),
-        )
-        .map_err(Into::into)
+        Ok(self
+            .binding_plan_for_layer(layer, index, store)?
+            .build_bindings(store)?)
     }
 
     fn parallel_layer_bindings(
@@ -2876,8 +2891,16 @@ fn deepseek_recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 /// DeepSeek token generation using bounded layer execution.
