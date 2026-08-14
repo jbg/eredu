@@ -69,6 +69,14 @@ pub(crate) fn validate_safetensors(
 }
 
 pub(crate) fn safetensors_plan(args: &DecoderConfig) -> Result<SafetensorsCheckpointPlan, String> {
+    safetensors_plan_with_root(args, "model", true)
+}
+
+pub(crate) fn safetensors_plan_with_root(
+    args: &DecoderConfig,
+    root: &str,
+    allow_derived_expert_layouts: bool,
+) -> Result<SafetensorsCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden_size")?;
     let vocab = dimension(args.vocab_size, "vocab_size")?;
     let query = checked_mul(
@@ -87,7 +95,7 @@ pub(crate) fn safetensors_plan(args: &DecoderConfig) -> Result<SafetensorsCheckp
     add_tensor(
         args,
         &mut common,
-        "model.embed_tokens.weight",
+        format!("{root}.embed_tokens.weight"),
         vec![vocab, hidden],
         TensorOperation::Matrix,
         None,
@@ -95,7 +103,7 @@ pub(crate) fn safetensors_plan(args: &DecoderConfig) -> Result<SafetensorsCheckp
     add_tensor(
         args,
         &mut common,
-        "model.norm.weight",
+        format!("{root}.norm.weight"),
         vec![hidden],
         TensorOperation::Vector,
         None,
@@ -111,7 +119,7 @@ pub(crate) fn safetensors_plan(args: &DecoderConfig) -> Result<SafetensorsCheckp
         )?;
     }
     for layer in 0..dimension(args.num_hidden_layers, "num_hidden_layers")? {
-        let block = format!("model.layers.{layer}");
+        let block = format!("{root}.layers.{layer}");
         for (name, shape, operation) in [
             (
                 "input_layernorm.weight",
@@ -198,6 +206,7 @@ pub(crate) fn safetensors_plan(args: &DecoderConfig) -> Result<SafetensorsCheckp
                 experts,
                 hidden,
                 intermediate,
+                allow_derived_expert_layouts,
             )?);
         } else {
             let intermediate = dimension(args.intermediate_size, "intermediate_size")?;
@@ -232,6 +241,7 @@ fn expert_layout_group(
     experts: usize,
     hidden: usize,
     intermediate: usize,
+    allow_derived_layouts: bool,
 ) -> Result<AlternativeLayoutGroup<SafetensorsTensorConstraint>, String> {
     let gate_up_quantization = args.weight_quantization_for(&format!("{prefix}.gate_up_proj"));
     let down_quantization = args.weight_quantization_for(&format!("{prefix}.down_proj"));
@@ -285,8 +295,11 @@ fn expert_layout_group(
             ),
         ],
     )?;
-    let mut variants = vec![packed, separate];
-    if gate_up_quantization.is_none() && down_quantization.is_none() {
+    let mut variants = vec![packed];
+    if allow_derived_layouts {
+        variants.push(separate);
+    }
+    if allow_derived_layouts && gate_up_quantization.is_none() && down_quantization.is_none() {
         let mut tensors = Vec::with_capacity(checked_mul(experts, 3, "expert tensor count")?);
         let mut discriminators = Vec::with_capacity(tensors.capacity());
         for expert in 0..experts {

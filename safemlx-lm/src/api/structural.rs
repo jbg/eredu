@@ -21,9 +21,8 @@ use crate::{
         muse_glimmer,
         nemotron_h::model as nemotron_h,
         qwen::{
-            dense::{self as dense_qwen, checkpoint as dense_qwen_checkpoint},
-            hybrid::checkpoint as qwen_hybrid_checkpoint,
-            vl::model as qwen3_vl,
+            dense::checkpoint as dense_qwen_checkpoint,
+            hybrid::checkpoint as qwen_hybrid_checkpoint, vl::checkpoint as qwen_vl_checkpoint,
         },
     },
     error::Error,
@@ -319,140 +318,6 @@ fn llama_expected(args: &llama::ModelArgs) -> Vec<ExpectedTensor> {
                     format!("{model}.mlp.down_proj.bias"),
                     format!("{gguf}.ffn_down.bias"),
                     hidden,
-                ),
-            ]);
-        }
-    }
-    tensors
-}
-
-fn dense_qwen_expected(args: &dense_qwen::DecoderConfig) -> Vec<ExpectedTensor> {
-    let hidden = args.hidden_size as usize;
-    let vocab = args.vocab_size as usize;
-    let query = (args.num_attention_heads * args.head_dim) as usize;
-    let key_value = (args.num_key_value_heads * args.head_dim) as usize;
-    let head = args.head_dim as usize;
-    let mut tensors = vec![
-        expected(
-            "model.embed_tokens.weight",
-            "token_embd.weight",
-            [vocab, hidden],
-        ),
-        expected_vector("model.norm.weight", "output_norm.weight", hidden),
-    ];
-    if !args.tie_word_embeddings {
-        tensors.push(expected("lm_head.weight", "output.weight", [vocab, hidden]));
-    }
-    for layer in 0..args.num_hidden_layers as usize {
-        let model = format!("model.layers.{layer}");
-        let gguf = format!("blk.{layer}");
-        tensors.extend([
-            expected_vector(
-                format!("{model}.input_layernorm.weight"),
-                format!("{gguf}.attn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.post_attention_layernorm.weight"),
-                format!("{gguf}.ffn_norm.weight"),
-                hidden,
-            ),
-            expected(
-                format!("{model}.self_attn.q_proj.weight"),
-                format!("{gguf}.attn_q.weight"),
-                [query, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.k_proj.weight"),
-                format!("{gguf}.attn_k.weight"),
-                [key_value, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.v_proj.weight"),
-                format!("{gguf}.attn_v.weight"),
-                [key_value, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.o_proj.weight"),
-                format!("{gguf}.attn_output.weight"),
-                [hidden, query],
-            ),
-        ]);
-        if args.qk_norm() {
-            tensors.extend([
-                expected_vector(
-                    format!("{model}.self_attn.q_norm.weight"),
-                    format!("{gguf}.attn_q_norm.weight"),
-                    head,
-                ),
-                expected_vector(
-                    format!("{model}.self_attn.k_norm.weight"),
-                    format!("{gguf}.attn_k_norm.weight"),
-                    head,
-                ),
-            ]);
-        }
-        if args.qkv_bias() {
-            tensors.extend([
-                expected_vector(
-                    format!("{model}.self_attn.q_proj.bias"),
-                    format!("{gguf}.attn_q.bias"),
-                    query,
-                ),
-                expected_vector(
-                    format!("{model}.self_attn.k_proj.bias"),
-                    format!("{gguf}.attn_k.bias"),
-                    key_value,
-                ),
-                expected_vector(
-                    format!("{model}.self_attn.v_proj.bias"),
-                    format!("{gguf}.attn_v.bias"),
-                    key_value,
-                ),
-            ]);
-        }
-        if args.is_moe() {
-            let experts = args.num_experts as usize;
-            let intermediate = args.moe_intermediate_size as usize;
-            tensors.extend([
-                expected(
-                    format!("{model}.mlp.gate.weight"),
-                    format!("{gguf}.ffn_gate_inp.weight"),
-                    [experts, hidden],
-                ),
-                expected_rank3(
-                    format!("{model}.mlp.experts.gate_proj"),
-                    format!("{gguf}.ffn_gate_exps.weight"),
-                    [experts, intermediate, hidden],
-                ),
-                expected_rank3(
-                    format!("{model}.mlp.experts.up_proj"),
-                    format!("{gguf}.ffn_up_exps.weight"),
-                    [experts, intermediate, hidden],
-                ),
-                expected_rank3(
-                    format!("{model}.mlp.experts.down_proj"),
-                    format!("{gguf}.ffn_down_exps.weight"),
-                    [experts, hidden, intermediate],
-                ),
-            ]);
-        } else {
-            let intermediate = args.intermediate_size as usize;
-            tensors.extend([
-                expected(
-                    format!("{model}.mlp.gate_proj.weight"),
-                    format!("{gguf}.ffn_gate.weight"),
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{model}.mlp.up_proj.weight"),
-                    format!("{gguf}.ffn_up.weight"),
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{model}.mlp.down_proj.weight"),
-                    format!("{gguf}.ffn_down.weight"),
-                    [hidden, intermediate],
                 ),
             ]);
         }
@@ -4863,220 +4728,12 @@ fn validate_qwen3_vl_safetensors(
     store: &SafetensorsWeightStore,
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    let args = match qwen3_vl::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let is_moe = args.text_config.is_moe();
-    if is_moe != (kind == ModelKind::Qwen3VlMoe) {
-        return invalid_geometry(format!(
-            "Qwen3-VL dispatch selected {kind:?}, but the nested text configuration is {}",
-            if is_moe { "MoE" } else { "dense" }
-        ));
-    }
-    if args.text_config.num_hidden_layers as usize > store.keys().len()
-        || args.vision_config.layer_count() > store.keys().len()
-    {
-        return invalid_geometry(format!(
-            "configured Qwen3-VL text/vision depths {}/{} exceed the entire {}-tensor checkpoint catalog",
-            args.text_config.num_hidden_layers,
-            args.vision_config.layer_count(),
-            store.keys().len()
-        ));
-    }
-
-    let quantization = args.text_config.weight_quantization();
-    let (mut text, vision) = qwen3_vl_safetensors_expected(&args);
-    let mut allowed = BTreeSet::new();
-    for tensor in text.iter().chain(&vision) {
-        allowed.insert(tensor.safetensors_name.clone());
-        if tensor.operation == TensorOperation::Matrix {
-            if let Some(quantization) = quantization {
-                add_safetensors_format_companions(
-                    &mut allowed,
-                    &tensor.safetensors_name,
-                    SafetensorsMatrixFormat::Affine(quantization),
-                );
-            }
-        }
-    }
-
-    let mut issues = Vec::new();
-    if is_moe {
-        text.retain(|tensor| !tensor.safetensors_name.contains(".mlp.experts."));
-    }
-    append_structural_issues(
-        validate_safetensor_plan_with(store, text, |name| {
-            if name.ends_with(".mlp.gate.weight") {
-                None
-            } else {
-                args.text_config.weight_quantization_for(name)
-            }
-        }),
-        &mut issues,
-    );
-    append_structural_issues(validate_safetensor_plan(store, vision, None), &mut issues);
-
-    if is_moe {
-        let experts = args.text_config.num_experts as usize;
-        let hidden = args.text_config.hidden_size as usize;
-        let intermediate = args.text_config.moe_intermediate_size as usize;
-        let allow_split = !options.weight_residency.is_fully_resident();
-        for layer in 0..args.text_config.num_hidden_layers as usize {
-            let prefix = format!("model.language_model.layers.{layer}.mlp.experts");
-            validate_split_or_packed_swiglu_experts(
-                store,
-                &prefix,
-                experts,
-                hidden,
-                intermediate,
-                allow_split,
-                allow_split,
-                args.text_config
-                    .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-                args.text_config
-                    .weight_quantization_for(&format!("{prefix}.down_proj")),
-                &mut issues,
-            );
-            allowed.extend([
-                format!("{prefix}.gate_up_proj"),
-                format!("{prefix}.gate_proj"),
-                format!("{prefix}.up_proj"),
-                format!("{prefix}.down_proj"),
-            ]);
-            for bank in ["gate_up_proj", "gate_proj", "up_proj", "down_proj"] {
-                let name = format!("{prefix}.{bank}");
-                if let Some(quantization) = args.text_config.weight_quantization_for(&name) {
-                    allowed.insert(format!("{name}.scales"));
-                    if quantization.has_biases() {
-                        allowed.insert(format!("{name}.biases"));
-                    }
-                }
-            }
-            for expert in 0..experts {
-                for projection in ["w1", "w2", "w3", "gate_proj", "up_proj", "down_proj"] {
-                    allowed.insert(format!("{prefix}.{expert}.{projection}.weight"));
-                }
-            }
-        }
-    }
-
-    for key in store.keys() {
-        if !allowed.contains(&key) {
-            issues.push(unexpected_layout(&key, "Qwen3-VL SafeTensors"));
-        }
-    }
-    finish(issues)
-}
-
-fn qwen3_vl_safetensors_expected(
-    args: &qwen3_vl::ModelArgs,
-) -> (Vec<ExpectedTensor>, Vec<ExpectedTensor>) {
-    let mut text = dense_qwen_expected(&args.text_config);
-    for tensor in &mut text {
-        if let Some(rest) = tensor.safetensors_name.strip_prefix("model.") {
-            tensor.safetensors_name = format!("model.language_model.{rest}");
-        }
-    }
-
-    let vision = qwen_vision_safetensors_expected(
-        &args.vision_config,
-        args.text_config.hidden_size as usize,
-        "model.visual",
-    );
-    (text, vision)
-}
-
-fn qwen_vision_safetensors_expected(
-    config: &qwen3_vl::VisionConfig,
-    text_hidden: usize,
-    root: &str,
-) -> Vec<ExpectedTensor> {
-    let hidden = config.hidden_size as usize;
-    let intermediate = config.intermediate_size as usize;
-    let channels = config.in_channels as usize;
-    let temporal = config.temporal_patch_size as usize;
-    let patch = config.patch_size as usize;
-    let merger_hidden = hidden * (config.spatial_merge_size as usize).pow(2);
-    let dense = |name: String, shape: Vec<usize>| ExpectedTensor {
-        safetensors_name: name,
-        gguf_name: String::new(),
-        safetensors_shape: shape.clone(),
-        gguf_shape: shape,
-        operation: TensorOperation::Dense,
-    };
-    let mut vision = vec![
-        dense(
-            format!("{root}.pos_embed.weight"),
-            vec![config.num_position_embeddings as usize, hidden],
-        ),
-        dense(
-            format!("{root}.patch_embed.proj.weight"),
-            vec![hidden, channels, temporal, patch, patch],
-        ),
-        dense(format!("{root}.patch_embed.proj.bias"), vec![hidden]),
-    ];
-    for layer in 0..config.layer_count() {
-        let prefix = format!("{root}.blocks.{layer}");
-        vision.extend([
-            dense(format!("{prefix}.norm1.weight"), vec![hidden]),
-            dense(format!("{prefix}.norm1.bias"), vec![hidden]),
-            dense(
-                format!("{prefix}.attn.qkv.weight"),
-                vec![3 * hidden, hidden],
-            ),
-            dense(format!("{prefix}.attn.qkv.bias"), vec![3 * hidden]),
-            dense(format!("{prefix}.attn.proj.weight"), vec![hidden, hidden]),
-            dense(format!("{prefix}.attn.proj.bias"), vec![hidden]),
-            dense(format!("{prefix}.norm2.weight"), vec![hidden]),
-            dense(format!("{prefix}.norm2.bias"), vec![hidden]),
-            dense(
-                format!("{prefix}.mlp.linear_fc1.weight"),
-                vec![intermediate, hidden],
-            ),
-            dense(format!("{prefix}.mlp.linear_fc1.bias"), vec![intermediate]),
-            dense(
-                format!("{prefix}.mlp.linear_fc2.weight"),
-                vec![hidden, intermediate],
-            ),
-            dense(format!("{prefix}.mlp.linear_fc2.bias"), vec![hidden]),
-        ]);
-    }
-    vision.extend([
-        dense(format!("{root}.merger.norm.weight"), vec![hidden]),
-        dense(format!("{root}.merger.norm.bias"), vec![hidden]),
-        dense(
-            format!("{root}.merger.linear_fc1.weight"),
-            vec![merger_hidden, merger_hidden],
-        ),
-        dense(
-            format!("{root}.merger.linear_fc1.bias"),
-            vec![merger_hidden],
-        ),
-        dense(
-            format!("{root}.merger.linear_fc2.weight"),
-            vec![text_hidden, merger_hidden],
-        ),
-        dense(format!("{root}.merger.linear_fc2.bias"), vec![text_hidden]),
-    ]);
-    for index in 0..config.deepstack_layer_count() {
-        let prefix = format!("{root}.deepstack_merger_list.{index}");
-        vision.extend([
-            dense(format!("{prefix}.norm.weight"), vec![merger_hidden]),
-            dense(format!("{prefix}.norm.bias"), vec![merger_hidden]),
-            dense(
-                format!("{prefix}.linear_fc1.weight"),
-                vec![merger_hidden, merger_hidden],
-            ),
-            dense(format!("{prefix}.linear_fc1.bias"), vec![merger_hidden]),
-            dense(
-                format!("{prefix}.linear_fc2.weight"),
-                vec![text_hidden, merger_hidden],
-            ),
-            dense(format!("{prefix}.linear_fc2.bias"), vec![text_hidden]),
-        ]);
-    }
-    vision
+    qwen_vl_checkpoint::validate_safetensors(
+        kind == ModelKind::Qwen3VlMoe,
+        config,
+        store,
+        !options.weight_residency.is_fully_resident(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7277,51 +6934,12 @@ fn validate_qwen3_vl_gguf(
     if let Err(error) = architecture.validate_load_policy(options) {
         return invalid_geometry(error.to_string());
     }
-    let is_moe = architecture == GgufArchitecture::Qwen3VlMoe;
-    let metadata_name = architecture.metadata_name();
-    let translate = |name: &str| dense_qwen::translate_gguf_weight_name(name, is_moe);
-    if let Err(error) = checkpoint.catalog().translated_outputs(translate) {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args =
-        match dense_qwen::config_from_gguf_catalog(checkpoint, metadata, metadata_name, is_moe) {
-            Ok(args) => args,
-            Err(error) => return invalid_geometry(error.to_string()),
-        };
-    if let Err(error) = qwen3_vl::validate_qwen3_vl_text_gguf_catalog(&args, metadata) {
-        return invalid_geometry(error.to_string());
-    }
-    let expected = dense_qwen_expected(&args);
-    let allowed = expected
-        .iter()
-        .map(|tensor| tensor.gguf_name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut issues = validate_gguf_plan(checkpoint, expected, "Qwen3-VL text");
-    if is_moe {
-        issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
-            checkpoint,
-            (0..args.num_hidden_layers as usize).map(|layer| {
-                (
-                    format!("blk.{layer}.ffn_gate_exps.weight"),
-                    format!("blk.{layer}.ffn_up_exps.weight"),
-                )
-            }),
-            "Qwen3-VL-MoE",
-        ));
-    }
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if !allowed.contains(name) {
-            issues.push(unexpected_layout(name, "Qwen3-VL text GGUF"));
-        }
-    }
-    finish(issues)
+    let variant = match architecture {
+        GgufArchitecture::Qwen3Vl => qwen_vl_checkpoint::GgufVariant::Dense,
+        GgufArchitecture::Qwen3VlMoe => qwen_vl_checkpoint::GgufVariant::Moe,
+        _ => unreachable!("Qwen-VL GGUF validator received another architecture"),
+    };
+    qwen_vl_checkpoint::validate_gguf(variant, checkpoint, metadata)
 }
 
 pub(crate) fn validate_qwen3_vl_projector_gguf(
@@ -7330,60 +6948,12 @@ pub(crate) fn validate_qwen3_vl_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let architecture = match dense_qwen::gguf_string(model_metadata, "general.architecture") {
-        Ok(architecture) => architecture,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let is_moe = architecture == "qwen3vlmoe";
-    if architecture != "qwen3vl" && !is_moe {
-        return invalid_geometry(format!(
-            "Qwen3-VL projector requires qwen3vl or qwen3vlmoe text, got {architecture:?}"
-        ));
-    }
-    let text_args = match dense_qwen::config_from_gguf_catalog(
+    qwen_vl_checkpoint::validate_projector_gguf(
         model_checkpoint,
-        model_metadata,
-        &architecture,
-        is_moe,
-    ) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let args = match qwen3_vl::qwen3_vl_args_from_gguf_catalog(
-        text_args,
         model_metadata,
         checkpoint,
         metadata,
-    ) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let deepstack = args.vision_config.deepstack_layers();
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(|name| qwen3_vl::translate_qwen3_vl_mmproj_name(name, &deepstack))
-    {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let expected = qwen_vision_gguf_expected(&args.vision_config, args.text_config.hidden_size);
-    let allowed = expected
-        .iter()
-        .map(|tensor| tensor.gguf_name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut issues = validate_gguf_plan(checkpoint, expected, "Qwen3-VL projector");
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if !allowed.contains(name) {
-            issues.push(unexpected_layout(name, "Qwen3-VL projector GGUF"));
-        }
-    }
-    finish(issues)
+    )
 }
 
 pub(crate) fn validate_qwen35_projector_gguf(
@@ -7399,91 +6969,6 @@ pub(crate) fn validate_qwen35_projector_gguf(
         metadata,
     )
 }
-fn qwen_vision_gguf_expected(
-    vision: &qwen3_vl::VisionConfig,
-    text_hidden_size: i32,
-) -> Vec<ExpectedTensor> {
-    let hidden = vision.hidden_size as usize;
-    let intermediate = vision.intermediate_size as usize;
-    let text_hidden = text_hidden_size as usize;
-    let patch = vision.patch_size as usize;
-    let merger_hidden = hidden * (vision.spatial_merge_size as usize).pow(2);
-    let dense = |name: String, shape: Vec<usize>| {
-        expected_dense_with_gguf_shape("", name, shape.clone(), shape)
-    };
-    let matrix = |name: String, shape: Vec<usize>| ExpectedTensor {
-        safetensors_name: String::new(),
-        gguf_name: name,
-        safetensors_shape: shape.clone(),
-        gguf_shape: shape,
-        operation: TensorOperation::Matrix,
-    };
-    let mut tensors = vec![
-        dense(
-            "v.position_embd.weight".into(),
-            vec![vision.num_position_embeddings as usize, hidden],
-        ),
-        dense("v.patch_embd.weight".into(), vec![hidden, 3, patch, patch]),
-        dense(
-            "v.patch_embd.weight.1".into(),
-            vec![hidden, 3, patch, patch],
-        ),
-        dense("v.patch_embd.bias".into(), vec![hidden]),
-    ];
-    for layer in 0..vision.layer_count() {
-        let prefix = format!("v.blk.{layer}");
-        tensors.extend([
-            dense(format!("{prefix}.ln1.weight"), vec![hidden]),
-            dense(format!("{prefix}.ln1.bias"), vec![hidden]),
-            matrix(
-                format!("{prefix}.attn_qkv.weight"),
-                vec![3 * hidden, hidden],
-            ),
-            dense(format!("{prefix}.attn_qkv.bias"), vec![3 * hidden]),
-            matrix(format!("{prefix}.attn_out.weight"), vec![hidden, hidden]),
-            dense(format!("{prefix}.attn_out.bias"), vec![hidden]),
-            dense(format!("{prefix}.ln2.weight"), vec![hidden]),
-            dense(format!("{prefix}.ln2.bias"), vec![hidden]),
-            matrix(
-                format!("{prefix}.ffn_up.weight"),
-                vec![intermediate, hidden],
-            ),
-            dense(format!("{prefix}.ffn_up.bias"), vec![intermediate]),
-            matrix(
-                format!("{prefix}.ffn_down.weight"),
-                vec![hidden, intermediate],
-            ),
-            dense(format!("{prefix}.ffn_down.bias"), vec![hidden]),
-        ]);
-    }
-    tensors.extend([
-        dense("v.post_ln.weight".into(), vec![hidden]),
-        dense("v.post_ln.bias".into(), vec![hidden]),
-        matrix("mm.0.weight".into(), vec![merger_hidden, merger_hidden]),
-        dense("mm.0.bias".into(), vec![merger_hidden]),
-        matrix("mm.2.weight".into(), vec![text_hidden, merger_hidden]),
-        dense("mm.2.bias".into(), vec![text_hidden]),
-    ]);
-    for layer in vision.deepstack_layers() {
-        let prefix = format!("v.deepstack.{layer}");
-        tensors.extend([
-            dense(format!("{prefix}.norm.weight"), vec![merger_hidden]),
-            dense(format!("{prefix}.norm.bias"), vec![merger_hidden]),
-            matrix(
-                format!("{prefix}.fc1.weight"),
-                vec![merger_hidden, merger_hidden],
-            ),
-            dense(format!("{prefix}.fc1.bias"), vec![merger_hidden]),
-            matrix(
-                format!("{prefix}.fc2.weight"),
-                vec![text_hidden, merger_hidden],
-            ),
-            dense(format!("{prefix}.fc2.bias"), vec![text_hidden]),
-        ]);
-    }
-    tensors
-}
-
 fn validate_qwen35_gguf(
     architecture: GgufArchitecture,
     checkpoint: &GgufCheckpoint,
@@ -7710,9 +7195,10 @@ mod admission_policy_tests {
 #[cfg(test)]
 mod dense_qwen_tests {
     use super::*;
+    use crate::architectures::qwen::dense;
 
-    fn qwen2_args(tied: bool) -> dense_qwen::DecoderConfig {
-        dense_qwen::config_from_hf_value(&serde_json::json!({
+    fn qwen2_args(tied: bool) -> dense::DecoderConfig {
+        dense::config_from_hf_value(&serde_json::json!({
             "model_type": "qwen2", "hidden_size": 8, "num_hidden_layers": 2,
             "intermediate_size": 16, "num_attention_heads": 4,
             "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 32,
@@ -7724,10 +7210,11 @@ mod dense_qwen_tests {
 
     #[test]
     fn qwen2_plan_is_exactly_biased_and_has_no_qk_norms() {
-        let tied = dense_qwen_expected(&qwen2_args(true));
+        let tied = dense_qwen_checkpoint::safetensors_plan(&qwen2_args(true)).unwrap();
         let names = tied
+            .common_tensors
             .iter()
-            .map(|tensor| tensor.safetensors_name.as_str())
+            .map(|tensor| tensor.key.as_str())
             .collect::<BTreeSet<_>>();
         assert!(names.contains("model.layers.0.self_attn.q_proj.bias"));
         assert!(names.contains("model.layers.0.self_attn.k_proj.bias"));
@@ -7736,10 +7223,11 @@ mod dense_qwen_tests {
         assert!(!names.contains("model.layers.0.self_attn.k_norm.weight"));
         assert!(!names.contains("lm_head.weight"));
 
-        let untied = dense_qwen_expected(&qwen2_args(false));
+        let untied = dense_qwen_checkpoint::safetensors_plan(&qwen2_args(false)).unwrap();
         assert!(untied
+            .common_tensors
             .iter()
-            .any(|tensor| tensor.safetensors_name == "lm_head.weight"));
+            .any(|tensor| tensor.key == "lm_head.weight"));
     }
 }
 

@@ -51,7 +51,7 @@ use crate::{
         KeyValueCache,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
+        build_module_binding_plan_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
@@ -1631,26 +1631,40 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         let mut units = vec![
             StaticUnitBindings::new(
                 VISION_STATIC_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.vision,
                     "model.visual",
                     store,
                     vision_recipes,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, "model.language_model.embed_tokens", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    "model.language_model.embed_tokens",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, "model.language_model.norm", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    "model.language_model.norm",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?,
         ];
         if let Some(head) = &self.lm_head {
             units.push(StaticUnitBindings::new(
                 HEAD_UNIT,
-                build_module_bindings(head, "lm_head", store)?,
+                build_module_binding_plan_with_recipes(head, "lm_head", store, BTreeMap::new())?
+                    .build_bindings(store)?,
             )?);
         }
         Ok(units)
@@ -2043,7 +2057,10 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
                 self.sparse_expert_cache,
             )
         } else {
-            Ok(build_module_bindings(layer, &prefix, store)?)
+            Ok(
+                build_module_binding_plan_with_recipes(layer, &prefix, store, BTreeMap::new())?
+                    .build_bindings(store)?,
+            )
         }
     }
 
