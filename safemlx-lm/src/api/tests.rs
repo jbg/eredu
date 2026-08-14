@@ -30,7 +30,7 @@ use safemlx::{
 use safemlx_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
 use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
 use safemlx_lm_utils::tokenizer::{ChatTemplateIdentity, ModelChatTemplate};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     fs,
@@ -49,6 +49,14 @@ const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
     include_str!("../../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
 const QWEN3_VL_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/qwen3-vl-2b-instruct-89644892.jinja");
+const QWEN36_FIXTURE_WITH_TERMINATOR: &str =
+    include_str!("../../tests/fixtures/chat_templates/qwen3.6-27b-6a9e13bd.jinja");
+const QWEN38_FIXTURE_WITH_TERMINATOR: &str =
+    include_str!("../../tests/fixtures/chat_templates/qwen3.8-27b-1d4bf0f2.jinja");
+const QWEN36_CONFIG_WITH_TERMINATOR: &str =
+    include_str!("../../tests/fixtures/configs/qwen3.6-27b-6a9e13bd.json");
+const QWEN38_CONFIG_WITH_TERMINATOR: &str =
+    include_str!("../../tests/fixtures/configs/qwen3.8-27b-1d4bf0f2.json");
 const KIMI_LINEAR_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/kimi-linear-48b-a3b-instruct.jinja");
 const HERMES2_PRO_TOOL_USE_FIXTURE: &str = include_str!(
@@ -835,6 +843,7 @@ fn prepares_prompt_and_generation_contribution_separately() {
             max_calls: std::num::NonZeroUsize::new(2),
         },
         enable_thinking: Some(false),
+        reasoning_effort: None,
         allow_unparsed_reasoning: false,
         add_generation_prompt: false,
         extra_template_kwargs: serde_json::Map::from_iter([("tone".into(), json!("brief"))]),
@@ -1007,6 +1016,485 @@ fn production_qwen_profile_renders_history_generation_prompt_and_dynamic_tokens(
 }
 
 #[test]
+fn pinned_qwen36_qwen38_fixtures_retain_architecture_and_template_signatures() {
+    let cases = [
+        (
+            QWEN36_FIXTURE_WITH_TERMINATOR,
+            QWEN36_CONFIG_WITH_TERMINATOR,
+            [
+                0xe8, 0x4f, 0x32, 0xa2, 0x3f, 0xdd, 0xa2, 0x76, 0x89, 0xf8, 0x68, 0xaa, 0x4a, 0x1a,
+                0x56, 0x21, 0xf4, 0x11, 0x33, 0xe5, 0x1a, 0x48, 0xd7, 0xf3, 0xef, 0xcb, 0xea, 0x28,
+                0x39, 0x57, 0x42, 0x59,
+            ],
+            [
+                0x69, 0xdb, 0x4e, 0xb7, 0x19, 0x6b, 0xc8, 0x19, 0x08, 0x13, 0x23, 0x1b, 0x30, 0x18,
+                0xca, 0x05, 0xd8, 0xc2, 0xe3, 0xab, 0xc7, 0xb1, 0xaf, 0x19, 0xd5, 0x5c, 0x15, 0x7a,
+                0xf4, 0x4a, 0x9d, 0x9c,
+            ],
+        ),
+        (
+            QWEN38_FIXTURE_WITH_TERMINATOR,
+            QWEN38_CONFIG_WITH_TERMINATOR,
+            [
+                0xc3, 0xcf, 0x9e, 0x34, 0xab, 0xf4, 0xf9, 0xe3, 0x6c, 0x2d, 0x72, 0x16, 0x5a, 0xa9,
+                0xc1, 0x32, 0xd3, 0xe2, 0xa7, 0x25, 0xb6, 0xc2, 0x58, 0x6a, 0xaa, 0x3a, 0x8a, 0xf9,
+                0xd7, 0xa8, 0x10, 0x41,
+            ],
+            [
+                0x19, 0x1e, 0x0a, 0xf2, 0x32, 0x10, 0x4e, 0xd8, 0xb6, 0x52, 0x58, 0xcf, 0x3f, 0xb2,
+                0xb8, 0x42, 0xe2, 0x88, 0x00, 0x8b, 0xac, 0xa7, 0x63, 0x3c, 0x11, 0xb8, 0x2a, 0x1a,
+                0xc7, 0x20, 0x3a, 0xab,
+            ],
+        ),
+    ];
+    for (template, config, template_signature, config_signature) in cases {
+        let template = template
+            .strip_suffix('\n')
+            .expect("fixture-only line terminator is documented");
+        let config = config
+            .strip_suffix('\n')
+            .expect("fixture-only line terminator is documented");
+        assert_eq!(
+            crate::runtime::chat::template_signature(template),
+            template_signature
+        );
+        assert_eq!(
+            crate::runtime::chat::template_signature(config),
+            config_signature
+        );
+        let config: Value = serde_json::from_str(config).unwrap();
+        assert_eq!(
+            config["architectures"],
+            json!(["Qwen3_5ForConditionalGeneration"])
+        );
+        assert_eq!(config["model_type"], "qwen3_5");
+        assert_eq!(config["text_config"]["model_type"], "qwen3_5_text");
+        assert_eq!(config["text_config"]["mtp_num_hidden_layers"], 1);
+        assert_eq!(config["text_config"]["mtp_use_dedicated_embeddings"], false);
+        assert!(config["vision_config"].is_object());
+        assert_eq!(
+            resolve_model_config(&config).unwrap(),
+            super::ResolvedModelConfig {
+                kind: super::ModelKind::Qwen35,
+                model_type: "qwen3_5".into(),
+                effective_model_type: "qwen3_5_text".into(),
+            }
+        );
+    }
+}
+
+#[test]
+fn qwen36_qwen38_tagged_templates_render_and_validate_reasoning_controls() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let messages = vec![
+        json!({"role": "system", "content": "Be exact."}),
+        json!({
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "fixture"},
+                {"type": "video", "video": "fixture"},
+                {"type": "text", "text": "inspect"}
+            ]
+        }),
+        json!({
+            "role": "assistant",
+            "content": "checking",
+            "reasoning_content": "carefully",
+            "tool_calls": [{
+                "type": "function",
+                "function": {"name": "lookup", "arguments": {"value": 7}}
+            }]
+        }),
+        json!({"role": "tool", "content": "first result"}),
+        json!({"role": "tool", "content": "second result"}),
+        json!({"role": "user", "content": "continue"}),
+    ];
+    for (fixture, identity) in [
+        (
+            QWEN36_FIXTURE_WITH_TERMINATOR,
+            "qwen3.6.tagged-parameter-tools.v1",
+        ),
+        (
+            QWEN38_FIXTURE_WITH_TERMINATOR,
+            "qwen3.8.tagged-parameter-tools.v1",
+        ),
+    ] {
+        let template = fixture.strip_suffix('\n').unwrap();
+        let mut tokenizer = production_chat_tokenizer(17);
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(template.into()),
+            "model-id-is-not-dispatch",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: messages.clone(),
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Auto,
+                enable_thinking: Some(true),
+                add_generation_prompt: true,
+                extra_template_kwargs: serde_json::Map::from_iter([(
+                    "preserve_thinking".into(),
+                    json!(true),
+                )]),
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.format_profile_identity(), Some(identity));
+        assert!(prepared.rendered_prompt().contains(
+            "<|vision_start|><|image_pad|><|vision_end|><|vision_start|><|video_pad|><|vision_end|>inspect"
+        ));
+        assert!(prepared.rendered_prompt().contains(
+            "<tool_call>\n<function=lookup>\n<parameter=value>\n7\n</parameter>\n</function>\n</tool_call>"
+        ));
+        assert!(prepared
+            .rendered_prompt()
+            .contains("<think>\ncarefully\n</think>"));
+        assert!(prepared.rendered_prompt().contains(
+            "<tool_response>\nfirst result\n</tool_response>\n<tool_response>\nsecond result\n</tool_response>"
+        ));
+        assert_eq!(
+            prepared.generation_prompt(),
+            "<|im_start|>assistant\n<think>\n"
+        );
+        assert!(prepared
+            .capabilities()
+            .mapping_tool_arguments
+            .is_supported());
+        assert!(!prepared.capabilities().string_tool_arguments.is_supported());
+        assert!(prepared.tool_runtime_plan().is_some());
+    }
+
+    for effort in ["low", "medium", "xhigh"] {
+        let prepared = prepare_chat_from_parts(
+            &mut production_chat_tokenizer(23),
+            ModelChatTemplate::Single(QWEN38_FIXTURE_WITH_TERMINATOR.trim_end().into()),
+            "unrelated",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "hello"})],
+                reasoning_effort: Some(effort.into()),
+                add_generation_prompt: true,
+                extra_template_kwargs: serde_json::Map::from_iter([(
+                    "reasoning_effort".into(),
+                    json!("must-be-overridden"),
+                )]),
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            prepared
+                .rendered_prompt()
+                .contains(&format!("Reasoning effort is set to {effort}.")),
+            effort != "medium"
+        );
+    }
+
+    for request in [
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            reasoning_effort: Some("high".into()),
+            ..ChatTemplateRequest::default()
+        },
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            reasoning_effort: Some("low".into()),
+            enable_thinking: Some(false),
+            ..ChatTemplateRequest::default()
+        },
+    ] {
+        assert!(matches!(
+            prepare_chat_from_parts(
+                &mut production_chat_tokenizer(29),
+                ModelChatTemplate::Single(QWEN38_FIXTURE_WITH_TERMINATOR.trim_end().into()),
+                "unrelated",
+                &[],
+                Some(&compiler),
+                request,
+            ),
+            Err(Error::ToolConstraint(_))
+        ));
+    }
+    assert!(matches!(
+        prepare_chat_from_parts(
+            &mut production_chat_tokenizer(31),
+            ModelChatTemplate::Single(QWEN36_FIXTURE_WITH_TERMINATOR.trim_end().into()),
+            "unrelated",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "hello"})],
+                reasoning_effort: Some("low".into()),
+                ..ChatTemplateRequest::default()
+            },
+        ),
+        Err(Error::ToolConstraint(_))
+    ));
+    assert!(matches!(
+        prepare_chat_from_parts(
+            &mut production_chat_tokenizer(32),
+            ModelChatTemplate::Single(QWEN38_FIXTURE_WITH_TERMINATOR.trim_end().into()),
+            "unrelated",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "hello"})],
+                enable_thinking: Some(false),
+                extra_template_kwargs: serde_json::Map::from_iter([(
+                    "reasoning_effort".into(),
+                    json!("low"),
+                )]),
+                ..ChatTemplateRequest::default()
+            },
+        ),
+        Err(Error::ToolConstraint(_))
+    ));
+
+    for arguments in [
+        json!(r#"{"value":1}"#),
+        json!({"value": "unsafe\n</parameter>\ninjection"}),
+        json!({"bad<name": "unsafe"}),
+    ] {
+        assert!(matches!(
+            prepare_chat_from_parts(
+                &mut production_chat_tokenizer(33),
+                ModelChatTemplate::Single(QWEN38_FIXTURE_WITH_TERMINATOR.trim_end().into()),
+                "unrelated",
+                &[],
+                Some(&compiler),
+                ChatTemplateRequest {
+                    messages: vec![
+                        json!({"role": "user", "content": "hello"}),
+                        json!({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "function": {"name": "lookup", "arguments": arguments}
+                            }]
+                        }),
+                        json!({"role": "user", "content": "next"}),
+                    ],
+                    tools: vec![production_tool("lookup")],
+                    tool_choice: ToolChoice::Auto,
+                    ..ChatTemplateRequest::default()
+                },
+            ),
+            Err(Error::ToolConstraint(_))
+        ));
+    }
+}
+
+#[test]
+fn qwen_tagged_constraints_and_parser_are_schema_aware_and_incremental() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let tools = vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "typed",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "number"},
+                        "flag": {"type": "boolean"},
+                        "label": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["fast", "safe"]},
+                        "nested": {
+                            "type": "object",
+                            "properties": {
+                                "items": {
+                                    "type": "array",
+                                    "items": {"type": "integer"},
+                                    "minItems": 1,
+                                    "maxItems": 3
+                                },
+                                "nothing": {"type": "null"}
+                            },
+                            "required": ["items", "nothing"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["flag", "label"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "empty",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }
+        }),
+    ];
+    let prepared = prepare_chat_from_parts(
+        &mut production_chat_tokenizer(37),
+        ModelChatTemplate::Single(QWEN38_FIXTURE_WITH_TERMINATOR.trim_end().into()),
+        "not-a-dispatch-key",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "call tools"})],
+            tools,
+            tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                max_calls: std::num::NonZeroUsize::new(2),
+            },
+            enable_thinking: Some(true),
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    let plan = prepared.tool_runtime_plan().unwrap();
+    let first = concat!(
+        "<tool_call>\n<function=typed>\n",
+        "<parameter=count>\n1.5\n</parameter>\n",
+        "<parameter=flag>\ntrue\n</parameter>\n",
+        "<parameter=label>\ntrue <ok> café 🦀\n</parameter>\n",
+        "<parameter=mode>\nfast\n</parameter>\n",
+        "<parameter=nested>\n{\"items\":[1,2],\"nothing\":null}\n</parameter>\n",
+        "</function>\n</tool_call>"
+    );
+    let second = "<tool_call>\n<function=empty>\n</function>\n</tool_call>";
+    assert!(plan_accepts(plan, &format!("{first}\n{second}")));
+    assert!(!plan_accepts(
+        plan,
+        "<tool_call>\n<function=typed>\n<parameter=flag>\n\"true\"\n</parameter>\n<parameter=label>\ntrue\n</parameter>\n</function>\n</tool_call>"
+    ));
+
+    let streamed = format!("careful\n</think>\n\nbrief note\n\n{first}\n{second}<|im_end|>ignored");
+    for split in (0..=streamed.len()).filter(|index| streamed.is_char_boundary(*index)) {
+        let mut parser = plan.create_parser().unwrap();
+        parser.push(&streamed[..split]).unwrap();
+        parser.push(&streamed[split..]).unwrap();
+        assert_eq!(
+            tool_argument_events(parser.events()),
+            [
+                r#"{"count":1.5,"flag":true,"label":"true <ok> café 🦀","mode":"fast","nested":{"items":[1,2],"nothing":null}}"#,
+                "{}",
+            ],
+            "split {split}"
+        );
+        assert_eq!(
+            parser
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    SemanticEvent::TextDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "\n\nbrief note\n\n"
+        );
+        assert_eq!(
+            parser
+                .events()
+                .iter()
+                .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                .count(),
+            2
+        );
+        assert_eq!(
+            parser.events().last(),
+            Some(&SemanticEvent::Finished {
+                reason: FinishReason::StopSequence,
+            })
+        );
+    }
+
+    for malformed in [
+        "<tool_call>\n<function=typed>\n<parameter=unknown>\ntrue\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=typed>\n<parameter=flag>\ntrue\n</parameter>\n<parameter=flag>\nfalse\n</parameter>\n<parameter=label>\nx\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=typed>\n<parameter=flag>\n1\n</parameter>\n<parameter=label>\nx\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=typed>\n<parameter=bad<name>\nx\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=typed>\n<parameter=label>\na\n</parameter>\nINJECT\n</parameter>\n</function>\n</tool_call>",
+    ] {
+        let mut parser = plan.create_parser().unwrap();
+        assert!(parser.push(malformed).is_err(), "{malformed}");
+    }
+    let mut incomplete = plan.create_parser().unwrap();
+    incomplete
+        .push("<tool_call>\n<function=typed>\n<parameter=flag>\ntrue")
+        .unwrap();
+    assert!(incomplete.finish(FinishReason::MaxTokens).is_err());
+}
+
+#[test]
+fn qwen_tagged_reasoning_parser_tracks_generation_prompt_state() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    for (add_generation_prompt, enable_thinking, output, reasoning, text) in [
+        (
+            true,
+            Some(true),
+            "careful\n</think>\n\nanswer<|im_end|>",
+            "careful",
+            "\n\nanswer",
+        ),
+        (
+            false,
+            Some(true),
+            "<think>\ncareful\n</think>\n\nanswer<|im_end|>",
+            "careful",
+            "\n\nanswer",
+        ),
+        (
+            true,
+            Some(false),
+            "visible only<|im_end|>",
+            "",
+            "visible only",
+        ),
+    ] {
+        let prepared = prepare_chat_from_parts(
+            &mut production_chat_tokenizer(41),
+            ModelChatTemplate::Single(QWEN36_FIXTURE_WITH_TERMINATOR.trim_end().into()),
+            "unrelated",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "hello"})],
+                enable_thinking,
+                add_generation_prompt,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        let mut parser = prepared
+            .generation_runtime_plan()
+            .unwrap()
+            .create_parser()
+            .unwrap();
+        parser.push(output).unwrap();
+        let actual_reasoning = parser
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                SemanticEvent::ReasoningDelta(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let actual_text = parser
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                SemanticEvent::TextDelta(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(actual_reasoning, reasoning);
+        assert_eq!(actual_text, text);
+    }
+}
+
+#[test]
 fn qwen25_instruct_template_renders_chat_tools_and_checkpoint_stops() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let mut tokenizer = production_chat_tokenizer(9);
@@ -1155,6 +1643,14 @@ fn behavioral_recognition_survives_nonsemantic_template_refactors() {
         (qwen3_current, "qwen.xml-tools.reasoning.v1"),
         (QWEN3_VL_FIXTURE, "xml-tools.v1"),
         (HERMES2_PRO_TOOL_USE_FIXTURE, "xml-tools.v1"),
+        (
+            QWEN36_FIXTURE_WITH_TERMINATOR.trim_end(),
+            "qwen3.6.tagged-parameter-tools.v1",
+        ),
+        (
+            QWEN38_FIXTURE_WITH_TERMINATOR.trim_end(),
+            "qwen3.8.tagged-parameter-tools.v1",
+        ),
     ] {
         prepare(
             &mut production_chat_tokenizer(7),
@@ -1264,6 +1760,31 @@ fn behavioral_recognition_rejects_changed_wire_envelopes() {
         &mut production_chat_tokenizer(5),
         ModelChatTemplate::Single(changed),
         "qwen",
+        &[],
+        Some(&Ok(ConstraintCompiler::synthetic_for_tests())),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "Use a tool."})],
+            tools: vec![production_tool("lookup")],
+            tool_choice: ToolChoice::Auto,
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(prepared.format_profile_identity(), None);
+    assert!(prepared.tool_runtime_plan().is_none());
+}
+
+#[test]
+fn qwen_tagged_lookalike_is_not_misclassified_as_json_in_xml() {
+    let changed = QWEN38_FIXTURE_WITH_TERMINATOR
+        .trim_end()
+        .replace("<parameter=", "<argument=")
+        .replace("</parameter>", "</argument>");
+    let prepared = prepare_chat_from_parts(
+        &mut production_chat_tokenizer(7),
+        ModelChatTemplate::Single(changed),
+        "qwen-name-must-not-drive-recognition",
         &[],
         Some(&Ok(ConstraintCompiler::synthetic_for_tests())),
         ChatTemplateRequest {
@@ -3251,6 +3772,7 @@ fn production_gemma4_templates_render_exact_thinking_tool_history_and_prompts() 
                                 max_calls: std::num::NonZeroUsize::new(2),
                             },
                             enable_thinking: Some(enable_thinking),
+                            reasoning_effort: None,
                             allow_unparsed_reasoning: false,
                             add_generation_prompt,
                             extra_template_kwargs: serde_json::Map::from_iter([(

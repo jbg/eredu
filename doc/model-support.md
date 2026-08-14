@@ -46,7 +46,7 @@ projector.
 | Qwen2 / Qwen2.5 | text | yes | `qwen2` | dense text models; exact full/sliding schedules |
 | Qwen3 | text | yes | `qwen3`, `qwen3moe` | dense and MoE |
 | Qwen3-VL | text, image, video | yes | `qwen3vl`, `qwen3vlmoe` + projector | dense and MoE text decoders, MRoPE and DeepStack |
-| Qwen3-Next / Qwen3.5 | text; image/video where present | yes | `qwen3next`, `qwen35`, `qwen35moe` | hybrid recurrent/full attention, dense and MoE; Qwen3.5 projector support |
+| Qwen3-Next / Qwen3.5 / Qwen3.6 / Qwen3.8 | text; image/video where present | yes | `qwen3next`, `qwen35`, `qwen35moe` | shared Qwen3.5 hybrid recurrent/full-attention contract; dense and MoE, projector and embedded-MTP support; official Qwen3.6/3.8 chat and tagged-parameter tools |
 | DeepSeek-V3 / R1 | text | yes | `deepseek2` | compressed MLA, dense-to-MoE schedules, native block FP8 |
 | DeepSeek-V4 | text | yes | `deepseek4` | mHC compressed sparse attention, routed/shared experts, native FP8 and mixed FP4, embedded MTP and fused DSpark |
 | GPT-OSS | text | yes | `gpt-oss` | Harmony chat, scheduled attention, native MXFP4 experts |
@@ -114,6 +114,15 @@ raw token and text completion APIs remain available separately.
 Native tool calling requires independently recognized tool rendering, output
 parsing, and constraint capabilities. An ordinary chat template does not imply
 tool support. See [Native tool calling](tool-calling.md).
+
+Accordingly, a full checkpoint-support claim covers more than loading tensor
+weights: it includes the checkpoint tokenizer and template sidecars, reasoning
+controls and history, media placeholders where applicable, and native tool
+rendering, constraints, and response parsing. Qwen3.6 and Qwen3.8 retain the
+`qwen3_5` / `qwen3_5_text` architecture contract. Their released templates use
+tagged function parameters rather than the older Qwen JSON-in-XML protocol;
+Qwen3.8 additionally accepts `reasoning_effort` values `low`, `medium`, and
+`xhigh`, while Qwen3.6 has no effort selector.
 
 ## Execution capabilities
 

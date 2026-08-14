@@ -1,7 +1,8 @@
 # Chat-template fixtures
 
 These Jinja files are fixed copies of selected production chat-template bodies.
-They test rendering and behavioral protocol recognition for Qwen, Mistral,
+They test rendering and behavioral protocol recognition for Qwen (including
+the pinned Qwen3.6 and Qwen3.8 release templates), Mistral,
 Llama, Nemotron, Gemma, GPT-OSS, Kimi Linear, LFM2, DeepSeek, Inkling, and
 Muse-Glimmer templates.
 

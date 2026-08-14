@@ -27,7 +27,7 @@ use crate::runtime::chat::dialect::DECLARATIVE_DIALECT;
 use crate::runtime::chat::dialect::{
     DeclarativeCallId, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
     ExactEnvelope, JsonFunctionEnvelope, NamedCallIdEncoding, NamedJsonArgumentsEncoding,
-    ParallelCallLayout, StructuralObjectEncoding, ToolNameConstraint,
+    ParallelCallLayout, StructuralObjectEncoding, TaggedParametersEncoding, ToolNameConstraint,
 };
 use crate::{
     runtime::chat::constraints::ConstraintBlueprint,
@@ -75,6 +75,12 @@ pub struct ChatTemplateRequest {
     pub parallel_tool_calls: ParallelToolCallPolicy,
     /// Explicit thinking/reasoning toggle, or `None` to preserve the template default.
     pub enable_thinking: Option<bool>,
+    /// Template-defined reasoning effort, or `None` to preserve the template default.
+    ///
+    /// Effort names are deliberately strings because checkpoint families expose
+    /// different levels. A recognized format profile validates the values it
+    /// supports before rendering.
+    pub reasoning_effort: Option<String>,
     /// Permit explicit thinking when no semantic reasoning parser is recognized.
     ///
     /// The default is fail-closed because raw fallback may expose reasoning
@@ -84,8 +90,9 @@ pub struct ChatTemplateRequest {
     pub add_generation_prompt: bool,
     /// Additional variables exposed to the checkpoint chat template.
     ///
-    /// `enable_thinking`, when explicitly set above, overrides a same-named
-    /// entry. Existing renderer precedence for all other keys is preserved.
+    /// `enable_thinking` and `reasoning_effort`, when explicitly set above,
+    /// override same-named entries. Existing renderer precedence for all other
+    /// keys is preserved.
     pub extra_template_kwargs: Map<String, Value>,
 }
 
@@ -122,6 +129,7 @@ impl Eq for GenerationConstraint {}
 pub(crate) struct SemanticRuntimePlan {
     dialect: &'static dyn FormatDialect,
     dialect_parameters: DialectParameters,
+    tools: Vec<Value>,
     structural_tokens: Vec<ResolvedStructuralToken>,
     profile_stop_sequences: Vec<String>,
 }
@@ -130,6 +138,7 @@ impl SemanticRuntimePlan {
     pub(crate) fn new(
         dialect: &'static dyn FormatDialect,
         dialect_parameters: DialectParameters,
+        tools: Vec<Value>,
         structural_token_spellings: Vec<String>,
         resolved_structural_token_ids: Vec<u32>,
         profile_stop_sequences: Vec<String>,
@@ -141,6 +150,7 @@ impl SemanticRuntimePlan {
         Self {
             dialect,
             dialect_parameters,
+            tools,
             structural_tokens: structural_token_spellings
                 .into_iter()
                 .zip(resolved_structural_token_ids)
@@ -162,7 +172,7 @@ impl SemanticRuntimePlan {
     ) -> Result<ToolRuntimeParser, String> {
         let parser = self
             .dialect
-            .incremental_parser_state(self.dialect_parameters)?;
+            .incremental_parser_state_with_tools(self.dialect_parameters, &self.tools)?;
         Ok(ToolRuntimeParser::new_with_structural_stops(
             parser,
             self.profile_stop_sequences.iter().map(String::as_str),
@@ -193,6 +203,7 @@ impl PartialEq for SemanticRuntimePlan {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.dialect, other.dialect)
             && self.dialect_parameters.ptr_eq(other.dialect_parameters)
+            && self.tools == other.tools
             && self.structural_tokens == other.structural_tokens
             && self.profile_stop_sequences == other.profile_stop_sequences
     }
@@ -222,6 +233,7 @@ pub(crate) struct GenerationRuntimePlanParts {
     pub(crate) tool_call_trigger: Option<String>,
     pub(crate) dialect: &'static dyn FormatDialect,
     pub(crate) dialect_parameters: DialectParameters,
+    pub(crate) tools: Vec<Value>,
     pub(crate) structural_token_spellings: Vec<String>,
     pub(crate) resolved_structural_token_ids: Vec<u32>,
     pub(crate) profile_stop_sequences: Vec<String>,
@@ -236,6 +248,7 @@ impl GenerationRuntimePlan {
         let semantic = SemanticRuntimePlan::new(
             parts.dialect,
             parts.dialect_parameters,
+            parts.tools,
             parts.structural_token_spellings,
             parts.resolved_structural_token_ids,
             parts.profile_stop_sequences,
@@ -294,10 +307,10 @@ impl GenerationRuntimePlan {
     /// parser.
     #[cfg(test)]
     pub(crate) fn create_parser(&self) -> Result<ToolRuntimeParser, String> {
-        let parser = self
-            .semantic
-            .dialect
-            .incremental_parser_state(self.semantic.dialect_parameters)?;
+        let parser = self.semantic.dialect.incremental_parser_state_with_tools(
+            self.semantic.dialect_parameters,
+            &self.semantic.tools,
+        )?;
         let mut parser = ToolRuntimeParser::new(
             parser,
             self.semantic
@@ -561,6 +574,7 @@ pub(crate) struct PreparedFormatProfile {
     pub(crate) tool_dialect_parameters: Option<DialectParameters>,
     pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
     pub(crate) reasoning_template_control: ReasoningTemplateControl,
+    pub(crate) reasoning_effort_control: Option<ReasoningEffortControl>,
     pub(crate) supports_reasoning_parsing: bool,
     pub(crate) supports_tool_reasoning: bool,
     pub(crate) supports_tool_input_rendering: bool,
@@ -570,6 +584,12 @@ pub(crate) struct PreparedFormatProfile {
     pub(crate) required_structural_tokens: Vec<String>,
     pub(crate) tool_required_structural_tokens: Vec<String>,
     pub(crate) stop_sequences: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReasoningEffortControl {
+    pub(crate) kwarg: &'static str,
+    pub(crate) supported: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,6 +667,66 @@ pub(crate) const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialec
     }),
     ..QWEN_XML_TOOL_SPEC
 };
+
+const QWEN_TAGGED_PARAMETERS: TaggedParametersEncoding = TaggedParametersEncoding {
+    function_prefix: "<function=",
+    function_name_suffix: ">\n",
+    parameter_prefix: "<parameter=",
+    parameter_name_suffix: ">\n",
+    parameter_suffix: "\n</parameter>\n",
+    function_suffix: "</function>",
+};
+
+const QWEN_TAGGED_TOOL_SPEC_BASE: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    reasoning_template_kwarg: "enable_thinking",
+    supports_tool_reasoning: true,
+    output: ExactEnvelope {
+        prefix: "",
+        suffix: "",
+    },
+    call: ExactEnvelope {
+        prefix: "<tool_call>\n",
+        suffix: "\n</tool_call>",
+    },
+    payload_shape: DeclarativePayloadShape::TaggedParameters(QWEN_TAGGED_PARAMETERS),
+    json_function: None,
+    reasoning_channel: None,
+    text_channel: None,
+    raw_text_before_calls: true,
+    call_separator: "\n",
+    parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    protocol_max_tools: None,
+    protocol_max_calls: None,
+    auto_activation_trigger: Some("<tool_call>\n"),
+    required_structural_tokens: &["<|im_end|>"],
+    stop_sequences: &["<|im_end|>"],
+};
+
+pub(crate) const QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING: DeclarativeDialectSpec =
+    DeclarativeDialectSpec {
+        reasoning_channel: Some(DelimitedChannel {
+            prefix: "<think>\n",
+            suffix: "\n</think>",
+            required: false,
+            prefix_in_prompt: false,
+        }),
+        ..QWEN_TAGGED_TOOL_SPEC_BASE
+    };
+
+pub(crate) const QWEN_TAGGED_TOOL_SPEC_PREFILLED_REASONING: DeclarativeDialectSpec =
+    DeclarativeDialectSpec {
+        reasoning_channel: Some(DelimitedChannel {
+            prefix: "<think>\n",
+            suffix: "\n</think>",
+            required: false,
+            prefix_in_prompt: true,
+        }),
+        ..QWEN_TAGGED_TOOL_SPEC_BASE
+    };
+
+pub(crate) const QWEN_TAGGED_TOOL_SPEC_NO_REASONING: DeclarativeDialectSpec =
+    QWEN_TAGGED_TOOL_SPEC_BASE;
 
 pub(crate) const MISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
@@ -1048,6 +1128,7 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
             tool_dialect_parameters: Some(parameters),
             generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
             reasoning_template_control: ReasoningTemplateControl::Boolean("enable_thinking"),
+            reasoning_effort_control: None,
             supports_reasoning_parsing: false,
             supports_tool_reasoning: true,
             supports_tool_input_rendering: true,
@@ -1068,6 +1149,7 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
         tool_dialect_parameters: None,
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
         reasoning_template_control: ReasoningTemplateControl::Boolean("enable_thinking"),
+        reasoning_effort_control: None,
         supports_reasoning_parsing: false,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: false,

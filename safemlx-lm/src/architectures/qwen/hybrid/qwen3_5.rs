@@ -6897,7 +6897,7 @@ pub fn load_qwen3_5_model(
     Ok(model)
 }
 
-/// Loads a dense or MoE Qwen3.5/3.6 checkpoint while affine-quantizing eligible
+/// Loads a dense or MoE Qwen3.5/3.6/3.8 checkpoint while affine-quantizing eligible
 /// text weights, including packed rank-3 routed expert banks when present.
 pub fn load_qwen3_5_model_quantized(
     model_dir: impl AsRef<Path>,
@@ -6910,11 +6910,11 @@ pub fn load_qwen3_5_model_quantized(
     let (args, image_token_id, video_token_id, vision_config) = get_qwen3_5_model_args(model_dir)?;
     if args.quantization_config.is_some() {
         return Err(Error::Quantization(
-            "Qwen3.5/3.6 on-load quantization requires floating-point weights; native FP8 checkpoints cannot be implicitly transcoded".into(),
+            "Qwen3.5/3.6/3.8 on-load quantization requires floating-point weights; native FP8 checkpoints cannot be implicitly transcoded".into(),
         ));
     }
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Qwen3.5/3.6",
+        "Qwen3.5/3.6/3.8",
         args.quantization,
         quantization,
     )? {

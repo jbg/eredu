@@ -1,4 +1,4 @@
-//! Qwen3-Next and Qwen3.5/3.6 adapters for embedded MTP layers.
+//! Qwen3-Next and Qwen3.5/3.6/3.8 adapters for embedded MTP layers.
 
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 

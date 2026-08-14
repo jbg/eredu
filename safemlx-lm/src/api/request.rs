@@ -476,6 +476,45 @@ fn capability(condition: bool, reason: impl Into<String>) -> CapabilitySupport {
     }
 }
 
+fn validate_qwen_tagged_history(messages: &[Value]) -> Result<(), Error> {
+    for (message_index, message) in messages.iter().enumerate() {
+        let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for (call_index, call) in tool_calls.iter().enumerate() {
+            let function = call.get("function").unwrap_or(call);
+            let Some(arguments) = function.get("arguments") else {
+                continue;
+            };
+            let arguments = arguments.as_object().ok_or_else(|| {
+                Error::ToolConstraint(format!(
+                    "messages[{message_index}].tool_calls[{call_index}].function.arguments must be a mapping for Qwen tagged-parameter templates; serialized strings are unsupported"
+                ))
+            })?;
+            for (name, value) in arguments {
+                if name.is_empty()
+                    || name
+                        .chars()
+                        .any(|character| matches!(character, '<' | '>' | '\r' | '\n'))
+                {
+                    return Err(Error::ToolConstraint(format!(
+                        "messages[{message_index}].tool_calls[{call_index}] contains unsafe tagged parameter name {name:?}"
+                    )));
+                }
+                if value
+                    .as_str()
+                    .is_some_and(|value| value.contains("\n</parameter>"))
+                {
+                    return Err(Error::ToolConstraint(format!(
+                        "messages[{message_index}].tool_calls[{call_index}] parameter {name:?} contains the unescaped tagged-parameter closing delimiter"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn recognize_gemma_protocol(
     tokenizer: &mut ChatTokenizer,
     selected_template: &ModelChatTemplate,
@@ -677,6 +716,7 @@ fn recognize_gemma_protocol(
         reasoning_template_control: crate::runtime::chat::ReasoningTemplateControl::Boolean(
             "enable_thinking",
         ),
+        reasoning_effort_control: None,
         supports_reasoning_parsing: true,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: tool_input_rendering,
@@ -832,6 +872,7 @@ fn recognize_inkling_protocol(
             enabled: "high",
             disabled: "none",
         },
+        reasoning_effort_control: None,
         supports_reasoning_parsing: true,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: tool_output_protocol,
@@ -932,6 +973,7 @@ fn recognize_muse_atem_protocol(
             enabled: "high",
             disabled: "high",
         },
+        reasoning_effort_control: None,
         supports_reasoning_parsing: true,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: mapping_tool_arguments,
@@ -1072,6 +1114,7 @@ fn recognized_dialect_profile(
         generation_prompt_behavior,
         reasoning_template_control:
             crate::runtime::chat::ReasoningTemplateControl::Boolean(reasoning_template_kwarg),
+        reasoning_effort_control: None,
         supports_reasoning_parsing: dialect.supports_reasoning_parsing(parameters),
         supports_tool_reasoning,
         supports_tool_input_rendering,
@@ -1104,7 +1147,7 @@ fn recognize_remaining_protocols(
             KIMI_K2_NATIVE_TOOL_SPEC, LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC,
             MINISTRAL_JSON_LIST_TOOL_SPEC, MISTRAL_JSON_LIST_TOOL_SPEC,
             NEMOTRON_NANO_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC,
-            QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
+            QWEN3_XML_TOOL_SPEC, QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING, QWEN_XML_TOOL_SPEC,
         },
     };
 
@@ -1235,6 +1278,66 @@ fn recognize_remaining_protocols(
     let qwen_mapping = supports(&mapping, &qwen_markers);
     let qwen_string = supports(&string, &qwen_markers);
     if qwen_mapping || qwen_string {
+        let tagged_mapping = mapping.as_deref().is_some_and(|rendered| {
+            rendered.contains(
+                "<tool_call>\n<function=safemlx_probe_7c91>\n<parameter=value>\n__safemlx_mapping_argument_probe__\n</parameter>\n</function>\n</tool_call>",
+            )
+        });
+        let tagged_string = string.as_deref().is_some_and(|rendered| {
+            rendered.contains("<function=safemlx_probe_7c91>\n<parameter=value>")
+                && rendered.contains("__safemlx_string_argument_probe__")
+        });
+        if tagged_mapping || tagged_string {
+            let mut effort_kwargs = serde_json::Map::new();
+            effort_kwargs.insert("reasoning_effort".into(), serde_json::json!("low"));
+            let qwen38 = tokenizer
+                .apply_chat_template_json(
+                    selected_template.clone(),
+                    [vec![serde_json::json!({
+                        "role": "user",
+                        "content": "__safemlx_effort_probe__"
+                    })]],
+                    Some(&[]),
+                    model_id,
+                    false,
+                    Some(&effort_kwargs),
+                )
+                .ok()
+                .and_then(|rendered| rendered.into_iter().next())
+                .is_some_and(|rendered| rendered.contains("Reasoning effort is set to low."));
+            let identity = if qwen38 {
+                "qwen3.8.tagged-parameter-tools.v1"
+            } else {
+                "qwen3.6.tagged-parameter-tools.v1"
+            };
+            let mut profile = recognized_dialect_profile(
+                tokenizer,
+                identity,
+                &DECLARATIVE_DIALECT,
+                DialectParameters::Declarative(&QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING),
+                tagged_mapping,
+                false,
+            )?;
+            if qwen38 {
+                profile.reasoning_effort_control =
+                    Some(crate::runtime::chat::ReasoningEffortControl {
+                        kwarg: "reasoning_effort",
+                        supported: &["low", "medium", "xhigh"],
+                    });
+            }
+            return Some(profile);
+        }
+        let json_in_xml = |rendered: &Option<String>| {
+            rendered.as_deref().is_some_and(|rendered| {
+                rendered.contains("\"name\": \"safemlx_probe_7c91\"")
+                    && rendered.contains("\"arguments\":")
+            })
+        };
+        let qwen_mapping = qwen_mapping && json_in_xml(&mapping);
+        let qwen_string = qwen_string && json_in_xml(&string);
+        if !qwen_mapping && !qwen_string {
+            return None;
+        }
         let reasoning = render_reasoning_protocol_probe(tokenizer, selected_template, model_id)
             .is_some_and(|rendered| {
                 rendered.contains(
@@ -1379,6 +1482,88 @@ pub(super) fn prepare_chat_from_parts(
         {
             profile = recognized;
         }
+    }
+    if profile
+        .identity
+        .as_deref()
+        .is_some_and(|identity| identity.starts_with("qwen3.6."))
+        && request.reasoning_effort.is_none()
+        && request
+            .extra_template_kwargs
+            .contains_key("reasoning_effort")
+    {
+        return Err(Error::ToolConstraint(
+            "Qwen3.6 does not expose reasoning_effort control".into(),
+        ));
+    }
+    let extra_reasoning_effort = if request.reasoning_effort.is_none() {
+        profile
+            .reasoning_effort_control
+            .and_then(|control| {
+                request
+                    .extra_template_kwargs
+                    .get(control.kwarg)
+                    .map(|value| (control, value))
+            })
+            .map(|(control, value)| {
+                value.as_str().map(|value| (control, value)).ok_or_else(|| {
+                    Error::ToolConstraint(format!(
+                        "{} must be a string for format profile {:?}",
+                        control.kwarg,
+                        profile.identity.as_deref().unwrap_or("unregistered")
+                    ))
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(reasoning_effort) = request
+        .reasoning_effort
+        .as_deref()
+        .or_else(|| extra_reasoning_effort.map(|(_, value)| value))
+    {
+        if request.enable_thinking == Some(false) {
+            return Err(Error::ToolConstraint(
+                "reasoning_effort cannot be combined with enable_thinking=false".into(),
+            ));
+        }
+        let control = profile.reasoning_effort_control.ok_or_else(|| {
+            Error::ToolConstraint(format!(
+                "format profile {:?} does not expose reasoning_effort control",
+                profile.identity.as_deref().unwrap_or("unregistered")
+            ))
+        })?;
+        if !control.supported.contains(&reasoning_effort) {
+            return Err(Error::ToolConstraint(format!(
+                "unsupported reasoning_effort {reasoning_effort:?} for format profile {:?}; expected {}",
+                profile.identity.as_deref().unwrap_or("unregistered"),
+                control.supported.join(", ")
+            )));
+        }
+    }
+    let add_generation_prompt = profile
+        .generation_prompt_behavior
+        .resolve(request.add_generation_prompt);
+    if profile.identity.as_deref().is_some_and(|identity| {
+        identity.starts_with("qwen3.6.") || identity.starts_with("qwen3.8.")
+    }) {
+        use crate::runtime::chat::{
+            dialect::DialectParameters, QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING,
+            QWEN_TAGGED_TOOL_SPEC_NO_REASONING, QWEN_TAGGED_TOOL_SPEC_PREFILLED_REASONING,
+        };
+        let spec = if request.enable_thinking == Some(false) {
+            &QWEN_TAGGED_TOOL_SPEC_NO_REASONING
+        } else if add_generation_prompt {
+            &QWEN_TAGGED_TOOL_SPEC_PREFILLED_REASONING
+        } else {
+            &QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING
+        };
+        let parameters = DialectParameters::Declarative(spec);
+        profile.dialect_parameters = Some(parameters);
+        profile.tool_dialect_parameters = Some(parameters);
+        profile.supports_reasoning_parsing = request.enable_thinking != Some(false);
+        validate_qwen_tagged_history(&request.messages)?;
     }
     if profile.identity.as_deref() == Some("muse-glimmer.atem.v1") {
         if request.enable_thinking == Some(false) {
@@ -1555,6 +1740,7 @@ pub(super) fn prepare_chat_from_parts(
         tool_choice,
         parallel_tool_calls: _,
         enable_thinking,
+        reasoning_effort,
         allow_unparsed_reasoning: _,
         add_generation_prompt,
         mut extra_template_kwargs,
@@ -1577,6 +1763,12 @@ pub(super) fn prepare_chat_from_parts(
                 .template_entry(enable_thinking);
             extra_template_kwargs.insert(kwarg.into(), value);
         }
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        let control = profile
+            .reasoning_effort_control
+            .expect("reasoning effort was validated against the recognized profile");
+        extra_template_kwargs.insert(control.kwarg.into(), Value::String(reasoning_effort));
     }
 
     let without_generation_prompt = tokenizer
