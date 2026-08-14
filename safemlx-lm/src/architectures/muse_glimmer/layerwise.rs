@@ -52,9 +52,10 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         populate_module_from_lease, populate_module_from_lease_excluding,
     },
+    runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -111,9 +112,10 @@ fn vision_static_bindings(
             },
         );
     }
-    Ok(build_module_bindings_with_recipes(
-        vision, "model", store, recipes,
-    )?)
+    Ok(
+        build_module_binding_plan_with_recipes(vision, "model", store, recipes)?
+            .build_bindings(store)?,
+    )
 }
 
 /// Architecture-owned KV cache accepted by the canonical Muse-Glimmer adapter.
@@ -1901,21 +1903,39 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             let root = self.language_model_root();
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, &format!("{root}.embed_tokens"), store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    &format!("{root}.embed_tokens"),
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             let root = self.language_model_root();
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, &format!("{root}.norm"), store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    &format!("{root}.norm"),
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings(head, "lm_head", store)?,
+                    build_module_binding_plan_with_recipes(
+                        head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2264,11 +2284,15 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         match layer {
-            MuseGlimmerLayer::Vision(_) if group == 0 => Ok(build_module_bindings(
-                layer,
-                &self.layer_checkpoint_prefix(group, index),
-                store,
-            )?),
+            MuseGlimmerLayer::Vision(_) if group == 0 => {
+                Ok(build_module_binding_plan_with_recipes(
+                    layer,
+                    &self.layer_checkpoint_prefix(group, index),
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?)
+            }
             MuseGlimmerLayer::Text(layer) if group == 1 => qwen_text_layer_bindings(
                 layer,
                 &self.args,
@@ -3010,12 +3034,14 @@ pub(crate) fn qwen_text_layer_bindings(
     external_experts: bool,
 ) -> Result<Vec<WeightBinding>, Error> {
     if external_experts {
-        return Ok(build_module_bindings_excluding(
+        return Ok(build_module_binding_plan_with_recipes_excluding(
             layer,
             prefix,
             store,
+            BTreeMap::new(),
             |name| name.starts_with("mlp.experts."),
-        )?);
+        )?
+        .build_bindings(store)?);
     }
     let expert_prefix = format!("{prefix}.mlp.experts");
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
@@ -3086,9 +3112,10 @@ pub(crate) fn qwen_text_layer_bindings(
             },
         );
     }
-    Ok(build_module_bindings_with_recipes(
-        layer, prefix, store, recipes,
-    )?)
+    Ok(
+        build_module_binding_plan_with_recipes(layer, prefix, store, recipes)?
+            .build_bindings(store)?,
+    )
 }
 
 pub(crate) fn qwen3_expert_catalog(
@@ -3279,8 +3306,18 @@ fn recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let plan = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    plan.build_bindings(store)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .pop()
+        .ok_or_else(|| Error::UnsupportedArchitecture("empty expert binding plan".into()))
 }
 
 fn split_expert_key(

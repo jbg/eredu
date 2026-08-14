@@ -2,6 +2,7 @@
 
 /// Muse-Glimmer DFlash external assistant.
 pub mod assistant;
+pub(crate) mod checkpoint;
 /// Bounded and unified residency execution for Muse-Glimmer.
 pub mod layerwise;
 pub(crate) mod mtp;

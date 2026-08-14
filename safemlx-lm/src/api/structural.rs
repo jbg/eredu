@@ -18,7 +18,7 @@ use crate::{
         lfm2::checkpoint as lfm2_checkpoint,
         llama::checkpoint as llama_checkpoint,
         moshi::personaplex,
-        muse_glimmer,
+        muse_glimmer::checkpoint as muse_glimmer_checkpoint,
         nemotron_h::model as nemotron_h,
         qwen::{
             dense::checkpoint as dense_qwen_checkpoint,
@@ -119,7 +119,7 @@ pub(crate) fn validate_safetensors(
                 !options.weight_residency.is_fully_resident(),
             ),
             ModelKind::Llama => llama_checkpoint::validate_safetensors(config, store),
-            ModelKind::MuseGlimmer => validate_muse_glimmer_safetensors(config, store),
+            ModelKind::MuseGlimmer => muse_glimmer_checkpoint::validate_safetensors(config, store),
             ModelKind::NemotronH => validate_nemotron_h_safetensors(config, store),
             ModelKind::PersonaPlex => validate_personaplex_safetensors(config, store),
             ModelKind::Qwen2 => validate_dense_qwen_safetensors(config, store),
@@ -170,7 +170,9 @@ pub(crate) fn validate_gguf(
             GgufArchitecture::Llama | GgufArchitecture::Mistral => {
                 llama_checkpoint::validate_gguf(checkpoint, metadata)
             }
-            GgufArchitecture::MuseGlimmer => validate_muse_glimmer_gguf(checkpoint, metadata),
+            GgufArchitecture::MuseGlimmer => {
+                muse_glimmer_checkpoint::validate_gguf(checkpoint, metadata)
+            }
             GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
                 validate_nemotron_h_gguf(architecture, checkpoint, metadata, options)
             }
@@ -208,7 +210,6 @@ fn unverified(architecture: &str) -> StructuralValidation {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum SafetensorsMatrixFormat {
-    Dense,
     Affine(crate::runtime::checkpoint::quantization::WeightQuantization),
 }
 
@@ -219,199 +220,6 @@ struct ExpectedTensor {
     safetensors_shape: Vec<usize>,
     gguf_shape: Vec<usize>,
     operation: TensorOperation,
-}
-
-fn muse_glimmer_expected(config: &Value) -> Result<Vec<ExpectedTensor>, Error> {
-    let args = muse_glimmer::config_from_hf_value(config)?;
-    let vision = config.get("vision_config").ok_or_else(|| {
-        Error::UnsupportedArchitecture("Muse-Glimmer config is missing vision_config".into())
-    })?;
-    let vision_i32 = |field: &str| -> Result<usize, Error> {
-        vision
-            .get(field)
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Muse-Glimmer vision_config requires positive integer {field}"
-                ))
-            })
-    };
-    let hidden = args.hidden_size as usize;
-    let vocab = args.vocab_size as usize;
-    let query = (args.num_attention_heads * args.head_dim) as usize;
-    let key_value = (args.num_key_value_heads * args.head_dim) as usize;
-    let intermediate = args.intermediate_size as usize;
-    let root = "model.language_model";
-    let mut tensors = vec![
-        expected(
-            format!("{root}.embed_tokens.weight"),
-            "token_embd.weight",
-            [vocab, hidden],
-        ),
-        expected_vector(format!("{root}.norm.weight"), "output_norm.weight", hidden),
-        expected("lm_head.weight", "output.weight", [vocab, hidden]),
-    ];
-    for layer in 0..args.num_hidden_layers as usize {
-        let model = format!("{root}.layers.{layer}");
-        let gguf = format!("blk.{layer}");
-        tensors.extend([
-            expected_vector(
-                format!("{model}.input_layernorm.weight"),
-                format!("{gguf}.attn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.post_attention_layernorm.weight"),
-                format!("{gguf}.post_attention_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.pre_feedforward_layernorm.weight"),
-                format!("{gguf}.ffn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.post_feedforward_layernorm.weight"),
-                format!("{gguf}.post_ffw_norm.weight"),
-                hidden,
-            ),
-            expected(
-                format!("{model}.self_attn.q_proj.weight"),
-                format!("{gguf}.attn_q.weight"),
-                [query, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.k_proj.weight"),
-                format!("{gguf}.attn_k.weight"),
-                [key_value, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.v_proj.weight"),
-                format!("{gguf}.attn_v.weight"),
-                [key_value, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.o_proj.weight"),
-                format!("{gguf}.attn_output.weight"),
-                [hidden, query],
-            ),
-            expected(
-                format!("{model}.self_attn.gate_proj.weight"),
-                format!("{gguf}.attn_gate.weight"),
-                [query, hidden],
-            ),
-            expected(
-                format!("{model}.mlp.gate_proj.weight"),
-                format!("{gguf}.ffn_gate.weight"),
-                [intermediate, hidden],
-            ),
-            expected(
-                format!("{model}.mlp.up_proj.weight"),
-                format!("{gguf}.ffn_up.weight"),
-                [intermediate, hidden],
-            ),
-            expected(
-                format!("{model}.mlp.down_proj.weight"),
-                format!("{gguf}.ffn_down.weight"),
-                [hidden, intermediate],
-            ),
-        ]);
-    }
-
-    let vision_hidden = vision_i32("hidden_size")?;
-    let vision_intermediate = vision_i32("intermediate_size")?;
-    let vision_layers = vision_i32("num_hidden_layers")?;
-    let patch = vision_i32("patch_size")?;
-    let temporal = vision_i32("patch_temporal")?;
-    let pos_height = vision_i32("pos_emb_height")?;
-    let pos_width = vision_i32("pos_emb_width")?;
-    tensors.extend([
-        expected(
-            "model.vision_tower.patch_embedder.patch_embedding.weight",
-            "",
-            [vision_hidden, temporal * 3 * patch * patch],
-        ),
-        expected(
-            "model.vision_tower.patch_embedder.position_embedding_table.weight",
-            "",
-            [pos_height * pos_width, vision_hidden],
-        ),
-        expected_vector("model.vision_tower.ln_pre.weight", "", vision_hidden),
-        expected_vector("model.vision_tower.ln_pre.bias", "", vision_hidden),
-        expected_vector("model.vision_tower.ln_post.weight", "", vision_hidden),
-        expected_vector("model.vision_tower.ln_post.bias", "", vision_hidden),
-    ]);
-    for layer in 0..vision_layers {
-        let model = format!("model.vision_tower.layers.{layer}");
-        for norm in ["norm1", "norm2"] {
-            tensors.push(expected_vector(
-                format!("{model}.{norm}.weight"),
-                "",
-                vision_hidden,
-            ));
-            tensors.push(expected_vector(
-                format!("{model}.{norm}.bias"),
-                "",
-                vision_hidden,
-            ));
-        }
-        for projection in ["q_proj", "k_proj", "v_proj", "proj"] {
-            tensors.push(expected(
-                format!("{model}.attn.{projection}.weight"),
-                "",
-                [vision_hidden, vision_hidden],
-            ));
-            tensors.push(expected_vector(
-                format!("{model}.attn.{projection}.bias"),
-                "",
-                vision_hidden,
-            ));
-        }
-        tensors.push(expected(
-            format!("{model}.mlp.fc1.weight"),
-            "",
-            [vision_intermediate, vision_hidden],
-        ));
-        tensors.push(expected_vector(
-            format!("{model}.mlp.fc1.bias"),
-            "",
-            vision_intermediate,
-        ));
-        tensors.push(expected(
-            format!("{model}.mlp.fc2.weight"),
-            "",
-            [vision_hidden, vision_intermediate],
-        ));
-        tensors.push(expected_vector(
-            format!("{model}.mlp.fc2.bias"),
-            "",
-            vision_hidden,
-        ));
-    }
-    let out_hidden = config
-        .get("out_hidden_size")
-        .and_then(Value::as_u64)
-        .unwrap_or(6144) as usize;
-    let projector = config
-        .get("projector_hidden_size")
-        .and_then(Value::as_u64)
-        .unwrap_or(4096) as usize;
-    tensors.extend([
-        expected(
-            "model.vision_adapter.fc1.weight",
-            "",
-            [projector, out_hidden],
-        ),
-        expected(
-            "model.vision_adapter.fc2.weight",
-            "",
-            [projector, projector],
-        ),
-        expected("model.vision_projection.weight", "", [hidden, projector]),
-    ]);
-    Ok(tensors)
 }
 
 fn expected(
@@ -1240,45 +1048,6 @@ fn validate_dense_qwen_safetensors(
     dense_qwen_checkpoint::validate_safetensors(config, store)
 }
 
-fn validate_muse_glimmer_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> StructuralValidation {
-    let expected = match muse_glimmer_expected(config) {
-        Ok(expected) => expected,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let args = match muse_glimmer::config_from_hf_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let quantization = args.weight_quantization();
-    let mut allowed = BTreeSet::new();
-    for tensor in &expected {
-        allowed.insert(tensor.safetensors_name.clone());
-        if tensor.operation == TensorOperation::Matrix {
-            if let Some(quantization) = quantization {
-                add_safetensors_format_companions(
-                    &mut allowed,
-                    &tensor.safetensors_name,
-                    SafetensorsMatrixFormat::Affine(quantization),
-                );
-            }
-        }
-    }
-    let mut issues = Vec::new();
-    append_structural_issues(
-        validate_safetensor_plan(store, expected, quantization),
-        &mut issues,
-    );
-    for key in store.keys() {
-        if !allowed.contains(&key) {
-            issues.push(unexpected_layout(&key, "Muse-Glimmer SafeTensors"));
-        }
-    }
-    finish(issues)
-}
-
 fn validate_personaplex_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
@@ -1643,57 +1412,6 @@ fn validate_qwen3_vl_safetensors(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_safetensor_plan(
-    store: &SafetensorsWeightStore,
-    expected: Vec<ExpectedTensor>,
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
-) -> StructuralValidation {
-    validate_safetensor_format_plan(store, expected, |_| {
-        quantization.map_or(
-            SafetensorsMatrixFormat::Dense,
-            SafetensorsMatrixFormat::Affine,
-        )
-    })
-}
-
-fn validate_safetensor_format_plan(
-    store: &SafetensorsWeightStore,
-    expected: Vec<ExpectedTensor>,
-    format_for: impl Fn(&str) -> SafetensorsMatrixFormat,
-) -> StructuralValidation {
-    let mut common = Vec::new();
-    let mut groups = Vec::new();
-    let mut construction_issues = Vec::new();
-    for tensor in expected {
-        let format = if tensor.operation == TensorOperation::Matrix {
-            format_for(&tensor.safetensors_name)
-        } else {
-            SafetensorsMatrixFormat::Dense
-        };
-        expand_safetensors_format(
-            &tensor.safetensors_name,
-            &tensor.safetensors_shape,
-            format,
-            &mut common,
-            &mut groups,
-            &mut construction_issues,
-        );
-    }
-    if !construction_issues.is_empty() {
-        return finish(construction_issues);
-    }
-    let plan = match SafetensorsCheckpointPlan::new(
-        "SafeTensors",
-        common,
-        groups,
-        CatalogPolicy::non_strict(),
-    ) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    checkpoint_validation::validate_safetensors_plan(store, &plan)
-}
-
 fn expand_safetensors_format(
     name: &str,
     shape: &[usize],
@@ -1703,11 +1421,6 @@ fn expand_safetensors_format(
     issues: &mut Vec<StructuralIssue>,
 ) {
     match format {
-        SafetensorsMatrixFormat::Dense => common.push(SafetensorsTensorConstraint::required(
-            name,
-            shape.to_vec(),
-            StoredDtypeConstraint::Floating,
-        )),
         SafetensorsMatrixFormat::Affine(quantization) => {
             let Some(&input) = shape.last() else {
                 issues.push(layout(
@@ -1806,7 +1519,6 @@ fn add_safetensors_format_companions(
 ) {
     let prefix = quantized_outer_prefix(name);
     match format {
-        SafetensorsMatrixFormat::Dense => {}
         SafetensorsMatrixFormat::Affine(quantization) => {
             if let Some(alias) = quantized_weight_alias(name) {
                 // SafeMLX-written checkpoints expose the packed matrix through
@@ -2221,233 +1933,18 @@ fn validate_dense_qwen_gguf(
     dense_qwen_checkpoint::validate_gguf(variant, checkpoint, metadata)
 }
 
-fn muse_glimmer_gguf_expected(args: &muse_glimmer::DecoderConfig) -> Vec<ExpectedTensor> {
-    let hidden = args.hidden_size as usize;
-    let vocab = args.vocab_size as usize;
-    let query = (args.num_attention_heads * args.head_dim) as usize;
-    let key_value = (args.num_key_value_heads * args.head_dim) as usize;
-    let head = args.head_dim as usize;
-    let intermediate = args.intermediate_size as usize;
-    let mut tensors = vec![
-        expected(
-            "model.embed_tokens.weight",
-            "token_embd.weight",
-            [vocab, hidden],
-        ),
-        expected_vector("model.norm.weight", "output_norm.weight", hidden),
-        expected("lm_head.weight", "output.weight", [vocab, hidden]),
-    ];
-    for layer in 0..args.num_hidden_layers as usize {
-        let model = format!("model.layers.{layer}");
-        let gguf = format!("blk.{layer}");
-        tensors.extend([
-            expected_vector(
-                format!("{model}.input_layernorm.weight"),
-                format!("{gguf}.attn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.post_attention_layernorm.weight"),
-                format!("{gguf}.post_attention_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.pre_feedforward_layernorm.weight"),
-                format!("{gguf}.ffn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.post_feedforward_layernorm.weight"),
-                format!("{gguf}.post_ffw_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.self_attn.q_norm.weight"),
-                format!("{gguf}.attn_q_norm.weight"),
-                head,
-            ),
-            expected_vector(
-                format!("{model}.self_attn.k_norm.weight"),
-                format!("{gguf}.attn_k_norm.weight"),
-                head,
-            ),
-            expected(
-                format!("{model}.self_attn.q_proj.weight"),
-                format!("{gguf}.attn_q.weight"),
-                [query, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.k_proj.weight"),
-                format!("{gguf}.attn_k.weight"),
-                [key_value, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.v_proj.weight"),
-                format!("{gguf}.attn_v.weight"),
-                [key_value, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.o_proj.weight"),
-                format!("{gguf}.attn_output.weight"),
-                [hidden, query],
-            ),
-            expected(
-                format!("{model}.self_attn.gate_proj.weight"),
-                format!("{gguf}.attn_gate.weight"),
-                [query, hidden],
-            ),
-            expected(
-                format!("{model}.mlp.gate_proj.weight"),
-                format!("{gguf}.ffn_gate.weight"),
-                [intermediate, hidden],
-            ),
-            expected(
-                format!("{model}.mlp.up_proj.weight"),
-                format!("{gguf}.ffn_up.weight"),
-                [intermediate, hidden],
-            ),
-            expected(
-                format!("{model}.mlp.down_proj.weight"),
-                format!("{gguf}.ffn_down.weight"),
-                [hidden, intermediate],
-            ),
-        ]);
-    }
-    tensors
-}
-
-fn validate_muse_glimmer_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> StructuralValidation {
-    let translate = |name: &str| muse_glimmer::translate_gguf_weight_name(name, false);
-    if let Err(error) = checkpoint.catalog().translated_outputs(translate) {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args =
-        match muse_glimmer::config_from_gguf_catalog(checkpoint, metadata, "muse-glimmer", false) {
-            Ok(args) => args,
-            Err(error) => return invalid_geometry(error.to_string()),
-        };
-    let expected = muse_glimmer_gguf_expected(&args);
-    let allowed = expected
-        .iter()
-        .map(|tensor| tensor.gguf_name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut issues = validate_gguf_plan(checkpoint, expected, "Muse-Glimmer");
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if !allowed.contains(name) {
-            issues.push(unexpected_layout(name, "Muse-Glimmer GGUF"));
-        }
-    }
-    finish(issues)
-}
-
 pub(crate) fn validate_muse_glimmer_projector_gguf(
     model_checkpoint: &GgufCheckpoint,
     model_metadata: &HashMap<String, GgufMetadataValue>,
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let text = match muse_glimmer::config_from_gguf_catalog(
+    muse_glimmer_checkpoint::validate_projector_gguf(
         model_checkpoint,
         model_metadata,
-        "muse-glimmer",
-        false,
-    ) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let vision =
-        match muse_glimmer::vision::VisionConfig::from_gguf_metadata(metadata, text.hidden_size) {
-            Ok(config) => config,
-            Err(error) => return invalid_geometry(error.to_string()),
-        };
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(muse_glimmer::translate_mmproj_weight_name)
-    {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let dense = |name: String, shape: Vec<usize>| {
-        expected_dense_with_gguf_shape("", name, shape.clone(), shape)
-    };
-    let matrix = |name: String, shape: Vec<usize>| ExpectedTensor {
-        safetensors_name: String::new(),
-        gguf_name: name,
-        safetensors_shape: shape.clone(),
-        gguf_shape: shape,
-        operation: TensorOperation::Matrix,
-    };
-    let hidden = vision.hidden_size as usize;
-    let intermediate = vision.intermediate_size as usize;
-    let patch = vision.patch_size as usize;
-    let merged = hidden * (vision.merge_size as usize).pow(2);
-    let mut expected = vec![
-        dense("v.patch_embd.weight".into(), vec![hidden, 3, patch, patch]),
-        dense("v.position_embd.weight".into(), vec![1024, hidden]),
-        dense("v.pre_ln.weight".into(), vec![hidden]),
-        dense("v.pre_ln.bias".into(), vec![hidden]),
-        dense("v.post_ln.weight".into(), vec![hidden]),
-        dense("v.post_ln.bias".into(), vec![hidden]),
-    ];
-    for layer in 0..vision.layer_count() {
-        let prefix = format!("v.blk.{layer}");
-        expected.extend([
-            dense(format!("{prefix}.ln1.weight"), vec![hidden]),
-            dense(format!("{prefix}.ln1.bias"), vec![hidden]),
-            dense(format!("{prefix}.ln2.weight"), vec![hidden]),
-            dense(format!("{prefix}.ln2.bias"), vec![hidden]),
-            matrix(format!("{prefix}.attn_q.weight"), vec![hidden, hidden]),
-            dense(format!("{prefix}.attn_q.bias"), vec![hidden]),
-            matrix(format!("{prefix}.attn_k.weight"), vec![hidden, hidden]),
-            dense(format!("{prefix}.attn_k.bias"), vec![hidden]),
-            matrix(format!("{prefix}.attn_v.weight"), vec![hidden, hidden]),
-            dense(format!("{prefix}.attn_v.bias"), vec![hidden]),
-            matrix(format!("{prefix}.attn_out.weight"), vec![hidden, hidden]),
-            dense(format!("{prefix}.attn_out.bias"), vec![hidden]),
-            matrix(
-                format!("{prefix}.ffn_up.weight"),
-                vec![intermediate, hidden],
-            ),
-            dense(format!("{prefix}.ffn_up.bias"), vec![intermediate]),
-            matrix(
-                format!("{prefix}.ffn_down.weight"),
-                vec![hidden, intermediate],
-            ),
-            dense(format!("{prefix}.ffn_down.bias"), vec![hidden]),
-        ]);
-    }
-    expected.extend([
-        matrix("mm.0.weight".into(), vec![4096, merged]),
-        matrix("mm.1.weight".into(), vec![4096, 4096]),
-        matrix("mm.2.weight".into(), vec![text.hidden_size as usize, 4096]),
-    ]);
-    let allowed = expected
-        .iter()
-        .map(|tensor| tensor.gguf_name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut issues = validate_gguf_plan(checkpoint, expected, "Muse-Glimmer projector");
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if !allowed.contains(name) {
-            issues.push(unexpected_layout(name, "Muse-Glimmer projector GGUF"));
-        }
-    }
-    finish(issues)
+        checkpoint,
+        metadata,
+    )
 }
 
 fn validate_qwen3_vl_gguf(
