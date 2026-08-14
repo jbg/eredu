@@ -27,9 +27,11 @@ use crate::{
         },
         checkpoint::{
             binding::{
-                build_module_bindings_with_recipes, populate_module_from_lease,
+                build_module_binding_plan_with_recipes,
+                build_module_binding_plan_with_recipes_excluding, populate_module_from_lease,
                 populate_module_from_lease_excluding,
             },
+            binding_plan::{BindingPlan, PlannedBinding},
             quantization::WeightQuantization,
             recipe::DerivedWeightRecipe,
             store::{GgufWeightStore, TensorSelection, WeightStore},
@@ -607,23 +609,25 @@ impl DeepSeekV4LayerwiseAdapter {
         if let Some(mtp) = &self.static_model.mtp {
             return Ok(Some(StaticUnitBindings::new(
                 DRAFT_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     mtp,
                     "mtp",
                     store,
                     draft_recipes(mtp, &self.args, store, false)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?));
         }
         if let Some(dspark) = &self.static_model.dspark {
             return Ok(Some(StaticUnitBindings::new(
                 DRAFT_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     dspark,
                     "mtp",
                     store,
                     draft_recipes(dspark, &self.args, store, true)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?));
         }
         Ok(None)
@@ -963,25 +967,27 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         Ok(vec![
             StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.static_model.model.embed_tokens,
                     "embed",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.static_model.model.norm,
                     "norm",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 HC_HEAD_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.static_model.model.hc_head,
                     "hc_head",
                     store,
@@ -990,16 +996,18 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
                         ("base".into(), source("hc_head_base")),
                         ("scale".into(), source("hc_head_scale")),
                     ]),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 HEAD_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.static_model.lm_head,
                     "head",
                     store,
                     qwen_linear_recipes("head", &self.static_model.lm_head),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
         ]
         .into_iter()
@@ -1245,20 +1253,14 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         layer: &DecoderLayer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings = build_module_bindings_with_recipes(
+        let bindings = build_module_binding_plan_with_recipes_excluding(
             layer,
             &format!("layers.{index}"),
             store,
             self.layer_recipes(layer, index, store)?,
+            |name| self.sparse_expert_cache && name.starts_with("ffn.switch_mlp."),
         )?;
-        if self.sparse_expert_cache {
-            Ok(bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("ffn.switch_mlp."))
-                .collect())
-        } else {
-            Ok(bindings)
-        }
+        Ok(bindings.build_bindings(store)?)
     }
 
     fn parallel_layer_bindings(
@@ -2182,8 +2184,7 @@ pub(crate) fn expert_catalog(
                         shape: vec![1, output as usize, (input / 8) as usize],
                     };
                 }
-                let bytes = recipe.infer(store)?.byte_len();
-                bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                bindings.push(deepseek_v4_recipe_binding(name, recipe, store)?);
             }
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
@@ -2199,6 +2200,23 @@ pub(crate) fn expert_catalog(
         }
     }
     Ok(entries)
+}
+
+fn deepseek_v4_recipe_binding(
+    name: &str,
+    recipe: DerivedWeightRecipe,
+    store: &dyn WeightStore,
+) -> Result<WeightBinding, Error> {
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 #[allow(clippy::too_many_arguments)]
