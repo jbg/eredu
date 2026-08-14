@@ -1,5 +1,6 @@
 //! Moonshot Kimi Linear text architecture.
 
+pub(crate) mod checkpoint;
 pub mod layerwise;
 pub mod model;
 

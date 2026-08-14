@@ -1,6 +1,6 @@
 //! Pure checkpoint-structure plans shared by inspection and high-level loading.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
@@ -14,7 +14,7 @@ use crate::{
         gemma4::{checkpoint as gemma4_checkpoint, model as gemma4},
         gpt_oss::checkpoint as gpt_oss_checkpoint,
         inkling::{checkpoint as inkling_checkpoint, model as inkling},
-        kimi_linear::model as kimi_linear,
+        kimi_linear::checkpoint as kimi_linear_checkpoint,
         lfm2::model as lfm2,
         llama::model as llama,
         moshi::personaplex,
@@ -28,8 +28,8 @@ use crate::{
     error::Error,
     runtime::checkpoint::{
         schema::{
-            gguf_encoding_supported, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
-            GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
+            AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+            GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
             SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
         },
         store::{SafetensorsWeightStore, StoredDtype, WeightStore},
@@ -112,7 +112,7 @@ pub(crate) fn validate_safetensors(
             ModelKind::Gemma4 => validate_gemma4_safetensors(config, store, options),
             ModelKind::GptOss => validate_gpt_oss_safetensors(config, store),
             ModelKind::Inkling => validate_inkling_safetensors(config, store),
-            ModelKind::KimiLinear => validate_kimi_linear_safetensors(config, store),
+            ModelKind::KimiLinear => kimi_linear_checkpoint::validate_safetensors(config, store),
             ModelKind::Lfm2 => validate_lfm2_safetensors(config, store, options),
             ModelKind::Llama => validate_llama_safetensors(config, store),
             ModelKind::MuseGlimmer => validate_muse_glimmer_safetensors(config, store),
@@ -171,7 +171,9 @@ pub(crate) fn validate_gguf(
             architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
                 validate_qwen3_vl_gguf(architecture, checkpoint, metadata, options)
             }
-            GgufArchitecture::KimiLinear => validate_kimi_linear_gguf(checkpoint, metadata),
+            GgufArchitecture::KimiLinear => {
+                kimi_linear_checkpoint::validate_gguf(checkpoint, metadata)
+            }
             GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe
             | GgufArchitecture::Qwen3Next => {
@@ -515,221 +517,6 @@ fn muse_glimmer_expected(config: &Value) -> Result<Vec<ExpectedTensor>, Error> {
         expected("model.vision_projection.weight", "", [hidden, projector]),
     ]);
     Ok(tensors)
-}
-
-fn kimi_linear_expected(args: &kimi_linear::ModelArgs) -> Vec<ExpectedTensor> {
-    let hidden = args.hidden_size as usize;
-    let vocab = args.vocab_size as usize;
-    let mut tensors = vec![
-        expected(
-            "model.embed_tokens.weight",
-            "token_embd.weight",
-            [vocab, hidden],
-        ),
-        expected_vector("model.norm.weight", "output_norm.weight", hidden),
-    ];
-    if !args.tie_word_embeddings {
-        tensors.push(expected("lm_head.weight", "output.weight", [vocab, hidden]));
-    }
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        let prefix = format!("model.layers.{layer}");
-        tensors.extend([
-            expected_vector(
-                format!("{prefix}.input_layernorm.weight"),
-                format!("blk.{layer}.attn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{prefix}.post_attention_layernorm.weight"),
-                format!("blk.{layer}.ffn_norm.weight"),
-                hidden,
-            ),
-        ]);
-        if policy.attention == kimi_linear::AttentionKind::Kda {
-            let heads = args.kda_config.num_heads as usize;
-            let head = args.kda_config.head_dim as usize;
-            let projection = heads * head;
-            tensors.extend([
-                expected(
-                    format!("{prefix}.self_attn.q_proj.weight"),
-                    format!("blk.{layer}.attn_q.weight"),
-                    [projection, hidden],
-                ),
-                expected(
-                    format!("{prefix}.self_attn.k_proj.weight"),
-                    format!("blk.{layer}.attn_k.weight"),
-                    [projection, hidden],
-                ),
-                expected(
-                    format!("{prefix}.self_attn.v_proj.weight"),
-                    format!("blk.{layer}.attn_v.weight"),
-                    [projection, hidden],
-                ),
-                expected(
-                    format!("{prefix}.self_attn.f_a_proj.weight"),
-                    format!("blk.{layer}.ssm_f_a.weight"),
-                    [head, hidden],
-                ),
-                expected(
-                    format!("{prefix}.self_attn.f_b_proj.weight"),
-                    format!("blk.{layer}.ssm_f_b.weight"),
-                    [projection, head],
-                ),
-                expected(
-                    format!("{prefix}.self_attn.b_proj.weight"),
-                    format!("blk.{layer}.ssm_beta.weight"),
-                    [heads, hidden],
-                ),
-                expected(
-                    format!("{prefix}.self_attn.g_a_proj.weight"),
-                    format!("blk.{layer}.ssm_g_a.weight"),
-                    [head, hidden],
-                ),
-                expected(
-                    format!("{prefix}.self_attn.g_b_proj.weight"),
-                    format!("blk.{layer}.ssm_g_b.weight"),
-                    [projection, head],
-                ),
-                expected_vector(
-                    format!("{prefix}.self_attn.dt_bias"),
-                    format!("blk.{layer}.ssm_dt.bias"),
-                    projection,
-                ),
-                expected_vector(
-                    format!("{prefix}.self_attn.o_norm.weight"),
-                    format!("blk.{layer}.ssm_norm.weight"),
-                    head,
-                ),
-                expected(
-                    format!("{prefix}.self_attn.o_proj.weight"),
-                    format!("blk.{layer}.attn_output.weight"),
-                    [hidden, projection],
-                ),
-            ]);
-        } else {
-            let heads = args.num_attention_heads as usize;
-            let query_head = (args.qk_nope_head_dim + args.qk_rope_head_dim) as usize;
-            if let Some(rank) = args.q_lora_rank {
-                tensors.extend([
-                    expected(
-                        format!("{prefix}.self_attn.q_a_proj.weight"),
-                        format!("blk.{layer}.attn_q_a.weight"),
-                        [rank as usize, hidden],
-                    ),
-                    expected_vector(
-                        format!("{prefix}.self_attn.q_a_layernorm.weight"),
-                        format!("blk.{layer}.attn_q_a_norm.weight"),
-                        rank as usize,
-                    ),
-                    expected(
-                        format!("{prefix}.self_attn.q_b_proj.weight"),
-                        format!("blk.{layer}.attn_q_b.weight"),
-                        [heads * query_head, rank as usize],
-                    ),
-                ]);
-            } else {
-                tensors.push(expected(
-                    format!("{prefix}.self_attn.q_proj.weight"),
-                    format!("blk.{layer}.attn_q.weight"),
-                    [heads * query_head, hidden],
-                ));
-            }
-            tensors.extend([
-                expected(
-                    format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),
-                    format!("blk.{layer}.attn_kv_a_mqa.weight"),
-                    [(args.kv_lora_rank + args.qk_rope_head_dim) as usize, hidden],
-                ),
-                expected_vector(
-                    format!("{prefix}.self_attn.kv_a_layernorm.weight"),
-                    format!("blk.{layer}.attn_kv_a_norm.weight"),
-                    args.kv_lora_rank as usize,
-                ),
-                expected(
-                    format!("{prefix}.self_attn.o_proj.weight"),
-                    format!("blk.{layer}.attn_output.weight"),
-                    [hidden, heads * args.v_head_dim as usize],
-                ),
-            ]);
-            if args.split_kv_b {
-                tensors.extend([
-                    expected(
-                        format!("{prefix}.self_attn.k_b_proj.weight"),
-                        format!("blk.{layer}.attn_k_b.weight"),
-                        [
-                            heads * args.qk_nope_head_dim as usize,
-                            args.kv_lora_rank as usize,
-                        ],
-                    ),
-                    expected(
-                        format!("{prefix}.self_attn.v_b_proj.weight"),
-                        format!("blk.{layer}.attn_v_b.weight"),
-                        [heads * args.v_head_dim as usize, args.kv_lora_rank as usize],
-                    ),
-                ]);
-            } else {
-                tensors.push(expected(
-                    format!("{prefix}.self_attn.kv_b_proj.weight"),
-                    format!("blk.{layer}.attn_kv_b.weight"),
-                    [
-                        heads * (args.qk_nope_head_dim + args.v_head_dim) as usize,
-                        args.kv_lora_rank as usize,
-                    ],
-                ));
-            }
-        }
-        if policy.feed_forward == kimi_linear::FeedForwardPolicy::SparseMoe {
-            let experts = args.num_experts as usize;
-            let intermediate = args.moe_intermediate_size as usize;
-            tensors.extend([
-                expected(
-                    format!("{prefix}.mlp.gate.weight"),
-                    format!("blk.{layer}.ffn_gate_inp.weight"),
-                    [experts, hidden],
-                ),
-                expected_vector(
-                    format!("{prefix}.mlp.gate.e_score_correction_bias"),
-                    format!("blk.{layer}.exp_probs_b.bias"),
-                    experts,
-                ),
-                expected(
-                    format!("{prefix}.mlp.shared_experts.gate_proj.weight"),
-                    format!("blk.{layer}.ffn_gate_shexp.weight"),
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{prefix}.mlp.shared_experts.up_proj.weight"),
-                    format!("blk.{layer}.ffn_up_shexp.weight"),
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{prefix}.mlp.shared_experts.down_proj.weight"),
-                    format!("blk.{layer}.ffn_down_shexp.weight"),
-                    [hidden, intermediate],
-                ),
-            ]);
-        } else {
-            let intermediate = args.intermediate_size as usize;
-            tensors.extend([
-                expected(
-                    format!("{prefix}.mlp.gate_proj.weight"),
-                    format!("blk.{layer}.ffn_gate.weight"),
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{prefix}.mlp.up_proj.weight"),
-                    format!("blk.{layer}.ffn_up.weight"),
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{prefix}.mlp.down_proj.weight"),
-                    format!("blk.{layer}.ffn_down.weight"),
-                    [hidden, intermediate],
-                ),
-            ]);
-        }
-    }
-    tensors
 }
 
 fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
@@ -1758,206 +1545,6 @@ fn validate_gpt_oss_safetensors(
     gpt_oss_checkpoint::validate_safetensors(config, store)
 }
 
-fn validate_kimi_linear_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> StructuralValidation {
-    let args = match kimi_linear::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > store.keys().len() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
-            args.num_hidden_layers,
-            store.keys().len()
-        ));
-    }
-
-    let mut issues = Vec::new();
-    let mut normalized = BTreeMap::<String, String>::new();
-    for raw in store.keys() {
-        if raw.starts_with("model.mtp.") {
-            continue;
-        }
-        let canonical = raw
-            .replace(".block_sparse_moe.", ".mlp.")
-            .replace(".inner.weight", ".weight");
-        if let Some(previous) = normalized.insert(canonical.clone(), raw.clone()) {
-            issues.push(StructuralIssue {
-                kind: StructuralIssueKind::ConflictingLayout,
-                detail: format!(
-                    "Kimi Linear checkpoint tensors {previous:?} and {raw:?} both map to {canonical:?}"
-                ),
-                tensor_name: Some(raw),
-                tensor_type_code: None,
-                metadata_key: None,
-            });
-        }
-    }
-
-    let mut expected = kimi_linear_expected(&args);
-    let mut allowed = BTreeSet::new();
-    for tensor in &mut expected {
-        if let Some(raw) = normalized.get(&tensor.safetensors_name) {
-            tensor.safetensors_name = raw.clone();
-        }
-        allowed.insert(tensor.safetensors_name.clone());
-        if tensor.operation == TensorOperation::Matrix {
-            let canonical = tensor
-                .safetensors_name
-                .replace(".block_sparse_moe.", ".mlp.")
-                .replace(".inner.weight", ".weight");
-            if let Some(quantization) = args.weight_quantization_for(&canonical) {
-                add_safetensors_format_companions(
-                    &mut allowed,
-                    &tensor.safetensors_name,
-                    SafetensorsMatrixFormat::Affine(quantization),
-                );
-            }
-        }
-    }
-    append_structural_issues(
-        validate_safetensor_plan_with(store, expected, |raw| {
-            args.weight_quantization_for(
-                &raw.replace(".block_sparse_moe.", ".mlp.")
-                    .replace(".inner.weight", ".weight"),
-            )
-        }),
-        &mut issues,
-    );
-
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.attention == kimi_linear::AttentionKind::Kda {
-            let prefix = format!("model.layers.{layer}.self_attn");
-            let projection = (args.kda_config.num_heads * args.kda_config.head_dim) as usize;
-            let kernel = args.kda_config.short_conv_kernel_size as usize;
-            for name in ["q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"] {
-                let canonical = format!("{prefix}.{name}");
-                let raw = normalized.get(&canonical).unwrap_or(&canonical);
-                allowed.insert(raw.clone());
-                validate_float_element_count(store, raw, projection * kernel, &mut issues);
-            }
-            let canonical = format!("{prefix}.A_log");
-            let raw = normalized.get(&canonical).unwrap_or(&canonical);
-            allowed.insert(raw.clone());
-            validate_float_element_count(
-                store,
-                raw,
-                args.kda_config.num_heads as usize,
-                &mut issues,
-            );
-        }
-        if policy.feed_forward != kimi_linear::FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        let prefix = format!("model.layers.{layer}.mlp.experts");
-        let gate_up = format!("{prefix}.gate_up_proj");
-        let down = format!("{prefix}.down_proj");
-        let has_packed = normalized.contains_key(&gate_up) || normalized.contains_key(&down);
-        let mut expert_expected = Vec::new();
-        if has_packed {
-            let gate_up_raw = normalized.get(&gate_up).unwrap_or(&gate_up).clone();
-            let down_raw = normalized.get(&down).unwrap_or(&down).clone();
-            allowed.extend([gate_up_raw.clone(), down_raw.clone()]);
-            for (raw, canonical) in [(&gate_up_raw, &gate_up), (&down_raw, &down)] {
-                if let Some(quantization) = args.weight_quantization_for(canonical) {
-                    allowed.insert(format!("{raw}.scales"));
-                    if quantization.has_biases() {
-                        allowed.insert(format!("{raw}.biases"));
-                    }
-                }
-            }
-            expert_expected.extend([
-                expected_rank3(
-                    gate_up_raw,
-                    "",
-                    [
-                        args.num_experts as usize,
-                        2 * args.moe_intermediate_size as usize,
-                        args.hidden_size as usize,
-                    ],
-                ),
-                expected_rank3(
-                    down_raw,
-                    "",
-                    [
-                        args.num_experts as usize,
-                        args.hidden_size as usize,
-                        args.moe_intermediate_size as usize,
-                    ],
-                ),
-            ]);
-        } else {
-            if args.quantization.is_some() {
-                issues.push(StructuralIssue {
-                    kind: StructuralIssueKind::ConflictingLayout,
-                    detail: format!(
-                        "checkpoint-native quantized Kimi Linear layer {layer} requires packed expert banks"
-                    ),
-                    tensor_name: Some(format!("{prefix}.0.w1.weight")),
-                    tensor_type_code: None,
-                    metadata_key: Some("quantization".into()),
-                });
-            }
-            for expert in 0..args.num_experts as usize {
-                for (projection, shape) in [
-                    (
-                        "w1",
-                        vec![
-                            args.moe_intermediate_size as usize,
-                            args.hidden_size as usize,
-                        ],
-                    ),
-                    (
-                        "w2",
-                        vec![
-                            args.hidden_size as usize,
-                            args.moe_intermediate_size as usize,
-                        ],
-                    ),
-                    (
-                        "w3",
-                        vec![
-                            args.moe_intermediate_size as usize,
-                            args.hidden_size as usize,
-                        ],
-                    ),
-                ] {
-                    let canonical = format!("{prefix}.{expert}.{projection}.weight");
-                    let raw = normalized.get(&canonical).unwrap_or(&canonical).clone();
-                    allowed.insert(raw.clone());
-                    expert_expected.push(ExpectedTensor {
-                        safetensors_name: raw,
-                        gguf_name: String::new(),
-                        safetensors_shape: shape.clone(),
-                        gguf_shape: shape,
-                        operation: TensorOperation::Matrix,
-                    });
-                }
-            }
-        }
-        append_structural_issues(
-            validate_safetensor_plan_with(store, expert_expected, |raw| {
-                let canonical = raw.replace(".block_sparse_moe.", ".mlp.");
-                if canonical.ends_with("gate_up_proj") || canonical.ends_with("down_proj") {
-                    args.weight_quantization_for(&canonical)
-                } else {
-                    None
-                }
-            }),
-            &mut issues,
-        );
-    }
-
-    for raw in store.keys() {
-        if !raw.starts_with("model.mtp.") && !allowed.contains(&raw) {
-            issues.push(unexpected_layout(&raw, "Kimi Linear SafeTensors"));
-        }
-    }
-    finish(issues)
-}
-
 fn append_structural_issues(validation: StructuralValidation, issues: &mut Vec<StructuralIssue>) {
     match validation {
         StructuralValidation::Exact => {}
@@ -1965,53 +1552,6 @@ fn append_structural_issues(validation: StructuralValidation, issues: &mut Vec<S
         StructuralValidation::Unverified(_) => {
             unreachable!("pure tensor plan is always exact or invalid")
         }
-    }
-}
-
-fn validate_float_element_count(
-    store: &SafetensorsWeightStore,
-    name: &str,
-    elements: usize,
-    issues: &mut Vec<StructuralIssue>,
-) {
-    let metadata = match store.metadata(name) {
-        Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
-            issues.push(missing(name));
-            return;
-        }
-        Err(error) => {
-            issues.push(layout(name, error.to_string()));
-            return;
-        }
-    };
-    let actual = metadata
-        .shape
-        .iter()
-        .try_fold(1usize, |total, dimension| total.checked_mul(*dimension));
-    if actual != Some(elements) {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::ShapeMismatch,
-            detail: format!(
-                "tensor {name:?} must contain {elements} elements for the loader reshape, got shape {:?}",
-                metadata.shape
-            ),
-            tensor_name: Some(name.into()),
-            tensor_type_code: None,
-            metadata_key: None,
-        });
-    }
-    if !is_float_dtype(&metadata.stored_dtype) {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::UnsupportedEncoding,
-            detail: format!(
-                "tensor {name:?} uses unsupported SafeTensors dtype {:?}",
-                metadata.stored_dtype
-            ),
-            tensor_name: Some(name.into()),
-            tensor_type_code: None,
-            metadata_key: None,
-        });
     }
 }
 
@@ -3026,127 +2566,6 @@ fn validate_deepseek4_gguf(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
     deepseek_v4_checkpoint::validate_gguf(checkpoint, metadata)
-}
-
-fn validate_kimi_linear_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> StructuralValidation {
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(kimi_linear::translate_gguf_weight_name)
-    {
-        return invalid_geometry(error.to_string());
-    }
-    let args = match kimi_linear::model_args_from_gguf_catalog(checkpoint, metadata) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if let Err(error) = args.validate() {
-        return invalid_geometry(error.to_string());
-    }
-
-    let mut issues =
-        validate_gguf_plan(checkpoint, kimi_linear_expected(&args), "Kimi Linear GGUF");
-    issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
-        checkpoint,
-        (0..args.num_hidden_layers as usize).map(|layer| {
-            (
-                format!("blk.{layer}.ffn_gate_exps.weight"),
-                format!("blk.{layer}.ffn_up_exps.weight"),
-            )
-        }),
-        "Kimi Linear GGUF",
-    ));
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.attention != kimi_linear::AttentionKind::Kda {
-            continue;
-        }
-        let projection = (args.kda_config.num_heads * args.kda_config.head_dim) as usize;
-        let kernel = args.kda_config.short_conv_kernel_size as usize;
-        for suffix in [
-            "ssm_conv1d_q.weight",
-            "ssm_conv1d_k.weight",
-            "ssm_conv1d_v.weight",
-        ] {
-            issues.extend(validate_gguf_element_count(
-                checkpoint,
-                &format!("blk.{layer}.{suffix}"),
-                projection * kernel,
-                TensorOperation::Dense,
-                "Kimi Linear GGUF",
-            ));
-        }
-        let canonical = format!("blk.{layer}.ssm_a");
-        let weight_alias = format!("{canonical}.weight");
-        let name = if checkpoint
-            .catalog()
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == weight_alias)
-        {
-            weight_alias
-        } else {
-            canonical
-        };
-        issues.extend(validate_gguf_element_count(
-            checkpoint,
-            &name,
-            args.kda_config.num_heads as usize,
-            TensorOperation::Vector,
-            "Kimi Linear GGUF",
-        ));
-    }
-    finish(issues)
-}
-
-fn validate_gguf_element_count(
-    checkpoint: &GgufCheckpoint,
-    name: &str,
-    expected_elements: usize,
-    operation: TensorOperation,
-    loader_name: &str,
-) -> Vec<StructuralIssue> {
-    let Some(actual) = checkpoint
-        .catalog()
-        .tensors()
-        .find(|tensor| tensor.descriptor().name == name)
-    else {
-        return vec![missing(name)];
-    };
-    let mut issues = Vec::new();
-    let elements = actual
-        .descriptor()
-        .mlx_shape()
-        .into_iter()
-        .try_fold(1usize, |product, dimension| {
-            product.checked_mul(usize::try_from(dimension).ok()?)
-        });
-    if elements != Some(expected_elements) {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::ShapeMismatch,
-            detail: format!(
-                "tensor {name:?} must contain {expected_elements} elements for the loader transform, got {:?}",
-                actual.descriptor().mlx_shape()
-            ),
-            tensor_name: Some(name.into()),
-            tensor_type_code: Some(actual.descriptor().ggml_type.code()),
-            metadata_key: None,
-        });
-    }
-    if !gguf_encoding_supported(operation, actual.descriptor().ggml_type) {
-        let encoding = actual.descriptor().ggml_type;
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::UnsupportedEncoding,
-            detail: format!(
-                "GGUF tensor {name:?} uses {encoding:?} (type {}) for a {operation:?} operation, which the {loader_name} loader does not support",
-                encoding.code()
-            ),
-            tensor_name: Some(name.into()),
-            tensor_type_code: Some(encoding.code()),
-            metadata_key: None,
-        });
-    }
-    issues
 }
 
 fn validate_lfm2_gguf(

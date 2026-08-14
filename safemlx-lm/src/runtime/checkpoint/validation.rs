@@ -27,6 +27,7 @@ trait Constraint<E> {
     fn aliases(&self) -> &[String];
     fn shape(&self) -> &[usize];
     fn alternate_shapes(&self) -> &[Vec<usize>];
+    fn element_count(&self) -> Option<usize>;
     fn requirement(&self) -> TensorRequirement;
     fn role(&self) -> TensorRole;
     fn accepts(&self, encoding: &E) -> bool;
@@ -49,6 +50,9 @@ impl Constraint<StoredDtype> for SafetensorsTensorConstraint {
     }
     fn alternate_shapes(&self) -> &[Vec<usize>] {
         &[]
+    }
+    fn element_count(&self) -> Option<usize> {
+        self.element_count
     }
     fn requirement(&self) -> TensorRequirement {
         self.requirement
@@ -87,6 +91,9 @@ impl Constraint<GgufType> for GgufTensorConstraint {
     }
     fn alternate_shapes(&self) -> &[Vec<usize>] {
         &self.alternate_shapes
+    }
+    fn element_count(&self) -> Option<usize> {
+        self.element_count
     }
     fn requirement(&self) -> TensorRequirement {
         self.requirement
@@ -489,7 +496,18 @@ fn validate_constraint<E: std::fmt::Debug, T: Constraint<E>>(
     }
 
     if !accepts_shape(constraint, &actual.shape) {
-        if constraint.alternate_shapes().is_empty() {
+        if let Some(element_count) = constraint.element_count() {
+            issues.push(CheckpointIssue {
+                kind: CheckpointIssueKind::ShapeMismatch,
+                detail: format!(
+                    "tensor {actual_key:?} must contain {element_count} elements for the loader transform, got {:?}",
+                    actual.shape
+                ),
+                tensor_name: Some(actual_key.into()),
+                tensor_type_code: constraint.type_code(&actual.encoding),
+                metadata_key: None,
+            });
+        } else if constraint.alternate_shapes().is_empty() {
             issues.push(shape_mismatch(
                 actual_key,
                 constraint.shape(),
@@ -528,6 +546,12 @@ fn validate_constraint<E: std::fmt::Debug, T: Constraint<E>>(
 }
 
 fn accepts_shape<E, T: Constraint<E>>(constraint: &T, actual: &[usize]) -> bool {
+    if let Some(element_count) = constraint.element_count() {
+        return actual
+            .iter()
+            .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
+            == Some(element_count);
+    }
     actual == constraint.shape()
         || constraint
             .alternate_shapes()
@@ -720,6 +744,41 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, CheckpointIssueKind::ConflictingLayout);
         assert_eq!(issues[0].tensor_name.as_deref(), Some("released"));
+    }
+
+    #[test]
+    fn element_count_constraints_accept_reshape_equivalent_storage() {
+        let plan = safe_plan(
+            vec![SafetensorsTensorConstraint::required(
+                "convolution",
+                vec![4, 1, 2],
+                StoredDtypeConstraint::Floating,
+            )
+            .with_element_count(8)],
+            Vec::new(),
+            CatalogPolicy::strict(),
+        );
+        let reshaped = BTreeMap::from([safe("convolution", &[4, 2], StoredDtype::BF16)]);
+        assert!(validate_catalog(
+            &reshaped,
+            &plan.identity,
+            &plan.common_tensors,
+            &plan.layout_groups,
+            &plan.catalog_policy,
+        )
+        .is_empty());
+
+        let wrong = BTreeMap::from([safe("convolution", &[4, 3], StoredDtype::BF16)]);
+        let issues = validate_catalog(
+            &wrong,
+            &plan.identity,
+            &plan.common_tensors,
+            &plan.layout_groups,
+            &plan.catalog_policy,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].kind, CheckpointIssueKind::ShapeMismatch);
+        assert!(issues[0].detail.contains("must contain 8 elements"));
     }
 
     fn alternatives() -> Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>> {

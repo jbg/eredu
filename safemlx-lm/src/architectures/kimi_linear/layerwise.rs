@@ -33,9 +33,11 @@ use crate::{
         },
         checkpoint::{
             binding::{
-                build_module_bindings_with_recipes, canonical_checkpoint_name,
+                build_module_binding_plan_with_recipes,
+                build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
                 populate_module_from_lease, populate_module_from_lease_excluding,
             },
+            binding_plan::{BindingPlan, PlannedBinding},
             quantization::{should_quantize_on_load, WeightQuantization},
             recipe::DerivedWeightRecipe,
             store::{GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend},
@@ -1287,30 +1289,38 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.embedding,
                     "model.embed_tokens",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.norm,
                     "model.norm",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(lm_head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings_with_recipes(lm_head, "lm_head", store, BTreeMap::new())?,
+                    build_module_binding_plan_with_recipes(
+                        lm_head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -1690,20 +1700,14 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings = build_module_bindings_with_recipes(
+        let plan = build_module_binding_plan_with_recipes_excluding(
             layer,
             &format!("model.layers.{index}"),
             store,
             self.recipes_for_layer(layer, index, store)?,
+            |name| self.sparse_expert_cache && name.starts_with("mlp.experts."),
         )?;
-        if self.sparse_expert_cache {
-            Ok(bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("mlp.experts."))
-                .collect())
-        } else {
-            Ok(bindings)
-        }
+        Ok(plan.build_bindings(store)?)
     }
     fn parallel_layer_bindings(
         &self,
@@ -2000,7 +2004,7 @@ pub(crate) fn kimi_expert_catalog_for_layers(
         }
         let prefix = format!("model.layers.{layer}.mlp.experts");
         for expert in 0..args.num_experts as usize {
-            let mut bindings = Vec::new();
+            let mut planned = Vec::new();
             for (binding_name, recipe) in [
                 (
                     "gate_up_proj",
@@ -2011,7 +2015,13 @@ pub(crate) fn kimi_expert_catalog_for_layers(
                     expert_projection_recipe(&normalized, &prefix, expert, "down_proj")?,
                 ),
             ] {
-                bindings.push(recipe_binding(binding_name, recipe, store)?);
+                let metadata = recipe.infer(store)?;
+                planned.push(PlannedBinding {
+                    target_name: binding_name.into(),
+                    expected_shape: metadata.shape().to_vec(),
+                    expected_dtype: metadata.dtype().clone(),
+                    recipe,
+                });
             }
             for (name, projection, suffix) in [
                 ("gate_up_proj_scales", "gate_up_proj", "_scales"),
@@ -2026,9 +2036,18 @@ pub(crate) fn kimi_expert_catalog_for_layers(
                     projection,
                     suffix,
                 )? {
-                    bindings.push(recipe_binding(name, recipe, store)?);
+                    let metadata = recipe.infer(store)?;
+                    planned.push(PlannedBinding {
+                        target_name: name.into(),
+                        expected_shape: metadata.shape().to_vec(),
+                        expected_dtype: metadata.dtype().clone(),
+                        recipe,
+                    });
                 }
             }
+            let bindings = BindingPlan::new(planned)
+                .and_then(|plan| plan.build_bindings(store))
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
                     Error::UnsupportedArchitecture(
@@ -2153,15 +2172,6 @@ fn optional_expert_component_recipe(
             "Kimi Linear checkpoint {prefix} has mismatched packed gate/up expert components {suffix:?}"
         ))),
     }
-}
-
-fn recipe_binding(
-    name: &str,
-    recipe: DerivedWeightRecipe,
-    store: &dyn WeightStore,
-) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
 }
 
 /// Token generation over a bounded Kimi model.

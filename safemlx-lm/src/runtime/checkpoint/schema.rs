@@ -58,6 +58,9 @@ pub(crate) struct SafetensorsTensorConstraint {
     /// Alternative physical names for the same logical tensor.
     pub(crate) aliases: Vec<String>,
     pub(crate) shape: Vec<usize>,
+    /// Accept any physical shape with this many elements. `shape` remains the
+    /// canonical shape used by loading recipes.
+    pub(crate) element_count: Option<usize>,
     pub(crate) dtype: StoredDtypeConstraint,
     pub(crate) requirement: TensorRequirement,
     pub(crate) role: TensorRole,
@@ -73,6 +76,7 @@ impl SafetensorsTensorConstraint {
             key: key.into(),
             aliases: Vec::new(),
             shape: shape.into(),
+            element_count: None,
             dtype,
             requirement: TensorRequirement::Required,
             role: TensorRole::Tensor,
@@ -89,6 +93,11 @@ impl SafetensorsTensorConstraint {
         aliases: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.aliases = aliases.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub(crate) fn with_element_count(mut self, element_count: usize) -> Self {
+        self.element_count = Some(element_count);
         self
     }
 
@@ -166,6 +175,9 @@ pub(crate) struct GgufTensorConstraint {
     /// Additional accepted physical shapes for encodings with equivalent
     /// runtime semantics (for example, flattened and singleton-axis kernels).
     pub(crate) alternate_shapes: Vec<Vec<usize>>,
+    /// Accept any physical shape with this many elements. `shape` remains the
+    /// canonical shape used by loading recipes.
+    pub(crate) element_count: Option<usize>,
     pub(crate) encoding: GgufTypeConstraint,
     pub(crate) requirement: TensorRequirement,
     pub(crate) role: TensorRole,
@@ -182,6 +194,7 @@ impl GgufTensorConstraint {
             aliases: Vec::new(),
             shape: shape.into(),
             alternate_shapes: Vec::new(),
+            element_count: None,
             encoding,
             requirement: TensorRequirement::Required,
             role: TensorRole::Tensor,
@@ -206,6 +219,11 @@ impl GgufTensorConstraint {
         shapes: impl IntoIterator<Item = impl Into<Vec<usize>>>,
     ) -> Self {
         self.alternate_shapes = shapes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub(crate) fn with_element_count(mut self, element_count: usize) -> Self {
+        self.element_count = Some(element_count);
         self
     }
 
@@ -280,6 +298,14 @@ pub(crate) enum CheckpointPlanError {
     InvalidShape { key: String, shape: Vec<usize> },
     #[error("checkpoint tensor {key:?} shape element count overflows")]
     ShapeOverflow { key: String },
+    #[error("checkpoint tensor {key:?} has invalid required element count {element_count}")]
+    InvalidElementCount { key: String, element_count: usize },
+    #[error("checkpoint tensor {key:?} canonical shape contains {shape_elements} elements, but its required element count is {element_count}")]
+    ElementCountMismatch {
+        key: String,
+        shape_elements: usize,
+        element_count: usize,
+    },
     #[error("checkpoint plan contains duplicate tensor key {key:?}")]
     DuplicateTensorKey { key: String },
     #[error("checkpoint layout variant {variant:?} has invalid discriminator {key:?}")]
@@ -300,6 +326,7 @@ trait PhysicalConstraint {
     fn aliases_mut(&mut self) -> &mut Vec<String>;
     fn shape(&self) -> &[usize];
     fn alternate_shapes(&self) -> &[Vec<usize>];
+    fn element_count(&self) -> Option<usize>;
     fn normalize(&mut self);
     fn has_empty_encoding_set(&self) -> bool;
 }
@@ -319,6 +346,9 @@ impl PhysicalConstraint for SafetensorsTensorConstraint {
     }
     fn alternate_shapes(&self) -> &[Vec<usize>] {
         &[]
+    }
+    fn element_count(&self) -> Option<usize> {
+        self.element_count
     }
     fn normalize(&mut self) {
         self.dtype.normalize();
@@ -343,6 +373,9 @@ impl PhysicalConstraint for GgufTensorConstraint {
     }
     fn alternate_shapes(&self) -> &[Vec<usize>] {
         &self.alternate_shapes
+    }
+    fn element_count(&self) -> Option<usize> {
+        self.element_count
     }
     fn normalize(&mut self) {
         self.encoding.normalize();
@@ -383,19 +416,38 @@ fn normalize_plan<T: PhysicalConstraint>(
                 .iter()
                 .map(|shape| shape.as_slice()),
         );
-        for shape in shapes {
+        let mut canonical_elements = None;
+        for (index, shape) in shapes.enumerate() {
             if shape.contains(&0) {
                 return Err(CheckpointPlanError::InvalidShape {
                     key: tensor.key().into(),
                     shape: shape.to_vec(),
                 });
             }
-            shape
+            let elements = shape
                 .iter()
                 .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
                 .ok_or_else(|| CheckpointPlanError::ShapeOverflow {
                     key: tensor.key().into(),
                 })?;
+            if index == 0 {
+                canonical_elements = Some(elements);
+            }
+        }
+        if let Some(element_count) = tensor.element_count() {
+            if element_count == 0 {
+                return Err(CheckpointPlanError::InvalidElementCount {
+                    key: tensor.key().into(),
+                    element_count,
+                });
+            }
+            if canonical_elements != Some(element_count) {
+                return Err(CheckpointPlanError::ElementCountMismatch {
+                    key: tensor.key().into(),
+                    shape_elements: canonical_elements.expect("canonical shape was checked"),
+                    element_count,
+                });
+            }
         }
         if tensor.has_empty_encoding_set() {
             return Err(CheckpointPlanError::EmptyEncodingSet {
@@ -618,6 +670,24 @@ mod tests {
                 CatalogPolicy::strict(),
             ),
             Err(CheckpointPlanError::ShapeOverflow { .. })
+        ));
+        assert!(matches!(
+            SafetensorsCheckpointPlan::new(
+                "invalid element count",
+                vec![tensor("a", vec![2, 2]).with_element_count(3)],
+                Vec::new(),
+                CatalogPolicy::strict(),
+            ),
+            Err(CheckpointPlanError::ElementCountMismatch { .. })
+        ));
+        assert!(matches!(
+            SafetensorsCheckpointPlan::new(
+                "zero element count",
+                vec![tensor("a", vec![2, 2]).with_element_count(0)],
+                Vec::new(),
+                CatalogPolicy::strict(),
+            ),
+            Err(CheckpointPlanError::InvalidElementCount { .. })
         ));
         assert!(matches!(
             GgufCheckpointPlan::new(
