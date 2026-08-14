@@ -313,7 +313,7 @@ fn overlap_pool(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum AttentionCache {
+pub enum AttentionCache {
     Local(ConcatKeyValueCache),
     Compressed {
         local: ConcatKeyValueCache,
@@ -364,6 +364,25 @@ impl AttentionCache {
                 .chain(pool.arrays())
                 .chain(index_pool.arrays())
                 .collect(),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        match self {
+            Self::Local(local) => local.clear(),
+            Self::Compressed { local, pool } => {
+                local.clear();
+                pool.clear();
+            }
+            Self::Sparse {
+                local,
+                pool,
+                index_pool,
+            } => {
+                local.clear();
+                pool.clear();
+                index_pool.clear();
+            }
         }
     }
 }
@@ -467,6 +486,8 @@ pub(crate) struct Attention {
     pub(crate) groups: i32,
     pub(crate) scale: f32,
     pub(crate) norm_epsilon: f32,
+    /// Per-rank query-head widths when the query domain is tensor-sharded.
+    pub(crate) parallel_head_widths: Option<Vec<usize>>,
     #[param]
     pub(crate) wq_a: Linear,
     #[param]
@@ -504,6 +525,7 @@ impl Attention {
             groups: args.o_groups,
             scale: (args.head_dim as f32).sqrt().recip(),
             norm_epsilon: args.rms_norm_eps,
+            parallel_head_widths: None,
             wq_a: Linear::new(
                 args.hidden_size,
                 args.q_lora_rank,
@@ -563,11 +585,54 @@ impl Attention {
         AttentionCache::new_for_ratio(self.ratio, sliding_window)
     }
 
+    pub(crate) fn new_parallel(
+        args: &ModelArgs,
+        layer_index: usize,
+        local_heads: i32,
+        head_widths: Vec<usize>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut attention = Self::new(args, layer_index, stream)?;
+        attention.heads = local_heads;
+        attention.wq_b = Linear::new(
+            args.q_lora_rank,
+            local_heads * args.head_dim,
+            false,
+            projection_format(args),
+            stream,
+        )?;
+        attention.attn_sink = Param::unloaded(&[local_heads], Dtype::Float32, stream)?;
+        attention.parallel_head_widths = Some(head_widths);
+        Ok(attention)
+    }
+
     pub(crate) fn forward(
         &mut self,
         input: &Array,
         mask: Option<&Array>,
         cache: Option<&mut AttentionCache>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.forward_impl(input, mask, cache, None, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        input: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut AttentionCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.forward_impl(input, mask, cache, Some(group), stream)
+    }
+
+    fn forward_impl(
+        &mut self,
+        input: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut AttentionCache>,
+        tensor_group: Option<&safemlx::distributed::Group>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let batch = input.dim(0);
@@ -745,6 +810,13 @@ impl Attention {
             }
         };
         output = self.rope.apply(&output, offset, true, stream)?;
+        if let Some(group) = tensor_group {
+            let widths = self.parallel_head_widths.as_ref().ok_or_else(|| {
+                Exception::custom("DeepSeek V4 TP attention has no query-head partition")
+            })?;
+            output =
+                safemlx::distributed::all_gather_uneven_axis(&output, 1, widths, group, stream)?;
+        }
         output = output
             .reshape(&[batch, self.groups, -1, tokens, self.head_dim], stream)?
             .transpose_axes(&[0, 1, 3, 2, 4], stream)?

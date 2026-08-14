@@ -42,10 +42,11 @@ use safemlx::{
 use crate::{
     api::{
         common::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
-        deepseek_v3, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, muse_glimmer, nemotron_h,
-        qwen3_vl, ModelKind, ModelLoadOptions,
+        deepseek_v3, deepseek_v4, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, muse_glimmer,
+        nemotron_h, qwen3_vl, ModelKind, ModelLoadOptions,
     },
     architectures::{
+        deepseek_v4::layerwise::DeepSeekV4LayerwiseAdapter,
         gemma4::layerwise::{Gemma4Layer, Gemma4LayerwiseAdapter},
         inkling::layerwise::{InklingLayer, InklingLayerwiseAdapter},
         kimi_linear::layerwise::KimiLinearLayerwiseAdapter,
@@ -224,6 +225,8 @@ pub struct PipelineStageInfo {
     pub model_kind: ModelKind,
     /// Decoder hidden width.
     pub hidden_size: i32,
+    /// Flattened hidden width transferred between pipeline stages.
+    pub activation_hidden_size: i32,
     /// Dtype used for transferred hidden activations.
     pub activation_dtype: Dtype,
     /// Checkpoint tensors selected for this rank.
@@ -1011,6 +1014,14 @@ pub enum PipelineLayerCache {
         /// Additional ordered fixed-state tensors.
         slots: Vec<PipelineStateSlot>,
     },
+    /// Architecture-owned attention state whose geometry cannot be reduced to
+    /// ordinary KV or compressed-latent storage.
+    DeepSeekV4 {
+        /// Global decoder-layer index.
+        global_layer: usize,
+        /// Local, compressed, or sparse-pooling V4 attention state.
+        cache: crate::architectures::deepseek_v4::attention::AttentionCache,
+    },
 }
 
 /// Architecture-checked stage-local inference cache.
@@ -1027,6 +1038,7 @@ enum PipelineMtpCache {
     #[default]
     None,
     DeepSeek(Vec<CompressedLatentCache>),
+    DeepSeekV4(deepseek_v4::DraftCache),
     Inkling(Vec<inkling::LayerCache>),
     NemotronH(Vec<nemotron_h::LayerCache>),
     QwenHybrid(Vec<qwen_hybrid::LayerCache>),
@@ -1073,7 +1085,8 @@ impl PipelineCache {
             .map(|layer| match layer {
                 PipelineLayerCache::StateSlots { global_layer, .. }
                 | PipelineLayerCache::KeyValue { global_layer, .. }
-                | PipelineLayerCache::CompressedLatent { global_layer, .. } => *global_layer,
+                | PipelineLayerCache::CompressedLatent { global_layer, .. }
+                | PipelineLayerCache::DeepSeekV4 { global_layer, .. } => *global_layer,
             })
             .collect()
     }
@@ -1105,6 +1118,7 @@ impl PipelineCache {
                     cache.clear()?;
                     slots.iter_mut().for_each(PipelineStateSlot::clear);
                 }
+                PipelineLayerCache::DeepSeekV4 { cache, .. } => cache.clear(),
             }
         }
         self.mtp = PipelineMtpCache::None;
@@ -1178,6 +1192,16 @@ impl PipelineCache {
                     cache.restore_checkpoint(previous_cache, stream)?;
                     slots.clone_from(previous_slots);
                 }
+                (
+                    PipelineLayerCache::DeepSeekV4 {
+                        global_layer,
+                        cache,
+                    },
+                    PipelineLayerCache::DeepSeekV4 {
+                        global_layer: previous_layer,
+                        cache: previous_cache,
+                    },
+                ) if global_layer == previous_layer => cache.clone_from(previous_cache),
                 _ => {
                     return Err(Error::Parallel(
                         "pipeline transaction checkpoint changed layer identity".into(),
@@ -1196,6 +1220,9 @@ impl PipelineCache {
                 for (cache, checkpoint) in current.iter_mut().zip(previous) {
                     cache.restore_checkpoint(checkpoint, stream)?;
                 }
+            }
+            (PipelineMtpCache::DeepSeekV4(current), PipelineMtpCache::DeepSeekV4(previous)) => {
+                current.clone_from(previous);
             }
             (PipelineMtpCache::Inkling(current), PipelineMtpCache::Inkling(previous)) => {
                 if current.len() != previous.len() {
@@ -1900,6 +1927,7 @@ impl PipelineLayerCache {
                 .flat_map(|(latent, rotary)| [latent, rotary])
                 .chain(slots.iter().filter_map(PipelineStateSlot::value))
                 .collect(),
+            Self::DeepSeekV4 { cache, .. } => cache.retained_arrays(),
         }
     }
 }
@@ -1932,6 +1960,18 @@ struct DeepSeekStage {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
+    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    expert_assignment: Option<ExpertAssignment>,
+    expert_storage: PipelineExpertStorage,
+    routing_statistics: RoutingStatistics,
+}
+
+struct DeepSeekV4Stage {
+    args: deepseek_v4::ModelArgs,
+    layer_adapter: DeepSeekV4LayerwiseAdapter,
+    range: Range<usize>,
+    layers: Vec<deepseek_v4::DecoderLayer>,
+    dense_layers: Option<PipelineLayerStorage>,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
@@ -2237,12 +2277,45 @@ trait PipelineStageAdapter {
         expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Error>;
+    fn prefill_embedded_mtp_cache(
+        &mut self,
+        output: &EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<bool, Error>;
+    fn fused_embedded_mtp_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        proposal_capacity: usize,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Error>;
+    fn adjust_fused_embedded_mtp_logits(
+        &mut self,
+        logits: Array,
+        last_token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Error>;
+    fn advance_embedded_mtp_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<bool, Error>;
 
     /// Returns the exact cache identity and local semantic state schedule.
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
     ) -> Result<PromptCacheModelIdentity, Error>;
+    fn new_cache_layers(
+        &self,
+        identity: &PromptCacheModelIdentity,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<Vec<PipelineLayerCache>, Error>;
 
     /// Executes this stage's local decoder range.
     fn forward(
@@ -2378,10 +2451,53 @@ trait PipelineStageSemantics {
             self.model_kind()
         )))
     }
+    fn prefill_embedded_mtp_cache(
+        &mut self,
+        _output: &EmbeddedMtpOutput,
+        _tokens: &Array,
+        _cache: &mut PipelineMtpCache,
+        _stream: &Stream,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn fused_embedded_mtp_logits(
+        &mut self,
+        _hidden: &Array,
+        _last_token: u32,
+        _proposal_capacity: usize,
+        _cache: &mut PipelineMtpCache,
+        _stream: &Stream,
+    ) -> Result<Option<Array>, Error> {
+        Ok(None)
+    }
+    fn adjust_fused_embedded_mtp_logits(
+        &mut self,
+        logits: Array,
+        _last_token: u32,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        Ok(logits)
+    }
+    fn advance_embedded_mtp_cache(
+        &mut self,
+        _hidden: &Array,
+        _tokens: &Array,
+        _cache: &mut PipelineMtpCache,
+        _stream: &Stream,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
     ) -> Result<PromptCacheModelIdentity, Error>;
+    fn new_cache_layers(
+        &self,
+        identity: &PromptCacheModelIdentity,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<Vec<PipelineLayerCache>, Error> {
+        materialize_pipeline_cache_layers(identity, paged)
+    }
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -2585,11 +2701,63 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         )
     }
 
+    fn prefill_embedded_mtp_cache(
+        &mut self,
+        output: &EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<bool, Error> {
+        self.0
+            .prefill_embedded_mtp_cache(output, tokens, cache, stream)
+    }
+
+    fn fused_embedded_mtp_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        proposal_capacity: usize,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Error> {
+        self.0
+            .fused_embedded_mtp_logits(hidden, last_token, proposal_capacity, cache, stream)
+    }
+
+    fn adjust_fused_embedded_mtp_logits(
+        &mut self,
+        logits: Array,
+        last_token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.0
+            .adjust_fused_embedded_mtp_logits(logits, last_token, stream)
+    }
+
+    fn advance_embedded_mtp_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<bool, Error> {
+        self.0
+            .advance_embedded_mtp_cache(hidden, tokens, cache, stream)
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
     ) -> Result<PromptCacheModelIdentity, Error> {
         self.0.prompt_cache_model_identity(topology)
+    }
+
+    fn new_cache_layers(
+        &self,
+        identity: &PromptCacheModelIdentity,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<Vec<PipelineLayerCache>, Error> {
+        self.0.new_cache_layers(identity, paged)
     }
 
     fn forward(
@@ -3143,6 +3311,7 @@ fn pipeline_kv_offset(caches: &[PipelineLayerCache]) -> i32 {
             cache: PipelineKeyValueCache::Paged(cache),
             ..
         } => cache.offset(),
+        PipelineLayerCache::DeepSeekV4 { cache, .. } => cache.offset(),
         PipelineLayerCache::StateSlots { .. } | PipelineLayerCache::CompressedLatent { .. } => 0,
     })
 }
@@ -3170,6 +3339,10 @@ fn pipeline_state_offset(family: &str, caches: &[PipelineLayerCache]) -> Result<
                 cache,
                 slots,
             } => (*global_layer, Some(cache.offset()), slots.as_slice()),
+            PipelineLayerCache::DeepSeekV4 {
+                global_layer,
+                cache,
+            } => (*global_layer, Some(cache.offset()), &[][..]),
         };
         for current in attention_offset
             .into_iter()
@@ -3444,6 +3617,200 @@ impl PipelineStageSemantics for DeepSeekStage {
             }
             _ => self.forward(input, step, mask, cache, stream),
         }
+    }
+}
+
+impl PipelineStageSemantics for DeepSeekV4Stage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::DeepSeekV4
+    }
+
+    fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
+        let mut shapes = vec![vec![step.batch_size, step.sequence_length]];
+        if let Some(dspark) = &self.args.dspark {
+            shapes.extend(
+                dspark
+                    .target_layer_ids
+                    .iter()
+                    .map(|_| vec![step.batch_size, step.sequence_length, self.args.hidden_size]),
+            );
+        }
+        shapes
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
+        self.dense_layers.as_ref()
+    }
+
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
+    fn embedded_mtp_len(&self) -> usize {
+        self.layer_adapter.embedded_mtp_len()
+    }
+
+    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+        Ok(PipelineMtpCache::DeepSeekV4(
+            self.layer_adapter.embedded_mtp_cache(),
+        ))
+    }
+
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut PipelineMtpCache,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        _expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Error> {
+        let PipelineMtpCache::DeepSeekV4(cache) = cache else {
+            return Err(Error::Parallel(
+                "DeepSeek V4 pipeline draft cache mismatch".into(),
+            ));
+        };
+        Ok(self
+            .layer_adapter
+            .forward_pipeline_mtp(hidden, tokens, depth, cache, stream)?)
+    }
+
+    fn prefill_embedded_mtp_cache(
+        &mut self,
+        output: &EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<bool, Error> {
+        let PipelineMtpCache::DeepSeekV4(cache) = cache else {
+            return Err(Error::Parallel(
+                "DeepSeek V4 pipeline draft cache mismatch".into(),
+            ));
+        };
+        self.layer_adapter
+            .prefill_pipeline_draft_cache(output, tokens, cache, stream)?;
+        Ok(true)
+    }
+
+    fn fused_embedded_mtp_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        proposal_capacity: usize,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Error> {
+        let PipelineMtpCache::DeepSeekV4(cache) = cache else {
+            return Err(Error::Parallel(
+                "DeepSeek V4 pipeline draft cache mismatch".into(),
+            ));
+        };
+        Ok(self.layer_adapter.fused_pipeline_draft_logits(
+            hidden,
+            last_token,
+            proposal_capacity,
+            cache,
+            stream,
+        )?)
+    }
+
+    fn adjust_fused_embedded_mtp_logits(
+        &mut self,
+        logits: Array,
+        last_token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        Ok(self
+            .layer_adapter
+            .adjust_pipeline_fused_logits(logits, last_token, stream)?)
+    }
+
+    fn advance_embedded_mtp_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<bool, Error> {
+        let PipelineMtpCache::DeepSeekV4(cache) = cache else {
+            return Err(Error::Parallel(
+                "DeepSeek V4 pipeline draft cache mismatch".into(),
+            ));
+        };
+        self.layer_adapter
+            .advance_pipeline_draft_cache(hidden, tokens, cache, stream)?;
+        Ok(true)
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "deepseek_v4",
+            &self.args.model_type,
+            crate::architectures::deepseek_v4::model::prompt_cache_architecture_fingerprint(
+                &self.args,
+            ),
+            self.args.num_hidden_layers as usize,
+            self.range.clone(),
+            crate::LayerSchedule::new(
+                self.range.len(),
+                vec![crate::LayerCachePolicy::NoState; self.range.len()],
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+        ))
+    }
+
+    fn new_cache_layers(
+        &self,
+        _identity: &PromptCacheModelIdentity,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<Vec<PipelineLayerCache>, Error> {
+        if paged.is_some() {
+            return Err(Error::UnsupportedArchitecture(
+                "DeepSeek V4 pipeline caches do not support paged persistence because compressed pooling/index state is architecture-owned".into(),
+            ));
+        }
+        self.range
+            .clone()
+            .map(|global_layer| {
+                Ok(PipelineLayerCache::DeepSeekV4 {
+                    global_layer,
+                    cache:
+                        crate::architectures::deepseek_v4::attention::AttentionCache::new_for_ratio(
+                            self.args.compress_ratios[global_layer],
+                            self.args.sliding_window,
+                        )?,
+                })
+            })
+            .collect()
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_cartesian(input, step, mask, cache, None, None, stream)
+    }
+
+    fn forward_with_execution(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_cartesian(input, step, mask, cache, execution, expert_group, stream)
     }
 }
 
@@ -4682,6 +5049,7 @@ fn qwen3_vl_pipeline_rope_delta(
             PipelineLayerCache::StateSlots { slots, .. }
             | PipelineLayerCache::KeyValue { slots, .. }
             | PipelineLayerCache::CompressedLatent { slots, .. } => slots,
+            PipelineLayerCache::DeepSeekV4 { .. } => continue,
         };
         if let Some(slot) = slots
             .iter()
@@ -4707,6 +5075,7 @@ fn qwen3_vl_set_pipeline_rope_delta(
             PipelineLayerCache::StateSlots { slots, .. }
             | PipelineLayerCache::KeyValue { slots, .. }
             | PipelineLayerCache::CompressedLatent { slots, .. } => slots,
+            PipelineLayerCache::DeepSeekV4 { .. } => continue,
         };
         if let Some(slot) = slots
             .iter_mut()
@@ -6020,7 +6389,7 @@ impl PipelineModel {
     pub fn new_cache(&self) -> Result<PipelineCache, Error> {
         let mut cache = PipelineCache::new(
             self.info.model_kind,
-            materialize_pipeline_cache_layers(&self.cache_identity, None)?,
+            self.stage.new_cache_layers(&self.cache_identity, None)?,
         );
         if self.info.is_last {
             cache.mtp = self.stage.new_embedded_mtp_cache()?;
@@ -6045,10 +6414,9 @@ impl PipelineModel {
                     expert_parallel_rank: (self.topology.expert_parallel_size > 1)
                         .then_some(self.topology.expert_parallel_rank),
                 });
-                let layers = materialize_pipeline_cache_layers(
-                    &self.cache_identity,
-                    Some((manager.clone(), rank)),
-                )?;
+                let layers = self
+                    .stage
+                    .new_cache_layers(&self.cache_identity, Some((manager.clone(), rank)))?;
                 let mut cache =
                     PipelineCache::with_residency_manager(self.info.model_kind, layers, manager);
                 if self.info.is_last {
@@ -6119,6 +6487,12 @@ impl PipelineModel {
                         "pipeline prompt persistence requires a paged cache".into(),
                     ));
                 }
+                PipelineLayerCache::DeepSeekV4 { .. } => {
+                    return Err(Error::UnsupportedArchitecture(
+                        "DeepSeek V4 compressed pipeline prompt-cache persistence is unsupported"
+                            .into(),
+                    ));
+                }
             }
         }
         let expected_offset = i32::try_from(prefix_token_ids.len())
@@ -6140,6 +6514,9 @@ impl PipelineModel {
                     slots,
                     ..
                 } => (*global_layer, slots),
+                PipelineLayerCache::DeepSeekV4 { .. } => unreachable!(
+                    "DeepSeek V4 pipeline prompt persistence was rejected before state export"
+                ),
             };
             for slot in slots {
                 match slot.value.as_ref() {
@@ -6233,6 +6610,9 @@ impl PipelineModel {
                     slots,
                     ..
                 } => (*global_layer, slots),
+                PipelineLayerCache::DeepSeekV4 { .. } => {
+                    unreachable!("DeepSeek V4 paged pipeline cache materialization is unsupported")
+                }
             };
             for slot in slots {
                 slot.value = restored_state
@@ -6557,7 +6937,23 @@ impl PipelineModel {
         } else {
             safemlx::ops::zeros_dtype(&shape, Dtype::Float32, stream)?
         };
-        let hidden_shape = [tokens.dim(0), tokens.dim(1), self.info.hidden_size];
+        let hidden_width_sum = distributed::all_sum(
+            &Array::from_int(local_hidden.as_ref().map_or(0, |hidden| hidden.dim(-1))),
+            execution.world(),
+            stream,
+        )?;
+        synchronize_outputs([&hidden_width_sum])?;
+        let hidden_width_sum = hidden_width_sum.try_item::<i32>(stream)?;
+        if hidden_width_sum <= 0 || hidden_width_sum % contribution_count != 0 {
+            return Err(Exception::custom(
+                "pipeline embedded MTP replicas published inconsistent hidden widths",
+            ));
+        }
+        let hidden_shape = [
+            tokens.dim(0),
+            tokens.dim(1),
+            hidden_width_sum / contribution_count,
+        ];
         let hidden = if contributes {
             local_hidden.expect("contributing pipeline MTP rank has hidden state")
         } else {
@@ -7052,7 +7448,7 @@ impl PipelineModel {
         } else {
             let peer = predecessor.expect("non-first predecessor");
             let received = distributed::recv(
-                &step.activation_shape(self.info.hidden_size),
+                &step.activation_shape(self.info.activation_hidden_size),
                 self.info.activation_dtype,
                 peer,
                 group,
@@ -7062,7 +7458,7 @@ impl PipelineModel {
                 Error::Parallel(format!(
                     "stage {} failed to receive {:?} {:?} activations from rank {peer}: {error}",
                     self.info.pipeline_stage,
-                    step.activation_shape(self.info.hidden_size),
+                    step.activation_shape(self.info.activation_hidden_size),
                     self.info.activation_dtype
                 ))
             })?;
@@ -7167,7 +7563,7 @@ impl PipelineModel {
         match output {
             PipelineStageOutput::Hidden(payload) => {
                 let hidden = &payload.hidden;
-                let expected = step.activation_shape(self.info.hidden_size);
+                let expected = step.activation_shape(self.info.activation_hidden_size);
                 if hidden.shape() != expected || hidden.dtype() != self.info.activation_dtype {
                     return Err(Error::Parallel(format!(
                         "stage {} produced activations shaped {:?} with {:?}, expected {expected:?} with {:?}",
@@ -7380,6 +7776,33 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<(), Exception> {
+        let handled = if self.model.info.is_last {
+            self.model
+                .stage
+                .prefill_embedded_mtp_cache(output, tokens, &mut cache.mtp, stream)
+        } else {
+            Ok(false)
+        };
+        let (failed, _) = self
+            .execution
+            .operation_consensus(handled.is_err(), false, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if failed {
+            return Err(handled.map_or_else(
+                |error| Exception::custom(error.to_string()),
+                |_| Exception::custom("a peer failed pipeline draft-cache prefill"),
+            ));
+        }
+        let handled = distributed::all_sum(
+            &Array::from_int(i32::from(handled.unwrap_or(false))),
+            self.execution.world(),
+            stream,
+        )?
+        .try_item::<i32>(stream)?
+            > 0;
+        if handled {
+            return Ok(());
+        }
         let sequence = tokens.dim(1);
         if sequence <= 1 {
             return Ok(());
@@ -7424,10 +7847,66 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<(), Exception> {
+        let handled = if self.model.info.is_last {
+            self.model
+                .stage
+                .advance_embedded_mtp_cache(hidden, tokens, cache, stream)
+        } else {
+            Ok(false)
+        };
+        let (failed, _) = self
+            .execution
+            .operation_consensus(handled.is_err(), false, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if failed {
+            return Err(handled.map_or_else(
+                |error| Exception::custom(error.to_string()),
+                |_| Exception::custom("a peer failed pipeline draft-cache advance"),
+            ));
+        }
+        let handled = distributed::all_sum(
+            &Array::from_int(i32::from(handled.unwrap_or(false))),
+            self.execution.world(),
+            stream,
+        )?
+        .try_item::<i32>(stream)?
+            > 0;
+        if handled {
+            return Ok(());
+        }
         for depth in 0..self.max_draft_tokens() {
             let _ = self.forward_draft(hidden, tokens, depth, cache, stream)?;
         }
         Ok(())
+    }
+
+    fn fused_draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        proposal_capacity: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        self.forward_fused_draft(hidden, last_token, proposal_capacity, cache, stream)
+    }
+
+    fn adjust_fused_draft_logits(
+        &mut self,
+        logits: Array,
+        last_token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let local = if self.model.info.is_last {
+            self.model
+                .stage
+                .adjust_fused_embedded_mtp_logits(logits.clone(), last_token, stream)
+                .map(Some)
+        } else {
+            Ok(None)
+        };
+        self.synchronize_fused_array(local, stream)
+            .map(|array| array.unwrap_or(logits))
     }
 
     fn max_draft_tokens(&self) -> usize {
@@ -7436,6 +7915,83 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
 }
 
 impl PipelineEmbeddedMtpTarget<'_> {
+    fn forward_fused_draft(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        proposal_capacity: usize,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        let local = if self.model.info.is_last {
+            self.model.stage.fused_embedded_mtp_logits(
+                hidden,
+                last_token,
+                proposal_capacity,
+                cache,
+                stream,
+            )
+        } else {
+            Ok(None)
+        };
+        self.synchronize_fused_array(local, stream)
+    }
+
+    fn synchronize_fused_array(
+        &self,
+        local: Result<Option<Array>, Error>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        let (failed, _) = self
+            .execution
+            .operation_consensus(local.is_err(), false, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if failed {
+            return Err(local.map_or_else(
+                |error| Exception::custom(error.to_string()),
+                |_| Exception::custom("a peer failed fused pipeline drafting"),
+            ));
+        }
+        let local = local.map_err(|error| Exception::custom(error.to_string()))?;
+        let count = distributed::all_sum(
+            &Array::from_int(i32::from(local.is_some())),
+            self.execution.world(),
+            stream,
+        )?;
+        let dimensions = (0..3)
+            .map(|axis| {
+                distributed::all_sum(
+                    &Array::from_int(local.as_ref().map_or(0, |array| array.dim(axis))),
+                    self.execution.world(),
+                    stream,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        synchronize_outputs(std::iter::once(&count).chain(dimensions.iter()))?;
+        let count = count.try_item::<i32>(stream)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let mut shape = Vec::with_capacity(3);
+        for dimension in dimensions {
+            let dimension = dimension.try_item::<i32>(stream)?;
+            if dimension % count != 0 {
+                return Err(Exception::custom(
+                    "pipeline fused-draft replicas published inconsistent shapes",
+                ));
+            }
+            shape.push(dimension / count);
+        }
+        let contribution = match local {
+            Some(array) => array.as_dtype(Dtype::Float32, stream)?,
+            None => safemlx::ops::zeros_dtype(&shape, Dtype::Float32, stream)?,
+        };
+        let output = distributed::all_sum(&contribution, self.execution.world(), stream)?
+            .divide(Array::from_f32(count as f32), stream)?;
+        synchronize_outputs([&output])?;
+        Ok(Some(output))
+    }
+
     fn forward_draft(
         &mut self,
         hidden: &Array,
@@ -7630,6 +8186,7 @@ fn base_info(
             .expect("validated topology has valid pipeline successor geometry"),
         model_kind,
         hidden_size,
+        activation_hidden_size: hidden_size,
         activation_dtype: Dtype::Float32,
         owned_tensors: Vec::new(),
         local_parameter_bytes: 0,
@@ -7916,7 +8473,7 @@ fn validate_hidden_metadata(
     dtype: Dtype,
     step: PipelineStep,
 ) -> Result<(), Error> {
-    let expected = step.activation_shape(info.hidden_size);
+    let expected = step.activation_shape(info.activation_hidden_size);
     if shape != expected {
         return Err(Error::Parallel(format!(
             "stage {} expected hidden activations shaped {expected:?}, got {shape:?}",
@@ -8958,6 +9515,7 @@ pub fn load_pipeline_model_with_options(
             model_type,
             Some(
                 "deepseek_v3"
+                    | "deepseek_v4"
                     | "qwen3_moe"
                     | "qwen3_vl_moe"
                     | "qwen3_vl_moe_text"
@@ -9105,6 +9663,23 @@ pub fn load_pipeline_model_with_options(
             )?;
             load_deepseek_pipeline(
                 deepseek_v3::get_model_args(model_dir)?,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                expert_cache,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("deepseek_v4") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::DeepSeekV4,
+                model_dir,
+                options,
+            )?;
+            load_deepseek_v4_pipeline(
+                deepseek_v4::get_model_args(model_dir)?,
                 store,
                 topology,
                 options.quantization,
@@ -10298,6 +10873,266 @@ impl DeepSeekStage {
                 hidden: mtp_hidden,
             })
         } else {
+            Ok(PipelineStageOutput::Hidden(PipelinePayload {
+                hidden,
+                auxiliary,
+            }))
+        }
+    }
+}
+
+impl DeepSeekV4Stage {
+    fn new(
+        args: deepseek_v4::ModelArgs,
+        range: Range<usize>,
+        external_experts: bool,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let layer_adapter = if external_experts {
+            DeepSeekV4LayerwiseAdapter::new_external_experts(args.clone(), stream)?
+        } else {
+            DeepSeekV4LayerwiseAdapter::new(args.clone(), stream)?
+        };
+        Ok(Self {
+            args,
+            layer_adapter,
+            range,
+            layers: Vec::new(),
+            dense_layers: None,
+            parallel_layout: None,
+            expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
+            routing_statistics: RoutingStatistics::default(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_cartesian(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.range.len() {
+            return Err(Error::Parallel(format!(
+                "DeepSeek V4 stage cache has {} entries, expected {}",
+                caches.len(),
+                self.range.len()
+            )));
+        }
+        let active_stream = execution.map_or(stream, ParallelExecutionContext::stream);
+        let (mut hidden, mut auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => {
+                let hidden = self.layer_adapter.pipeline_embed(tokens, active_stream)?;
+                // Token ids must remain exact across PP even when model activations
+                // use a 16-bit dtype. Float32 represents the supported vocabulary
+                // domain exactly and shares the pipeline payload dtype.
+                let mut tensors = vec![tokens.as_dtype(Dtype::Float32, active_stream)?];
+                if let Some(dspark) = &self.args.dspark {
+                    for _ in &dspark.target_layer_ids {
+                        tensors.push(safemlx::ops::zeros_dtype(
+                            &[step.batch_size, step.sequence_length, self.args.hidden_size],
+                            Dtype::Float32,
+                            active_stream,
+                        )?);
+                    }
+                }
+                (hidden, PipelineAuxiliaryState::new(tensors))
+            }
+            PipelineStageInput::Hidden(payload) => {
+                let hidden = payload.hidden.reshape(
+                    &[
+                        step.batch_size,
+                        step.sequence_length,
+                        self.args.hc_mult,
+                        self.args.hidden_size,
+                    ],
+                    active_stream,
+                )?;
+                (hidden, payload.auxiliary.clone())
+            }
+        };
+        let expected_aux = 1 + self
+            .args
+            .dspark
+            .as_ref()
+            .map_or(0, |config| config.target_layer_ids.len());
+        if auxiliary.tensors.len() != expected_aux {
+            return Err(Error::Parallel(format!(
+                "DeepSeek V4 pipeline payload has {} auxiliary tensors, expected {expected_aux}",
+                auxiliary.tensors.len()
+            )));
+        }
+        let input_ids = auxiliary.tensors[0].as_dtype(Dtype::Uint32, active_stream)?;
+        let tensor_group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        let assignment = self.expert_assignment.clone();
+        if let Some(assignment) = assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        } else if expert_group.is_some() {
+            return Err(Error::Parallel(
+                "DeepSeek V4 pipeline received an EP group without an expert assignment".into(),
+            ));
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
+        let expert_cache = self.expert_storage.cache();
+        let layer_adapter = &self.layer_adapter;
+        let parallel_layout = self.parallel_layout.clone();
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream: active_stream,
+            },
+            |global_layer, stream| {
+                layer_adapter.new_cartesian_layer(
+                    0,
+                    global_layer,
+                    parallel_layout.as_ref(),
+                    assignment.as_ref(),
+                    stream,
+                )
+            },
+            |global_layer, layer, hidden, cache, stream| {
+                let PipelineLayerCache::DeepSeekV4 {
+                    global_layer: cached_layer,
+                    cache,
+                } = cache
+                else {
+                    return Err(Error::Parallel(format!(
+                        "DeepSeek V4 cache type mismatch at global layer {global_layer}"
+                    )));
+                };
+                if *cached_layer != global_layer {
+                    return Err(Error::Parallel(format!(
+                        "DeepSeek V4 cache owns layer {cached_layer}, expected {global_layer}"
+                    )));
+                }
+                let output = if let (Some(assignment), Some(expert_cache)) =
+                    (assignment.as_ref(), expert_cache)
+                {
+                    let execute = |flat: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                        execute_pipeline_cached_deepseek_v4(
+                            &args,
+                            global_layer,
+                            flat,
+                            ids,
+                            weights,
+                            pass,
+                            expert_cache,
+                            assignment,
+                            expert_group,
+                            &mut self.routing_statistics,
+                            stream,
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))
+                    };
+                    match tensor_group {
+                        Some(group) => layer.forward_tensor_with_expert_executor(
+                            hidden,
+                            mask,
+                            Some(cache),
+                            &input_ids,
+                            group,
+                            stream,
+                            execute,
+                        )?,
+                        None => layer.forward_with_expert_executor(
+                            hidden,
+                            mask,
+                            Some(cache),
+                            &input_ids,
+                            stream,
+                            execute,
+                        )?,
+                    }
+                } else {
+                    match tensor_group {
+                        Some(group) => layer.forward_tensor_parallel(
+                            hidden,
+                            mask,
+                            Some(cache),
+                            &input_ids,
+                            group,
+                            stream,
+                        )?,
+                        None => layer.forward(hidden, mask, Some(cache), &input_ids, stream)?,
+                    }
+                };
+                if let Some(position) = args.dspark.as_ref().and_then(|config| {
+                    config
+                        .target_layer_ids
+                        .iter()
+                        .position(|wanted| *wanted == global_layer as i32)
+                }) {
+                    auxiliary.tensors[position + 1] =
+                        safemlx::ops::mean_axis(&output, 2, false, stream)?
+                            .as_dtype(Dtype::Float32, stream)?;
+                }
+                synchronize_outputs([&output])?;
+                Ok(output)
+            },
+        )?;
+        if self.range.end == self.args.num_hidden_layers as usize {
+            let draft_hidden = if let Some(dspark) = &self.args.dspark {
+                let captures = auxiliary.tensors[1..]
+                    .iter()
+                    .take(dspark.target_layer_ids.len())
+                    .collect::<Vec<_>>();
+                safemlx::ops::concatenate_axis(&captures, -1, active_stream)?
+            } else {
+                hidden.reshape(
+                    &[
+                        step.batch_size,
+                        step.sequence_length,
+                        self.args.hc_mult * self.args.hidden_size,
+                    ],
+                    active_stream,
+                )?
+            };
+            let logits = self.layer_adapter.pipeline_finish(&hidden, active_stream)?;
+            if self.layer_adapter.embedded_mtp_len() > 0 {
+                Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                    logits,
+                    hidden: draft_hidden,
+                })
+            } else {
+                Ok(PipelineStageOutput::Logits(logits))
+            }
+        } else {
+            let hidden = hidden
+                .reshape(
+                    &[
+                        step.batch_size,
+                        step.sequence_length,
+                        self.args.hc_mult * self.args.hidden_size,
+                    ],
+                    active_stream,
+                )?
+                .as_dtype(Dtype::Float32, active_stream)?;
             Ok(PipelineStageOutput::Hidden(PipelinePayload {
                 hidden,
                 auxiliary,
@@ -12737,6 +13572,35 @@ fn execute_pipeline_cached_deepseek(
     let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_deepseek(args, global_layer, routes, pass, cache, stream)
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    Ok(returned.reduced_output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_deepseek_v4(
+    args: &deepseek_v4::ModelArgs,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_deepseek_v4(args, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -22346,6 +23210,7 @@ impl GemmaStage {
                     ..
                 } => Some(cache.offset()),
                 PipelineLayerCache::CompressedLatent { .. } => None,
+                PipelineLayerCache::DeepSeekV4 { cache, .. } => Some(cache.offset()),
             })
             .max()
             .unwrap_or(0);
@@ -22912,6 +23777,236 @@ fn load_deepseek_pipeline(
     }
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_deepseek_v4_pipeline(
+    args: deepseek_v4::ModelArgs,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    if requested_quantization.is_some() {
+        return Err(Error::Quantization(
+            "DeepSeek V4 pipeline load-time conversion is unsupported; use native checkpoint formats"
+                .into(),
+        ));
+    }
+    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
+    let mut binding_adapter = if external_experts {
+        DeepSeekV4LayerwiseAdapter::new_external_experts(args.clone(), stream)?
+    } else {
+        DeepSeekV4LayerwiseAdapter::new(args.clone(), stream)?
+    };
+    let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
+    topology.preflight(
+        Some(args.num_hidden_layers as usize),
+        expert_assignment
+            .as_ref()
+            .map(ExpertAssignment::global_expert_count),
+    )?;
+    let range = topology.layer_range(args.num_hidden_layers as usize)?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        args.num_hidden_layers as usize,
+        ModelKind::DeepSeekV4,
+        args.hidden_size,
+    );
+    info.activation_hidden_size = args
+        .hidden_size
+        .checked_mul(args.hc_mult)
+        .ok_or_else(|| Error::Parallel("DeepSeek V4 pipeline hidden width overflowed".into()))?;
+    let mut stage = DeepSeekV4Stage::new(args.clone(), range, external_experts, stream)?;
+    stage.expert_assignment = expert_assignment;
+    if let Some(assignment) = stage.expert_assignment.as_ref() {
+        info.global_expert_count = Some(assignment.global_expert_count());
+        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+    }
+    let parallel_layout = if topology.tensor_parallel_size > 1 {
+        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+        let mut planner = build.planner();
+        binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
+        let (_, layout) = planner.finish()?;
+        binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
+        stage
+            .layer_adapter
+            .configure_cartesian_layout(build, &layout, stream)?;
+        Some(layout)
+    } else {
+        None
+    };
+    stage.parallel_layout = parallel_layout.clone();
+    stage.layers = stage
+        .range
+        .clone()
+        .map(|global_layer| {
+            stage.layer_adapter.new_cartesian_layer(
+                0,
+                global_layer,
+                parallel_layout.as_ref(),
+                stage.expert_assignment.as_ref(),
+                stream,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let owns_draft = info.is_last && stage.layer_adapter.embedded_mtp_len() > 0;
+    info.owns_embedded_mtp = owns_draft;
+    info.embedded_mtp_layers = if owns_draft {
+        stage.layer_adapter.embedded_mtp_len()
+    } else {
+        0
+    };
+    let static_roles = selected_pipeline_static_roles([
+        ("embedding", info.is_first || owns_draft),
+        ("norm", info.is_last),
+        ("hc_head", info.is_last),
+        ("output", info.is_last),
+        ("draft", owns_draft),
+    ]);
+    let static_units = pipeline_binding_units(&binding_adapter, store.as_ref(), &static_roles)?;
+    let mut loaded = PipelineLoadAccumulator::new("DeepSeek V4");
+    for role in &static_roles {
+        let bindings = pipeline_cartesian_static_bindings(
+            &static_units,
+            role,
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
+        let target = stage
+            .layer_adapter
+            .pipeline_static_mut(role)
+            .expect("selected DeepSeek V4 pipeline static target");
+        loaded.load(
+            target,
+            store.as_ref(),
+            &bindings,
+            None,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let bindings = binding_adapter.cartesian_layer_bindings(
+                0,
+                global_layer,
+                layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                stage.expert_assignment.as_ref(),
+                stream,
+            )?;
+            if external_experts {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    None,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("ffn.switch_mlp."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    None,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
+    let static_device_bytes = loaded.finish(&mut info)?;
+    let checkpoint_diagnostics = store.diagnostics()?;
+    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
+    if let Some(dense_stream) = dense_stream {
+        let streamed_layout = parallel_layout.clone();
+        let streamed_assignment = stage.expert_assignment.clone();
+        let streamed_adapter = &stage.layer_adapter;
+        stage.dense_layers = Some(build_pipeline_layer_storage(
+            Arc::clone(&store),
+            stage.range.clone(),
+            dense_stream,
+            static_device_bytes,
+            None,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                streamed_adapter.new_cartesian_layer(
+                    0,
+                    global_layer,
+                    streamed_layout.as_ref(),
+                    streamed_assignment.as_ref(),
+                    stream,
+                )
+            },
+            |global_layer, layer, store| {
+                binding_adapter.cartesian_layer_bindings(
+                    0,
+                    global_layer,
+                    layer,
+                    store,
+                    streamed_layout.as_ref(),
+                    streamed_assignment.as_ref(),
+                    stream,
+                )
+            },
+        )?);
+        if external_experts {
+            stage.dense_layers = stage
+                .dense_layers
+                .take()
+                .map(|storage| storage.with_independent_experts("ffn.switch_mlp."));
+        }
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
+        info.planned_owned_parameter_bytes = static_device_bytes
+            .checked_add(layer_bytes)
+            .ok_or_else(|| Error::Parallel("DeepSeek V4 pipeline byte total overflowed".into()))?;
+    } else {
+        info.planned_owned_parameter_bytes = static_device_bytes;
+    }
+    if external_experts {
+        let entries =
+            crate::architectures::deepseek_v4::layerwise::expert_catalog(&args, store.as_ref())?
+                .into_iter()
+                .filter(|entry| stage.range.contains(&entry.identity().layer))
+                .filter(|entry| {
+                    stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                        assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                    })
+                })
+                .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let cache = build_pipeline_expert_cache(
+                Arc::clone(&store),
+                entries,
+                expert_cache_options,
+                None,
+                weights_stream,
+                stream,
+            )?;
+            info.planned_owned_parameter_bytes = info
+                .planned_owned_parameter_bytes
+                .checked_add(cache.report()?.owned_bytes)
+                .ok_or_else(|| {
+                    Error::Parallel("DeepSeek V4 pipeline expert byte total overflowed".into())
+                })?;
+            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
+        }
+    }
+    info.opened_checkpoint_shards = materialized_shards;
+    info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
+    // V4 transports exact token identity beside flattened mHC streams. Float32
+    // preserves both token ids and every architecture-owned auxiliary tensor.
+    info.activation_dtype = Dtype::Float32;
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
 

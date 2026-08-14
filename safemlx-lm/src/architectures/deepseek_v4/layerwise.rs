@@ -25,7 +25,8 @@ use crate::{
             store::{TensorSelection, WeightStore},
         },
         execution::layerwise::{
-            load_layerwise_model, load_safetensors_layerwise_model, open_safetensors_weight_store,
+            load_layerwise_model, load_safetensors_layerwise_model,
+            load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
             ArchitectureAdapter, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
             StaticUnitBindings,
         },
@@ -79,6 +80,95 @@ impl DeepSeekV4LayerwiseModel {
         self.execution.forward(tokens, cache, stream)
     }
 
+    /// Runs a rank-local tensor-parallel target pass through the generalized executor.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_tensor_parallel(tokens, cache, group, stream)
+    }
+
+    /// Executes replicated layers while delegating routed experts to an EP owner.
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_with_layer_executor(
+            tokens,
+            cache,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, stream| {
+                let output = layer.forward_with_expert_executor(
+                    hidden,
+                    mask,
+                    Some(&mut cache.layers[index]),
+                    &context.input_ids,
+                    stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?;
+                capture_draft_hidden(&_adapter.args, index, &output, context, stream)?;
+                Ok(output)
+            },
+        )
+    }
+
+    /// Executes TP-sharded attention while delegating routed experts to EP.
+    pub(crate) fn forward_tensor_expert_parallel<F>(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        cache: &mut Cache,
+        tensor_group: &safemlx::distributed::Group,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_tensor_parallel_with_layer_executor(
+            tokens,
+            cache,
+            tensor_group,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, execution| {
+                let group = execution.group().ok_or_else(|| {
+                    Error::Parallel("DeepSeek V4 TP+EP execution has no TP group".into())
+                })?;
+                let output = layer.forward_tensor_with_expert_executor(
+                    hidden,
+                    mask,
+                    Some(&mut cache.layers[index]),
+                    &context.input_ids,
+                    group,
+                    execution.stream(),
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?;
+                capture_draft_hidden(&_adapter.args, index, &output, context, execution.stream())?;
+                Ok(output)
+            },
+        )
+    }
+
+    /// Returns the active Cartesian topology and rank-local parameter accounting.
+    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+        self.execution.parallel_info()
+    }
+
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+        self.execution.bind_parallel_topology(topology);
+    }
+
     pub(crate) fn mtp_len(&self) -> usize {
         self.execution.adapter().static_model.mtp_len()
     }
@@ -100,6 +190,82 @@ impl DeepSeekV4LayerwiseModel {
             crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
                 logits,
                 hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
+    pub(crate) fn forward_mtp_target_with_expert_executor<F>(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        tensor_group: Option<&safemlx::distributed::Group>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let (logits, context) = match tensor_group {
+            Some(tensor_group) => self
+                .execution
+                .forward_tensor_parallel_with_layer_executor_and_context(
+                    tokens,
+                    cache,
+                    tensor_group,
+                    stream,
+                    |_adapter, _group, index, layer, hidden, cache, context, execution| {
+                        let group = execution.group().ok_or_else(|| {
+                            Error::Parallel(
+                                "DeepSeek V4 TP+EP MTP target is missing its TP group".into(),
+                            )
+                        })?;
+                        let output = layer.forward_tensor_with_expert_executor(
+                            hidden,
+                            None,
+                            Some(&mut cache.layers[index]),
+                            &context.input_ids,
+                            group,
+                            execution.stream(),
+                            |hidden, ids, weights, stream| {
+                                execute(index, hidden, ids, weights, stream)
+                            },
+                        )?;
+                        capture_draft_hidden(
+                            &_adapter.args,
+                            index,
+                            &output,
+                            context,
+                            execution.stream(),
+                        )?;
+                        Ok(output)
+                    },
+                ),
+            None => self.execution.forward_with_layer_executor_and_context(
+                tokens,
+                cache,
+                stream,
+                |_adapter, _group, index, layer, hidden, cache, context, stream| {
+                    let output = layer.forward_with_expert_executor(
+                        hidden,
+                        None,
+                        Some(&mut cache.layers[index]),
+                        &context.input_ids,
+                        stream,
+                        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                    )?;
+                    capture_draft_hidden(&_adapter.args, index, &output, context, stream)?;
+                    Ok(output)
+                },
+            ),
+        }
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden: context.draft_hidden.ok_or_else(|| {
+                    Exception::custom("DeepSeek V4 EP pass did not retain MTP/DSpark hidden state")
+                })?,
                 tokens: tokens.clone(),
             },
         )
@@ -167,7 +333,7 @@ impl CausalLm<Cache> for DeepSeekV4LayerwiseModel {
 
 impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4LayerwiseModel {
     type Cache = Cache;
-    type DraftCache = Vec<AttentionCache>;
+    type DraftCache = super::model::DraftCache;
 
     fn prefill_target(
         &mut self,
@@ -301,10 +467,11 @@ pub struct DeepSeekV4LayerwiseAdapter {
     static_model: ResidentModel,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
+    parallel_topology: Option<crate::ParallelTopology>,
 }
 
 impl DeepSeekV4LayerwiseAdapter {
-    fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+    pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let mut resident = ResidentModel::new(args.clone(), stream)?;
         // Decoder layers are residency units owned by `LayerwiseModel`. Keep only
         // the shared static target and draft modules in this holder.
@@ -313,6 +480,7 @@ impl DeepSeekV4LayerwiseAdapter {
             static_model: resident,
             sparse_expert_cache: false,
             expert_cache: None,
+            parallel_topology: None,
             args,
         })
     }
@@ -384,6 +552,225 @@ impl DeepSeekV4LayerwiseAdapter {
             )?));
         }
         Ok(None)
+    }
+
+    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        Self::new_sparse(args, stream)
+    }
+
+    pub(crate) fn configure_cartesian_layout(
+        &mut self,
+        build: crate::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.configure_parallel_static(build, layout, stream)
+    }
+
+    pub(crate) fn pipeline_static_mut(&mut self, role: &str) -> Option<&mut dyn ModuleParameters> {
+        match role {
+            "embedding" => Some(&mut self.static_model.model.embed_tokens),
+            "norm" => Some(&mut self.static_model.model.norm),
+            "hc_head" => Some(&mut self.static_model.model.hc_head),
+            "output" => Some(&mut self.static_model.lm_head),
+            "draft" => self
+                .static_model
+                .mtp
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters)
+                .or_else(|| {
+                    self.static_model
+                        .dspark
+                        .as_mut()
+                        .map(|module| module as &mut dyn ModuleParameters)
+                }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pipeline_embed(
+        &mut self,
+        tokens: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let embedded = self
+            .static_model
+            .model
+            .embed_tokens
+            .forward(tokens, stream)?;
+        let hidden = embedded.try_index_device((.., .., NewAxis, ..), stream)?;
+        broadcast_to(
+            &hidden,
+            &[
+                embedded.dim(0),
+                embedded.dim(1),
+                self.args.hc_mult,
+                self.args.hidden_size,
+            ],
+            stream,
+        )
+    }
+
+    pub(crate) fn pipeline_finish(
+        &mut self,
+        hidden: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let hidden = self.static_model.model.hc_head.forward(hidden, stream)?;
+        let hidden = self.static_model.model.norm.forward(&hidden, stream)?;
+        self.static_model.lm_head.forward(&hidden, stream)
+    }
+
+    pub(crate) fn embedded_mtp_len(&self) -> usize {
+        self.static_model.mtp_len()
+    }
+
+    pub(crate) fn embedded_mtp_cache(&self) -> super::model::DraftCache {
+        self.static_model
+            .new_cache()
+            .expect("validated DeepSeek V4 draft cache geometry")
+            .mtp_layers
+    }
+
+    pub(crate) fn prefill_pipeline_draft_cache(
+        &mut self,
+        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut super::model::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let mut target_cache = self.static_model.new_cache()?;
+        target_cache.mtp_layers.clone_from(cache);
+        let pipeline_output;
+        let output = if self.args.dspark.is_none() && output.hidden.ndim() == 3 {
+            pipeline_output = crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits: output.logits.clone(),
+                hidden: output.hidden.reshape(
+                    &[
+                        output.hidden.dim(0),
+                        output.hidden.dim(1),
+                        self.args.hc_mult,
+                        self.args.hidden_size,
+                    ],
+                    stream,
+                )?,
+                tokens: output.tokens.clone(),
+            };
+            &pipeline_output
+        } else {
+            output
+        };
+        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::prefill_draft_cache(
+            &mut self.static_model,
+            output,
+            tokens,
+            &mut target_cache,
+            stream,
+        )?;
+        cache.clone_from(&target_cache.mtp_layers);
+        Ok(())
+    }
+
+    pub(crate) fn forward_pipeline_mtp(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut super::model::DraftCache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let hidden = if hidden.ndim() == 3 {
+            hidden.reshape(
+                &[
+                    hidden.dim(0),
+                    hidden.dim(1),
+                    self.args.hc_mult,
+                    self.args.hidden_size,
+                ],
+                stream,
+            )?
+        } else {
+            hidden.clone()
+        };
+        let (logits, hidden) = self
+            .static_model
+            .forward_mtp_draft(&hidden, tokens, depth, cache, stream)?;
+        let hidden = hidden.reshape(
+            &[
+                hidden.dim(0),
+                hidden.dim(1),
+                self.args.hc_mult * self.args.hidden_size,
+            ],
+            stream,
+        )?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
+    pub(crate) fn fused_pipeline_draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        proposal_capacity: usize,
+        cache: &mut super::model::DraftCache,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::fused_draft_logits(
+            &mut self.static_model,
+            hidden,
+            last_token,
+            proposal_capacity,
+            cache,
+            stream,
+        )
+    }
+
+    pub(crate) fn adjust_pipeline_fused_logits(
+        &mut self,
+        logits: Array,
+        last_token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::adjust_fused_draft_logits(
+            &mut self.static_model,
+            logits,
+            last_token,
+            stream,
+        )
+    }
+
+    pub(crate) fn advance_pipeline_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut super::model::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let hidden = if self.args.dspark.is_none() && hidden.ndim() == 3 {
+            hidden.reshape(
+                &[
+                    hidden.dim(0),
+                    hidden.dim(1),
+                    self.args.hc_mult,
+                    self.args.hidden_size,
+                ],
+                stream,
+            )?
+        } else {
+            hidden.clone()
+        };
+        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::advance_draft_cache(
+            &mut self.static_model,
+            &hidden,
+            tokens,
+            cache,
+            stream,
+        )
     }
 }
 
@@ -577,6 +964,136 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         Ok(DecoderLayer::new(&self.args, index, stream)?)
     }
 
+    fn register_parallel_parameters(
+        &self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let _ = context;
+        use crate::runtime::distributed::parallel::register_replicated_module;
+
+        register_replicated_module(planner, &self.static_model.model.embed_tokens, "embed")?;
+        register_replicated_module(planner, &self.static_model.model.norm, "norm")?;
+        register_replicated_module(planner, &self.static_model.model.hc_head, "hc_head")?;
+        register_replicated_module(planner, &self.static_model.lm_head, "head")?;
+        if let Some(mtp) = &self.static_model.mtp {
+            register_replicated_module(planner, mtp, "mtp")?;
+        }
+        if let Some(dspark) = &self.static_model.dspark {
+            register_replicated_module(planner, dspark, "mtp")?;
+        }
+        for index in 0..self.args.num_hidden_layers as usize {
+            let layer = DecoderLayer::new(&self.args, index, stream)?;
+            register_v4_layer_parallel_plan(planner, &layer, index)?;
+        }
+        Ok(())
+    }
+
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        _stream: &Stream,
+    ) -> Result<(), Error> {
+        self.parallel_topology = Some(context.topology());
+        Ok(())
+    }
+
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
+        self.layer_count(group)?;
+        let target = format!("layers.{index}.attn.wq_b.weight");
+        let query = layout.tensor(&target).ok_or_else(|| {
+            Error::Parallel(format!("missing DeepSeek V4 TP layout for {target}"))
+        })?;
+        if query.fell_back_to_replication() {
+            return Ok(DecoderLayer::new(&self.args, index, stream)?);
+        }
+        let units = query.logical_units().ok_or_else(|| {
+            Error::Parallel(format!("DeepSeek V4 TP query {target} has no head domain"))
+        })?;
+        let global_heads = usize::try_from(self.args.num_attention_heads)
+            .map_err(|_| Error::Parallel("DeepSeek V4 head count exceeds usize".into()))?;
+        if units == 0 || !global_heads.is_multiple_of(units) {
+            return Err(Error::Parallel(format!(
+                "DeepSeek V4 query head domain {units} does not divide {global_heads} heads"
+            )));
+        }
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("DeepSeek V4 TP layer was built before topology binding".into())
+        })?;
+        let heads_per_unit = global_heads / units;
+        let widths = (0..topology.tensor_parallel_size)
+            .map(|rank| {
+                crate::runtime::distributed::topology::balanced_contiguous_range(
+                    units,
+                    topology.tensor_parallel_size,
+                    rank,
+                    false,
+                )
+                .map(|range| range.len() * heads_per_unit)
+                .map_err(|error| Error::Parallel(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let local_heads = i32::try_from(widths[topology.tensor_parallel_rank])
+            .map_err(|_| Error::Parallel("DeepSeek V4 local head count exceeds i32".into()))?;
+        Ok(DecoderLayer::new_parallel(
+            &self.args,
+            index,
+            local_heads,
+            widths,
+            stream,
+        )?)
+    }
+
+    fn new_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
+        self.new_layer(group, index, stream)
+    }
+
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
+        self.new_parallel_layer(group, index, layout, stream)
+    }
+
+    fn expert_parallel_assignment(
+        &self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+        if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
+            return Ok(None);
+        }
+        if self.args.n_routed_experts <= 0 {
+            return Err(Error::Parallel(
+                "DeepSeek V4 PP+EP requires routed experts".into(),
+            ));
+        }
+        Ok(Some(
+            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+                self.args.n_routed_experts as usize,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )?,
+        ))
+    }
+
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("layers.{index}")
     }
@@ -606,6 +1123,24 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         } else {
             Ok(bindings)
         }
+    }
+
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &DecoderLayer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
     }
 
     fn populate_layer(
@@ -682,34 +1217,69 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
                 stream,
             )?
         };
-        if let Some(dspark) = &self.args.dspark {
-            if let Some(position) = dspark
-                .target_layer_ids
-                .iter()
-                .position(|wanted| *wanted == index as i32)
-            {
-                context.captures.push((
-                    position,
-                    safemlx::ops::mean_axis(&output, 2, false, stream)?,
-                ));
-            }
-        }
-        if index + 1 == self.args.num_hidden_layers as usize {
-            context.draft_hidden = if self.args.dspark.is_some() {
-                context.captures.sort_by_key(|(position, _)| *position);
-                Some(safemlx::ops::concatenate_axis(
-                    &context
-                        .captures
-                        .iter()
-                        .map(|(_, value)| value)
-                        .collect::<Vec<_>>(),
-                    -1,
-                    stream,
-                )?)
+        capture_draft_hidden(&self.args, index, &output, context, stream)?;
+        Ok(output)
+    }
+
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut DecoderLayer,
+        hidden: &Array,
+        cache: &mut Cache,
+        context: &mut DeepSeekV4ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        self.layer_count(group)?;
+        let output = if let Some(expert_cache) = &self.expert_cache {
+            let pass = if hidden.dim(1) > 1 {
+                ExpertPass::Prefill
             } else {
-                Some(output.clone())
+                ExpertPass::Decode
             };
-        }
+            layer.forward_tensor_with_expert_executor(
+                hidden,
+                None,
+                Some(&mut cache.layers[index]),
+                &context.input_ids,
+                tp_group,
+                execution.stream(),
+                |flat, indices, weights, stream| {
+                    execute_cached_experts(
+                        &self.args,
+                        expert_cache,
+                        index,
+                        flat,
+                        indices,
+                        weights,
+                        pass,
+                        stream,
+                    )
+                },
+            )?
+        } else {
+            layer.forward_tensor_parallel(
+                hidden,
+                None,
+                Some(&mut cache.layers[index]),
+                &context.input_ids,
+                tp_group,
+                execution.stream(),
+            )?
+        };
+        capture_draft_hidden(&self.args, index, &output, context, execution.stream())?;
         Ok(output)
     }
 
@@ -756,6 +1326,35 @@ pub fn load_deepseek_v4_layerwise_model(
     })
 }
 
+/// Loads V4 through the generalized tensor-parallel and residency engine.
+pub fn load_deepseek_v4_tensor_parallel_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerWeightResidency>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV4LayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::DeepSeekV4,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency()),
+    )?;
+    let args = super::model::get_model_args(model_dir)?;
+    let adapter = DeepSeekV4LayerwiseAdapter::new(args, stream)?;
+    Ok(DeepSeekV4LayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
+            adapter,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
 /// Loads V4 with routed experts in independent cache units.
 pub fn load_deepseek_v4_expert_cache_model(
     model_dir: impl AsRef<Path>,
@@ -784,6 +1383,138 @@ pub fn load_deepseek_v4_expert_cache_model(
         stream.clone(),
     )?);
     Ok(DeepSeekV4LayerwiseModel { execution })
+}
+
+/// Builds the non-expert V4 base used by pure EP execution.
+pub(crate) fn load_deepseek_v4_sparse_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: impl Into<LayerWeightResidency>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV4LayerwiseModel, Error> {
+    let adapter = DeepSeekV4LayerwiseAdapter::new_sparse(args, stream)?;
+    Ok(DeepSeekV4LayerwiseModel {
+        execution: load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?,
+    })
+}
+
+/// Builds the TP-sharded non-expert V4 base used by TP+EP execution.
+pub(crate) fn load_deepseek_v4_sparse_tp_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: impl Into<LayerWeightResidency>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV4LayerwiseModel, Error> {
+    let adapter = DeepSeekV4LayerwiseAdapter::new_sparse(args, stream)?;
+    Ok(DeepSeekV4LayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
+            store,
+            adapter,
+            non_expert,
+            build,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
+fn capture_draft_hidden(
+    args: &ModelArgs,
+    index: usize,
+    output: &Array,
+    context: &mut DeepSeekV4ForwardContext,
+    stream: &Stream,
+) -> Result<(), Error> {
+    if let Some(dspark) = &args.dspark {
+        if let Some(position) = dspark
+            .target_layer_ids
+            .iter()
+            .position(|wanted| *wanted == index as i32)
+        {
+            context
+                .captures
+                .push((position, safemlx::ops::mean_axis(output, 2, false, stream)?));
+        }
+    }
+    if index + 1 == args.num_hidden_layers as usize {
+        context.draft_hidden = if args.dspark.is_some() {
+            context.captures.sort_by_key(|(position, _)| *position);
+            Some(safemlx::ops::concatenate_axis(
+                &context
+                    .captures
+                    .iter()
+                    .map(|(_, value)| value)
+                    .collect::<Vec<_>>(),
+                -1,
+                stream,
+            )?)
+        } else {
+            Some(output.clone())
+        };
+    }
+    Ok(())
+}
+
+fn register_v4_layer_parallel_plan(
+    planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+    layer: &DecoderLayer,
+    index: usize,
+) -> Result<(), Error> {
+    use crate::runtime::distributed::parallel::{
+        array_parameter_member, partitioned_projection_members, register_replicated_module,
+        MemberSharding, ParameterGroupSpec, ParameterRole, ProjectionSharding,
+    };
+
+    let prefix = format!("layers.{index}");
+    let attention = &layer.attn;
+    let query_prefix = format!("{prefix}.attn.wq_b");
+    let preferred_heads = usize::try_from(attention.heads)
+        .map_err(|_| Error::Parallel("DeepSeek V4 query head count exceeds usize".into()))?;
+    let (units, mut members) = partitioned_projection_members(
+        &[(
+            &attention.wq_b,
+            query_prefix.as_str(),
+            ProjectionSharding::Column,
+        )],
+        preferred_heads,
+    )?;
+    members.push(array_parameter_member(
+        format!("{prefix}.attn.attn_sink"),
+        attention.attn_sink.as_ref(),
+        MemberSharding::Partitioned { axis: 0 },
+    )?);
+    planner.register(ParameterGroupSpec::partitioned(
+        format!("{prefix}.attn.query_heads"),
+        ParameterRole::AttentionHeads,
+        units,
+        members,
+    )?)?;
+
+    register_replicated_module(planner, &attention.wq_a, &format!("{prefix}.attn.wq_a"))?;
+    register_replicated_module(planner, &attention.q_norm, &format!("{prefix}.attn.q_norm"))?;
+    register_replicated_module(planner, &attention.wkv, &format!("{prefix}.attn.wkv"))?;
+    register_replicated_module(
+        planner,
+        &attention.kv_norm,
+        &format!("{prefix}.attn.kv_norm"),
+    )?;
+    register_replicated_module(planner, &attention.wo_a, &format!("{prefix}.attn.wo_a"))?;
+    register_replicated_module(planner, &attention.wo_b, &format!("{prefix}.attn.wo_b"))?;
+    register_replicated_module(planner, &layer.ffn, &format!("{prefix}.ffn"))?;
+    register_replicated_module(planner, &layer.attn_norm, &format!("{prefix}.attn_norm"))?;
+    register_replicated_module(planner, &layer.ffn_norm, &format!("{prefix}.ffn_norm"))?;
+    register_replicated_module(planner, &layer.attn_hc, &format!("{prefix}.attn_hc"))?;
+    register_replicated_module(planner, &layer.ffn_hc, &format!("{prefix}.ffn_hc"))?;
+    if let Some(compressor) = &attention.compressor {
+        register_replicated_module(planner, compressor, &format!("{prefix}.attn.compressor"))?;
+    }
+    if let Some(indexer) = &attention.indexer {
+        register_replicated_module(planner, indexer, &format!("{prefix}.attn.indexer"))?;
+    }
+    Ok(())
 }
 
 fn raw_layer_key(root: &str, local: &str) -> String {
@@ -1003,7 +1734,7 @@ fn draft_decoder_recipe(
     ))
 }
 
-fn expert_catalog(
+pub(crate) fn expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
@@ -1135,7 +1866,44 @@ fn execute_cached_experts(
 
 #[cfg(test)]
 mod tests {
-    use super::raw_layer_key;
+    use safemlx::{Device, DeviceType, ExecutionContext};
+
+    use super::{raw_layer_key, DeepSeekV4LayerwiseAdapter};
+    use crate::{
+        architectures::deepseek_v4::model::ModelArgs,
+        runtime::{
+            distributed::{
+                parallel::{ParallelBuildContext, ShardingPolicy},
+                topology::{DeviceAssignment, ParallelTopology},
+            },
+            execution::layerwise::ArchitectureAdapter,
+        },
+    };
+
+    fn args() -> ModelArgs {
+        ModelArgs::from_value(serde_json::json!({
+            "model_type": "deepseek_v4",
+            "hidden_size": 8,
+            "moe_intermediate_size": 4,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "qk_rope_head_dim": 4,
+            "q_lora_rank": 8,
+            "o_lora_rank": 8,
+            "o_groups": 2,
+            "vocab_size": 32,
+            "max_position_embeddings": 4096,
+            "compress_ratios": [0, 4],
+            "index_n_heads": 4,
+            "index_head_dim": 4,
+            "index_topk": 2,
+            "n_routed_experts": 8,
+            "num_experts_per_tok": 2
+        }))
+        .unwrap()
+    }
 
     #[test]
     fn maps_runtime_v4_layer_names_to_official_checkpoint_names() {
@@ -1155,5 +1923,56 @@ mod tests {
             raw_layer_key("layers.7", "attn.wq_a.weight_scale_inv"),
             "layers.7.attn.wq_a.scale"
         );
+    }
+
+    #[test]
+    fn cartesian_plan_shards_query_heads_and_balances_expert_ownership() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        for rank in 0..8 {
+            let topology = ParallelTopology::from_rank(
+                8,
+                rank,
+                2,
+                2,
+                2,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
+            .unwrap();
+            let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+            let adapter = DeepSeekV4LayerwiseAdapter::new(args(), execution.stream()).unwrap();
+            let assignment = adapter
+                .expert_parallel_assignment(topology)
+                .unwrap()
+                .unwrap();
+            assert_eq!(assignment.global_expert_count(), 8);
+            assert_eq!(assignment.local_expert_count(), 4);
+
+            let mut planner = build.planner();
+            adapter
+                .register_parallel_parameters(build, &mut planner, execution.stream())
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+            assert_eq!(
+                layout
+                    .tensor("layers.0.attn.wq_b.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[16, 8]
+            );
+            assert_eq!(
+                layout
+                    .tensor("layers.0.attn.attn_sink")
+                    .unwrap()
+                    .local_shape(),
+                &[2]
+            );
+            assert_eq!(
+                layout
+                    .tensor("layers.0.attn.wkv.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[8, 8]
+            );
+        }
     }
 }

@@ -538,10 +538,19 @@ pub struct Cache {
     pub(crate) mtp_layers: Vec<AttentionCache>,
 }
 
+/// Embedded draft cache shared by resident, layerwise, and distributed execution.
+pub(crate) type DraftCache = Vec<AttentionCache>;
+
 impl Cache {
     /// Current target-decoder sequence offset.
     pub fn offset(&self) -> i32 {
         self.layers.first().map_or(0, AttentionCache::offset)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        for cache in self.layers.iter_mut().chain(&mut self.mtp_layers) {
+            cache.clear();
+        }
     }
 }
 
@@ -588,6 +597,18 @@ impl DecoderLayer {
         })
     }
 
+    pub(crate) fn new_parallel(
+        args: &ModelArgs,
+        layer: usize,
+        local_heads: i32,
+        head_widths: Vec<usize>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut block = Self::new(args, layer, stream)?;
+        block.attn = Attention::new_parallel(args, layer, local_heads, head_widths, stream)?;
+        Ok(block)
+    }
+
     pub(crate) fn forward(
         &mut self,
         hidden: &Array,
@@ -625,6 +646,62 @@ impl DecoderLayer {
             self.attn_hc.collapse(hidden, self.norm_epsilon, stream)?;
         let normalized = self.attn_norm.forward(&collapsed, stream)?;
         let attention = self.attn.forward(&normalized, mask, cache, stream)?;
+        let hidden = expand(&attention, residual, &post, &combination, stream)?;
+
+        let residual = &hidden;
+        let (collapsed, post, combination) =
+            self.ffn_hc.collapse(&hidden, self.norm_epsilon, stream)?;
+        let normalized = self.ffn_norm.forward(&collapsed, stream)?;
+        let feed_forward =
+            self.ffn
+                .forward_with_expert_executor(&normalized, input_ids, stream, execute)?;
+        expand(&feed_forward, residual, &post, &combination, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut AttentionCache>,
+        input_ids: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let residual = hidden;
+        let (collapsed, post, combination) =
+            self.attn_hc.collapse(hidden, self.norm_epsilon, stream)?;
+        let normalized = self.attn_norm.forward(&collapsed, stream)?;
+        let attention =
+            self.attn
+                .forward_tensor_parallel(&normalized, mask, cache, group, stream)?;
+        let hidden = expand(&attention, residual, &post, &combination, stream)?;
+
+        let residual = &hidden;
+        let (collapsed, post, combination) =
+            self.ffn_hc.collapse(&hidden, self.norm_epsilon, stream)?;
+        let normalized = self.ffn_norm.forward(&collapsed, stream)?;
+        let feed_forward = self.ffn.forward(&normalized, input_ids, stream)?;
+        expand(&feed_forward, residual, &post, &combination, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_with_expert_executor(
+        &mut self,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut AttentionCache>,
+        input_ids: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: impl FnMut(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    ) -> Result<Array, Exception> {
+        let residual = hidden;
+        let (collapsed, post, combination) =
+            self.attn_hc.collapse(hidden, self.norm_epsilon, stream)?;
+        let normalized = self.attn_norm.forward(&collapsed, stream)?;
+        let attention =
+            self.attn
+                .forward_tensor_parallel(&normalized, mask, cache, group, stream)?;
         let hidden = expand(&attention, residual, &post, &combination, stream)?;
 
         let residual = &hidden;
@@ -1097,7 +1174,7 @@ impl Model {
         )
     }
 
-    fn forward_mtp_draft(
+    pub(crate) fn forward_mtp_draft(
         &mut self,
         hidden: &Array,
         tokens: &Array,

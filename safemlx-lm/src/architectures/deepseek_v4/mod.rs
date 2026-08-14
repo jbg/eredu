@@ -1,6 +1,6 @@
 //! DeepSeek-V4 model family.
 
-mod attention;
+pub(crate) mod attention;
 mod layers;
 /// Generalized bounded-residency execution.
 pub mod layerwise;
