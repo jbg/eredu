@@ -48,6 +48,7 @@ projector.
 | Qwen3-VL | text, image, video | yes | `qwen3vl`, `qwen3vlmoe` + projector | dense and MoE text decoders, MRoPE and DeepStack |
 | Qwen3-Next / Qwen3.5 | text; image/video where present | yes | `qwen3next`, `qwen35`, `qwen35moe` | hybrid recurrent/full attention, dense and MoE; Qwen3.5 projector support |
 | DeepSeek-V3 / R1 | text | yes | `deepseek2` | compressed MLA, dense-to-MoE schedules, native block FP8 |
+| DeepSeek-V4 | text | yes | `deepseek4` | mHC compressed sparse attention, routed/shared experts, native FP8 and mixed FP4, embedded MTP and fused DSpark |
 | GPT-OSS | text | yes | `gpt-oss` | Harmony chat, scheduled attention, native MXFP4 experts |
 | Gemma 4 | text, image, video, audio | yes | `gemma4` + projector | dense and MoE variants, shared-KV and media towers |
 | Gemma 4 assistant | text draft model | yes | `gemma4_assistant` | external multi-token prediction |
@@ -58,6 +59,13 @@ projector.
 | Muse-Glimmer | text, image, video | yes | `muse-glimmer`; optional projector | vision tower, mixed attention, ATEM/DFlash paths |
 | Moshi | realtime codec tokens | yes | no | temporal/depth generation without a codec dependency |
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
+
+DeepSeek-V4 uses the shared execution infrastructure for fully resident,
+host-layerwise, and dense disk-streamed weights; independent expert caches;
+device-resident or paged request state; and reusable prompt caches, including
+embedded MTP and fused DSpark draft state. Eligible dense SafeTensors weights
+can be transformed to affine or MXFP4 layouts at load time. Checkpoint-native
+FP8 and packed encodings remain native.
 
 Qwen2 vision-language and Qwen2 MoE checkpoints are not accepted by the Qwen2
 text adapter. A model that needs custom Python code or uses an unregistered

@@ -24,6 +24,7 @@ quantization, and residency request must still pass `inspect_model`.
 | Gemma 4 dense | TP, PP | TP, PP, TP+PP | SafeTensors and text-plus-projector GGUF |
 | Gemma 4 MoE | TP, PP, EP | all pure, pairwise, and triple-axis combinations | media towers and typed multimodal ingress included |
 | DeepSeek-V3 / R1 | TP, PP, EP | all pure, pairwise, and triple-axis combinations | SafeTensors and DeepSeek2 GGUF |
+| DeepSeek-V4 | TP, PP, EP | all pure, pairwise, and triple-axis combinations | SafeTensors and `deepseek4` GGUF; embedded MTP/DSpark and compressed prompt state included |
 | Kimi Linear | TP, PP, EP | all pure, pairwise, and triple-axis combinations | SafeTensors and `kimi-linear` GGUF |
 | LFM2 dense | TP, PP | TP, PP, TP+PP | SafeTensors and `lfm2` GGUF |
 | LFM2-MoE | TP, PP, EP | all pure, pairwise, and triple-axis combinations | SafeTensors and `lfm2moe` GGUF |
