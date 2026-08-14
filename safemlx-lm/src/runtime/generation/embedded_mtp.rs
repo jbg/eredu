@@ -300,6 +300,27 @@ pub(crate) trait EmbeddedMtpTarget {
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<(Array, Array), Exception>;
+    /// Optionally computes a fused block of base proposal logits. Architectures
+    /// with token-conditioned block heads can adjust each row in
+    /// `adjust_fused_draft_logits` as the scheduler samples it.
+    fn fused_draft_logits(
+        &mut self,
+        _hidden: &Array,
+        _last_token: u32,
+        _proposal_capacity: usize,
+        _cache: &mut Self::DraftCache,
+        _stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        Ok(None)
+    }
+    fn adjust_fused_draft_logits(
+        &mut self,
+        logits: Array,
+        _last_token: u32,
+        _stream: &Stream,
+    ) -> Result<Array, Exception> {
+        Ok(logits)
+    }
     fn advance_draft_cache(
         &mut self,
         hidden: &Array,
@@ -320,6 +341,8 @@ pub(crate) struct EmbeddedDraftState<C> {
     hidden: Array,
     draft_cache: C,
     depth: usize,
+    fused_logits: Option<Array>,
+    fused_cursor: usize,
 }
 
 pub(crate) struct EmbeddedVerification {
@@ -392,13 +415,47 @@ impl<T: EmbeddedMtpTarget> MtpBackend for EmbeddedMtpBackend<'_, T> {
     fn begin_draft(
         &mut self,
         state: &Self::TargetState,
-        _last_token: u32,
-        _stream: &Stream,
+        last_token: u32,
+        stream: &Stream,
     ) -> Result<Self::DraftState, Exception> {
+        let mut draft_cache = state.draft_cache.clone();
+        let fused_logits = self.target.fused_draft_logits(
+            &state.hidden,
+            last_token,
+            self.target.max_draft_tokens(),
+            &mut draft_cache,
+            stream,
+        )?;
         Ok(EmbeddedDraftState {
             hidden: state.hidden.clone(),
-            draft_cache: state.draft_cache.clone(),
+            draft_cache,
             depth: 0,
+            fused_logits,
+            fused_cursor: 0,
+        })
+    }
+
+    fn begin_draft_with_capacity(
+        &mut self,
+        state: &Self::TargetState,
+        last_token: u32,
+        proposal_capacity: usize,
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Self::DraftState, Exception> {
+        let mut draft_cache = state.draft_cache.clone();
+        let fused_logits = self.target.fused_draft_logits(
+            &state.hidden,
+            last_token,
+            proposal_capacity,
+            &mut draft_cache,
+            streams.draft(),
+        )?;
+        Ok(EmbeddedDraftState {
+            hidden: state.hidden.clone(),
+            draft_cache,
+            depth: 0,
+            fused_logits,
+            fused_cursor: 0,
         })
     }
 
@@ -408,6 +465,17 @@ impl<T: EmbeddedMtpTarget> MtpBackend for EmbeddedMtpBackend<'_, T> {
         last_token: u32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        if let Some(logits) = &state.fused_logits {
+            if state.fused_cursor >= logits.dim(1) as usize {
+                return Err(Exception::custom("fused MTP proposal block is exhausted"));
+            }
+            let row = state.fused_cursor as i32;
+            state.fused_cursor += 1;
+            let logits = logits.try_index_device((.., row, ..), stream)?;
+            return self
+                .target
+                .adjust_fused_draft_logits(logits, last_token, stream);
+        }
         let (logits, hidden) = self.target.draft_logits(
             &state.hidden,
             last_token,

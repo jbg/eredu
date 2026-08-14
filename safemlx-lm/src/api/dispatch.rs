@@ -66,6 +66,9 @@ impl Model {
             Self::DeepSeekV3(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
+            Self::DeepSeekV4(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            },
             Self::Inkling(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
@@ -476,6 +479,18 @@ impl Model {
                     target, cache, input, config, prng_key, sampler, stream, on_token,
                 )
             }
+            (Self::DeepSeekV4(target), ModelCache::DeepSeekV4(cache)) => {
+                crate::runtime::generation::embedded_mtp::generate_with_callback(
+                    target.as_mut(),
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    stream,
+                    on_token,
+                )
+            }
             (Self::Inkling(target), ModelCache::Inkling(cache)) => {
                 crate::runtime::generation::embedded_mtp::generate_with_callback(
                     target, cache, input, config, prng_key, sampler, stream, on_token,
@@ -522,6 +537,21 @@ impl Model {
             (Self::DeepSeekV3(target), ModelCache::DeepSeekV3(cache)) => {
                 crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
                     target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    semantic,
+                    cancellation,
+                    stream,
+                    scheduler_options,
+                    on_event,
+                )
+            }
+            (Self::DeepSeekV4(target), ModelCache::DeepSeekV4(cache)) => {
+                crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
+                    target.as_mut(),
                     cache,
                     input,
                     config,

@@ -546,7 +546,7 @@ impl Attention {
     pub(crate) fn forward(
         &mut self,
         input: &Array,
-        _mask: Option<&Array>,
+        mask: Option<&Array>,
         cache: Option<&mut AttentionCache>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
@@ -576,11 +576,18 @@ impl Attention {
                     zeros_dtype(&[batch, 1, tokens, 0], input.dtype(), stream)?,
                     stream,
                 )?;
-                let local_mask = causal_local_mask(tokens, offset, kv.dim(2), stream)?;
+                let generated_mask;
+                let local_mask = match mask {
+                    Some(mask) => mask,
+                    None => {
+                        generated_mask = causal_local_mask(tokens, offset, kv.dim(2), stream)?;
+                        &generated_mask
+                    }
+                };
                 dense_attention(
                     &query,
                     &kv,
-                    Some(&local_mask),
+                    Some(local_mask),
                     self.scale,
                     self.attn_sink.as_ref(),
                     stream,
@@ -699,11 +706,18 @@ impl Attention {
                 }
             }
             None => {
-                let local_mask = causal_local_mask(tokens, offset, kv.dim(2), stream)?;
+                let generated_mask;
+                let local_mask = match mask {
+                    Some(mask) => mask,
+                    None => {
+                        generated_mask = causal_local_mask(tokens, offset, kv.dim(2), stream)?;
+                        &generated_mask
+                    }
+                };
                 dense_attention(
                     &query,
                     &kv,
-                    Some(&local_mask),
+                    Some(local_mask),
                     self.scale,
                     self.attn_sink.as_ref(),
                     stream,

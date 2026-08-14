@@ -14,7 +14,7 @@ use safemlx::{
     macros::ModuleParameters,
     module::{Module, ModuleParametersExt},
     nn,
-    ops::{broadcast_to, indexing::NewAxis, indexing::TryIndexOp},
+    ops::{broadcast_to, concatenate_axis, indexing::NewAxis, indexing::TryIndexOp, mean_axis},
     Array, Dtype, Stream,
 };
 
@@ -358,14 +358,15 @@ impl ModelArgs {
                 "normalization, RoPE, and routing scales must be finite and positive",
             ));
         }
-        // Compression scheduling belongs to the target stack. Built-in MTP
-        // reuses target-layer captures and does not append phantom entries to
-        // this list (matching the official configuration schema).
-        let required_ratios = usize::try_from(self.num_hidden_layers)
-            .map_err(|_| unsupported("layer count is negative"))?;
+        // Official checkpoints append one compression entry per embedded
+        // prediction block.  Those blocks are ordinary V4 decoder layers and
+        // therefore use the same attention construction path as the target.
+        let required_ratios =
+            usize::try_from(self.num_hidden_layers + self.num_nextn_predict_layers)
+                .map_err(|_| unsupported("layer count is negative"))?;
         if self.compress_ratios.len() != required_ratios {
             return Err(unsupported(format!(
-                "compress_ratios has {} entries but {required_ratios} target layers require entries",
+                "compress_ratios has {} entries but {required_ratios} decoder blocks require entries",
                 self.compress_ratios.len()
             )));
         }
@@ -375,6 +376,14 @@ impl ModelArgs {
             .any(|ratio| !matches!(ratio, 0 | 4 | 128))
         {
             return Err(unsupported("compress_ratios may contain only 0, 4, or 128"));
+        }
+        if self.compress_ratios[self.num_hidden_layers as usize..]
+            .iter()
+            .any(|ratio| *ratio != 0)
+        {
+            return Err(unsupported(
+                "embedded MTP and DSpark decoder blocks require local attention",
+            ));
         }
         if let Some(yarn) = &self.rope_scaling {
             if yarn.r#type != "yarn"
@@ -442,6 +451,10 @@ impl ModelArgsSource {
                     }
                 })
                 .collect();
+            self.compress_ratios.extend(std::iter::repeat_n(
+                0,
+                self.num_nextn_predict_layers.max(0) as usize,
+            ));
         }
         let dspark_fields = [
             self.dspark_block_size.is_some(),
@@ -522,6 +535,7 @@ pub fn validate_model_config_value(value: &Value) -> Result<(), Error> {
 #[derive(Debug, Clone)]
 pub struct Cache {
     layers: Vec<AttentionCache>,
+    mtp_layers: Vec<AttentionCache>,
 }
 
 impl Cache {
@@ -550,7 +564,7 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             attn: Attention::new(args, layer, stream)?,
             ffn: Moe::new(args, layer as i32, stream)?,
@@ -574,7 +588,7 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         hidden: &Array,
         mask: Option<&Array>,
@@ -595,6 +609,18 @@ impl DecoderLayer {
         let normalized = self.ffn_norm.forward(&collapsed, stream)?;
         let feed_forward = self.ffn.forward(&normalized, input_ids, stream)?;
         expand(&feed_forward, residual, &post, &combination, stream)
+    }
+
+    fn prefill_attention_cache(
+        &mut self,
+        hidden: &Array,
+        cache: &mut AttentionCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let (collapsed, _, _) = self.attn_hc.collapse(hidden, self.norm_epsilon, stream)?;
+        let normalized = self.attn_norm.forward(&collapsed, stream)?;
+        let _ = self.attn.forward(&normalized, None, Some(cache), stream)?;
+        Ok(())
     }
 }
 
@@ -636,12 +662,13 @@ impl TextModel {
         })
     }
 
-    fn forward(
+    fn forward_streams_and_captures(
         &mut self,
         input_ids: &Array,
         mut cache: Option<&mut Cache>,
+        capture_layers: &[i32],
         stream: &Stream,
-    ) -> Result<Array, Exception> {
+    ) -> Result<(Array, Option<Array>), Exception> {
         let embedded = self.embed_tokens.forward(input_ids, stream)?;
         let batch = embedded.dim(0);
         let tokens = embedded.dim(1);
@@ -651,14 +678,296 @@ impl TextModel {
             &[batch, tokens, self.args.hc_mult, self.args.hidden_size],
             stream,
         )?;
+        let mut captures = Vec::with_capacity(capture_layers.len());
         for (layer_index, layer) in self.layers.iter_mut().enumerate() {
             let layer_cache = cache
                 .as_deref_mut()
                 .map(|cache| &mut cache.layers[layer_index]);
             hidden = layer.forward(&hidden, None, layer_cache, input_ids, stream)?;
+            if let Some(position) = capture_layers
+                .iter()
+                .position(|wanted| *wanted == layer_index as i32)
+            {
+                captures.push((position, mean_axis(&hidden, 2, false, stream)?));
+            }
+        }
+        captures.sort_by_key(|(position, _)| *position);
+        let captures = if captures.is_empty() {
+            None
+        } else {
+            Some(concatenate_axis(
+                &captures.iter().map(|(_, value)| value).collect::<Vec<_>>(),
+                -1,
+                stream,
+            )?)
+        };
+        Ok((hidden, captures))
+    }
+
+    fn forward_streams(
+        &mut self,
+        input_ids: &Array,
+        cache: Option<&mut Cache>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.forward_streams_and_captures(input_ids, cache, &[], stream)
+            .map(|(hidden, _)| hidden)
+    }
+
+    fn collapse(&mut self, hidden: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let hidden = self.hc_head.forward(hidden, stream)?;
+        self.norm.forward(&hidden, stream)
+    }
+
+    fn forward(
+        &mut self,
+        input_ids: &Array,
+        cache: Option<&mut Cache>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let hidden = self.forward_streams(input_ids, cache, stream)?;
+        self.collapse(&hidden, stream)
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct MtpLayer {
+    #[param]
+    e_proj: Linear,
+    #[param]
+    h_proj: Linear,
+    #[param]
+    enorm: nn::RmsNorm,
+    #[param]
+    hnorm: nn::RmsNorm,
+    #[param]
+    decoder: DecoderLayer,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    hc_head: HyperHead,
+}
+
+impl MtpLayer {
+    fn new(args: &ModelArgs, depth: usize, stream: &Stream) -> Result<Self, Exception> {
+        let format = super::layers::projection_format(args);
+        let layer = args.num_hidden_layers as usize + depth;
+        Ok(Self {
+            e_proj: Linear::new(args.hidden_size, args.hidden_size, false, format, stream)?,
+            h_proj: Linear::new(args.hidden_size, args.hidden_size, false, format, stream)?,
+            enorm: rms_norm(args.hidden_size, args.rms_norm_eps, stream)?,
+            hnorm: rms_norm(args.hidden_size, args.rms_norm_eps, stream)?,
+            decoder: DecoderLayer::new(args, layer, stream)?,
+            norm: rms_norm(args.hidden_size, args.rms_norm_eps, stream)?,
+            hc_head: HyperHead::unloaded(
+                args.hc_mult,
+                args.hidden_size,
+                args.rms_norm_eps,
+                args.hc_eps,
+                stream,
+            )?,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        hidden: &Array,
+        embedded: &Array,
+        tokens: &Array,
+        cache: &mut AttentionCache,
+        head: &mut Linear,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let embedded = self.enorm.forward(embedded, stream)?;
+        let hidden = self.hnorm.forward(hidden, stream)?;
+        let embedded = self
+            .e_proj
+            .forward(&embedded, stream)?
+            .try_index_device((.., .., NewAxis, ..), stream)?;
+        let hidden = self.h_proj.forward(&hidden, stream)?;
+        let fused = embedded.add(hidden, stream)?;
+        let hidden = self
+            .decoder
+            .forward(&fused, None, Some(cache), tokens, stream)?;
+        let collapsed = self.hc_head.forward(&hidden, stream)?;
+        let normalized = self.norm.forward(&collapsed, stream)?;
+        Ok((head.forward(&normalized, stream)?, hidden))
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct MtpModule {
+    #[param]
+    layers: Vec<MtpLayer>,
+}
+
+impl MtpModule {
+    fn new(args: &ModelArgs, stream: &Stream) -> Result<Option<Self>, Exception> {
+        let count = args.num_nextn_predict_layers.max(0) as usize;
+        if count == 0 || args.dspark.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            layers: (0..count)
+                .map(|depth| MtpLayer::new(args, depth, stream))
+                .collect::<Result<_, _>>()?,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct DsparkModule {
+    #[param]
+    layers: Vec<DecoderLayer>,
+    #[param]
+    main_proj: Linear,
+    #[param]
+    main_norm: nn::RmsNorm,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    hc_head: HyperHead,
+    #[param]
+    markov_w1: nn::Embedding,
+    #[param]
+    markov_w2: Linear,
+    #[param]
+    confidence_head: Linear,
+    sliding_window: i32,
+}
+
+impl DsparkModule {
+    fn new(args: &ModelArgs, stream: &Stream) -> Result<Option<Self>, Exception> {
+        let Some(config) = &args.dspark else {
+            return Ok(None);
+        };
+        let count = args.num_nextn_predict_layers.max(0) as usize;
+        if count == 0 {
+            return Err(Exception::custom(
+                "DSpark requires at least one draft stage",
+            ));
+        }
+        let format = super::layers::projection_format(args);
+        Ok(Some(Self {
+            layers: (0..count)
+                .map(|depth| {
+                    DecoderLayer::new(args, args.num_hidden_layers as usize + depth, stream)
+                })
+                .collect::<Result<_, _>>()?,
+            main_proj: Linear::new(
+                args.hidden_size * config.target_layer_ids.len() as i32,
+                args.hidden_size,
+                false,
+                format,
+                stream,
+            )?,
+            main_norm: rms_norm(args.hidden_size, args.rms_norm_eps, stream)?,
+            norm: rms_norm(args.hidden_size, args.rms_norm_eps, stream)?,
+            hc_head: HyperHead::unloaded(
+                args.hc_mult,
+                args.hidden_size,
+                args.rms_norm_eps,
+                args.hc_eps,
+                stream,
+            )?,
+            markov_w1: nn::Embedding::unloaded(
+                args.vocab_size,
+                config.markov_rank,
+                Dtype::Float32,
+                stream,
+            )?,
+            markov_w2: Linear::new(
+                config.markov_rank,
+                args.vocab_size,
+                false,
+                WeightFormat::Dense,
+                stream,
+            )?,
+            confidence_head: Linear::new(
+                args.hidden_size + config.markov_rank,
+                1,
+                false,
+                WeightFormat::Dense,
+                stream,
+            )?,
+            sliding_window: args.sliding_window,
+        }))
+    }
+
+    fn prefill_context(
+        &mut self,
+        captures: &Array,
+        caches: &mut [AttentionCache],
+        hc_mult: i32,
+        hidden_size: i32,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let main = self
+            .main_norm
+            .forward(&self.main_proj.forward(captures, stream)?, stream)?;
+        let batch = main.dim(0);
+        let tokens = main.dim(1);
+        let hidden = broadcast_to(
+            &main.try_index_device((.., .., NewAxis, ..), stream)?,
+            &[batch, tokens, hc_mult, hidden_size],
+            stream,
+        )?;
+        for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
+            layer.prefill_attention_cache(&hidden, cache, stream)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draft_block(
+        &mut self,
+        anchor: u32,
+        capacity: usize,
+        caches: &mut [AttentionCache],
+        embedding: &mut nn::Embedding,
+        head: &mut Linear,
+        config: &DsparkConfig,
+        hc_mult: i32,
+        hidden_size: i32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if capacity == 0 {
+            return Err(Exception::custom(
+                "DSpark proposal capacity must be positive",
+            ));
+        }
+        let mut ids = vec![config.noise_token_id as u32; capacity];
+        ids[0] = anchor;
+        let tokens = Array::from_slice(&ids, &[1, ids.len() as i32]);
+        let embedded = embedding.forward(&tokens, stream)?;
+        let mut hidden = broadcast_to(
+            &embedded.try_index_device((.., .., NewAxis, ..), stream)?,
+            &[1, ids.len() as i32, hc_mult, hidden_size],
+            stream,
+        )?;
+        for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
+            let keys = (cache.offset() + ids.len() as i32).min(self.sliding_window);
+            let block_mask = Array::ones::<bool>(&[ids.len() as i32, keys], stream)?;
+            hidden = layer.forward(&hidden, Some(&block_mask), Some(cache), &tokens, stream)?;
         }
         let hidden = self.hc_head.forward(&hidden, stream)?;
-        self.norm.forward(&hidden, stream)
+        let hidden = self.norm.forward(&hidden, stream)?;
+        head.forward(&hidden, stream)
+    }
+
+    fn adjust_logits(
+        &mut self,
+        logits: Array,
+        last_token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let token = Array::from_slice(&[last_token], &[1, 1]);
+        let markov = self.markov_w1.forward(&token, stream)?;
+        let adjustment = self
+            .markov_w2
+            .forward(&markov, stream)?
+            .try_index_device((.., 0, ..), stream)?;
+        logits.add(adjustment, stream)
     }
 }
 
@@ -673,6 +982,10 @@ pub struct Model {
     #[param]
     /// Language-model output projection.
     pub lm_head: Linear,
+    #[param]
+    mtp: Option<MtpModule>,
+    #[param]
+    dspark: Option<DsparkModule>,
 }
 
 impl Model {
@@ -694,6 +1007,8 @@ impl Model {
                 head_format,
                 stream,
             )?,
+            mtp: MtpModule::new(&args, stream)?,
+            dspark: DsparkModule::new(&args, stream)?,
             args,
         })
     }
@@ -707,7 +1022,78 @@ impl Model {
                 .iter()
                 .map(|layer| layer.attn.new_cache(self.args.sliding_window))
                 .collect::<Result<_, _>>()?,
+            mtp_layers: if let Some(mtp) = &self.mtp {
+                mtp.layers
+                    .iter()
+                    .map(|layer| layer.decoder.attn.new_cache(self.args.sliding_window))
+                    .collect::<Result<_, _>>()?
+            } else if let Some(dspark) = &self.dspark {
+                dspark
+                    .layers
+                    .iter()
+                    .map(|layer| layer.attn.new_cache(self.args.sliding_window))
+                    .collect::<Result<_, _>>()?
+            } else {
+                Vec::new()
+            },
         })
+    }
+
+    pub(crate) fn mtp_len(&self) -> usize {
+        self.dspark.as_ref().map_or_else(
+            || self.mtp.as_ref().map_or(0, |mtp| mtp.layers.len()),
+            |_| self.args.dspark.as_ref().unwrap().block_size as usize,
+        )
+    }
+
+    fn forward_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let capture_layers = self
+            .args
+            .dspark
+            .as_ref()
+            .map_or(&[][..], |config| config.target_layer_ids.as_slice());
+        let (hidden, captures) =
+            self.model
+                .forward_streams_and_captures(tokens, Some(cache), capture_layers, stream)?;
+        let collapsed = self.model.collapse(&hidden, stream)?;
+        let logits = self.lm_head.forward(&collapsed, stream)?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden: captures.unwrap_or(hidden),
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
+    fn forward_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [AttentionCache],
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let embedded = self.model.embed_tokens.forward(tokens, stream)?;
+        let mtp = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("DeepSeek-V4 checkpoint has no embedded MTP"))?;
+        let count = mtp.layers.len();
+        let index = depth % count;
+        mtp.layers[index].forward(
+            hidden,
+            &embedded,
+            tokens,
+            &mut cache[index],
+            &mut self.lm_head,
+            stream,
+        )
     }
 
     /// Returns the cache layout when it can be represented by the generic
@@ -790,10 +1176,7 @@ pub fn load_model(
         crate::api::ModelLoadOptions::default(),
     )?;
     let mut model = Model::new(args.clone(), stream)?;
-    let mut config = StrictLoadConfig::default().allow_unused_prefix("mtp.");
-    for layer in args.num_hidden_layers..args.num_hidden_layers + args.num_nextn_predict_layers {
-        config = config.allow_unused_prefix(format!("layers.{layer}."));
-    }
+    let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
     load_safetensors_dir_strict_with_split_swiglu_experts_and_transform(
         &mut model,
@@ -817,6 +1200,48 @@ fn transform_checkpoint_tensor(
     mut value: Array,
     stream: &Stream,
 ) -> Result<Vec<(String, Array)>, Error> {
+    if let Some(rest) = key.strip_prefix("mtp.").map(str::to_owned) {
+        let (depth, field) = rest.split_once('.').ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("invalid DeepSeek-V4 MTP tensor {key:?}"))
+        })?;
+        if args.dspark.is_some() {
+            key = match field {
+                "main_proj.weight" | "main_proj.scale" => {
+                    format!("dspark.main_proj.{}", field.rsplit_once('.').unwrap().1)
+                }
+                "main_norm.weight" => "dspark.main_norm.weight".into(),
+                "norm.weight" => "dspark.norm.weight".into(),
+                "markov_head.markov_w1.weight" => "dspark.markov_w1.weight".into(),
+                "markov_head.markov_w2.weight" => "dspark.markov_w2.weight".into(),
+                "confidence_head.proj.weight" => "dspark.confidence_head.weight".into(),
+                "hc_head_fn" => "dspark.hc_head.function".into(),
+                "hc_head_base" => "dspark.hc_head.base".into(),
+                "hc_head_scale" => "dspark.hc_head.scale".into(),
+                other => format!("dspark.layers.{depth}.{other}"),
+            };
+        } else {
+            let direct = matches!(
+                field,
+                "e_proj.weight"
+                    | "e_proj.scale"
+                    | "h_proj.weight"
+                    | "h_proj.scale"
+                    | "enorm.weight"
+                    | "hnorm.weight"
+                    | "norm.weight"
+                    | "hc_head_fn"
+                    | "hc_head_base"
+                    | "hc_head_scale"
+            );
+            key = match field {
+                "hc_head_fn" => format!("mtp.layers.{depth}.hc_head.function"),
+                "hc_head_base" => format!("mtp.layers.{depth}.hc_head.base"),
+                "hc_head_scale" => format!("mtp.layers.{depth}.hc_head.scale"),
+                other if direct => format!("mtp.layers.{depth}.{other}"),
+                other => format!("mtp.layers.{depth}.decoder.{other}"),
+            };
+        }
+    }
     key = match key.as_str() {
         "embed.weight" => "model.embed_tokens.weight".into(),
         "norm.weight" => "model.norm.weight".into(),
@@ -910,6 +1335,152 @@ impl CausalLm<Cache> for Model {
     }
 }
 
+impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for Model {
+    type Cache = Cache;
+    type DraftCache = Vec<AttentionCache>;
+
+    fn prefill_target(
+        &mut self,
+        input: runtime_input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let tokens = runtime_input::text_token_ids(input, stream)?;
+        *cache = self.new_cache()?;
+        self.forward_mtp_target(&tokens, cache, stream)
+    }
+
+    fn verify_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        self.forward_mtp_target(tokens, cache, stream)
+    }
+
+    fn prefill_draft_cache(
+        &mut self,
+        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let sequence = tokens.dim(1);
+        if let Some(dspark) = &mut self.dspark {
+            return dspark.prefill_context(
+                &output.hidden,
+                &mut cache.mtp_layers,
+                self.args.hc_mult,
+                self.args.hidden_size,
+                stream,
+            );
+        }
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = output
+            .hidden
+            .try_index_device((.., ..sequence - 1, .., ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        for depth in 0..cache.mtp_layers.len() {
+            let _ = self.forward_mtp_draft(&hidden, &next, depth, &mut cache.mtp_layers, stream)?;
+        }
+        Ok(())
+    }
+
+    fn draft_cache(cache: &Cache) -> Self::DraftCache {
+        cache.mtp_layers.clone()
+    }
+
+    fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
+        cache.mtp_layers.clone_from(draft);
+    }
+
+    fn draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        if self.dspark.is_some() {
+            return Err(Exception::custom(
+                "DSpark uses fused block execution, not sequential MTP layers",
+            ));
+        }
+        let token = Array::from_slice(&[last_token], &[1, 1]);
+        self.forward_mtp_draft(hidden, &token, draft_index, cache, stream)
+    }
+
+    fn fused_draft_logits(
+        &mut self,
+        _hidden: &Array,
+        last_token: u32,
+        proposal_capacity: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        let Some(dspark) = self.dspark.as_mut() else {
+            return Ok(None);
+        };
+        // Proposal-block self attention is transactional. Only accepted target
+        // captures advance the canonical DSpark context cache during commit.
+        let mut proposal_cache = cache.clone();
+        let logits = dspark.draft_block(
+            last_token,
+            proposal_capacity,
+            &mut proposal_cache,
+            &mut self.model.embed_tokens,
+            &mut self.lm_head,
+            self.args.dspark.as_ref().unwrap(),
+            self.args.hc_mult,
+            self.args.hidden_size,
+            stream,
+        )?;
+        Ok(Some(logits))
+    }
+
+    fn adjust_fused_draft_logits(
+        &mut self,
+        logits: Array,
+        last_token: u32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.dspark
+            .as_mut()
+            .ok_or_else(|| Exception::custom("DeepSeek-V4 has no fused DSpark module"))?
+            .adjust_logits(logits, last_token, stream)
+    }
+
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if let Some(dspark) = &mut self.dspark {
+            return dspark.prefill_context(
+                hidden,
+                cache,
+                self.args.hc_mult,
+                self.args.hidden_size,
+                stream,
+            );
+        }
+        for depth in 0..cache.len() {
+            let _ = self.forward_mtp_draft(hidden, tokens, depth, cache, stream)?;
+        }
+        Ok(())
+    }
+
+    fn max_draft_tokens(&self) -> usize {
+        self.mtp_len()
+    }
+}
+
 /// DeepSeek-V4 token generation iterator.
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, Model, Cache, S>;
@@ -934,7 +1505,7 @@ mod tests {
             "o_groups": 2,
             "vocab_size": 32,
             "max_position_embeddings": 4096,
-            "compress_ratios": [0, 4, 128],
+            "compress_ratios": [0, 4, 128, 0],
             "index_n_heads": 4,
             "index_head_dim": 4,
             "index_topk": 2,
@@ -945,16 +1516,33 @@ mod tests {
     }
 
     #[test]
-    fn mtp_does_not_extend_target_compression_schedule() {
+    fn mtp_extends_decoder_compression_schedule() {
         let args = ModelArgs::from_value(minimal_config()).unwrap();
-        assert_eq!(args.compress_ratios, [0, 4, 128]);
+        assert_eq!(args.compress_ratios, [0, 4, 128, 0]);
         assert_eq!(args.num_nextn_predict_layers, 1);
     }
 
     #[test]
     fn rejects_unknown_compression_ratios() {
         let mut value = minimal_config();
-        value["compress_ratios"] = json!([0, 8, 128]);
+        value["compress_ratios"] = json!([0, 8, 128, 0]);
+        assert!(ModelArgs::from_value(value).is_err());
+    }
+
+    #[test]
+    fn defaults_append_local_attention_for_prediction_blocks() {
+        let mut value = minimal_config();
+        value["compress_ratios"] = json!([]);
+        assert_eq!(
+            ModelArgs::from_value(value).unwrap().compress_ratios,
+            [0, 4, 0, 0]
+        );
+    }
+
+    #[test]
+    fn prediction_blocks_reject_compressed_attention() {
+        let mut value = minimal_config();
+        value["compress_ratios"] = json!([0, 4, 128, 4]);
         assert!(ModelArgs::from_value(value).is_err());
     }
 
