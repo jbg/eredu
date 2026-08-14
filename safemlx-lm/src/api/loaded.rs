@@ -2100,9 +2100,15 @@ pub(super) fn load_gguf_model_data(
                 (Model::DeepSeekV3(model), loaded.eos_token_ids)
             }
             GgufArchitecture::DeepSeek4 => {
-                return Err(Error::UnsupportedArchitecture(
-                    "DeepSeek-V4 GGUF execution loader is not initialized".into(),
-                ));
+                let (loaded, eos_token_ids) = crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    options.weight_residency,
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                (Model::DeepSeekV4Layerwise(Box::new(loaded)), eos_token_ids)
             }
             GgufArchitecture::GptOss => {
                 let loaded = gpt_oss::load_gguf_checkpoint(
@@ -2328,9 +2334,15 @@ pub(super) fn load_gguf_model_data(
                 (Model::DeepSeekV3(loaded), eos_token_ids)
             }
             GgufArchitecture::DeepSeek4 => {
-                return Err(Error::UnsupportedArchitecture(
-                    "DeepSeek-V4 GGUF execution loader is not initialized".into(),
-                ));
+                let (loaded, eos_token_ids) = crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (Model::DeepSeekV4Layerwise(Box::new(loaded)), eos_token_ids)
             }
             GgufArchitecture::GptOss => {
                 let (loaded, eos_token_ids) =

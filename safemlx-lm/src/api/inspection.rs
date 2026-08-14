@@ -5797,6 +5797,240 @@ mod tests {
             .unwrap();
     }
 
+    fn deepseek4_gguf_metadata() -> BTreeMap<String, MetadataValue> {
+        BTreeMap::from([
+            (
+                "general.architecture".into(),
+                MetadataValue::String("deepseek4".into()),
+            ),
+            ("general.file_type".into(), MetadataValue::Uint32(36)),
+            ("deepseek4.block_count".into(), MetadataValue::Uint32(3)),
+            (
+                "deepseek4.context_length".into(),
+                MetadataValue::Uint32(128),
+            ),
+            (
+                "deepseek4.embedding_length".into(),
+                MetadataValue::Uint32(32),
+            ),
+            (
+                "deepseek4.embedding_length_out".into(),
+                MetadataValue::Uint32(64),
+            ),
+            (
+                "deepseek4.attention.head_count".into(),
+                MetadataValue::Uint32(4),
+            ),
+            (
+                "deepseek4.attention.head_count_kv".into(),
+                MetadataValue::Uint32(1),
+            ),
+            (
+                "deepseek4.attention.key_length".into(),
+                MetadataValue::Uint32(16),
+            ),
+            (
+                "deepseek4.attention.layer_norm_rms_epsilon".into(),
+                MetadataValue::Float32(0.000001),
+            ),
+            (
+                "deepseek4.attention.q_lora_rank".into(),
+                MetadataValue::Uint32(32),
+            ),
+            (
+                "deepseek4.attention.output_lora_rank".into(),
+                MetadataValue::Uint32(16),
+            ),
+            (
+                "deepseek4.attention.output_group_count".into(),
+                MetadataValue::Uint32(2),
+            ),
+            (
+                "deepseek4.attention.sliding_window".into(),
+                MetadataValue::Uint32(8),
+            ),
+            (
+                "deepseek4.attention.compress_ratios".into(),
+                MetadataValue::Array(MetadataArray::Uint32(vec![0, 4, 128])),
+            ),
+            (
+                "deepseek4.attention.compress_rope_freq_base".into(),
+                MetadataValue::Float32(160_000.0),
+            ),
+            (
+                "deepseek4.attention.indexer.head_count".into(),
+                MetadataValue::Uint32(4),
+            ),
+            (
+                "deepseek4.attention.indexer.key_length".into(),
+                MetadataValue::Uint32(8),
+            ),
+            (
+                "deepseek4.attention.indexer.top_k".into(),
+                MetadataValue::Uint32(2),
+            ),
+            (
+                "deepseek4.rope.dimension_count".into(),
+                MetadataValue::Uint32(8),
+            ),
+            (
+                "deepseek4.rope.freq_base".into(),
+                MetadataValue::Float32(10_000.0),
+            ),
+            (
+                "deepseek4.hyper_connection.count".into(),
+                MetadataValue::Uint32(2),
+            ),
+            (
+                "deepseek4.hyper_connection.sinkhorn_iterations".into(),
+                MetadataValue::Uint32(4),
+            ),
+            (
+                "deepseek4.hyper_connection.epsilon".into(),
+                MetadataValue::Float32(0.000001),
+            ),
+            (
+                "deepseek4.expert_feed_forward_length".into(),
+                MetadataValue::Uint32(32),
+            ),
+            ("deepseek4.expert_count".into(), MetadataValue::Uint32(2)),
+            (
+                "deepseek4.expert_shared_count".into(),
+                MetadataValue::Uint32(1),
+            ),
+            (
+                "deepseek4.expert_used_count".into(),
+                MetadataValue::Uint32(1),
+            ),
+            (
+                "deepseek4.expert_gating_func".into(),
+                MetadataValue::Uint32(3),
+            ),
+            (
+                "deepseek4.expert_weights_norm".into(),
+                MetadataValue::Bool(true),
+            ),
+            (
+                "deepseek4.expert_weights_scale".into(),
+                MetadataValue::Float32(1.0),
+            ),
+            (
+                "deepseek4.swiglu_clamp_exp".into(),
+                MetadataValue::Array(MetadataArray::Float32(vec![7.0; 3])),
+            ),
+            (
+                "deepseek4.swiglu_clamp_shexp".into(),
+                MetadataValue::Array(MetadataArray::Float32(vec![7.0; 3])),
+            ),
+            (
+                "deepseek4.hash_layer_count".into(),
+                MetadataValue::Uint32(1),
+            ),
+            ("deepseek4.vocab_size".into(), MetadataValue::Uint32(32)),
+        ])
+    }
+
+    fn deepseek4_gguf_specs() -> Vec<(String, Vec<u64>, GgmlType)> {
+        let tensor = |name: String, mlx: &[u64], encoding| {
+            let mut dimensions = mlx.to_vec();
+            dimensions.reverse();
+            (name, dimensions, encoding)
+        };
+        let f32 = |name: String, mlx: &[u64]| tensor(name, mlx, GgmlType::F32);
+        let mut specs = vec![
+            f32("token_embd.weight".into(), &[32, 32]),
+            f32("output_norm.weight".into(), &[32]),
+            f32("output.weight".into(), &[32, 32]),
+            f32("output_hc_fn.weight".into(), &[2, 64]),
+            f32("output_hc_base.weight".into(), &[2]),
+            f32("output_hc_scale.weight".into(), &[1]),
+        ];
+        for (layer, ratio) in [0_u64, 4, 128].into_iter().enumerate() {
+            let root = format!("blk.{layer}");
+            specs.extend([
+                f32(format!("{root}.attn_norm.weight"), &[32]),
+                f32(format!("{root}.ffn_norm.weight"), &[32]),
+                f32(format!("{root}.attn_sinks.weight"), &[4]),
+                f32(format!("{root}.attn_q_a.weight"), &[32, 32]),
+                f32(format!("{root}.attn_q_a_norm.weight"), &[32]),
+                f32(format!("{root}.attn_q_b.weight"), &[64, 32]),
+                f32(format!("{root}.attn_kv.weight"), &[16, 32]),
+                f32(format!("{root}.attn_kv_a_norm.weight"), &[16]),
+                f32(format!("{root}.attn_output_a.weight"), &[32, 32]),
+                f32(format!("{root}.attn_output_b.weight"), &[32, 32]),
+                f32(format!("{root}.hc_attn_fn.weight"), &[8, 64]),
+                f32(format!("{root}.hc_attn_base.weight"), &[8]),
+                f32(format!("{root}.hc_attn_scale.weight"), &[3]),
+                f32(format!("{root}.hc_ffn_fn.weight"), &[8, 64]),
+                f32(format!("{root}.hc_ffn_base.weight"), &[8]),
+                f32(format!("{root}.hc_ffn_scale.weight"), &[3]),
+                f32(format!("{root}.ffn_gate_inp.weight"), &[2, 32]),
+                f32(format!("{root}.ffn_gate_shexp.weight"), &[32, 32]),
+                f32(format!("{root}.ffn_down_shexp.weight"), &[32, 32]),
+                f32(format!("{root}.ffn_up_shexp.weight"), &[32, 32]),
+                tensor(
+                    format!("{root}.ffn_gate_exps.weight"),
+                    &[2, 32, 32],
+                    GgmlType::MxFp4,
+                ),
+                tensor(
+                    format!("{root}.ffn_down_exps.weight"),
+                    &[2, 32, 32],
+                    GgmlType::MxFp4,
+                ),
+                tensor(
+                    format!("{root}.ffn_up_exps.weight"),
+                    &[2, 32, 32],
+                    GgmlType::MxFp4,
+                ),
+            ]);
+            if layer == 0 {
+                specs.push(tensor(
+                    format!("{root}.ffn_gate_tid2eid.weight"),
+                    &[32, 1],
+                    GgmlType::I32,
+                ));
+            } else {
+                specs.push(f32(format!("{root}.exp_probs_b.bias"), &[2]));
+            }
+            if ratio != 0 {
+                let output = if ratio == 4 { 32 } else { 16 };
+                specs.extend([
+                    f32(format!("{root}.attn_compressor_kv.weight"), &[output, 32]),
+                    f32(format!("{root}.attn_compressor_gate.weight"), &[output, 32]),
+                    f32(
+                        format!("{root}.attn_compressor_ape.weight"),
+                        &[ratio, output],
+                    ),
+                    f32(format!("{root}.attn_compressor_norm.weight"), &[16]),
+                ]);
+            }
+            if ratio == 4 {
+                specs.extend([
+                    f32(format!("{root}.indexer.attn_q_b.weight"), &[32, 32]),
+                    f32(format!("{root}.indexer.proj.weight"), &[4, 32]),
+                    f32(format!("{root}.indexer_compressor_kv.weight"), &[16, 32]),
+                    f32(format!("{root}.indexer_compressor_gate.weight"), &[16, 32]),
+                    f32(format!("{root}.indexer_compressor_ape.weight"), &[4, 16]),
+                    f32(format!("{root}.indexer_compressor_norm.weight"), &[8]),
+                ]);
+            }
+        }
+        specs
+    }
+
+    fn write_complete_deepseek4_gguf(
+        path: &Path,
+        mutate_metadata: impl FnOnce(&mut BTreeMap<String, MetadataValue>),
+        mutate_specs: impl FnOnce(&mut Vec<(String, Vec<u64>, GgmlType)>),
+    ) {
+        let mut metadata = deepseek4_gguf_metadata();
+        mutate_metadata(&mut metadata);
+        let mut specs = deepseek4_gguf_specs();
+        mutate_specs(&mut specs);
+        write_gguf_specs(path, &metadata, &specs);
+    }
+
     fn deepseek2_gguf_metadata() -> BTreeMap<String, MetadataValue> {
         BTreeMap::from([
             (
@@ -9118,6 +9352,238 @@ mod tests {
             issue.code == InspectionIssueCode::QuantizationCompanionMismatch
                 && issue.tensor_name.as_deref() == Some("blk.0.attn_qkvz.weight")
                 && issue.tensor_type_code == Some(GgmlType::Q4_0.code())
+        }));
+    }
+
+    #[test]
+    fn complete_deepseek4_gguf_catalog_is_exactly_loadable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deepseek4.gguf");
+        write_complete_deepseek4_gguf(&path, |_| {}, |_| {});
+        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        assert_eq!(report.structural_binding, InspectionReadiness::Ready);
+        assert_eq!(report.model_loadability, InspectionReadiness::Ready);
+        assert!(report.is_loadable(), "{:#?}", report.issues);
+
+        let checkpoint = GgufCheckpoint::open(&path).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        assert_eq!(
+            structural::validate_gguf(
+                GgufArchitecture::DeepSeek4,
+                &checkpoint,
+                &metadata,
+                ModelLoadOptions::default(),
+            ),
+            structural::StructuralValidation::Exact
+        );
+        let args = deepseek_v4::model_args_from_gguf_catalog(&checkpoint, &metadata).unwrap();
+        assert_eq!(args.compress_ratios, [0, 4, 128]);
+        assert_eq!(args.num_hash_layers, 1);
+        assert_eq!(args.quantized_weight_configs.as_ref().unwrap().len(), 9);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canonical_deepseek4_gguf_binds_through_the_shared_metal_layerwise_loader() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deepseek4.gguf");
+        write_complete_deepseek4_gguf(&path, |_| {}, |_| {});
+        let checkpoint = GgufCheckpoint::open(&path).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let context =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        for residency in [
+            WeightResidency::fully_resident(),
+            WeightResidency::layerwise_host(
+                crate::runtime::execution::layerwise::LayerwiseLoadOptions::default(),
+            ),
+            WeightResidency::dense_disk_stream(crate::DenseDiskStreamLoadOptions::default()),
+            WeightResidency::with_expert_cache(
+                NonExpertWeightResidency::FullyResident,
+                crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+            ),
+        ] {
+            crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
+                &checkpoint,
+                &metadata,
+                residency,
+                None,
+                context.stream(),
+                weights.stream(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canonical_deepseek4_gguf_preflights_every_cartesian_pipeline_rank() {
+        use crate::runtime::distributed::topology::{DeviceAssignment, ParallelTopology};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deepseek4.gguf");
+        write_complete_deepseek4_gguf(&path, |_| {}, |_| {});
+        let execution =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        for rank in 0..8 {
+            let topology = ParallelTopology::from_rank(
+                8,
+                rank,
+                2,
+                2,
+                2,
+                DeviceAssignment::new(safemlx::DeviceType::Gpu, 0),
+            )
+            .unwrap();
+            for residency in [
+                WeightResidency::fully_resident(),
+                WeightResidency::with_expert_cache(
+                    NonExpertWeightResidency::DenseDiskStream(
+                        crate::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
+                    ),
+                    crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                ),
+            ] {
+                let loaded =
+                    crate::architectures::distributed::pipeline::load_pipeline_model_with_options(
+                        &path,
+                        ModelLoadOptions::with_parallel(topology).with_weight_residency(residency),
+                        execution.stream(),
+                        weights.stream(),
+                    )
+                    .unwrap();
+                assert_eq!(loaded.stage_info().topology, topology);
+                assert!(!loaded.stage_info().global_layer_range.is_empty());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canonical_deepseek4_gguf_preflights_every_tensor_expert_rank() {
+        use crate::runtime::distributed::topology::{DeviceAssignment, ParallelTopology};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deepseek4.gguf");
+        write_complete_deepseek4_gguf(&path, |_| {}, |_| {});
+        let execution =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        for rank in 0..4 {
+            let topology = ParallelTopology::from_rank(
+                4,
+                rank,
+                2,
+                1,
+                2,
+                DeviceAssignment::new(safemlx::DeviceType::Gpu, 0),
+            )
+            .unwrap();
+            for residency in [
+                WeightResidency::fully_resident(),
+                WeightResidency::with_expert_cache(
+                    NonExpertWeightResidency::DenseDiskStream(
+                        crate::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
+                    ),
+                    crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                ),
+            ] {
+                let loaded = crate::architectures::distributed::expert::
+                    load_expert_parallel_model_with_options(
+                        &path,
+                        ModelLoadOptions::with_parallel(topology)
+                            .with_weight_residency(residency),
+                        execution.stream(),
+                        weights.stream(),
+                    )
+                    .unwrap();
+                assert_eq!(loaded.info().topology, topology);
+                assert_eq!(loaded.info().assignment.local_expert_count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek4_gguf_exact_catalog_rejects_missing_alias_and_extra_tensors() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, mutate) in [("missing.gguf", 0_u8), ("alias.gguf", 1), ("extra.gguf", 2)] {
+            let path = directory.path().join(name);
+            write_complete_deepseek4_gguf(
+                &path,
+                |_| {},
+                |specs| match mutate {
+                    0 => specs.retain(|(name, _, _)| name != "blk.1.indexer_compressor_kv.weight"),
+                    1 => {
+                        specs
+                            .iter_mut()
+                            .find(|(name, _, _)| name == "blk.1.indexer.proj.weight")
+                            .unwrap()
+                            .0 = "blk.1.indexer.weights_proj.weight".into();
+                    }
+                    _ => specs.push(("blk.0.legacy.weight".into(), vec![32], GgmlType::F32)),
+                },
+            );
+            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            assert!(!report.is_loadable(), "{name}: {:#?}", report.issues);
+        }
+    }
+
+    #[test]
+    fn deepseek4_gguf_requires_canonical_special_encodings_and_metadata_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, tensor_name, encoding) in [
+            (
+                "dense-experts.gguf",
+                "blk.2.ffn_gate_exps.weight",
+                GgmlType::F32,
+            ),
+            (
+                "float-hash.gguf",
+                "blk.0.ffn_gate_tid2eid.weight",
+                GgmlType::F32,
+            ),
+        ] {
+            let path = directory.path().join(name);
+            write_complete_deepseek4_gguf(
+                &path,
+                |_| {},
+                |specs| {
+                    specs
+                        .iter_mut()
+                        .find(|(name, _, _)| name == tensor_name)
+                        .unwrap()
+                        .2 = encoding;
+                },
+            );
+            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            assert!(!report.is_loadable());
+            assert!(report.issues.iter().any(|issue| {
+                issue.code == InspectionIssueCode::UnsupportedTensorEncoding
+                    && issue.tensor_name.as_deref() == Some(tensor_name)
+            }));
+        }
+
+        let bad_output = directory.path().join("bad-output-width.gguf");
+        write_complete_deepseek4_gguf(
+            &bad_output,
+            |metadata| {
+                metadata.insert(
+                    "deepseek4.embedding_length_out".into(),
+                    MetadataValue::Uint32(32),
+                );
+            },
+            |_| {},
+        );
+        let report = inspect_model(&bad_output, ModelInspectionOptions::default()).unwrap();
+        assert!(!report.is_loadable());
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::InvalidLayerOrExpertCount
+                && issue.detail.contains("embedding_length_out")
         }));
     }
 

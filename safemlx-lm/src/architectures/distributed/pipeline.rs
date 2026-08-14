@@ -9037,9 +9037,9 @@ pub fn load_pipeline_model(
 
 /// Loads an executable rank-local Cartesian pipeline stage.
 ///
-/// Llama/Mistral, DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen, Qwen3-VL, GPT-OSS,
+/// Llama/Mistral, DeepSeek-V3/R1/V4, Inkling, Kimi Linear, Qwen, Qwen3-VL, GPT-OSS,
 /// LFM2, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 text TP+PP stages, plus
-/// DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen, Qwen3-VL-MoE, GPT-OSS, Gemma 4
+/// DeepSeek-V3/R1/V4, Inkling, Kimi Linear, Qwen, Qwen3-VL-MoE, GPT-OSS, Gemma 4
 /// MoE, LFM2-MoE, Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP stages,
 /// support fully resident, host-layerwise, and dense-disk-streamed layers.
 /// Non-resident units compose pipeline placement with the authoritative TP
@@ -9088,6 +9088,7 @@ pub fn load_pipeline_model_with_options(
             && !matches!(
                 architecture,
                 crate::api::GgufArchitecture::DeepSeek2
+                    | crate::api::GgufArchitecture::DeepSeek4
                     | crate::api::GgufArchitecture::Qwen3Moe
                     | crate::api::GgufArchitecture::Qwen3VlMoe
                     | crate::api::GgufArchitecture::KimiLinear
@@ -9101,7 +9102,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "pipeline independent expert caching has registered DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                "pipeline independent expert caching has registered DeepSeek-V3/R1/V4, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -9111,6 +9112,7 @@ pub fn load_pipeline_model_with_options(
             && !matches!(
                 architecture,
                 crate::api::GgufArchitecture::DeepSeek2
+                    | crate::api::GgufArchitecture::DeepSeek4
                     | crate::api::GgufArchitecture::Qwen3Moe
                     | crate::api::GgufArchitecture::Qwen3VlMoe
                     | crate::api::GgufArchitecture::KimiLinear
@@ -9124,7 +9126,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight has registered DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
+                "TP+PP+EP preflight has registered DeepSeek-V3/R1/V4, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -9134,6 +9136,7 @@ pub fn load_pipeline_model_with_options(
                 crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::DeepSeek2
+                    | crate::api::GgufArchitecture::DeepSeek4
                     | crate::api::GgufArchitecture::Qwen3Moe
                     | crate::api::GgufArchitecture::Qwen3Vl
                     | crate::api::GgufArchitecture::Qwen3VlMoe
@@ -9156,6 +9159,7 @@ pub fn load_pipeline_model_with_options(
                 crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::DeepSeek2
+                    | crate::api::GgufArchitecture::DeepSeek4
                     | crate::api::GgufArchitecture::Llama
                     | crate::api::GgufArchitecture::Mistral
                     | crate::api::GgufArchitecture::Qwen2
@@ -9198,9 +9202,25 @@ pub fn load_pipeline_model_with_options(
         )
         .into_loader_result()?;
         return match architecture {
-            crate::api::GgufArchitecture::DeepSeek4 => Err(Error::UnsupportedArchitecture(
-                "DeepSeek-V4 GGUF pipeline loader is not initialized".into(),
-            )),
+            crate::api::GgufArchitecture::DeepSeek4 => {
+                let prepared = deepseek_v4::prepare_gguf_checkpoint(&checkpoint, &metadata)?;
+                let store: SharedWeightStore =
+                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        deepseek_v4::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?);
+                load_deepseek_v4_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )
+            }
             crate::api::GgufArchitecture::Llama | crate::api::GgufArchitecture::Mistral => {
                 let prepared = llama::prepare_llama_gguf_checkpoint(
                     &checkpoint,

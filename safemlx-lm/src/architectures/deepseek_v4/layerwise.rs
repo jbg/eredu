@@ -1,11 +1,18 @@
-//! Bounded-residency execution for DeepSeek V4 SafeTensors checkpoints.
+//! Checkpoint-format-independent bounded-residency execution for DeepSeek V4.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
-    ops::{broadcast_to, indexing::NewAxis, indexing::TryIndexOp},
+    ops::{
+        broadcast_to, indexing::NewAxis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue,
+    },
     Array, Dtype, Stream,
 };
 
@@ -22,7 +29,7 @@ use crate::{
             },
             quantization::WeightQuantization,
             recipe::DerivedWeightRecipe,
-            store::{TensorSelection, WeightStore},
+            store::{GgufWeightStore, TensorSelection, WeightStore},
         },
         execution::layerwise::{
             load_layerwise_model, load_safetensors_layerwise_model,
@@ -1143,6 +1150,38 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         )
     }
 
+    fn expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        let indices = assignment.local_global_expert_ids().to_vec();
+        self.layer_bindings(group, index, &global, store)?
+            .into_iter()
+            .map(|binding| {
+                let target = binding.logical_target().unwrap_or_else(|| binding.name());
+                if target.starts_with("ffn.switch_mlp.") {
+                    binding
+                        .select_bounded_output(
+                            store,
+                            TensorSelection::Indices {
+                                axis: 0,
+                                indices: indices.clone(),
+                            },
+                        )
+                        .map_err(Error::from)
+                } else {
+                    Ok(binding)
+                }
+            })
+            .collect()
+    }
+
     fn populate_layer(
         &self,
         _group: usize,
@@ -1165,7 +1204,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
             store
                 .keys()
                 .into_iter()
-                .filter(|key| key.contains(".ffn.experts."))
+                .filter(|key| is_routed_expert_source(key))
                 .collect()
         } else {
             Vec::new()
@@ -1304,6 +1343,10 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
     }
 }
 
+fn is_routed_expert_source(key: &str) -> bool {
+    key.contains(".ffn.experts.") || key.contains(".ffn.expert_banks.")
+}
+
 /// Loads V4 with resident, host-windowed, or dense disk-streamed layers.
 pub fn load_deepseek_v4_layerwise_model(
     model_dir: impl AsRef<Path>,
@@ -1326,6 +1369,101 @@ pub fn load_deepseek_v4_layerwise_model(
     })
 }
 
+/// Loads a canonical llama.cpp `deepseek4` GGUF through the generalized
+/// resident/layerwise/dense-stream and independent-expert-cache engine.
+pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    residency: crate::WeightResidency,
+    requested_quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
+    if requested_quantization.is_some() {
+        return Err(Error::Quantization(
+            "DeepSeek V4 GGUF already carries exact mixed per-operation encodings; load-time conversion is unsupported"
+                .into(),
+        ));
+    }
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::DeepSeek4,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )
+    .into_loader_result()?;
+    let prepared = super::model::prepare_gguf_checkpoint(checkpoint, metadata)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            super::model::translate_gguf_weight_name,
+            residency.max_mapped_shards(),
+        )?);
+    let mut execution = load_layerwise_model(
+        Arc::clone(&store),
+        if residency.expert_cache().is_some() {
+            DeepSeekV4LayerwiseAdapter::new_sparse(prepared.args.clone(), stream)?
+        } else {
+            DeepSeekV4LayerwiseAdapter::new(prepared.args.clone(), stream)?
+        },
+        residency.layers(),
+        stream,
+        weights_stream,
+    )?;
+    if let Some(options) = residency.expert_cache() {
+        let entries = expert_catalog(&prepared.args, store.as_ref())?;
+        execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?);
+    }
+    Ok((
+        DeepSeekV4LayerwiseModel { execution },
+        prepared.eos_token_ids,
+    ))
+}
+
+/// Loads a canonical `deepseek4` GGUF with TP composed with any layer residency.
+pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    options: LayerWeightResidency,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
+    let residency = options.weight_residency();
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::DeepSeek4,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )
+    .into_loader_result()?;
+    let prepared = super::model::prepare_gguf_checkpoint(checkpoint, metadata)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            super::model::translate_gguf_weight_name,
+            options.max_mapped_shards(),
+        )?);
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        DeepSeekV4LayerwiseAdapter::new(prepared.args, stream)?,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )?;
+    Ok((
+        DeepSeekV4LayerwiseModel { execution },
+        prepared.eos_token_ids,
+    ))
+}
+
 /// Loads V4 through the generalized tensor-parallel and residency engine.
 pub fn load_deepseek_v4_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
@@ -1336,6 +1474,22 @@ pub fn load_deepseek_v4_tensor_parallel_model(
 ) -> Result<DeepSeekV4LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        return load_deepseek_v4_gguf_tensor_parallel_model(
+            &checkpoint,
+            &metadata,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )
+        .map(|(model, _)| model);
+    }
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV4,
         model_dir,
@@ -1564,6 +1718,14 @@ fn grouped_output_recipe(
             format!("{root}.attn.wo_a.scale"),
             ((args.o_lora_rank + 127) / 128) as usize,
         ),
+        "scales" => (
+            format!("{root}.attn.wo_a.scales"),
+            args.o_lora_rank as usize,
+        ),
+        "biases" => (
+            format!("{root}.attn.wo_a.biases"),
+            args.o_lora_rank as usize,
+        ),
         other => {
             return Err(Error::UnsupportedArchitecture(format!(
                 "unsupported V4 grouped output component {other:?}"
@@ -1597,6 +1759,21 @@ fn expert_bank_recipe(
     let Some((gate_up, component)) = component else {
         return Ok(None);
     };
+    let bank = |projection: &str| format!("{root}.ffn.expert_banks.{projection}.{component}");
+    if store.metadata(&bank("w1")).is_ok() {
+        let source =
+            |projection: &str| DerivedWeightRecipe::source(bank(projection), TensorSelection::Full);
+        let recipe = if gate_up {
+            DerivedWeightRecipe::Concatenate {
+                axis: 1,
+                inputs: vec![source("w1"), source("w3")],
+            }
+        } else {
+            source("w2")
+        };
+        recipe.infer(store)?;
+        return Ok(Some(recipe));
+    }
     let source = |expert: i32, projection: &str| {
         DerivedWeightRecipe::source(
             format!("{root}.ffn.experts.{expert}.{projection}.{component}"),
@@ -1741,6 +1918,8 @@ pub(crate) fn expert_catalog(
     let mut entries = Vec::new();
     for layer in 0..args.num_hidden_layers as usize {
         let root = format!("layers.{layer}.ffn.experts");
+        let bank_root = format!("layers.{layer}.ffn.expert_banks");
+        let fused_banks = store.metadata(&format!("{bank_root}.w1.weight")).is_ok();
         for expert in 0..args.n_routed_experts as usize {
             let mut bindings = Vec::new();
             for (name, gate_up, component) in [
@@ -1749,28 +1928,53 @@ pub(crate) fn expert_catalog(
                 ("gate_up_proj_scales", true, "scale"),
                 ("down_proj_scales", false, "scale"),
             ] {
+                let scale_probe = if fused_banks {
+                    format!("{bank_root}.w1.scale")
+                } else {
+                    format!("{root}.{expert}.w1.scale")
+                };
                 if component == "scale"
                     && args.expert_dtype.as_deref().is_none()
-                    && store
-                        .metadata(&format!("{root}.{expert}.w1.scale"))
-                        .is_err()
+                    && store.metadata(&scale_probe).is_err()
                 {
                     continue;
                 }
                 let source = |projection: &str| {
                     DerivedWeightRecipe::source(
-                        format!("{root}.{expert}.{projection}.{component}"),
-                        TensorSelection::Full,
+                        if fused_banks {
+                            format!("{bank_root}.{projection}.{component}")
+                        } else {
+                            format!("{root}.{expert}.{projection}.{component}")
+                        },
+                        if fused_banks {
+                            TensorSelection::Range {
+                                axis: 0,
+                                start: expert,
+                                end: expert + 1,
+                            }
+                        } else {
+                            TensorSelection::Full
+                        },
                     )
                 };
                 let mut recipe = if gate_up {
-                    DerivedWeightRecipe::Stack {
-                        axis: 0,
-                        inputs: vec![DerivedWeightRecipe::Concatenate {
+                    let recipe = DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![source("w1"), source("w3")],
+                    };
+                    if fused_banks {
+                        recipe
+                    } else {
+                        DerivedWeightRecipe::Stack {
                             axis: 0,
-                            inputs: vec![source("w1"), source("w3")],
-                        }],
+                            inputs: vec![DerivedWeightRecipe::Concatenate {
+                                axis: 0,
+                                inputs: vec![source("w1"), source("w3")],
+                            }],
+                        }
                     }
+                } else if fused_banks {
+                    source("w2")
                 } else {
                     DerivedWeightRecipe::Stack {
                         axis: 0,

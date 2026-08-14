@@ -15,7 +15,7 @@ use safemlx::{
 };
 
 use crate::{
-    api::qwen3_5::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
+    api::qwen3_5::QwenLinear as Linear,
     nn::attention::indexed_sparse_attention,
     runtime::cache::{ConcatKeyValueCache, KeyValueCache, PoolingCache},
 };
@@ -122,20 +122,13 @@ pub(crate) struct GroupedOutput {
 }
 
 impl GroupedOutput {
-    fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    fn new(args: &ModelArgs, root: &str, stream: &Stream) -> Result<Self, Exception> {
         let input_dims = args.num_attention_heads * args.head_dim / args.o_groups;
+        let format = projection_format(args, &format!("{root}.weight"));
         Ok(Self {
             groups: args.o_groups,
             projections: (0..args.o_groups)
-                .map(|_| {
-                    Linear::new(
-                        input_dims,
-                        args.o_lora_rank,
-                        false,
-                        projection_format(args),
-                        stream,
-                    )
-                })
+                .map(|_| Linear::new(input_dims, args.o_lora_rank, false, format, stream))
                 .collect::<Result<_, _>>()?,
         })
     }
@@ -175,6 +168,7 @@ impl Compressor {
         args: &ModelArgs,
         ratio: i32,
         head_dim: i32,
+        root: &str,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let overlap = ratio == 4;
@@ -183,8 +177,20 @@ impl Compressor {
             ratio,
             head_dim,
             overlap,
-            wkv: Linear::new(args.hidden_size, output, false, WeightFormat::Dense, stream)?,
-            wgate: Linear::new(args.hidden_size, output, false, WeightFormat::Dense, stream)?,
+            wkv: Linear::new(
+                args.hidden_size,
+                output,
+                false,
+                projection_format(args, &format!("{root}.wkv.weight")),
+                stream,
+            )?,
+            wgate: Linear::new(
+                args.hidden_size,
+                output,
+                false,
+                projection_format(args, &format!("{root}.wgate.weight")),
+                stream,
+            )?,
             ape: Param::unloaded(&[ratio, output], Dtype::Float32, stream)?,
             norm: rms_norm(head_dim, args.rms_norm_eps, stream)?,
             rope: V4Rope::new(args, args.compress_rope_theta, true, ratio)?,
@@ -401,7 +407,7 @@ pub(crate) struct Indexer {
 }
 
 impl Indexer {
-    fn new(args: &ModelArgs, ratio: i32, stream: &Stream) -> Result<Self, Exception> {
+    fn new(args: &ModelArgs, ratio: i32, root: &str, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             heads: args.index_n_heads,
             head_dim: args.index_head_dim,
@@ -410,17 +416,23 @@ impl Indexer {
                 args.q_lora_rank,
                 args.index_n_heads * args.index_head_dim,
                 false,
-                projection_format(args),
+                projection_format(args, &format!("{root}.wq_b.weight")),
                 stream,
             )?,
             weights_proj: Linear::new(
                 args.hidden_size,
                 args.index_n_heads,
                 false,
-                WeightFormat::Dense,
+                projection_format(args, &format!("{root}.weights_proj.weight")),
                 stream,
             )?,
-            compressor: Compressor::new(args, ratio, args.index_head_dim, stream)?,
+            compressor: Compressor::new(
+                args,
+                ratio,
+                args.index_head_dim,
+                &format!("{root}.compressor"),
+                stream,
+            )?,
         })
     }
 
@@ -518,6 +530,7 @@ impl Attention {
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let ratio = args.compress_ratios[layer_index];
+        let root = format!("layers.{layer_index}.attn");
         Ok(Self {
             ratio,
             heads: args.num_attention_heads,
@@ -530,7 +543,7 @@ impl Attention {
                 args.hidden_size,
                 args.q_lora_rank,
                 false,
-                projection_format(args),
+                projection_format(args, &format!("{root}.wq_a.weight")),
                 stream,
             )?,
             q_norm: rms_norm(args.q_lora_rank, args.rms_norm_eps, stream)?,
@@ -538,33 +551,44 @@ impl Attention {
                 args.q_lora_rank,
                 args.num_attention_heads * args.head_dim,
                 false,
-                projection_format(args),
+                projection_format(args, &format!("{root}.wq_b.weight")),
                 stream,
             )?,
             wkv: Linear::new(
                 args.hidden_size,
                 args.head_dim,
                 false,
-                projection_format(args),
+                projection_format(args, &format!("{root}.wkv.weight")),
                 stream,
             )?,
             kv_norm: rms_norm(args.head_dim, args.rms_norm_eps, stream)?,
-            wo_a: GroupedOutput::new(args, stream)?,
+            wo_a: GroupedOutput::new(args, &format!("{root}.wo_a"), stream)?,
             wo_b: Linear::new(
                 args.o_groups * args.o_lora_rank,
                 args.hidden_size,
                 false,
-                projection_format(args),
+                projection_format(args, &format!("{root}.wo_b.weight")),
                 stream,
             )?,
             attn_sink: Param::unloaded(&[args.num_attention_heads], Dtype::Float32, stream)?,
             compressor: if ratio == 0 {
                 None
             } else {
-                Some(Compressor::new(args, ratio, args.head_dim, stream)?)
+                Some(Compressor::new(
+                    args,
+                    ratio,
+                    args.head_dim,
+                    &format!("{root}.compressor"),
+                    stream,
+                )?)
             },
             indexer: if ratio == 4 {
-                Some(Indexer::new(args, ratio, stream)?)
+                Some(Indexer::new(
+                    args,
+                    ratio,
+                    &format!("{root}.indexer"),
+                    stream,
+                )?)
             } else {
                 None
             },
@@ -598,7 +622,7 @@ impl Attention {
             args.q_lora_rank,
             local_heads * args.head_dim,
             false,
-            projection_format(args),
+            projection_format(args, &format!("layers.{layer_index}.attn.wq_b.weight")),
             stream,
         )?;
         attention.attn_sink = Param::unloaded(&[local_heads], Dtype::Float32, stream)?;

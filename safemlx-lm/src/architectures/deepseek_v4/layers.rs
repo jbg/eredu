@@ -16,12 +16,8 @@ use crate::{
 
 use super::model::ModelArgs;
 
-pub(crate) fn projection_format(args: &ModelArgs) -> WeightFormat {
-    if args.quantization_config.is_some() {
-        WeightFormat::Fp8E8M0
-    } else {
-        WeightFormat::Dense
-    }
+pub(crate) fn projection_format(args: &ModelArgs, weight_name: &str) -> WeightFormat {
+    args.weight_format_for(weight_name)
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -40,13 +36,31 @@ impl Mlp {
         args: &ModelArgs,
         intermediate_size: i32,
         limited: bool,
+        root: &str,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let format = projection_format(args);
         Ok(Self {
-            gate_proj: Linear::new(args.hidden_size, intermediate_size, false, format, stream)?,
-            up_proj: Linear::new(args.hidden_size, intermediate_size, false, format, stream)?,
-            down_proj: Linear::new(intermediate_size, args.hidden_size, false, format, stream)?,
+            gate_proj: Linear::new(
+                args.hidden_size,
+                intermediate_size,
+                false,
+                projection_format(args, &format!("{root}.w1.weight")),
+                stream,
+            )?,
+            up_proj: Linear::new(
+                args.hidden_size,
+                intermediate_size,
+                false,
+                projection_format(args, &format!("{root}.w3.weight")),
+                stream,
+            )?,
+            down_proj: Linear::new(
+                intermediate_size,
+                args.hidden_size,
+                false,
+                projection_format(args, &format!("{root}.w2.weight")),
+                stream,
+            )?,
             swiglu_limit: if limited { args.swiglu_limit } else { 0.0 },
         })
     }
@@ -166,6 +180,7 @@ impl Moe {
                 args,
                 args.moe_intermediate_size * args.n_shared_experts,
                 false,
+                &format!("layers.{layer_index}.ffn.shared_experts"),
                 stream,
             )?,
         })

@@ -4,7 +4,7 @@
 //! than individual repository names.  Flash, Pro, Base, Instruct, MTP, and
 //! fused DSpark checkpoints therefore share one validation path.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -14,7 +14,10 @@ use safemlx::{
     macros::ModuleParameters,
     module::{Module, ModuleParametersExt},
     nn,
-    ops::{broadcast_to, concatenate_axis, indexing::NewAxis, indexing::TryIndexOp, mean_axis},
+    ops::{
+        broadcast_to, concatenate_axis, indexing::NewAxis, indexing::TryIndexOp, mean_axis,
+        GgufCheckpoint, GgufMetadataArray, GgufMetadataValue,
+    },
     Array, Dtype, Stream,
 };
 
@@ -31,9 +34,11 @@ use crate::{
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::residency::{derive_prompt_cache_architecture_fingerprint, LayerCachePolicy},
     runtime::checkpoint::load::{
+        gguf_quantization_configs,
         load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadConfig,
         StrictLoadReport,
     },
+    runtime::checkpoint::quantization::WeightQuantization,
 };
 
 use super::{
@@ -189,6 +194,8 @@ pub struct ModelArgs {
     pub num_nextn_predict_layers: i32,
     pub expert_dtype: Option<String>,
     pub quantization_config: Option<Fp8QuantizationConfig>,
+    /// Exact per-weight formats reconstructed from a mixed GGUF catalog.
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
     pub tie_word_embeddings: bool,
     pub dspark: Option<DsparkConfig>,
 }
@@ -281,6 +288,23 @@ impl ModelArgs {
     /// Whether this checkpoint contains a fused DSpark drafter.
     pub const fn has_dspark(&self) -> bool {
         self.dspark.is_some()
+    }
+
+    pub(crate) fn weight_format_for(&self, weight_name: &str) -> WeightFormat {
+        if self.quantization_config.is_some() {
+            WeightFormat::Fp8E8M0
+        } else if let Some(format) = self
+            .quantized_weight_configs
+            .as_ref()
+            .and_then(|formats| formats.get(weight_name))
+        {
+            match *format {
+                iq @ WeightQuantization::GgufIQuant { .. } => WeightFormat::IQuant(iq),
+                affine => WeightFormat::Affine(affine),
+            }
+        } else {
+            WeightFormat::Dense
+        }
     }
 
     pub(crate) fn validate(&self) -> Result<(), Error> {
@@ -408,6 +432,11 @@ impl ModelArgs {
                 )));
             }
         }
+        if self.quantization_config.is_some() && self.quantized_weight_configs.is_some() {
+            return Err(unsupported(
+                "native FP8 metadata cannot be combined with GGUF per-weight formats",
+            ));
+        }
         if self
             .expert_dtype
             .as_deref()
@@ -514,6 +543,7 @@ impl ModelArgsSource {
             num_nextn_predict_layers: self.num_nextn_predict_layers,
             expert_dtype: self.expert_dtype,
             quantization_config: self.quantization_config,
+            quantized_weight_configs: None,
             tie_word_embeddings: self.tie_word_embeddings,
             dspark,
         };
@@ -853,11 +883,23 @@ struct MtpLayer {
 
 impl MtpLayer {
     fn new(args: &ModelArgs, depth: usize, stream: &Stream) -> Result<Self, Exception> {
-        let format = super::layers::projection_format(args);
         let layer = args.num_hidden_layers as usize + depth;
+        let root = format!("mtp.{depth}");
         Ok(Self {
-            e_proj: Linear::new(args.hidden_size, args.hidden_size, false, format, stream)?,
-            h_proj: Linear::new(args.hidden_size, args.hidden_size, false, format, stream)?,
+            e_proj: Linear::new(
+                args.hidden_size,
+                args.hidden_size,
+                false,
+                super::layers::projection_format(args, &format!("{root}.e_proj.weight")),
+                stream,
+            )?,
+            h_proj: Linear::new(
+                args.hidden_size,
+                args.hidden_size,
+                false,
+                super::layers::projection_format(args, &format!("{root}.h_proj.weight")),
+                stream,
+            )?,
             enorm: rms_norm(args.hidden_size, args.rms_norm_eps, stream)?,
             hnorm: rms_norm(args.hidden_size, args.rms_norm_eps, stream)?,
             decoder: DecoderLayer::new(args, layer, stream)?,
@@ -950,7 +992,6 @@ impl DsparkModule {
                 "DSpark requires at least one draft stage",
             ));
         }
-        let format = super::layers::projection_format(args);
         Ok(Some(Self {
             layers: (0..count)
                 .map(|depth| {
@@ -961,7 +1002,7 @@ impl DsparkModule {
                 args.hidden_size * config.target_layer_ids.len() as i32,
                 args.hidden_size,
                 false,
-                format,
+                super::layers::projection_format(args, "mtp.0.main_proj.weight"),
                 stream,
             )?,
             main_norm: rms_norm(args.hidden_size, args.rms_norm_eps, stream)?,
@@ -983,14 +1024,20 @@ impl DsparkModule {
                 config.markov_rank,
                 args.vocab_size,
                 false,
-                WeightFormat::Dense,
+                super::layers::projection_format(
+                    args,
+                    &format!("mtp.{}.markov_head.markov_w2.weight", count - 1),
+                ),
                 stream,
             )?,
             confidence_head: Linear::new(
                 args.hidden_size + config.markov_rank,
                 1,
                 false,
-                WeightFormat::Dense,
+                super::layers::projection_format(
+                    args,
+                    &format!("mtp.{}.confidence_head.proj.weight", count - 1),
+                ),
                 stream,
             )?,
             sliding_window: args.sliding_window,
@@ -1096,11 +1143,7 @@ impl Model {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         args.validate()
             .map_err(|error| Exception::custom(error.to_string()))?;
-        let head_format = if args.quantization_config.is_some() {
-            WeightFormat::Fp8E8M0
-        } else {
-            WeightFormat::Dense
-        };
+        let head_format = args.weight_format_for("head.weight");
         Ok(Self {
             model: TextModel::new(&args, stream)?,
             lm_head: Linear::new(
@@ -1238,6 +1281,17 @@ impl Model {
 
 /// Stable identity for all cache-relevant V4 geometry.
 pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    let mut quantized_weight_configs = args
+        .quantized_weight_configs
+        .as_ref()
+        .map(|configs| {
+            configs
+                .iter()
+                .map(|(name, config)| format!("{name}={config:?}"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    quantized_weight_configs.sort_unstable();
     derive_prompt_cache_architecture_fingerprint(
         "deepseek_v4",
         [
@@ -1254,6 +1308,14 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
             ("index_head_dim", args.index_head_dim.to_string()),
             ("index_topk", args.index_topk.to_string()),
             ("hc_mult", args.hc_mult.to_string()),
+            (
+                "native_quantization",
+                format!("{:?}", args.quantization_config),
+            ),
+            (
+                "quantized_weight_configs",
+                quantized_weight_configs.join(";"),
+            ),
         ],
     )
 }
@@ -1263,6 +1325,379 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let value: Value =
         serde_json::from_slice(&std::fs::read(model_dir.as_ref().join("config.json"))?)?;
     ModelArgs::from_value(value)
+}
+
+pub(crate) struct PreparedDeepSeekV4Gguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+/// Parses the canonical llama.cpp `deepseek4` metadata and logical catalog.
+pub(crate) fn model_args_from_gguf_catalog(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> Result<ModelArgs, Error> {
+    let architecture = gguf_string(metadata, "general.architecture")?;
+    if architecture != "deepseek4" {
+        return Err(unsupported(format!(
+            "GGUF architecture is {architecture:?}, expected \"deepseek4\""
+        )));
+    }
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+
+    let key = |suffix: &str| format!("deepseek4.{suffix}");
+    let total_layers = gguf_i32(metadata, &key("block_count"))?;
+    let nextn = gguf_optional_i64(metadata, &key("nextn_predict_layers"))?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| unsupported("GGUF nextn_predict_layers exceeds i32"))?
+        .unwrap_or(0);
+    let main_layers = total_layers
+        .checked_sub(nextn)
+        .ok_or_else(|| unsupported("GGUF NextN count exceeds block_count"))?;
+    let ratios = gguf_i32_array(metadata, &key("attention.compress_ratios"))?;
+    let swiglu_exp = gguf_uniform_f32_array(metadata, &key("swiglu_clamp_exp"), total_layers)?;
+    let swiglu_shared = gguf_uniform_f32_array(metadata, &key("swiglu_clamp_shexp"), total_layers)?;
+    if swiglu_exp.to_bits() != swiglu_shared.to_bits() {
+        return Err(unsupported(format!(
+            "GGUF routed/shared SwiGLU clamps disagree: {swiglu_exp} versus {swiglu_shared}"
+        )));
+    }
+    let gating = gguf_i32(metadata, &key("expert_gating_func"))?;
+    if gating != 3 {
+        return Err(unsupported(format!(
+            "GGUF expert_gating_func {gating} is not sqrtsoftplus (3)"
+        )));
+    }
+    let vocab_size = match metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        Some(tokens) => i32::try_from(tokens.len())
+            .map_err(|_| unsupported("GGUF tokenizer vocabulary exceeds i32"))?,
+        None if metadata.contains_key("tokenizer.ggml.tokens") => {
+            return Err(unsupported(
+                "GGUF tokenizer.ggml.tokens metadata has the wrong type",
+            ))
+        }
+        None => gguf_i32(metadata, &key("vocab_size"))?,
+    };
+    let rope_scaling = match gguf_optional_string(metadata, &key("rope.scaling.type"))? {
+        None => None,
+        Some(scaling) if scaling == "none" || scaling == "default" => None,
+        Some(scaling) if scaling == "yarn" => Some(YarnConfig {
+            r#type: "yarn".into(),
+            factor: gguf_f32(metadata, &key("rope.scaling.factor"))?,
+            original_max_position_embeddings: gguf_i32(
+                metadata,
+                &key("rope.scaling.original_context_length"),
+            )?,
+            beta_fast: gguf_optional_f32(metadata, &key("rope.scaling.yarn_beta_fast"))?
+                .unwrap_or_else(default_beta_fast),
+            beta_slow: gguf_optional_f32(metadata, &key("rope.scaling.yarn_beta_slow"))?
+                .unwrap_or_else(default_beta_slow),
+        }),
+        Some(scaling) => {
+            return Err(unsupported(format!(
+                "GGUF RoPE scaling {scaling:?} is unsupported"
+            )))
+        }
+    };
+
+    let hidden_size = gguf_i32(metadata, &key("embedding_length"))?;
+    let hc_mult = gguf_i32(metadata, &key("hyper_connection.count"))?;
+    let embedding_length_out = gguf_i32(metadata, &key("embedding_length_out"))?;
+    if embedding_length_out != hidden_size * hc_mult {
+        return Err(unsupported(format!(
+            "GGUF embedding_length_out {embedding_length_out} does not equal hidden_size * hyper_connection.count ({})",
+            hidden_size * hc_mult
+        )));
+    }
+    let mut args = ModelArgsSource {
+        model_type: "deepseek_v4".into(),
+        hidden_size,
+        moe_intermediate_size: gguf_i32(metadata, &key("expert_feed_forward_length"))?,
+        num_hidden_layers: main_layers,
+        num_attention_heads: gguf_i32(metadata, &key("attention.head_count"))?,
+        num_key_value_heads: gguf_optional_i64(metadata, &key("attention.head_count_kv"))?
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| unsupported("GGUF key/value head count exceeds i32"))?
+            .unwrap_or(1),
+        head_dim: gguf_i32(metadata, &key("attention.key_length"))?,
+        qk_rope_head_dim: gguf_i32(metadata, &key("rope.dimension_count"))?,
+        q_lora_rank: gguf_i32(metadata, &key("attention.q_lora_rank"))?,
+        o_lora_rank: gguf_i32(metadata, &key("attention.output_lora_rank"))?,
+        o_groups: gguf_i32(metadata, &key("attention.output_group_count"))?,
+        vocab_size,
+        rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
+        max_position_embeddings: gguf_i32(metadata, &key("context_length"))?,
+        rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?
+            .unwrap_or_else(default_rope_theta),
+        compress_rope_theta: gguf_f32(metadata, &key("attention.compress_rope_freq_base"))?,
+        rope_scaling,
+        sliding_window: gguf_i32(metadata, &key("attention.sliding_window"))?,
+        compress_ratios: ratios,
+        index_n_heads: gguf_i32(metadata, &key("attention.indexer.head_count"))?,
+        index_head_dim: gguf_i32(metadata, &key("attention.indexer.key_length"))?,
+        index_topk: gguf_i32(metadata, &key("attention.indexer.top_k"))?,
+        hc_mult,
+        hc_sinkhorn_iters: gguf_i32(metadata, &key("hyper_connection.sinkhorn_iterations"))?,
+        hc_eps: gguf_f32(metadata, &key("hyper_connection.epsilon"))?,
+        n_routed_experts: gguf_i32(metadata, &key("expert_count"))?,
+        n_shared_experts: gguf_i32(metadata, &key("expert_shared_count"))?,
+        num_experts_per_tok: gguf_i32(metadata, &key("expert_used_count"))?,
+        num_hash_layers: gguf_i32(metadata, &key("hash_layer_count"))?,
+        scoring_func: "sqrtsoftplus".into(),
+        topk_method: "noaux_tc".into(),
+        norm_topk_prob: gguf_bool(metadata, &key("expert_weights_norm"))?,
+        routed_scaling_factor: gguf_f32(metadata, &key("expert_weights_scale"))?,
+        swiglu_limit: swiglu_exp,
+        num_nextn_predict_layers: nextn,
+        expert_dtype: Some("fp4".into()),
+        quantization_config: None,
+        tie_word_embeddings: false,
+        dspark_block_size: None,
+        dspark_noise_token_id: None,
+        dspark_target_layer_ids: None,
+        dspark_markov_rank: None,
+    }
+    .normalize()?;
+    args.quantized_weight_configs = Some(gguf_quantization_configs(
+        checkpoint,
+        translate_gguf_weight_name,
+    )?);
+    args.validate()?;
+    Ok(args)
+}
+
+pub(crate) fn prepare_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> Result<PreparedDeepSeekV4Gguf, Error> {
+    Ok(PreparedDeepSeekV4Gguf {
+        args: model_args_from_gguf_catalog(checkpoint, metadata)?,
+        eos_token_ids: crate::api::gguf_eos_token_ids(metadata)?,
+    })
+}
+
+/// Canonical llama.cpp tensor names translated to the native V4 source contract.
+pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
+    for (source, target, strip_weight) in [
+        ("token_embd", "embed", false),
+        ("output_norm", "norm", false),
+        ("output", "head", false),
+        ("output_hc_fn", "hc_head_fn", true),
+        ("output_hc_base", "hc_head_base", true),
+        ("output_hc_scale", "hc_head_scale", true),
+    ] {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            let mut translated = name.replacen(source, target, 1);
+            if strip_weight && translated.ends_with(".weight") {
+                translated.truncate(translated.len() - ".weight".len());
+            }
+            return translated;
+        }
+    }
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_string();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+    let root = format!("layers.{layer}");
+    for (source, target, strip_weight) in [
+        ("attn_norm", "attn_norm", false),
+        ("attn_sinks", "attn.attn_sink", true),
+        ("attn_q_a", "attn.wq_a", false),
+        ("attn_q_a_norm", "attn.q_norm", false),
+        ("attn_q_b", "attn.wq_b", false),
+        ("attn_kv", "attn.wkv", false),
+        ("attn_kv_a_norm", "attn.kv_norm", false),
+        ("attn_output_a", "attn.wo_a", false),
+        ("attn_output_b", "attn.wo_b", false),
+        ("hc_attn_fn", "hc_attn_fn", true),
+        ("hc_attn_base", "hc_attn_base", true),
+        ("hc_attn_scale", "hc_attn_scale", true),
+        ("hc_ffn_fn", "hc_ffn_fn", true),
+        ("hc_ffn_base", "hc_ffn_base", true),
+        ("hc_ffn_scale", "hc_ffn_scale", true),
+        ("attn_compressor_kv", "attn.compressor.wkv", false),
+        ("attn_compressor_gate", "attn.compressor.wgate", false),
+        ("attn_compressor_ape", "attn.compressor.ape", true),
+        ("attn_compressor_norm", "attn.compressor.norm", false),
+        ("indexer.proj", "attn.indexer.weights_proj", false),
+        ("indexer.attn_q_b", "attn.indexer.wq_b", false),
+        (
+            "indexer_compressor_kv",
+            "attn.indexer.compressor.wkv",
+            false,
+        ),
+        (
+            "indexer_compressor_gate",
+            "attn.indexer.compressor.wgate",
+            false,
+        ),
+        (
+            "indexer_compressor_ape",
+            "attn.indexer.compressor.ape",
+            true,
+        ),
+        (
+            "indexer_compressor_norm",
+            "attn.indexer.compressor.norm",
+            false,
+        ),
+        ("ffn_norm", "ffn_norm", false),
+        ("ffn_gate_inp", "ffn.gate", false),
+        ("exp_probs_b", "ffn.gate", false),
+        ("ffn_gate_tid2eid", "ffn.gate.tid2eid", true),
+        ("ffn_gate_shexp", "ffn.shared_experts.w1", false),
+        ("ffn_down_shexp", "ffn.shared_experts.w2", false),
+        ("ffn_up_shexp", "ffn.shared_experts.w3", false),
+        ("ffn_gate_exps", "ffn.expert_banks.w1", false),
+        ("ffn_down_exps", "ffn.expert_banks.w2", false),
+        ("ffn_up_exps", "ffn.expert_banks.w3", false),
+    ] {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            let mut translated = format!("{root}.{}", parameter.replacen(source, target, 1));
+            if target.contains("expert_banks") && translated.ends_with(".scales") {
+                translated.truncate(translated.len() - ".scales".len());
+                translated.push_str(".scale");
+            }
+            if strip_weight && translated.ends_with(".weight") {
+                translated.truncate(translated.len() - ".weight".len());
+            }
+            return translated;
+        }
+    }
+    name.to_string()
+}
+
+fn gguf_string(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<String, Error> {
+    gguf_optional_string(metadata, key)?
+        .ok_or_else(|| unsupported(format!("GGUF metadata is missing required key {key:?}")))
+}
+
+fn gguf_optional_string(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<String>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(unsupported(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_i32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<i32, Error> {
+    let value = gguf_optional_i64(metadata, key)?
+        .ok_or_else(|| unsupported(format!("GGUF metadata is missing required key {key:?}")))?;
+    i32::try_from(value).map_err(|_| unsupported(format!("GGUF value {key:?} exceeds i32")))
+}
+
+fn gguf_optional_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<i64>, Error> {
+    match metadata.get(key) {
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| unsupported(format!("GGUF metadata key {key:?} has the wrong type"))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_f32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key)?
+        .ok_or_else(|| unsupported(format!("GGUF metadata is missing required key {key:?}")))
+}
+
+fn gguf_optional_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<f32>, Error> {
+    match metadata.get(key) {
+        Some(value) => value
+            .as_f32()
+            .map(Some)
+            .ok_or_else(|| unsupported(format!("GGUF metadata key {key:?} has the wrong type"))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_bool(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<bool, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Bool(value)) => Ok(*value),
+        Some(value) => value
+            .as_i64()
+            .map(|value| value != 0)
+            .ok_or_else(|| unsupported(format!("GGUF metadata key {key:?} has the wrong type"))),
+        None => Err(unsupported(format!(
+            "GGUF metadata is missing required key {key:?}"
+        ))),
+    }
+}
+
+fn gguf_i32_array(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Vec<i32>, Error> {
+    let values = metadata
+        .get(key)
+        .and_then(GgufMetadataValue::to_i64_vec)
+        .ok_or_else(|| {
+            unsupported(format!(
+                "GGUF metadata key {key:?} must be an integer array"
+            ))
+        })?;
+    values
+        .into_iter()
+        .map(|value| {
+            i32::try_from(value)
+                .map_err(|_| unsupported(format!("GGUF array value {key:?} exceeds i32")))
+        })
+        .collect()
+}
+
+fn gguf_uniform_f32_array(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    expected: i32,
+) -> Result<f32, Error> {
+    let values = match metadata.get(key) {
+        Some(GgufMetadataValue::Array(GgufMetadataArray::Float32(values))) => values.clone(),
+        Some(GgufMetadataValue::Array(GgufMetadataArray::Float64(values))) => {
+            values.iter().map(|value| *value as f32).collect()
+        }
+        _ => {
+            return Err(unsupported(format!(
+                "GGUF metadata key {key:?} must be a float array"
+            )))
+        }
+    };
+    if values.len() != expected as usize || values.is_empty() {
+        return Err(unsupported(format!(
+            "GGUF metadata key {key:?} has {} values, expected {expected}",
+            values.len()
+        )));
+    }
+    let first = values[0];
+    if values
+        .iter()
+        .any(|value| value.to_bits() != first.to_bits())
+    {
+        return Err(unsupported(format!(
+            "GGUF metadata key {key:?} must be uniform"
+        )));
+    }
+    Ok(first)
 }
 
 /// Loads an official dense or mixed FP4/FP8 V4 SafeTensors checkpoint.

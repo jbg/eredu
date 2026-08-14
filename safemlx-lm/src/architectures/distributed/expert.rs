@@ -4479,6 +4479,7 @@ fn load_gguf_ep(
             architecture,
             "kimi-linear"
                 | "deepseek2"
+                | "deepseek4"
                 | "inkling"
                 | "qwen3moe"
                 | "qwen3vlmoe"
@@ -4497,6 +4498,19 @@ fn load_gguf_ep(
         )));
     }
     crate::api::validate_gguf_quantization_source(checkpoint, &metadata, options.quantization)?;
+    if architecture == "deepseek4" {
+        let mut structural_options = options;
+        structural_options.parallel = None;
+        structural_options.weight_residency =
+            crate::runtime::execution::layerwise::WeightResidency::fully_resident();
+        crate::api::structural::validate_gguf(
+            crate::api::GgufArchitecture::DeepSeek4,
+            checkpoint,
+            &metadata,
+            structural_options,
+        )
+        .into_loader_result()?;
+    }
     let inkling_mmproj = if architecture == "inkling" {
         inkling::open_sibling_mmproj(gguf_file)?
     } else {
@@ -4536,7 +4550,9 @@ fn load_gguf_ep(
                 .into(),
         ));
     }
-    if topology.tensor_parallel_size > 1 || matches!(architecture, "qwen3vlmoe" | "gemma4") {
+    if topology.tensor_parallel_size > 1
+        || matches!(architecture, "deepseek4" | "qwen3vlmoe" | "gemma4")
+    {
         reject_external_gguf_ep_quantization(options.quantization)?;
         return load_external_gguf_ep(
             architecture,
@@ -4726,6 +4742,59 @@ fn load_external_gguf_ep(
                 ModelKind::KimiLinear,
                 assignment,
                 ExpertArchitecture::KimiLinearLayerwise(Box::new(model)),
+                store,
+                entries,
+                expert_residency,
+                replicated_parameter_bytes,
+                stream,
+                weights_stream,
+            )
+        }
+        "deepseek4" => {
+            let prepared = deepseek_v4::prepare_gguf_checkpoint(checkpoint, metadata)?;
+            let args = prepared.args;
+            let assignment = resolve_model_assignment(
+                assignment,
+                args.n_routed_experts as usize,
+                topology,
+            )?;
+            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                    checkpoint.clone(),
+                    deepseek_v4::translate_gguf_weight_name,
+                    max_mapped_shards,
+                )?);
+            let model = if topology.tensor_parallel_size > 1 {
+                crate::architectures::deepseek_v4::layerwise::
+                    load_deepseek_v4_sparse_tp_ep_base_with_store(
+                        store.clone(),
+                        args.clone(),
+                        non_expert,
+                        ParallelBuildContext::new(topology, ShardingPolicy::Require),
+                        stream,
+                        weights_stream,
+                    )?
+            } else {
+                crate::architectures::deepseek_v4::layerwise::
+                    load_deepseek_v4_sparse_ep_base_with_store(
+                        store.clone(),
+                        args.clone(),
+                        non_expert,
+                        stream,
+                        weights_stream,
+                    )?
+            };
+            let entries = crate::architectures::deepseek_v4::layerwise::expert_catalog(
+                &args,
+                store.as_ref(),
+            )?;
+            let replicated_parameter_bytes =
+                planned_replicated_bytes(&model.residency_report()?)?;
+            finish_external_ep(
+                topology,
+                ModelKind::DeepSeekV4,
+                assignment,
+                ExpertArchitecture::DeepSeekV4Layerwise(Box::new(model)),
                 store,
                 entries,
                 expert_residency,
@@ -5493,7 +5562,7 @@ fn load_deepseek_v4_external_ep(
 ) -> Result<ExpertParallelModel, Error> {
     if options.quantization.is_some() {
         return Err(Error::Quantization(
-            "DeepSeek V4 distributed load-time conversion is not initialized; use checkpoint-native FP4/FP8 weights"
+            "DeepSeek V4 distributed load-time conversion is not initialized; use checkpoint-native mixed weights"
                 .into(),
         ));
     }
