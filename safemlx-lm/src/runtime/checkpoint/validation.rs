@@ -24,6 +24,7 @@ struct PhysicalMetadata<E> {
 
 trait Constraint<E> {
     fn key(&self) -> &str;
+    fn aliases(&self) -> &[String];
     fn shape(&self) -> &[usize];
     fn requirement(&self) -> TensorRequirement;
     fn role(&self) -> TensorRole;
@@ -38,6 +39,9 @@ trait Constraint<E> {
 impl Constraint<StoredDtype> for SafetensorsTensorConstraint {
     fn key(&self) -> &str {
         &self.key
+    }
+    fn aliases(&self) -> &[String] {
+        &self.aliases
     }
     fn shape(&self) -> &[usize] {
         &self.shape
@@ -70,6 +74,9 @@ impl Constraint<StoredDtype> for SafetensorsTensorConstraint {
 impl Constraint<GgufType> for GgufTensorConstraint {
     fn key(&self) -> &str {
         &self.key
+    }
+    fn aliases(&self) -> &[String] {
+        &self.aliases
     }
     fn shape(&self) -> &[usize] {
         &self.shape
@@ -185,7 +192,7 @@ where
     let mut issues = Vec::new();
     let mut accounted = BTreeSet::new();
     for constraint in common {
-        accounted.insert(constraint.key().to_string());
+        account_constraint(&mut accounted, constraint);
         validate_constraint(catalog, identity, constraint, &mut issues);
     }
 
@@ -196,7 +203,7 @@ where
             let count = variant
                 .discriminator_keys
                 .iter()
-                .filter(|key| catalog.contains_key(*key))
+                .filter(|key| discriminator_present(catalog, variant, key))
                 .count();
             if count == variant.discriminator_keys.len() {
                 present.push(variant);
@@ -218,7 +225,7 @@ where
                 tensor_name: variant
                     .discriminator_keys
                     .iter()
-                    .find(|key| !catalog.contains_key(*key))
+                    .find(|key| !discriminator_present(catalog, variant, key))
                     .cloned(),
                 tensor_type_code: None,
                 metadata_key: None,
@@ -264,14 +271,14 @@ where
 
         for variant in present {
             for constraint in &variant.tensors {
-                accounted.insert(constraint.key().to_string());
+                account_constraint(&mut accounted, constraint);
                 validate_constraint(catalog, identity, constraint, &mut issues);
             }
         }
         for (variant, _) in partial {
             for constraint in &variant.tensors {
-                if catalog.contains_key(constraint.key()) {
-                    accounted.insert(constraint.key().to_string());
+                if constraint_present(catalog, constraint) {
+                    account_constraint(&mut accounted, constraint);
                 }
                 validate_constraint(catalog, identity, constraint, &mut issues);
             }
@@ -301,13 +308,60 @@ where
     issues
 }
 
+fn constraint_present<E, T: Constraint<E>>(
+    catalog: &BTreeMap<String, PhysicalMetadata<E>>,
+    constraint: &T,
+) -> bool {
+    std::iter::once(constraint.key())
+        .chain(constraint.aliases().iter().map(String::as_str))
+        .any(|key| catalog.contains_key(key))
+}
+
+fn discriminator_present<E, T: Constraint<E>>(
+    catalog: &BTreeMap<String, PhysicalMetadata<E>>,
+    variant: &super::schema::LayoutVariant<T>,
+    key: &str,
+) -> bool {
+    variant
+        .tensors
+        .iter()
+        .find(|constraint| constraint.key() == key)
+        .map_or_else(
+            || catalog.contains_key(key),
+            |constraint| constraint_present(catalog, constraint),
+        )
+}
+
+fn account_constraint<E, T: Constraint<E>>(accounted: &mut BTreeSet<String>, constraint: &T) {
+    accounted.insert(constraint.key().to_string());
+    accounted.extend(constraint.aliases().iter().cloned());
+}
+
 fn validate_constraint<E: std::fmt::Debug, T: Constraint<E>>(
     catalog: &BTreeMap<String, PhysicalMetadata<E>>,
     identity: &str,
     constraint: &T,
     issues: &mut Vec<CheckpointIssue>,
 ) {
-    let Some(actual) = catalog.get(constraint.key()) else {
+    let present = std::iter::once(constraint.key())
+        .chain(constraint.aliases().iter().map(String::as_str))
+        .filter_map(|key| catalog.get(key).map(|metadata| (key, metadata)))
+        .collect::<Vec<_>>();
+    if present.len() > 1 {
+        issues.push(CheckpointIssue {
+            kind: CheckpointIssueKind::ConflictingLayout,
+            detail: format!(
+                "checkpoint plan {identity:?} contains multiple physical aliases for logical tensor {:?}: {:?}",
+                constraint.key(),
+                present.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+            ),
+            tensor_name: present.get(1).map(|(key, _)| (*key).to_string()),
+            tensor_type_code: None,
+            metadata_key: None,
+        });
+        return;
+    }
+    let Some((actual_key, actual)) = present.first().copied() else {
         if constraint.requirement() == TensorRequirement::Required {
             if constraint.role() == TensorRole::Companion {
                 issues.push(companion_issue(
@@ -328,10 +382,10 @@ fn validate_constraint<E: std::fmt::Debug, T: Constraint<E>>(
         && (actual.shape != constraint.shape() || !constraint.accepts(&actual.encoding))
     {
         issues.push(companion_issue(
-            constraint.key(),
+            actual_key,
             format!(
                 "companion tensor {:?} expected shape {:?} and {}, got {:?} {:?}",
-                constraint.key(),
+                actual_key,
                 constraint.shape(),
                 constraint.encoding_detail(),
                 actual.shape,
@@ -343,7 +397,7 @@ fn validate_constraint<E: std::fmt::Debug, T: Constraint<E>>(
 
     if actual.shape != constraint.shape() {
         issues.push(shape_mismatch(
-            constraint.key(),
+            actual_key,
             constraint.shape(),
             &actual.shape,
         ));
@@ -352,7 +406,7 @@ fn validate_constraint<E: std::fmt::Debug, T: Constraint<E>>(
         issues.push(CheckpointIssue {
             kind: CheckpointIssueKind::UnsupportedEncoding,
             detail: constraint.unsupported_detail(identity, &actual.encoding),
-            tensor_name: Some(constraint.key().into()),
+            tensor_name: Some(actual_key.into()),
             tensor_type_code: constraint.type_code(&actual.encoding),
             metadata_key: None,
         });
@@ -506,6 +560,44 @@ mod tests {
             &plan.catalog_policy,
         );
         assert_eq!(issues[0].kind, CheckpointIssueKind::CompanionMismatch);
+    }
+
+    #[test]
+    fn physical_aliases_are_selected_once_and_accounted_by_strict_catalogs() {
+        let plan = safe_plan(
+            vec![SafetensorsTensorConstraint::required(
+                "canonical",
+                vec![2],
+                StoredDtypeConstraint::Floating,
+            )
+            .with_aliases(["released"])],
+            Vec::new(),
+            CatalogPolicy::strict(),
+        );
+        let released = BTreeMap::from([safe("released", &[2], StoredDtype::BF16)]);
+        assert!(validate_catalog(
+            &released,
+            &plan.identity,
+            &plan.common_tensors,
+            &plan.layout_groups,
+            &plan.catalog_policy,
+        )
+        .is_empty());
+
+        let conflicting = BTreeMap::from([
+            safe("canonical", &[2], StoredDtype::F16),
+            safe("released", &[2], StoredDtype::BF16),
+        ]);
+        let issues = validate_catalog(
+            &conflicting,
+            &plan.identity,
+            &plan.common_tensors,
+            &plan.layout_groups,
+            &plan.catalog_policy,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].kind, CheckpointIssueKind::ConflictingLayout);
+        assert_eq!(issues[0].tensor_name.as_deref(), Some("released"));
     }
 
     fn alternatives() -> Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>> {

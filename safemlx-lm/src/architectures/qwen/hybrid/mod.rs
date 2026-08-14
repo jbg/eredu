@@ -1,5 +1,6 @@
 //! Shared Qwen3-Next and Qwen3.5 hybrid decoder implementation.
 
+pub(crate) mod checkpoint;
 /// Bounded-residency execution shared by the hybrid family.
 pub mod layerwise;
 pub(crate) mod mtp;

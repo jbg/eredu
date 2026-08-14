@@ -55,6 +55,8 @@ impl StoredDtypeConstraint {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct SafetensorsTensorConstraint {
     pub(crate) key: String,
+    /// Alternative physical names for the same logical tensor.
+    pub(crate) aliases: Vec<String>,
     pub(crate) shape: Vec<usize>,
     pub(crate) dtype: StoredDtypeConstraint,
     pub(crate) requirement: TensorRequirement,
@@ -69,6 +71,7 @@ impl SafetensorsTensorConstraint {
     ) -> Self {
         Self {
             key: key.into(),
+            aliases: Vec::new(),
             shape: shape.into(),
             dtype,
             requirement: TensorRequirement::Required,
@@ -78,6 +81,14 @@ impl SafetensorsTensorConstraint {
 
     pub(crate) fn optional(mut self) -> Self {
         self.requirement = TensorRequirement::Optional;
+        self
+    }
+
+    pub(crate) fn with_aliases(
+        mut self,
+        aliases: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.aliases = aliases.into_iter().map(Into::into).collect();
         self
     }
 
@@ -149,6 +160,8 @@ pub(crate) fn gguf_encoding_supported(operation: TensorOperation, encoding: Gguf
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct GgufTensorConstraint {
     pub(crate) key: String,
+    /// Alternative physical names for the same logical tensor.
+    pub(crate) aliases: Vec<String>,
     pub(crate) shape: Vec<usize>,
     pub(crate) encoding: GgufTypeConstraint,
     pub(crate) requirement: TensorRequirement,
@@ -163,6 +176,7 @@ impl GgufTensorConstraint {
     ) -> Self {
         Self {
             key: key.into(),
+            aliases: Vec::new(),
             shape: shape.into(),
             encoding,
             requirement: TensorRequirement::Required,
@@ -172,6 +186,14 @@ impl GgufTensorConstraint {
 
     pub(crate) fn optional(mut self) -> Self {
         self.requirement = TensorRequirement::Optional;
+        self
+    }
+
+    pub(crate) fn with_aliases(
+        mut self,
+        aliases: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.aliases = aliases.into_iter().map(Into::into).collect();
         self
     }
 
@@ -240,6 +262,8 @@ pub(crate) enum CheckpointPlanError {
     EmptyLayoutVariant { variant: String },
     #[error("checkpoint tensor key must not be empty")]
     EmptyTensorKey,
+    #[error("checkpoint tensor {key:?} contains an empty physical alias")]
+    EmptyTensorAlias { key: String },
     #[error("checkpoint tensor {key:?} has invalid shape {shape:?}")]
     InvalidShape { key: String, shape: Vec<usize> },
     #[error("checkpoint tensor {key:?} shape element count overflows")]
@@ -260,6 +284,8 @@ pub(crate) enum CheckpointPlanError {
 
 trait PhysicalConstraint {
     fn key(&self) -> &str;
+    fn aliases(&self) -> &[String];
+    fn aliases_mut(&mut self) -> &mut Vec<String>;
     fn shape(&self) -> &[usize];
     fn normalize(&mut self);
     fn has_empty_encoding_set(&self) -> bool;
@@ -268,6 +294,12 @@ trait PhysicalConstraint {
 impl PhysicalConstraint for SafetensorsTensorConstraint {
     fn key(&self) -> &str {
         &self.key
+    }
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+    fn aliases_mut(&mut self) -> &mut Vec<String> {
+        &mut self.aliases
     }
     fn shape(&self) -> &[usize] {
         &self.shape
@@ -283,6 +315,12 @@ impl PhysicalConstraint for SafetensorsTensorConstraint {
 impl PhysicalConstraint for GgufTensorConstraint {
     fn key(&self) -> &str {
         &self.key
+    }
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+    fn aliases_mut(&mut self) -> &mut Vec<String> {
+        &mut self.aliases
     }
     fn shape(&self) -> &[usize] {
         &self.shape
@@ -310,6 +348,13 @@ fn normalize_plan<T: PhysicalConstraint>(
         if tensor.key().trim().is_empty() {
             return Err(CheckpointPlanError::EmptyTensorKey);
         }
+        tensor.aliases_mut().sort();
+        tensor.aliases_mut().dedup();
+        if tensor.aliases().iter().any(|alias| alias.trim().is_empty()) {
+            return Err(CheckpointPlanError::EmptyTensorAlias {
+                key: tensor.key().into(),
+            });
+        }
         if tensor.shape().is_empty() || tensor.shape().contains(&0) {
             return Err(CheckpointPlanError::InvalidShape {
                 key: tensor.key().into(),
@@ -328,10 +373,14 @@ fn normalize_plan<T: PhysicalConstraint>(
             .ok_or_else(|| CheckpointPlanError::ShapeOverflow {
                 key: tensor.key().into(),
             })?;
-        if !keys.insert(tensor.key().to_string()) {
-            return Err(CheckpointPlanError::DuplicateTensorKey {
-                key: tensor.key().into(),
-            });
+        for physical_key in
+            std::iter::once(tensor.key()).chain(tensor.aliases().iter().map(String::as_str))
+        {
+            if !keys.insert(physical_key.to_string()) {
+                return Err(CheckpointPlanError::DuplicateTensorKey {
+                    key: physical_key.into(),
+                });
+            }
         }
         Ok(())
     };
@@ -497,6 +546,16 @@ mod tests {
                 CatalogPolicy::strict(),
             ),
             Err(CheckpointPlanError::DuplicateTensorKey { .. })
+        ));
+        let aliased = tensor("logical", vec![1]).with_aliases(["physical"]);
+        assert!(matches!(
+            SafetensorsCheckpointPlan::new(
+                "duplicate alias",
+                vec![aliased, tensor("physical", vec![1])],
+                Vec::new(),
+                CatalogPolicy::strict(),
+            ),
+            Err(CheckpointPlanError::DuplicateTensorKey { key }) if key == "physical"
         ));
         assert!(matches!(
             SafetensorsCheckpointPlan::new(
