@@ -1,6 +1,10 @@
 //! Unified Llama/Mistral loading across weight-residency policies.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+};
 
 use safemlx::{
     error::Exception,
@@ -39,7 +43,9 @@ use crate::{
         PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     },
     runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
-    runtime::checkpoint::binding::{build_module_bindings, populate_module_from_lease},
+    runtime::checkpoint::binding::{
+        build_module_binding_plan_with_recipes, populate_module_from_lease,
+    },
     runtime::checkpoint::{
         quantization::WeightQuantization,
         store::{GgufWeightStore, WeightStore},
@@ -918,20 +924,38 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, "model.embed_tokens", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    "model.embed_tokens",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, "model.norm", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    "model.norm",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings(head, "lm_head", store)?,
+                    build_module_binding_plan_with_recipes(
+                        head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -1207,6 +1231,22 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("model.layers.{index}")
+    }
+
+    fn layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn WeightStore,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        Ok(build_module_binding_plan_with_recipes(
+            layer,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            BTreeMap::new(),
+        )?
+        .build_bindings(store)?)
     }
 
     fn layer_unit_name(&self, _group: usize, index: usize) -> String {

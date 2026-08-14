@@ -16,7 +16,7 @@ use crate::{
         inkling::{checkpoint as inkling_checkpoint, model as inkling},
         kimi_linear::checkpoint as kimi_linear_checkpoint,
         lfm2::checkpoint as lfm2_checkpoint,
-        llama::model as llama,
+        llama::checkpoint as llama_checkpoint,
         moshi::personaplex,
         muse_glimmer,
         nemotron_h::model as nemotron_h,
@@ -118,7 +118,7 @@ pub(crate) fn validate_safetensors(
                 store,
                 !options.weight_residency.is_fully_resident(),
             ),
-            ModelKind::Llama => validate_llama_safetensors(config, store),
+            ModelKind::Llama => llama_checkpoint::validate_safetensors(config, store),
             ModelKind::MuseGlimmer => validate_muse_glimmer_safetensors(config, store),
             ModelKind::NemotronH => validate_nemotron_h_safetensors(config, store),
             ModelKind::PersonaPlex => validate_personaplex_safetensors(config, store),
@@ -168,7 +168,7 @@ pub(crate) fn validate_gguf(
                 lfm2_checkpoint::validate_gguf(variant, checkpoint, metadata)
             }
             GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-                validate_llama_gguf(checkpoint, metadata)
+                llama_checkpoint::validate_gguf(checkpoint, metadata)
             }
             GgufArchitecture::MuseGlimmer => validate_muse_glimmer_gguf(checkpoint, metadata),
             GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
@@ -219,120 +219,6 @@ struct ExpectedTensor {
     safetensors_shape: Vec<usize>,
     gguf_shape: Vec<usize>,
     operation: TensorOperation,
-}
-
-fn llama_expected(args: &llama::ModelArgs) -> Vec<ExpectedTensor> {
-    let hidden = args.hidden_size as usize;
-    let vocab = args.vocab_size as usize;
-    let intermediate = args.intermediate_size as usize;
-    let query = (args.num_attention_heads * args.head_dim) as usize;
-    let key_value = (args.num_key_value_heads * args.head_dim) as usize;
-    let mut tensors = vec![
-        expected(
-            "model.embed_tokens.weight",
-            "token_embd.weight",
-            [vocab, hidden],
-        ),
-        expected_vector("model.norm.weight", "output_norm.weight", hidden),
-    ];
-    if !args.tie_word_embeddings {
-        tensors.push(expected("lm_head.weight", "output.weight", [vocab, hidden]));
-    }
-    for layer in 0..args.num_hidden_layers as usize {
-        let model = format!("model.layers.{layer}");
-        let gguf = format!("blk.{layer}");
-        tensors.extend([
-            expected_vector(
-                format!("{model}.input_layernorm.weight"),
-                format!("{gguf}.attn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.post_attention_layernorm.weight"),
-                format!("{gguf}.ffn_norm.weight"),
-                hidden,
-            ),
-            expected(
-                format!("{model}.self_attn.q_proj.weight"),
-                format!("{gguf}.attn_q.weight"),
-                [query, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.k_proj.weight"),
-                format!("{gguf}.attn_k.weight"),
-                [key_value, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.v_proj.weight"),
-                format!("{gguf}.attn_v.weight"),
-                [key_value, hidden],
-            ),
-            expected(
-                format!("{model}.self_attn.o_proj.weight"),
-                format!("{gguf}.attn_output.weight"),
-                [hidden, query],
-            ),
-            expected(
-                format!("{model}.mlp.gate_proj.weight"),
-                format!("{gguf}.ffn_gate.weight"),
-                [intermediate, hidden],
-            ),
-            expected(
-                format!("{model}.mlp.up_proj.weight"),
-                format!("{gguf}.ffn_up.weight"),
-                [intermediate, hidden],
-            ),
-            expected(
-                format!("{model}.mlp.down_proj.weight"),
-                format!("{gguf}.ffn_down.weight"),
-                [hidden, intermediate],
-            ),
-        ]);
-        if args.attention_bias {
-            tensors.extend([
-                expected_vector(
-                    format!("{model}.self_attn.q_proj.bias"),
-                    format!("{gguf}.attn_q.bias"),
-                    query,
-                ),
-                expected_vector(
-                    format!("{model}.self_attn.k_proj.bias"),
-                    format!("{gguf}.attn_k.bias"),
-                    key_value,
-                ),
-                expected_vector(
-                    format!("{model}.self_attn.v_proj.bias"),
-                    format!("{gguf}.attn_v.bias"),
-                    key_value,
-                ),
-                expected_vector(
-                    format!("{model}.self_attn.o_proj.bias"),
-                    format!("{gguf}.attn_output.bias"),
-                    hidden,
-                ),
-            ]);
-        }
-        if args.mlp_bias {
-            tensors.extend([
-                expected_vector(
-                    format!("{model}.mlp.gate_proj.bias"),
-                    format!("{gguf}.ffn_gate.bias"),
-                    intermediate,
-                ),
-                expected_vector(
-                    format!("{model}.mlp.up_proj.bias"),
-                    format!("{gguf}.ffn_up.bias"),
-                    intermediate,
-                ),
-                expected_vector(
-                    format!("{model}.mlp.down_proj.bias"),
-                    format!("{gguf}.ffn_down.bias"),
-                    hidden,
-                ),
-            ]);
-        }
-    }
-    tensors
 }
 
 fn muse_glimmer_expected(config: &Value) -> Result<Vec<ExpectedTensor>, Error> {
@@ -1323,54 +1209,6 @@ fn quantization_companion_issue(name: &str, detail: String) -> StructuralIssue {
     }
 }
 
-fn validate_llama_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> StructuralValidation {
-    let args = match llama::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > store.keys().len() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
-            args.num_hidden_layers,
-            store.keys().len()
-        ));
-    }
-    let expected = llama_expected(&args);
-    let quantization = args.weight_quantization();
-    let mut allowed = BTreeSet::new();
-    for tensor in &expected {
-        allowed.insert(tensor.safetensors_name.clone());
-        if tensor.operation == TensorOperation::Matrix {
-            if let Some(quantization) = quantization {
-                add_safetensors_format_companions(
-                    &mut allowed,
-                    &tensor.safetensors_name,
-                    SafetensorsMatrixFormat::Affine(quantization),
-                );
-            }
-        }
-    }
-    let mut issues = match validate_safetensor_plan(store, expected, quantization) {
-        StructuralValidation::Exact => Vec::new(),
-        StructuralValidation::Invalid(issues) => issues,
-        StructuralValidation::Unverified(_) => {
-            unreachable!("pure plan is always exact or invalid")
-        }
-    };
-    for key in store.keys() {
-        if !allowed.contains(&key)
-            && !key.starts_with("rope_freqs.")
-            && !key.ends_with(".rotary_emb.inv_freq")
-        {
-            issues.push(unexpected_layout(&key, "Llama SafeTensors"));
-        }
-    }
-    finish(issues)
-}
-
 fn validate_qwen3_next_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
@@ -2152,48 +1990,6 @@ fn validate_gpt_oss_gguf(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
     gpt_oss_checkpoint::validate_gguf(checkpoint, metadata)
-}
-
-fn validate_llama_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> StructuralValidation {
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(llama::translate_gguf_weight_name)
-    {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args = match llama::model_args_from_gguf_catalog(checkpoint, metadata) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > checkpoint.catalog().physical_tensor_count() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor GGUF catalog",
-            args.num_hidden_layers,
-            checkpoint.catalog().physical_tensor_count()
-        ));
-    }
-    let expected = llama_expected(&args);
-    let allowed = expected
-        .iter()
-        .map(|tensor| tensor.gguf_name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut issues = validate_gguf_plan(checkpoint, expected, "Llama");
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if !allowed.contains(name) && !name.starts_with("rope_freqs.") {
-            issues.push(unexpected_layout(name, "Llama GGUF"));
-        }
-    }
-    finish(issues)
 }
 
 fn nemotron_h_gguf_expected(args: &nemotron_h::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
