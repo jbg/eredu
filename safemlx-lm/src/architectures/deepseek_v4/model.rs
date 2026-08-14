@@ -207,6 +207,8 @@ pub struct ModelArgs {
     pub num_nextn_predict_layers: i32,
     pub expert_dtype: Option<String>,
     pub quantization_config: Option<Fp8QuantizationConfig>,
+    /// Uniform runtime format selected by load-time transformation.
+    pub quantization: Option<WeightQuantization>,
     /// Exact per-weight formats reconstructed from a mixed GGUF catalog.
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
     pub tie_word_embeddings: bool,
@@ -315,9 +317,59 @@ impl ModelArgs {
                 iq @ WeightQuantization::GgufIQuant { .. } => WeightFormat::IQuant(iq),
                 affine => WeightFormat::Affine(affine),
             }
+        } else if let Some(quantization) = self.quantization {
+            match quantization {
+                iq @ WeightQuantization::GgufIQuant { .. } => WeightFormat::IQuant(iq),
+                affine => WeightFormat::Affine(affine),
+            }
         } else {
             WeightFormat::Dense
         }
+    }
+
+    pub(crate) fn has_checkpoint_native_quantization(&self) -> bool {
+        self.quantization_config.is_some()
+            || self.expert_dtype.is_some()
+            || self
+                .quantized_weight_configs
+                .as_ref()
+                .is_some_and(|formats| !formats.is_empty())
+    }
+
+    pub(crate) fn resolve_load_time_quantization(
+        &self,
+        context: &str,
+        requested: Option<WeightQuantization>,
+    ) -> Result<Option<WeightQuantization>, Error> {
+        let Some(requested) = requested else {
+            return Ok(None);
+        };
+        requested.validate()?;
+        if self.has_checkpoint_native_quantization() {
+            return Err(Error::Quantization(format!(
+                "{context} checkpoint already contains checkpoint-native mixed or FP8 weights; implicit dequantization and requantization is unsupported"
+            )));
+        }
+        crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            context,
+            self.quantization,
+            requested,
+        )
+        .map(|required| required.then_some(requested))
+    }
+
+    pub(crate) fn with_load_time_quantization(
+        &self,
+        quantization: WeightQuantization,
+    ) -> Result<Self, Error> {
+        quantization.validate()?;
+        let mut target = self.clone();
+        target.expert_dtype = None;
+        target.quantization_config = None;
+        target.quantized_weight_configs = None;
+        target.quantization = Some(quantization);
+        target.validate()?;
+        Ok(target)
     }
 
     pub(crate) fn validate(&self) -> Result<(), Error> {
@@ -450,6 +502,15 @@ impl ModelArgs {
                 "native FP8 metadata cannot be combined with GGUF per-weight formats",
             ));
         }
+        if self.quantization.is_some()
+            && (self.quantization_config.is_some()
+                || self.expert_dtype.is_some()
+                || self.quantized_weight_configs.is_some())
+        {
+            return Err(unsupported(
+                "load-time quantization cannot be combined with checkpoint-native formats",
+            ));
+        }
         if self
             .expert_dtype
             .as_deref()
@@ -556,6 +617,7 @@ impl ModelArgsSource {
             num_nextn_predict_layers: self.num_nextn_predict_layers,
             expert_dtype: self.expert_dtype,
             quantization_config: self.quantization_config,
+            quantization: None,
             quantized_weight_configs: None,
             tie_word_embeddings: self.tie_word_embeddings,
             dspark,
@@ -1768,6 +1830,7 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
                 "native_quantization",
                 format!("{:?}", args.quantization_config),
             ),
+            ("load_time_quantization", format!("{:?}", args.quantization)),
             (
                 "quantized_weight_configs",
                 quantized_weight_configs.join(";"),

@@ -35,10 +35,10 @@ use crate::{
             store::{GgufWeightStore, TensorSelection, WeightStore},
         },
         execution::layerwise::{
-            load_layerwise_model, load_safetensors_layerwise_model,
-            load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+            load_layerwise_model_with_quantization,
+            load_tensor_parallel_layerwise_model_with_quantization, open_safetensors_weight_store,
             ArchitectureAdapter, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
-            StaticUnitBindings,
+            LoadTimeQuantizableAdapter, StaticUnitBindings,
         },
         residency::{
             expert_cache::{
@@ -860,6 +860,21 @@ impl DeepSeekV4LayerwiseAdapter {
     }
 }
 
+impl LoadTimeQuantizableAdapter for DeepSeekV4LayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let args = self.args.with_load_time_quantization(quantization)?;
+        if self.sparse_expert_cache {
+            Self::new_sparse(args, stream)
+        } else {
+            Self::new(args, stream)
+        }
+    }
+}
+
 impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
@@ -868,6 +883,26 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn quantization(&self) -> Option<WeightQuantization> {
+        self.args.quantization
+    }
+
+    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+        let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+        if target == "head.weight" {
+            return true;
+        }
+        if !target.starts_with("mtp.") {
+            return false;
+        }
+        if target.ends_with(".gate_up_proj") || target.ends_with(".down_proj") {
+            return true;
+        }
+        target.ends_with(".weight")
+            && !target.ends_with("norm.weight")
+            && !target.contains(".markov_w1.")
     }
 
     fn prompt_cache_model_identity(
@@ -1445,18 +1480,22 @@ fn is_routed_expert_source(key: &str) -> bool {
 pub fn load_deepseek_v4_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    requested_quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV4LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let args = super::model::get_model_args(model_dir)?;
+    let quantization =
+        args.resolve_load_time_quantization("DeepSeek V4", requested_quantization)?;
     let adapter = DeepSeekV4LayerwiseAdapter::new(args, stream)?;
     Ok(DeepSeekV4LayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
+        execution: load_layerwise_model_with_quantization(
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
+            quantization,
             stream,
             weights_stream,
         )?,
@@ -1473,12 +1512,6 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
-    if requested_quantization.is_some() {
-        return Err(Error::Quantization(
-            "DeepSeek V4 GGUF already carries exact mixed per-operation encodings; load-time conversion is unsupported"
-                .into(),
-        ));
-    }
     crate::api::structural::validate_gguf(
         crate::api::GgufArchitecture::DeepSeek4,
         checkpoint,
@@ -1487,13 +1520,16 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
     )
     .into_loader_result()?;
     let prepared = super::model::prepare_gguf_checkpoint(checkpoint, metadata)?;
+    let quantization = prepared
+        .args
+        .resolve_load_time_quantization("DeepSeek V4 GGUF", requested_quantization)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             super::model::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-    let mut execution = load_layerwise_model(
+    let mut execution = load_layerwise_model_with_quantization(
         Arc::clone(&store),
         if residency.expert_cache().is_some() {
             DeepSeekV4LayerwiseAdapter::new_sparse(prepared.args.clone(), stream)?
@@ -1501,18 +1537,29 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
             DeepSeekV4LayerwiseAdapter::new(prepared.args.clone(), stream)?
         },
         residency.layers(),
+        quantization,
         stream,
         weights_stream,
     )?;
     if let Some(options) = residency.expert_cache() {
         let entries = expert_catalog(&prepared.args, store.as_ref())?;
-        execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-            store,
-            entries,
-            options,
-            weights_stream.clone(),
-            stream.clone(),
-        )?);
+        execution.adapter_mut().expert_cache = Some(match quantization {
+            Some(quantization) => ExpertCache::new_quantized_shared(
+                store,
+                entries,
+                options,
+                quantization,
+                weights_stream.clone(),
+                stream.clone(),
+            )?,
+            None => ExpertCache::new_shared(
+                store,
+                entries,
+                options,
+                weights_stream.clone(),
+                stream.clone(),
+            )?,
+        });
     }
     Ok((
         DeepSeekV4LayerwiseModel { execution },
@@ -1525,6 +1572,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     options: LayerWeightResidency,
+    requested_quantization: Option<WeightQuantization>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1538,16 +1586,21 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
     )
     .into_loader_result()?;
     let prepared = super::model::prepare_gguf_checkpoint(checkpoint, metadata)?;
+    let quantization = prepared.args.resolve_load_time_quantization(
+        "DeepSeek V4 GGUF tensor parallel",
+        requested_quantization,
+    )?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             super::model::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
-    let execution = load_tensor_parallel_layerwise_model(
+    let execution = load_tensor_parallel_layerwise_model_with_quantization(
         store,
         DeepSeekV4LayerwiseAdapter::new(prepared.args, stream)?,
         options,
+        quantization,
         build,
         stream,
         weights_stream,
@@ -1562,6 +1615,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
 pub fn load_deepseek_v4_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    requested_quantization: Option<WeightQuantization>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1578,6 +1632,7 @@ pub fn load_deepseek_v4_tensor_parallel_model(
             &checkpoint,
             &metadata,
             options,
+            requested_quantization,
             build,
             stream,
             weights_stream,
@@ -1590,12 +1645,15 @@ pub fn load_deepseek_v4_tensor_parallel_model(
         crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency()),
     )?;
     let args = super::model::get_model_args(model_dir)?;
+    let quantization =
+        args.resolve_load_time_quantization("DeepSeek V4 tensor parallel", requested_quantization)?;
     let adapter = DeepSeekV4LayerwiseAdapter::new(args, stream)?;
     Ok(DeepSeekV4LayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
+        execution: load_tensor_parallel_layerwise_model_with_quantization(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
+            quantization,
             build,
             stream,
             weights_stream,
@@ -1608,28 +1666,44 @@ pub fn load_deepseek_v4_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    requested_quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV4LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = super::model::get_model_args(model_dir)?;
+    let quantization = args.resolve_load_time_quantization(
+        "DeepSeek V4 independent expert cache",
+        requested_quantization,
+    )?;
     let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
     let adapter = DeepSeekV4LayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution = load_layerwise_model(
+    let mut execution = load_layerwise_model_with_quantization(
         Arc::clone(&store),
         adapter,
         non_expert,
+        quantization,
         stream,
         weights_stream,
     )?;
     let entries = expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantization {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(DeepSeekV4LayerwiseModel { execution })
 }
 
@@ -1638,12 +1712,22 @@ pub(crate) fn load_deepseek_v4_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
+    requested_quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV4LayerwiseModel, Error> {
+    let quantization =
+        args.resolve_load_time_quantization("DeepSeek V4 expert parallel", requested_quantization)?;
     let adapter = DeepSeekV4LayerwiseAdapter::new_sparse(args, stream)?;
     Ok(DeepSeekV4LayerwiseModel {
-        execution: load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?,
+        execution: load_layerwise_model_with_quantization(
+            store,
+            adapter,
+            non_expert,
+            quantization,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 
@@ -1652,16 +1736,22 @@ pub(crate) fn load_deepseek_v4_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
+    requested_quantization: Option<WeightQuantization>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV4LayerwiseModel, Error> {
+    let quantization = args.resolve_load_time_quantization(
+        "DeepSeek V4 tensor/expert parallel",
+        requested_quantization,
+    )?;
     let adapter = DeepSeekV4LayerwiseAdapter::new_sparse(args, stream)?;
     Ok(DeepSeekV4LayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
+        execution: load_tensor_parallel_layerwise_model_with_quantization(
             store,
             adapter,
             non_expert,
+            quantization,
             build,
             stream,
             weights_stream,
@@ -2133,8 +2223,12 @@ fn execute_cached_experts(
                     });
                 }
                 let started = Instant::now();
-                let quantization = (args.expert_dtype.as_deref() == Some("fp4"))
-                    .then_some(WeightQuantization::MxFp4);
+                let quantization = match args.expert_dtype.as_deref() {
+                    Some("fp4") => Some(WeightQuantization::MxFp4),
+                    Some("fp8") => None,
+                    None => args.quantization,
+                    Some(_) => unreachable!("validated expert dtype"),
+                };
                 let bank = crate::nn::moe::PackedSwiGluExperts::new(
                     acquired.identities().len() as i32,
                     args.hidden_size,
@@ -2164,17 +2258,20 @@ fn execute_cached_experts(
 
 #[cfg(test)]
 mod tests {
-    use safemlx::{Device, DeviceType, ExecutionContext};
+    use safemlx::{module::ModuleParameters, Device, DeviceType, Dtype, ExecutionContext};
 
     use super::{raw_layer_key, DeepSeekV4LayerwiseAdapter};
     use crate::{
         architectures::deepseek_v4::model::ModelArgs,
         runtime::{
+            checkpoint::quantization::WeightQuantization,
+            checkpoint::store::TensorSelection,
             distributed::{
                 parallel::{ParallelBuildContext, ShardingPolicy},
                 topology::{DeviceAssignment, ParallelTopology},
             },
-            execution::layerwise::ArchitectureAdapter,
+            execution::layerwise::{ArchitectureAdapter, LoadTimeQuantizableAdapter},
+            residency::manager::WeightBinding,
         },
     };
 
@@ -2201,6 +2298,123 @@ mod tests {
             "num_experts_per_tok": 2
         }))
         .unwrap()
+    }
+
+    fn quantizable_args(dspark: bool) -> ModelArgs {
+        let mut value = serde_json::json!({
+            "model_type": "deepseek_v4",
+            "hidden_size": 32,
+            "moe_intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "qk_rope_head_dim": 4,
+            "q_lora_rank": 32,
+            "o_lora_rank": 32,
+            "o_groups": 2,
+            "vocab_size": 64,
+            "max_position_embeddings": 4096,
+            "compress_ratios": [0, 0],
+            "index_n_heads": 8,
+            "index_head_dim": 8,
+            "index_topk": 2,
+            "n_routed_experts": 8,
+            "num_experts_per_tok": 2,
+            "num_nextn_predict_layers": 1
+        });
+        if dspark {
+            value["dspark_block_size"] = 4.into();
+            value["dspark_noise_token_id"] = 0.into();
+            value["dspark_target_layer_ids"] = serde_json::json!([0]);
+            value["dspark_markov_rank"] = 32.into();
+        }
+        ModelArgs::from_value(value).unwrap()
+    }
+
+    fn assert_packed_parameter(module: &impl ModuleParameters, suffix: &str) {
+        let parameters = module.parameters().flatten();
+        let (_, parameter) = parameters
+            .iter()
+            .find(|(name, _)| name.ends_with(suffix))
+            .unwrap_or_else(|| panic!("missing packed parameter ending in {suffix:?}"));
+        assert_eq!(parameter.dtype(), Dtype::Uint32, "{suffix}");
+    }
+
+    fn binding(target: &str) -> WeightBinding {
+        WeightBinding::new("parameter", target, TensorSelection::Full, 4).unwrap()
+    }
+
+    #[test]
+    fn static_quantization_selects_only_packed_v4_modules() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let adapter =
+            DeepSeekV4LayerwiseAdapter::new(quantizable_args(true), execution.stream()).unwrap();
+
+        assert!(adapter.quantizes_static_binding(&binding("head.weight")));
+        assert!(adapter.quantizes_static_binding(&binding("mtp.main_proj.weight")));
+        assert!(adapter.quantizes_static_binding(&binding(
+            "mtp.layers.0.decoder.ffn.switch_mlp.gate_up_proj"
+        )));
+        assert!(!adapter.quantizes_static_binding(&binding("embed.weight")));
+        assert!(!adapter.quantizes_static_binding(&binding("hc_head.function")));
+        assert!(!adapter.quantizes_static_binding(&binding("mtp.main_norm.weight")));
+        assert!(!adapter.quantizes_static_binding(&binding("mtp.markov_w1.weight")));
+        assert!(!adapter.quantizes_static_binding(&binding("mtp.layers.0.attn.compressor.ape")));
+    }
+
+    #[test]
+    fn uniform_load_time_format_covers_target_moe_and_embedded_mtp() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let source =
+            DeepSeekV4LayerwiseAdapter::new(quantizable_args(false), execution.stream()).unwrap();
+        let target = source
+            .load_time_quantized(WeightQuantization::MxFp4, execution.stream())
+            .unwrap();
+        let layer = target.new_layer(0, 0, execution.stream()).unwrap();
+
+        assert_eq!(target.quantization(), Some(WeightQuantization::MxFp4));
+        assert_packed_parameter(&layer, "attn.wq_a.weight");
+        assert_packed_parameter(&layer, "ffn.switch_mlp.gate_up_proj");
+        assert_packed_parameter(&layer, "ffn.shared_experts.gate_proj.weight");
+        assert_packed_parameter(
+            target.static_model.mtp.as_ref().unwrap(),
+            "layers.0.e_proj.weight",
+        );
+        assert_packed_parameter(
+            target.static_model.mtp.as_ref().unwrap(),
+            "layers.0.decoder.ffn.switch_mlp.down_proj",
+        );
+        assert_packed_parameter(&target.static_model.lm_head, "weight");
+    }
+
+    #[test]
+    fn uniform_load_time_format_covers_fused_dspark_projections() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let source =
+            DeepSeekV4LayerwiseAdapter::new(quantizable_args(true), execution.stream()).unwrap();
+        let target = source
+            .load_time_quantized(WeightQuantization::MxFp4, execution.stream())
+            .unwrap();
+        let dspark = target.static_model.dspark.as_ref().unwrap();
+
+        assert_packed_parameter(dspark, "main_proj.weight");
+        assert_packed_parameter(dspark, "markov_w2.weight");
+        assert_packed_parameter(dspark, "confidence_head.weight");
+        assert_packed_parameter(dspark, "layers.0.attn.wq_a.weight");
+        assert_packed_parameter(dspark, "layers.0.ffn.switch_mlp.down_proj");
+    }
+
+    #[test]
+    fn checkpoint_native_formats_reject_implicit_transcoding() {
+        let mut args = quantizable_args(false);
+        args.expert_dtype = Some("fp4".into());
+        let error = args
+            .resolve_load_time_quantization("DeepSeek V4", Some(WeightQuantization::MxFp4))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("implicit dequantization and requantization"));
     }
 
     #[test]

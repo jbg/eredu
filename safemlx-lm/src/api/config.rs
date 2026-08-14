@@ -415,7 +415,10 @@ pub(crate) fn validate_load_policy(
         && !options.weight_residency.is_fully_resident()
         && artifact == ArtifactLoadKind::Safetensors
         && options.weight_residency.expert_cache().is_none()
-        && !matches!(kind, ModelKind::Qwen2 | ModelKind::Qwen3)
+        && !matches!(
+            kind,
+            ModelKind::DeepSeekV4 | ModelKind::Qwen2 | ModelKind::Qwen3
+        )
     {
         return Err(Error::Quantization(format!(
             "load-time quantization is unsupported for {} nonresident loading; use a matching checkpoint-native packed format",
@@ -509,5 +512,28 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
         ModelKind::Qwen3Vl => qwen3_vl::validate_model_config_value(config),
         ModelKind::Qwen3VlMoe => qwen3_vl_moe::validate_model_config_value(config),
         ModelKind::Qwen35 => qwen3_5::validate_model_config_value(config),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_load_policy, ArtifactLoadKind, ModelKind, ModelLoadOptions};
+    use crate::{
+        runtime::checkpoint::quantization::WeightQuantization, LayerwiseLoadOptions,
+        WeightResidency,
+    };
+
+    #[test]
+    fn deepseek_v4_quantization_composes_with_nonresident_layers() {
+        let options = ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+            .with_weight_residency(WeightResidency::layerwise_host(
+                LayerwiseLoadOptions::default(),
+            ));
+        validate_load_policy(
+            ModelKind::DeepSeekV4,
+            ArtifactLoadKind::Safetensors,
+            options,
+        )
+        .unwrap();
     }
 }

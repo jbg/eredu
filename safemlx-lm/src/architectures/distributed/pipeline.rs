@@ -23919,7 +23919,7 @@ fn load_deepseek_pipeline(
 
 #[allow(clippy::too_many_arguments)]
 fn load_deepseek_v4_pipeline(
-    args: deepseek_v4::ModelArgs,
+    source_args: deepseek_v4::ModelArgs,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
@@ -23928,38 +23928,45 @@ fn load_deepseek_v4_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    if requested_quantization.is_some() {
-        return Err(Error::Quantization(
-            "DeepSeek V4 pipeline load-time conversion is unsupported; use native checkpoint formats"
-                .into(),
-        ));
-    }
+    let quantize_on_load = source_args
+        .resolve_load_time_quantization("DeepSeek V4 pipeline", requested_quantization)?;
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
     let mut binding_adapter = if external_experts {
-        DeepSeekV4LayerwiseAdapter::new_external_experts(args.clone(), stream)?
+        DeepSeekV4LayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
     } else {
-        DeepSeekV4LayerwiseAdapter::new(args.clone(), stream)?
+        DeepSeekV4LayerwiseAdapter::new(source_args.clone(), stream)?
+    };
+    let target_args = match quantize_on_load {
+        Some(quantization) => source_args.with_load_time_quantization(quantization)?,
+        None => source_args.clone(),
+    };
+    let mut target_binding_adapter = if let Some(quantization) = quantize_on_load {
+        binding_adapter.load_time_quantized(quantization, stream)?
+    } else if external_experts {
+        DeepSeekV4LayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
+    } else {
+        DeepSeekV4LayerwiseAdapter::new(target_args.clone(), stream)?
     };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
-        Some(args.num_hidden_layers as usize),
+        Some(source_args.num_hidden_layers as usize),
         expert_assignment
             .as_ref()
             .map(ExpertAssignment::global_expert_count),
     )?;
-    let range = topology.layer_range(args.num_hidden_layers as usize)?;
+    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
     let mut info = base_info(
         topology,
         range.clone(),
-        args.num_hidden_layers as usize,
+        source_args.num_hidden_layers as usize,
         ModelKind::DeepSeekV4,
-        args.hidden_size,
+        source_args.hidden_size,
     );
-    info.activation_hidden_size = args
+    info.activation_hidden_size = source_args
         .hidden_size
-        .checked_mul(args.hc_mult)
+        .checked_mul(source_args.hc_mult)
         .ok_or_else(|| Error::Parallel("DeepSeek V4 pipeline hidden width overflowed".into()))?;
-    let mut stage = DeepSeekV4Stage::new(args.clone(), range, external_experts, stream)?;
+    let mut stage = DeepSeekV4Stage::new(target_args.clone(), range, external_experts, stream)?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -23971,6 +23978,7 @@ fn load_deepseek_v4_pipeline(
         binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
         let (_, layout) = planner.finish()?;
         binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
+        target_binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
         stage
             .layer_adapter
             .configure_cartesian_layout(build, &layout, stream)?;
@@ -24006,7 +24014,32 @@ fn load_deepseek_v4_pipeline(
         ("output", info.is_last),
         ("draft", owns_draft),
     ]);
-    let static_units = pipeline_binding_units(&binding_adapter, store.as_ref(), &static_roles)?;
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                quantization,
+                stream,
+            )?;
+            (store, Some(report))
+        }
+        None => (store, None),
+    };
+    let expert_quantization = quantize_on_load;
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization.clone();
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("DeepSeek V4");
     for role in &static_roles {
         let bindings = pipeline_cartesian_static_bindings(
@@ -24023,7 +24056,7 @@ fn load_deepseek_v4_pipeline(
             target,
             store.as_ref(),
             &bindings,
-            None,
+            quantize_on_load,
             weights_stream,
             stream,
         )?;
@@ -24044,7 +24077,7 @@ fn load_deepseek_v4_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
-                    None,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("ffn.switch_mlp."),
@@ -24054,7 +24087,7 @@ fn load_deepseek_v4_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
-                    None,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                 )?;
@@ -24073,7 +24106,7 @@ fn load_deepseek_v4_pipeline(
             stage.range.clone(),
             dense_stream,
             static_device_bytes,
-            None,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |global_layer, stream| {
@@ -24111,22 +24144,24 @@ fn load_deepseek_v4_pipeline(
         info.planned_owned_parameter_bytes = static_device_bytes;
     }
     if external_experts {
-        let entries =
-            crate::architectures::deepseek_v4::layerwise::expert_catalog(&args, store.as_ref())?
-                .into_iter()
-                .filter(|entry| stage.range.contains(&entry.identity().layer))
-                .filter(|entry| {
-                    stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                        assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-                    })
-                })
-                .collect::<Vec<_>>();
+        let entries = crate::architectures::deepseek_v4::layerwise::expert_catalog(
+            &source_args,
+            store.as_ref(),
+        )?
+        .into_iter()
+        .filter(|entry| stage.range.contains(&entry.identity().layer))
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
                 expert_cache_options,
-                None,
+                expert_quantization,
                 weights_stream,
                 stream,
             )?;

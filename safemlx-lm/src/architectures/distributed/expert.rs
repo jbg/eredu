@@ -3781,8 +3781,12 @@ pub(crate) fn execute_cached_deepseek_v4(
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
-            let quantization =
-                (args.expert_dtype.as_deref() == Some("fp4")).then_some(WeightQuantization::MxFp4);
+            let quantization = match args.expert_dtype.as_deref() {
+                Some("fp4") => Some(WeightQuantization::MxFp4),
+                Some("fp8") => None,
+                None => args.quantization,
+                Some(_) => unreachable!("validated expert dtype"),
+            };
             let bank = PackedSwiGluExperts::new(
                 acquired.identities().len() as i32,
                 args.hidden_size,
@@ -4799,6 +4803,7 @@ fn load_external_gguf_ep(
                         store.clone(),
                         args.clone(),
                         non_expert,
+                        expert_residency.quantization(),
                         ParallelBuildContext::new(topology, ShardingPolicy::Require),
                         stream,
                         weights_stream,
@@ -4809,6 +4814,7 @@ fn load_external_gguf_ep(
                         store.clone(),
                         args.clone(),
                         non_expert,
+                        expert_residency.quantization(),
                         stream,
                         weights_stream,
                     )?
@@ -5466,6 +5472,12 @@ impl ExternalExpertResidency {
             Self::SparseCache(_, _) => RoutedExpertResidency::SparseCache,
         }
     }
+
+    const fn quantization(self) -> Option<WeightQuantization> {
+        match self {
+            Self::FullyResident(quantization) | Self::SparseCache(_, quantization) => quantization,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5589,12 +5601,6 @@ fn load_deepseek_v4_external_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    if options.quantization.is_some() {
-        return Err(Error::Quantization(
-            "DeepSeek V4 distributed load-time conversion is not initialized; use checkpoint-native mixed weights"
-                .into(),
-        ));
-    }
     let args = deepseek_v4::get_model_args(model_dir)?;
     let assignment =
         resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
@@ -5606,6 +5612,7 @@ fn load_deepseek_v4_external_ep(
             store.clone(),
             args.clone(),
             non_expert,
+            options.quantization,
             ParallelBuildContext::new(topology, ShardingPolicy::Require),
             stream,
             weights_stream,
@@ -5615,6 +5622,7 @@ fn load_deepseek_v4_external_ep(
             store.clone(),
             args.clone(),
             non_expert,
+            options.quantization,
             stream,
             weights_stream,
         )?
@@ -5880,7 +5888,7 @@ fn load_deepseek_v4_ep(
             topology,
             options,
             options.weight_residency.layers(),
-            ExternalExpertResidency::SparseCache(expert_options, None),
+            ExternalExpertResidency::SparseCache(expert_options, options.quantization),
             options.weight_residency.max_mapped_shards(),
             assignment,
             stream,
@@ -5898,7 +5906,7 @@ fn load_deepseek_v4_ep(
         topology,
         options,
         LayerWeightResidency::FullyResident,
-        ExternalExpertResidency::FullyResident(None),
+        ExternalExpertResidency::FullyResident(options.quantization),
         crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
         assignment,
         stream,

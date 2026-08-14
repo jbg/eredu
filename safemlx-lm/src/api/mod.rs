@@ -524,16 +524,12 @@ fn load_model_for_kind(
                     model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
-            ModelKind::DeepSeekV4 if options.quantization.is_some() => {
-                Err(Error::UnsupportedArchitecture(
-                    "DeepSeek-V4 load-time transformation is not initialized".into(),
-                ))
-            }
             ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
                 crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_expert_cache_model(
                     model_dir,
                     non_expert,
                     expert_cache,
+                    options.quantization,
                     stream,
                     weights_stream,
                 )?,
@@ -598,9 +594,15 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::DeepSeekV4 => Err(Error::UnsupportedArchitecture(
-                "DeepSeek-V4 load-time transformation is not initialized".into(),
-            )),
+            ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
+                crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_layerwise_model(
+                    model_dir,
+                    execution,
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?,
+            ))),
             ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
                 crate::architectures::gemma4::layerwise::execute_transformed_gemma4_model(
                     model_dir,
@@ -724,6 +726,7 @@ fn load_model_for_kind(
             crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_layerwise_model(
                 model_dir,
                 execution,
+                None,
                 stream,
                 weights_stream,
             )?,

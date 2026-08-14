@@ -155,7 +155,8 @@ impl Moe {
             Some("fp4") => Some(WeightQuantization::MxFp4),
             // Native FP8 expert banks are bound through the block-FP8 packed
             // expert recipes; dense here is the unloaded parameter fallback.
-            Some("fp8") | None => None,
+            Some("fp8") => None,
+            None => args.quantization,
             Some(_) => unreachable!("validated expert dtype"),
         };
         Ok(Self {

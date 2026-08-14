@@ -3998,18 +3998,15 @@ fn packed_weight_companion_dtypes(module: &impl ModuleParameters) -> BTreeMap<St
         .collect()
 }
 
-pub(crate) fn load_layerwise_model_quantized<A, O>(
+fn quantize_layerwise_store<A>(
     store: SharedWeightStore,
-    source_adapter: A,
-    target_adapter: A,
-    options: O,
+    source_adapter: &A,
+    target_adapter: &A,
     quantization: WeightQuantization,
     stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseModel<A>, Error>
+) -> Result<(SharedWeightStore, BoundedQuantizationReport), Error>
 where
     A: ArchitectureAdapter,
-    O: Into<LayerWeightResidency>,
 {
     let mut recipes = BTreeMap::new();
     let mut collect =
@@ -4109,10 +4106,7 @@ where
     )?);
     let report = transformed.report().clone();
     let transformed: SharedWeightStore = transformed;
-    let mut model =
-        load_layerwise_model(transformed, target_adapter, options, stream, weights_stream)?;
-    model.metadata.materialization = Some(report);
-    Ok(model)
+    Ok((transformed, report))
 }
 
 /// Loads an adapter directly or through the shared bounded packed overlay.
@@ -4137,17 +4131,67 @@ where
     match quantization {
         Some(quantization) => {
             let target_adapter = source_adapter.load_time_quantized(quantization, stream)?;
-            load_layerwise_model_quantized(
+            let (store, report) = quantize_layerwise_store(
                 store,
-                source_adapter,
-                target_adapter,
-                options,
+                &source_adapter,
+                &target_adapter,
                 quantization,
                 stream,
-                weights_stream,
-            )
+            )?;
+            let mut model =
+                load_layerwise_model(store, target_adapter, options, stream, weights_stream)?;
+            model.metadata.materialization = Some(report);
+            Ok(model)
         }
         None => load_layerwise_model(store, source_adapter, options, stream, weights_stream),
+    }
+}
+
+/// Loads a tensor-parallel adapter directly or through the same bounded packed
+/// overlay used by non-distributed residency.
+pub(crate) fn load_tensor_parallel_layerwise_model_with_quantization<A, O>(
+    store: SharedWeightStore,
+    source_adapter: A,
+    options: O,
+    quantization: Option<WeightQuantization>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LayerwiseModel<A>, Error>
+where
+    A: LoadTimeQuantizableAdapter,
+    O: Into<LayerWeightResidency>,
+{
+    let options = options.into();
+    match quantization {
+        Some(quantization) => {
+            let target_adapter = source_adapter.load_time_quantized(quantization, stream)?;
+            let (store, report) = quantize_layerwise_store(
+                store,
+                &source_adapter,
+                &target_adapter,
+                quantization,
+                stream,
+            )?;
+            let mut model = load_tensor_parallel_layerwise_model(
+                store,
+                target_adapter,
+                options,
+                build,
+                stream,
+                weights_stream,
+            )?;
+            model.metadata.materialization = Some(report);
+            Ok(model)
+        }
+        None => load_tensor_parallel_layerwise_model(
+            store,
+            source_adapter,
+            options,
+            build,
+            stream,
+            weights_stream,
+        ),
     }
 }
 
