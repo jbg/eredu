@@ -42,10 +42,11 @@ use crate::{
         KeyValueCache,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         canonical_checkpoint_name, packed_companion_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
+    runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -2369,35 +2370,38 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.embeddings,
                     "model.embeddings",
                     store,
                     self.recipes_for_module(&self.embeddings, "model.embeddings", store, None)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.norm,
                     "model.norm_f",
                     store,
                     self.recipes_for_module(&self.norm, "model.norm_f", store, None)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings_with_recipes(
+                    build_module_binding_plan_with_recipes(
                         head,
                         "lm_head",
                         store,
                         self.recipes_for_module(head, "lm_head", store, None)?,
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2405,13 +2409,14 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
             if let Some(mtp) = &self.mtp {
                 units.push(StaticUnitBindings::new(
                     MTP_UNIT,
-                    build_module_bindings_with_recipes_excluding(
+                    build_module_binding_plan_with_recipes_excluding(
                         mtp,
                         "",
                         store,
                         self.mtp_recipes(store)?,
                         |name| self.sparse_expert_cache && name.contains(".moe.experts."),
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2902,11 +2907,17 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         let prefix = format!("model.layers.{index}");
         let recipes = self.recipes_for_module(layer, &prefix, store, Some(index))?;
         let bindings = if self.sparse_expert_cache {
-            build_module_bindings_with_recipes_excluding(layer, &prefix, store, recipes, |name| {
-                name.starts_with("moe.experts.")
-            })?
+            build_module_binding_plan_with_recipes_excluding(
+                layer,
+                &prefix,
+                store,
+                recipes,
+                |name| name.starts_with("moe.experts."),
+            )?
+            .build_bindings(store)?
         } else {
-            build_module_bindings_with_recipes(layer, &prefix, store, recipes)?
+            build_module_binding_plan_with_recipes(layer, &prefix, store, recipes)?
+                .build_bindings(store)?
         };
         bindings
             .into_iter()
@@ -3207,7 +3218,7 @@ fn nemotron_expert_entries(
     (0..args.n_routed_experts as usize)
         .map(|expert| -> Result<ExpertCatalogEntry, Error> {
             let identity = ExpertIdentity::new(identity_layer, expert);
-            let mut bindings = Vec::new();
+            let mut planned = Vec::new();
             for projection in ["up_proj", "down_proj"] {
                 let weight_recipe = if packed {
                     DerivedWeightRecipe::source(
@@ -3227,12 +3238,12 @@ fn nemotron_expert_entries(
                         )?],
                     }
                 };
-                bindings.push(nemotron_recipe_binding(projection, weight_recipe, store)?);
+                planned.push(nemotron_planned_binding(projection, weight_recipe, store)?);
                 if packed {
                     for suffix in ["scales", "biases"] {
                         let runtime = format!("{prefix}.{projection}_{suffix}");
                         if let Some(raw) = normalized.get(&runtime) {
-                            bindings.push(nemotron_recipe_binding(
+                            planned.push(nemotron_planned_binding(
                                 &format!("{projection}_{suffix}"),
                                 DerivedWeightRecipe::source(
                                     raw.clone(),
@@ -3248,6 +3259,9 @@ fn nemotron_expert_entries(
                     }
                 }
             }
+            let bindings = BindingPlan::new(planned)
+                .and_then(|plan| plan.build_bindings(store))
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
                     Error::UnsupportedArchitecture("Nemotron-H expert byte total overflowed".into())
@@ -3262,13 +3276,18 @@ fn nemotron_expert_entries(
         .collect()
 }
 
-fn nemotron_recipe_binding(
+fn nemotron_planned_binding(
     name: &str,
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
-) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+) -> Result<PlannedBinding, Error> {
+    let metadata = recipe.infer(store)?;
+    Ok(PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    })
 }
 
 /// Nemotron-H token generation iterator using bounded layer execution.
