@@ -51,9 +51,10 @@ use crate::{
         KeyValueCache,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
+        populate_module_from_lease, populate_module_from_lease_excluding,
     },
+    runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     runtime::checkpoint::{
         quantization::WeightQuantization,
         recipe::DerivedWeightRecipe,
@@ -1341,8 +1342,16 @@ fn gemma_expert_recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 pub(crate) fn execute_acquired_gemma_experts(
@@ -1959,11 +1968,16 @@ impl Gemma4LayerwiseAdapter {
             let parameters = module.parameters().flatten();
             recipes.retain(|name, _| parameters.contains_key(name.as_str()));
         }
-        let mut bindings = build_module_bindings_with_recipes(module, prefix, store, recipes)?;
-        if self.external_experts && prefix.starts_with("model.language_model.layers.") {
-            bindings.retain(|binding| !binding.name().starts_with("experts."));
-        }
-        Ok(bindings)
+        let external_experts =
+            self.external_experts && prefix.starts_with("model.language_model.layers.");
+        Ok(build_module_binding_plan_with_recipes_excluding(
+            module,
+            prefix,
+            store,
+            recipes,
+            |name| external_experts && name.starts_with("experts."),
+        )?
+        .build_bindings(store)?)
     }
 
     fn prepare_per_layer_inputs_with_execution(

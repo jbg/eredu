@@ -271,6 +271,31 @@ where
             });
         }
 
+        if !present.is_empty() && !partial.is_empty() {
+            issues.push(CheckpointIssue {
+                kind: CheckpointIssueKind::ConflictingLayout,
+                detail: format!(
+                    "checkpoint plan {:?} layout group {:?} mixes present variants {:?} with partially present variants {:?}",
+                    identity,
+                    group.id,
+                    present
+                        .iter()
+                        .map(|variant| variant.id.as_str())
+                        .collect::<Vec<_>>(),
+                    partial
+                        .iter()
+                        .map(|(variant, _)| variant.id.as_str())
+                        .collect::<Vec<_>>()
+                ),
+                tensor_name: present
+                    .first()
+                    .and_then(|variant| variant.discriminator_keys.first())
+                    .cloned(),
+                tensor_type_code: None,
+                metadata_key: None,
+            });
+        }
+
         if present.len() > 1 {
             issues.push(CheckpointIssue {
                 kind: CheckpointIssueKind::ConflictingLayout,
@@ -700,6 +725,13 @@ mod tests {
         assert!(conflict
             .iter()
             .any(|issue| issue.detail.contains("conflicting variants")));
+        let mixed_partial = evaluate(BTreeMap::from([
+            safe("packed", &[4, 2], StoredDtype::F32),
+            safe("gate", &[2, 2], StoredDtype::F32),
+        ]));
+        assert!(mixed_partial
+            .iter()
+            .any(|issue| issue.detail.contains("partially present variants")));
     }
 
     #[test]

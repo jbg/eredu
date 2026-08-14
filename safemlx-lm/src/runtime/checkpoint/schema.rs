@@ -354,7 +354,8 @@ fn normalize_plan<T: PhysicalConstraint>(
                 key: tensor.key().into(),
             });
         }
-        if tensor.shape().is_empty() || tensor.shape().contains(&0) {
+        // Empty shapes are scalar tensors. A zero-sized dimension is invalid.
+        if tensor.shape().contains(&0) {
             return Err(CheckpointPlanError::InvalidShape {
                 key: tensor.key().into(),
                 shape: tensor.shape().to_vec(),
@@ -536,7 +537,11 @@ mod tests {
         };
         let plan = SafetensorsCheckpointPlan::new(
             "stable",
-            vec![tensor("z", vec![2]), tensor("a", vec![1])],
+            vec![
+                tensor("z", vec![2]),
+                tensor("a", vec![1]),
+                tensor("scalar", vec![]),
+            ],
             Vec::new(),
             CatalogPolicy::strict(),
         )
@@ -546,7 +551,7 @@ mod tests {
                 .iter()
                 .map(|tensor| tensor.key.as_str())
                 .collect::<Vec<_>>(),
-            ["a", "z"]
+            ["a", "scalar", "z"]
         );
         assert!(matches!(
             SafetensorsCheckpointPlan::new(
