@@ -534,8 +534,8 @@ pub fn validate_model_config_value(value: &Value) -> Result<(), Error> {
 /// Per-layer V4 cache state.
 #[derive(Debug, Clone)]
 pub struct Cache {
-    layers: Vec<AttentionCache>,
-    mtp_layers: Vec<AttentionCache>,
+    pub(crate) layers: Vec<AttentionCache>,
+    pub(crate) mtp_layers: Vec<AttentionCache>,
 }
 
 impl Cache {
@@ -608,6 +608,32 @@ impl DecoderLayer {
             self.ffn_hc.collapse(&hidden, self.norm_epsilon, stream)?;
         let normalized = self.ffn_norm.forward(&collapsed, stream)?;
         let feed_forward = self.ffn.forward(&normalized, input_ids, stream)?;
+        expand(&feed_forward, residual, &post, &combination, stream)
+    }
+
+    pub(crate) fn forward_with_expert_executor(
+        &mut self,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut AttentionCache>,
+        input_ids: &Array,
+        stream: &Stream,
+        execute: impl FnMut(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    ) -> Result<Array, Exception> {
+        let residual = hidden;
+        let (collapsed, post, combination) =
+            self.attn_hc.collapse(hidden, self.norm_epsilon, stream)?;
+        let normalized = self.attn_norm.forward(&collapsed, stream)?;
+        let attention = self.attn.forward(&normalized, mask, cache, stream)?;
+        let hidden = expand(&attention, residual, &post, &combination, stream)?;
+
+        let residual = &hidden;
+        let (collapsed, post, combination) =
+            self.ffn_hc.collapse(&hidden, self.norm_epsilon, stream)?;
+        let normalized = self.ffn_norm.forward(&collapsed, stream)?;
+        let feed_forward =
+            self.ffn
+                .forward_with_expert_executor(&normalized, input_ids, stream, execute)?;
         expand(&feed_forward, residual, &post, &combination, stream)
     }
 
@@ -796,7 +822,7 @@ impl MtpLayer {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct MtpModule {
+pub(crate) struct MtpModule {
     #[param]
     layers: Vec<MtpLayer>,
 }
@@ -816,7 +842,7 @@ impl MtpModule {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct DsparkModule {
+pub(crate) struct DsparkModule {
     #[param]
     layers: Vec<DecoderLayer>,
     #[param]
@@ -983,9 +1009,9 @@ pub struct Model {
     /// Language-model output projection.
     pub lm_head: Linear,
     #[param]
-    mtp: Option<MtpModule>,
+    pub(crate) mtp: Option<MtpModule>,
     #[param]
-    dspark: Option<DsparkModule>,
+    pub(crate) dspark: Option<DsparkModule>,
 }
 
 impl Model {

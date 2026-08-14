@@ -2,6 +2,8 @@
 
 mod attention;
 mod layers;
+/// Generalized bounded-residency execution.
+pub mod layerwise;
 /// Configuration and decoder implementation.
 pub mod model;
 

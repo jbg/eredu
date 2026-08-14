@@ -424,7 +424,8 @@ impl LayerWeightResidency {
         WeightResidency::with_layers(self)
     }
 
-    const fn is_fully_resident(self) -> bool {
+    /// Returns whether every ordinary execution unit remains device-resident.
+    pub const fn is_fully_resident(self) -> bool {
         matches!(self, Self::FullyResident)
     }
 

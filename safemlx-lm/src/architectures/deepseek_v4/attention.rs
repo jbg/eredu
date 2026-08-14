@@ -327,11 +327,43 @@ pub(crate) enum AttentionCache {
 }
 
 impl AttentionCache {
+    pub(crate) fn new_for_ratio(ratio: i32, sliding_window: i32) -> Result<Self, Exception> {
+        let local = ConcatKeyValueCache::new_for_sliding_attention(sliding_window);
+        match ratio {
+            0 => Ok(Self::Local(local)),
+            4 => Ok(Self::Sparse {
+                local,
+                pool: PoolingCache::new(4)?,
+                index_pool: PoolingCache::new(4)?,
+            }),
+            ratio => Ok(Self::Compressed {
+                local,
+                pool: PoolingCache::new(ratio)?,
+            }),
+        }
+    }
+
     pub(crate) fn offset(&self) -> i32 {
         match self {
             Self::Local(cache)
             | Self::Compressed { local: cache, .. }
             | Self::Sparse { local: cache, .. } => cache.offset(),
+        }
+    }
+
+    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::Local(local) => local.arrays().collect(),
+            Self::Compressed { local, pool } => local.arrays().chain(pool.arrays()).collect(),
+            Self::Sparse {
+                local,
+                pool,
+                index_pool,
+            } => local
+                .arrays()
+                .chain(pool.arrays())
+                .chain(index_pool.arrays())
+                .collect(),
         }
     }
 }
@@ -528,19 +560,7 @@ impl Attention {
     }
 
     pub(crate) fn new_cache(&self, sliding_window: i32) -> Result<AttentionCache, Exception> {
-        let local = ConcatKeyValueCache::new_for_sliding_attention(sliding_window);
-        match self.ratio {
-            0 => Ok(AttentionCache::Local(local)),
-            4 => Ok(AttentionCache::Sparse {
-                local,
-                pool: PoolingCache::new(4)?,
-                index_pool: PoolingCache::new(4)?,
-            }),
-            ratio => Ok(AttentionCache::Compressed {
-                local,
-                pool: PoolingCache::new(ratio)?,
-            }),
-        }
+        AttentionCache::new_for_ratio(self.ratio, sliding_window)
     }
 
     pub(crate) fn forward(

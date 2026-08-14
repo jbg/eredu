@@ -794,6 +794,8 @@ pub struct PackedSwiGluExperts {
     pub gate_up_iquant: Option<WeightQuantization>,
     /// Optional checkpoint-native IQ encoding for the down projection.
     pub down_iquant: Option<WeightQuantization>,
+    /// Whether weights/scales use checkpoint-native block FP8 with E8M0 scales.
+    pub native_fp8_e8m0: bool,
     #[param]
     /// Concatenated gate/up weights shaped `[experts, 2 * intermediate, hidden]`.
     pub gate_up_proj: Param<Array>,
@@ -945,6 +947,7 @@ impl PackedSwiGluExperts {
             down_affine,
             gate_up_iquant,
             down_iquant,
+            native_fp8_e8m0: false,
             gate_up_proj,
             gate_up_proj_scales,
             gate_up_proj_biases,
@@ -967,6 +970,41 @@ impl PackedSwiGluExperts {
         Ok(self)
     }
 
+    /// Rebuilds projection storage for native block-FP8 expert tensors.
+    pub fn with_native_fp8_e8m0(mut self, stream: &Stream) -> Result<Self, Exception> {
+        let ceil128 = |value: i32| (value + 127) / 128;
+        self.gate_up_proj = Param::<Array>::unloaded(
+            &[self.num_experts, 2 * self.intermediate_dim, self.hidden_dim],
+            Dtype::Uint8,
+            stream,
+        )?;
+        self.gate_up_proj_scales = Param::<Option<Array>>::unloaded_some(
+            &[
+                self.num_experts,
+                ceil128(2 * self.intermediate_dim),
+                ceil128(self.hidden_dim),
+            ],
+            Dtype::Uint8,
+            stream,
+        )?;
+        self.down_proj = Param::<Array>::unloaded(
+            &[self.num_experts, self.hidden_dim, self.intermediate_dim],
+            Dtype::Uint8,
+            stream,
+        )?;
+        self.down_proj_scales = Param::<Option<Array>>::unloaded_some(
+            &[
+                self.num_experts,
+                ceil128(self.hidden_dim),
+                ceil128(self.intermediate_dim),
+            ],
+            Dtype::Uint8,
+            stream,
+        )?;
+        self.native_fp8_e8m0 = true;
+        Ok(self)
+    }
+
     fn forward_chunk(
         &mut self,
         hidden_states: &Array,
@@ -977,7 +1015,18 @@ impl PackedSwiGluExperts {
         let num_tokens = hidden_states.dim(0);
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
-        let gate_up = if let Some(iquant) = self.gate_up_iquant {
+        let gate_up = if self.native_fp8_e8m0 {
+            crate::nn::fp8::grouped_linear(
+                &hidden,
+                self.gate_up_proj.as_ref(),
+                self.gate_up_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("native FP8 gate/up scales"),
+                &plan.sorted_group_ids,
+                stream,
+            )?
+        } else if let Some(iquant) = self.gate_up_iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
             let native = NativeQuantizedTensor::from_iq_array(
                 self.gate_up_proj.value.clone(),
@@ -1015,7 +1064,18 @@ impl PackedSwiGluExperts {
             up = safemlx::ops::clip(up, (-limit, limit), stream)?;
         }
         let activated = silu(gate, stream)?.multiply(up, stream)?;
-        let output = if let Some(iquant) = self.down_iquant {
+        let output = if self.native_fp8_e8m0 {
+            crate::nn::fp8::grouped_linear(
+                &activated,
+                self.down_proj.as_ref(),
+                self.down_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .expect("native FP8 down scales"),
+                &plan.sorted_group_ids,
+                stream,
+            )?
+        } else if let Some(iquant) = self.down_iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
             let native = NativeQuantizedTensor::from_iq_array(
                 self.down_proj.value.clone(),

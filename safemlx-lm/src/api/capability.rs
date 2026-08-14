@@ -606,6 +606,7 @@ impl Model {
             }
             Self::DeepSeekV3(model) => deepseek_spec(model.args())?,
             Self::DeepSeekV4(model) => deepseek_v4_spec(&model.args)?,
+            Self::DeepSeekV4Layerwise(model) => deepseek_v4_spec(model.args())?,
             Self::GptOss(model) => gpt_oss_spec(model.args())?,
             Self::Gemma4(model) => {
                 let (_, _, image, audio, video) = model.media_accounting();
@@ -2371,6 +2372,7 @@ impl Model {
             }
             Self::DeepSeekV3(_)
             | Self::DeepSeekV4(_)
+            | Self::DeepSeekV4Layerwise(_)
             | Self::GptOss(_)
             | Self::KimiLinear(_)
             | Self::Llama(_)

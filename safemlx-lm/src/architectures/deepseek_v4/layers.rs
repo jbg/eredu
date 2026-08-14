@@ -146,15 +146,22 @@ impl Moe {
         };
         Ok(Self {
             gate: MoeGate::new(args, layer_index, stream)?,
-            switch_mlp: PackedSwiGluExperts::new(
-                args.n_routed_experts,
-                args.hidden_size,
-                args.moe_intermediate_size,
-                expert_quantization,
-                expert_quantization,
-                stream,
-            )?
-            .with_swiglu_limit(args.swiglu_limit)?,
+            switch_mlp: {
+                let bank = PackedSwiGluExperts::new(
+                    args.n_routed_experts,
+                    args.hidden_size,
+                    args.moe_intermediate_size,
+                    expert_quantization,
+                    expert_quantization,
+                    stream,
+                )?;
+                let bank = if args.expert_dtype.as_deref() == Some("fp8") {
+                    bank.with_native_fp8_e8m0(stream)?
+                } else {
+                    bank
+                };
+                bank.with_swiglu_limit(args.swiglu_limit)?
+            },
             shared_experts: Mlp::new(
                 args,
                 args.moe_intermediate_size * args.n_shared_experts,
@@ -174,6 +181,21 @@ impl Moe {
         let flat = input.reshape(&[-1, input.dim(-1)], stream)?;
         let (indices, weights) = self.gate.forward(&flat, input_ids, stream)?;
         let routed = self.switch_mlp.forward(&flat, &indices, &weights, stream)?;
+        let shared = self.shared_experts.forward(&flat, stream)?;
+        routed.add(shared, stream)?.reshape(shape, stream)
+    }
+
+    pub(crate) fn forward_with_expert_executor(
+        &mut self,
+        input: &Array,
+        input_ids: &Array,
+        stream: &Stream,
+        mut execute: impl FnMut(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    ) -> Result<Array, Exception> {
+        let shape = input.shape();
+        let flat = input.reshape(&[-1, input.dim(-1)], stream)?;
+        let (indices, weights) = self.gate.forward(&flat, input_ids, stream)?;
+        let routed = execute(&flat, &indices, &weights, stream)?;
         let shared = self.shared_experts.forward(&flat, stream)?;
         routed.add(shared, stream)?.reshape(shape, stream)
     }
