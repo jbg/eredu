@@ -730,6 +730,7 @@ fn pipeline_ring_worker() {
             descriptor.clone(),
             &prefix_ids,
             &PromptCacheOptions::default(),
+            &stream,
         )
         .unwrap();
     let token = safemlx::Array::from_slice(&[0u32], &[1, 1]);

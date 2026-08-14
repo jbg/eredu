@@ -48,10 +48,11 @@ pub use runtime::cache::residency::{
     CacheLayerResidencyStats, CachePoolLimits, CachePoolReport, CachePoolResource,
     CacheRankIdentity, CacheRepresentation, CacheResidencyError, CacheResidencyManager,
     CacheResidencyPolicy, CacheResidencyPool, CacheResidencyReport, CacheTier, LayerCachePolicy,
-    LiveCacheDiskPolicy, MutableStateResidency, PagedCacheOptions, PromptCacheBlock,
-    PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions, PromptCacheStateTensor,
-    PromptCacheTopology, StateResidencyClass, StateTensorDimension, StateTensorDtype,
-    StateTensorOwner, StateTensorPolicy, StateTensorRole, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+    LiveCacheDiskPolicy, MutableStateResidency, PagedCacheOptions, PoolingStateComponent,
+    PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
+    PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass, StateTensorDimension,
+    StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorPresence, StateTensorRole,
+    CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 pub use runtime::cache::PagedKeyValueCache;
 pub use runtime::distributed::cartesian::CartesianExecution;

@@ -4,7 +4,11 @@
 //! than individual repository names.  Flash, Pro, Base, Instruct, MTP, and
 //! fused DSpark checkpoints therefore share one validation path.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    num::NonZeroU32,
+    path::Path,
+};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -32,7 +36,15 @@ use crate::{
         hyper_connections::{expand, HyperConnection, HyperHead},
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::residency::{derive_prompt_cache_architecture_fingerprint, LayerCachePolicy},
+    runtime::cache::residency::{
+        derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
+        save_prompt_cache_snapshot, validate_prompt_cache_model_identity, CacheBlockArrays,
+        CacheRankIdentity, LayerCachePolicy, LoadedPromptCacheBlock, MutableStateResidency,
+        PagedCacheOptions, PoolingStateComponent, PromptCacheDescriptor, PromptCacheManifest,
+        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
+        PromptCacheTopology, StateTensorDimension, StateTensorDtype, StateTensorPolicy,
+        StateTensorRole,
+    },
     runtime::checkpoint::load::{
         gguf_quantization_configs,
         load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadConfig,
@@ -1242,29 +1254,57 @@ impl Model {
         )
     }
 
-    /// Returns the cache layout when it can be represented by the generic
-    /// prompt-cache schema. Compressed sparse V4 layers carry pooled and
-    /// indexer state and therefore require the richer V4 cache schema.
+    /// Returns the exact generic prompt-cache layout, including compressed
+    /// pooling and sparse-indexer state.
     pub(crate) fn prompt_cache_layer_layout(
         &self,
     ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
-        if self.args.compress_ratios.iter().any(|ratio| *ratio != 0) {
-            return Err(Error::UnsupportedArchitecture(
-                "DeepSeek-V4 compressed sparse prompt caches require pooled/indexer state".into(),
-            ));
-        }
-        let policy = LayerCachePolicy::key_value(
-            AttentionPolicy::sliding(self.args.sliding_window as u32)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            self.args.num_attention_heads,
-            self.args.head_dim,
+        prompt_cache_layer_layout(&self.args, 0..self.args.num_hidden_layers as usize)
+    }
+
+    /// Atomically persists target KV plus compressed pooling/indexer state.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        validate_prompt_cache_model_identity(
+            &descriptor,
+            &prompt_cache_model_identity(&self.args, PromptCacheTopology::default())?,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        LayerSchedule::new(
-            self.args.num_hidden_layers as usize,
-            vec![policy; self.args.num_hidden_layers as usize],
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        save_prompt_cache_with_rank(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            None,
+            stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+    }
+
+    /// Restores target KV plus compressed pooling/indexer state exactly.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        load_prompt_cache_with_identity(
+            &self.args,
+            directory,
+            expected,
+            prefix_token_ids,
+            prompt_cache_model_identity(&self.args, PromptCacheTopology::default())?,
+            stream,
+        )
     }
 
     /// Runs target decoding and returns vocabulary logits.
@@ -1277,6 +1317,355 @@ impl Model {
         let hidden = self.model.forward(input_ids, cache, stream)?;
         self.lm_head.forward(&hidden, stream)
     }
+}
+
+fn pooling_role(stream: u32, component: PoolingStateComponent) -> StateTensorRole {
+    StateTensorRole::Pooling { stream, component }
+}
+
+fn pooling_state_policies(
+    stream: u32,
+    ratio: i32,
+    width: i32,
+    overlapping: bool,
+) -> Result<Vec<StateTensorPolicy>, Error> {
+    let divisor = NonZeroU32::new(ratio as u32).ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("invalid DeepSeek V4 compression ratio {ratio}"))
+    })?;
+    let fixed = |value| {
+        StateTensorDimension::fixed(value)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+    };
+    let policy = |component, shape| {
+        StateTensorPolicy::new(
+            pooling_role(stream, component),
+            shape,
+            StateTensorDtype::Floating,
+            MutableStateResidency::AlwaysDeviceMutable,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+    };
+    let source_width = if overlapping { width * 2 } else { width };
+    let mut policies = vec![
+        policy(
+            PoolingStateComponent::PendingValues,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::PrefixTokensRem(divisor),
+                fixed(source_width)?,
+            ],
+        )?
+        .when_prefix_remainder_nonzero(divisor),
+        policy(
+            PoolingStateComponent::PendingGates,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::PrefixTokensRem(divisor),
+                fixed(source_width)?,
+            ],
+        )?
+        .when_prefix_remainder_nonzero(divisor),
+        policy(
+            PoolingStateComponent::Pooled,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::PrefixTokensDiv(divisor),
+                fixed(width)?,
+            ],
+        )?
+        .when_prefix_at_least(divisor),
+    ];
+    if overlapping {
+        for component in [
+            PoolingStateComponent::OverlapValues,
+            PoolingStateComponent::OverlapGates,
+        ] {
+            policies.push(
+                policy(
+                    component,
+                    vec![StateTensorDimension::Batch, fixed(ratio)?, fixed(width)?],
+                )?
+                .when_prefix_at_least(divisor),
+            );
+        }
+    }
+    Ok(policies)
+}
+
+pub(crate) fn prompt_cache_layer_layout(
+    args: &ModelArgs,
+    range: std::ops::Range<usize>,
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let attention = AttentionPolicy::sliding(args.sliding_window as u32)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let mut policies = Vec::with_capacity(range.len());
+    for layer in range.clone() {
+        let ratio = args.compress_ratios[layer];
+        let policy = if ratio == 0 {
+            LayerCachePolicy::key_only(attention, args.num_key_value_heads, args.head_dim)
+        } else {
+            let mut tensors = pooling_state_policies(0, ratio, args.head_dim, ratio == 4)?;
+            if ratio == 4 {
+                tensors.extend(pooling_state_policies(1, ratio, args.index_head_dim, true)?);
+            }
+            LayerCachePolicy::key_only_with_fixed_state(
+                attention,
+                args.num_key_value_heads,
+                args.head_dim,
+                tensors,
+            )
+        }
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        policies.push(policy);
+    }
+    LayerSchedule::new(range.len(), policies)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+pub(crate) fn prompt_cache_model_identity(
+    args: &ModelArgs,
+    topology: PromptCacheTopology,
+) -> Result<PromptCacheModelIdentity, Error> {
+    let layer_count = args.num_hidden_layers as usize;
+    Ok(PromptCacheModelIdentity {
+        model_family: "deepseek_v4".into(),
+        effective_model_type: args.model_type.clone(),
+        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+        layer_count,
+        global_layer_start: 0,
+        global_layer_end: layer_count,
+        sink_tokens: 0,
+        topology,
+        layer_layout: prompt_cache_layer_layout(args, 0..layer_count)?,
+    })
+}
+
+pub(crate) fn save_prompt_cache_with_rank(
+    cache: &mut Cache,
+    destination: impl AsRef<Path>,
+    descriptor: PromptCacheDescriptor,
+    prefix_token_ids: &[u32],
+    options: &PromptCacheOptions,
+    rank: Option<CacheRankIdentity>,
+    stream: &Stream,
+) -> Result<PromptCacheManifest, Error> {
+    save_attention_prompt_cache(
+        &cache.layers,
+        destination,
+        descriptor,
+        prefix_token_ids,
+        options,
+        rank,
+        stream,
+    )
+}
+
+pub(crate) fn save_attention_prompt_cache(
+    caches: &[AttentionCache],
+    destination: impl AsRef<Path>,
+    descriptor: PromptCacheDescriptor,
+    prefix_token_ids: &[u32],
+    options: &PromptCacheOptions,
+    rank: Option<CacheRankIdentity>,
+    stream: &Stream,
+) -> Result<PromptCacheManifest, Error> {
+    let end = i32::try_from(prefix_token_ids.len())
+        .map_err(|_| Error::UnsupportedArchitecture("V4 prompt length exceeds i32".into()))?;
+    if caches.len() != descriptor.layer_layout.len() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "V4 cache contains {} target layers, descriptor contains {}",
+            caches.len(),
+            descriptor.layer_layout.len()
+        )));
+    }
+    let mut blocks = Vec::with_capacity(caches.len());
+    for (index, layer_cache) in caches.iter().enumerate() {
+        if layer_cache.offset() != end {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "V4 layer {index} cache offset {} does not match prefix {end}",
+                layer_cache.offset()
+            )));
+        }
+        let (keys, values) = layer_cache.local_snapshot(stream)?.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("V4 layer {index} local KV state is missing"))
+        })?;
+        if values.dim(-1) != 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "V4 layer {index} local cache unexpectedly contains value channels"
+            )));
+        }
+        // Safetensors deliberately rejects zero-element arrays. Key-only
+        // blocks therefore persist one zero sentinel channel per token; the
+        // canonical KeyOnly policy validates it and restore drops it.
+        let mut sentinel_shape = keys.shape().to_vec();
+        *sentinel_shape
+            .last_mut()
+            .expect("V4 key cache is rank four") = 1;
+        let values = safemlx::ops::zeros_dtype(&sentinel_shape, keys.dtype(), stream)?;
+        let retained = i64::from(keys.dim(-2));
+        blocks.push(PromptCacheSnapshotBlock {
+            global_layer: descriptor.global_layer_start + index,
+            start: i64::from(end) - retained,
+            end: i64::from(end),
+            rank,
+            arrays: CacheBlockArrays::KeyValue { keys, values },
+        });
+    }
+    let state = caches
+        .iter()
+        .enumerate()
+        .flat_map(|(index, cache)| {
+            cache.prompt_cache_state_arrays(descriptor.global_layer_start + index)
+        })
+        .collect::<Vec<_>>();
+    save_prompt_cache_snapshot(
+        destination,
+        descriptor,
+        prefix_token_ids,
+        blocks,
+        &state,
+        options,
+    )
+    .map_err(|error| Exception::custom(error.to_string()).into())
+}
+
+fn restore_local_blocks(
+    layer: usize,
+    end: i32,
+    mut blocks: Vec<LoadedPromptCacheBlock>,
+    cache: &mut AttentionCache,
+    stream: &Stream,
+) -> Result<(), Error> {
+    blocks.sort_by_key(|block| block.start);
+    let start = blocks.first().map_or(i64::from(end), |block| block.start);
+    let mut expected = start;
+    let mut keys = Vec::with_capacity(blocks.len());
+    let mut values = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if block.start != expected {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "V4 layer {layer} prompt-cache blocks are not contiguous"
+            )));
+        }
+        expected = block.end;
+        match block.arrays {
+            CacheBlockArrays::KeyValue {
+                keys: block_keys,
+                values: block_values,
+            } => {
+                keys.push(block_keys);
+                values.push(block_values);
+            }
+            CacheBlockArrays::CompressedLatentRotary { .. } => {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "V4 layer {layer} prompt-cache representation mismatch"
+                )));
+            }
+        }
+    }
+    if expected != i64::from(end) || keys.is_empty() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "V4 layer {layer} prompt-cache KV state is incomplete"
+        )));
+    }
+    let keys = concatenate_axis(&keys, -2, stream)?;
+    let persisted_values = concatenate_axis(&values, -2, stream)?;
+    if persisted_values.dim(-1) != 1 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "V4 layer {layer} key-only sentinel geometry is invalid"
+        )));
+    }
+    let mut value_shape = keys.shape().to_vec();
+    *value_shape.last_mut().expect("V4 key cache is rank four") = 0;
+    let values = safemlx::ops::zeros_dtype(&value_shape, keys.dtype(), stream)?;
+    cache.restore_local(keys, values, end)?;
+    Ok(())
+}
+
+fn empty_cache_for_args(args: &ModelArgs) -> Result<Cache, Error> {
+    let target_count = args.num_hidden_layers as usize;
+    let draft_count = args.num_nextn_predict_layers.max(0) as usize;
+    let build = |layer: usize| {
+        AttentionCache::new_for_ratio(args.compress_ratios[layer], args.sliding_window)
+            .map_err(Error::from)
+    };
+    Ok(Cache {
+        layers: (0..target_count).map(&build).collect::<Result<_, _>>()?,
+        mtp_layers: (target_count..target_count + draft_count)
+            .map(build)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+pub(crate) fn load_prompt_cache_with_identity(
+    args: &ModelArgs,
+    directory: impl AsRef<Path>,
+    expected: &PromptCacheDescriptor,
+    prefix_token_ids: &[u32],
+    identity: PromptCacheModelIdentity,
+    stream: &Stream,
+) -> Result<(Cache, PromptCacheManifest), Error> {
+    let (layers, manifest) = load_attention_prompt_cache_with_identity(
+        args,
+        directory,
+        expected,
+        prefix_token_ids,
+        identity,
+        stream,
+    )?;
+    let mut cache = empty_cache_for_args(args)?;
+    cache.layers = layers;
+    Ok((cache, manifest))
+}
+
+pub(crate) fn load_attention_prompt_cache_with_identity(
+    args: &ModelArgs,
+    directory: impl AsRef<Path>,
+    expected: &PromptCacheDescriptor,
+    prefix_token_ids: &[u32],
+    identity: PromptCacheModelIdentity,
+    stream: &Stream,
+) -> Result<(Vec<AttentionCache>, PromptCacheManifest), Error> {
+    let (blocks, state, manifest) =
+        open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+    let mut by_layer = BTreeMap::<usize, Vec<_>>::new();
+    for block in blocks {
+        by_layer.entry(block.global_layer).or_default().push(block);
+    }
+    let mut state = state
+        .into_iter()
+        .map(|tensor| ((tensor.owner, tensor.role), tensor.array))
+        .collect::<BTreeMap<_, _>>();
+    let end = i32::try_from(prefix_token_ids.len())
+        .map_err(|_| Error::UnsupportedArchitecture("V4 prompt length exceeds i32".into()))?;
+    let mut caches = (identity.global_layer_start..identity.global_layer_end)
+        .map(|layer| {
+            AttentionCache::new_for_ratio(args.compress_ratios[layer], args.sliding_window)
+                .map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, layer_cache) in caches.iter_mut().enumerate() {
+        let global_layer = identity.global_layer_start + index;
+        restore_local_blocks(
+            global_layer,
+            end,
+            by_layer.remove(&global_layer).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "V4 layer {global_layer} prompt-cache KV state is missing"
+                ))
+            })?,
+            layer_cache,
+            stream,
+        )?;
+        layer_cache.restore_prompt_cache_state(global_layer, &mut state, end)?;
+    }
+    if !by_layer.is_empty() || !state.is_empty() {
+        return Err(Error::UnsupportedArchitecture(
+            "V4 prompt cache contains unexpected layer state".into(),
+        ));
+    }
+    Ok((caches, manifest))
 }
 
 /// Stable identity for all cache-relevant V4 geometry.
@@ -2025,8 +2414,17 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
-    use super::ModelArgs;
+    use super::{
+        load_prompt_cache_with_identity, prompt_cache_model_identity, save_prompt_cache_with_rank,
+        AttentionCache, Cache, ModelArgs,
+    };
+    use crate::runtime::cache::{
+        residency::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
+        KeyValueCache, PoolingCache,
+    };
+    use safemlx::{ops::zeros_dtype, Device, DeviceType, Dtype, Stream};
     use serde_json::json;
+    use tempfile::TempDir;
 
     fn minimal_config() -> serde_json::Value {
         json!({
@@ -2096,5 +2494,170 @@ mod tests {
         value["dspark_target_layer_ids"] = json!([0, 2]);
         value["dspark_markov_rank"] = json!(8);
         assert!(ModelArgs::from_value(value).unwrap().has_dspark());
+    }
+
+    fn fill_pool(
+        pool: &mut PoolingCache,
+        prefix: i32,
+        width: i32,
+        overlapping: bool,
+        stream: &Stream,
+    ) {
+        let source_width = width * if overlapping { 2 } else { 1 };
+        let values = zeros_dtype(&[1, prefix, source_width], Dtype::Float32, stream).unwrap();
+        let gates = zeros_dtype(&[1, prefix, source_width], Dtype::Float32, stream).unwrap();
+        pool.accumulate_windows(values, gates, 0, stream).unwrap();
+        let complete = prefix / pool.ratio();
+        if complete > 0 {
+            pool.update_and_fetch(
+                zeros_dtype(&[1, complete, width], Dtype::Float32, stream).unwrap(),
+                stream,
+            )
+            .unwrap();
+            if overlapping {
+                pool.replace_overlap(
+                    zeros_dtype(&[1, pool.ratio(), width], Dtype::Float32, stream).unwrap(),
+                    zeros_dtype(&[1, pool.ratio(), width], Dtype::Float32, stream).unwrap(),
+                );
+            }
+        }
+    }
+
+    fn populated_cache(args: &ModelArgs, prefix: i32, stream: &Stream) -> Cache {
+        let mut layers = args.compress_ratios[..args.num_hidden_layers as usize]
+            .iter()
+            .map(|ratio| AttentionCache::new_for_ratio(*ratio, args.sliding_window).unwrap())
+            .collect::<Vec<_>>();
+        for cache in &mut layers {
+            let keys = zeros_dtype(&[1, 1, prefix, args.head_dim], Dtype::Float32, stream).unwrap();
+            let values = zeros_dtype(&[1, 1, prefix, 0], Dtype::Float32, stream).unwrap();
+            match cache {
+                AttentionCache::Local(local)
+                | AttentionCache::Compressed { local, .. }
+                | AttentionCache::Sparse { local, .. } => {
+                    local.update_and_fetch(keys, values, stream).unwrap();
+                }
+            }
+            match cache {
+                AttentionCache::Local(_) => {}
+                AttentionCache::Compressed { pool, .. } => {
+                    fill_pool(pool, prefix, args.head_dim, false, stream);
+                }
+                AttentionCache::Sparse {
+                    pool, index_pool, ..
+                } => {
+                    fill_pool(pool, prefix, args.head_dim, true, stream);
+                    fill_pool(index_pool, prefix, args.index_head_dim, true, stream);
+                }
+            }
+        }
+        Cache {
+            layers,
+            mtp_layers: Vec::new(),
+        }
+    }
+
+    fn descriptor(args: &ModelArgs) -> PromptCacheDescriptor {
+        let identity = prompt_cache_model_identity(args, PromptCacheTopology::default()).unwrap();
+        PromptCacheDescriptor {
+            model_family: identity.model_family,
+            effective_model_type: identity.effective_model_type,
+            checkpoint_fingerprint: "checkpoint".into(),
+            prefix_content_fingerprint: "prefix".into(),
+            architecture_fingerprint: identity.architecture_fingerprint,
+            layer_count: identity.layer_count,
+            global_layer_start: identity.global_layer_start,
+            global_layer_end: identity.global_layer_end,
+            batch_size: 1,
+            layer_layout: identity.layer_layout,
+            sink_tokens: identity.sink_tokens,
+            topology: identity.topology,
+        }
+    }
+
+    #[test]
+    fn compressed_prompt_cache_round_trips_all_pooling_components() {
+        let args = ModelArgs::from_value(minimal_config()).unwrap();
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let destination = TempDir::new().unwrap();
+        let descriptor = descriptor(&args);
+        for (length, expected_total, expected_sparse, expected_long) in
+            [(5usize, 12usize, 10usize, 2usize), (128, 7, 6, 1)]
+        {
+            let prefix = (0..length as u32).collect::<Vec<_>>();
+            let mut cache = populated_cache(&args, length as i32, &stream);
+            let path = destination.path().join(format!("cache-{length}"));
+            let manifest = save_prompt_cache_with_rank(
+                &mut cache,
+                &path,
+                descriptor.clone(),
+                &prefix,
+                &PromptCacheOptions::default(),
+                None,
+                &stream,
+            )
+            .unwrap();
+            assert_eq!(manifest.blocks.len(), 3);
+            assert_eq!(manifest.state_tensors.len(), expected_total);
+
+            let identity =
+                prompt_cache_model_identity(&args, PromptCacheTopology::default()).unwrap();
+            let (restored, restored_manifest) = load_prompt_cache_with_identity(
+                &args,
+                &path,
+                &descriptor,
+                &prefix,
+                identity,
+                &stream,
+            )
+            .unwrap();
+            assert_eq!(restored_manifest, manifest);
+            assert_eq!(restored.offset(), length as i32);
+            assert_eq!(
+                restored.layers[1].prompt_cache_state_arrays(1).len(),
+                expected_sparse
+            );
+            assert_eq!(
+                restored.layers[2].prompt_cache_state_arrays(2).len(),
+                expected_long
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_prompt_cache_rejects_missing_conditional_state() {
+        let args = ModelArgs::from_value(minimal_config()).unwrap();
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let prefix = [1, 2, 3, 4, 5];
+        let mut cache = populated_cache(&args, prefix.len() as i32, &stream);
+        let destination = TempDir::new().unwrap();
+        let path = destination.path().join("cache");
+        let descriptor = descriptor(&args);
+        save_prompt_cache_with_rank(
+            &mut cache,
+            &path,
+            descriptor.clone(),
+            &prefix,
+            &PromptCacheOptions::default(),
+            None,
+            &stream,
+        )
+        .unwrap();
+        let manifest_path = path.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&manifest_path).unwrap()).unwrap();
+        manifest["state_tensors"].as_array_mut().unwrap().remove(0);
+        serde_json::to_writer_pretty(std::fs::File::create(&manifest_path).unwrap(), &manifest)
+            .unwrap();
+        let identity = prompt_cache_model_identity(&args, PromptCacheTopology::default()).unwrap();
+        assert!(load_prompt_cache_with_identity(
+            &args,
+            &path,
+            &descriptor,
+            &prefix,
+            identity,
+            &stream,
+        )
+        .is_err());
     }
 }

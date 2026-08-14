@@ -1023,6 +1023,17 @@ impl ExpertParallelModel {
                 .save_prompt_cache(directory, descriptor, prefix_token_ids, options)
                 .map_err(Into::into),
             (
+                ExpertArchitecture::DeepSeekV4Layerwise(model),
+                ExpertParallelCache::DeepSeekV4(cache),
+            ) => model.save_prompt_cache(
+                cache,
+                directory,
+                descriptor,
+                prefix_token_ids,
+                options,
+                stream,
+            ),
+            (
                 ExpertArchitecture::KimiLinear(_) | ExpertArchitecture::KimiLinearLayerwise(_),
                 ExpertParallelCache::KimiLinear(cache),
             ) => kimi_linear::Model::save_prompt_cache_with_rank(
@@ -1112,6 +1123,11 @@ impl ExpertParallelModel {
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let directory = self.prompt_cache_rank_directory(root.as_ref());
         match &self.architecture {
+            ExpertArchitecture::DeepSeekV4Layerwise(model) => {
+                return model
+                    .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                    .map(|(cache, manifest)| (ExpertParallelCache::DeepSeekV4(cache), manifest));
+            }
             ExpertArchitecture::KimiLinear(model) => {
                 return kimi_linear::Model::load_paged_prompt_cache_with_identity(
                     &model.args,
@@ -1298,6 +1314,9 @@ impl ExpertParallelModel {
                 Some(model.prompt_cache_model_identity()?)
             }
             ExpertArchitecture::GptOssLayerwise(model) => {
+                Some(model.prompt_cache_model_identity()?)
+            }
+            ExpertArchitecture::DeepSeekV4Layerwise(model) => {
                 Some(model.prompt_cache_model_identity()?)
             }
             ExpertArchitecture::InklingLayerwise(model) => {

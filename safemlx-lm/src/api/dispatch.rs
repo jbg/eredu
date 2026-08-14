@@ -1023,9 +1023,8 @@ impl Model {
         match self {
             Self::Llama(model) => load!(model, ModelCache::Llama),
             Self::DeepSeekV3(model) => load!(model, ModelCache::DeepSeekV3),
-            Self::DeepSeekV4(_) | Self::DeepSeekV4Layerwise(_) => Err(Exception::custom(
-                "persisted DeepSeek-V4 prompt caches are not supported yet",
-            )),
+            Self::DeepSeekV4(model) => load!(model, ModelCache::DeepSeekV4),
+            Self::DeepSeekV4Layerwise(model) => load!(model, ModelCache::DeepSeekV4),
             Self::GptOss(model) => load!(model, ModelCache::GptOss),
             Self::DenseQwen(model) => load!(model, ModelCache::KeyValue),
             Self::MuseGlimmer(model) => load!(model, ModelCache::KeyValue),
@@ -1065,6 +1064,30 @@ impl Model {
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::DeepSeekV4(model), ModelCache::DeepSeekV4(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::DeepSeekV4Layerwise(model), ModelCache::DeepSeekV4(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,

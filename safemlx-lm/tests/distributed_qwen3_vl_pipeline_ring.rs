@@ -689,6 +689,7 @@ fn qwen3_vl_pipeline_ring_worker() {
             descriptor.clone(),
             &[1, 30, 2],
             &PromptCacheOptions::default(),
+            &stream,
         )
         .unwrap();
     let token = Array::from_slice(&[3u32], &[1, 1]);

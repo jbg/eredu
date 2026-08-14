@@ -4069,7 +4069,7 @@ mod tests {
                 &PromptCacheOptions::default(),
             )
             .unwrap();
-        assert_eq!(saved.schema_version, 5);
+        assert_eq!(saved.schema_version, 6);
         drop(paged);
 
         let identity = super::prompt_cache_model_identity(&args).unwrap();
@@ -4081,7 +4081,7 @@ mod tests {
             options,
         )
         .unwrap();
-        assert_eq!(manifest.schema_version, 5);
+        assert_eq!(manifest.schema_version, 6);
         let mut restored_paged = super::new_paged_cache_with_manager(&args, manager, None).unwrap();
         assert_eq!(
             restored_paged

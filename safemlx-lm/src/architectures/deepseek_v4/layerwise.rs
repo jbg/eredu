@@ -21,7 +21,10 @@ use crate::{
     error::Error,
     nn::generation::CausalLm,
     runtime::{
-        cache::residency::{PromptCacheModelIdentity, PromptCacheTopology},
+        cache::residency::{
+            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        },
         checkpoint::{
             binding::{
                 build_module_bindings_with_recipes, populate_module_from_lease,
@@ -50,8 +53,8 @@ use crate::{
 use super::{
     attention::AttentionCache,
     model::{
-        prompt_cache_architecture_fingerprint, Cache, DecoderLayer, Model as ResidentModel,
-        ModelArgs,
+        load_prompt_cache_with_identity, prompt_cache_model_identity, save_prompt_cache_with_rank,
+        Cache, DecoderLayer, Model as ResidentModel, ModelArgs,
     },
 };
 
@@ -301,8 +304,7 @@ impl DeepSeekV4LayerwiseModel {
             .transpose()?)
     }
 
-    /// Returns the generic prompt-cache layout when the V4 attention schedule
-    /// does not require compressed pooling/indexer state.
+    /// Returns the exact generic prompt-cache layout including pooling state.
     pub(crate) fn prompt_cache_layer_layout(
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
@@ -310,6 +312,43 @@ impl DeepSeekV4LayerwiseModel {
             .adapter()
             .static_model
             .prompt_cache_layer_layout()
+    }
+
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
+    }
+
+    /// Atomically persists target KV plus compressed pooling/indexer state.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.execution.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    /// Restores target KV plus compressed pooling/indexer state exactly.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        self.execution
+            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
     }
 }
 
@@ -795,38 +834,52 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         &self,
         topology: Option<crate::ParallelTopology>,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let layer_count = self.args.num_hidden_layers as usize;
-        if self.args.compress_ratios[..layer_count]
-            .iter()
-            .any(|ratio| *ratio != 0)
-        {
-            return Err(Error::UnsupportedArchitecture(
-                "DeepSeek-V4 compressed sparse prompt caches require pooled/indexer state".into(),
-            ));
-        }
-        let policy = crate::LayerCachePolicy::key_value(
-            crate::AttentionPolicy::sliding(self.args.sliding_window as u32)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            self.args.num_attention_heads,
-            self.args.head_dim,
-        )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let layer_layout = crate::LayerSchedule::new(layer_count, vec![policy; layer_count])
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(PromptCacheModelIdentity {
-            model_family: "deepseek_v4".into(),
-            effective_model_type: self.args.model_type.clone(),
-            architecture_fingerprint: prompt_cache_architecture_fingerprint(&self.args),
-            layer_count,
-            global_layer_start: 0,
-            global_layer_end: layer_count,
-            sink_tokens: 0,
-            topology: topology.map_or_else(
+        prompt_cache_model_identity(
+            &self.args,
+            topology.map_or_else(
                 PromptCacheTopology::default,
                 PromptCacheTopology::for_parallel_topology,
             ),
-            layer_layout,
-        })
+        )
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Self::Cache,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        save_prompt_cache_with_rank(
+            cache,
+            destination,
+            descriptor.clone(),
+            prefix_token_ids,
+            options,
+            descriptor.topology.cache_rank_identity(),
+            stream,
+        )
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        load_prompt_cache_with_identity(
+            &self.args,
+            directory,
+            expected,
+            prefix_token_ids,
+            identity.clone(),
+            stream,
+        )
     }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {

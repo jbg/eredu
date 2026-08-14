@@ -845,6 +845,7 @@ fn gemma4_multimodal_pipeline_ring_worker() {
             descriptor.clone(),
             &prefix_ids,
             &PromptCacheOptions::default(),
+            &stream,
         )
         .unwrap();
 

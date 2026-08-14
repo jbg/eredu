@@ -104,6 +104,16 @@ pub struct PoolingCache {
     processed_tokens: i32,
 }
 
+/// Exact materialized state of an append-only pooling stream.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PoolingCacheState {
+    pub(crate) pending_values: Option<Array>,
+    pub(crate) pending_gates: Option<Array>,
+    pub(crate) pooled: Option<Array>,
+    pub(crate) overlap_values: Option<Array>,
+    pub(crate) overlap_gates: Option<Array>,
+}
+
 /// Complete source windows emitted by [`PoolingCache::accumulate_windows`].
 pub struct PoolingWindows {
     /// Source values shaped `[batch, complete_source_tokens, width]`.
@@ -115,6 +125,11 @@ pub struct PoolingWindows {
 }
 
 impl PoolingCache {
+    /// Number of source tokens represented by one pooled token.
+    pub const fn ratio(&self) -> i32 {
+        self.ratio
+    }
+
     /// Creates an empty pooling stream.
     pub fn new(ratio: i32) -> Result<Self, Exception> {
         if ratio <= 0 {
@@ -149,6 +164,57 @@ impl PoolingCache {
             .chain(self.pooled.iter())
             .chain(self.overlap_values.iter())
             .chain(self.overlap_gates.iter())
+    }
+
+    /// Borrows the exact array components used by prompt-cache persistence.
+    pub(crate) fn state_arrays(&self) -> [Option<&Array>; 5] {
+        [
+            self.pending_values.as_ref(),
+            self.pending_gates.as_ref(),
+            self.pooled.as_ref(),
+            self.overlap_values.as_ref(),
+            self.overlap_gates.as_ref(),
+        ]
+    }
+
+    /// Restores an exactly validated pooling frontier.
+    pub(crate) fn restore_state(
+        &mut self,
+        state: PoolingCacheState,
+        processed_tokens: i32,
+    ) -> Result<(), Exception> {
+        if processed_tokens < 0 {
+            return Err(Exception::custom(
+                "restored pooling source offset must be non-negative",
+            ));
+        }
+        if state.pending_values.is_some() != state.pending_gates.is_some()
+            || state.overlap_values.is_some() != state.overlap_gates.is_some()
+        {
+            return Err(Exception::custom(
+                "restored pooling value/gate components are incomplete",
+            ));
+        }
+        let pending = processed_tokens % self.ratio;
+        if state
+            .pending_values
+            .as_ref()
+            .map_or(0, |array| array.dim(1))
+            != pending
+            || state.pooled.as_ref().map_or(0, |array| array.dim(1))
+                != processed_tokens / self.ratio
+        {
+            return Err(Exception::custom(
+                "restored pooling state does not match its source-token frontier",
+            ));
+        }
+        self.pending_values = state.pending_values;
+        self.pending_gates = state.pending_gates;
+        self.pooled = state.pooled;
+        self.overlap_values = state.overlap_values;
+        self.overlap_gates = state.overlap_gates;
+        self.processed_tokens = processed_tokens;
+        Ok(())
     }
 
     /// Replaces the overlap carried between adjacent complete windows and
@@ -2571,7 +2637,11 @@ impl ConcatKeyValueCache {
         end: i32,
     ) -> Result<(), Exception> {
         let length = keys.dim(-2);
-        if keys.shape() != values.shape() || end < length {
+        let compatible = keys.ndim() == values.ndim()
+            && keys.ndim() >= 2
+            && keys.shape()[..keys.ndim() - 2] == values.shape()[..values.ndim() - 2]
+            && values.dim(-2) == length;
+        if !compatible || end < length {
             return Err(Exception::custom(
                 "restored key/value cache arrays do not match their retained range",
             ));

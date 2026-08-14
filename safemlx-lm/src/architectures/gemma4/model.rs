@@ -7104,7 +7104,10 @@ mod tests {
             panic!("Gemma 4 layer zero must own multimodal prefix state");
         };
         assert_eq!(tensors[0].role, StateTensorRole::PrefixEmbedding);
-        assert!(!tensors[0].required);
+        assert_eq!(
+            tensors[0].presence,
+            crate::runtime::cache::residency::StateTensorPresence::Optional
+        );
     }
 
     #[test]

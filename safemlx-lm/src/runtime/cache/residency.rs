@@ -36,7 +36,7 @@ use crate::runtime::{
     residency::policy::CacheEvictionPolicy,
 };
 
-const PROMPT_CACHE_SCHEMA_VERSION: u32 = 5;
+const PROMPT_CACHE_SCHEMA_VERSION: u32 = 6;
 const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
 const PROMPT_CACHE_GENERATIONS_DIRECTORY: &str = ".generations";
 const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
@@ -4272,6 +4272,15 @@ pub enum LayerCachePolicy {
         /// Per-head key/value dimension.
         head_dim: NonZeroU32,
     },
+    /// Attention history whose value payload is intentionally empty.
+    KeyOnly {
+        /// Exact full or sliding attention range for this layer.
+        attention: AttentionPolicy,
+        /// Rank-local key head count.
+        num_key_heads: NonZeroU32,
+        /// Per-head key dimension.
+        head_dim: NonZeroU32,
+    },
     /// DeepSeek compressed latent state plus rotary keys.
     CompressedLatentRotary {
         /// Exact full or sliding attention range for this layer.
@@ -4297,6 +4306,17 @@ pub enum LayerCachePolicy {
         /// Ordered tensors required in addition to keys and values.
         tensors: Vec<StateTensorPolicy>,
     },
+    /// Key-only attention plus mutable pooling or recurrent state.
+    KeyOnlyWithFixedState {
+        /// Exact full or sliding attention range for this layer.
+        attention: AttentionPolicy,
+        /// Rank-local key head count.
+        num_key_heads: NonZeroU32,
+        /// Per-head key dimension.
+        head_dim: NonZeroU32,
+        /// Ordered tensors required in addition to keys.
+        tensors: Vec<StateTensorPolicy>,
+    },
 }
 
 /// Semantic role of one non-attention cache tensor.
@@ -4314,6 +4334,29 @@ pub enum StateTensorRole {
     PrefixEmbedding,
     /// Model-global multimodal position offset.
     PositionDelta,
+    /// One tensor in an append-only token-pooling stream.
+    Pooling {
+        /// Stable stream slot within the owning layer.
+        stream: u32,
+        /// Exact component of the pooling state.
+        component: PoolingStateComponent,
+    },
+}
+
+/// Semantic component of one append-only pooling stream.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolingStateComponent {
+    /// Source values waiting for a complete pooling group.
+    PendingValues,
+    /// Source gate logits waiting for a complete pooling group.
+    PendingGates,
+    /// Complete pooled output history.
+    Pooled,
+    /// Source values retained for an overlapping group.
+    OverlapValues,
+    /// Source gate logits retained for an overlapping group.
+    OverlapGates,
 }
 
 /// Runtime ownership behavior for live model state.
@@ -4364,10 +4407,28 @@ pub enum StateTensorDimension {
     Batch,
     /// Exact prompt token count.
     PrefixTokens,
+    /// Integer quotient of the exact prompt token count and a positive divisor.
+    PrefixTokensDiv(NonZeroU32),
+    /// Integer remainder of the exact prompt token count and a positive divisor.
+    PrefixTokensRem(NonZeroU32),
     /// Positive architecture-defined dimension.
     Fixed(NonZeroU32),
     /// Scalar dimension list marker; only valid as the sole entry.
     Scalar,
+}
+
+/// Exact condition under which a state tensor must be materialized.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateTensorPresence {
+    /// Every persisted cache materializes the tensor.
+    Required,
+    /// The tensor may be present independently of prefix geometry.
+    Optional,
+    /// The tensor is present exactly when the prefix has a non-zero remainder.
+    PrefixRemainderNonZero(NonZeroU32),
+    /// The tensor is present exactly when the prefix contains one complete group.
+    PrefixAtLeast(NonZeroU32),
 }
 
 /// Accepted dtype family for one fixed-state tensor.
@@ -4395,8 +4456,8 @@ pub struct StateTensorPolicy {
     pub dtype: StateTensorDtype,
     /// Authoritative live-state residency behavior.
     pub residency: MutableStateResidency,
-    /// Whether every persisted cache must materialize this tensor.
-    pub required: bool,
+    /// Exact condition under which persisted caches materialize this tensor.
+    pub presence: StateTensorPresence,
 }
 
 impl LayerCachePolicy {
@@ -4405,8 +4466,10 @@ impl LayerCachePolicy {
         match self {
             Self::NoState | Self::FixedState { .. } => None,
             Self::KeyValue { .. }
+            | Self::KeyOnly { .. }
             | Self::CompressedLatentRotary { .. }
-            | Self::KeyValueWithFixedState { .. } => Some(StateResidencyClass::SealablePaged),
+            | Self::KeyValueWithFixedState { .. }
+            | Self::KeyOnlyWithFixedState { .. } => Some(StateResidencyClass::SealablePaged),
         }
     }
 
@@ -4420,6 +4483,19 @@ impl LayerCachePolicy {
             attention,
             num_key_value_heads: positive_u32(num_key_value_heads, "key/value head count")?,
             head_dim: positive_u32(head_dim, "key/value head dimension")?,
+        })
+    }
+
+    /// Constructs validated key-only attention state geometry.
+    pub fn key_only(
+        attention: AttentionPolicy,
+        num_key_heads: i32,
+        head_dim: i32,
+    ) -> Result<Self, CacheResidencyError> {
+        Ok(Self::KeyOnly {
+            attention,
+            num_key_heads: positive_u32(num_key_heads, "key head count")?,
+            head_dim: positive_u32(head_dim, "key head dimension")?,
         })
     }
 
@@ -4460,20 +4536,41 @@ impl LayerCachePolicy {
         Ok(policy)
     }
 
+    /// Constructs validated key-only attention plus mutable state geometry.
+    pub fn key_only_with_fixed_state(
+        attention: AttentionPolicy,
+        num_key_heads: i32,
+        head_dim: i32,
+        tensors: Vec<StateTensorPolicy>,
+    ) -> Result<Self, CacheResidencyError> {
+        let policy = Self::KeyOnlyWithFixedState {
+            attention,
+            num_key_heads: positive_u32(num_key_heads, "key head count")?,
+            head_dim: positive_u32(head_dim, "key head dimension")?,
+            tensors,
+        };
+        validate_layer_cache_policy(&policy)?;
+        Ok(policy)
+    }
+
     /// Returns the exact attention policy when this layer owns attention state.
     pub const fn attention(&self) -> Option<AttentionPolicy> {
         match self {
             Self::NoState | Self::FixedState { .. } => None,
             Self::KeyValue { attention, .. }
+            | Self::KeyOnly { attention, .. }
             | Self::CompressedLatentRotary { attention, .. }
-            | Self::KeyValueWithFixedState { attention, .. } => Some(*attention),
+            | Self::KeyValueWithFixedState { attention, .. }
+            | Self::KeyOnlyWithFixedState { attention, .. } => Some(*attention),
         }
     }
 
     /// Returns the ordered non-attention tensor policies for this layer.
     pub fn fixed_state(&self) -> &[StateTensorPolicy] {
         match self {
-            Self::FixedState { tensors } | Self::KeyValueWithFixedState { tensors, .. } => tensors,
+            Self::FixedState { tensors }
+            | Self::KeyValueWithFixedState { tensors, .. }
+            | Self::KeyOnlyWithFixedState { tensors, .. } => tensors,
             _ => &[],
         }
     }
@@ -4499,7 +4596,7 @@ impl StateTensorPolicy {
             shape,
             dtype,
             residency,
-            required: true,
+            presence: StateTensorPresence::Required,
         };
         validate_state_tensor_policies(std::slice::from_ref(&policy))?;
         Ok(policy)
@@ -4507,8 +4604,32 @@ impl StateTensorPolicy {
 
     /// Marks this tensor as absent for cache instances that do not use the state.
     pub const fn optional(mut self) -> Self {
-        self.required = false;
+        self.presence = StateTensorPresence::Optional;
         self
+    }
+
+    /// Requires this tensor exactly when `prefix_tokens % divisor != 0`.
+    pub const fn when_prefix_remainder_nonzero(mut self, divisor: NonZeroU32) -> Self {
+        self.presence = StateTensorPresence::PrefixRemainderNonZero(divisor);
+        self
+    }
+
+    /// Requires this tensor exactly when `prefix_tokens >= divisor`.
+    pub const fn when_prefix_at_least(mut self, divisor: NonZeroU32) -> Self {
+        self.presence = StateTensorPresence::PrefixAtLeast(divisor);
+        self
+    }
+
+    /// Returns whether this tensor must be present for the exact prompt length.
+    pub fn is_required_for(&self, prefix_tokens: usize) -> bool {
+        match self.presence {
+            StateTensorPresence::Required => true,
+            StateTensorPresence::Optional => false,
+            StateTensorPresence::PrefixRemainderNonZero(divisor) => {
+                !prefix_tokens.is_multiple_of(divisor.get() as usize)
+            }
+            StateTensorPresence::PrefixAtLeast(divisor) => prefix_tokens >= divisor.get() as usize,
+        }
     }
 
     /// Returns the unified residency classification for this fixed state.
@@ -4590,6 +4711,19 @@ fn validate_layer_cache_policy(policy: &LayerCachePolicy) -> Result<(), CacheRes
             validate_dimension(*num_key_value_heads)?;
             validate_dimension(*head_dim)?;
         }
+        LayerCachePolicy::KeyOnly {
+            num_key_heads,
+            head_dim,
+            ..
+        }
+        | LayerCachePolicy::KeyOnlyWithFixedState {
+            num_key_heads,
+            head_dim,
+            ..
+        } => {
+            validate_dimension(*num_key_heads)?;
+            validate_dimension(*head_dim)?;
+        }
         LayerCachePolicy::CompressedLatentRotary {
             latent_dim,
             rotary_dim,
@@ -4604,7 +4738,9 @@ fn validate_layer_cache_policy(policy: &LayerCachePolicy) -> Result<(), CacheRes
     if tensors.is_empty()
         && matches!(
             policy,
-            LayerCachePolicy::FixedState { .. } | LayerCachePolicy::KeyValueWithFixedState { .. }
+            LayerCachePolicy::FixedState { .. }
+                | LayerCachePolicy::KeyValueWithFixedState { .. }
+                | LayerCachePolicy::KeyOnlyWithFixedState { .. }
         )
     {
         return Err(CacheResidencyError::InvalidOptions(
@@ -4638,7 +4774,8 @@ fn validate_state_tensor_policies(
             StateTensorRole::Recurrent => MutableStateResidency::LayerScopedOffloadable,
             StateTensorRole::Convolution { .. }
             | StateTensorRole::PrefixEmbedding
-            | StateTensorRole::PositionDelta => MutableStateResidency::AlwaysDeviceMutable,
+            | StateTensorRole::PositionDelta
+            | StateTensorRole::Pooling { .. } => MutableStateResidency::AlwaysDeviceMutable,
         };
         if tensor.residency != expected {
             return Err(CacheResidencyError::InvalidOptions(format!(
@@ -4661,6 +4798,12 @@ fn resolved_state_shape(
         .map(|dimension| match dimension {
             StateTensorDimension::Batch => i32::try_from(batch_size),
             StateTensorDimension::PrefixTokens => i32::try_from(prefix_tokens),
+            StateTensorDimension::PrefixTokensDiv(divisor) => {
+                i32::try_from(prefix_tokens / divisor.get() as usize)
+            }
+            StateTensorDimension::PrefixTokensRem(divisor) => {
+                i32::try_from(prefix_tokens % divisor.get() as usize)
+            }
             StateTensorDimension::Fixed(value) => i32::try_from(value.get()),
             StateTensorDimension::Scalar => Ok(1),
         })
@@ -4729,7 +4872,7 @@ fn validate_state_arrays(
     for (index, layer) in layers.iter().enumerate() {
         let owner = StateTensorOwner::Layer(global_layer_start + index);
         for policy in layer.fixed_state() {
-            if policy.required || seen.contains(&(owner, policy.role)) {
+            if policy.is_required_for(prefix_tokens) || seen.contains(&(owner, policy.role)) {
                 expected.push((owner, policy.role));
             }
         }
@@ -5467,6 +5610,25 @@ fn validate_prompt_cache_layer_layouts(
                     head_dim.get() as i32,
                 ],
             ),
+            LayerCachePolicy::KeyOnly {
+                num_key_heads,
+                head_dim,
+                ..
+            }
+            | LayerCachePolicy::KeyOnlyWithFixedState {
+                num_key_heads,
+                head_dim,
+                ..
+            } => (
+                CacheRepresentation::KeyValue,
+                vec![
+                    batch,
+                    num_key_heads.get() as i32,
+                    token_count,
+                    head_dim.get() as i32,
+                ],
+                vec![batch, num_key_heads.get() as i32, token_count, 1],
+            ),
             LayerCachePolicy::CompressedLatentRotary {
                 latent_dim,
                 rotary_dim,
@@ -5664,9 +5826,10 @@ fn validate_manifest(
                     block.global_layer
                 )))
             }
-            LayerCachePolicy::KeyValue { .. } | LayerCachePolicy::KeyValueWithFixedState { .. } => {
-                CacheRepresentation::KeyValue
-            }
+            LayerCachePolicy::KeyValue { .. }
+            | LayerCachePolicy::KeyOnly { .. }
+            | LayerCachePolicy::KeyValueWithFixedState { .. }
+            | LayerCachePolicy::KeyOnlyWithFixedState { .. } => CacheRepresentation::KeyValue,
             LayerCachePolicy::CompressedLatentRotary { .. } => {
                 CacheRepresentation::CompressedLatentRotary
             }
@@ -5704,6 +5867,24 @@ fn validate_manifest(
                 ];
                 (shape.clone(), shape)
             }
+            LayerCachePolicy::KeyOnly {
+                num_key_heads,
+                head_dim,
+                ..
+            }
+            | LayerCachePolicy::KeyOnlyWithFixedState {
+                num_key_heads,
+                head_dim,
+                ..
+            } => (
+                vec![
+                    batch,
+                    num_key_heads.get() as i32,
+                    token_count,
+                    head_dim.get() as i32,
+                ],
+                vec![batch, num_key_heads.get() as i32, token_count, 1],
+            ),
             LayerCachePolicy::CompressedLatentRotary {
                 latent_dim,
                 rotary_dim,
@@ -5753,10 +5934,12 @@ fn validate_manifest(
         }
         match block.representation {
             CacheRepresentation::KeyValue
-                if block.first_shape.len() != 4 || block.first_shape != block.second_shape =>
+                if block.first_shape.len() != 4
+                    || block.second_shape.len() != 4
+                    || block.first_shape[..3] != block.second_shape[..3] =>
             {
                 return Err(CacheResidencyError::MalformedManifest(
-                    "key/value blocks must use identical rank-4 shapes".into(),
+                    "key/value blocks must share rank-4 batch, head, and token dimensions".into(),
                 ));
             }
             CacheRepresentation::CompressedLatentRotary
@@ -5804,7 +5987,9 @@ fn validate_manifest(
     for (index, layer) in manifest.layer_layout.iter().enumerate() {
         let owner = StateTensorOwner::Layer(manifest.global_layer_start + index);
         for policy in layer.fixed_state() {
-            if policy.required || actual_state.contains(&(owner, policy.role)) {
+            if policy.is_required_for(manifest.total_prefix_tokens)
+                || actual_state.contains(&(owner, policy.role))
+            {
                 expected_state.push((owner, policy));
             }
         }
@@ -5960,7 +6145,9 @@ fn validate_complete_prefix(
             let expected_representation = match policy {
                 LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => unreachable!(),
                 LayerCachePolicy::KeyValue { .. }
-                | LayerCachePolicy::KeyValueWithFixedState { .. } => CacheRepresentation::KeyValue,
+                | LayerCachePolicy::KeyOnly { .. }
+                | LayerCachePolicy::KeyValueWithFixedState { .. }
+                | LayerCachePolicy::KeyOnlyWithFixedState { .. } => CacheRepresentation::KeyValue,
                 LayerCachePolicy::CompressedLatentRotary { .. } => {
                     CacheRepresentation::CompressedLatentRotary
                 }
@@ -5996,6 +6183,24 @@ fn validate_complete_prefix(
                     ];
                     (shape.clone(), shape)
                 }
+                LayerCachePolicy::KeyOnly {
+                    num_key_heads,
+                    head_dim,
+                    ..
+                }
+                | LayerCachePolicy::KeyOnlyWithFixedState {
+                    num_key_heads,
+                    head_dim,
+                    ..
+                } => (
+                    vec![
+                        batch,
+                        num_key_heads.get() as i32,
+                        token_count,
+                        head_dim.get() as i32,
+                    ],
+                    vec![batch, num_key_heads.get() as i32, token_count, 1],
+                ),
                 LayerCachePolicy::CompressedLatentRotary {
                     latent_dim,
                     rotary_dim,
@@ -6081,9 +6286,11 @@ fn validate_block_arrays(
     }
     match arrays {
         CacheBlockArrays::KeyValue { .. } => {
-            if first.shape() != second.shape() {
+            if first.ndim() != second.ndim()
+                || first.shape()[..first.ndim() - 2] != second.shape()[..second.ndim() - 2]
+            {
                 return Err(CacheResidencyError::ArrayMismatch(
-                    "key and value block shapes must match".into(),
+                    "key and value blocks must share leading dimensions".into(),
                 ));
             }
         }

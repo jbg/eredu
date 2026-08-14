@@ -2316,6 +2316,16 @@ trait PipelineStageAdapter {
         identity: &PromptCacheModelIdentity,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error>;
+    fn load_resident_prompt_cache(
+        &self,
+        _directory: &Path,
+        _expected: &PromptCacheDescriptor,
+        _identity: &PromptCacheModelIdentity,
+        _prefix_token_ids: &[u32],
+        _stream: &Stream,
+    ) -> Result<Option<(Vec<PipelineLayerCache>, PromptCacheManifest)>, Error> {
+        Ok(None)
+    }
 
     /// Executes this stage's local decoder range.
     fn forward(
@@ -2497,6 +2507,16 @@ trait PipelineStageSemantics {
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
         materialize_pipeline_cache_layers(identity, paged)
+    }
+    fn load_resident_prompt_cache(
+        &self,
+        _directory: &Path,
+        _expected: &PromptCacheDescriptor,
+        _identity: &PromptCacheModelIdentity,
+        _prefix_token_ids: &[u32],
+        _stream: &Stream,
+    ) -> Result<Option<(Vec<PipelineLayerCache>, PromptCacheManifest)>, Error> {
+        Ok(None)
     }
     fn forward(
         &mut self,
@@ -2758,6 +2778,18 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
         self.0.new_cache_layers(identity, paged)
+    }
+
+    fn load_resident_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<Option<(Vec<PipelineLayerCache>, PromptCacheManifest)>, Error> {
+        self.0
+            .load_resident_prompt_cache(directory, expected, identity, prefix_token_ids, stream)
     }
 
     fn forward(
@@ -3226,6 +3258,10 @@ fn materialize_pipeline_cache_layers(
                         .collect(),
                     &paged,
                 ),
+                crate::LayerCachePolicy::KeyOnly { .. }
+                | crate::LayerCachePolicy::KeyOnlyWithFixedState { .. } => Err(Error::Parallel(
+                    "key-only pipeline caches require architecture-owned materialization".into(),
+                )),
                 crate::LayerCachePolicy::CompressedLatentRotary { .. } => {
                     let cache = match &paged {
                         Some((manager, rank)) => {
@@ -3756,11 +3792,10 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
             ),
             self.args.num_hidden_layers as usize,
             self.range.clone(),
-            crate::LayerSchedule::new(
-                self.range.len(),
-                vec![crate::LayerCachePolicy::NoState; self.range.len()],
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?,
+            crate::architectures::deepseek_v4::model::prompt_cache_layer_layout(
+                &self.args,
+                self.range.clone(),
+            )?,
         ))
     }
 
@@ -3787,6 +3822,36 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
                 })
             })
             .collect()
+    }
+
+    fn load_resident_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<Option<(Vec<PipelineLayerCache>, PromptCacheManifest)>, Error> {
+        let (restored, manifest) =
+            crate::architectures::deepseek_v4::model::load_attention_prompt_cache_with_identity(
+                &self.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                identity.clone(),
+                stream,
+            )?;
+        Ok(Some((
+            restored
+                .into_iter()
+                .enumerate()
+                .map(|(index, cache)| PipelineLayerCache::DeepSeekV4 {
+                    global_layer: identity.global_layer_start + index,
+                    cache,
+                })
+                .collect(),
+            manifest,
+        )))
     }
 
     fn forward(
@@ -6450,6 +6515,7 @@ impl PipelineModel {
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
+        stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
         let identity = self.prompt_cache_model_identity()?;
         validate_prompt_cache_model_identity(&descriptor, &identity)
@@ -6459,9 +6525,7 @@ impl PipelineModel {
                 "pipeline prompt cache architecture does not match the stage".into(),
             ));
         }
-        let manager = cache.residency_manager.clone().ok_or_else(|| {
-            Error::Parallel("pipeline prompt persistence requires a paged cache".into())
-        })?;
+        let manager = cache.residency_manager.clone();
         for layer in &mut cache.layers {
             match layer {
                 PipelineLayerCache::StateSlots { .. } => {}
@@ -6487,12 +6551,7 @@ impl PipelineModel {
                         "pipeline prompt persistence requires a paged cache".into(),
                     ));
                 }
-                PipelineLayerCache::DeepSeekV4 { .. } => {
-                    return Err(Error::UnsupportedArchitecture(
-                        "DeepSeek V4 compressed pipeline prompt-cache persistence is unsupported"
-                            .into(),
-                    ));
-                }
+                PipelineLayerCache::DeepSeekV4 { .. } => {}
             }
         }
         let expected_offset = i32::try_from(prefix_token_ids.len())
@@ -6514,9 +6573,7 @@ impl PipelineModel {
                     slots,
                     ..
                 } => (*global_layer, slots),
-                PipelineLayerCache::DeepSeekV4 { .. } => unreachable!(
-                    "DeepSeek V4 pipeline prompt persistence was rejected before state export"
-                ),
+                PipelineLayerCache::DeepSeekV4 { .. } => continue,
             };
             for slot in slots {
                 match slot.value.as_ref() {
@@ -6533,7 +6590,7 @@ impl PipelineModel {
                             array,
                         });
                     }
-                    None if slot.policy.required => {
+                    None if slot.policy.is_required_for(prefix_token_ids.len()) => {
                         return Err(Error::Parallel(format!(
                             "pipeline state {:?} at global layer {global_layer} is required but uninitialized",
                             slot.policy.role
@@ -6543,15 +6600,36 @@ impl PipelineModel {
                 }
             }
         }
-        manager
-            .save_prompt_cache(
-                self.prompt_cache_rank_directory(root.as_ref()),
-                descriptor,
-                prefix_token_ids,
-                &state_arrays,
-                options,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))
+        if let Some(manager) = manager {
+            return manager
+                .save_prompt_cache(
+                    self.prompt_cache_rank_directory(root.as_ref()),
+                    descriptor,
+                    prefix_token_ids,
+                    &state_arrays,
+                    options,
+                )
+                .map_err(|error| Error::Parallel(error.to_string()));
+        }
+        let caches = cache
+            .layers
+            .iter()
+            .map(|layer| match layer {
+                PipelineLayerCache::DeepSeekV4 { cache, .. } => Ok(cache.clone()),
+                _ => Err(Error::Parallel(
+                    "pipeline prompt persistence requires a paged cache".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::architectures::deepseek_v4::model::save_attention_prompt_cache(
+            &caches,
+            self.prompt_cache_rank_directory(root.as_ref()),
+            descriptor.clone(),
+            prefix_token_ids,
+            options,
+            descriptor.topology.cache_rank_identity(),
+            stream,
+        )
     }
 
     /// Opens this stage's compatible persisted prefix without eager array loading.
@@ -6566,6 +6644,15 @@ impl PipelineModel {
         let identity = self.prompt_cache_model_identity()?;
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Error::Parallel(error.to_string()))?;
+        if let Some((layers, manifest)) = self.stage.load_resident_prompt_cache(
+            &self.prompt_cache_rank_directory(root.as_ref()),
+            expected,
+            &identity,
+            prefix_token_ids,
+            stream,
+        )? {
+            return Ok((PipelineCache::new(self.info.model_kind, layers), manifest));
+        }
         let (manager, manifest) = open_prompt_cache(
             self.prompt_cache_rank_directory(root.as_ref()),
             expected,
@@ -6619,7 +6706,7 @@ impl PipelineModel {
                     .remove(&(StateTensorOwner::Layer(global_layer), slot.policy.role));
                 if slot.value.is_some() {
                     slot.offset = offset;
-                } else if slot.policy.required {
+                } else if slot.policy.is_required_for(prefix_token_ids.len()) {
                     return Err(Error::Parallel(format!(
                         "persisted pipeline state {:?} at global layer {global_layer} is missing",
                         slot.policy.role
@@ -24723,7 +24810,7 @@ mod tests {
                         shape: vec![crate::runtime::cache::residency::StateTensorDimension::Scalar],
                         dtype: crate::runtime::cache::residency::StateTensorDtype::Float32,
                         residency: crate::MutableStateResidency::LayerScopedOffloadable,
-                        required: true,
+                        presence: crate::runtime::cache::residency::StateTensorPresence::Required,
                     }],
                 }],
             )

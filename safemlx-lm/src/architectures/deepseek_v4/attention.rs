@@ -1,5 +1,7 @@
 //! Local, compressed, and indexed sparse attention for DeepSeek V4.
 
+use std::collections::BTreeMap;
+
 use safemlx::{
     error::Exception,
     fast::ScaledDotProductAttentionMask,
@@ -17,7 +19,12 @@ use safemlx::{
 use crate::{
     api::qwen3_5::QwenLinear as Linear,
     nn::attention::indexed_sparse_attention,
-    runtime::cache::{ConcatKeyValueCache, KeyValueCache, PoolingCache},
+    runtime::cache::{
+        residency::{
+            PoolingStateComponent, PromptCacheStateArray, StateTensorOwner, StateTensorRole,
+        },
+        ConcatKeyValueCache, KeyValueCache, PoolingCache, PoolingCacheState,
+    },
 };
 
 use super::{
@@ -373,6 +380,70 @@ impl AttentionCache {
         }
     }
 
+    pub(crate) fn local_snapshot(
+        &self,
+        stream: &Stream,
+    ) -> Result<Option<(Array, Array)>, Exception> {
+        match self {
+            Self::Local(local) | Self::Compressed { local, .. } | Self::Sparse { local, .. } => {
+                local.snapshot_arrays(stream)
+            }
+        }
+    }
+
+    pub(crate) fn restore_local(
+        &mut self,
+        keys: Array,
+        values: Array,
+        end: i32,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Local(local) | Self::Compressed { local, .. } | Self::Sparse { local, .. } => {
+                local.restore_resident(keys, values, end)
+            }
+        }
+    }
+
+    pub(crate) fn prompt_cache_state_arrays(
+        &self,
+        global_layer: usize,
+    ) -> Vec<PromptCacheStateArray<'_>> {
+        let mut arrays = Vec::new();
+        match self {
+            Self::Local(_) => {}
+            Self::Compressed { pool, .. } => {
+                append_pooling_state_arrays(&mut arrays, global_layer, 0, pool);
+            }
+            Self::Sparse {
+                pool, index_pool, ..
+            } => {
+                append_pooling_state_arrays(&mut arrays, global_layer, 0, pool);
+                append_pooling_state_arrays(&mut arrays, global_layer, 1, index_pool);
+            }
+        }
+        arrays
+    }
+
+    pub(crate) fn restore_prompt_cache_state(
+        &mut self,
+        global_layer: usize,
+        tensors: &mut BTreeMap<(StateTensorOwner, StateTensorRole), Array>,
+        processed_tokens: i32,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Local(_) => Ok(()),
+            Self::Compressed { pool, .. } => {
+                restore_pooling_state(global_layer, 0, pool, tensors, processed_tokens, false)
+            }
+            Self::Sparse {
+                pool, index_pool, ..
+            } => {
+                restore_pooling_state(global_layer, 0, pool, tensors, processed_tokens, true)?;
+                restore_pooling_state(global_layer, 1, index_pool, tensors, processed_tokens, true)
+            }
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         match self {
             Self::Local(local) => local.clear(),
@@ -391,6 +462,79 @@ impl AttentionCache {
             }
         }
     }
+}
+
+const POOLING_COMPONENTS: [PoolingStateComponent; 5] = [
+    PoolingStateComponent::PendingValues,
+    PoolingStateComponent::PendingGates,
+    PoolingStateComponent::Pooled,
+    PoolingStateComponent::OverlapValues,
+    PoolingStateComponent::OverlapGates,
+];
+
+fn pooling_role(stream: u32, component: PoolingStateComponent) -> StateTensorRole {
+    StateTensorRole::Pooling { stream, component }
+}
+
+fn append_pooling_state_arrays<'a>(
+    arrays: &mut Vec<PromptCacheStateArray<'a>>,
+    global_layer: usize,
+    stream: u32,
+    pool: &'a PoolingCache,
+) {
+    for (component, array) in POOLING_COMPONENTS.into_iter().zip(pool.state_arrays()) {
+        if let Some(array) = array {
+            arrays.push(PromptCacheStateArray {
+                owner: StateTensorOwner::Layer(global_layer),
+                role: pooling_role(stream, component),
+                array,
+            });
+        }
+    }
+}
+
+fn restore_pooling_state(
+    global_layer: usize,
+    stream: u32,
+    pool: &mut PoolingCache,
+    tensors: &mut BTreeMap<(StateTensorOwner, StateTensorRole), Array>,
+    processed_tokens: i32,
+    overlapping: bool,
+) -> Result<(), Exception> {
+    let mut take = |component| {
+        tensors.remove(&(
+            StateTensorOwner::Layer(global_layer),
+            pooling_role(stream, component),
+        ))
+    };
+    let pending_values = take(PoolingStateComponent::PendingValues);
+    let pending_gates = take(PoolingStateComponent::PendingGates);
+    let pooled = take(PoolingStateComponent::Pooled);
+    let overlap_values = take(PoolingStateComponent::OverlapValues);
+    let overlap_gates = take(PoolingStateComponent::OverlapGates);
+    let ratio = pool.ratio();
+    let expect_pending = processed_tokens % ratio != 0;
+    let expect_complete = processed_tokens >= ratio;
+    if pending_values.is_some() != expect_pending
+        || pending_gates.is_some() != expect_pending
+        || pooled.is_some() != expect_complete
+        || overlap_values.is_some() != (overlapping && expect_complete)
+        || overlap_gates.is_some() != (overlapping && expect_complete)
+    {
+        return Err(Exception::custom(format!(
+            "DeepSeek V4 layer {global_layer} pooling stream {stream} has incomplete persisted state"
+        )));
+    }
+    pool.restore_state(
+        PoolingCacheState {
+            pending_values,
+            pending_gates,
+            pooled,
+            overlap_values,
+            overlap_gates,
+        },
+        processed_tokens,
+    )
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
