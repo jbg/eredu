@@ -49,7 +49,7 @@ impl Constraint<StoredDtype> for SafetensorsTensorConstraint {
         &self.shape
     }
     fn alternate_shapes(&self) -> &[Vec<usize>] {
-        &[]
+        &self.alternate_shapes
     }
     fn element_count(&self) -> Option<usize> {
         self.element_count
@@ -744,6 +744,40 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, CheckpointIssueKind::ConflictingLayout);
         assert_eq!(issues[0].tensor_name.as_deref(), Some("released"));
+    }
+
+    #[test]
+    fn safetensors_alternate_shapes_accept_only_declared_layouts() {
+        let plan = safe_plan(
+            vec![SafetensorsTensorConstraint::required(
+                "convolution",
+                vec![4, 1, 2],
+                StoredDtypeConstraint::Floating,
+            )
+            .with_alternate_shapes([vec![4, 2, 1]])],
+            Vec::new(),
+            CatalogPolicy::strict(),
+        );
+        let alternate = BTreeMap::from([safe("convolution", &[4, 2, 1], StoredDtype::BF16)]);
+        assert!(validate_catalog(
+            &alternate,
+            &plan.identity,
+            &plan.common_tensors,
+            &plan.layout_groups,
+            &plan.catalog_policy,
+        )
+        .is_empty());
+
+        let undeclared = BTreeMap::from([safe("convolution", &[4, 2], StoredDtype::BF16)]);
+        let issues = validate_catalog(
+            &undeclared,
+            &plan.identity,
+            &plan.common_tensors,
+            &plan.layout_groups,
+            &plan.catalog_policy,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].kind, CheckpointIssueKind::ShapeMismatch);
     }
 
     #[test]

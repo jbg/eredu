@@ -15,7 +15,7 @@ use crate::{
         gpt_oss::checkpoint as gpt_oss_checkpoint,
         inkling::{checkpoint as inkling_checkpoint, model as inkling},
         kimi_linear::checkpoint as kimi_linear_checkpoint,
-        lfm2::model as lfm2,
+        lfm2::checkpoint as lfm2_checkpoint,
         llama::model as llama,
         moshi::personaplex,
         muse_glimmer,
@@ -113,7 +113,11 @@ pub(crate) fn validate_safetensors(
             ModelKind::GptOss => validate_gpt_oss_safetensors(config, store),
             ModelKind::Inkling => validate_inkling_safetensors(config, store),
             ModelKind::KimiLinear => kimi_linear_checkpoint::validate_safetensors(config, store),
-            ModelKind::Lfm2 => validate_lfm2_safetensors(config, store, options),
+            ModelKind::Lfm2 => lfm2_checkpoint::validate_safetensors(
+                config,
+                store,
+                !options.weight_residency.is_fully_resident(),
+            ),
             ModelKind::Llama => validate_llama_safetensors(config, store),
             ModelKind::MuseGlimmer => validate_muse_glimmer_safetensors(config, store),
             ModelKind::NemotronH => validate_nemotron_h_safetensors(config, store),
@@ -156,7 +160,12 @@ pub(crate) fn validate_gguf(
             GgufArchitecture::Gemma4 => validate_gemma4_gguf(checkpoint, metadata, options),
             GgufArchitecture::Inkling => validate_inkling_gguf(checkpoint, metadata, options),
             GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-                validate_lfm2_gguf(architecture, checkpoint, metadata)
+                let variant = if architecture == GgufArchitecture::Lfm2Moe {
+                    lfm2_checkpoint::GgufVariant::Moe
+                } else {
+                    lfm2_checkpoint::GgufVariant::Dense
+                };
+                lfm2_checkpoint::validate_gguf(variant, checkpoint, metadata)
             }
             GgufArchitecture::Llama | GgufArchitecture::Mistral => {
                 validate_llama_gguf(checkpoint, metadata)
@@ -516,181 +525,6 @@ fn muse_glimmer_expected(config: &Value) -> Result<Vec<ExpectedTensor>, Error> {
         ),
         expected("model.vision_projection.weight", "", [hidden, projector]),
     ]);
-    Ok(tensors)
-}
-
-fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
-    let hidden = args.hidden_size as usize;
-    let vocab = args.vocab_size as usize;
-    let head = (args.hidden_size / args.num_attention_heads) as usize;
-    let key_value =
-        (args.num_key_value_heads * args.hidden_size / args.num_attention_heads) as usize;
-    let mut tensors = vec![
-        expected(
-            "model.embed_tokens.weight",
-            "token_embd.weight",
-            [vocab, hidden],
-        ),
-        expected_vector(
-            "model.embedding_norm.weight",
-            "token_embd_norm.weight",
-            hidden,
-        ),
-    ];
-    if !args.tie_word_embeddings {
-        tensors.push(expected("lm_head.weight", "output.weight", [vocab, hidden]));
-    }
-    for layer in 0..args.num_hidden_layers as usize {
-        let model = format!("model.layers.{layer}");
-        let gguf = format!("blk.{layer}");
-        tensors.extend([
-            expected_vector(
-                format!("{model}.operator_norm.weight"),
-                format!("{gguf}.attn_norm.weight"),
-                hidden,
-            ),
-            expected_vector(
-                format!("{model}.ffn_norm.weight"),
-                format!("{gguf}.ffn_norm.weight"),
-                hidden,
-            ),
-        ]);
-        let policy = args.layer_schedule.get(layer).ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "LFM2 layer schedule has no policy for layer {layer}"
-            ))
-        })?;
-        match policy.operator {
-            lfm2::OperatorPolicy::CausalConvolution => {
-                tensors.extend([
-                    expected_dense_with_gguf_shape(
-                        format!("{model}.conv.conv.weight"),
-                        format!("{gguf}.shortconv.conv.weight"),
-                        vec![hidden, 1, args.conv_l_cache as usize],
-                        vec![hidden, args.conv_l_cache as usize],
-                    ),
-                    expected(
-                        format!("{model}.conv.in_proj.weight"),
-                        format!("{gguf}.shortconv.in_proj.weight"),
-                        [3 * hidden, hidden],
-                    ),
-                    expected(
-                        format!("{model}.conv.out_proj.weight"),
-                        format!("{gguf}.shortconv.out_proj.weight"),
-                        [hidden, hidden],
-                    ),
-                ]);
-                if args.conv_bias {
-                    tensors.extend([
-                        expected_vector(
-                            format!("{model}.conv.conv.bias"),
-                            format!("{gguf}.shortconv.conv.bias"),
-                            hidden,
-                        ),
-                        expected_vector(
-                            format!("{model}.conv.in_proj.bias"),
-                            format!("{gguf}.shortconv.in_proj.bias"),
-                            3 * hidden,
-                        ),
-                        expected_vector(
-                            format!("{model}.conv.out_proj.bias"),
-                            format!("{gguf}.shortconv.out_proj.bias"),
-                            hidden,
-                        ),
-                    ]);
-                }
-            }
-            lfm2::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full) => tensors.extend([
-                expected(
-                    format!("{model}.self_attn.q_proj.weight"),
-                    format!("{gguf}.attn_q.weight"),
-                    [hidden, hidden],
-                ),
-                expected(
-                    format!("{model}.self_attn.k_proj.weight"),
-                    format!("{gguf}.attn_k.weight"),
-                    [key_value, hidden],
-                ),
-                expected(
-                    format!("{model}.self_attn.v_proj.weight"),
-                    format!("{gguf}.attn_v.weight"),
-                    [key_value, hidden],
-                ),
-                expected(
-                    format!("{model}.self_attn.out_proj.weight"),
-                    format!("{gguf}.attn_output.weight"),
-                    [hidden, hidden],
-                ),
-                expected_vector(
-                    format!("{model}.self_attn.q_layernorm.weight"),
-                    format!("{gguf}.attn_q_norm.weight"),
-                    head,
-                ),
-                expected_vector(
-                    format!("{model}.self_attn.k_layernorm.weight"),
-                    format!("{gguf}.attn_k_norm.weight"),
-                    head,
-                ),
-            ]),
-            lfm2::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Sliding { .. }) => {
-                return Err(Error::UnsupportedArchitecture(
-                    "LFM2 structural admission does not support sliding attention".into(),
-                ));
-            }
-        }
-        if policy.feed_forward == lfm2::FeedForwardPolicy::SparseMoe {
-            let experts = args.num_experts as usize;
-            let intermediate = args.moe_intermediate_size as usize;
-            tensors.extend([
-                expected(
-                    format!("{model}.feed_forward.gate.weight"),
-                    format!("{gguf}.ffn_gate_inp.weight"),
-                    [experts, hidden],
-                ),
-                expected_rank3(
-                    format!("{model}.feed_forward.experts.gate_proj"),
-                    format!("{gguf}.ffn_gate_exps.weight"),
-                    [experts, intermediate, hidden],
-                ),
-                expected_rank3(
-                    format!("{model}.feed_forward.experts.up_proj"),
-                    format!("{gguf}.ffn_up_exps.weight"),
-                    [experts, intermediate, hidden],
-                ),
-                expected_rank3(
-                    format!("{model}.feed_forward.experts.down_proj"),
-                    format!("{gguf}.ffn_down_exps.weight"),
-                    [experts, hidden, intermediate],
-                ),
-            ]);
-            if args.use_expert_bias {
-                tensors.push(expected_vector(
-                    format!("{model}.feed_forward.expert_bias"),
-                    format!("{gguf}.ffn_exp_probs_b.bias"),
-                    experts,
-                ));
-            }
-        } else {
-            let intermediate = args.dense_intermediate_size as usize;
-            tensors.extend([
-                expected(
-                    format!("{model}.feed_forward.w1.weight"),
-                    format!("{gguf}.ffn_gate.weight"),
-                    [intermediate, hidden],
-                ),
-                expected(
-                    format!("{model}.feed_forward.w2.weight"),
-                    format!("{gguf}.ffn_down.weight"),
-                    [hidden, intermediate],
-                ),
-                expected(
-                    format!("{model}.feed_forward.w3.weight"),
-                    format!("{gguf}.ffn_up.weight"),
-                    [intermediate, hidden],
-                ),
-            ]);
-        }
-    }
     Ok(tensors)
 }
 
@@ -1462,82 +1296,6 @@ fn validate_deepseek_v3_safetensors(
     )
 }
 
-fn validate_lfm2_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    let args = match lfm2::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > store.keys().len() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
-            args.num_hidden_layers,
-            store.keys().len()
-        ));
-    }
-    let mut expected = match lfm2_expected(&args) {
-        Ok(expected) => expected,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let mlx_conv_shape = [args.hidden_size as usize, args.conv_l_cache as usize, 1];
-    for tensor in &mut expected {
-        if tensor.safetensors_name.ends_with(".conv.conv.weight")
-            && store
-                .metadata(&tensor.safetensors_name)
-                .is_ok_and(|metadata| metadata.shape == mlx_conv_shape)
-        {
-            // MLX-LM may serialize its native Conv1d layout. The LFM2 loaders
-            // normalize this to SafeMLX's internal checkpoint layout.
-            tensor.safetensors_shape = mlx_conv_shape.to_vec();
-        }
-    }
-    if !args.has_sparse_moe_layers() {
-        return validate_safetensor_plan_with(store, expected, |name| {
-            args.weight_quantization_for(name)
-        });
-    }
-    expected.retain(|tensor| !tensor.safetensors_name.contains(".feed_forward.experts."));
-    let mut issues = Vec::new();
-    append_structural_issues(
-        validate_safetensor_plan_with(store, expected, |name| {
-            if name.ends_with(".feed_forward.gate.weight") {
-                None
-            } else {
-                args.weight_quantization_for(name)
-            }
-        }),
-        &mut issues,
-    );
-    let allow_derived_packed = !options.weight_residency.is_fully_resident();
-    for (layer, _) in args
-        .layer_schedule
-        .iter()
-        .enumerate()
-        .filter(|(_, policy)| policy.feed_forward == lfm2::FeedForwardPolicy::SparseMoe)
-    {
-        validate_split_or_packed_swiglu_experts(
-            store,
-            &format!("model.layers.{layer}.feed_forward.experts"),
-            args.num_experts as usize,
-            args.hidden_size as usize,
-            args.moe_intermediate_size as usize,
-            true,
-            allow_derived_packed,
-            args.weight_quantization_for(&format!(
-                "model.layers.{layer}.feed_forward.experts.gate_up_proj"
-            )),
-            args.weight_quantization_for(&format!(
-                "model.layers.{layer}.feed_forward.experts.down_proj"
-            )),
-            &mut issues,
-        );
-    }
-    finish(issues)
-}
-
 fn validate_gpt_oss_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
@@ -2047,195 +1805,6 @@ fn validate_qwen3_vl_safetensors(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_split_or_packed_swiglu_experts(
-    store: &SafetensorsWeightStore,
-    prefix: &str,
-    experts: usize,
-    hidden: usize,
-    intermediate: usize,
-    allow_per_expert_split: bool,
-    allow_separate_packed: bool,
-    gate_up_quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
-    down_quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
-    issues: &mut Vec<StructuralIssue>,
-) {
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
-    let gate_up = format!("{prefix}.gate_up_proj");
-    let gate = format!("{prefix}.gate_proj");
-    let up = format!("{prefix}.up_proj");
-    let down = format!("{prefix}.down_proj");
-    let packed_present = keys.contains(&gate_up)
-        || (keys.contains(&down) && !keys.contains(&gate) && !keys.contains(&up));
-    if packed_present {
-        let mut packed_allowed = BTreeSet::from([gate_up.clone(), down.clone()]);
-        for (name, quantization) in [(&gate_up, gate_up_quantization), (&down, down_quantization)] {
-            if let Some(quantization) = quantization {
-                packed_allowed.insert(format!("{name}.scales"));
-                if quantization.has_biases() {
-                    packed_allowed.insert(format!("{name}.biases"));
-                }
-            }
-        }
-        for key in keys
-            .iter()
-            .filter(|key| key.starts_with(&format!("{prefix}.")) && !packed_allowed.contains(*key))
-        {
-            issues.push(StructuralIssue {
-                kind: StructuralIssueKind::ConflictingLayout,
-                detail: format!("expert catalog {prefix:?} mixes packed tensor names with {key:?}"),
-                tensor_name: Some(key.clone()),
-                tensor_type_code: None,
-                metadata_key: None,
-            });
-        }
-        append_structural_issues(
-            validate_safetensor_plan_with(
-                store,
-                vec![
-                    expected_rank3(gate_up, "", [experts, 2 * intermediate, hidden]),
-                    expected_rank3(down, "", [experts, hidden, intermediate]),
-                ],
-                |name| {
-                    if name.ends_with("gate_up_proj") {
-                        gate_up_quantization
-                    } else {
-                        down_quantization
-                    }
-                },
-            ),
-            issues,
-        );
-        return;
-    }
-
-    let separate_present = keys.contains(&gate) || keys.contains(&up) || keys.contains(&down);
-    if separate_present {
-        if !allow_separate_packed {
-            issues.push(StructuralIssue {
-                kind: StructuralIssueKind::ConflictingLayout,
-                detail: format!(
-                    "the requested resident loader requires {gate_up:?}; separate packed gate/up tensors are only supported by bounded loading"
-                ),
-                tensor_name: Some(gate),
-                tensor_type_code: None,
-                metadata_key: None,
-            });
-            issues.push(missing(&gate_up));
-            return;
-        }
-        let mut separate_allowed = BTreeSet::from([gate.clone(), up.clone(), down.clone()]);
-        for (name, quantization) in [
-            (&gate, gate_up_quantization),
-            (&up, gate_up_quantization),
-            (&down, down_quantization),
-        ] {
-            if let Some(quantization) = quantization {
-                separate_allowed.insert(format!("{name}.scales"));
-                if quantization.has_biases() {
-                    separate_allowed.insert(format!("{name}.biases"));
-                }
-            }
-        }
-        for key in keys.iter().filter(|key| {
-            key.starts_with(&format!("{prefix}.")) && !separate_allowed.contains(*key)
-        }) {
-            issues.push(StructuralIssue {
-                kind: StructuralIssueKind::ConflictingLayout,
-                detail: format!(
-                    "expert catalog {prefix:?} mixes separate packed banks with {key:?}"
-                ),
-                tensor_name: Some(key.clone()),
-                tensor_type_code: None,
-                metadata_key: None,
-            });
-        }
-        append_structural_issues(
-            validate_safetensor_plan_with(
-                store,
-                vec![
-                    expected_rank3(gate, "", [experts, intermediate, hidden]),
-                    expected_rank3(up, "", [experts, intermediate, hidden]),
-                    expected_rank3(down, "", [experts, hidden, intermediate]),
-                ],
-                |name| {
-                    if name.ends_with("down_proj") {
-                        down_quantization
-                    } else {
-                        gate_up_quantization
-                    }
-                },
-            ),
-            issues,
-        );
-        return;
-    }
-
-    if !allow_per_expert_split || gate_up_quantization.is_some() || down_quantization.is_some() {
-        let split = keys
-            .iter()
-            .find(|key| key.starts_with(&format!("{prefix}.")))
-            .cloned();
-        if let Some(split) = split {
-            issues.push(StructuralIssue {
-                kind: StructuralIssueKind::ConflictingLayout,
-                detail: format!(
-                    "the selected loader cannot derive the required packed expert representation from {split:?}"
-                ),
-                tensor_name: Some(split),
-                tensor_type_code: None,
-                metadata_key: None,
-            });
-        }
-        issues.extend([missing(&gate_up), missing(&down)]);
-        return;
-    }
-
-    let mut allowed = BTreeSet::new();
-    for expert in 0..experts {
-        for (aliases, shape) in [
-            (["w1", "gate_proj"], vec![intermediate, hidden]),
-            (["w2", "down_proj"], vec![hidden, intermediate]),
-            (["w3", "up_proj"], vec![intermediate, hidden]),
-        ] {
-            let candidates =
-                aliases.map(|projection| format!("{prefix}.{expert}.{projection}.weight"));
-            allowed.extend(candidates.iter().cloned());
-            let present = candidates
-                .iter()
-                .filter(|candidate| keys.contains(*candidate))
-                .collect::<Vec<_>>();
-            if present.len() > 1 {
-                issues.push(StructuralIssue {
-                    kind: StructuralIssueKind::ConflictingLayout,
-                    detail: format!(
-                        "expert {expert} has conflicting aliases {:?} and {:?}",
-                        present[0], present[1]
-                    ),
-                    tensor_name: Some(present[1].clone()),
-                    tensor_type_code: None,
-                    metadata_key: None,
-                });
-            }
-            let name = present.first().map_or(&candidates[0], |name| *name);
-            validate_safetensor(store, name, &shape, false, issues);
-        }
-    }
-    for key in keys
-        .iter()
-        .filter(|key| key.starts_with(&format!("{prefix}.")) && !allowed.contains(*key))
-    {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: format!(
-                "expert catalog {prefix:?} contains an unexpected or out-of-range tensor {key:?}"
-            ),
-            tensor_name: Some(key.clone()),
-            tensor_type_code: None,
-            metadata_key: None,
-        });
-    }
-}
-
 fn validate_safetensor_plan(
     store: &SafetensorsWeightStore,
     expected: Vec<ExpectedTensor>,
@@ -2439,33 +2008,6 @@ fn validate_safetensor_format(
     }
 }
 
-fn validate_safetensor_plan_with(
-    store: &SafetensorsWeightStore,
-    expected: Vec<ExpectedTensor>,
-    quantization_for: impl Fn(
-        &str,
-    )
-        -> Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
-) -> StructuralValidation {
-    let mut issues = Vec::new();
-    for tensor in expected {
-        if tensor.operation == TensorOperation::Matrix {
-            if let Some(quantization) = quantization_for(&tensor.safetensors_name) {
-                validate_quantized_safetensor(store, &tensor, quantization, &mut issues);
-                continue;
-            }
-        }
-        validate_safetensor(
-            store,
-            &tensor.safetensors_name,
-            &tensor.safetensors_shape,
-            false,
-            &mut issues,
-        );
-    }
-    finish(issues)
-}
-
 fn validate_quantized_safetensor(
     store: &SafetensorsWeightStore,
     tensor: &ExpectedTensor,
@@ -2566,69 +2108,6 @@ fn validate_deepseek4_gguf(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
     deepseek_v4_checkpoint::validate_gguf(checkpoint, metadata)
-}
-
-fn validate_lfm2_gguf(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> StructuralValidation {
-    let is_moe = architecture == GgufArchitecture::Lfm2Moe;
-    let metadata_name = architecture.metadata_name();
-    let translate = |name: &str| lfm2::translate_gguf_weight_name(name, is_moe);
-    if let Err(error) = checkpoint.catalog().translated_outputs(translate) {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args = match lfm2::args_from_gguf_catalog(checkpoint, metadata, metadata_name, is_moe) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > checkpoint.catalog().physical_tensor_count() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor GGUF catalog",
-            args.num_hidden_layers,
-            checkpoint.catalog().physical_tensor_count()
-        ));
-    }
-    let mut expected = match lfm2_expected(&args) {
-        Ok(expected) => expected,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    for tensor in &mut expected {
-        if let Some(prefix) = tensor.gguf_name.strip_suffix(".ffn_exp_probs_b.bias") {
-            let alias = format!("{prefix}.exp_probs_b.bias");
-            if checkpoint
-                .catalog()
-                .tensors()
-                .any(|actual| actual.descriptor().name == alias)
-            {
-                tensor.gguf_name = alias;
-            }
-        }
-    }
-    let mut issues = validate_gguf_plan(checkpoint, expected, "LFM2");
-    if is_moe {
-        issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
-            checkpoint,
-            args.layer_schedule
-                .iter()
-                .enumerate()
-                .filter_map(|(layer, policy)| {
-                    (policy.feed_forward == lfm2::FeedForwardPolicy::SparseMoe).then_some((
-                        format!("blk.{layer}.ffn_gate_exps.weight"),
-                        format!("blk.{layer}.ffn_up_exps.weight"),
-                    ))
-                }),
-            "LFM2 MoE",
-        ));
-    }
-    finish(issues)
 }
 
 fn validate_inkling_gguf(
@@ -3385,54 +2864,5 @@ mod dense_qwen_tests {
             .common_tensors
             .iter()
             .any(|tensor| tensor.key == "lm_head.weight"));
-    }
-}
-
-#[cfg(test)]
-mod lfm2_schedule_tests {
-    use super::*;
-
-    #[test]
-    fn structural_plan_uses_each_feed_forward_policy_in_order() {
-        let mut args = lfm2::model_args_from_config_value(&serde_json::json!({
-            "model_type": "lfm2_moe", "vocab_size": 32, "hidden_size": 16,
-            "intermediate_size": 24, "num_hidden_layers": 3,
-            "num_attention_heads": 4, "num_key_value_heads": 2,
-            "max_position_embeddings": 64, "norm_eps": 1e-5,
-            "layer_types": ["conv", "full_attention", "conv"],
-            "conv_L_cache": 3, "block_auto_adjust_ff_dim": false,
-            "moe_intermediate_size": 8, "num_dense_layers": 1,
-            "num_experts": 2, "num_experts_per_tok": 1
-        }))
-        .unwrap();
-        args.layer_schedule = crate::LayerSchedule::new(
-            3,
-            vec![
-                lfm2::LayerPolicy {
-                    operator: lfm2::OperatorPolicy::CausalConvolution,
-                    feed_forward: lfm2::FeedForwardPolicy::SparseMoe,
-                },
-                lfm2::LayerPolicy {
-                    operator: lfm2::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full),
-                    feed_forward: lfm2::FeedForwardPolicy::Dense,
-                },
-                lfm2::LayerPolicy {
-                    operator: lfm2::OperatorPolicy::CausalConvolution,
-                    feed_forward: lfm2::FeedForwardPolicy::SparseMoe,
-                },
-            ],
-        )
-        .unwrap();
-
-        let names = lfm2_expected(&args)
-            .unwrap()
-            .into_iter()
-            .map(|tensor| tensor.safetensors_name)
-            .collect::<BTreeSet<_>>();
-        assert!(names.contains("model.layers.0.feed_forward.gate.weight"));
-        assert!(!names.contains("model.layers.0.feed_forward.w1.weight"));
-        assert!(names.contains("model.layers.1.feed_forward.w1.weight"));
-        assert!(!names.contains("model.layers.1.feed_forward.gate.weight"));
-        assert!(names.contains("model.layers.2.feed_forward.gate.weight"));
     }
 }

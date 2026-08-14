@@ -44,9 +44,10 @@ use crate::{
         KeyValueCache,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
+        populate_module_from_lease, populate_module_from_lease_excluding,
     },
+    runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -1173,20 +1174,38 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, "model.embed_tokens", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    "model.embed_tokens",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, "model.embedding_norm", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    "model.embedding_norm",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings(head, "lm_head", store)?,
+                    build_module_binding_plan_with_recipes(
+                        head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -1626,15 +1645,14 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
                 }
             }
         }
-        let bindings = build_module_bindings_with_recipes(layer, &prefix, store, recipes)?;
-        Ok(if self.sparse_expert_cache {
-            bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("feed_forward.experts."))
-                .collect()
-        } else {
-            bindings
-        })
+        Ok(build_module_binding_plan_with_recipes_excluding(
+            layer,
+            &prefix,
+            store,
+            recipes,
+            |name| self.sparse_expert_cache && name.starts_with("feed_forward.experts."),
+        )?
+        .build_bindings(store)?)
     }
     fn parallel_layer_bindings(
         &self,
@@ -1902,7 +1920,7 @@ pub(crate) fn lfm2_expert_catalog(
         let packed_down = format!("{prefix}.down_proj");
         for expert in 0..args.num_experts as usize {
             let identity = ExpertIdentity::new(layer, expert);
-            let mut bindings = Vec::new();
+            let mut planned = Vec::new();
             if keys.contains(&packed_gate_up) && keys.contains(&packed_down) {
                 for (name, key) in [
                     ("gate_up_proj", &packed_gate_up),
@@ -1916,8 +1934,7 @@ pub(crate) fn lfm2_expert_catalog(
                             end: expert + 1,
                         },
                     );
-                    let bytes = recipe.infer(store)?.byte_len();
-                    bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                    planned.push(planned_binding(name, recipe, store)?);
                 }
                 for (name, key) in [
                     ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
@@ -1934,8 +1951,7 @@ pub(crate) fn lfm2_expert_catalog(
                                 end: expert + 1,
                             },
                         );
-                        let bytes = recipe.infer(store)?.byte_len();
-                        bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                        planned.push(planned_binding(name, recipe, store)?);
                     }
                 }
             } else if keys.contains(&format!("{prefix}.gate_proj"))
@@ -1969,8 +1985,7 @@ pub(crate) fn lfm2_expert_catalog(
                         DerivedWeightRecipe::source(packed_down.clone(), selection.clone()),
                     ),
                 ] {
-                    let bytes = recipe.infer(store)?.byte_len();
-                    bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                    planned.push(planned_binding(name, recipe, store)?);
                 }
                 for suffix in ["_scales", "_biases"] {
                     let gate = format!("{prefix}.gate_proj{suffix}");
@@ -1983,21 +1998,19 @@ pub(crate) fn lfm2_expert_catalog(
                                 DerivedWeightRecipe::source(up, selection.clone()),
                             ],
                         };
-                        let bytes = recipe.infer(store)?.byte_len();
-                        bindings.push(WeightBinding::from_recipe(
+                        planned.push(planned_binding(
                             format!("gate_up_proj{suffix}"),
                             recipe,
-                            bytes,
+                            store,
                         )?);
                     }
                     let down = format!("{packed_down}{suffix}");
                     if keys.contains(&down) {
                         let recipe = DerivedWeightRecipe::source(down, selection.clone());
-                        let bytes = recipe.infer(store)?.byte_len();
-                        bindings.push(WeightBinding::from_recipe(
+                        planned.push(planned_binding(
                             format!("down_proj{suffix}"),
                             recipe,
-                            bytes,
+                            store,
                         )?);
                     }
                 }
@@ -2036,10 +2049,12 @@ pub(crate) fn lfm2_expert_catalog(
                         },
                     ),
                 ] {
-                    let bytes = recipe.infer(store)?.byte_len();
-                    bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                    planned.push(planned_binding(name, recipe, store)?);
                 }
             }
+            let bindings = BindingPlan::new(planned)
+                .and_then(|plan| plan.build_bindings(store))
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
                     Error::UnsupportedArchitecture("LFM2 expert byte total overflowed".into())
@@ -2053,6 +2068,20 @@ pub(crate) fn lfm2_expert_catalog(
         }
     }
     Ok(entries)
+}
+
+fn planned_binding(
+    name: impl Into<String>,
+    recipe: DerivedWeightRecipe,
+    store: &dyn WeightStore,
+) -> Result<PlannedBinding, Error> {
+    let metadata = recipe.infer(store)?;
+    Ok(PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    })
 }
 
 /// LFM2 token generation iterator using bounded layer execution.

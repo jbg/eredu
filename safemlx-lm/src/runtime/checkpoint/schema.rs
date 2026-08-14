@@ -58,6 +58,8 @@ pub(crate) struct SafetensorsTensorConstraint {
     /// Alternative physical names for the same logical tensor.
     pub(crate) aliases: Vec<String>,
     pub(crate) shape: Vec<usize>,
+    /// Additional accepted physical shapes with equivalent runtime semantics.
+    pub(crate) alternate_shapes: Vec<Vec<usize>>,
     /// Accept any physical shape with this many elements. `shape` remains the
     /// canonical shape used by loading recipes.
     pub(crate) element_count: Option<usize>,
@@ -76,6 +78,7 @@ impl SafetensorsTensorConstraint {
             key: key.into(),
             aliases: Vec::new(),
             shape: shape.into(),
+            alternate_shapes: Vec::new(),
             element_count: None,
             dtype,
             requirement: TensorRequirement::Required,
@@ -98,6 +101,14 @@ impl SafetensorsTensorConstraint {
 
     pub(crate) fn with_element_count(mut self, element_count: usize) -> Self {
         self.element_count = Some(element_count);
+        self
+    }
+
+    pub(crate) fn with_alternate_shapes(
+        mut self,
+        shapes: impl IntoIterator<Item = impl Into<Vec<usize>>>,
+    ) -> Self {
+        self.alternate_shapes = shapes.into_iter().map(Into::into).collect();
         self
     }
 
@@ -345,13 +356,16 @@ impl PhysicalConstraint for SafetensorsTensorConstraint {
         &self.shape
     }
     fn alternate_shapes(&self) -> &[Vec<usize>] {
-        &[]
+        &self.alternate_shapes
     }
     fn element_count(&self) -> Option<usize> {
         self.element_count
     }
     fn normalize(&mut self) {
         self.dtype.normalize();
+        self.alternate_shapes.sort();
+        self.alternate_shapes.dedup();
+        self.alternate_shapes.retain(|shape| shape != &self.shape);
     }
     fn has_empty_encoding_set(&self) -> bool {
         matches!(&self.dtype, StoredDtypeConstraint::OneOf(dtypes) if dtypes.is_empty())
@@ -698,6 +712,15 @@ mod tests {
                     GgufTypeConstraint::Exact(GgufType::F32),
                 )
                 .with_alternate_shapes([vec![1, 0]])],
+                Vec::new(),
+                CatalogPolicy::strict(),
+            ),
+            Err(CheckpointPlanError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            SafetensorsCheckpointPlan::new(
+                "invalid SafeTensors alternate",
+                vec![tensor("a", vec![1]).with_alternate_shapes([vec![1, 0]])],
                 Vec::new(),
                 CatalogPolicy::strict(),
             ),
