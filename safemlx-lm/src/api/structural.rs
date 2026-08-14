@@ -29,8 +29,21 @@ use crate::{
     error::Error,
     runtime::{
         attention::AttentionPolicy,
-        checkpoint::store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+        checkpoint::{
+            schema::{
+                gguf_encoding_supported, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
+                GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
+                SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
+            },
+            store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+            validation as checkpoint_validation,
+        },
     },
+};
+
+pub(crate) use crate::runtime::checkpoint::contract::{
+    CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
+    CheckpointValidation as StructuralValidation,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -38,81 +51,6 @@ use crate::{
 pub(crate) enum StructuralValidationPolicy {
     Exact,
     Unverified,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum StructuralIssueKind {
-    MissingTensor,
-    UnexpectedTensor,
-    ConflictingLayout,
-    ShapeMismatch,
-    UnsupportedEncoding,
-    QuantizationCompanionMismatch,
-    InvalidGeometry,
-    ValidationUnavailable,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct StructuralIssue {
-    pub(crate) kind: StructuralIssueKind,
-    pub(crate) detail: String,
-    pub(crate) tensor_name: Option<String>,
-    pub(crate) tensor_type_code: Option<u32>,
-    pub(crate) metadata_key: Option<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum StructuralValidation {
-    Exact,
-    Invalid(Vec<StructuralIssue>),
-    Unverified(StructuralIssue),
-}
-
-impl StructuralValidation {
-    pub(crate) fn into_loader_result(self) -> Result<(), Error> {
-        match self {
-            Self::Exact => Ok(()),
-            Self::Unverified(issue) => Err(Error::StrictLoadValidation {
-                missing: Vec::new(),
-                unused: vec![issue.detail],
-            }),
-            Self::Invalid(issues) => {
-                let mut missing = issues
-                    .iter()
-                    .filter(|issue| issue.kind == StructuralIssueKind::MissingTensor)
-                    .filter_map(|issue| issue.tensor_name.clone())
-                    .collect::<Vec<_>>();
-                let mut unused = issues
-                    .into_iter()
-                    .filter(|issue| issue.kind != StructuralIssueKind::MissingTensor)
-                    .map(|issue| {
-                        if issue.kind == StructuralIssueKind::UnexpectedTensor {
-                            issue.tensor_name.unwrap_or(issue.detail)
-                        } else {
-                            issue.detail
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                missing.sort();
-                missing.dedup();
-                unused.sort();
-                Err(Error::StrictLoadValidation { missing, unused })
-            }
-        }
-    }
-
-    fn with_strict_catalog(self, strict: bool) -> Self {
-        if strict {
-            return self;
-        }
-        match self {
-            Self::Invalid(mut issues) => {
-                issues.retain(|issue| issue.kind != StructuralIssueKind::UnexpectedTensor);
-                finish(issues)
-            }
-            validation => validation,
-        }
-    }
 }
 
 /// Exhaustive policy table for high-level SafeTensors loader families.
@@ -259,15 +197,6 @@ fn unverified(architecture: &str) -> StructuralValidation {
         tensor_type_code: None,
         metadata_key: None,
     })
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum TensorOperation {
-    Matrix,
-    Vector,
-    Dense,
-    I32,
-    MxFp4Matrix,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -6142,23 +6071,12 @@ fn validate_safetensor_plan(
     expected: Vec<ExpectedTensor>,
     quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
 ) -> StructuralValidation {
-    let mut issues = Vec::new();
-    for tensor in expected {
-        if tensor.operation == TensorOperation::Matrix {
-            if let Some(quantization) = quantization {
-                validate_quantized_safetensor(store, &tensor, quantization, &mut issues);
-                continue;
-            }
-        }
-        validate_safetensor(
-            store,
-            &tensor.safetensors_name,
-            &tensor.safetensors_shape,
-            false,
-            &mut issues,
-        );
-    }
-    finish(issues)
+    validate_safetensor_format_plan(store, expected, |_| {
+        quantization.map_or(
+            SafetensorsMatrixFormat::Dense,
+            SafetensorsMatrixFormat::Affine,
+        )
+    })
 }
 
 fn validate_safetensor_format_plan(
@@ -6166,22 +6084,178 @@ fn validate_safetensor_format_plan(
     expected: Vec<ExpectedTensor>,
     format_for: impl Fn(&str) -> SafetensorsMatrixFormat,
 ) -> StructuralValidation {
-    let mut issues = Vec::new();
+    let mut common = Vec::new();
+    let mut groups = Vec::new();
+    let mut construction_issues = Vec::new();
     for tensor in expected {
         let format = if tensor.operation == TensorOperation::Matrix {
             format_for(&tensor.safetensors_name)
         } else {
             SafetensorsMatrixFormat::Dense
         };
-        validate_safetensor_format(
-            store,
+        expand_safetensors_format(
             &tensor.safetensors_name,
             &tensor.safetensors_shape,
             format,
-            &mut issues,
+            &mut common,
+            &mut groups,
+            &mut construction_issues,
         );
     }
-    finish(issues)
+    if !construction_issues.is_empty() {
+        return finish(construction_issues);
+    }
+    let plan = match SafetensorsCheckpointPlan::new(
+        "SafeTensors",
+        common,
+        groups,
+        CatalogPolicy::non_strict(),
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    checkpoint_validation::validate_safetensors_plan(store, &plan)
+}
+
+fn expand_safetensors_format(
+    name: &str,
+    shape: &[usize],
+    format: SafetensorsMatrixFormat,
+    common: &mut Vec<SafetensorsTensorConstraint>,
+    groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
+    issues: &mut Vec<StructuralIssue>,
+) {
+    match format {
+        SafetensorsMatrixFormat::Dense => common.push(SafetensorsTensorConstraint::required(
+            name,
+            shape.to_vec(),
+            StoredDtypeConstraint::Floating,
+        )),
+        SafetensorsMatrixFormat::Affine(quantization) => {
+            let Some(&input) = shape.last() else {
+                issues.push(layout(
+                    name,
+                    format!("quantized matrix has invalid shape {shape:?}"),
+                ));
+                return;
+            };
+            let group_size = quantization.group_size() as usize;
+            let bits = quantization.bits() as usize;
+            let Some(packed_input) = input.checked_mul(bits).map(|value| value / 32) else {
+                issues.push(quantization_companion_issue(
+                    name,
+                    format!("quantized tensor {name:?} packing geometry overflows"),
+                ));
+                return;
+            };
+            if !input.is_multiple_of(group_size)
+                || !input.is_multiple_of(32)
+                || !input.checked_mul(bits).unwrap_or(1).is_multiple_of(32)
+            {
+                issues.push(quantization_companion_issue(
+                    name,
+                    format!(
+                        "quantized tensor {name:?} input dimension {input} is incompatible with group size {group_size} and {bits}-bit packing"
+                    ),
+                ));
+                return;
+            }
+            let mut packed = shape.to_vec();
+            *packed.last_mut().expect("non-empty matrix shape") = packed_input;
+            let packed_constraint = |key: String| {
+                SafetensorsTensorConstraint::required(
+                    key,
+                    packed.clone(),
+                    StoredDtypeConstraint::Exact(StoredDtype::U32),
+                )
+            };
+            if let Some(alias) = quantized_weight_alias(name) {
+                groups.push(AlternativeLayoutGroup {
+                    id: format!("packed alias for {name}"),
+                    required: true,
+                    variants: vec![
+                        LayoutVariant {
+                            id: "canonical".into(),
+                            tensors: vec![packed_constraint(name.into())],
+                            discriminator_keys: vec![name.into()],
+                        },
+                        LayoutVariant {
+                            id: "internal".into(),
+                            tensors: vec![packed_constraint(alias.clone())],
+                            discriminator_keys: vec![alias],
+                        },
+                    ],
+                });
+            } else {
+                common.push(packed_constraint(name.into()));
+            }
+            let mut companion_shape = shape.to_vec();
+            *companion_shape.last_mut().expect("non-empty matrix shape") = input / group_size;
+            let prefix = quantized_outer_prefix(name);
+            let companion_dtype = || {
+                StoredDtypeConstraint::OneOf(vec![
+                    StoredDtype::F16,
+                    StoredDtype::BF16,
+                    StoredDtype::F32,
+                    StoredDtype::U8,
+                ])
+            };
+            common.push(
+                SafetensorsTensorConstraint::required(
+                    format!("{prefix}.scales"),
+                    companion_shape.clone(),
+                    companion_dtype(),
+                )
+                .companion(),
+            );
+            if quantization.has_biases() {
+                common.push(
+                    SafetensorsTensorConstraint::required(
+                        format!("{prefix}.biases"),
+                        companion_shape,
+                        companion_dtype(),
+                    )
+                    .companion(),
+                );
+            }
+        }
+        SafetensorsMatrixFormat::Fp8Block128 => {
+            if shape.len() < 2 {
+                issues.push(layout(
+                    name,
+                    format!("native block-FP8 weight must have rank at least two, got {shape:?}"),
+                ));
+                return;
+            }
+            common.push(SafetensorsTensorConstraint::required(
+                name,
+                shape.to_vec(),
+                StoredDtypeConstraint::OneOf(vec![StoredDtype::F8E4M3, StoredDtype::U8]),
+            ));
+            let mut scale_shape = shape.to_vec();
+            let rank = scale_shape.len();
+            scale_shape[rank - 2] = scale_shape[rank - 2].div_ceil(128);
+            scale_shape[rank - 1] = scale_shape[rank - 1].div_ceil(128);
+            let scale = if name.ends_with(".weight") {
+                format!("{}.weight_scale_inv", name.trim_end_matches(".weight"))
+            } else {
+                format!("{name}_scale_inv")
+            };
+            common.push(
+                SafetensorsTensorConstraint::required(
+                    scale,
+                    scale_shape,
+                    StoredDtypeConstraint::OneOf(vec![
+                        StoredDtype::F16,
+                        StoredDtype::BF16,
+                        StoredDtype::F32,
+                        StoredDtype::U8,
+                    ]),
+                )
+                .companion(),
+            );
+        }
+    }
 }
 
 fn add_safetensors_format_companions(
@@ -6223,87 +6297,19 @@ fn validate_safetensor_format(
     format: SafetensorsMatrixFormat,
     issues: &mut Vec<StructuralIssue>,
 ) {
-    match format {
-        SafetensorsMatrixFormat::Dense => validate_safetensor(store, name, shape, false, issues),
-        SafetensorsMatrixFormat::Affine(quantization) => {
-            let tensor = ExpectedTensor {
-                safetensors_name: name.into(),
-                gguf_name: String::new(),
-                safetensors_shape: shape.to_vec(),
-                gguf_shape: shape.to_vec(),
-                operation: TensorOperation::Matrix,
-            };
-            validate_quantized_safetensor(store, &tensor, quantization, issues);
-        }
-        SafetensorsMatrixFormat::Fp8Block128 => {
-            validate_fp8_safetensor(store, name, shape, issues);
-        }
-    }
-}
-
-fn validate_fp8_safetensor(
-    store: &SafetensorsWeightStore,
-    name: &str,
-    shape: &[usize],
-    issues: &mut Vec<StructuralIssue>,
-) {
-    let metadata = match store.metadata(name) {
-        Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
-            issues.push(missing(name));
-            return;
-        }
-        Err(error) => {
-            issues.push(layout(name, error.to_string()));
-            return;
-        }
-    };
-    if metadata.shape != shape {
-        issues.push(shape_mismatch(name, shape, &metadata.shape));
-    }
-    if !matches!(metadata.stored_dtype, StoredDtype::F8E4M3 | StoredDtype::U8) {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::UnsupportedEncoding,
-            detail: format!(
-                "native block-FP8 tensor {name:?} requires F8E4M3 or raw FP8-byte U8 storage, got {:?}",
-                metadata.stored_dtype
-            ),
-            tensor_name: Some(name.into()),
-            tensor_type_code: None,
-            metadata_key: Some("quantization_config".into()),
-        });
-    }
-    if shape.len() < 2 {
-        issues.push(layout(
-            name,
-            format!("native block-FP8 weight must have rank at least two, got {shape:?}"),
-        ));
-        return;
-    }
-    let mut scale_shape = shape.to_vec();
-    let rank = scale_shape.len();
-    scale_shape[rank - 2] = scale_shape[rank - 2].div_ceil(128);
-    scale_shape[rank - 1] = scale_shape[rank - 1].div_ceil(128);
-    let scale = if name.ends_with(".weight") {
-        format!("{}.weight_scale_inv", name.trim_end_matches(".weight"))
-    } else {
-        format!("{name}_scale_inv")
-    };
-    match store.metadata(&scale) {
-        Ok(metadata)
-            if metadata.shape == scale_shape
-                && is_float_or_u8_dtype(&metadata.stored_dtype) => {}
-        Ok(metadata) => issues.push(quantization_companion_issue(
-            &scale,
-            format!(
-                "native block-FP8 companion {scale:?} expected shape {scale_shape:?} and F16, BF16, F32, or native E8M0 U8 storage, got {:?} {:?}",
-                metadata.shape, metadata.stored_dtype
-            ),
-        )),
-        Err(_) => issues.push(quantization_companion_issue(
-            &scale,
-            format!("native block-FP8 weight {name:?} is missing companion {scale:?}"),
-        )),
+    let mut common = Vec::new();
+    let mut groups = Vec::new();
+    expand_safetensors_format(name, shape, format, &mut common, &mut groups, issues);
+    if let Ok(plan) = SafetensorsCheckpointPlan::new(
+        format!("SafeTensors tensor {name}"),
+        common,
+        groups,
+        CatalogPolicy::non_strict(),
+    ) {
+        append_structural_issues(
+            checkpoint_validation::validate_safetensors_plan(store, &plan),
+            issues,
+        );
     }
 }
 
@@ -6340,53 +6346,13 @@ fn validate_quantized_safetensor(
     quantization: crate::runtime::checkpoint::quantization::WeightQuantization,
     issues: &mut Vec<StructuralIssue>,
 ) {
-    let input = *tensor.safetensors_shape.last().expect("matrix shape");
-    let group_size = quantization.group_size() as usize;
-    let bits = quantization.bits() as usize;
-    if !input.is_multiple_of(group_size)
-        || !input.is_multiple_of(32)
-        || !input.checked_mul(bits).unwrap_or(1).is_multiple_of(32)
-    {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::QuantizationCompanionMismatch,
-            detail: format!(
-                "quantized tensor {:?} input dimension {input} is incompatible with group size {group_size} and {bits}-bit packing",
-                tensor.safetensors_name
-            ),
-            tensor_name: Some(tensor.safetensors_name.clone()),
-            tensor_type_code: None,
-            metadata_key: Some("quantization".into()),
-        });
-        return;
-    }
-    let mut packed = tensor.safetensors_shape.clone();
-    *packed.last_mut().expect("matrix shape") = input * bits / 32;
-    let canonical = &tensor.safetensors_name;
-    let alias = quantized_weight_alias(canonical);
-    let present = std::iter::once(canonical.as_str())
-        .chain(alias.as_deref())
-        .filter(|name| store.metadata(name).is_ok())
-        .collect::<Vec<_>>();
-    match present.as_slice() {
-        [] => issues.push(missing(canonical)),
-        [name] => validate_safetensor(store, name, &packed, true, issues),
-        [_, conflicting, ..] => issues.push(StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: format!(
-                "quantized checkpoint contains both canonical and internal packed-weight aliases for {canonical:?}: {present:?}"
-            ),
-            tensor_name: Some((**conflicting).into()),
-            tensor_type_code: None,
-            metadata_key: None,
-        }),
-    }
-    let prefix = quantized_outer_prefix(&tensor.safetensors_name);
-    let mut companions = tensor.safetensors_shape.clone();
-    *companions.last_mut().expect("matrix shape") = input / group_size;
-    validate_quantization_companion(store, &format!("{prefix}.scales"), &companions, issues);
-    if quantization.has_biases() {
-        validate_quantization_companion(store, &format!("{prefix}.biases"), &companions, issues);
-    }
+    validate_safetensor_format(
+        store,
+        &tensor.safetensors_name,
+        &tensor.safetensors_shape,
+        SafetensorsMatrixFormat::Affine(quantization),
+        issues,
+    );
 }
 
 fn quantized_weight_alias(name: &str) -> Option<String> {
@@ -6411,37 +6377,26 @@ fn validate_safetensor(
     packed: bool,
     issues: &mut Vec<StructuralIssue>,
 ) {
-    let metadata = match store.metadata(name) {
-        Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
-            issues.push(missing(name));
-            return;
-        }
-        Err(error) => {
-            issues.push(layout(name, error.to_string()));
-            return;
-        }
-    };
-    if metadata.shape != shape {
-        issues.push(shape_mismatch(name, shape, &metadata.shape));
-    }
-    let supported = if packed {
-        matches!(metadata.stored_dtype, StoredDtype::U32)
+    let dtype = if packed {
+        StoredDtypeConstraint::Exact(StoredDtype::U32)
     } else {
-        is_float_dtype(&metadata.stored_dtype)
+        StoredDtypeConstraint::Floating
     };
-    if !supported {
-        issues.push(StructuralIssue {
-            kind: StructuralIssueKind::UnsupportedEncoding,
-            detail: format!(
-                "tensor {name:?} uses unsupported SafeTensors dtype {:?}",
-                metadata.stored_dtype
-            ),
-            tensor_name: Some(name.into()),
-            tensor_type_code: None,
-            metadata_key: None,
-        });
-    }
+    let plan = SafetensorsCheckpointPlan::new(
+        format!("SafeTensors tensor {name}"),
+        vec![SafetensorsTensorConstraint::required(
+            name,
+            shape.to_vec(),
+            dtype,
+        )],
+        Vec::new(),
+        CatalogPolicy::non_strict(),
+    )
+    .expect("legacy structural tensor constraints are valid");
+    append_structural_issues(
+        checkpoint_validation::validate_safetensors_plan(store, &plan),
+        issues,
+    );
 }
 
 fn validate_quantization_companion(
@@ -6450,29 +6405,27 @@ fn validate_quantization_companion(
     shape: &[usize],
     issues: &mut Vec<StructuralIssue>,
 ) {
-    match store.metadata(name) {
-        Ok(metadata) => {
-            if metadata.shape != shape || !is_float_or_u8_dtype(&metadata.stored_dtype) {
-                issues.push(StructuralIssue {
-                    kind: StructuralIssueKind::QuantizationCompanionMismatch,
-                    detail: format!(
-                        "quantization companion {name:?} expected shape {shape:?} and a supported scale/bias dtype, got {:?} {:?}",
-                        metadata.shape, metadata.stored_dtype
-                    ),
-                    tensor_name: Some(name.into()),
-                    tensor_type_code: None,
-                    metadata_key: Some("quantization".into()),
-                });
-            }
-        }
-        Err(_) => issues.push(StructuralIssue {
-            kind: StructuralIssueKind::QuantizationCompanionMismatch,
-            detail: format!("quantized weight is missing required companion tensor {name:?}"),
-            tensor_name: Some(name.into()),
-            tensor_type_code: None,
-            metadata_key: Some("quantization".into()),
-        }),
-    }
+    let plan = SafetensorsCheckpointPlan::new(
+        format!("SafeTensors companion {name}"),
+        vec![SafetensorsTensorConstraint::required(
+            name,
+            shape.to_vec(),
+            StoredDtypeConstraint::OneOf(vec![
+                StoredDtype::F16,
+                StoredDtype::BF16,
+                StoredDtype::F32,
+                StoredDtype::U8,
+            ]),
+        )
+        .companion()],
+        Vec::new(),
+        CatalogPolicy::non_strict(),
+    )
+    .expect("legacy companion constraints are valid");
+    append_structural_issues(
+        checkpoint_validation::validate_safetensors_plan(store, &plan),
+        issues,
+    );
 }
 
 fn validate_deepseek2_gguf(
@@ -8835,47 +8788,28 @@ fn validate_gguf_plan(
     expected: Vec<ExpectedTensor>,
     loader_name: &str,
 ) -> Vec<StructuralIssue> {
-    let catalog = checkpoint
-        .catalog()
-        .tensors()
-        .map(|tensor| (tensor.descriptor().name.as_str(), tensor))
-        .collect::<BTreeMap<_, _>>();
-    let mut issues = Vec::new();
-    for expected in expected {
-        let Some(actual) = catalog.get(expected.gguf_name.as_str()) else {
-            issues.push(missing(&expected.gguf_name));
-            continue;
-        };
-        let shape = actual
-            .descriptor()
-            .mlx_shape()
-            .into_iter()
-            .map(|dimension| usize::try_from(dimension).unwrap_or(usize::MAX))
-            .collect::<Vec<_>>();
-        if shape != expected.gguf_shape {
-            issues.push(shape_mismatch(
-                &expected.gguf_name,
-                &expected.gguf_shape,
-                &shape,
-            ));
-        }
-        if !gguf_encoding_supported(expected.operation, actual.descriptor().ggml_type) {
-            let encoding = actual.descriptor().ggml_type;
-            issues.push(StructuralIssue {
-                kind: StructuralIssueKind::UnsupportedEncoding,
-                detail: format!(
-                    "GGUF tensor {:?} uses {encoding:?} (type {}) for a {:?} operation, which the {loader_name} loader does not support",
-                    expected.gguf_name,
-                    encoding.code(),
-                    expected.operation
-                ),
-                tensor_name: Some(expected.gguf_name),
-                tensor_type_code: Some(encoding.code()),
-                metadata_key: None,
-            });
-        }
+    let constraints = expected
+        .into_iter()
+        .map(|expected| {
+            GgufTensorConstraint::required(
+                expected.gguf_name,
+                expected.gguf_shape,
+                GgufTypeConstraint::OperationClass(expected.operation),
+            )
+        })
+        .collect();
+    let plan = GgufCheckpointPlan::new(
+        loader_name,
+        constraints,
+        Vec::new(),
+        CatalogPolicy::non_strict(),
+    )
+    .expect("legacy GGUF structural constraints are valid");
+    match checkpoint_validation::validate_gguf_plan(checkpoint, &plan) {
+        StructuralValidation::Exact => Vec::new(),
+        StructuralValidation::Invalid(issues) => issues,
+        StructuralValidation::Unverified(issue) => vec![issue],
     }
-    issues
 }
 
 fn validate_gguf_one_of(
@@ -8962,40 +8896,11 @@ fn validate_inkling_paired_gguf_formats(
     }
 }
 
-fn gguf_encoding_supported(operation: TensorOperation, encoding: GgufType) -> bool {
-    match operation {
-        TensorOperation::Vector => {
-            matches!(encoding, GgufType::F32 | GgufType::F16 | GgufType::Bf16)
-        }
-        TensorOperation::Dense => {
-            matches!(encoding, GgufType::F32 | GgufType::F16 | GgufType::Bf16)
-        }
-        TensorOperation::I32 => encoding == GgufType::I32,
-        TensorOperation::MxFp4Matrix => encoding == GgufType::MxFp4,
-        TensorOperation::Matrix => !matches!(
-            encoding,
-            GgufType::I8
-                | GgufType::I16
-                | GgufType::I32
-                | GgufType::I64
-                | GgufType::F64
-                | GgufType::RemovedIQ4NL4_4
-                | GgufType::RemovedIQ4NL4_8
-                | GgufType::RemovedIQ4NL8_8
-                | GgufType::Unknown(_)
-        ),
-    }
-}
-
 fn is_float_dtype(dtype: &StoredDtype) -> bool {
     matches!(
         dtype,
         StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32
     )
-}
-
-fn is_float_or_u8_dtype(dtype: &StoredDtype) -> bool {
-    is_float_dtype(dtype) || matches!(dtype, StoredDtype::U8)
 }
 
 fn finish(issues: Vec<StructuralIssue>) -> StructuralValidation {
