@@ -214,7 +214,7 @@ impl ExpertParallelCache {
                     cache.clear()?;
                 }
             }
-            Self::DeepSeekV4(cache) => cache.reset(),
+            Self::DeepSeekV4(cache) => cache.reset()?,
             Self::KimiLinear(cache) => cache.reset()?,
             Self::DenseQwen(cache) => cache
                 .iter_mut()
@@ -833,6 +833,9 @@ impl ExpertParallelModel {
                 ExpertArchitecture::DeepSeekLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::DeepSeek),
+                ExpertArchitecture::DeepSeekV4Layerwise(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ExpertParallelCache::DeepSeekV4),
                 ExpertArchitecture::KimiLinear(model) => {
                     let rank = Some(CacheRankIdentity {
                         pipeline_rank: None,
@@ -978,6 +981,7 @@ impl ExpertParallelModel {
     ) -> Result<Option<CacheResidencyReport>, Error> {
         match cache {
             ExpertParallelCache::DeepSeek(cache) => cache.residency_report().map_err(Into::into),
+            ExpertParallelCache::DeepSeekV4(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::GptOss(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::KimiLinear(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::DenseQwenPaged(caches) => caches

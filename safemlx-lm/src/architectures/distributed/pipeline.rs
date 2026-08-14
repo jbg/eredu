@@ -1093,6 +1093,12 @@ impl PipelineCache {
 
     /// Clears retained state without changing local layer ownership.
     pub fn reset(&mut self) -> Result<(), Error> {
+        let shared_manager_cleared = self.residency_manager.is_some();
+        if let Some(manager) = &self.residency_manager {
+            manager
+                .clear()
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+        }
         for layer in &mut self.layers {
             match layer {
                 PipelineLayerCache::StateSlots { slots, .. } => {
@@ -1111,14 +1117,28 @@ impl PipelineCache {
                     slots,
                     ..
                 } => {
-                    cache.clear()?;
+                    if shared_manager_cleared {
+                        cache.reset_local_after_manager_clear();
+                    } else {
+                        cache.clear()?;
+                    }
                     slots.iter_mut().for_each(PipelineStateSlot::clear);
                 }
                 PipelineLayerCache::CompressedLatent { cache, slots, .. } => {
-                    cache.clear()?;
+                    if shared_manager_cleared {
+                        cache.reset_local_after_manager_clear();
+                    } else {
+                        cache.clear()?;
+                    }
                     slots.iter_mut().for_each(PipelineStateSlot::clear);
                 }
-                PipelineLayerCache::DeepSeekV4 { cache, .. } => cache.clear(),
+                PipelineLayerCache::DeepSeekV4 { cache, .. } => {
+                    if shared_manager_cleared {
+                        cache.reset_local_after_manager_clear();
+                    } else {
+                        cache.clear()?;
+                    }
+                }
             }
         }
         self.mtp = PipelineMtpCache::None;
@@ -1201,7 +1221,9 @@ impl PipelineCache {
                         global_layer: previous_layer,
                         cache: previous_cache,
                     },
-                ) if global_layer == previous_layer => cache.clone_from(previous_cache),
+                ) if global_layer == previous_layer => {
+                    cache.restore_checkpoint(previous_cache, stream)?
+                }
                 _ => {
                     return Err(Error::Parallel(
                         "pipeline transaction checkpoint changed layer identity".into(),
@@ -1222,7 +1244,14 @@ impl PipelineCache {
                 }
             }
             (PipelineMtpCache::DeepSeekV4(current), PipelineMtpCache::DeepSeekV4(previous)) => {
-                current.clone_from(previous);
+                if current.len() != previous.len() {
+                    return Err(Error::Parallel(
+                        "pipeline DeepSeek V4 MTP checkpoint length changed".into(),
+                    ));
+                }
+                for (cache, checkpoint) in current.iter_mut().zip(previous) {
+                    cache.restore_checkpoint(checkpoint, stream)?;
+                }
             }
             (PipelineMtpCache::Inkling(current), PipelineMtpCache::Inkling(previous)) => {
                 if current.len() != previous.len() {
@@ -2265,7 +2294,10 @@ trait PipelineStageAdapter {
     ) -> Result<PipelinePayload, Error>;
 
     fn embedded_mtp_len(&self) -> usize;
-    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error>;
+    fn new_embedded_mtp_cache(
+        &self,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error>;
     #[allow(clippy::too_many_arguments)]
     fn forward_embedded_mtp_draft(
         &mut self,
@@ -2316,16 +2348,6 @@ trait PipelineStageAdapter {
         identity: &PromptCacheModelIdentity,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error>;
-    fn load_resident_prompt_cache(
-        &self,
-        _directory: &Path,
-        _expected: &PromptCacheDescriptor,
-        _identity: &PromptCacheModelIdentity,
-        _prefix_token_ids: &[u32],
-        _stream: &Stream,
-    ) -> Result<Option<(Vec<PipelineLayerCache>, PromptCacheManifest)>, Error> {
-        Ok(None)
-    }
 
     /// Executes this stage's local decoder range.
     fn forward(
@@ -2442,7 +2464,10 @@ trait PipelineStageSemantics {
     fn embedded_mtp_len(&self) -> usize {
         0
     }
-    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+    fn new_embedded_mtp_cache(
+        &self,
+        _paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error> {
         Ok(PipelineMtpCache::None)
     }
     #[allow(clippy::too_many_arguments)]
@@ -2507,16 +2532,6 @@ trait PipelineStageSemantics {
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
         materialize_pipeline_cache_layers(identity, paged)
-    }
-    fn load_resident_prompt_cache(
-        &self,
-        _directory: &Path,
-        _expected: &PromptCacheDescriptor,
-        _identity: &PromptCacheModelIdentity,
-        _prefix_token_ids: &[u32],
-        _stream: &Stream,
-    ) -> Result<Option<(Vec<PipelineLayerCache>, PromptCacheManifest)>, Error> {
-        Ok(None)
     }
     fn forward(
         &mut self,
@@ -2696,8 +2711,11 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         self.0.embedded_mtp_len()
     }
 
-    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
-        self.0.new_embedded_mtp_cache()
+    fn new_embedded_mtp_cache(
+        &self,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error> {
+        self.0.new_embedded_mtp_cache(paged)
     }
 
     fn forward_embedded_mtp_draft(
@@ -2778,18 +2796,6 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
         self.0.new_cache_layers(identity, paged)
-    }
-
-    fn load_resident_prompt_cache(
-        &self,
-        directory: &Path,
-        expected: &PromptCacheDescriptor,
-        identity: &PromptCacheModelIdentity,
-        prefix_token_ids: &[u32],
-        stream: &Stream,
-    ) -> Result<Option<(Vec<PipelineLayerCache>, PromptCacheManifest)>, Error> {
-        self.0
-            .load_resident_prompt_cache(directory, expected, identity, prefix_token_ids, stream)
     }
 
     fn forward(
@@ -3514,7 +3520,10 @@ impl PipelineStageSemantics for DeepSeekStage {
         self.layer_adapter.embedded_mtp_len()
     }
 
-    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+    fn new_embedded_mtp_cache(
+        &self,
+        _paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error> {
         Ok(PipelineMtpCache::DeepSeek(
             self.layer_adapter.embedded_mtp_cache(),
         ))
@@ -3686,10 +3695,17 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         self.layer_adapter.embedded_mtp_len()
     }
 
-    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
-        Ok(PipelineMtpCache::DeepSeekV4(
-            self.layer_adapter.embedded_mtp_cache(),
-        ))
+    fn new_embedded_mtp_cache(
+        &self,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error> {
+        let cache = match paged {
+            Some((manager, rank)) => self
+                .layer_adapter
+                .embedded_mtp_cache_with_manager(manager, rank)?,
+            None => self.layer_adapter.embedded_mtp_cache(),
+        };
+        Ok(PipelineMtpCache::DeepSeekV4(cache))
     }
 
     fn forward_embedded_mtp_draft(
@@ -3804,54 +3820,29 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         _identity: &PromptCacheModelIdentity,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
-        if paged.is_some() {
-            return Err(Error::UnsupportedArchitecture(
-                "DeepSeek V4 pipeline caches do not support paged persistence because compressed pooling/index state is architecture-owned".into(),
-            ));
-        }
         self.range
             .clone()
             .map(|global_layer| {
+                let cache = match &paged {
+                    Some((manager, rank)) => crate::architectures::deepseek_v4::attention::AttentionCache::new_paged_for_ratio(
+                        self.args.compress_ratios[global_layer],
+                        self.args.sliding_window,
+                        manager.clone(),
+                        global_layer,
+                        0,
+                        *rank,
+                    )?,
+                    None => crate::architectures::deepseek_v4::attention::AttentionCache::new_for_ratio(
+                        self.args.compress_ratios[global_layer],
+                        self.args.sliding_window,
+                    )?,
+                };
                 Ok(PipelineLayerCache::DeepSeekV4 {
                     global_layer,
-                    cache:
-                        crate::architectures::deepseek_v4::attention::AttentionCache::new_for_ratio(
-                            self.args.compress_ratios[global_layer],
-                            self.args.sliding_window,
-                        )?,
+                    cache,
                 })
             })
             .collect()
-    }
-
-    fn load_resident_prompt_cache(
-        &self,
-        directory: &Path,
-        expected: &PromptCacheDescriptor,
-        identity: &PromptCacheModelIdentity,
-        prefix_token_ids: &[u32],
-        stream: &Stream,
-    ) -> Result<Option<(Vec<PipelineLayerCache>, PromptCacheManifest)>, Error> {
-        let (restored, manifest) =
-            crate::architectures::deepseek_v4::model::load_attention_prompt_cache_with_identity(
-                &self.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                identity.clone(),
-                stream,
-            )?;
-        Ok(Some((
-            restored
-                .into_iter()
-                .enumerate()
-                .map(|(index, cache)| PipelineLayerCache::DeepSeekV4 {
-                    global_layer: identity.global_layer_start + index,
-                    cache,
-                })
-                .collect(),
-            manifest,
-        )))
     }
 
     fn forward(
@@ -5403,7 +5394,10 @@ impl PipelineStageSemantics for NemotronHStage {
         self.layer_adapter.embedded_mtp_len()
     }
 
-    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+    fn new_embedded_mtp_cache(
+        &self,
+        _paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error> {
         Ok(PipelineMtpCache::NemotronH(
             self.layer_adapter.embedded_mtp_cache(),
         ))
@@ -5685,7 +5679,10 @@ impl PipelineStageSemantics for QwenHybridStage {
         self.layer_adapter.embedded_mtp_len()
     }
 
-    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+    fn new_embedded_mtp_cache(
+        &self,
+        _paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error> {
         Ok(PipelineMtpCache::QwenHybrid(
             self.layer_adapter.embedded_mtp_cache(),
         ))
@@ -6097,7 +6094,10 @@ impl PipelineStageSemantics for InklingStage {
         self.layer_adapter.embedded_mtp_len()
     }
 
-    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+    fn new_embedded_mtp_cache(
+        &self,
+        _paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error> {
         Ok(PipelineMtpCache::Inkling(
             self.layer_adapter.embedded_mtp_cache(),
         ))
@@ -6457,7 +6457,7 @@ impl PipelineModel {
             self.stage.new_cache_layers(&self.cache_identity, None)?,
         );
         if self.info.is_last {
-            cache.mtp = self.stage.new_embedded_mtp_cache()?;
+            cache.mtp = self.stage.new_embedded_mtp_cache(None)?;
         }
         Ok(cache)
     }
@@ -6482,10 +6482,13 @@ impl PipelineModel {
                 let layers = self
                     .stage
                     .new_cache_layers(&self.cache_identity, Some((manager.clone(), rank)))?;
-                let mut cache =
-                    PipelineCache::with_residency_manager(self.info.model_kind, layers, manager);
+                let mut cache = PipelineCache::with_residency_manager(
+                    self.info.model_kind,
+                    layers,
+                    manager.clone(),
+                );
                 if self.info.is_last {
-                    cache.mtp = self.stage.new_embedded_mtp_cache()?;
+                    cache.mtp = self.stage.new_embedded_mtp_cache(Some((manager, rank)))?;
                 }
                 Ok(cache)
             }
@@ -6515,7 +6518,7 @@ impl PipelineModel {
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-        stream: &Stream,
+        _stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
         let identity = self.prompt_cache_model_identity()?;
         validate_prompt_cache_model_identity(&descriptor, &identity)
@@ -6551,13 +6554,28 @@ impl PipelineModel {
                         "pipeline prompt persistence requires a paged cache".into(),
                     ));
                 }
-                PipelineLayerCache::DeepSeekV4 { .. } => {}
+                PipelineLayerCache::DeepSeekV4 { cache, .. } => {
+                    cache.finalize()?;
+                    if cache.residency_manager().is_none() {
+                        return Err(Error::Parallel(
+                            "pipeline prompt persistence requires a paged cache".into(),
+                        ));
+                    }
+                }
             }
         }
         let expected_offset = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Error::Parallel("pipeline prompt length exceeds i32".into()))?;
         let mut state_arrays = Vec::new();
         for layer in &cache.layers {
+            if let PipelineLayerCache::DeepSeekV4 {
+                global_layer,
+                cache,
+            } = layer
+            {
+                state_arrays.extend(cache.prompt_cache_state_arrays(*global_layer));
+                continue;
+            }
             let (global_layer, slots) = match layer {
                 PipelineLayerCache::StateSlots {
                     global_layer,
@@ -6573,7 +6591,7 @@ impl PipelineModel {
                     slots,
                     ..
                 } => (*global_layer, slots),
-                PipelineLayerCache::DeepSeekV4 { .. } => continue,
+                PipelineLayerCache::DeepSeekV4 { .. } => unreachable!(),
             };
             for slot in slots {
                 match slot.value.as_ref() {
@@ -6600,36 +6618,18 @@ impl PipelineModel {
                 }
             }
         }
-        if let Some(manager) = manager {
-            return manager
-                .save_prompt_cache(
-                    self.prompt_cache_rank_directory(root.as_ref()),
-                    descriptor,
-                    prefix_token_ids,
-                    &state_arrays,
-                    options,
-                )
-                .map_err(|error| Error::Parallel(error.to_string()));
-        }
-        let caches = cache
-            .layers
-            .iter()
-            .map(|layer| match layer {
-                PipelineLayerCache::DeepSeekV4 { cache, .. } => Ok(cache.clone()),
-                _ => Err(Error::Parallel(
-                    "pipeline prompt persistence requires a paged cache".into(),
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        crate::architectures::deepseek_v4::model::save_attention_prompt_cache(
-            &caches,
-            self.prompt_cache_rank_directory(root.as_ref()),
-            descriptor.clone(),
-            prefix_token_ids,
-            options,
-            descriptor.topology.cache_rank_identity(),
-            stream,
-        )
+        manager
+            .ok_or_else(|| {
+                Error::Parallel("pipeline prompt persistence requires a paged cache".into())
+            })?
+            .save_prompt_cache(
+                self.prompt_cache_rank_directory(root.as_ref()),
+                descriptor,
+                prefix_token_ids,
+                &state_arrays,
+                options,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     /// Opens this stage's compatible persisted prefix without eager array loading.
@@ -6644,15 +6644,6 @@ impl PipelineModel {
         let identity = self.prompt_cache_model_identity()?;
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        if let Some((layers, manifest)) = self.stage.load_resident_prompt_cache(
-            &self.prompt_cache_rank_directory(root.as_ref()),
-            expected,
-            &identity,
-            prefix_token_ids,
-            stream,
-        )? {
-            return Ok((PipelineCache::new(self.info.model_kind, layers), manifest));
-        }
         let (manager, manifest) = open_prompt_cache(
             self.prompt_cache_rank_directory(root.as_ref()),
             expected,
@@ -6677,8 +6668,9 @@ impl PipelineModel {
             expert_parallel_rank: (self.topology.expert_parallel_size > 1)
                 .then_some(self.topology.expert_parallel_rank),
         });
-        let mut layers =
-            materialize_pipeline_cache_layers(&self.cache_identity, Some((manager.clone(), rank)))?;
+        let mut layers = self
+            .stage
+            .new_cache_layers(&self.cache_identity, Some((manager.clone(), rank)))?;
         let offset = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Error::Parallel("pipeline prompt length exceeds i32".into()))?;
         for layer in &mut layers {
@@ -6697,8 +6689,12 @@ impl PipelineModel {
                     slots,
                     ..
                 } => (*global_layer, slots),
-                PipelineLayerCache::DeepSeekV4 { .. } => {
-                    unreachable!("DeepSeek V4 paged pipeline cache materialization is unsupported")
+                PipelineLayerCache::DeepSeekV4 {
+                    global_layer,
+                    cache,
+                } => {
+                    cache.restore_prompt_cache_state(*global_layer, &mut restored_state, offset)?;
+                    continue;
                 }
             };
             for slot in slots {
@@ -6975,7 +6971,19 @@ impl PipelineModel {
 
     fn ensure_embedded_mtp_cache(&self, cache: &mut PipelineCache) -> Result<(), Error> {
         if self.info.is_last && matches!(cache.mtp, PipelineMtpCache::None) {
-            cache.mtp = self.stage.new_embedded_mtp_cache()?;
+            let rank = Some(CacheRankIdentity {
+                pipeline_rank: Some(self.topology.pipeline_parallel_rank),
+                tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
+                    .then_some(self.topology.tensor_parallel_rank),
+                expert_parallel_rank: (self.topology.expert_parallel_size > 1)
+                    .then_some(self.topology.expert_parallel_rank),
+            });
+            let paged = cache
+                .residency_manager
+                .as_ref()
+                .cloned()
+                .map(|manager| (manager, rank));
+            cache.mtp = self.stage.new_embedded_mtp_cache(paged)?;
         }
         Ok(())
     }

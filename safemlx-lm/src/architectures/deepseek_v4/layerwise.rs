@@ -80,6 +80,27 @@ impl DeepSeekV4LayerwiseModel {
         self.execution.adapter().new_cache()
     }
 
+    /// Creates resident or explicitly bounded cache state independently of
+    /// parameter residency.
+    pub fn new_cache_with_options(
+        &self,
+        policy: crate::CacheResidencyPolicy,
+    ) -> Result<Cache, Error> {
+        let rank = self.execution.prompt_cache_rank_identity();
+        match policy {
+            crate::CacheResidencyPolicy::Device => self.new_cache().map_err(Into::into),
+            crate::CacheResidencyPolicy::Paged(options) => {
+                let manager = crate::CacheResidencyManager::new(options)
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
+                self.execution
+                    .adapter()
+                    .static_model
+                    .new_cache_with_manager(manager, rank)
+                    .map_err(Into::into)
+            }
+        }
+    }
+
     /// Runs target decoding.
     pub fn forward(
         &mut self,
@@ -388,7 +409,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4L
         stream: &Stream,
     ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
         let tokens = input::text_token_ids(input, stream)?;
-        *cache = self.new_cache()?;
+        cache.reset()?;
         self.forward_mtp_target(&tokens, cache, stream)
     }
 
@@ -423,6 +444,14 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4L
 
     fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
         cache.mtp_layers.clone_from(draft);
+    }
+
+    fn restore_target_checkpoint(
+        cache: &mut Self::Cache,
+        checkpoint: &Self::Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        cache.restore_target_checkpoint(checkpoint, stream)
     }
 
     fn draft_logits(
@@ -678,6 +707,17 @@ impl DeepSeekV4LayerwiseAdapter {
             .mtp_layers
     }
 
+    pub(crate) fn embedded_mtp_cache_with_manager(
+        &self,
+        manager: crate::CacheResidencyManager,
+        rank: Option<crate::CacheRankIdentity>,
+    ) -> Result<super::model::DraftCache, Error> {
+        Ok(self
+            .static_model
+            .new_cache_with_manager(manager, rank)?
+            .mtp_layers)
+    }
+
     pub(crate) fn prefill_pipeline_draft_cache(
         &mut self,
         output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
@@ -869,7 +909,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
-        _options: PagedCacheOptions,
+        options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
         load_prompt_cache_with_identity(
@@ -878,6 +918,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
             expected,
             prefix_token_ids,
             identity.clone(),
+            options,
             stream,
         )
     }

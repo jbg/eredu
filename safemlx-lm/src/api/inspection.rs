@@ -9405,15 +9405,22 @@ mod tests {
                 crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
             ),
         ] {
-            crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
-                &checkpoint,
-                &metadata,
-                residency,
-                None,
-                context.stream(),
-                weights.stream(),
-            )
-            .unwrap();
+            let (model, _) =
+                crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    residency,
+                    None,
+                    context.stream(),
+                    weights.stream(),
+                )
+                .unwrap();
+            let cache = model
+                .new_cache_with_options(crate::CacheResidencyPolicy::Paged(
+                    crate::PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
+                ))
+                .unwrap();
+            assert!(cache.residency_report().unwrap().is_some());
         }
     }
 
@@ -9458,6 +9465,12 @@ mod tests {
                     .unwrap();
                 assert_eq!(loaded.stage_info().topology, topology);
                 assert!(!loaded.stage_info().global_layer_range.is_empty());
+                let cache = loaded
+                    .new_cache_with_options(crate::CacheResidencyPolicy::Paged(
+                        crate::PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
+                    ))
+                    .unwrap();
+                assert!(loaded.cache_residency_report(&cache).unwrap().is_some());
             }
         }
     }
@@ -9504,6 +9517,12 @@ mod tests {
                     .unwrap();
                 assert_eq!(loaded.info().topology, topology);
                 assert_eq!(loaded.info().assignment.local_expert_count(), 1);
+                let cache = loaded
+                    .new_cache_with_options(crate::CacheResidencyPolicy::Paged(
+                        crate::PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
+                    ))
+                    .unwrap();
+                assert!(loaded.cache_residency_report(&cache).unwrap().is_some());
             }
         }
     }

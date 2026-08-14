@@ -949,6 +949,14 @@ impl Model {
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::DeepSeekV3)
                     .map_err(|error| Exception::custom(error.to_string())),
+                Self::DeepSeekV4(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::DeepSeekV4)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::DeepSeekV4Layerwise(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::DeepSeekV4)
+                    .map_err(|error| Exception::custom(error.to_string())),
                 Self::KimiLinear(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::KimiLinear)
@@ -1595,6 +1603,7 @@ impl ModelCache {
                 .residency_report()
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::DeepSeekV3(cache) => cache.residency_report(),
+            Self::DeepSeekV4(cache) => cache.residency_report(),
             Self::GptOss(cache) => cache.residency_report(),
             Self::Inkling(cache) => cache.residency_report(),
             Self::KimiLinear(cache) => cache.residency_report(),

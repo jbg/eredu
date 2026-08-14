@@ -1120,6 +1120,7 @@ pub struct PagedKeyValueCache {
     global_layer: usize,
     rank: Option<CacheRankIdentity>,
     sliding_window: Option<i32>,
+    key_only: bool,
     prefix_tokens: i32,
     tail_keys: Option<Array>,
     tail_values: Option<Array>,
@@ -1158,6 +1159,26 @@ impl LiveKeyValueCache {
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
         PagedKeyValueCache::new_with_layout(
+            manager,
+            global_layer,
+            sliding_window,
+            prefix_tokens,
+            rank,
+        )
+        .map(Self::Paged)
+    }
+
+    /// Creates a block-addressable key-only cache. The pager stores a
+    /// canonical one-channel sentinel beside each key block so the common
+    /// prompt-cache representation remains self-describing.
+    pub fn paged_key_only(
+        manager: CacheResidencyManager,
+        global_layer: usize,
+        sliding_window: Option<i32>,
+        prefix_tokens: i32,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        PagedKeyValueCache::new_key_only_with_layout(
             manager,
             global_layer,
             sliding_window,
@@ -1328,6 +1349,42 @@ impl PagedKeyValueCache {
         prefix_tokens: i32,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
+        Self::new_with_layout_and_mode(
+            manager,
+            global_layer,
+            sliding_window,
+            prefix_tokens,
+            rank,
+            false,
+        )
+    }
+
+    /// Creates one key-only layer cache with pinned-prefix and rank identity.
+    pub fn new_key_only_with_layout(
+        manager: CacheResidencyManager,
+        global_layer: usize,
+        sliding_window: Option<i32>,
+        prefix_tokens: i32,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        Self::new_with_layout_and_mode(
+            manager,
+            global_layer,
+            sliding_window,
+            prefix_tokens,
+            rank,
+            true,
+        )
+    }
+
+    fn new_with_layout_and_mode(
+        manager: CacheResidencyManager,
+        global_layer: usize,
+        sliding_window: Option<i32>,
+        prefix_tokens: i32,
+        rank: Option<CacheRankIdentity>,
+        key_only: bool,
+    ) -> Result<Self, Exception> {
         if sliding_window.is_some_and(|window| window <= 0) {
             return Err(Exception::custom(
                 "paged sliding attention window must be positive",
@@ -1351,6 +1408,7 @@ impl PagedKeyValueCache {
             global_layer,
             rank,
             sliding_window,
+            key_only,
             prefix_tokens,
             tail_keys: None,
             tail_values: None,
@@ -1372,6 +1430,12 @@ impl PagedKeyValueCache {
     /// Returns the exact visible attention window, or `None` for full attention.
     pub const fn attention_window(&self) -> Option<i32> {
         self.sliding_window
+    }
+
+    /// Returns whether values are represented by the canonical one-channel
+    /// persistence sentinel instead of an attention payload.
+    pub const fn is_key_only(&self) -> bool {
+        self.key_only
     }
 
     /// Returns a current aggregate manager report.
@@ -1572,6 +1636,7 @@ impl PagedKeyValueCache {
     ) -> Result<(), Exception> {
         if self.global_layer != checkpoint.global_layer
             || self.manager.session_id() != checkpoint.manager.session_id()
+            || self.key_only != checkpoint.key_only
         {
             return Err(Exception::custom(
                 "key/value cache checkpoint does not belong to the same paged layer",
@@ -1640,13 +1705,42 @@ impl PagedKeyValueCache {
         Ok(())
     }
 
-    fn validate_update(keys: &Array, values: &Array) -> Result<(), Exception> {
+    fn normalize_update_values(
+        &self,
+        keys: &Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if !self.key_only {
+            return Ok(values);
+        }
+        if keys.ndim() != 4
+            || values.ndim() != 4
+            || keys.shape()[..3] != values.shape()[..3]
+            || values.dim(-1) != 0
+            || keys.dtype() != values.dtype()
+        {
+            return Err(Exception::custom(
+                "paged key-only cache expects matching rank-4 keys and zero-width values",
+            ));
+        }
+        let mut shape = keys.shape().to_vec();
+        *shape.last_mut().expect("rank-4 key-only cache") = 1;
+        zeros_dtype(&shape, keys.dtype(), stream)
+    }
+
+    fn validate_update(&self, keys: &Array, values: &Array) -> Result<(), Exception> {
         if keys.ndim() != 4 || values.ndim() != 4 {
             return Err(Exception::custom(
                 "paged key/value cache expects rank-4 [batch, heads, sequence, dimension] arrays",
             ));
         }
-        if keys.shape() != values.shape() || keys.dtype() != values.dtype() {
+        let geometry_matches = if self.key_only {
+            keys.shape()[..3] == values.shape()[..3] && values.dim(-1) == 1
+        } else {
+            keys.shape() == values.shape()
+        };
+        if !geometry_matches || keys.dtype() != values.dtype() {
             return Err(Exception::custom(
                 "paged key/value cache updates must have identical key and value shapes and dtypes",
             ));
@@ -1663,7 +1757,8 @@ impl PagedKeyValueCache {
         self.manager
             .bind_transfer_device(stream)
             .map_err(cache_residency_exception)?;
-        Self::validate_update(&keys, &values)?;
+        let values = self.normalize_update_values(&keys, values, stream)?;
+        self.validate_update(&keys, &values)?;
         if let Some(tail) = &self.tail_keys {
             if tail.dim(0) != keys.dim(0)
                 || tail.dim(1) != keys.dim(1)
@@ -1894,6 +1989,7 @@ impl Default for PagedKeyValueCache {
             global_layer: 0,
             rank: None,
             sliding_window: Some(1),
+            key_only: false,
             prefix_tokens: 0,
             tail_keys: None,
             tail_values: None,
@@ -1931,6 +2027,11 @@ impl KeyValueCache for PagedKeyValueCache {
         sinks: Option<&Array>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
+        if self.key_only {
+            return Err(Exception::custom(
+                "key-only paged caches require architecture-owned attention",
+            ));
+        }
         let query_len = queries.dim(-2) as i64;
         let query_start = self.offset - query_len;
         let visible_start = self
@@ -2837,9 +2938,44 @@ mod tests {
         PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     };
     use safemlx::{
-        fast::ScaledDotProductAttentionMask, ops::indexing::TryIndexOp, transforms::eval, Array,
-        Device, DeviceType, Dtype, ExecutionContext,
+        fast::ScaledDotProductAttentionMask,
+        ops::{indexing::TryIndexOp, zeros_dtype},
+        transforms::eval,
+        Array, Device, DeviceType, Dtype, ExecutionContext,
     };
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn paged_key_only_cache_uses_canonical_sentinel_blocks() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let manager =
+            CacheResidencyManager::new(PagedCacheOptions::new(2, 4096, 4096, 1).unwrap()).unwrap();
+        let mut cache =
+            PagedKeyValueCache::new_key_only_with_layout(manager.clone(), 0, Some(8), 0, None)
+                .unwrap();
+        let keys = Array::from_slice(
+            &(0..20).map(|v| v as f32).collect::<Vec<_>>(),
+            &[1, 1, 5, 4],
+        );
+        let values = zeros_dtype(&[1, 1, 5, 0], Dtype::Float32, stream).unwrap();
+        let (visible_keys, visible_values) = cache.update_and_fetch(keys, values, stream).unwrap();
+        assert_eq!(visible_keys.shape(), &[1, 1, 5, 4]);
+        assert_eq!(visible_values.shape(), &[1, 1, 5, 1]);
+        cache.finalize().unwrap();
+        let ids = manager
+            .layer_block_ids(0, CacheRepresentation::KeyValue, 0, 5, 0)
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        for id in ids {
+            let lease = manager.lease_block(&id, stream).unwrap();
+            let CacheBlockArrays::KeyValue { keys, values } = lease.arrays() else {
+                panic!("key-only cache emitted the wrong block representation");
+            };
+            assert_eq!(keys.dim(-1), 4);
+            assert_eq!(values.dim(-1), 1);
+        }
+    }
 
     #[test]
     #[ignore = "requires MLX runtime execution"]

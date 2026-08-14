@@ -21,9 +21,10 @@ use crate::{
     nn::attention::indexed_sparse_attention,
     runtime::cache::{
         residency::{
-            PoolingStateComponent, PromptCacheStateArray, StateTensorOwner, StateTensorRole,
+            CacheRankIdentity, CacheResidencyManager, PoolingStateComponent, PromptCacheStateArray,
+            StateTensorOwner, StateTensorRole,
         },
-        ConcatKeyValueCache, KeyValueCache, PoolingCache, PoolingCacheState,
+        ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache, PoolingCache, PoolingCacheState,
     },
 };
 
@@ -327,13 +328,13 @@ fn overlap_pool(
 
 #[derive(Debug, Clone)]
 pub enum AttentionCache {
-    Local(ConcatKeyValueCache),
+    Local(LiveKeyValueCache),
     Compressed {
-        local: ConcatKeyValueCache,
+        local: LiveKeyValueCache,
         pool: PoolingCache,
     },
     Sparse {
-        local: ConcatKeyValueCache,
+        local: LiveKeyValueCache,
         pool: PoolingCache,
         index_pool: PoolingCache,
     },
@@ -341,7 +342,33 @@ pub enum AttentionCache {
 
 impl AttentionCache {
     pub(crate) fn new_for_ratio(ratio: i32, sliding_window: i32) -> Result<Self, Exception> {
-        let local = ConcatKeyValueCache::new_for_sliding_attention(sliding_window);
+        Self::new_for_ratio_with_local(
+            ratio,
+            LiveKeyValueCache::resident(ConcatKeyValueCache::new_for_sliding_attention(
+                sliding_window,
+            )),
+        )
+    }
+
+    pub(crate) fn new_paged_for_ratio(
+        ratio: i32,
+        sliding_window: i32,
+        manager: CacheResidencyManager,
+        global_layer: usize,
+        prefix_tokens: i32,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let local = LiveKeyValueCache::paged_key_only(
+            manager,
+            global_layer,
+            Some(sliding_window),
+            prefix_tokens,
+            rank,
+        )?;
+        Self::new_for_ratio_with_local(ratio, local)
+    }
+
+    fn new_for_ratio_with_local(ratio: i32, local: LiveKeyValueCache) -> Result<Self, Exception> {
         match ratio {
             0 => Ok(Self::Local(local)),
             4 => Ok(Self::Sparse {
@@ -366,14 +393,19 @@ impl AttentionCache {
 
     pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
         match self {
-            Self::Local(local) => local.arrays().collect(),
-            Self::Compressed { local, pool } => local.arrays().chain(pool.arrays()).collect(),
+            Self::Local(local) => local.retained_arrays(),
+            Self::Compressed { local, pool } => local
+                .retained_arrays()
+                .into_iter()
+                .chain(pool.arrays())
+                .collect(),
             Self::Sparse {
                 local,
                 pool,
                 index_pool,
             } => local
-                .arrays()
+                .retained_arrays()
+                .into_iter()
                 .chain(pool.arrays())
                 .chain(index_pool.arrays())
                 .collect(),
@@ -391,17 +423,92 @@ impl AttentionCache {
         }
     }
 
-    pub(crate) fn restore_local(
-        &mut self,
-        keys: Array,
-        values: Array,
-        end: i32,
-    ) -> Result<(), Exception> {
+    pub(crate) fn residency_manager(&self) -> Option<&CacheResidencyManager> {
         match self {
             Self::Local(local) | Self::Compressed { local, .. } | Self::Sparse { local, .. } => {
-                local.restore_resident(keys, values, end)
+                local.manager()
             }
         }
+    }
+
+    pub(crate) fn finalize(&mut self) -> Result<(), Exception> {
+        match self {
+            Self::Local(local) | Self::Compressed { local, .. } | Self::Sparse { local, .. } => {
+                local.finalize()
+            }
+        }
+    }
+
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        match (self, checkpoint) {
+            (Self::Local(local), Self::Local(previous)) => {
+                local.restore_checkpoint(previous, stream)
+            }
+            (
+                Self::Compressed { local, pool },
+                Self::Compressed {
+                    local: previous_local,
+                    pool: previous_pool,
+                },
+            ) => {
+                local.restore_checkpoint(previous_local, stream)?;
+                pool.clone_from(previous_pool);
+                Ok(())
+            }
+            (
+                Self::Sparse {
+                    local,
+                    pool,
+                    index_pool,
+                },
+                Self::Sparse {
+                    local: previous_local,
+                    pool: previous_pool,
+                    index_pool: previous_index_pool,
+                },
+            ) => {
+                local.restore_checkpoint(previous_local, stream)?;
+                pool.clone_from(previous_pool);
+                index_pool.clone_from(previous_index_pool);
+                Ok(())
+            }
+            _ => Err(Exception::custom(
+                "DeepSeek V4 cache checkpoint changed compression representation",
+            )),
+        }
+    }
+
+    pub(crate) fn reset_local_after_manager_clear(&mut self) {
+        match self {
+            Self::Local(local) => local.reset_local_after_manager_clear(),
+            Self::Compressed { local, pool } => {
+                local.reset_local_after_manager_clear();
+                pool.clear();
+            }
+            Self::Sparse {
+                local,
+                pool,
+                index_pool,
+            } => {
+                local.reset_local_after_manager_clear();
+                pool.clear();
+                index_pool.clear();
+            }
+        }
+    }
+
+    pub(crate) fn clear(&mut self) -> Result<(), Exception> {
+        if let Some(manager) = self.residency_manager().cloned() {
+            manager
+                .clear()
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        }
+        self.reset_local_after_manager_clear();
+        Ok(())
     }
 
     pub(crate) fn prompt_cache_state_arrays(
@@ -440,25 +547,6 @@ impl AttentionCache {
             } => {
                 restore_pooling_state(global_layer, 0, pool, tensors, processed_tokens, true)?;
                 restore_pooling_state(global_layer, 1, index_pool, tensors, processed_tokens, true)
-            }
-        }
-    }
-
-    pub(crate) fn clear(&mut self) {
-        match self {
-            Self::Local(local) => local.clear(),
-            Self::Compressed { local, pool } => {
-                local.clear();
-                pool.clear();
-            }
-            Self::Sparse {
-                local,
-                pool,
-                index_pool,
-            } => {
-                local.clear();
-                pool.clear();
-                index_pool.clear();
             }
         }
     }
@@ -636,7 +724,6 @@ impl Indexer {
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct Attention {
-    pub(crate) ratio: i32,
     pub(crate) heads: i32,
     pub(crate) head_dim: i32,
     pub(crate) groups: i32,
@@ -676,7 +763,6 @@ impl Attention {
         let ratio = args.compress_ratios[layer_index];
         let root = format!("layers.{layer_index}.attn");
         Ok(Self {
-            ratio,
             heads: args.num_attention_heads,
             head_dim: args.head_dim,
             groups: args.o_groups,
@@ -747,10 +833,6 @@ impl Attention {
                 1,
             )?,
         })
-    }
-
-    pub(crate) fn new_cache(&self, sliding_window: i32) -> Result<AttentionCache, Exception> {
-        AttentionCache::new_for_ratio(self.ratio, sliding_window)
     }
 
     pub(crate) fn new_parallel(
