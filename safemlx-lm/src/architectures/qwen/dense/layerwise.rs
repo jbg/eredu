@@ -48,11 +48,12 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
-        populate_module_from_lease, populate_module_from_lease_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
+        populate_module_from_lease, populate_module_from_lease_excluding, ModuleBindingPlan,
     },
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::checkpoint::{
+        binding_plan::{BindingPlan, PlannedBinding},
         quantization::{should_quantize_on_load, WeightQuantization},
         recipe::DerivedWeightRecipe,
     },
@@ -1600,20 +1601,38 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, "model.embed_tokens", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    "model.embed_tokens",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, "model.norm", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    "model.norm",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings(head, "lm_head", store)?,
+                    build_module_binding_plan_with_recipes(
+                        head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2335,11 +2354,25 @@ pub(crate) fn qwen_text_layer_bindings(
     store: &dyn WeightStore,
     external_experts: bool,
 ) -> Result<Vec<WeightBinding>, Error> {
+    Ok(
+        qwen_text_layer_binding_plan(layer, args, prefix, store, external_experts)?
+            .build_bindings(store)?,
+    )
+}
+
+pub(crate) fn qwen_text_layer_binding_plan(
+    layer: &TransformerBlock,
+    args: &DecoderConfig,
+    prefix: &str,
+    store: &dyn WeightStore,
+    external_experts: bool,
+) -> Result<ModuleBindingPlan, Error> {
     if external_experts {
-        return Ok(build_module_bindings_excluding(
+        return Ok(build_module_binding_plan_with_recipes_excluding(
             layer,
             prefix,
             store,
+            BTreeMap::new(),
             |name| name.starts_with("mlp.experts."),
         )?);
     }
@@ -2412,7 +2445,7 @@ pub(crate) fn qwen_text_layer_bindings(
             },
         );
     }
-    Ok(build_module_bindings_with_recipes(
+    Ok(build_module_binding_plan_with_recipes(
         layer, prefix, store, recipes,
     )?)
 }
@@ -2613,8 +2646,16 @@ fn recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 fn split_expert_key(

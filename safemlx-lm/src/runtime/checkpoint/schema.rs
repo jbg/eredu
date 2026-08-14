@@ -342,8 +342,7 @@ fn normalize_plan<T: PhysicalConstraint>(
     if identity.trim().is_empty() {
         return Err(CheckpointPlanError::EmptyIdentity);
     }
-    let mut keys = BTreeSet::new();
-    let mut validate_tensor = |tensor: &mut T| {
+    let normalize_tensor = |tensor: &mut T| {
         tensor.normalize();
         if tensor.key().trim().is_empty() {
             return Err(CheckpointPlanError::EmptyTensorKey);
@@ -373,19 +372,21 @@ fn normalize_plan<T: PhysicalConstraint>(
             .ok_or_else(|| CheckpointPlanError::ShapeOverflow {
                 key: tensor.key().into(),
             })?;
-        for physical_key in
-            std::iter::once(tensor.key()).chain(tensor.aliases().iter().map(String::as_str))
-        {
-            if !keys.insert(physical_key.to_string()) {
-                return Err(CheckpointPlanError::DuplicateTensorKey {
-                    key: physical_key.into(),
-                });
-            }
-        }
         Ok(())
     };
+    let physical_keys = |tensor: &T| {
+        std::iter::once(tensor.key().to_string())
+            .chain(tensor.aliases().iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    let mut keys = BTreeSet::new();
     for tensor in common.iter_mut() {
-        validate_tensor(tensor)?;
+        normalize_tensor(tensor)?;
+        for physical_key in physical_keys(tensor) {
+            if !keys.insert(physical_key.clone()) {
+                return Err(CheckpointPlanError::DuplicateTensorKey { key: physical_key });
+            }
+        }
     }
     common.sort_by(|left, right| left.key().cmp(right.key()));
 
@@ -408,6 +409,7 @@ fn normalize_plan<T: PhysicalConstraint>(
             });
         }
         let mut variant_ids = BTreeSet::new();
+        let mut group_keys = BTreeSet::new();
         for variant in &mut group.variants {
             if variant.id.trim().is_empty() {
                 return Err(CheckpointPlanError::EmptyId {
@@ -425,8 +427,15 @@ fn normalize_plan<T: PhysicalConstraint>(
                     variant: variant.id.clone(),
                 });
             }
+            let mut variant_keys = keys.clone();
             for tensor in &mut variant.tensors {
-                validate_tensor(tensor)?;
+                normalize_tensor(tensor)?;
+                for physical_key in physical_keys(tensor) {
+                    if !variant_keys.insert(physical_key.clone()) {
+                        return Err(CheckpointPlanError::DuplicateTensorKey { key: physical_key });
+                    }
+                    group_keys.insert(physical_key);
+                }
             }
             variant
                 .tensors
@@ -456,6 +465,7 @@ fn normalize_plan<T: PhysicalConstraint>(
                 });
             }
         }
+        keys.extend(group_keys);
         group.variants.sort_by(|left, right| left.id.cmp(&right.id));
     }
     groups.sort_by(|left, right| left.id.cmp(&right.id));
@@ -588,5 +598,30 @@ mod tests {
             ),
             Err(CheckpointPlanError::EmptyEncodingSet { .. })
         ));
+
+        let shared = tensor("shared", vec![1]);
+        let sibling_shared = SafetensorsCheckpointPlan::new(
+            "sibling shared key",
+            Vec::new(),
+            vec![AlternativeLayoutGroup {
+                id: "layout".into(),
+                required: true,
+                variants: vec![
+                    LayoutVariant {
+                        id: "a".into(),
+                        tensors: vec![tensor("a", vec![1]), shared.clone()],
+                        discriminator_keys: vec!["a".into()],
+                    },
+                    LayoutVariant {
+                        id: "b".into(),
+                        tensors: vec![tensor("b", vec![1]), shared],
+                        discriminator_keys: vec!["b".into()],
+                    },
+                ],
+            }],
+            CatalogPolicy::strict(),
+        )
+        .unwrap();
+        assert_eq!(sibling_shared.layout_groups[0].variants.len(), 2);
     }
 }

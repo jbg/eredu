@@ -21,7 +21,8 @@ use crate::{
         muse_glimmer,
         nemotron_h::model as nemotron_h,
         qwen::{
-            dense as dense_qwen, hybrid::checkpoint as qwen_hybrid_checkpoint,
+            dense::{self as dense_qwen, checkpoint as dense_qwen_checkpoint},
+            hybrid::checkpoint as qwen_hybrid_checkpoint,
             vl::model as qwen3_vl,
         },
     },
@@ -4465,73 +4466,7 @@ fn validate_dense_qwen_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
 ) -> StructuralValidation {
-    let args = match dense_qwen::config_from_hf_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > store.keys().len() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
-            args.num_hidden_layers,
-            store.keys().len()
-        ));
-    }
-    let mut expected = dense_qwen_expected(&args);
-    if !args.is_moe() {
-        let mut allowed = BTreeSet::new();
-        for tensor in &expected {
-            allowed.insert(tensor.safetensors_name.clone());
-            if tensor.operation == TensorOperation::Matrix {
-                if let Some(quantization) = args.weight_quantization_for(&tensor.safetensors_name) {
-                    add_safetensors_format_companions(
-                        &mut allowed,
-                        &tensor.safetensors_name,
-                        SafetensorsMatrixFormat::Affine(quantization),
-                    );
-                }
-            }
-        }
-        let mut issues = Vec::new();
-        append_structural_issues(
-            validate_safetensor_plan_with(store, expected, |name| {
-                args.weight_quantization_for(name)
-            }),
-            &mut issues,
-        );
-        for name in store.keys() {
-            if !allowed.contains(&name) {
-                issues.push(unexpected_layout(&name, "dense-Qwen SafeTensors"));
-            }
-        }
-        return finish(issues);
-    }
-    expected.retain(|tensor| !tensor.safetensors_name.contains(".mlp.experts."));
-    let mut issues = Vec::new();
-    append_structural_issues(
-        validate_safetensor_plan_with(store, expected, |name| {
-            if name.ends_with(".mlp.gate.weight") {
-                None
-            } else {
-                args.weight_quantization_for(name)
-            }
-        }),
-        &mut issues,
-    );
-    for layer in 0..args.num_hidden_layers as usize {
-        validate_split_or_packed_swiglu_experts(
-            store,
-            &format!("model.layers.{layer}.mlp.experts"),
-            args.num_experts as usize,
-            args.hidden_size as usize,
-            args.moe_intermediate_size as usize,
-            true,
-            true,
-            args.weight_quantization_for(&format!("model.layers.{layer}.mlp.experts.gate_up_proj")),
-            args.weight_quantization_for(&format!("model.layers.{layer}.mlp.experts.down_proj")),
-            &mut issues,
-        );
-    }
-    finish(issues)
+    dense_qwen_checkpoint::validate_safetensors(config, store)
 }
 
 fn validate_muse_glimmer_safetensors(
@@ -7095,52 +7030,13 @@ fn validate_dense_qwen_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let is_moe = architecture == GgufArchitecture::Qwen3Moe;
-    let metadata_name = architecture.metadata_name();
-    let translate = |name: &str| dense_qwen::translate_gguf_weight_name(name, is_moe);
-    if let Err(error) = checkpoint.catalog().translated_outputs(translate) {
-        return StructuralValidation::Invalid(vec![StructuralIssue {
-            kind: StructuralIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args =
-        match dense_qwen::config_from_gguf_catalog(checkpoint, metadata, metadata_name, is_moe) {
-            Ok(args) => args,
-            Err(error) => return invalid_geometry(error.to_string()),
-        };
-    if args.num_hidden_layers as usize > checkpoint.catalog().physical_tensor_count() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor GGUF catalog",
-            args.num_hidden_layers,
-            checkpoint.catalog().physical_tensor_count()
-        ));
-    }
-    let mut issues = validate_gguf_plan(
-        checkpoint,
-        dense_qwen_expected(&args),
-        if architecture == GgufArchitecture::Qwen2 {
-            "Qwen2"
-        } else {
-            "Qwen3"
-        },
-    );
-    if is_moe {
-        issues.extend(checkpoint_validation::validate_matching_gguf_encodings(
-            checkpoint,
-            (0..args.num_hidden_layers as usize).map(|layer| {
-                (
-                    format!("blk.{layer}.ffn_gate_exps.weight"),
-                    format!("blk.{layer}.ffn_up_exps.weight"),
-                )
-            }),
-            "Qwen3 MoE",
-        ));
-    }
-    finish(issues)
+    let variant = match architecture {
+        GgufArchitecture::Qwen2 => dense_qwen_checkpoint::GgufVariant::Qwen2,
+        GgufArchitecture::Qwen3 => dense_qwen_checkpoint::GgufVariant::Qwen3,
+        GgufArchitecture::Qwen3Moe => dense_qwen_checkpoint::GgufVariant::Qwen3Moe,
+        _ => unreachable!("dense Qwen GGUF validator received another architecture"),
+    };
+    dense_qwen_checkpoint::validate_gguf(variant, checkpoint, metadata)
 }
 
 fn muse_glimmer_gguf_expected(args: &muse_glimmer::DecoderConfig) -> Vec<ExpectedTensor> {

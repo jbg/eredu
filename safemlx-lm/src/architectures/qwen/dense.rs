@@ -1,5 +1,8 @@
 //! Shared Qwen2/Qwen2.5/Qwen3 decoder-only model implementation.
 
+/// Architecture-owned physical checkpoint contracts.
+#[path = "dense/checkpoint.rs"]
+pub(crate) mod checkpoint;
 /// Bounded and unified residency execution for dense Qwen decoders.
 #[path = "dense/layerwise.rs"]
 pub mod layerwise;
