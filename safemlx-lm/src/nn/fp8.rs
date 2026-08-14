@@ -68,11 +68,12 @@ fn ceil_div(lhs: i32, rhs: i32) -> i32 {
 }
 
 /// Decodes native unsigned E8M0 scale bytes without expanding FP8 weights.
-/// Float scale tensors are returned unchanged, allowing Qwen-style inverse
-/// scales and DeepSeek-V4 native scales to share every execution kernel.
+/// Float scale tensors are returned unchanged, allowing Qwen-style F16, BF16,
+/// or F32 inverse scales and DeepSeek-V4 native scales to share every execution
+/// kernel.
 pub fn decode_scale(scale: &Array, stream: &Stream) -> Result<Array, Exception> {
     match scale.dtype() {
-        Dtype::Float32 => Ok(scale.clone()),
+        Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 => Ok(scale.clone()),
         Dtype::Uint8 => {
             let table = (0u32..=255)
                 .map(|exponent| f32::from_bits(exponent << 23))
@@ -84,7 +85,7 @@ pub fn decode_scale(scale: &Array, stream: &Stream) -> Result<Array, Exception> 
             )
         }
         dtype => Err(Exception::custom(format!(
-            "block-FP8 scale must be Float32 or native E8M0 bytes, got {dtype:?}"
+            "block-FP8 scale must be Float16, Bfloat16, Float32, or native E8M0 bytes, got {dtype:?}"
         ))),
     }
 }
@@ -1694,6 +1695,19 @@ mod tests {
             8.0
         );
 
+        // Official Qwen3.8 FP8 checkpoints store inverse block scales as
+        // BF16. Keep them in their checkpoint dtype through the custom kernel
+        // instead of requiring a separate conversion at every projection.
+        let bf16_scale = scale.as_dtype(Dtype::Bfloat16, stream).unwrap();
+        let bf16_scale_output = linear(&input, &weight, &bf16_scale, stream).unwrap();
+        assert_eq!(
+            bf16_scale_output
+                .try_index_device((0, 0), stream)
+                .unwrap()
+                .item::<f32>(stream),
+            8.0
+        );
+
         let bf16_input = input.as_dtype(Dtype::Bfloat16, stream).unwrap();
         let bf16_output = linear(&bf16_input, &weight, &scale, stream).unwrap();
         assert_eq!(bf16_output.dtype(), Dtype::Bfloat16);
@@ -1708,7 +1722,9 @@ mod tests {
         );
 
         let grouped_weight = Array::from_slice(&[0x38u8; 32], &[2, 4, 4]);
-        let grouped_scale = Array::from_slice(&[2.0f32, 3.0], &[2, 1, 1]);
+        let grouped_scale = Array::from_slice(&[2.0f32, 3.0], &[2, 1, 1])
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap();
         let rows = Array::from_slice(&[1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], &[2, 4]);
         let groups = Array::from_slice(&[0u32, 1], &[2]);
         let output =
@@ -1732,7 +1748,9 @@ mod tests {
         // Exercise grouped row segments at real 128-row block boundaries,
         // including the transposed path used by absorbed MLA queries.
         let segmented_weight = Array::from_slice(&vec![0x38u8; 512 * 128], &[512, 128]);
-        let segmented_scale = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4, 1]);
+        let segmented_scale = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4, 1])
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap();
         let segmented_groups = Array::from_slice(&[0u32, 1], &[2]);
         let query = Array::from_slice(&vec![1.0f32; 2 * 128], &[2, 128]);
         let absorbed_query = segmented_transposed_linear(
@@ -1806,9 +1824,13 @@ mod tests {
         let stream = context.stream();
         let input = Array::from_slice(&[1.0f32; 128], &[1, 128]);
         let first_weight = Array::from_slice(&[0x38u8; 128 * 128], &[128, 128]);
-        let first_scale = Array::from_slice(&[1.0f32], &[1, 1]);
+        let first_scale = Array::from_slice(&[1.0f32], &[1, 1])
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap();
         let second_weight = Array::from_slice(&[0x38u8; 256 * 128], &[256, 128]);
-        let second_scale = Array::from_slice(&[2.0f32, 2.0], &[2, 1]);
+        let second_scale = Array::from_slice(&[2.0f32, 2.0], &[2, 1])
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap();
 
         ACTIVATION_QUANTIZATION_CALLS.with(|calls| calls.set(0));
         let (first, second) = linear_pair(

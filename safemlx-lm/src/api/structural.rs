@@ -6291,11 +6291,12 @@ fn validate_fp8_safetensor(
     };
     match store.metadata(&scale) {
         Ok(metadata)
-            if metadata.shape == scale_shape && metadata.stored_dtype == StoredDtype::F32 => {}
+            if metadata.shape == scale_shape
+                && is_float_or_u8_dtype(&metadata.stored_dtype) => {}
         Ok(metadata) => issues.push(quantization_companion_issue(
             &scale,
             format!(
-                "native block-FP8 companion {scale:?} expected shape {scale_shape:?} and F32 storage, got {:?} {:?}",
+                "native block-FP8 companion {scale:?} expected shape {scale_shape:?} and F16, BF16, F32, or native E8M0 U8 storage, got {:?} {:?}",
                 metadata.shape, metadata.stored_dtype
             ),
         )),

@@ -7986,7 +7986,7 @@ mod tests {
             "activation_scheme": "dynamic",
             "weight_block_size": [128, 128]
         });
-        let specs = fp8_fixture_specs(qwen35_safetensor_specs(true, false), |name, shape| {
+        let mut specs = fp8_fixture_specs(qwen35_safetensor_specs(true, false), |name, shape| {
             shape.len() >= 2
                 && name != "model.embed_tokens.weight"
                 && name != "lm_head.weight"
@@ -7994,15 +7994,36 @@ mod tests {
                 && !name.ends_with(".mlp.shared_expert_gate.weight")
                 && !name.ends_with(".linear_attn.conv1d.weight")
         });
+        for (name, _, dtype) in &mut specs {
+            if name.ends_with("weight_scale_inv") || name.ends_with("_scale_inv") {
+                *dtype = Dtype::BF16;
+            }
+        }
         let fp8 = write_typed_safetensors_dir(&config, &specs);
-        let report = inspect_model(fp8.path(), ModelInspectionOptions::default()).unwrap();
-        assert_eq!(
-            report.structural_binding,
-            InspectionReadiness::Ready,
-            "{:#?}",
-            report.issues
-        );
-        assert!(report.is_loadable());
+        for load in [
+            ModelLoadOptions::default(),
+            ModelLoadOptions::default()
+                .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
+            ModelLoadOptions::default().with_weight_residency(WeightResidency::dense_disk_stream(
+                crate::DenseDiskStreamLoadOptions::default(),
+            )),
+        ] {
+            let report = inspect_model(
+                fp8.path(),
+                ModelInspectionOptions {
+                    load,
+                    chat_request: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                report.structural_binding,
+                InspectionReadiness::Ready,
+                "{:#?}",
+                report.issues
+            );
+            assert!(report.is_loadable());
+        }
 
         let dense = write_complete_qwen35_safetensors_dir(false, false, |_| {});
         let load =
