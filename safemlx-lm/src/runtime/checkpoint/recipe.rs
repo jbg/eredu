@@ -53,17 +53,22 @@ pub enum RecipeDtype {
     F8E4M3,
     /// Encoded FP8 E5M2 bytes.
     F8E5M2,
+    /// Packed FP4 E2M1 values.
+    F4,
+    /// Unsigned E8M0 scale values.
+    F8E8M0,
     /// A checkpoint encoding unknown to this runtime.
     Other(String),
 }
 
 impl RecipeDtype {
-    fn byte_width(&self) -> Result<u64, WeightRecipeError> {
+    fn bit_width(&self) -> Result<u64, WeightRecipeError> {
         match self {
-            Self::Bool | Self::U8 | Self::I8 | Self::F8E4M3 | Self::F8E5M2 => Ok(1),
-            Self::I16 | Self::U16 | Self::F16 | Self::BF16 => Ok(2),
-            Self::I32 | Self::U32 | Self::F32 => Ok(4),
-            Self::F64 | Self::I64 | Self::U64 | Self::C64 => Ok(8),
+            Self::F4 => Ok(4),
+            Self::Bool | Self::U8 | Self::I8 | Self::F8E4M3 | Self::F8E5M2 | Self::F8E8M0 => Ok(8),
+            Self::I16 | Self::U16 | Self::F16 | Self::BF16 => Ok(16),
+            Self::I32 | Self::U32 | Self::F32 => Ok(32),
+            Self::F64 | Self::I64 | Self::U64 | Self::C64 => Ok(64),
             Self::Other(dtype) => Err(WeightRecipeError::UnsupportedDtype {
                 dtype: dtype.clone(),
             }),
@@ -90,6 +95,8 @@ impl From<StoredDtype> for RecipeDtype {
             StoredDtype::C64 => Self::C64,
             StoredDtype::F8E4M3 => Self::F8E4M3,
             StoredDtype::F8E5M2 => Self::F8E5M2,
+            StoredDtype::F4 => Self::F4,
+            StoredDtype::F8E8M0 => Self::F8E8M0,
             StoredDtype::Other(dtype) => Self::Other(dtype),
         }
     }
@@ -1137,14 +1144,14 @@ fn map_reinterpret_selection(
     operation: &'static str,
 ) -> Result<TensorSelection, WeightRecipeError> {
     let output_axis = selection_axis(selection).expect("non-full selection");
-    let output_unit = axis_unit_bytes(&output.shape, output.dtype.byte_width()?, output_axis)?;
+    let output_unit = axis_unit_bytes(&output.shape, output.dtype.bit_width()?, output_axis)?;
     let output_cycle = output_unit
         .checked_mul(output.shape[output_axis] as u64)
         .ok_or(WeightRecipeError::ArithmeticOverflow(
             "selection output cycle",
         ))?;
     for input_axis in 0..input.shape.len() {
-        let input_unit = axis_unit_bytes(&input.shape, input.dtype.byte_width()?, input_axis)?;
+        let input_unit = axis_unit_bytes(&input.shape, input.dtype.bit_width()?, input_axis)?;
         let input_cycle = input_unit
             .checked_mul(input.shape[input_axis] as u64)
             .ok_or(WeightRecipeError::ArithmeticOverflow(
@@ -1681,9 +1688,13 @@ fn metadata_for(
     dtype: RecipeDtype,
 ) -> Result<WeightRecipeMetadata, WeightRecipeError> {
     let elements = element_count(&shape, "recipe output")?;
-    let byte_len = elements
-        .checked_mul(dtype.byte_width()?)
-        .ok_or(WeightRecipeError::ArithmeticOverflow("recipe output bytes"))?;
+    let bits = elements
+        .checked_mul(dtype.bit_width()?)
+        .ok_or(WeightRecipeError::ArithmeticOverflow("recipe output bits"))?;
+    let byte_len = bits
+        .checked_add(7)
+        .ok_or(WeightRecipeError::ArithmeticOverflow("recipe output bytes"))?
+        / 8;
     if byte_len == 0 {
         return Err(WeightRecipeError::ZeroSizedOutput);
     }

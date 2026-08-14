@@ -86,6 +86,197 @@ pub trait KeyValueCache {
     ) -> Result<(Array, Array), Exception>;
 }
 
+/// Append-only compressed-token cache with an incomplete pooling window.
+///
+/// Values and gate logits are accumulated until `ratio` source tokens are
+/// available. Complete windows are returned to the architecture's pooling
+/// operator, while pooled outputs grow independently at the compressed token
+/// rate. This representation is shared by compressed-attention and indexer
+/// streams and preserves partial decode state across calls.
+#[derive(Debug, Clone)]
+pub struct PoolingCache {
+    ratio: i32,
+    pending_values: Option<Array>,
+    pending_gates: Option<Array>,
+    pooled: Option<Array>,
+    overlap_values: Option<Array>,
+    overlap_gates: Option<Array>,
+    processed_tokens: i32,
+}
+
+/// Complete source windows emitted by [`PoolingCache::accumulate_windows`].
+pub struct PoolingWindows {
+    /// Source values shaped `[batch, complete_source_tokens, width]`.
+    pub values: Array,
+    /// Gate logits with the same source-token extent.
+    pub gates: Array,
+    /// Absolute source-token position of the first returned value.
+    pub base_position: i32,
+}
+
+impl PoolingCache {
+    /// Creates an empty pooling stream.
+    pub fn new(ratio: i32) -> Result<Self, Exception> {
+        if ratio <= 0 {
+            return Err(Exception::custom("pooling ratio must be positive"));
+        }
+        Ok(Self {
+            ratio,
+            pending_values: None,
+            pending_gates: None,
+            pooled: None,
+            overlap_values: None,
+            overlap_gates: None,
+            processed_tokens: 0,
+        })
+    }
+
+    /// Source tokens represented by complete and incomplete windows.
+    pub const fn processed_tokens(&self) -> i32 {
+        self.processed_tokens
+    }
+
+    /// Number of compressed tokens currently retained.
+    pub fn pooled_tokens(&self) -> i32 {
+        self.pooled.as_ref().map_or(0, |pooled| pooled.dim(1))
+    }
+
+    /// Returns every array whose lifetime is part of this cache state.
+    pub fn arrays(&self) -> impl Iterator<Item = &Array> {
+        self.pending_values
+            .iter()
+            .chain(self.pending_gates.iter())
+            .chain(self.pooled.iter())
+            .chain(self.overlap_values.iter())
+            .chain(self.overlap_gates.iter())
+    }
+
+    /// Replaces the overlap carried between adjacent complete windows and
+    /// returns the previous pair. This is used by stride-one compressed
+    /// streams whose logical window spans the previous and current groups.
+    pub fn replace_overlap(
+        &mut self,
+        values: Array,
+        gates: Array,
+    ) -> (Option<Array>, Option<Array>) {
+        let previous_values = self.overlap_values.replace(values);
+        let previous_gates = self.overlap_gates.replace(gates);
+        (previous_values, previous_gates)
+    }
+
+    /// Adds source values and returns only complete pooling windows.
+    pub fn accumulate_windows(
+        &mut self,
+        values: Array,
+        gates: Array,
+        absolute_offset: i32,
+        stream: &Stream,
+    ) -> Result<PoolingWindows, Exception> {
+        if values.ndim() != 3
+            || gates.ndim() != 3
+            || values.dim(0) != gates.dim(0)
+            || values.dim(1) != gates.dim(1)
+        {
+            return Err(Exception::custom(
+                "pooling values and gates must be rank-3 with matching batch/token dimensions",
+            ));
+        }
+        if absolute_offset != self.processed_tokens {
+            return Err(Exception::custom(format!(
+                "pooling cache expected source offset {}, got {absolute_offset}",
+                self.processed_tokens
+            )));
+        }
+        let previous_pending = self.pending_values.as_ref().map_or(0, |value| value.dim(1));
+        let values = match self.pending_values.take() {
+            Some(previous) => concatenate_axis(&[previous, values], 1, stream)?,
+            None => values,
+        };
+        let gates = match self.pending_gates.take() {
+            Some(previous) => concatenate_axis(&[previous, gates], 1, stream)?,
+            None => gates,
+        };
+        let total = values.dim(1);
+        let usable = total / self.ratio * self.ratio;
+        self.processed_tokens = self
+            .processed_tokens
+            .checked_add(total - previous_pending)
+            .ok_or_else(|| Exception::custom("pooling source offset overflowed"))?;
+        let ready_values = values.try_index_device((.., ..usable, ..), stream)?;
+        let ready_gates = gates.try_index_device((.., ..usable, ..), stream)?;
+        if usable < total {
+            self.pending_values = Some(values.try_index_device((.., usable.., ..), stream)?);
+            self.pending_gates = Some(gates.try_index_device((.., usable.., ..), stream)?);
+        }
+        Ok(PoolingWindows {
+            values: ready_values,
+            gates: ready_gates,
+            base_position: absolute_offset - previous_pending,
+        })
+    }
+
+    /// Appends newly compressed values and returns the complete compressed history.
+    pub fn update_and_fetch(
+        &mut self,
+        new_pooled: Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if new_pooled.ndim() != 3 {
+            return Err(Exception::custom(
+                "pooled cache values must have shape [batch, tokens, width]",
+            ));
+        }
+        let empty_shape = [new_pooled.dim(0), 0, new_pooled.dim(-1)];
+        let dtype = new_pooled.dtype();
+        if new_pooled.dim(1) > 0 {
+            self.pooled = Some(match self.pooled.take() {
+                Some(previous) => concatenate_axis(&[previous, new_pooled], 1, stream)?,
+                None => new_pooled,
+            });
+        }
+        match &self.pooled {
+            Some(pooled) => Ok(pooled.clone()),
+            None => zeros_dtype(&empty_shape, dtype, stream),
+        }
+    }
+
+    /// Builds the causal validity mask for compressed positions.
+    ///
+    /// Query `offset + j` may consume pooled token `i` only after its complete
+    /// source window exists: `i < (offset + j + 1) / ratio`.
+    pub fn make_mask(
+        &self,
+        query_tokens: i32,
+        offset: i32,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        let pooled_tokens = self.pooled_tokens();
+        if pooled_tokens == 0 || query_tokens == 1 {
+            return Ok(None);
+        }
+        let pooled = Array::arange::<i32, i32>(Some(0), pooled_tokens, None, stream)?;
+        let visible =
+            Array::arange::<i32, i32>(Some(offset + 1), offset + query_tokens + 1, None, stream)?
+                .floor_divide(Array::from_int(self.ratio), stream)?
+                .reshape(&[query_tokens, 1], stream)?;
+        Ok(Some(
+            pooled
+                .reshape(&[1, pooled_tokens], stream)?
+                .lt(visible, stream)?,
+        ))
+    }
+
+    /// Clears all complete and partial compressed state.
+    pub fn clear(&mut self) {
+        self.pending_values = None;
+        self.pending_gates = None;
+        self.pooled = None;
+        self.overlap_values = None;
+        self.overlap_gates = None;
+        self.processed_tokens = 0;
+    }
+}
+
 const COMPRESSED_LATENT_CACHE_STEP: i32 = 256;
 
 /// Compressed attention cache that stores one latent KV vector and one rotary
@@ -2567,7 +2758,8 @@ mod tests {
 
     use super::{
         BlockwiseAttentionAccumulator, CompressedLatentCache, ConcatKeyValueCache,
-        KeyValueAttentionBlock, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
+        KeyValueAttentionBlock, KeyValueCache, PagedKeyValueCache, PoolingCache,
+        SlidingKeyValueCache,
     };
     use crate::runtime::cache::residency::{
         inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheRankIdentity,
@@ -2602,6 +2794,38 @@ mod tests {
                 saved.as_slice::<f32>().as_ptr()
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn pooling_cache_is_invariant_to_decode_chunking() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let mut cache = PoolingCache::new(4).unwrap();
+        let first = cache
+            .accumulate_windows(
+                Array::from_slice(&[1.0f32, 2.0, 3.0], &[1, 3, 1]),
+                Array::from_slice(&[0.0f32; 3], &[1, 3, 1]),
+                0,
+                stream,
+            )
+            .unwrap();
+        assert_eq!(first.values.dim(1), 0);
+        let second = cache
+            .accumulate_windows(
+                Array::from_slice(&[4.0f32, 5.0], &[1, 2, 1]),
+                Array::from_slice(&[0.0f32; 2], &[1, 2, 1]),
+                3,
+                stream,
+            )
+            .unwrap();
+        assert_eq!(second.base_position, 0);
+        assert_eq!(second.values.shape(), [1, 4, 1]);
+        assert_eq!(cache.processed_tokens(), 5);
+        assert_eq!(
+            second.values.evaluated().unwrap().as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 4.0]
+        );
     }
 
     #[test]

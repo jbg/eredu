@@ -20,7 +20,11 @@ use safemlx::fast::MetalKernel;
 use safemlx::fast::MetalKernelConfig;
 use safemlx::{
     error::Exception,
-    ops::{concatenate_axis, grouped_matmul, indexing::TryIndexOp, matmul},
+    ops::{
+        concatenate_axis, grouped_matmul,
+        indexing::{take, TryIndexOp},
+        matmul,
+    },
     transforms::eval,
     Array, DeviceType, Dtype, Stream,
 };
@@ -61,6 +65,28 @@ const TILED_ROW_THRESHOLD: i32 = 8;
 
 fn ceil_div(lhs: i32, rhs: i32) -> i32 {
     (lhs + rhs - 1) / rhs
+}
+
+/// Decodes native unsigned E8M0 scale bytes without expanding FP8 weights.
+/// Float scale tensors are returned unchanged, allowing Qwen-style inverse
+/// scales and DeepSeek-V4 native scales to share every execution kernel.
+pub fn decode_scale(scale: &Array, stream: &Stream) -> Result<Array, Exception> {
+    match scale.dtype() {
+        Dtype::Float32 => Ok(scale.clone()),
+        Dtype::Uint8 => {
+            let table = (0u32..=255)
+                .map(|exponent| f32::from_bits(exponent << 23))
+                .collect::<Vec<_>>();
+            take(
+                Array::from_slice(&table, &[256]),
+                scale.as_dtype(Dtype::Uint32, stream)?,
+                stream,
+            )
+        }
+        dtype => Err(Exception::custom(format!(
+            "block-FP8 scale must be Float32 or native E8M0 bytes, got {dtype:?}"
+        ))),
+    }
 }
 
 fn linear_tiled_config(rows: i32, in_dim: i32, out_dim: i32, scale_cols: i32) -> MetalKernelConfig {
@@ -129,7 +155,7 @@ fn dequantize_grouped(weight: &Array, scale: &Array, stream: &Stream) -> Result<
     let experts = weight.dim(0);
     let out_dim = weight.dim(1);
     let in_dim = weight.dim(2);
-    let scale = Array::repeat_axis::<f32>(scale.clone(), 128, 1, stream)?;
+    let scale = Array::repeat_axis::<f32>(decode_scale(scale, stream)?, 128, 1, stream)?;
     let scale = Array::repeat_axis::<f32>(scale, 128, 2, stream)?;
     weight.from_fp8(Dtype::Float32, stream)?.multiply(
         scale.try_index_device((..experts, ..out_dim, ..in_dim), stream)?,
@@ -306,9 +332,10 @@ pub fn dequantize(weight: &Array, scale: &Array, stream: &Stream) -> Result<Arra
             "block-FP8 dequantization expects rank-2 weight and scale arrays",
         ));
     }
+    let scale = decode_scale(scale, stream)?;
     let out_dim = weight.dim(0);
     let in_dim = weight.dim(1);
-    let scale = Array::repeat_axis::<f32>(scale.clone(), 128, 0, stream)?;
+    let scale = Array::repeat_axis::<f32>(scale, 128, 0, stream)?;
     let scale = Array::repeat_axis::<f32>(scale, 128, 1, stream)?;
     weight.from_fp8(Dtype::Float32, stream)?.multiply(
         scale.try_index_device((..out_dim, ..in_dim), stream)?,
@@ -328,6 +355,7 @@ pub fn linear(
             "block-FP8 linear expects an input with at least one dimension and rank-2 weight/scale arrays",
         ));
     }
+    let scale = decode_scale(scale, stream)?;
     let input_shape = input.shape();
     let output_dtype = activation_dtype(input)?;
     let in_dim = input.dim(-1);
@@ -344,7 +372,7 @@ pub fn linear(
     }
     let rows = (input.size() as i32) / in_dim;
     if is_cpu_stream(stream)? {
-        let weight = dequantize(weight, scale, stream)?;
+        let weight = dequantize(weight, &scale, stream)?;
         let output = matmul(input, &weight.transpose(stream)?, stream)?;
         return restore_activation_dtype(output, output_dtype, stream);
     }
@@ -353,7 +381,7 @@ pub fn linear(
     let scale_cols = scale.dim(1);
 
     let out = linear_quantized(
-        &input, weight, scale, rows, in_dim, out_dim, scale_cols, stream,
+        &input, weight, &scale, rows, in_dim, out_dim, scale_cols, stream,
     )?;
 
     finish_linear_output(out, input_shape, output_dtype, out_dim, stream)
@@ -379,15 +407,17 @@ pub(crate) fn linear_pair(
             "paired block-FP8 linear expects an input with at least one dimension and rank-2 weight/scale arrays",
         ));
     }
+    let first_scale = decode_scale(first_scale, stream)?;
+    let second_scale = decode_scale(second_scale, stream)?;
     let input_shape = input.shape();
     let output_dtype = activation_dtype(input)?;
     let in_dim = input.dim(-1);
-    let first_out_dim = validate_linear_dimensions(first_weight, first_scale, in_dim)?;
-    let second_out_dim = validate_linear_dimensions(second_weight, second_scale, in_dim)?;
+    let first_out_dim = validate_linear_dimensions(first_weight, &first_scale, in_dim)?;
+    let second_out_dim = validate_linear_dimensions(second_weight, &second_scale, in_dim)?;
     if is_cpu_stream(stream)? {
         return Ok((
-            linear(input, first_weight, first_scale, stream)?,
-            linear(input, second_weight, second_scale, stream)?,
+            linear(input, first_weight, &first_scale, stream)?,
+            linear(input, second_weight, &second_scale, stream)?,
         ));
     }
 
@@ -397,9 +427,9 @@ pub(crate) fn linear_pair(
     let fused = linear_pair_quantized(
         &quantized,
         first_weight,
-        first_scale,
+        &first_scale,
         second_weight,
-        second_scale,
+        &second_scale,
         rows,
         in_dim,
         first_out_dim,
@@ -1020,6 +1050,7 @@ pub fn grouped_linear(
             "grouped block-FP8 linear expects rank-2 input, rank-3 weight/scale, and rank-1 group ids",
         ));
     }
+    let scale = decode_scale(scale, stream)?;
     let output_dtype = activation_dtype(input)?;
     let routes = input.dim(0);
     let in_dim = input.dim(1);
@@ -1041,7 +1072,7 @@ pub fn grouped_linear(
     }
     let scale_cols = scale.dim(2);
     if is_cpu_stream(stream)? {
-        let weight = dequantize_grouped(weight, scale, stream)?;
+        let weight = dequantize_grouped(weight, &scale, stream)?;
         let output = grouped_matmul(
             input,
             &weight.swap_axes(-1, -2, stream)?,
@@ -1073,7 +1104,7 @@ pub fn grouped_linear(
             &input.values,
             &input.scales,
             weight,
-            scale,
+            &scale,
             group_ids,
             routes,
             in_dim,
@@ -1086,7 +1117,7 @@ pub fn grouped_linear(
             &input.values,
             &input.scales,
             weight,
-            scale,
+            &scale,
             group_ids,
             routes,
             in_dim,
@@ -1326,6 +1357,7 @@ pub fn segmented_linear(
             "segmented block-FP8 linear expects rank-2 input/weight/scale and rank-1 group ids",
         ));
     }
+    let scale = decode_scale(scale, stream)?;
     if input.dim(0) != group_ids.dim(0)
         || input.dim(1) != weight.dim(1)
         || group_stride <= 0
@@ -1342,7 +1374,7 @@ pub fn segmented_linear(
         return segmented_reference(
             input,
             weight,
-            scale,
+            &scale,
             group_ids,
             group_stride,
             row_offset,
@@ -1369,7 +1401,7 @@ pub fn segmented_linear(
         cell.borrow()
             .as_ref()
             .expect("segmented FP8 linear kernel initialized")
-            .apply_one_device([input, weight, scale, group_ids], &config, stream)
+            .apply_one_device([input, weight, &scale, group_ids], &config, stream)
     })
 }
 
@@ -1394,6 +1426,7 @@ pub fn segmented_transposed_linear(
             "segmented transposed block-FP8 linear expects rank-2 input/weight/scale and rank-1 group ids",
         ));
     }
+    let scale = decode_scale(scale, stream)?;
     if input.dim(0) != group_ids.dim(0)
         || group_stride <= 0
         || row_offset < 0
@@ -1409,7 +1442,7 @@ pub fn segmented_transposed_linear(
         return segmented_reference(
             input,
             weight,
-            scale,
+            &scale,
             group_ids,
             group_stride,
             row_offset,
@@ -1437,7 +1470,7 @@ pub fn segmented_transposed_linear(
         cell.borrow()
             .as_ref()
             .expect("segmented transposed FP8 linear kernel initialized")
-            .apply_one_device([input, weight, scale, group_ids], &config, stream)
+            .apply_one_device([input, weight, &scale, group_ids], &config, stream)
     })
 }
 
@@ -1627,9 +1660,20 @@ const CUDA_HEADER: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::{
-        grouped_linear, linear, linear_pair, quantize_activations, segmented_linear,
+        decode_scale, grouped_linear, linear, linear_pair, quantize_activations, segmented_linear,
         segmented_transposed_linear, ACTIVATION_QUANTIZATION_CALLS,
     };
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn decodes_native_e8m0_scale_bytes() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let encoded = Array::from_slice(&[127u8, 128, 126], &[3]);
+        let decoded = decode_scale(&encoded, stream).unwrap();
+        let decoded = decoded.evaluated().unwrap();
+        assert_eq!(decoded.as_slice::<f32>(), &[1.0, 2.0, 0.5]);
+    }
     use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, Dtype, ExecutionContext};
 
     fn assert_block_fp8_dense_and_grouped_projections(device_type: DeviceType) {

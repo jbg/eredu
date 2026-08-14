@@ -1432,6 +1432,7 @@ fn modalities_for_safetensors(kind: ModelKind, config: &Value) -> Vec<ArtifactMo
             modalities.insert(ArtifactModality::Video);
         }
         ModelKind::DeepSeekV3
+        | ModelKind::DeepSeekV4
         | ModelKind::GptOss
         | ModelKind::KimiLinear
         | ModelKind::Llama

@@ -8,6 +8,8 @@ use crate::runtime::execution::layerwise::WeightResidency;
 pub enum ModelKind {
     /// DeepSeek-V3/R1 MLA and MoE architecture.
     DeepSeekV3,
+    /// DeepSeek-V4 compressed sparse-attention and mHC architecture.
+    DeepSeekV4,
     /// Gemma 4 text architecture.
     Gemma4,
     /// OpenAI GPT-OSS MXFP4 sparse decoder architecture.
@@ -132,8 +134,9 @@ impl ModelKind {
     /// Inspection parity tests iterate this list. The exhaustive matches in
     /// the loader and preflight planner remain the compile-time backstop when
     /// a new variant is added.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::DeepSeekV3,
+        Self::DeepSeekV4,
         Self::Gemma4,
         Self::GptOss,
         Self::Inkling,
@@ -155,6 +158,7 @@ impl ModelKind {
     pub const fn model_type_name(self) -> &'static str {
         match self {
             Self::DeepSeekV3 => "deepseek_v3",
+            Self::DeepSeekV4 => "deepseek_v4",
             Self::Gemma4 => "gemma4",
             Self::GptOss => "gpt_oss",
             Self::Inkling => "inkling_mm_model",
@@ -176,6 +180,7 @@ impl ModelKind {
     pub(super) fn from_model_type(model_type: &str) -> Result<Self, Error> {
         match model_type {
             "deepseek_v3" => Ok(Self::DeepSeekV3),
+            "deepseek_v4" => Ok(Self::DeepSeekV4),
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "gpt_oss" => Ok(Self::GptOss),
             "inkling_mm_model" => Ok(Self::Inkling),
@@ -206,6 +211,7 @@ pub(crate) enum ArtifactLoadKind {
 pub(crate) enum GgufArchitecture {
     KimiLinear,
     DeepSeek2,
+    DeepSeek4,
     GptOss,
     Inkling,
     Gemma4,
@@ -227,12 +233,13 @@ pub(crate) enum GgufArchitecture {
 }
 
 impl GgufArchitecture {
-    pub(crate) const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, gpt-oss, inkling, gemma4, llama, mistral, muse-glimmer, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen3vlmoe, qwen35, qwen35moe, and qwen3next";
+    pub(crate) const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, deepseek4, gpt-oss, inkling, gemma4, llama, mistral, muse-glimmer, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen3vlmoe, qwen35, qwen35moe, and qwen3next";
 
     pub(crate) fn resolve(name: &str) -> Result<Self, Error> {
         match name {
             "kimi-linear" => Ok(Self::KimiLinear),
             "deepseek2" => Ok(Self::DeepSeek2),
+            "deepseek4" => Ok(Self::DeepSeek4),
             "gpt-oss" => Ok(Self::GptOss),
             "inkling" => Ok(Self::Inkling),
             "gemma4" => Ok(Self::Gemma4),
@@ -262,6 +269,7 @@ impl GgufArchitecture {
         match self {
             Self::KimiLinear => ModelKind::KimiLinear,
             Self::DeepSeek2 => ModelKind::DeepSeekV3,
+            Self::DeepSeek4 => ModelKind::DeepSeekV4,
             Self::GptOss => ModelKind::GptOss,
             Self::Inkling => ModelKind::Inkling,
             Self::Gemma4 => ModelKind::Gemma4,
@@ -287,6 +295,7 @@ impl GgufArchitecture {
                 self,
                 Self::KimiLinear
                     | Self::DeepSeek2
+                    | Self::DeepSeek4
                     | Self::GptOss
                     | Self::Inkling
                     | Self::Gemma4
@@ -310,6 +319,7 @@ impl GgufArchitecture {
         match self {
             Self::KimiLinear => "kimi-linear",
             Self::DeepSeek2 => "deepseek2",
+            Self::DeepSeek4 => "deepseek4",
             Self::GptOss => "gpt-oss",
             Self::Inkling => "inkling",
             Self::Gemma4 => "gemma4",
@@ -420,6 +430,7 @@ pub(crate) fn validate_load_policy(
             kind,
             ModelKind::KimiLinear
                 | ModelKind::DeepSeekV3
+                | ModelKind::DeepSeekV4
                 | ModelKind::GptOss
                 | ModelKind::Inkling
                 | ModelKind::Lfm2
@@ -482,6 +493,7 @@ pub(crate) fn resolve_model_config(
 fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
     match kind {
         ModelKind::DeepSeekV3 => deepseek_v3::validate_model_config_value(config),
+        ModelKind::DeepSeekV4 => deepseek_v4::validate_model_config_value(config),
         ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
         ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
         ModelKind::Inkling => inkling::validate_model_config_value(config),

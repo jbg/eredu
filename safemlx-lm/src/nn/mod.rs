@@ -10,6 +10,8 @@ pub mod fp8;
 pub mod gated_delta;
 /// Causal language-model generation traits used by architecture implementations.
 pub mod generation;
+/// Multi-stream residual mixing shared by hyper-connection architectures.
+pub mod hyper_connections;
 /// Activation functions and feed-forward layers.
 pub mod layers;
 /// Linear layers, embeddings, and language-model heads.

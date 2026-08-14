@@ -2099,6 +2099,11 @@ pub(super) fn load_gguf_model_data(
                 )?;
                 (Model::DeepSeekV3(model), loaded.eos_token_ids)
             }
+            GgufArchitecture::DeepSeek4 => {
+                return Err(Error::UnsupportedArchitecture(
+                    "DeepSeek-V4 GGUF execution loader is not initialized".into(),
+                ));
+            }
             GgufArchitecture::GptOss => {
                 let loaded = gpt_oss::load_gguf_checkpoint(
                     &checkpoint,
@@ -2321,6 +2326,11 @@ pub(super) fn load_gguf_model_data(
                         weights_stream,
                     )?;
                 (Model::DeepSeekV3(loaded), eos_token_ids)
+            }
+            GgufArchitecture::DeepSeek4 => {
+                return Err(Error::UnsupportedArchitecture(
+                    "DeepSeek-V4 GGUF execution loader is not initialized".into(),
+                ));
             }
             GgufArchitecture::GptOss => {
                 let (loaded, eos_token_ids) =

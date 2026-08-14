@@ -70,6 +70,10 @@ pub enum StoredDtype {
     C64,
     /// Encoded FP8 E4M3 bytes. This is not an ordinary integer execution dtype.
     F8E4M3,
+    /// Packed FP4 E2M1 values, two logical scalars per byte.
+    F4,
+    /// Unsigned E8M0 scale bytes used by MX formats.
+    F8E8M0,
     /// Encoded FP8 E5M2 bytes.
     F8E5M2,
     /// Another safetensors encoding not represented by a named variant.
@@ -94,6 +98,8 @@ impl From<Dtype> for StoredDtype {
             Dtype::U64 => Self::U64,
             Dtype::C64 => Self::C64,
             Dtype::F8_E4M3 => Self::F8E4M3,
+            Dtype::F4 => Self::F4,
+            Dtype::F8_E8M0 => Self::F8E8M0,
             Dtype::F8_E5M2 => Self::F8E5M2,
             other => Self::Other(format!("{other:?}")),
         }
@@ -1977,6 +1983,49 @@ impl WeightLease {
             });
         }
 
+        // Materialize non-contiguous logical selections directly from encoded
+        // rows. This bounds both host and device memory for TP/EP shards and,
+        // unlike selecting an MLX array afterwards, also understands packed
+        // FP4's two logical values per byte.
+        if matches!(
+            &self.selection,
+            TensorSelection::Range { axis, .. } if *axis != 0
+        ) || matches!(&self.selection, TensorSelection::Indices { .. })
+        {
+            let selected_data = select_encoded_safetensors_data(
+                &self.key,
+                &shard.path,
+                info.dtype,
+                &info.shape,
+                data,
+                &self.selection,
+                &self.output_shape,
+            )?;
+            let view = TensorView::new(info.dtype, self.output_shape.clone(), &selected_data)
+                .map_err(|error| WeightStoreError::MalformedSafetensors {
+                    path: shard.path.clone(),
+                    message: format!("tensor {:?}: {error}", self.key),
+                })?;
+            let source_value =
+                Array::try_from(view).map_err(|source| WeightStoreError::MlxConversion {
+                    key: self.key.clone(),
+                    source,
+                })?;
+            let materialized = source_value
+                .copy(execution_stream)
+                .map_err(|source| self.mlx_error("copy", source))?;
+            return Ok(PendingWeightMaterialization {
+                output: materialized,
+                _source: source_value,
+                _gguf_group: None,
+                lease: Some(self),
+                source_stream: source_stream.clone(),
+                execution_stream: execution_stream.clone(),
+                borrowed_source: false,
+                completed: false,
+            });
+        }
+
         // Axis-zero ranges are contiguous in safetensors storage. Slice the
         // mmap bytes before constructing an MLX array: `Array::try_from` copies
         // its complete `TensorView`, so selecting afterwards would transiently
@@ -2818,6 +2867,103 @@ fn contiguous_safetensors_data<'a>(
         })
 }
 
+fn select_encoded_safetensors_data(
+    key: &str,
+    path: &Path,
+    dtype: Dtype,
+    full_shape: &[usize],
+    data: &[u8],
+    selection: &TensorSelection,
+    output_shape: &[usize],
+) -> Result<Vec<u8>, WeightStoreError> {
+    let (axis, indices): (usize, Vec<usize>) = match selection {
+        TensorSelection::Range { axis, start, end } => (*axis, (*start..*end).collect()),
+        TensorSelection::Indices { axis, indices } => (*axis, indices.clone()),
+        _ => {
+            return Err(WeightStoreError::InvalidSelection {
+                key: key.into(),
+                message: "encoded row selection requires an axis range or indices".into(),
+            })
+        }
+    };
+    let axis_len = full_shape[axis];
+    let outer = full_shape[..axis].iter().product::<usize>();
+    let inner = full_shape[axis + 1..].iter().product::<usize>();
+    let bits = dtype.bitsize();
+    let selected_elements = output_shape.iter().product::<usize>();
+    let selected_bits =
+        selected_elements
+            .checked_mul(bits)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("encoded selection bit length for tensor {key:?}"),
+            })?;
+    if selected_bits % 8 != 0 {
+        return Err(WeightStoreError::BoundedSelectionUnavailable {
+            key: key.into(),
+            message: "selected packed payload is not byte aligned".into(),
+        });
+    }
+    let mut output = Vec::with_capacity(selected_bits / 8);
+    if bits == 4 {
+        // V4 dimensions and partition boundaries are even. Requiring aligned
+        // blocks preserves the checkpoint's nibble order without decoding.
+        if inner % 2 != 0 || indices.iter().any(|index| index * inner % 2 != 0) {
+            return Err(WeightStoreError::BoundedSelectionUnavailable {
+                key: key.into(),
+                message: "FP4 axis selection crosses a packed nibble boundary".into(),
+            });
+        }
+        let block_bytes = inner / 2;
+        for outer_index in 0..outer {
+            for index in &indices {
+                let element = (outer_index * axis_len + index) * inner;
+                let start = element / 2;
+                let end = start + block_bytes;
+                output.extend_from_slice(data.get(start..end).ok_or_else(|| {
+                    WeightStoreError::MalformedSafetensors {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "encoded FP4 selection for tensor {key:?} exceeds payload"
+                        ),
+                    }
+                })?);
+            }
+        }
+    } else {
+        if !bits.is_multiple_of(8) {
+            return Err(WeightStoreError::UnsupportedStoredDtype {
+                key: key.into(),
+                dtype: dtype.into(),
+            });
+        }
+        let scalar_bytes = bits / 8;
+        let block_bytes =
+            inner
+                .checked_mul(scalar_bytes)
+                .ok_or_else(|| WeightStoreError::Overflow {
+                    context: format!("encoded selection block for tensor {key:?}"),
+                })?;
+        for outer_index in 0..outer {
+            for index in &indices {
+                let start = (outer_index * axis_len + index)
+                    .checked_mul(block_bytes)
+                    .ok_or_else(|| WeightStoreError::Overflow {
+                        context: format!("encoded selection offset for tensor {key:?}"),
+                    })?;
+                let end = start + block_bytes;
+                output.extend_from_slice(data.get(start..end).ok_or_else(|| {
+                    WeightStoreError::MalformedSafetensors {
+                        path: path.to_path_buf(),
+                        message: format!("encoded selection for tensor {key:?} exceeds payload"),
+                    }
+                })?);
+            }
+        }
+    }
+    debug_assert_eq!(output.len(), selected_bits / 8);
+    Ok(output)
+}
+
 fn materialize_contiguous(
     key: &str,
     source: &Array,
@@ -2982,6 +3128,8 @@ fn is_supported_execution_dtype(dtype: Dtype) -> bool {
             | Dtype::I64
             | Dtype::U64
             | Dtype::F8_E4M3
+            | Dtype::F4
+            | Dtype::F8_E8M0
     )
 }
 
@@ -4136,6 +4284,45 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(value.evaluated().unwrap().as_slice::<i32>(), &[7, 8, 9]);
+    }
+
+    #[test]
+    fn encoded_axis_selection_bounds_dense_and_fp4_payloads() {
+        let dense = (0u8..24).collect::<Vec<_>>();
+        let selected = select_encoded_safetensors_data(
+            "dense",
+            Path::new("dense.safetensors"),
+            Dtype::U8,
+            &[2, 3, 4],
+            &dense,
+            &TensorSelection::Range {
+                axis: 1,
+                start: 1,
+                end: 3,
+            },
+            &[2, 2, 4],
+        )
+        .unwrap();
+        assert_eq!(selected, [&dense[4..12], &dense[16..24]].concat());
+
+        // Logical [2, 4, 2] occupies eight bytes. Selecting axis-1 rows 1..3
+        // copies only their packed bytes from each outer row.
+        let fp4 = (0u8..8).collect::<Vec<_>>();
+        let selected = select_encoded_safetensors_data(
+            "fp4",
+            Path::new("fp4.safetensors"),
+            Dtype::F4,
+            &[2, 4, 2],
+            &fp4,
+            &TensorSelection::Range {
+                axis: 1,
+                start: 1,
+                end: 3,
+            },
+            &[2, 2, 2],
+        )
+        .unwrap();
+        assert_eq!(selected, vec![1, 2, 5, 6]);
     }
 
     #[cfg(target_os = "macos")]

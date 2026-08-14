@@ -893,6 +893,8 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
 pub(crate) enum QwenWeightFormat {
     Dense,
     Fp8,
+    /// Native block-FP8 with unsigned E8M0 scale bytes.
+    Fp8E8M0,
     Affine(WeightQuantization),
     IQuant(WeightQuantization),
 }
@@ -910,14 +912,14 @@ impl QwenWeightFormat {
     pub(crate) fn affine(self) -> Option<WeightQuantization> {
         match self {
             Self::Affine(affine) => Some(affine),
-            Self::Dense | Self::Fp8 | Self::IQuant(_) => None,
+            Self::Dense | Self::Fp8 | Self::Fp8E8M0 | Self::IQuant(_) => None,
         }
     }
 
     pub(crate) fn quantization(self) -> Option<WeightQuantization> {
         match self {
             Self::Affine(quantization) | Self::IQuant(quantization) => Some(quantization),
-            Self::Dense | Self::Fp8 => None,
+            Self::Dense | Self::Fp8 | Self::Fp8E8M0 => None,
         }
     }
 
@@ -979,7 +981,9 @@ impl QwenLinear {
         }
         let (weight_shape, weight_dtype) = match format {
             QwenWeightFormat::Dense => (vec![output_dims, input_dims], Dtype::Float32),
-            QwenWeightFormat::Fp8 => (vec![output_dims, input_dims], Dtype::Uint8),
+            QwenWeightFormat::Fp8 | QwenWeightFormat::Fp8E8M0 => {
+                (vec![output_dims, input_dims], Dtype::Uint8)
+            }
             QwenWeightFormat::Affine(quantization) => (
                 vec![
                     output_dims,
@@ -1003,10 +1007,15 @@ impl QwenLinear {
             input_dims,
             output_dims,
             weight: Param::<Array>::unloaded(&weight_shape, weight_dtype, stream)?,
-            weight_scale_inv: if format == QwenWeightFormat::Fp8 {
+            weight_scale_inv: if matches!(format, QwenWeightFormat::Fp8 | QwenWeightFormat::Fp8E8M0)
+            {
                 Param::<Option<Array>>::unloaded_some(
                     &[ceil_div(output_dims, 128), ceil_div(input_dims, 128)],
-                    Dtype::Float32,
+                    if format == QwenWeightFormat::Fp8E8M0 {
+                        Dtype::Uint8
+                    } else {
+                        Dtype::Float32
+                    },
                     stream,
                 )?
             } else {

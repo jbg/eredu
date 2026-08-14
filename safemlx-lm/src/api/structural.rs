@@ -10,6 +10,7 @@ use super::{GgufArchitecture, ModelKind, ModelLoadOptions};
 use crate::{
     architectures::{
         deepseek_v3::model as deepseek_v3,
+        deepseek_v4::model as deepseek_v4,
         gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
         inkling::model as inkling,
@@ -118,6 +119,7 @@ impl StructuralValidation {
 pub(crate) const fn safetensors_policy(kind: ModelKind) -> StructuralValidationPolicy {
     match kind {
         ModelKind::DeepSeekV3
+        | ModelKind::DeepSeekV4
         | ModelKind::Gemma4
         | ModelKind::GptOss
         | ModelKind::Inkling
@@ -143,6 +145,7 @@ pub(crate) const fn gguf_policy(architecture: GgufArchitecture) -> StructuralVal
         | GgufArchitecture::Mistral
         | GgufArchitecture::MuseGlimmer
         | GgufArchitecture::DeepSeek2
+        | GgufArchitecture::DeepSeek4
         | GgufArchitecture::Lfm2
         | GgufArchitecture::Lfm2Moe
         | GgufArchitecture::GptOss
@@ -171,6 +174,7 @@ pub(crate) fn validate_safetensors(
     let validation = match safetensors_policy(kind) {
         StructuralValidationPolicy::Exact => match kind {
             ModelKind::DeepSeekV3 => validate_deepseek_v3_safetensors(config, store, options),
+            ModelKind::DeepSeekV4 => validate_deepseek_v4_safetensors(config, store),
             ModelKind::Gemma4 => validate_gemma4_safetensors(config, store, options),
             ModelKind::GptOss => validate_gpt_oss_safetensors(config, store),
             ModelKind::Inkling => validate_inkling_safetensors(config, store),
@@ -213,6 +217,7 @@ pub(crate) fn validate_gguf(
     let validation = match gguf_policy(architecture) {
         StructuralValidationPolicy::Exact => match architecture {
             GgufArchitecture::DeepSeek2 => validate_deepseek2_gguf(checkpoint, metadata),
+            GgufArchitecture::DeepSeek4 => unverified("deepseek4"),
             GgufArchitecture::GptOss => validate_gpt_oss_gguf(checkpoint, metadata),
             GgufArchitecture::Gemma4 => validate_gemma4_gguf(checkpoint, metadata, options),
             GgufArchitecture::Inkling => validate_inkling_gguf(checkpoint, metadata, options),
@@ -3455,6 +3460,204 @@ fn validate_nemotron_experts_at(
             );
         }
     }
+}
+
+fn validate_deepseek_v4_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let args = match deepseek_v4::ModelArgs::from_value(config.clone()) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let hidden = args.hidden_size as usize;
+    let mut issues = Vec::new();
+    for (name, shape) in [
+        (
+            "embed.weight".to_string(),
+            vec![args.vocab_size as usize, hidden],
+        ),
+        ("norm.weight".to_string(), vec![hidden]),
+        (
+            "head.weight".to_string(),
+            vec![args.vocab_size as usize, hidden],
+        ),
+        (
+            "hc_head_fn".to_string(),
+            vec![
+                args.hc_mult as usize,
+                (args.hc_mult * args.hidden_size) as usize,
+            ],
+        ),
+        ("hc_head_base".to_string(), vec![args.hc_mult as usize]),
+        ("hc_head_scale".to_string(), vec![1]),
+    ] {
+        validate_safetensor(store, &name, &shape, false, &mut issues);
+    }
+    let mix = ((2 + args.hc_mult) * args.hc_mult) as usize;
+    for layer in 0..args.num_hidden_layers as usize {
+        let root = format!("layers.{layer}");
+        let ratio = args.compress_ratios[layer];
+        for (name, shape) in [
+            (
+                format!("{root}.attn.wq_a.weight"),
+                vec![args.q_lora_rank as usize, hidden],
+            ),
+            (
+                format!("{root}.attn.q_norm.weight"),
+                vec![args.q_lora_rank as usize],
+            ),
+            (
+                format!("{root}.attn.wq_b.weight"),
+                vec![
+                    (args.num_attention_heads * args.head_dim) as usize,
+                    args.q_lora_rank as usize,
+                ],
+            ),
+            (
+                format!("{root}.attn.wkv.weight"),
+                vec![args.head_dim as usize, hidden],
+            ),
+            (
+                format!("{root}.attn.kv_norm.weight"),
+                vec![args.head_dim as usize],
+            ),
+            (
+                format!("{root}.attn.wo_a.weight"),
+                vec![
+                    (args.o_groups * args.o_lora_rank) as usize,
+                    (args.num_attention_heads * args.head_dim / args.o_groups) as usize,
+                ],
+            ),
+            (
+                format!("{root}.attn.wo_b.weight"),
+                vec![hidden, (args.o_groups * args.o_lora_rank) as usize],
+            ),
+            (
+                format!("{root}.attn.attn_sink"),
+                vec![args.num_attention_heads as usize],
+            ),
+            (format!("{root}.attn_norm.weight"), vec![hidden]),
+            (format!("{root}.ffn_norm.weight"), vec![hidden]),
+            (
+                format!("{root}.hc_attn_fn"),
+                vec![mix, (args.hc_mult * args.hidden_size) as usize],
+            ),
+            (format!("{root}.hc_attn_base"), vec![mix]),
+            (format!("{root}.hc_attn_scale"), vec![3]),
+            (
+                format!("{root}.hc_ffn_fn"),
+                vec![mix, (args.hc_mult * args.hidden_size) as usize],
+            ),
+            (format!("{root}.hc_ffn_base"), vec![mix]),
+            (format!("{root}.hc_ffn_scale"), vec![3]),
+            (
+                format!("{root}.ffn.gate.weight"),
+                vec![args.n_routed_experts as usize, hidden],
+            ),
+        ] {
+            validate_safetensor(store, &name, &shape, false, &mut issues);
+        }
+        let router = if layer < args.num_hash_layers as usize {
+            (
+                format!("{root}.ffn.gate.tid2eid"),
+                vec![args.vocab_size as usize, args.num_experts_per_tok as usize],
+            )
+        } else {
+            (
+                format!("{root}.ffn.gate.bias"),
+                vec![args.n_routed_experts as usize],
+            )
+        };
+        validate_safetensor(store, &router.0, &router.1, false, &mut issues);
+        for expert in 0..args.n_routed_experts as usize {
+            for (projection, shape) in [
+                ("w1", vec![args.moe_intermediate_size as usize, hidden]),
+                ("w2", vec![hidden, args.moe_intermediate_size as usize]),
+                ("w3", vec![args.moe_intermediate_size as usize, hidden]),
+            ] {
+                validate_safetensor(
+                    store,
+                    &format!("{root}.ffn.experts.{expert}.{projection}.weight"),
+                    &shape,
+                    false,
+                    &mut issues,
+                );
+            }
+        }
+        for (projection, shape) in [
+            (
+                "w1",
+                vec![
+                    (args.moe_intermediate_size * args.n_shared_experts) as usize,
+                    hidden,
+                ],
+            ),
+            (
+                "w2",
+                vec![
+                    hidden,
+                    (args.moe_intermediate_size * args.n_shared_experts) as usize,
+                ],
+            ),
+            (
+                "w3",
+                vec![
+                    (args.moe_intermediate_size * args.n_shared_experts) as usize,
+                    hidden,
+                ],
+            ),
+        ] {
+            validate_safetensor(
+                store,
+                &format!("{root}.ffn.shared_experts.{projection}.weight"),
+                &shape,
+                false,
+                &mut issues,
+            );
+        }
+        if ratio != 0 {
+            let output = args.head_dim * if ratio == 4 { 2 } else { 1 };
+            for (name, shape) in [
+                (
+                    format!("{root}.attn.compressor.wkv.weight"),
+                    vec![output as usize, hidden],
+                ),
+                (
+                    format!("{root}.attn.compressor.wgate.weight"),
+                    vec![output as usize, hidden],
+                ),
+                (
+                    format!("{root}.attn.compressor.ape"),
+                    vec![ratio as usize, output as usize],
+                ),
+                (
+                    format!("{root}.attn.compressor.norm.weight"),
+                    vec![args.head_dim as usize],
+                ),
+            ] {
+                validate_safetensor(store, &name, &shape, false, &mut issues);
+            }
+        }
+        if ratio == 4 {
+            for (name, shape) in [
+                (
+                    format!("{root}.attn.indexer.wq_b.weight"),
+                    vec![
+                        (args.index_n_heads * args.index_head_dim) as usize,
+                        args.q_lora_rank as usize,
+                    ],
+                ),
+                (
+                    format!("{root}.attn.indexer.weights_proj.weight"),
+                    vec![args.index_n_heads as usize, hidden],
+                ),
+            ] {
+                validate_safetensor(store, &name, &shape, false, &mut issues);
+            }
+        }
+    }
+    finish(issues)
 }
 
 fn validate_deepseek_v3_safetensors(

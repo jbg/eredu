@@ -188,6 +188,22 @@ pub enum TopKRouterScoreFunction {
     Softmax,
     /// Sigmoid scores, as used by Nemotron/DeepSeek-style routers.
     Sigmoid,
+    /// Square-root softplus scores used by DeepSeek V4.
+    SqrtSoftplus,
+}
+
+impl TopKRouterScoreFunction {
+    fn requires_fp32(self) -> bool {
+        matches!(self, Self::Sigmoid | Self::SqrtSoftplus)
+    }
+
+    fn apply(self, logits: Array, stream: &Stream) -> Result<Array, Exception> {
+        match self {
+            Self::Softmax => softmax_axis(logits, -1, true, stream),
+            Self::Sigmoid => sigmoid(logits, stream),
+            Self::SqrtSoftplus => safemlx::nn::softplus(logits, stream)?.sqrt(stream),
+        }
+    }
 }
 
 /// Configuration for a reusable top-k MoE router.
@@ -387,7 +403,7 @@ impl TopKRouter {
     ) -> Result<(Array, Array), Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
         let logits = if let Some(scales) = self.scales.as_ref() {
-            let input = if self.score_function == TopKRouterScoreFunction::Sigmoid {
+            let input = if self.score_function.requires_fp32() {
                 flat.as_dtype(Dtype::Float32, stream)?
             } else {
                 flat
@@ -403,7 +419,7 @@ impl TopKRouter {
                 self.mode,
                 stream,
             )?
-        } else if self.score_function == TopKRouterScoreFunction::Sigmoid {
+        } else if self.score_function.requires_fp32() {
             matmul(
                 &flat.as_dtype(Dtype::Float32, stream)?,
                 &self
@@ -416,10 +432,7 @@ impl TopKRouter {
         } else {
             matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?
         };
-        let scores = match self.score_function {
-            TopKRouterScoreFunction::Softmax => softmax_axis(&logits, -1, true, stream)?,
-            TopKRouterScoreFunction::Sigmoid => sigmoid(logits, stream)?,
-        };
+        let scores = self.score_function.apply(logits, stream)?;
         let mut scores_for_choice = scores.clone();
         if let Some(bias) = self.e_score_correction_bias.as_ref() {
             scores_for_choice = scores_for_choice.add(bias, stream)?;
@@ -445,17 +458,20 @@ impl TopKRouter {
         Ok((top_k_index, top_k_weights))
     }
 
-    /// Returns selected expert ids and weights while reporting router internals.
-    pub fn forward_with_observer(
+    /// Computes routing weights for caller-provided global expert ids.
+    ///
+    /// This is the hash-router form used by DeepSeek V4: the checkpoint's
+    /// token-id table chooses experts, while the ordinary router projection
+    /// still supplies their normalized contribution weights.
+    pub fn forward_with_routing_indices(
         &mut self,
         hidden_states: &Array,
+        expert_indices: &Array,
         stream: &Stream,
-        prefix: &str,
-        observer: &mut dyn ActivationObserver,
-    ) -> Result<TopKRouterOutput, Exception> {
+    ) -> Result<(Array, Array), Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
         let logits = if let Some(scales) = self.scales.as_ref() {
-            let input = if self.score_function == TopKRouterScoreFunction::Sigmoid {
+            let input = if self.score_function.requires_fp32() {
                 flat.as_dtype(Dtype::Float32, stream)?
             } else {
                 flat
@@ -471,7 +487,61 @@ impl TopKRouter {
                 self.mode,
                 stream,
             )?
-        } else if self.score_function == TopKRouterScoreFunction::Sigmoid {
+        } else if self.score_function.requires_fp32() {
+            matmul(
+                &flat.as_dtype(Dtype::Float32, stream)?,
+                &self
+                    .weight
+                    .as_ref()
+                    .as_dtype(Dtype::Float32, stream)?
+                    .transpose(stream)?,
+                stream,
+            )?
+        } else {
+            matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?
+        };
+        let scores = self.score_function.apply(logits, stream)?;
+        let expert_indices = expert_indices.reshape(&[-1, self.top_k], stream)?;
+        let mut weights = take_along_axis(scores, &expert_indices, -1, stream)?;
+        if self.norm_topk_prob {
+            let denominator = weights
+                .sum_axis(-1, true, stream)?
+                .add(Array::from_f32(self.normalization_epsilon), stream)?;
+            weights = weights.divide(denominator, stream)?;
+        }
+        if self.routed_scaling_factor != 1.0 {
+            weights = weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
+        }
+        Ok((expert_indices, weights))
+    }
+
+    /// Returns selected expert ids and weights while reporting router internals.
+    pub fn forward_with_observer(
+        &mut self,
+        hidden_states: &Array,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut dyn ActivationObserver,
+    ) -> Result<TopKRouterOutput, Exception> {
+        let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
+        let logits = if let Some(scales) = self.scales.as_ref() {
+            let input = if self.score_function.requires_fp32() {
+                flat.as_dtype(Dtype::Float32, stream)?
+            } else {
+                flat
+            };
+            quantized_matmul_with_mode(
+                &input,
+                self.weight.as_ref(),
+                scales,
+                self.biases.as_ref().as_ref(),
+                true,
+                self.group_size,
+                self.bits,
+                self.mode,
+                stream,
+            )?
+        } else if self.score_function.requires_fp32() {
             matmul(
                 &flat.as_dtype(Dtype::Float32, stream)?,
                 &self
@@ -485,10 +555,7 @@ impl TopKRouter {
             matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?
         };
         observer.observe(&format!("{prefix}.router_logits"), &logits)?;
-        let scores = match self.score_function {
-            TopKRouterScoreFunction::Softmax => softmax_axis(&logits, -1, true, stream)?,
-            TopKRouterScoreFunction::Sigmoid => sigmoid(logits, stream)?,
-        };
+        let scores = self.score_function.apply(logits, stream)?;
         observer.observe(&format!("{prefix}.router_scores"), &scores)?;
 
         let mut scores_for_choice = scores.clone();
@@ -717,6 +784,8 @@ pub struct PackedSwiGluExperts {
     pub hidden_dim: i32,
     /// Per-expert intermediate dimension.
     pub intermediate_dim: i32,
+    /// Optional DeepSeek-style bound applied before the SwiGLU product.
+    pub swiglu_limit: Option<f32>,
     /// Optional encoding for the concatenated gate/up projection.
     pub gate_up_affine: Option<WeightQuantization>,
     /// Optional encoding for the down projection.
@@ -871,6 +940,7 @@ impl PackedSwiGluExperts {
             num_experts,
             hidden_dim,
             intermediate_dim,
+            swiglu_limit: None,
             gate_up_affine,
             down_affine,
             gate_up_iquant,
@@ -882,6 +952,19 @@ impl PackedSwiGluExperts {
             down_proj_scales,
             down_proj_biases,
         })
+    }
+
+    /// Applies a finite activation bound to gate and up projections.
+    ///
+    /// The gate is upper-bounded while the up projection is bounded on both
+    /// sides, matching the limited SwiGLU used by DeepSeek V4. A non-positive
+    /// value disables the bound.
+    pub fn with_swiglu_limit(mut self, limit: f32) -> Result<Self, Exception> {
+        if !limit.is_finite() {
+            return Err(Exception::custom("SwiGLU limit must be finite"));
+        }
+        self.swiglu_limit = (limit > 0.0).then_some(limit);
+        Ok(self)
     }
 
     fn forward_chunk(
@@ -925,8 +1008,12 @@ impl PackedSwiGluExperts {
                 stream,
             )?
         };
-        let gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
-        let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
+        let mut gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
+        let mut up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
+        if let Some(limit) = self.swiglu_limit {
+            gate = safemlx::ops::clip(gate, ((), limit), stream)?;
+            up = safemlx::ops::clip(up, (-limit, limit), stream)?;
+        }
         let activated = silu(gate, stream)?.multiply(up, stream)?;
         let output = if let Some(iquant) = self.down_iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");

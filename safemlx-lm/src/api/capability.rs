@@ -9,7 +9,7 @@ use super::{
     PreparedModelInput,
 };
 use crate::{
-    architectures::qwen::hybrid::qwen3_5::LayerPolicy as QwenHybridLayerPolicy,
+    architectures::{deepseek_v4, qwen::hybrid::qwen3_5::LayerPolicy as QwenHybridLayerPolicy},
     nn::rope::FloatOrString,
     runtime::{
         attention::AttentionPolicy,
@@ -605,6 +605,7 @@ impl Model {
                 dense_qwen_spec(&model.args().text_config, true)?
             }
             Self::DeepSeekV3(model) => deepseek_spec(model.args())?,
+            Self::DeepSeekV4(model) => deepseek_v4_spec(&model.args)?,
             Self::GptOss(model) => gpt_oss_spec(model.args())?,
             Self::Gemma4(model) => {
                 let (_, _, image, audio, video) = model.media_accounting();
@@ -897,6 +898,69 @@ fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError>
             hidden_size: positive(args.hidden_size, "hidden_size")?,
             allocation_granularity: 256,
             completeness: EstimationCompleteness::Complete,
+        },
+    ))
+}
+
+fn deepseek_v4_spec(args: &deepseek_v4::ModelArgs) -> Result<Spec, CapabilityError> {
+    let effective = positive(args.max_position_embeddings, "max_position_embeddings")?;
+    let native = args
+        .rope_scaling
+        .as_ref()
+        .map(|rope| {
+            positive(
+                rope.original_max_position_embeddings,
+                "original_max_position_embeddings",
+            )
+        })
+        .transpose()?
+        .unwrap_or(effective);
+    let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
+    let compressed = args
+        .compress_ratios
+        .iter()
+        .filter(|ratio| **ratio != 0)
+        .count() as u64;
+    let head_dim = positive(args.head_dim, "head_dim")?;
+    Ok((
+        CapabilityValue::Available {
+            value: native,
+            kind: MeasurementKind::Exact,
+            source: "validated DeepSeek-V4 YaRN configuration",
+        },
+        CapabilityValue::Available {
+            value: effective,
+            kind: MeasurementKind::Exact,
+            source: "validated DeepSeek-V4 configuration",
+        },
+        CacheStateStrategy::MixedKv {
+            full_layers: compressed,
+            sliding: vec![SlidingWindowLayerCount {
+                layers,
+                window: positive(args.sliding_window, "sliding_window")?,
+            }],
+        },
+        text_modalities(),
+        ArchitectureEstimate {
+            fixed_scalars_per_batch: 0,
+            // Pooled state grows more slowly than one vector per source token;
+            // charging a full vector is a complete safe upper bound across the
+            // heterogeneous 4/128 compression schedule.
+            growing: vec![
+                GrowingState {
+                    layers,
+                    scalars_per_position: head_dim,
+                    window: Some(positive(args.sliding_window, "sliding_window")?),
+                },
+                GrowingState {
+                    layers: compressed,
+                    scalars_per_position: head_dim,
+                    window: None,
+                },
+            ],
+            hidden_size: positive(args.hidden_size, "hidden_size")?,
+            allocation_granularity: 128,
+            completeness: EstimationCompleteness::Conservative,
         },
     ))
 }
@@ -2306,6 +2370,7 @@ impl Model {
                 inkling_workspace(model.args(), modality, payload, metadata, self.model_type())
             }
             Self::DeepSeekV3(_)
+            | Self::DeepSeekV4(_)
             | Self::GptOss(_)
             | Self::KimiLinear(_)
             | Self::Llama(_)

@@ -2,6 +2,8 @@
 
 /// DeepSeek-V3 and DeepSeek-R1 implementations.
 pub mod deepseek_v3;
+/// DeepSeek-V4 compressed sparse-attention and mHC architecture.
+pub mod deepseek_v4;
 /// Architecture-dispatched distributed model adapters.
 pub mod distributed;
 /// Gemma 4 text and multimodal implementations.

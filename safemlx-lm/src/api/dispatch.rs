@@ -6,6 +6,8 @@ use super::*;
 pub enum Model {
     /// DeepSeek-V3/R1 model.
     DeepSeekV3(crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel),
+    /// DeepSeek-V4 target model.
+    DeepSeekV4(Box<crate::architectures::deepseek_v4::model::Model>),
     /// Gemma 4 text and multimodal model.
     Gemma4(Box<crate::architectures::gemma4::layerwise::Gemma4LayerwiseModel>),
     /// OpenAI GPT-OSS model.
@@ -42,6 +44,7 @@ impl Model {
             Self::Llama(model) => model.parallel_info(),
             Self::MuseGlimmer(model) => model.parallel_info(),
             Self::DeepSeekV3(model) => model.parallel_info(),
+            Self::DeepSeekV4(_) => None,
             Self::GptOss(model) => model.parallel_info(),
             Self::DenseQwen(model) => model.parallel_info(),
             Self::KimiLinear(model) => model.parallel_info(),
@@ -591,6 +594,7 @@ impl Model {
     ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
         match self {
             Self::DeepSeekV3(model) => Ok(Some(model.residency_report()?)),
+            Self::DeepSeekV4(_) => Ok(None),
             Self::Gemma4(model) => Ok(Some(model.residency_report()?)),
             Self::Inkling(model) => Ok(Some(model.residency_report()?)),
             Self::KimiLinear(model) => Ok(Some(model.residency_report()?)),
@@ -611,6 +615,7 @@ impl Model {
     ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         match self {
             Self::DeepSeekV3(model) => model.dense_stream_report(),
+            Self::DeepSeekV4(_) => Ok(None),
             Self::Gemma4(model) => model.dense_stream_report(),
             Self::Inkling(model) => model.dense_stream_report(),
             Self::KimiLinear(model) => model.dense_stream_report(),
@@ -648,6 +653,7 @@ impl Model {
     pub fn model_type(&self) -> &str {
         match self {
             Self::DeepSeekV3(model) => &model.args().model_type,
+            Self::DeepSeekV4(model) => &model.args.model_type,
             Self::Gemma4(model) => &model.args().model_type,
             Self::GptOss(model) => &model.args().model_type,
             Self::Inkling(model) => &model.args().model_type,
@@ -678,6 +684,9 @@ impl Model {
             Self::Llama(model) => Ok(llama::prompt_cache_architecture_fingerprint(model.args())),
             Self::DeepSeekV3(model) => Ok(deepseek_v3::prompt_cache_architecture_fingerprint(
                 model.args(),
+            )),
+            Self::DeepSeekV4(model) => Ok(deepseek_v4::prompt_cache_architecture_fingerprint(
+                &model.args,
             )),
             Self::GptOss(model) => Ok(gpt_oss::prompt_cache_architecture_fingerprint(model.args())),
             Self::Inkling(model) => {
@@ -710,6 +719,7 @@ impl Model {
         match self {
             Self::Llama(model) => model.prompt_cache_layer_layout(),
             Self::DeepSeekV3(model) => model.prompt_cache_layer_layout(),
+            Self::DeepSeekV4(model) => model.prompt_cache_layer_layout(),
             Self::GptOss(model) => model.prompt_cache_layer_layout(),
             Self::DenseQwen(model) => model.prompt_cache_layer_layout(),
             Self::MuseGlimmer(model) => model.prompt_cache_layer_layout(),
@@ -825,6 +835,11 @@ impl Model {
     pub fn new_cache(&self) -> ModelCache {
         match self {
             Self::DeepSeekV3(model) => ModelCache::DeepSeekV3(model.new_cache()),
+            Self::DeepSeekV4(model) => ModelCache::DeepSeekV4(
+                model
+                    .new_cache()
+                    .expect("validated DeepSeek-V4 cache geometry"),
+            ),
             Self::Gemma4(model) => ModelCache::Gemma4(model.new_cache()),
             Self::GptOss(model) => ModelCache::GptOss(model.new_cache()),
             Self::Inkling(model) => ModelCache::Inkling(model.new_cache()),
@@ -931,6 +946,9 @@ impl Model {
         match self {
             Self::Llama(model) => load!(model, ModelCache::Llama),
             Self::DeepSeekV3(model) => load!(model, ModelCache::DeepSeekV3),
+            Self::DeepSeekV4(_) => Err(Exception::custom(
+                "persisted DeepSeek-V4 prompt caches are not supported yet",
+            )),
             Self::GptOss(model) => load!(model, ModelCache::GptOss),
             Self::DenseQwen(model) => load!(model, ModelCache::KeyValue),
             Self::MuseGlimmer(model) => load!(model, ModelCache::KeyValue),
@@ -1109,6 +1127,7 @@ impl Model {
         let model_family = match self {
             Self::Llama(_) => "llama",
             Self::DeepSeekV3(_) => "deepseek_v3",
+            Self::DeepSeekV4(_) => "deepseek_v4",
             Self::GptOss(_) => "gpt_oss",
             Self::DenseQwen(_) => "dense_qwen",
             Self::MuseGlimmer(_) => "muse_glimmer",
@@ -1220,6 +1239,12 @@ impl Model {
             (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
+            (Self::DeepSeekV4(model), ModelCache::DeepSeekV4(cache)) => {
+                let tokens = input::text_token_ids(input, stream)?;
+                model
+                    .forward(&tokens, Some(cache), stream)?
+                    .try_index_device((.., -1, ..), stream)
+            }
             (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
@@ -1330,6 +1355,11 @@ impl Model {
                     model, cache, temp, input, prng_key, stream, sampler,
                 ),
             ),
+            (Self::DeepSeekV4(model), ModelCache::DeepSeekV4(cache)) => ModelGenerate::DeepSeekV4(
+                crate::architectures::deepseek_v4::model::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ),
+            ),
             (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => ModelGenerate::KimiLinear(
                 crate::architectures::kimi_linear::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
@@ -1345,6 +1375,8 @@ impl Model {
 pub enum ModelCache {
     /// Compressed latent MLA cache for DeepSeek-V3/R1.
     DeepSeekV3(deepseek_v3::Cache),
+    /// Local and compressed attention caches for DeepSeek-V4.
+    DeepSeekV4(crate::architectures::deepseek_v4::model::Cache),
     /// Gemma 4 generation cache.
     Gemma4(gemma4::Cache),
     /// GPT-OSS cache following its canonical per-layer attention schedule.
@@ -1469,6 +1501,8 @@ where
 {
     /// DeepSeek-V3/R1 generation iterator.
     DeepSeekV3(crate::architectures::deepseek_v3::layerwise::Generate<'a, S>),
+    /// DeepSeek-V4 generation iterator.
+    DeepSeekV4(crate::architectures::deepseek_v4::model::Generate<'a, S>),
     /// Gemma 4 generation iterator.
     Gemma4(crate::architectures::gemma4::layerwise::Generate<'a, S>),
     /// GPT-OSS generation iterator.
@@ -1544,6 +1578,7 @@ where
     pub fn sampler_mut(&mut self) -> &mut S {
         match self {
             Self::DeepSeekV3(generate) => generate.sampler_mut(),
+            Self::DeepSeekV4(generate) => generate.sampler_mut(),
             Self::Gemma4(generate) => generate.sampler_mut(),
             Self::GptOss(generate) => generate.sampler_mut(),
             Self::Inkling(generate) => generate.sampler_mut(),
@@ -1572,6 +1607,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::DeepSeekV3(generate) => generate.next(),
+            Self::DeepSeekV4(generate) => generate.next(),
             Self::Gemma4(generate) => generate.next(),
             Self::GptOss(generate) => generate.next(),
             Self::Inkling(generate) => generate.next(),

@@ -8641,6 +8641,9 @@ pub fn load_pipeline_model_with_options(
         )
         .into_loader_result()?;
         return match architecture {
+            crate::api::GgufArchitecture::DeepSeek4 => Err(Error::UnsupportedArchitecture(
+                "DeepSeek-V4 GGUF pipeline loader is not initialized".into(),
+            )),
             crate::api::GgufArchitecture::Llama | crate::api::GgufArchitecture::Mistral => {
                 let prepared = llama::prepare_llama_gguf_checkpoint(
                     &checkpoint,

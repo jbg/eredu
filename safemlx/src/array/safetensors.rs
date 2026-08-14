@@ -1,8 +1,10 @@
 //! Implement conversion from safetensors `TensorView` to `Array`.
 //!
-//! MLX represents FP8 E4M3 values as `uint8` arrays containing the encoded
-//! bit patterns. Accordingly, `F8_E4M3` tensor views are loaded losslessly as
-//! [`Dtype::Uint8`]. `F8_E5M2` is not supported.
+//! MLX represents checkpoint FP8 and FP4 values as integer arrays containing
+//! their encoded bit patterns. Accordingly, `F8_E4M3`, `F8_E8M0`, and `F4`
+//! tensor views are loaded losslessly as [`Dtype::Uint8`]. The last dimension
+//! of an F4 storage array is half its logical scalar dimension because two
+//! values occupy each byte. `F8_E5M2` is not supported.
 
 use std::ffi::c_void;
 
@@ -22,17 +24,21 @@ impl<'data> TryFrom<TensorView<'data>> for Array {
     type Error = ConversionError;
 
     fn try_from(value: TensorView<'data>) -> Result<Self, Self::Error> {
-        let dtype = match value.dtype() {
+        let stored_dtype = value.dtype();
+        let dtype = match stored_dtype {
             // MLX's FP8 conversion and kernels use uint8 arrays as the storage
             // type for E4M3. Keep the checkpoint bytes unchanged so callers can
             // pass the array directly to those operations.
-            safetensors::Dtype::F8_E4M3 => Dtype::Uint8,
+            safetensors::Dtype::F8_E4M3
+            | safetensors::Dtype::F8_E8M0
+            | safetensors::Dtype::F4 => Dtype::Uint8,
             dtype => dtype.try_into()?,
         };
-        let shape = value.shape()
+        let mut shape = value.shape()
             .iter()
             .map(|x| *x as i32)
             .collect::<Vec<_>>();
+        adjust_packed_shape(stored_dtype, &mut shape)?;
 
         let data = value.data();
 
@@ -53,11 +59,14 @@ impl Array {
     pub unsafe fn try_from_borrowed_safetensors(
         value: TensorView<'_>,
     ) -> Result<Self, ConversionError> {
-        let dtype = match value.dtype() {
-            safetensors::Dtype::F8_E4M3 => Dtype::Uint8,
+        let stored_dtype = value.dtype();
+        let dtype = match stored_dtype {
+            safetensors::Dtype::F8_E4M3
+            | safetensors::Dtype::F8_E8M0
+            | safetensors::Dtype::F4 => Dtype::Uint8,
             dtype => dtype.try_into()?,
         };
-        let shape = value
+        let mut shape = value
             .shape()
             .iter()
             .map(|dimension| {
@@ -65,10 +74,31 @@ impl Array {
                     .map_err(|_| crate::error::Exception::custom("shape is too large").into())
             })
             .collect::<Result<Vec<_>, ConversionError>>()?;
+        adjust_packed_shape(stored_dtype, &mut shape)?;
         Ok(unsafe {
             Self::try_from_borrowed_host_data(value.data().as_ptr().cast(), &shape, dtype)?
         })
     }
+}
+
+fn adjust_packed_shape(
+    dtype: safetensors::Dtype,
+    shape: &mut [i32],
+) -> Result<(), ConversionError> {
+    if dtype != safetensors::Dtype::F4 {
+        return Ok(());
+    }
+    let last = shape.last_mut().ok_or_else(|| {
+        crate::error::Exception::custom("F4 safetensors scalar storage is unsupported")
+    })?;
+    if *last % 2 != 0 {
+        return Err(crate::error::Exception::custom(
+            "F4 safetensors final dimension must be even for packed storage",
+        )
+        .into());
+    }
+    *last /= 2;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -271,5 +301,32 @@ mod tests {
         let tensor = TensorView::new(safetensors::Dtype::F8_E5M2, vec![1], &encoded).unwrap();
 
         assert!(Array::try_from(tensor).is_err());
+    }
+
+    #[test]
+    fn test_conversion_float8_e8m0_preserves_encoded_bytes() {
+        let encoded = [0x00, 0x7f, 0x80, 0xff];
+        let tensor = TensorView::new(
+            safetensors::Dtype::F8_E8M0,
+            vec![2, 2],
+            &encoded,
+        )
+        .unwrap();
+        let converted = Array::try_from(tensor).unwrap();
+        let array = converted.evaluated().unwrap();
+        assert_eq!(array.as_array().dtype(), Dtype::Uint8);
+        assert_eq!(array.as_array().shape(), &[2, 2]);
+        assert_eq!(array.as_slice::<u8>(), &encoded);
+    }
+
+    #[test]
+    fn test_conversion_float4_uses_physical_packed_shape() {
+        let encoded = [0x10, 0x32, 0x54, 0x76];
+        let tensor = TensorView::new(safetensors::Dtype::F4, vec![2, 4], &encoded).unwrap();
+        let converted = Array::try_from(tensor).unwrap();
+        let array = converted.evaluated().unwrap();
+        assert_eq!(array.as_array().dtype(), Dtype::Uint8);
+        assert_eq!(array.as_array().shape(), &[2, 2]);
+        assert_eq!(array.as_slice::<u8>(), &encoded);
     }
 }

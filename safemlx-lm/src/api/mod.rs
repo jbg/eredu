@@ -68,6 +68,8 @@ use crate::{
 
 /// DeepSeek-V3 and DeepSeek-R1 decoder support.
 pub(crate) use crate::architectures::deepseek_v3::model as deepseek_v3;
+/// DeepSeek-V4 compressed sparse-attention decoder support.
+pub(crate) use crate::architectures::deepseek_v4::model as deepseek_v4;
 pub(crate) use crate::architectures::gemma4::assistant as gemma4_assistant;
 pub(crate) use crate::architectures::gemma4::audio as gemma4_audio;
 /// Gemma 4 text model support.
@@ -522,6 +524,9 @@ fn load_model_for_kind(
                     model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
+            ModelKind::DeepSeekV4 => Err(Error::UnsupportedArchitecture(
+                "DeepSeek-V4 expert-cache loader is not initialized".into(),
+            )),
             ModelKind::GptOss => Ok(Model::GptOss(
                 crate::architectures::gpt_oss::layerwise::load_gpt_oss_expert_cache_model(
                     model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
@@ -581,6 +586,9 @@ fn load_model_for_kind(
                     stream,
                     weights_stream,
                 )?,
+            )),
+            ModelKind::DeepSeekV4 => Err(Error::UnsupportedArchitecture(
+                "DeepSeek-V4 load-time transformation is not initialized".into(),
             )),
             ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
                 crate::architectures::gemma4::layerwise::execute_transformed_gemma4_model(
@@ -698,6 +706,11 @@ fn load_model_for_kind(
                 weights_stream,
             )?,
         )),
+        ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4(Box::new(deepseek_v4::load_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?))),
         ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
             crate::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
                 model_dir,

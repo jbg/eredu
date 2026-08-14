@@ -34,6 +34,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let metadata = read_model_metadata(model_dir)?;
     match ModelKind::from_model_type(&effective_model_type(&metadata))? {
         ModelKind::DeepSeekV3 => deepseek_v3::load_tokenizer(model_dir),
+        ModelKind::DeepSeekV4 => deepseek_v3::load_tokenizer(model_dir),
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
         ModelKind::GptOss => gpt_oss::load_tokenizer(model_dir),
         ModelKind::Inkling => inkling::load_tokenizer(model_dir),
