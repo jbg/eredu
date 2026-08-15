@@ -37,6 +37,14 @@ input_sets:
         text: "Explain why deterministic validation inputs matter in one sentence."
       - id: unicode_and_code
         text: "Return the UTF-8 text 'café Δ' and the Rust expression 7_u32 * 6."
+      - id: recurrent_pattern_64
+        text: "state zero, state one, state two, state three; "
+        repeat: 16
+      - id: recurrent_pattern_256
+        text: "state zero, state one, state two, state three; "
+        repeat: 64
+      - id: punctuation_and_numbers
+        text: "Sequence 0, 1, 1, 2, 3, 5, 8, 13; symbols: []{}()<>&*; answer with the next two values."
     teacher_forced_decode_tokens: 16
   text_performance:
     kind: token_ids

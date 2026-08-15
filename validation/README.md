@@ -119,5 +119,24 @@ python /opt/pilot/run_pilot_case.py \
 
 The case directory always receives `pilot-summary.json`, including partial
 phase evidence if a download, load, correctness, or performance phase fails.
+Use `--prompt-id <id>` to select any deterministic correctness prompt from the
+manifest, `--skip-performance` for correctness-only diagnostics, and
+`--refresh-model` only when the pinned checkpoint cache must be downloaded
+again. `--overwrite` replaces result artifacts without discarding that cache.
+
+For numerical localization, `run_prompt_matrix.py` runs one case across every
+manifest prompt in a single GPU allocation while reusing the checkpoint:
+
+```bash
+python /opt/safemlx/validation/run_prompt_matrix.py \
+  --case nemotron_h_dense \
+  --manifest /opt/safemlx/validation/models.yaml \
+  --output-root /artifacts/safemlx-cuda-pilot/<matrix-id>
+```
+
+Pass `--prompt-id <id>` repeatedly to select a subset. The matrix writes an
+incremental `prompt-matrix-summary.json` and exits `0` when every comparison
+passes, `1` for threshold failures, or `2` for execution errors.
+
 The first five-family L4 pilot and its findings are recorded in
 `doc/cuda-validation-pilot-2026-08-15.md`.

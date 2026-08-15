@@ -8,6 +8,8 @@ from unittest import mock
 
 from validation import compare_checkpoints as comparator
 from validation import reference_runner
+from validation import run_pilot_case
+from validation import run_prompt_matrix
 
 
 def write_safetensors(path, tensors):
@@ -237,6 +239,63 @@ class ReferenceRunnerTests(unittest.TestCase):
         self.assertEqual(registry, {})
         self.assertEqual(patches, [])
 
+
+class PilotPromptTests(unittest.TestCase):
+    def test_select_prompt_expands_repeat(self):
+        manifest = {
+            "input_sets": {
+                "text_correctness": {
+                    "prompts": [{"id": "pattern", "text": "ab", "repeat": 3}]
+                }
+            }
+        }
+
+        self.assertEqual(
+            run_pilot_case.select_prompt(manifest, "pattern"),
+            {"id": "pattern", "text": "ababab", "repeat": 3},
+        )
+
+    def test_select_prompt_rejects_unknown_or_invalid_repeat(self):
+        manifest = {
+            "input_sets": {
+                "text_correctness": {
+                    "prompts": [{"id": "pattern", "text": "ab", "repeat": 0}]
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "resolve exactly once"):
+            run_pilot_case.select_prompt(manifest, "missing")
+        with self.assertRaisesRegex(ValueError, "repeat must be positive"):
+            run_pilot_case.select_prompt(manifest, "pattern")
+
+    def test_prompt_matrix_defaults_to_all_prompts(self):
+        manifest = {
+            "input_sets": {
+                "text_correctness": {
+                    "prompts": [{"id": "first"}, {"id": "second"}]
+                }
+            }
+        }
+
+        self.assertEqual(
+            run_prompt_matrix.prompt_ids(manifest, None), ["first", "second"]
+        )
+        self.assertEqual(
+            run_prompt_matrix.prompt_ids(manifest, ["second"]), ["second"]
+        )
+
+    def test_prompt_matrix_rejects_unknown_or_duplicate_prompts(self):
+        manifest = {
+            "input_sets": {
+                "text_correctness": {"prompts": [{"id": "first"}]}
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "unknown prompt ids: second"):
+            run_prompt_matrix.prompt_ids(manifest, ["second"])
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            run_prompt_matrix.prompt_ids(manifest, ["first", "first"])
 
 if __name__ == "__main__":
     unittest.main()

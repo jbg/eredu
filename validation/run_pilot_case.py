@@ -15,15 +15,13 @@ import traceback
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
-import yaml
-from huggingface_hub import snapshot_download
-
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", required=True)
+    parser.add_argument("--prompt-id", default="short_ascii")
     parser.add_argument(
         "--manifest", type=pathlib.Path, default=SCRIPT_DIR / "models.yaml"
     )
@@ -34,6 +32,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--performance-prompt-tokens", type=int, default=128)
     parser.add_argument("--performance-decode-steps", type=int, default=128)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--refresh-model", action="store_true")
+    parser.add_argument("--skip-performance", action="store_true")
     args = parser.parse_args(argv)
     if args.performance_prompt_tokens <= 0:
         parser.error("--performance-prompt-tokens must be positive")
@@ -47,6 +47,8 @@ def utc_now() -> str:
 
 
 def load_case(path: pathlib.Path, case_id: str) -> tuple[dict, dict]:
+    import yaml
+
     manifest = yaml.safe_load(path.read_text())
     matches = [case for case in manifest.get("cases", ()) if case.get("id") == case_id]
     if len(matches) != 1:
@@ -61,6 +63,21 @@ def repeat_token_ids(token_ids: Sequence[int], count: int) -> list[int]:
     if not token_ids:
         raise ValueError("cannot construct a performance prompt from zero token IDs")
     return (list(token_ids) * math.ceil(count / len(token_ids)))[:count]
+
+
+def select_prompt(manifest: dict, prompt_id: str) -> dict:
+    prompts = manifest["input_sets"]["text_correctness"]["prompts"]
+    matches = [prompt for prompt in prompts if prompt.get("id") == prompt_id]
+    if len(matches) != 1:
+        raise ValueError("prompt {!r} must resolve exactly once".format(prompt_id))
+    prompt = matches[0]
+    text = prompt.get("text")
+    repeat = prompt.get("repeat", 1)
+    if not isinstance(text, str) or not text:
+        raise ValueError("prompt {!r} must have non-empty text".format(prompt_id))
+    if not isinstance(repeat, int) or repeat <= 0:
+        raise ValueError("prompt {!r} repeat must be positive".format(prompt_id))
+    return {"id": prompt_id, "text": text * repeat, "repeat": repeat}
 
 
 def write_json(path: pathlib.Path, value: dict) -> None:
@@ -131,6 +148,8 @@ def gpu_inventory() -> list[dict]:
 
 
 def download_checkpoint(case: dict, model_dir: pathlib.Path) -> str:
+    from huggingface_hub import snapshot_download
+
     model = case["model"]
     model_dir.mkdir(parents=True, exist_ok=True)
     return snapshot_download(
@@ -172,13 +191,14 @@ def artifact_metrics(path: pathlib.Path) -> dict:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     manifest, case = load_case(args.manifest, args.case)
+    prompt = select_prompt(manifest, args.prompt_id)
     output_dir = args.output_root / args.case
     summary_path = output_dir / "pilot-summary.json"
     if output_dir.exists() and any(output_dir.iterdir()) and not args.overwrite:
         raise ValueError("refusing to replace {}; pass --overwrite".format(output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = args.model_root / args.case
-    if args.overwrite and model_dir.exists():
+    if args.refresh_model and model_dir.exists():
         shutil.rmtree(model_dir)
 
     summary = {
@@ -199,7 +219,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "gpu": gpu_inventory(),
         },
         "pilot_scope": {
-            "correctness_inputs": ["text_correctness.short_ascii"],
+            "correctness_inputs": ["text_correctness." + prompt["id"]],
             "performance_prompt_tokens": args.performance_prompt_tokens,
             "performance_decode_steps": args.performance_decode_steps,
             "measured_runs": 1,
@@ -225,7 +245,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         write_json(summary_path, summary)
 
-        prompt = manifest["input_sets"]["text_correctness"]["prompts"][0]["text"]
         actual_prefix = output_dir / "correctness-safemlx"
         actual_json = actual_prefix.with_suffix(".json")
         run_command(
@@ -236,7 +255,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "--device",
                 "gpu",
                 "--prompt",
-                prompt,
+                prompt["text"],
                 "--decode-steps",
                 str(
                     manifest["correctness_profiles"][case["correctness_profile"]][
@@ -311,39 +330,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         summary["artifacts"]["comparison"] = str(comparison_json)
         write_json(summary_path, summary)
 
-        correctness_report = json.loads(actual_json.read_text())
-        performance_ids = repeat_token_ids(
-            correctness_report["input"]["token_ids"], args.performance_prompt_tokens
-        )
-        performance_prefix = output_dir / "performance-safemlx-128x128"
-        performance_json = performance_prefix.with_suffix(".json")
-        run_command(
-            [
-                "checkpoint_probe",
-                "--model",
-                str(model_dir),
-                "--device",
-                "gpu",
-                "--input-ids",
-                ",".join(str(token) for token in performance_ids),
-                "--decode-steps",
-                str(args.performance_decode_steps),
-                "--warmup-runs",
-                "1",
-                "--output",
-                str(performance_prefix),
-                "--overwrite",
-            ],
-            summary["phases"].setdefault("safemlx_performance", {}),
-            output_dir / "safemlx-performance.log",
-        )
-        summary["artifacts"]["safemlx_performance"] = str(performance_json)
+        performance_json = None
+        if not args.skip_performance:
+            correctness_report = json.loads(actual_json.read_text())
+            performance_ids = repeat_token_ids(
+                correctness_report["input"]["token_ids"], args.performance_prompt_tokens
+            )
+            performance_prefix = output_dir / "performance-safemlx-128x128"
+            performance_json = performance_prefix.with_suffix(".json")
+            run_command(
+                [
+                    "checkpoint_probe",
+                    "--model",
+                    str(model_dir),
+                    "--device",
+                    "gpu",
+                    "--input-ids",
+                    ",".join(str(token) for token in performance_ids),
+                    "--decode-steps",
+                    str(args.performance_decode_steps),
+                    "--warmup-runs",
+                    "1",
+                    "--output",
+                    str(performance_prefix),
+                    "--overwrite",
+                ],
+                summary["phases"].setdefault("safemlx_performance", {}),
+                output_dir / "safemlx-performance.log",
+            )
+            summary["artifacts"]["safemlx_performance"] = str(performance_json)
         summary["evidence"] = {
             "comparison": json.loads(comparison_json.read_text()),
             "safemlx_correctness": artifact_metrics(actual_json),
             "transformers_correctness": artifact_metrics(reference_json),
-            "safemlx_performance": artifact_metrics(performance_json),
         }
+        if performance_json is not None:
+            summary["evidence"]["safemlx_performance"] = artifact_metrics(performance_json)
         summary["status"] = "passed" if comparison_status == 0 else "correctness_failed"
         return_code = 0 if comparison_status == 0 else 1
     except Exception as error:
