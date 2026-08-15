@@ -1385,6 +1385,74 @@ impl Model {
         }
     }
 
+    /// Computes next-token logits for text tokens appended to an existing cache.
+    pub fn decode_text_with_cache(
+        &mut self,
+        tokens: &Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::GptOss(model), ModelCache::GptOss(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::Inkling(model), ModelCache::Inkling(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::Llama(model), ModelCache::Llama(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::Lfm2(model), ModelCache::Lfm2(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::DeepSeekV4(model), ModelCache::DeepSeekV4(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::DeepSeekV4Layerwise(model), ModelCache::DeepSeekV4(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+                model.decode_logits(tokens, cache, stream)
+            }
+            _ => Err(Exception::custom(
+                "model cache type does not match model kind",
+            )),
+        }
+    }
+
     /// Creates a token iterator from typed input using a cache returned by [`Model::new_cache`].
     pub fn generate_input_with_cache<'a>(
         &'a mut self,

@@ -1928,6 +1928,19 @@ impl LoadedModel {
         self.model.prefill_input_with_cache(input, cache, stream)
     }
 
+    /// Computes next-token logits for text tokens appended to an existing cache.
+    ///
+    /// Unlike [`LoadedModel::prefill_input_with_cache`], this preserves
+    /// architecture-specific decode state such as Qwen3-VL's MRoPE delta.
+    pub fn decode_text_with_cache(
+        &mut self,
+        tokens: &Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.model.decode_text_with_cache(tokens, cache, stream)
+    }
+
     /// Computes initial logits from an owned processor result.
     #[cfg(feature = "media-processing")]
     pub fn prefill_prepared_input_with_cache(

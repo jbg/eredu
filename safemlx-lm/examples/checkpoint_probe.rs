@@ -371,10 +371,9 @@ fn run_probe(
             .unwrap_or_else(|| *greedy_token_ids.last().expect("prefill prediction exists"));
         fed_token_ids.push(token_id);
         let token = Array::from(&[token_id][..]).try_index_device(NewAxis, stream)?;
-        let parts = [InputPart::text_token_ids(&token)];
 
         let wall_started = Instant::now();
-        let logits = model.prefill_input_with_cache(ModelInput::new(&parts), &mut cache, stream)?;
+        let logits = model.decode_text_with_cache(&token, &mut cache, stream)?;
         let timed = async_eval_timed([&logits], stream)?;
         let device_elapsed = timed.elapsed()?;
         let wall_elapsed = wall_started.elapsed();

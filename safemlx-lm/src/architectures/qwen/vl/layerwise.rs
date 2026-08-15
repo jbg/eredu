@@ -3177,6 +3177,63 @@ mod tests {
     }
 
     #[test]
+    fn architecture_erased_text_decode_matches_full_recompute() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let config_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join("config.json"),
+            serde_json::to_vec(&config(false)).unwrap(),
+        )
+        .unwrap();
+        let args = eager::get_qwen3_vl_model_args(config_dir.path()).unwrap();
+        let mut fixture = eager::Model::new(args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, false);
+
+        let load = || {
+            load_qwen3_vl_layerwise_model(
+                dir.path(),
+                LayerWeightResidency::FullyResident,
+                None,
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap()
+        };
+        let mut cached = crate::api::Model::Qwen3Vl(load());
+        let mut recomputed = crate::api::Model::Qwen3Vl(load());
+        let mut cached_state = cached.new_cache();
+        let mut recomputed_state = recomputed.new_cache();
+
+        let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
+        let prompt_parts = [input::InputPart::text_token_ids(&prompt)];
+        cached
+            .prefill_input_with_cache(
+                input::ModelInput::new(&prompt_parts),
+                &mut cached_state,
+                gpu.stream(),
+            )
+            .unwrap();
+        let next = Array::from_slice(&[4u32], &[1, 1]);
+        let actual = cached
+            .decode_text_with_cache(&next, &mut cached_state, gpu.stream())
+            .unwrap();
+
+        let complete = Array::from_slice(&[1u32, 2, 3, 4], &[1, 4]);
+        let complete_parts = [input::InputPart::text_token_ids(&complete)];
+        let expected = recomputed
+            .prefill_input_with_cache(
+                input::ModelInput::new(&complete_parts),
+                &mut recomputed_state,
+                gpu.stream(),
+            )
+            .unwrap();
+        assert_close(&actual, &expected);
+    }
+
+    #[test]
     fn qwen3_vl_moe_sparse_expert_cache_multimodal_and_decode_parity() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
