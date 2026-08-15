@@ -51,6 +51,19 @@ RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/op
     install -m 0755 \
         /tmp/safemlx-target/release/examples/checkpoint_probe \
         /usr/local/bin/checkpoint_probe; \
+    mlx_cute_header="$(find /tmp/safemlx-target/release/build \
+        -path '*/include/cute/numeric/numeric_types.hpp' \
+        -print -quit)"; \
+    test -n "${mlx_cute_header}"; \
+    mlx_include_root="$(dirname "$(dirname "$(dirname "${mlx_cute_header}")")")"; \
+    mlx_cccl_include_root="$(find /tmp/safemlx-target/release/build \
+        -type d -path '*/_deps/cccl-src/include' \
+        -print -quit)"; \
+    test -n "${mlx_cccl_include_root}"; \
+    install -d /usr/local/include; \
+    cp -a "${mlx_include_root}/." /usr/local/include/; \
+    install -d /usr/local/include/cccl; \
+    cp -a "${mlx_cccl_include_root}/." /usr/local/include/cccl/; \
     ldd /usr/local/bin/checkpoint_probe > /tmp/checkpoint-probe.ldd; \
     unexpected_missing="$(awk '/not found/ && $1 != "libcuda.so.1" { print $1 }' /tmp/checkpoint-probe.ldd)"; \
     if [ -n "${unexpected_missing}" ]; then \
@@ -110,12 +123,16 @@ ENV SAFEMLX_CUDA_ARCHITECTURES="80;89;90" \
 # MLX's CUDA backend compiles some execution plans with NVRTC on first use.
 # Keep the pinned toolkit headers available to those runtime compilations.
 COPY --from=checkpoint-probe-builder /usr/local/cuda/include /usr/local/cuda/include
+COPY --from=checkpoint-probe-builder /usr/local/include /usr/local/include
 COPY --from=checkpoint-probe-builder /usr/local/bin/checkpoint_probe /usr/local/bin/checkpoint_probe
 
 COPY validation /opt/safemlx/validation
 RUN set -eux; \
     mv /tmp/python-packages.lock.txt /opt/safemlx/python-packages.lock.txt; \
     test -f "${CUDA_HOME}/include/cuda_runtime.h"; \
+    test -f /usr/local/include/cute/numeric/numeric_types.hpp; \
+    test -f /usr/local/include/cutlass/numeric_conversion.h; \
+    test -d /usr/local/include/cccl/cuda; \
     find /opt/conda/lib/python3.11/site-packages/nvidia \
         -type d -name lib -print \
         | LC_ALL=C sort > /etc/ld.so.conf.d/pytorch-nvidia.conf; \

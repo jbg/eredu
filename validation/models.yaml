@@ -658,7 +658,7 @@ cases:
     inputs: [text_correctness, text_performance]
     reference:
       implementation: transformers
-      trust_remote_code: true
+      trust_remote_code: false
     correctness_profile: bf16_reference
     benchmark_profile: decoder_standard
     hardware_profile: l4x1
