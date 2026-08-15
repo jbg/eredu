@@ -102,14 +102,20 @@ RUN python -m pip install --no-cache-dir \
     && python -m pip freeze | LC_ALL=C sort > /tmp/python-packages.lock.txt
 
 ENV SAFEMLX_CUDA_ARCHITECTURES="80;89;90" \
+    CUDA_HOME=/usr/local/cuda \
+    CUDA_PATH=/usr/local/cuda \
     CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
     CUDAToolkit_ROOT=/usr/local/cuda
 
+# MLX's CUDA backend compiles some execution plans with NVRTC on first use.
+# Keep the pinned toolkit headers available to those runtime compilations.
+COPY --from=checkpoint-probe-builder /usr/local/cuda/include /usr/local/cuda/include
 COPY --from=checkpoint-probe-builder /usr/local/bin/checkpoint_probe /usr/local/bin/checkpoint_probe
 
 COPY validation /opt/safemlx/validation
 RUN set -eux; \
     mv /tmp/python-packages.lock.txt /opt/safemlx/python-packages.lock.txt; \
+    test -f "${CUDA_HOME}/include/cuda_runtime.h"; \
     find /opt/conda/lib/python3.11/site-packages/nvidia \
         -type d -name lib -print \
         | LC_ALL=C sort > /etc/ld.so.conf.d/pytorch-nvidia.conf; \
