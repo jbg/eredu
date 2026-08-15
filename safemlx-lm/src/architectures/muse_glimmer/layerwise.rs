@@ -18,10 +18,10 @@ use safemlx::{
 };
 
 use super::{
-    self as resident,
     vision::{VisionBlock, VisionConfig, VisionState, VisionStatic},
     DecoderConfig, Experts, FeedForward, TransformerBlock,
 };
+use crate::architectures::muse_glimmer as resident;
 use crate::{
     api::{
         common::{

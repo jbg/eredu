@@ -15,6 +15,30 @@ Install the reference dependencies in a CUDA-enabled Python environment:
 python -m pip install -r validation/requirements.txt
 ```
 
+## Pinned CUDA image
+
+The published `linux/amd64` image contains the CUDA-enabled
+`checkpoint_probe`, PyTorch, Transformers, and the validation scripts:
+
+```text
+ghcr.io/jbg/safemlx-validation:cuda12.9.1-rust1.89.0-torch2.8.0-v1
+```
+
+Run it on a host with the NVIDIA Container Toolkit, mounting checkpoints and
+results separately so downloaded weights do not become container layers:
+
+```bash
+docker run --rm --gpus all \
+  -v "$PWD/models:/models:ro" \
+  -v "$PWD/validation/results:/data/results" \
+  ghcr.io/jbg/safemlx-validation:cuda12.9.1-rust1.89.0-torch2.8.0-v1 \
+  checkpoint_probe --help
+```
+
+Use the `-git-<12-character commit>` tag emitted by the publish workflow, or
+the registry digest reported by it, when a run must remain tied to one source
+revision. The version tag is intentionally not named `latest`.
+
 Run SafeMLX:
 
 ```bash

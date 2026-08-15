@@ -17,7 +17,8 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use super::{self as resident, DecoderConfig, Experts, FeedForward, TransformerBlock};
+use super::{DecoderConfig, Experts, FeedForward, TransformerBlock};
+use crate::architectures::qwen::dense as resident;
 use crate::{
     api::{
         common::{
