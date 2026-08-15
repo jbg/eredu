@@ -140,7 +140,7 @@ class ComparatorTests(unittest.TestCase):
             top_k=None,
             top_k_overlap_min=None,
             require_unambiguous_argmax_match=None,
-            argmax_margin_min=0.0,
+            argmax_margin_min=None,
         )
         profile = {
             "relative_l2_max": 0.08,
@@ -148,6 +148,7 @@ class ComparatorTests(unittest.TestCase):
             "top_k": 5,
             "top_k_overlap_min": 3,
             "require_unambiguous_argmax_match": True,
+            "argmax_margin_min": 0.25,
         }
         with mock.patch.object(
             comparator, "load_manifest_profile", return_value=profile
@@ -155,6 +156,7 @@ class ComparatorTests(unittest.TestCase):
             selected = comparator.thresholds_from_args(args)
         self.assertEqual(selected.relative_l2_max, 0.08)
         self.assertEqual(selected.top_k_overlap_min, 3)
+        self.assertEqual(selected.argmax_margin_min, 0.25)
 
     def test_cli_writes_report_and_returns_failure_status(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -181,6 +183,16 @@ class ComparatorTests(unittest.TestCase):
 
 
 class ReferenceRunnerTests(unittest.TestCase):
+    def test_prefill_mode_defaults_to_full_and_accepts_tokenwise(self):
+        common = ["--probe", "probe.json", "--output", "result"]
+        self.assertEqual(reference_runner.parse_args(common).prefill_mode, "full")
+        self.assertEqual(
+            reference_runner.parse_args(
+                common + ["--prefill-mode", "tokenwise"]
+            ).prefill_mode,
+            "tokenwise",
+        )
+
     def test_probe_validation_does_not_import_gpu_dependencies(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "probe.json"

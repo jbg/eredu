@@ -49,6 +49,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="eager",
     )
     parser.add_argument(
+        "--prefill-mode",
+        choices=("full", "tokenwise"),
+        default="full",
+        help="Build the reference cache in one full prefill or one token at a time",
+    )
+    parser.add_argument(
         "--device-map",
         help="Optional Transformers device_map (for example cuda:0 or auto)",
     )
@@ -165,12 +171,42 @@ class Timer:
         return PhaseTiming(time.perf_counter() - self.wall_started, device_seconds)
 
 
-def run_sequence(torch, model, device, input_ids, fed_ids, capture: bool) -> ReferenceRun:
+def run_sequence(
+    torch,
+    model,
+    device,
+    input_ids,
+    fed_ids,
+    capture: bool,
+    prefill_mode: str = "full",
+) -> ReferenceRun:
     tokens = torch.tensor([input_ids], dtype=torch.long, device=device)
     attention_mask = torch.ones_like(tokens)
     timer = Timer(torch, device)
     timer.start()
-    outputs = model(input_ids=tokens, attention_mask=attention_mask, use_cache=True)
+    if prefill_mode == "full":
+        outputs = model(input_ids=tokens, attention_mask=attention_mask, use_cache=True)
+    elif prefill_mode == "tokenwise":
+        attention_mask = torch.empty((1, 0), dtype=torch.long, device=device)
+        past_key_values = None
+        for token_id in input_ids:
+            token = torch.tensor([[token_id]], dtype=torch.long, device=device)
+            attention_mask = torch.cat(
+                (
+                    attention_mask,
+                    torch.ones((1, 1), dtype=attention_mask.dtype, device=device),
+                ),
+                dim=1,
+            )
+            outputs = model(
+                input_ids=token,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+    else:
+        raise ValueError("unsupported prefill mode {!r}".format(prefill_mode))
     prefill_timing = timer.finish()
     current = outputs.logits[:, -1, :]
     vocabulary_size = current.shape[-1]
@@ -301,12 +337,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with torch.inference_mode():
             warmup_started = time.perf_counter()
             for _ in range(args.warmup_runs):
-                run_sequence(torch, model, device, input_ids, fed_ids, capture=False)
+                run_sequence(
+                    torch,
+                    model,
+                    device,
+                    input_ids,
+                    fed_ids,
+                    capture=False,
+                    prefill_mode=args.prefill_mode,
+                )
             warmup_wall_seconds = time.perf_counter() - warmup_started
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             before_run_memory = memory_snapshot(torch, device)
-            result = run_sequence(torch, model, device, input_ids, fed_ids, capture=True)
+            result = run_sequence(
+                torch,
+                model,
+                device,
+                input_ids,
+                fed_ids,
+                capture=True,
+                prefill_mode=args.prefill_mode,
+            )
             after_run_memory = memory_snapshot(torch, device)
 
         tensors = {
@@ -352,6 +404,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "device": str(device),
                 "dtype": args.dtype,
                 "attn_implementation": args.attn_implementation,
+                "prefill_mode": args.prefill_mode,
                 "cuda_version": torch.version.cuda,
                 "cuda_device_name": (
                     torch.cuda.get_device_name(device) if device.type == "cuda" else None

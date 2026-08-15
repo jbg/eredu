@@ -101,6 +101,17 @@ correctness_profiles:
     top_k_overlap_min: 4
     require_unambiguous_argmax_match: true
     require_cached_vs_full_recompute: true
+  nemotron_h_bf16_reference:
+    reference_dtype: bf16
+    sampled_prefill_positions: [0, 7, -1]
+    teacher_forced_decode_steps: 16
+    relative_l2_max: 0.025
+    cosine_similarity_min: 0.999
+    top_k: 5
+    top_k_overlap_min: 4
+    require_unambiguous_argmax_match: true
+    argmax_margin_min: 0.25
+    require_cached_vs_full_recompute: true
   native_mxfp4_reference:
     reference_dtype: checkpoint_native
     sampled_prefill_positions: [0, 7, -1]
@@ -677,7 +688,8 @@ cases:
     reference:
       implementation: transformers
       trust_remote_code: false
-    correctness_profile: bf16_reference
+      prefill_mode: tokenwise
+    correctness_profile: nemotron_h_bf16_reference
     benchmark_profile: decoder_standard
     hardware_profile: l4x1
     timeout_minutes: 50

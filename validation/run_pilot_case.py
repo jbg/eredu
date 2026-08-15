@@ -292,6 +292,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "auto" if profile["reference_dtype"] == "checkpoint_native" else "bfloat16",
             "--attn-implementation",
             "auto" if case["family"] in ("gpt_oss", "nemotron_h", "qwen3_vl") else "eager",
+            "--prefill-mode",
+            case["reference"].get("prefill_mode", "full"),
             "--warmup-runs",
             "1",
             "--overwrite",

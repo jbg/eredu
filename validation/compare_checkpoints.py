@@ -56,7 +56,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--argmax-margin-min",
         type=float,
-        default=0.0,
+        default=None,
         help="Only enforce argmax equality when the reference top-1 margin exceeds this value",
     )
     parser.add_argument("--overwrite", action="store_true")
@@ -194,7 +194,7 @@ def thresholds_from_args(args: argparse.Namespace) -> Thresholds:
                 True,
             )
         ),
-        argmax_margin_min=float(args.argmax_margin_min),
+        argmax_margin_min=float(selected(args.argmax_margin_min, "argmax_margin_min", 0.0)),
     )
     if thresholds.relative_l2_max < 0:
         raise ValueError("relative_l2_max must be non-negative")
