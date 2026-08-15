@@ -2665,7 +2665,12 @@ fn validate_model_args(args: &DecoderConfig) -> Result<(), Error> {
                 args.num_key_value_heads, args.head_dim
             ))
         })?;
-    if args.hidden_size != query_width {
+    // Qwen2 derives the per-head dimension from hidden_size, but Qwen3
+    // checkpoints declare it independently. For example, Qwen3-0.6B uses a
+    // 1024-wide residual stream and 16 x 128-wide query projections. The
+    // attention implementation already projects hidden_size -> query_width
+    // and query_width -> hidden_size, so only Qwen2 requires equality here.
+    if args.architecture() == Architecture::Qwen2 && args.hidden_size != query_width {
         return Err(Error::UnsupportedArchitecture(format!(
             "hidden_size ({}) must equal num_attention_heads ({}) x head_dim ({})",
             args.hidden_size, args.num_attention_heads, args.head_dim
@@ -3814,6 +3819,29 @@ mod tests {
         assert!(!args.qk_norm());
         assert_eq!(args.attention_schedule.full_layer_count(), 28);
         assert_eq!(args.attention_schedule.sliding_layer_count(), 0);
+    }
+
+    #[test]
+    fn qwen3_accepts_explicit_head_dimension_wider_than_residual_heads() {
+        let args = super::config_from_hf_value(&serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": "qwen3",
+            "hidden_size": 1024,
+            "num_hidden_layers": 28,
+            "intermediate_size": 3072,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 151936,
+            "max_position_embeddings": 40960,
+            "rope_theta": 1000000.0,
+            "tie_word_embeddings": true,
+            "attention_bias": false
+        }))
+        .unwrap();
+        assert_eq!(args.hidden_size, 1024);
+        assert_eq!(args.num_attention_heads * args.head_dim, 2048);
     }
 
     #[test]
