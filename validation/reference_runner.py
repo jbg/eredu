@@ -110,6 +110,29 @@ def auto_model_class(transformers, model_type: Optional[str]):
     return transformers.AutoModelForCausalLM
 
 
+def patch_nemotron_h_cache_registry(
+    model_type: Optional[str], cache_registry: dict, linear_attention_layer
+) -> List[str]:
+    """Backport the Transformers cache placeholder for cache-free MLP blocks."""
+    if model_type != "nemotron_h" or "mlp" in cache_registry:
+        return []
+    cache_registry["mlp"] = linear_attention_layer
+    return ["nemotron_h_mlp_cache_placeholder"]
+
+
+def apply_reference_compatibility_patches(model_type: Optional[str]) -> List[str]:
+    if model_type != "nemotron_h":
+        return []
+    from transformers.cache_utils import (  # pylint: disable=import-outside-toplevel
+        DYNAMIC_LAYER_TYPE_MAPPING,
+        LinearAttentionLayer,
+    )
+
+    return patch_nemotron_h_cache_registry(
+        model_type, DYNAMIC_LAYER_TYPE_MAPPING, LinearAttentionLayer
+    )
+
+
 def synchronize(torch, device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -247,6 +270,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError("CUDA was requested but torch.cuda.is_available() is false")
 
+        model_type = probe.get("model", {}).get("model_type")
+        compatibility_patches = apply_reference_compatibility_patches(model_type)
+
         load_kwargs = {
             "trust_remote_code": args.trust_remote_code,
             "local_files_only": args.local_files_only,
@@ -261,9 +287,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             load_kwargs["device_map"] = args.device_map
 
         load_started = time.perf_counter()
-        model_loader = auto_model_class(
-            transformers, probe.get("model", {}).get("model_type")
-        )
+        model_loader = auto_model_class(transformers, model_type)
         model = model_loader.from_pretrained(model_source, **load_kwargs)
         model.eval()
         if not args.device_map:
@@ -339,6 +363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                 "trust_remote_code": args.trust_remote_code,
+                "compatibility_patches": compatibility_patches,
             },
             "input": {
                 "token_ids": input_ids,

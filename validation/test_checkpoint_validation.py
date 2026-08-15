@@ -205,6 +205,38 @@ class ReferenceRunnerTests(unittest.TestCase):
         selected = reference_runner.auto_model_class(fake_transformers, "qwen3")
         self.assertIs(selected, fake_transformers.AutoModelForCausalLM)
 
+    def test_nemotron_h_registers_mlp_cache_placeholder(self):
+        placeholder = object()
+        registry = {"linear_attention": object()}
+
+        patches = reference_runner.patch_nemotron_h_cache_registry(
+            "nemotron_h", registry, placeholder
+        )
+
+        self.assertIs(registry["mlp"], placeholder)
+        self.assertEqual(patches, ["nemotron_h_mlp_cache_placeholder"])
+
+    def test_nemotron_h_preserves_upstream_mlp_cache_mapping(self):
+        upstream = object()
+        registry = {"mlp": upstream}
+
+        patches = reference_runner.patch_nemotron_h_cache_registry(
+            "nemotron_h", registry, object()
+        )
+
+        self.assertIs(registry["mlp"], upstream)
+        self.assertEqual(patches, [])
+
+    def test_other_models_do_not_patch_cache_registry(self):
+        registry = {}
+
+        patches = reference_runner.patch_nemotron_h_cache_registry(
+            "qwen3", registry, object()
+        )
+
+        self.assertEqual(registry, {})
+        self.assertEqual(patches, [])
+
 
 if __name__ == "__main__":
     unittest.main()

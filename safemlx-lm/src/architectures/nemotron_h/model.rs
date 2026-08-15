@@ -15,8 +15,8 @@ use safemlx::{
     ops::{
         broadcast_to, concatenate_axis, exp, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros, GgufCheckpoint,
-        GgufMetadataValue,
+        quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros, zeros_dtype,
+        GgufCheckpoint, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
@@ -882,8 +882,11 @@ impl MambaRmsNormGated {
 
     /// Applies SiLU gate modulation followed by grouped RMS normalization.
     pub fn forward(&self, x: &Array, gate: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let input_dtype = x.dtype();
         let original_shape = x.shape().to_vec();
-        let gated = x.multiply(silu(gate.clone(), stream)?, stream)?;
+        let x = x.as_dtype(Dtype::Float32, stream)?;
+        let gate = gate.as_dtype(Dtype::Float32, stream)?;
+        let gated = x.multiply(silu(gate, stream)?, stream)?;
         let grouped = gated.reshape(&[-1, self.n_groups, self.group_size], stream)?;
         let variance = safemlx::ops::mean_axis(&grouped.square(stream)?, -1, true, stream)?;
         let normalized = grouped
@@ -891,7 +894,8 @@ impl MambaRmsNormGated {
                 safemlx::ops::rsqrt(variance.add(Array::from_f32(self.eps), stream)?, stream)?,
                 stream,
             )?
-            .reshape(&original_shape, stream)?;
+            .reshape(&original_shape, stream)?
+            .as_dtype(input_dtype, stream)?;
         normalized.multiply(&*self.weight, stream)
     }
 
@@ -1776,7 +1780,11 @@ impl Mamba2Mixer {
         let state = cache
             .as_ref()
             .and_then(|cache| cache.conv_state.clone())
-            .unwrap_or(zeros::<f32>(&[batch, state_len, channels], stream)?);
+            .unwrap_or(zeros_dtype(
+                &[batch, state_len, channels],
+                hidden_states_b_c.dtype(),
+                stream,
+            )?);
         let padded = concatenate_axis(&[state, hidden_states_b_c.clone()], 1, stream)?;
         if let Some(cache) = cache {
             cache.conv_state = Some(padded.try_index_device((.., seq_len.., ..), stream)?);
@@ -2051,6 +2059,7 @@ impl Module<Mamba2Input<'_>> for Mamba2Mixer {
         }
         .reshape(&[batch, seq_len, self.intermediate_size], stream)?;
         let scan = self.norm.forward(&scan, &gate, stream)?;
+        let scan = scan.as_dtype(x.dtype(), stream)?;
         self.out_proj.forward(&scan, stream)
     }
 
@@ -4659,7 +4668,8 @@ mod tests {
         expand_layer_values, gguf_affine_quantization, hybrid_pattern_from_gguf_layers,
         model_args_from_config_value, rewrite_nemotron_h_weight_key, translate_gguf_weight_name,
         unique_nonzero_layer_value, validate_model_config_value, AttentionCache, Experts,
-        LayerCache, LayerPolicy, Model, ModelArgs, ModelInput, SparseMoeBlock,
+        LayerCache, LayerPolicy, Mamba2Input, Mamba2Mixer, Model, ModelArgs, ModelInput,
+        SparseMoeBlock,
     };
     use crate::{
         nn::{
@@ -4672,7 +4682,7 @@ mod tests {
     use safemlx::{
         module::{Module, ModuleParameters, Param},
         ops::dequantize_with_mode,
-        Array, Device, DeviceType, ExecutionContext,
+        Array, Device, DeviceType, Dtype, ExecutionContext,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -5026,6 +5036,44 @@ mod tests {
                 "{quantization:?} maximum error {maximum_error}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn mamba_bfloat16_forward_preserves_activation_and_cache_dtypes() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let args = tiny_full_args();
+        let mut mixer = Mamba2Mixer::new(&args, 0, stream).unwrap();
+        for (index, parameter) in mixer.parameters_mut().flatten().values_mut().enumerate() {
+            let value = Array::full::<f32>(
+                parameter.shape(),
+                Array::from_f32((index + 1) as f32 * 0.001),
+                stream,
+            )
+            .unwrap();
+            **parameter = value.as_dtype(Dtype::Bfloat16, stream).unwrap();
+        }
+        let input = Array::full::<f32>(&[1, 3, args.hidden_size], Array::from_f32(0.125), stream)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap();
+        let mut cache = super::Mamba2Cache::default();
+
+        let output = mixer
+            .forward(
+                Mamba2Input {
+                    x: &input,
+                    cache: Some(&mut cache),
+                },
+                stream,
+            )
+            .unwrap();
+
+        assert_eq!(output.dtype(), Dtype::Bfloat16);
+        assert_eq!(cache.conv_state.as_ref().unwrap().dtype(), Dtype::Bfloat16);
+        assert_eq!(cache.ssm_state.as_ref().unwrap().dtype(), Dtype::Float32);
+        output.evaluated().unwrap();
     }
 
     #[test]
