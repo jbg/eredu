@@ -15,8 +15,8 @@ use safemlx::{
     ops::{
         broadcast_to, concatenate_axis, exp, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros, zeros_dtype,
-        GgufCheckpoint, GgufMetadataValue,
+        maximum, quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros,
+        zeros_dtype, GgufCheckpoint, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
@@ -1751,6 +1751,8 @@ pub struct Mamba2Mixer {
     pub d_mlp: i32,
     /// Number of tokens per prefill scan chunk.
     pub chunk_size: i32,
+    /// Lower bound applied to the discretized SSM timestep.
+    pub time_step_min: f32,
     #[quantizable]
     #[param]
     /// Joint input projection.
@@ -1805,6 +1807,7 @@ impl Mamba2Mixer {
             conv_kernel_size: args.conv_kernel,
             d_mlp,
             chunk_size: args.chunk_size,
+            time_step_min: args.time_step_min,
             in_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 projection_size,
@@ -1941,8 +1944,9 @@ impl Mamba2Mixer {
             .try_index_device((.., .., .., NewAxis), stream)?
             .multiply(d_b.try_index_device((.., .., NewAxis, ..), stream)?, stream)?;
         let state = state.multiply(d_a, stream)?.add(d_b_x, stream)?;
+        let output_state = state.as_dtype(c_t.dtype(), stream)?;
         let y = sum_axis(
-            state.multiply(c_t.try_index_device((.., .., NewAxis, ..), stream)?, stream)?,
+            output_state.multiply(c_t.try_index_device((.., .., NewAxis, ..), stream)?, stream)?,
             -1,
             false,
             stream,
@@ -1976,8 +1980,11 @@ impl Mamba2Mixer {
                 dt.try_index_device((.., index..index + 1, ..), stream)?
                     .add(dt_bias, stream)?,
                 stream,
-            )?
-            .reshape(&[batch, self.num_heads], stream)?;
+            )?;
+            let dt_floor = Array::from_f32(self.time_step_min).as_dtype(dt_t.dtype(), stream)?;
+            let dt_t = maximum(dt_t, dt_floor, stream)?
+                .as_dtype(Dtype::Float32, stream)?
+                .reshape(&[batch, self.num_heads], stream)?;
             let (next_state, y) = self.scan_token(state, x_t, b_t, c_t, dt_t, a, d, stream)?;
             state = next_state;
             outputs.push(y.try_index_device((.., NewAxis, .., ..), stream)?);
@@ -1998,10 +2005,20 @@ impl Mamba2Mixer {
         let batch = shape[0];
         let seq_len = shape[1];
         let mut state = self.initial_ssm_state(batch, cache.as_deref(), stream)?;
-        let a = exp(self.A_log.as_ref(), stream)?
-            .multiply(Array::from_f32(-1.0), stream)?
-            .reshape(&[1, self.num_heads, 1, 1], stream)?;
-        let d = self.D.as_ref().reshape(&[1, self.num_heads, 1], stream)?;
+        let hidden_states = hidden_states.as_dtype(Dtype::Float32, stream)?;
+        let b_states = b_states.as_dtype(Dtype::Float32, stream)?;
+        let c_states = c_states.as_dtype(Dtype::Float32, stream)?;
+        let a = exp(
+            self.A_log.as_ref().as_dtype(Dtype::Float32, stream)?,
+            stream,
+        )?
+        .multiply(Array::from_f32(-1.0), stream)?
+        .reshape(&[1, self.num_heads, 1, 1], stream)?;
+        let d = self
+            .D
+            .as_ref()
+            .as_dtype(Dtype::Float32, stream)?
+            .reshape(&[1, self.num_heads, 1], stream)?;
         let dt_bias = self
             .dt_bias
             .as_ref()
@@ -2050,9 +2067,12 @@ impl Mamba2Mixer {
         }
         let batch = hidden_states.dim(0);
         let state = self.initial_ssm_state(batch, cache.as_deref(), stream)?;
-        let a = exp(self.A_log.as_ref(), stream)?
-            .multiply(Array::from_f32(-1.0), stream)?
-            .reshape(&[1, self.num_heads, 1, 1], stream)?;
+        let a = exp(
+            self.A_log.as_ref().as_dtype(Dtype::Float32, stream)?,
+            stream,
+        )?
+        .multiply(Array::from_f32(-1.0), stream)?
+        .reshape(&[1, self.num_heads, 1, 1], stream)?;
         let d = self.D.as_ref().reshape(&[1, self.num_heads, 1], stream)?;
         let dt_bias = self
             .dt_bias
@@ -2065,8 +2085,9 @@ impl Mamba2Mixer {
             dt.try_index_device((.., 0..1, ..), stream)?
                 .add(&dt_bias, stream)?,
             stream,
-        )?
-        .reshape(&[batch, self.num_heads], stream)?;
+        )?;
+        let dt_floor = Array::from_f32(self.time_step_min).as_dtype(dt_t.dtype(), stream)?;
+        let dt_t = maximum(dt_t, dt_floor, stream)?.reshape(&[batch, self.num_heads], stream)?;
         let (state, y) = self.scan_token(state, x_t, b_t, c_t, dt_t, &a, &d, stream)?;
         if let Some(cache) = cache {
             cache.ssm_state = Some(state);
@@ -5163,8 +5184,11 @@ mod tests {
     fn mamba_bfloat16_forward_preserves_activation_and_cache_dtypes() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
-        let args = tiny_full_args();
+        let mut args = tiny_full_args();
+        args.chunk_size = 2;
+        args.time_step_min = 0.125;
         let mut mixer = Mamba2Mixer::new(&args, 0, stream).unwrap();
+        assert_eq!(mixer.time_step_min, args.time_step_min);
         for (index, parameter) in mixer.parameters_mut().flatten().values_mut().enumerate() {
             let value = Array::full::<f32>(
                 parameter.shape(),
@@ -5174,7 +5198,7 @@ mod tests {
             .unwrap();
             **parameter = value.as_dtype(Dtype::Bfloat16, stream).unwrap();
         }
-        let input = Array::full::<f32>(&[1, 3, args.hidden_size], Array::from_f32(0.125), stream)
+        let input = Array::full::<f32>(&[1, 7, args.hidden_size], Array::from_f32(0.125), stream)
             .unwrap()
             .as_dtype(Dtype::Bfloat16, stream)
             .unwrap();
@@ -5194,6 +5218,24 @@ mod tests {
         assert_eq!(cache.conv_state.as_ref().unwrap().dtype(), Dtype::Bfloat16);
         assert_eq!(cache.ssm_state.as_ref().unwrap().dtype(), Dtype::Float32);
         output.evaluated().unwrap();
+
+        let decode_input =
+            Array::full::<f32>(&[1, 1, args.hidden_size], Array::from_f32(0.125), stream)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16, stream)
+                .unwrap();
+        let decode_output = mixer
+            .forward(
+                Mamba2Input {
+                    x: &decode_input,
+                    cache: Some(&mut cache),
+                },
+                stream,
+            )
+            .unwrap();
+        assert_eq!(decode_output.dtype(), Dtype::Bfloat16);
+        assert_eq!(cache.ssm_state.as_ref().unwrap().dtype(), Dtype::Float32);
+        decode_output.evaluated().unwrap();
     }
 
     #[test]
