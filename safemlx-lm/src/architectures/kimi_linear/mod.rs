@@ -9,5 +9,4 @@ pub use layerwise::{
     Generate as LayerwiseGenerate, KimiLinearLayerwiseModel,
 };
 #[cfg(test)]
-pub use model::{load_gguf, load_model, load_model_quantized};
 pub use model::{load_tokenizer, Cache, Generate, Model, ModelArgs, ModelInput};

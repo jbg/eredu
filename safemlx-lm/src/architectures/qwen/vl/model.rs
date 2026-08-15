@@ -8,7 +8,7 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, ModuleParametersExt},
+    module::Module,
     nn,
     ops::{
         concatenate_axis,
@@ -45,19 +45,8 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache,
     },
-    runtime::checkpoint::load::{
-        gguf_quantization_configs, load_safetensors_dir_quantized_strict,
-        load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::WeightQuantization,
+    runtime::checkpoint::load::gguf_quantization_configs,
 };
-
-#[cfg(test)]
-use crate::runtime::checkpoint::load::{
-    gguf_metadata, load_named_array_strict, load_named_iq_array_strict,
-};
-#[cfg(test)]
-use safemlx::ops::{stack_axis, GgufTensor};
 
 #[derive(Debug, Clone)]
 /// Parsed Qwen3-VL configuration.
@@ -839,246 +828,9 @@ fn mrope_values(
     (cos, sin)
 }
 
-/// Loads Qwen3-VL safetensors from a model directory.
-pub fn load_qwen3_vl_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    let args = get_qwen3_vl_model_args(model_dir)?;
-    let kind = if args.text_config.is_moe() {
-        crate::api::ModelKind::Qwen3VlMoe
-    } else {
-        crate::api::ModelKind::Qwen3Vl
-    };
-    crate::api::structural::validate_safetensors_load_path(
-        kind,
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
-    let mut model = Model::new(args, stream)?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    load_safetensors_dir_strict(&mut model, model_dir, weights_stream, &config, &mut report)?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Loads a dense Qwen3-VL checkpoint while quantizing its language model and
-/// every aligned vision transformer or merger projection.
-pub fn load_qwen3_vl_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    let mut args = get_qwen3_vl_model_args(model_dir)?;
-    let kind = if args.text_config.is_moe() {
-        crate::api::ModelKind::Qwen3VlMoe
-    } else {
-        crate::api::ModelKind::Qwen3Vl
-    };
-    crate::api::structural::validate_safetensors_load_path(
-        kind,
-        model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
-    )?;
-    let existing = args
-        .text_config
-        .quantization
-        .or(args.text_config.quantization_config);
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Qwen3-VL",
-        existing,
-        quantization,
-    )? {
-        return load_qwen3_vl_model(model_dir, stream, weights_stream);
-    }
-    args.text_config.quantization = Some(quantization);
-    args.text_config.quantization_config = None;
-    args.vision_config
-        .apply_load_time_quantization(quantization);
-    let mut model = Model::new(args, stream)?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    load_safetensors_dir_quantized_strict(
-        &mut model,
-        model_dir,
-        weights_stream,
-        stream,
-        quantization,
-        &config,
-        &mut report,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Loads a dense or MoE Qwen3-VL GGUF language model and its llama.cpp-style
-/// vision projector. Dense projector tensors can be converted through the
-/// shared load-time packed overlay; supported checkpoint-native projector
-/// encodings load directly. The language model may use any GGUF quantization
-/// supported by the shared Qwen text loader.
-#[cfg(test)]
-pub fn load_qwen3_vl_gguf(
-    gguf_file: impl AsRef<Path>,
-    mmproj_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    Ok(load_qwen3_vl_gguf_with_metadata(gguf_file, mmproj_file, stream, weights_stream)?.model)
-}
-
-#[cfg(test)]
-pub(crate) struct LoadedQwen3VlGguf {
-    pub(crate) model: Model,
-    pub(crate) eos_token_ids: Vec<u32>,
-}
-
 pub(crate) struct PreparedQwen3VlGguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
-}
-
-#[cfg(test)]
-pub(crate) fn load_qwen3_vl_gguf_with_metadata(
-    gguf_file: impl AsRef<Path>,
-    mmproj_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedQwen3VlGguf, Error> {
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    let vision_metadata = gguf_metadata(&vision_checkpoint);
-    load_qwen3_vl_gguf_checkpoint(
-        &checkpoint,
-        metadata,
-        &vision_checkpoint,
-        vision_metadata,
-        None,
-        stream,
-        weights_stream,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn load_qwen3_vl_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    vision_checkpoint: &GgufCheckpoint,
-    vision_metadata: HashMap<String, GgufMetadataValue>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedQwen3VlGguf, Error> {
-    let prepared = prepare_qwen3_vl_gguf_checkpoint(
-        checkpoint,
-        &metadata,
-        vision_checkpoint,
-        &vision_metadata,
-    )?;
-    let mut model_args = prepared.args;
-    let is_moe = model_args.text_config.is_moe();
-    if let Some(quantization) = quantization {
-        model_args.text_config.quantization = Some(quantization);
-        model_args.text_config.quantization_config = None;
-        model_args.text_config.quantized_weights = None;
-        model_args.text_config.quantized_weight_configs = None;
-    }
-    let mut model = Model::new(model_args, stream)?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    let text_name = |name: &str| {
-        let name = dense_qwen::translate_gguf_weight_name(name, is_moe);
-        name.strip_prefix("model.")
-            .map(|name| format!("model.language_model.{name}"))
-            .unwrap_or(name)
-    };
-    let mut text_materializer = checkpoint.materializer();
-    for tensor in checkpoint.catalog().tensors() {
-        let physical_name = &tensor.descriptor().name;
-        if is_moe
-            && (physical_name.contains("ffn_gate_exps") || physical_name.contains("ffn_up_exps"))
-        {
-            continue;
-        }
-        for (name, value) in text_materializer
-            .converted_tensor(physical_name)?
-            .into_arrays()
-        {
-            load_named_array_strict(
-                &mut model,
-                text_name(&name),
-                value,
-                quantization.map(|value| (value, stream)),
-                &config,
-                &mut report,
-            )?;
-        }
-    }
-    if is_moe {
-        for layer in 0..model.args.text_config.num_hidden_layers {
-            let source_prefix = format!("blk.{layer}");
-            let target_prefix = format!("model.language_model.layers.{layer}.mlp.experts");
-            let gate = text_materializer
-                .converted_tensor(&format!("{source_prefix}.ffn_gate_exps.weight"))?
-                .into_arrays()
-                .into_iter()
-                .collect::<HashMap<_, _>>();
-            let up = text_materializer
-                .converted_tensor(&format!("{source_prefix}.ffn_up_exps.weight"))?
-                .into_arrays()
-                .into_iter()
-                .collect::<HashMap<_, _>>();
-            for (source_suffix, target_suffix) in
-                [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
-            {
-                let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
-                let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
-                match (gate.get(&gate_name), up.get(&up_name)) {
-                    (Some(gate), Some(up)) => {
-                        let value =
-                            concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?;
-                        load_named_array_strict(
-                            &mut model,
-                            format!("{target_prefix}.gate_up_proj{target_suffix}"),
-                            value,
-                            quantization.map(|value| (value, stream)),
-                            &config,
-                            &mut report,
-                        )?;
-                    }
-                    (None, None) if source_suffix != "weight" => {}
-                    _ => {
-                        return Err(Error::UnsupportedArchitecture(format!(
-                            "Qwen3-VL-MoE GGUF has incomplete gate/up expert tensors under {source_prefix}"
-                        )))
-                    }
-                }
-            }
-        }
-    }
-    let deepstack = model.args.vision_config.deepstack_layers();
-    load_qwen_vision_mmproj_weights(
-        &mut model,
-        vision_checkpoint,
-        "model.visual",
-        &deepstack,
-        &config,
-        &mut report,
-        weights_stream,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(LoadedQwen3VlGguf {
-        model,
-        eos_token_ids: prepared.eos_token_ids,
-    })
 }
 
 pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
@@ -1444,69 +1196,6 @@ pub(crate) fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32
 }
 
 /// Loads one shared Qwen vision projector into an architecture-selected root.
-#[cfg(test)]
-pub(crate) fn load_qwen_vision_mmproj_weights<M: safemlx::module::ModuleParameters>(
-    model: &mut M,
-    checkpoint: &GgufCheckpoint,
-    root: &str,
-    deepstack_layers: &[i32],
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-    weights_stream: &Stream,
-) -> Result<(), Error> {
-    let translate = |name: &str| {
-        let translated = translate_qwen3_vl_mmproj_name(name, deepstack_layers);
-        translated
-            .strip_prefix("model.visual")
-            .map(|suffix| format!("{root}{suffix}"))
-            .unwrap_or(translated)
-    };
-    let mut materializer = checkpoint.materializer();
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if matches!(
-            name.as_str(),
-            "v.patch_embd.weight" | "v.patch_embd.weight.1"
-        ) {
-            continue;
-        }
-        let converted = materializer.converted_tensor(name)?;
-        let native = matches!(converted, GgufTensor::IQuant(_));
-        for (name, value) in converted.into_arrays() {
-            let name = translate(&name);
-            if native {
-                load_named_iq_array_strict(model, name, value, config, report);
-            } else {
-                load_named_array_strict(model, name, value, None, config, report)?;
-            }
-        }
-    }
-    let first = materializer
-        .converted_tensor("v.patch_embd.weight")?
-        .into_arrays()
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::UnsupportedArchitecture("empty patch embedding tensor".into()))?
-        .1;
-    let second = materializer
-        .converted_tensor("v.patch_embd.weight.1")?
-        .into_arrays()
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::UnsupportedArchitecture("empty patch embedding tensor".into()))?
-        .1;
-    let patch = stack_axis(&[first, second], 2, weights_stream)?;
-    load_named_array_strict(
-        model,
-        format!("{root}.patch_embed.proj.weight"),
-        patch,
-        None,
-        config,
-        report,
-    )?;
-    Ok(())
-}
-
 /// Finds the dense sibling mmproj used by the single-path dense or MoE loader.
 pub(crate) fn find_qwen3_vl_mmproj(gguf_file: &Path) -> Result<PathBuf, Error> {
     crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen3vl")?.ok_or_else(|| {
@@ -2074,17 +1763,27 @@ mod tests {
                 .then_some(safemlx_gguf::GgmlType::Q8_0)
             },
         );
-        let mut loaded = super::load_qwen3_vl_gguf_with_metadata(
-            fixture.path(),
-            vision_fixture.path(),
-            stream,
-            stream,
-        )
-        .unwrap();
-        assert_eq!(loaded.model.args.image_token_id, 30);
-        assert_eq!(loaded.model.args.video_token_id, 31);
-        assert_eq!(loaded.model.args.mrope_section, vec![2, 2, 2]);
-        assert_eq!(loaded.eos_token_ids, vec![2]);
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let vision_checkpoint = safemlx::ops::GgufCheckpoint::open(vision_fixture.path()).unwrap();
+        let vision_metadata = crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let (mut loaded, eos_token_ids) =
+            crate::architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_layerwise_model(
+                &checkpoint,
+                &metadata,
+                &vision_checkpoint,
+                &vision_metadata,
+                crate::WeightResidency::fully_resident(),
+                None,
+                stream,
+                weights.stream(),
+            )
+            .unwrap();
+        assert_eq!(loaded.args().image_token_id, 30);
+        assert_eq!(loaded.args().video_token_id, 31);
+        assert_eq!(loaded.args().mrope_section, vec![2, 2, 2]);
+        assert_eq!(eos_token_ids, vec![2]);
 
         let directory = tempfile::tempdir().unwrap();
         let model_path = directory.path().join("qwen3vl-f16.gguf");
@@ -2159,9 +1858,8 @@ mod tests {
         else {
             panic!("last Qwen3-VL GGUF pipeline stage did not produce logits")
         };
-        let mut resident_cache = loaded.model.new_cache();
+        let mut resident_cache = loaded.new_cache();
         let expected = loaded
-            .model
             .prefill_input_logits(input, &mut resident_cache, stream)
             .unwrap();
         let actual = actual.try_index_device((.., -1, ..), stream).unwrap();

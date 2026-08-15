@@ -11,7 +11,7 @@ use std::{
 
 use safemlx::{
     distributed::{self, Backend},
-    module::{Module, ModuleParameters},
+    module::ModuleParameters,
     ops::{indexing::TryIndexOp, GgufMetadataValue},
     random::{self, RandomState},
     Array, Device, DeviceType, ExecutionContext, Stream,
@@ -40,12 +40,10 @@ use safemlx_lm::{
             layerwise::{load_nemotron_h_tensor_parallel_model, NemotronHLayerwiseModel},
             model::{self as nemotron_model, Cache as NemotronCache},
         },
-        qwen::dense::{
-            self as dense_qwen,
-            layerwise::{
-                load_tensor_parallel_model as load_qwen_tensor_parallel_model,
-                DenseQwenLayerwiseCache, LayerwiseDecoder as DenseQwenLayerwiseDecoder,
-            },
+        qwen::dense::layerwise::{
+            load_safetensors as load_qwen_safetensors,
+            load_tensor_parallel_model as load_qwen_tensor_parallel_model, DenseQwenLayerwiseCache,
+            LayerwiseDecoder as DenseQwenLayerwiseDecoder,
         },
     },
     runtime::cache::KeyValueCache,
@@ -1134,31 +1132,25 @@ fn tensor_ring_worker() {
     }
 
     if family == FixtureFamily::Qwen3MoeSafetensors {
-        let mut reference = dense_qwen::load_safetensors(&checkpoint, &stream, &stream).unwrap();
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut reference = load_qwen_safetensors(
+            &checkpoint,
+            LayerWeightResidency::FullyResident,
+            None,
+            &stream,
+            weights.stream(),
+        )
+        .unwrap();
         let mut reference_cache = reference.new_cache();
         let reference_logits = reference
-            .forward(
-                dense_qwen::ModelInput {
-                    inputs: &prompt,
-                    mask: None,
-                    cache: &mut reference_cache,
-                },
-                &stream,
-            )
+            .forward(&prompt, None, &mut reference_cache, &stream)
             .unwrap();
         assert_arrays_close(&logits, &reference_logits, 5e-5);
         cache.assert_qwen3_moe_local_cache_geometry(2);
         let token = Array::from_slice(&[3u32], &[1, 1]);
         let distributed_decode = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
         let reference_decode = reference
-            .forward(
-                dense_qwen::ModelInput {
-                    inputs: &token,
-                    mask: None,
-                    cache: &mut reference_cache,
-                },
-                &stream,
-            )
+            .forward(&token, None, &mut reference_cache, &stream)
             .unwrap();
         assert_arrays_close(&distributed_decode, &reference_decode, 5e-5);
         cache.assert_qwen3_moe_local_cache_geometry(3);

@@ -4904,17 +4904,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
 
-        let mut resident =
-            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_inkling_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
         let mut layerwise =
             load_inkling_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
                 .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = resident::Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
+        let mut layerwise_cache = layerwise.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2, 3], &[1, 3]),
             Array::from_slice(&[4u32], &[1, 1]),
@@ -4922,13 +4925,7 @@ mod tests {
             Array::from_slice(&[6u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    &tokens,
-                    None,
-                    Some(&mut resident_cache),
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = layerwise
                 .forward(&tokens, &mut layerwise_cache, gpu.stream())
@@ -5085,8 +5082,14 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
-        let mut resident =
-            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_inkling_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 768, 768)
                 .unwrap();
@@ -5102,22 +5105,13 @@ mod tests {
         )
         .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut cached_cache = resident::Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
+        let mut cached_cache = cached.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2, 3], &[1, 3]),
             Array::from_slice(&[4u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    &tokens,
-                    None,
-                    Some(&mut resident_cache),
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = cached
                 .forward(&tokens, &mut cached_cache, gpu.stream())
@@ -5150,8 +5144,14 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
-        let mut resident =
-            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_inkling_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let expert_options = ExpertCacheLoadOptions::new(
             OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
             1 << 16,
@@ -5178,13 +5178,7 @@ mod tests {
             Array::from_slice(&[4u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    &tokens,
-                    None,
-                    Some(&mut resident_cache),
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = cached
                 .forward(&tokens, &mut cached_cache, gpu.stream())
@@ -5330,8 +5324,14 @@ mod tests {
         )
         .unwrap();
 
-        let mut resident =
-            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_inkling_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let mut layerwise = load_inkling_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),

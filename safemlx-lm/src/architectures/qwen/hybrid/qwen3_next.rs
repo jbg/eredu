@@ -18,15 +18,6 @@ use crate::error::Error;
 #[cfg(test)]
 use crate::runtime::checkpoint::quantization::AffineQuantization;
 
-#[cfg(test)]
-use crate::runtime::checkpoint::load::{
-    load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadReport,
-};
-#[cfg(test)]
-use crate::runtime::checkpoint::quantization::WeightQuantization;
-#[cfg(test)]
-use safemlx::module::ModuleParametersExt;
-
 pub use super::qwen3_5::{
     sample, Cache, Generate, LayerCache, LayerPolicy, LinearAttentionCache, Model, ModelArgs,
     ModelInput,
@@ -56,97 +47,6 @@ pub fn model_args_from_config_value(config: &serde_json::Value) -> Result<ModelA
 /// Loads `tokenizer.json` from a Qwen3-Next model directory.
 pub fn load_qwen3_next_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     super::qwen3_5::load_qwen3_5_tokenizer(model_dir)
-}
-
-/// Loads a Qwen3-Next safetensors checkpoint.
-#[cfg(test)]
-pub fn load_qwen3_next_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    load_qwen3_next_model_with_quantization(model_dir.as_ref(), None, stream, weights_stream)
-}
-
-/// Loads a Qwen3-Next checkpoint while affine-quantizing eligible weights.
-#[cfg(test)]
-pub fn load_qwen3_next_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    quantization.validate()?;
-    let model_dir = model_dir.as_ref();
-    let args = get_qwen3_next_model_args(model_dir)?;
-    if args.quantization_config.is_some() {
-        return Err(Error::Quantization(
-            "Qwen3-Next on-load quantization requires floating-point weights; native FP8 checkpoints cannot be implicitly transcoded".into(),
-        ));
-    }
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Qwen3-Next",
-        args.quantization,
-        quantization,
-    )? {
-        return load_qwen3_next_model(model_dir, stream, weights_stream);
-    }
-    load_qwen3_next_model_with_quantization(model_dir, Some(quantization), stream, weights_stream)
-}
-
-#[cfg(test)]
-fn load_qwen3_next_model_with_quantization(
-    model_dir: &Path,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3Next,
-        model_dir,
-        crate::api::ModelLoadOptions {
-            quantization,
-            ..Default::default()
-        },
-    )?;
-    let mut args = get_qwen3_next_model_args(model_dir)?;
-    if let Some(config) = &args.quantization_config {
-        config.validate_supported()?;
-    }
-    if let Some(quantization) = quantization {
-        args.quantization = Some(quantization);
-    }
-    let mut model = Model::new(args, None, None, None, stream)?;
-    let args = model.args.clone();
-    let config = super::qwen3_5::qwen3_5_strict_load_config(false);
-    let mut report = StrictLoadReport::default();
-    if args.uses_fp8() {
-        super::qwen3_5::load_qwen_fp8_safetensors_dir_strict_with_transform(
-            &mut model,
-            model_dir,
-            weights_stream,
-            stream,
-            &config,
-            &mut report,
-            args.num_experts,
-            |key, value| split_fused_projection(&key, value, &args, stream),
-        )?;
-    } else {
-        load_safetensors_dir_strict_with_split_swiglu_experts_and_transform(
-            &mut model,
-            model_dir,
-            weights_stream,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-            args.num_experts,
-            |key, value| split_fused_projection(&key, value, &args, stream),
-        )?;
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
 }
 
 #[cfg(test)]

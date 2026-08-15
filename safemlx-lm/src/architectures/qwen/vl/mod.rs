@@ -7,7 +7,7 @@ pub mod layerwise;
 /// Qwen3-VL implementation.
 pub mod model;
 /// Qwen3-VL-MoE specialization.
-pub mod moe;
+pub(crate) mod moe;
 #[cfg(feature = "image-processing")]
 pub(crate) mod processor;
 pub(crate) mod vision;

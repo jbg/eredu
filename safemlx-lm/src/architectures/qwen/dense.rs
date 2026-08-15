@@ -15,7 +15,7 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt},
+    module::{Module, ModuleParameters as ModuleParametersTrait},
     nn,
     ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
@@ -57,18 +57,10 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
-    runtime::checkpoint::load::{
-        gguf_quantization_configs, load_safetensors_dir_lenient,
-        load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
+    runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
 };
-
-#[cfg(test)]
-use crate::runtime::checkpoint::load::{gguf_metadata, load_gguf_strict, load_named_array_strict};
-#[cfg(test)]
-use safemlx::ops::concatenate_axis;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Dense Qwen decoder generation selected by checkpoint metadata.
@@ -2849,165 +2841,6 @@ fn validate_rope_scaling(args: &DecoderConfig) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) struct LoadedGguf {
-    pub(crate) model: Model,
-    pub(crate) eos_token_ids: Vec<u32>,
-}
-
-/// Loads a dense-Qwen GGUF checkpoint.
-///
-/// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
-/// supported. The quantized formats are consumed in the packed affine
-/// representation emitted by MLX's GGUF loader.
-#[cfg(test)]
-pub fn load_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    Ok(load_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
-}
-
-#[cfg(test)]
-pub(crate) fn load_gguf_with_metadata(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedGguf, Error> {
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
-}
-
-#[cfg(test)]
-pub(crate) fn load_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedGguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
-    if !matches!(architecture.as_str(), "qwen2" | "qwen3" | "qwen3moe") {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports qwen2, qwen3, and qwen3moe"
-        )));
-    }
-    let is_moe = architecture == "qwen3moe";
-    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
-    crate::api::structural::validate_gguf(
-        gguf_architecture,
-        checkpoint,
-        &metadata,
-        crate::api::ModelLoadOptions::default(),
-    )
-    .into_loader_result()?;
-    let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
-    checkpoint
-        .catalog()
-        .translated_outputs(translate)
-        .map_err(safemlx::error::IoError::from)?;
-    let mut args = config_from_gguf_catalog(checkpoint, &metadata, &architecture, is_moe)?;
-    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
-    if is_moe {
-        for layer in 0..args.num_hidden_layers {
-            let prefix = format!("model.layers.{layer}.mlp.experts");
-            if let Some(config) = configs.remove(&format!("{prefix}.gate_proj")) {
-                configs.remove(&format!("{prefix}.up_proj"));
-                configs.insert(format!("{prefix}.gate_up_proj"), config);
-            }
-        }
-    }
-    args.quantized_weights = Some(configs.keys().cloned().collect());
-    args.quantized_weight_configs = Some(configs);
-    args.quantization = None;
-    if let Some(quantization) = quantization {
-        args.quantization = Some(quantization);
-        args.quantization_config = None;
-        args.quantized_weights = None;
-        args.quantized_weight_configs = None;
-    }
-
-    let mut model = Model::new(args, stream)?;
-    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
-    let mut report = StrictLoadReport::default();
-    if !is_moe {
-        load_gguf_strict(
-            &mut model,
-            checkpoint,
-            quantization.map(|value| (value, stream)),
-            &config,
-            &mut report,
-            |name, value| Ok((translate_gguf_weight_name(&name, false), value)),
-        )?;
-    } else {
-        let mut materializer = checkpoint.materializer();
-        for tensor in checkpoint.catalog().tensors() {
-            let physical_name = &tensor.descriptor().name;
-            if physical_name.contains("ffn_gate_exps") || physical_name.contains("ffn_up_exps") {
-                continue;
-            }
-            for (name, value) in materializer.converted_tensor(physical_name)?.into_arrays() {
-                load_named_array_strict(
-                    &mut model,
-                    translate_gguf_weight_name(&name, true),
-                    value,
-                    quantization.map(|value| (value, stream)),
-                    &config,
-                    &mut report,
-                )?;
-            }
-        }
-        for layer in 0..model.args.num_hidden_layers {
-            let source_prefix = format!("blk.{layer}");
-            let target_prefix = format!("model.layers.{layer}.mlp.experts");
-            let gate = materializer
-                .converted_tensor(&format!("{source_prefix}.ffn_gate_exps.weight"))?
-                .into_arrays()
-                .into_iter()
-                .collect::<HashMap<_, _>>();
-            let up = materializer
-                .converted_tensor(&format!("{source_prefix}.ffn_up_exps.weight"))?
-                .into_arrays()
-                .into_iter()
-                .collect::<HashMap<_, _>>();
-            for (source_suffix, target_suffix) in
-                [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
-            {
-                let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
-                let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
-                match (gate.get(&gate_name), up.get(&up_name)) {
-                    (Some(gate), Some(up)) => {
-                        let value = concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?;
-                        load_named_array_strict(
-                            &mut model,
-                            format!("{target_prefix}.gate_up_proj{target_suffix}"),
-                            value,
-                            quantization.map(|value| (value, stream)),
-                            &config,
-                            &mut report,
-                        )?;
-                    }
-                    (None, None) if source_suffix != "weight" => {}
-                    _ => {
-                        return Err(Error::UnsupportedArchitecture(format!(
-                            "Qwen3 MoE GGUF has incomplete gate/up expert tensors under {source_prefix}"
-                        )))
-                    }
-                }
-            }
-        }
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
-    Ok(LoadedGguf {
-        model,
-        eos_token_ids,
-    })
-}
-
 pub(crate) fn prepare_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
@@ -3493,70 +3326,6 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-/// Loads a dense-Qwen model and SafeTensors weights from a model directory.
-pub fn load_safetensors(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    let model_args = load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
-        model_args.model_kind(),
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
-    let mut model = Model::new(model_args, stream)?;
-
-    load_safetensors_dir_lenient(&mut model, model_dir, weights_stream)?;
-    model.copy_to_stream(stream)?;
-
-    Ok(model)
-}
-
-/// Loads a dense-Qwen checkpoint while quantizing matrices tensor-by-tensor.
-pub fn load_safetensors_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    let mut model_args = load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
-        model_args.model_kind(),
-        model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
-    )?;
-    let architecture_name = match model_args.architecture() {
-        Architecture::Qwen2 => "Qwen2/Qwen2.5",
-        Architecture::Qwen3 => "Qwen3",
-    };
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        architecture_name,
-        model_args.weight_quantization(),
-        quantization,
-    )? {
-        return load_safetensors(model_dir, stream, weights_stream);
-    }
-    model_args.quantization = Some(quantization);
-    let mut model = Model::new(model_args, stream)?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    load_safetensors_dir_quantized_strict(
-        &mut model,
-        model_dir,
-        weights_stream,
-        stream,
-        quantization,
-        &config,
-        &mut report,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
 impl<C> CausalLm<Vec<Option<C>>> for Model
 where
     C: KeyValueCache + Default,
@@ -3614,14 +3383,37 @@ mod tests {
     };
 
     use crate::{
-        architectures::qwen::dense::{load_safetensors, load_tokenizer},
+        architectures::qwen::dense::load_tokenizer,
         nn::generation::CausalLm,
         runtime::attention::{AttentionPolicy, LayerSchedule},
-        runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+        runtime::cache::KeyValueCache,
         runtime::checkpoint::quantization::AffineQuantization,
     };
 
     const CACHED_TEST_MODEL_DIR: &str = "../cache/Qwen3-4B-bf16";
+
+    fn load_gguf_fully_resident(
+        path: impl AsRef<std::path::Path>,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> (
+        crate::architectures::qwen::dense::layerwise::LayerwiseDecoder,
+        Vec<u32>,
+    ) {
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(path).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let architecture = super::gguf_string(&metadata, "general.architecture").unwrap();
+        crate::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
+            &checkpoint,
+            &metadata,
+            &architecture,
+            crate::WeightResidency::fully_resident(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap()
+    }
 
     fn tiny_args() -> super::DecoderConfig {
         super::DecoderConfig {
@@ -4727,9 +4519,12 @@ mod tests {
         ]);
 
         let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
-        let loaded = super::load_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
-        assert_eq!(loaded.model.args.head_dim, 32);
-        assert_eq!(loaded.eos_token_ids, vec![1]);
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let (loaded, eos_token_ids) =
+            load_gguf_fully_resident(fixture.path(), stream, weights.stream());
+        assert_eq!(loaded.args().head_dim, 32);
+        assert_eq!(eos_token_ids, vec![1]);
     }
 
     #[test]
@@ -4781,18 +4576,30 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let mut loaded_safetensors =
-            super::load_safetensors(safetensors_dir.path(), stream, stream).unwrap();
-        let quantized = super::load_safetensors_quantized(
+            crate::architectures::qwen::dense::layerwise::load_safetensors(
+                safetensors_dir.path(),
+                crate::LayerWeightResidency::FullyResident,
+                None,
+                stream,
+                weights.stream(),
+            )
+            .unwrap();
+        let quantized = crate::architectures::qwen::dense::layerwise::load_safetensors(
             safetensors_dir.path(),
-            AffineQuantization::new(32, 4).unwrap().into(),
+            crate::LayerWeightResidency::FullyResident,
+            Some(AffineQuantization::new(32, 4).unwrap().into()),
             stream,
-            stream,
+            weights.stream(),
         )
         .unwrap();
-        let quantized_parameters = quantized.parameters().flatten();
-        assert!(quantized_parameters.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
-        assert!(quantized_parameters.contains_key("model.layers.0.self_attn.q_proj.inner.bias"));
+        assert!(quantized
+            .residency_report()
+            .unwrap()
+            .materialization()
+            .is_some_and(|report| report.transformed_weights > 0));
 
         let arrays = source
             .parameters()
@@ -4863,32 +4670,27 @@ mod tests {
             ),
         ]);
         let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
-        let mut loaded = super::load_gguf_with_metadata(fixture.path(), stream, stream)
-            .unwrap()
-            .model;
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let (mut loaded, _) = crate::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
+            &checkpoint,
+            &metadata,
+            "qwen2",
+            crate::WeightResidency::fully_resident(),
+            None,
+            stream,
+            weights.stream(),
+        )
+        .unwrap();
 
         let tokens = Array::from_slice(&[1_i32, 2, 3], &[1, 3]);
         let mut safetensors_cache = loaded_safetensors.new_cache();
         let mut loaded_cache = loaded.new_cache();
         let safetensors_logits = loaded_safetensors
-            .forward(
-                super::ModelInput {
-                    inputs: &tokens,
-                    mask: None,
-                    cache: &mut safetensors_cache,
-                },
-                stream,
-            )
+            .forward(&tokens, None, &mut safetensors_cache, stream)
             .unwrap();
         let loaded_logits = loaded
-            .forward(
-                super::ModelInput {
-                    inputs: &tokens,
-                    mask: None,
-                    cache: &mut loaded_cache,
-                },
-                stream,
-            )
+            .forward(&tokens, None, &mut loaded_cache, stream)
             .unwrap();
         assert!(safetensors_logits
             .all_close(&loaded_logits, Some(1e-5), Some(1e-5), None, stream)
@@ -5003,14 +4805,24 @@ mod tests {
         assert_eq!(checkpoint.catalog().shards().len(), 2);
         assert_eq!(checkpoint.catalog().physical_tensor_count(), arrays.len());
 
-        let loaded = super::load_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
-        assert_eq!(loaded.model.model_type(), "qwen3_moe");
-        let parameters = loaded.model.parameters().flatten();
-        let paired = &parameters["model.layers.0.mlp.experts.gate_up_proj"];
-        assert!(paired
-            .all_close(&gate_up, None, None, None, stream)
-            .unwrap()
-            .item::<bool>(stream));
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let (mut loaded, _) = load_gguf_fully_resident(fixture.path(), stream, weights.stream());
+        assert_eq!(loaded.args().model_type, "qwen3_moe");
+        let keys = loaded.checkpoint_store().keys();
+        assert!(keys.contains(&"model.layers.0.mlp.experts.gate_proj".to_string()));
+        assert!(keys.contains(&"model.layers.0.mlp.experts.up_proj".to_string()));
+        let mut cache = loaded.new_cache();
+        let logits = loaded
+            .forward(
+                &Array::from_slice(&[1i32, 2], &[1, 2]),
+                None,
+                &mut cache,
+                stream,
+            )
+            .unwrap();
+        eval([&logits]).unwrap();
+        assert_eq!(logits.shape(), &[1, 2, 32]);
     }
 
     #[test]
@@ -5024,17 +4836,17 @@ mod tests {
         let stream = ctx.stream();
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut model = super::load_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
-        assert_eq!(model.model_type(), "qwen3_moe");
-        assert_eq!(model.args.num_hidden_layers, 48);
-        assert_eq!(model.args.num_experts, 128);
-        assert_eq!(model.args.num_experts_per_tok, 8);
+        let (mut model, _) = load_gguf_fully_resident(&gguf_file, stream, weights_ctx.stream());
+        assert_eq!(model.args().model_type, "qwen3_moe");
+        assert_eq!(model.args().num_hidden_layers, 48);
+        assert_eq!(model.args().num_experts, 128);
+        assert_eq!(model.args().num_experts_per_tok, 8);
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
         let parts = [crate::runtime::media::input::InputPart::text_token_ids(
             &tokens,
         )];
-        let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut cache = model.new_cache();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
             crate::runtime::media::input::ModelInput::new(&parts),
@@ -5043,7 +4855,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(logits.shape(), &[1, 151936]);
-        assert_eq!(cache.len(), 48);
         assert!(cache
             .iter()
             .all(|layer| layer.as_ref().is_some_and(|layer| layer.offset() == 2)));
@@ -5067,9 +4878,9 @@ mod tests {
         let stream = ctx.stream();
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut model = super::load_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        let (mut model, _) = load_gguf_fully_resident(&gguf_file, stream, weights_ctx.stream());
         assert!(model
-            .args
+            .args()
             .quantized_weight_configs
             .as_ref()
             .is_some_and(|configs| configs.values().any(|config| config.bits() == 4)));
@@ -5078,7 +4889,7 @@ mod tests {
         let parts = [crate::runtime::media::input::InputPart::text_token_ids(
             &tokens,
         )];
-        let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut cache = model.new_cache();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
             crate::runtime::media::input::ModelInput::new(&parts),
@@ -5086,8 +4897,10 @@ mod tests {
             stream,
         )
         .unwrap();
-        assert_eq!(logits.shape(), &[1, model.args.vocab_size]);
-        assert_eq!(cache.len(), model.args.num_hidden_layers as usize);
+        assert_eq!(logits.shape(), &[1, model.args().vocab_size]);
+        assert!(cache
+            .iter()
+            .all(|layer| layer.as_ref().is_some_and(|layer| layer.offset() == 2)));
     }
 
     fn strict_loads_and_runs_real_qwen3_group16_gguf(env_var: &str, bits: i32) {
@@ -5098,9 +4911,9 @@ mod tests {
         let stream = ctx.stream();
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut model = super::load_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        let (mut model, _) = load_gguf_fully_resident(&gguf_file, stream, weights_ctx.stream());
         assert!(model
-            .args
+            .args()
             .quantized_weight_configs
             .as_ref()
             .is_some_and(|configs| configs
@@ -5114,7 +4927,7 @@ mod tests {
         let parts = [crate::runtime::media::input::InputPart::text_token_ids(
             &tokens,
         )];
-        let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut cache = model.new_cache();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
             crate::runtime::media::input::ModelInput::new(&parts),
@@ -5122,8 +4935,8 @@ mod tests {
             stream,
         )
         .unwrap();
-        assert_eq!(logits.shape(), &[1, model.args.vocab_size]);
-        assert_eq!(cache.len(), model.args.num_hidden_layers as usize);
+        assert_eq!(logits.shape(), &[1, model.args().vocab_size]);
+        assert_eq!(cache.len(), model.args().num_hidden_layers as usize);
         assert!(cache
             .iter()
             .all(|layer| layer.as_ref().is_some_and(|layer| layer.offset() == 64)));
@@ -5153,9 +4966,14 @@ mod tests {
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let _model =
-            super::load_safetensors(CACHED_TEST_MODEL_DIR, ctx.stream(), weights_ctx.stream())
-                .unwrap();
+        let _model = crate::architectures::qwen::dense::layerwise::load_safetensors(
+            CACHED_TEST_MODEL_DIR,
+            crate::LayerWeightResidency::FullyResident,
+            None,
+            ctx.stream(),
+            weights_ctx.stream(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5176,20 +4994,27 @@ mod tests {
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let weights_stream = weights_ctx.stream();
-        let mut model = load_safetensors(CACHED_TEST_MODEL_DIR, stream, weights_stream).unwrap();
+        let mut model = crate::architectures::qwen::dense::layerwise::load_safetensors(
+            CACHED_TEST_MODEL_DIR,
+            crate::LayerWeightResidency::FullyResident,
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
 
         let encoding = tokenizer.encode("hello", true).unwrap();
         let prompt_tokens = Array::from(encoding.get_ids())
             .try_index_device(NewAxis, stream)
             .unwrap();
-        let mut cache = Vec::new();
+        let mut cache = model.new_cache();
 
         let mut tokens = Vec::new();
         let input_parts = [crate::runtime::media::input::InputPart::text_token_ids(
             &prompt_tokens,
         )];
         let input = crate::runtime::media::input::ModelInput::new(&input_parts);
-        let generate = super::Generate::<ConcatKeyValueCache>::new(
+        let generate = crate::api::common::generation::Generate::new(
             &mut model, &mut cache, 0.0, input, None, stream,
         );
         for (token, ntoks) in generate.zip(0..10) {

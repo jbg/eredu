@@ -65,16 +65,6 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::runtime::checkpoint::load::{
-    gguf_metadata, load_named_array_strict, StrictLoadConfig, StrictLoadReport,
-};
-#[cfg(test)]
-use safemlx::{module::ModuleParametersExt, ops::concatenate_axis};
-
-#[cfg(test)]
-use crate::runtime::checkpoint::load::load_safetensors_dir_strict_with_split_swiglu_experts_and_transform;
-
-#[cfg(test)]
 use crate::runtime::cache::residency::open_prompt_cache_snapshot;
 
 fn default_model_type() -> String {
@@ -2588,234 +2578,10 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, Model, Cache, S>;
 
-#[cfg(test)]
-pub(crate) fn transform_safetensors_weight(
-    args: &ModelArgs,
-    mut key: String,
-    value: Array,
-    stream: &Stream,
-) -> Result<Vec<(String, Array)>, Error> {
-    if key.starts_with("model.mtp.") {
-        return Ok(Vec::new());
-    }
-    key = key.replace(".block_sparse_moe.", ".mlp.");
-    if key.ends_with(".q_conv1d.weight")
-        || key.ends_with(".k_conv1d.weight")
-        || key.ends_with(".v_conv1d.weight")
-    {
-        let projection = args.kda_config.num_heads * args.kda_config.head_dim;
-        let kernel = args.kda_config.short_conv_kernel_size;
-        if value.size() as i32 != projection * kernel {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Kimi Linear convolution tensor {key} has shape {:?}, expected {projection}x{kernel}",
-                value.shape()
-            )));
-        }
-        return Ok(vec![(
-            key,
-            value.reshape(&[projection, 1, kernel], stream)?,
-        )]);
-    }
-    if key.ends_with(".A_log") {
-        let heads = args.kda_config.num_heads;
-        if value.size() != heads as usize {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Kimi Linear transition tensor {key} has shape {:?}, expected {heads} values",
-                value.shape()
-            )));
-        }
-        return Ok(vec![(key, value.reshape(&[1, 1, heads, 1], stream)?)]);
-    }
-    Ok(vec![(key, value)])
-}
-
-#[cfg(test)]
-fn strict_load_config() -> StrictLoadConfig {
-    StrictLoadConfig::default()
-}
-
-/// Loads the official sharded safetensors checkpoint.
-#[cfg(test)]
-pub fn load_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    load_model_impl(model_dir.as_ref(), None, stream, weights_stream)
-}
-
-#[cfg(test)]
-fn load_model_impl(
-    model_dir: &Path,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let inspection_options = quantization.map_or_else(
-        crate::api::ModelLoadOptions::default,
-        crate::api::ModelLoadOptions::with_quantization,
-    );
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::KimiLinear,
-        model_dir,
-        inspection_options,
-    )?;
-    let mut args = get_model_args(model_dir)?;
-    if let Some(quantization) = quantization {
-        quantization.validate()?;
-        args.quantization = Some(quantization);
-    }
-    let mut model = Model::new(args.clone(), stream)?;
-    let mut report = StrictLoadReport::default();
-    load_safetensors_dir_strict_with_split_swiglu_experts_and_transform(
-        &mut model,
-        model_dir,
-        weights_stream,
-        stream,
-        quantization,
-        &strict_load_config(),
-        &mut report,
-        args.num_experts,
-        |key, value| transform_safetensors_weight(&args, key, value, stream),
-    )?;
-    report.finish(&model, &strict_load_config())?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Loads a floating-point checkpoint while quantizing eligible weights.
-#[cfg(test)]
-pub fn load_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    let args = get_model_args(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Kimi Linear",
-        args.quantization,
-        quantization,
-    )? {
-        return load_model(model_dir, stream, weights_stream);
-    }
-    load_model_impl(model_dir, Some(quantization), stream, weights_stream)
-}
-
 /// Kimi Linear model plus architecture-owned GGUF stop IDs.
-#[cfg(test)]
-pub(crate) struct LoadedKimiLinearGguf {
-    pub(crate) model: Model,
-}
-
 pub(crate) struct PreparedKimiLinearGguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
-}
-
-/// Loads a llama.cpp `kimi-linear` GGUF checkpoint.
-#[cfg(test)]
-pub fn load_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
-}
-
-#[cfg(test)]
-pub(crate) fn load_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedKimiLinearGguf, Error> {
-    let options = quantization.map_or_else(
-        crate::api::ModelLoadOptions::default,
-        crate::api::ModelLoadOptions::with_quantization,
-    );
-    crate::api::structural::validate_gguf(
-        crate::api::GgufArchitecture::KimiLinear,
-        checkpoint,
-        &metadata,
-        options,
-    )
-    .into_loader_result()?;
-    let prepared = prepare_gguf_checkpoint(checkpoint, &metadata, quantization, weights_stream)?;
-    let args = prepared.args;
-    let mut model = Model::new(args.clone(), stream)?;
-    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
-    let mut report = StrictLoadReport::default();
-    let mut materializer = checkpoint.materializer();
-    for tensor in checkpoint.catalog().tensors() {
-        let physical_name = &tensor.descriptor().name;
-        if physical_name.contains("ffn_gate_exps") || physical_name.contains("ffn_up_exps") {
-            continue;
-        }
-        let group = materializer.converted_tensor(physical_name)?;
-        for (source_name, value) in group.into_arrays() {
-            let target_name = translate_gguf_weight_name(&source_name);
-            let value = normalize_gguf_weight(&target_name, value, &args, weights_stream)?;
-            load_named_array_strict(
-                &mut model,
-                target_name,
-                value,
-                quantization.map(|quantization| (quantization, stream)),
-                &config,
-                &mut report,
-            )?;
-        }
-    }
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        let source_prefix = format!("blk.{layer}");
-        let target_prefix = format!("model.layers.{layer}.mlp.experts");
-        let gate = materializer
-            .converted_tensor(&format!("{source_prefix}.ffn_gate_exps.weight"))?
-            .into_arrays()
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        let up = materializer
-            .converted_tensor(&format!("{source_prefix}.ffn_up_exps.weight"))?
-            .into_arrays()
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        for (source_suffix, target_suffix) in
-            [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
-        {
-            let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
-            let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
-            let (gate, up) = match (gate.get(&gate_name), up.get(&up_name)) {
-                (Some(gate), Some(up)) => (gate, up),
-                (None, None) if source_suffix != "weight" => continue,
-                (gate, up) => {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "Kimi Linear GGUF has mismatched expert components {gate_name:?} ({}) and {up_name:?} ({})",
-                        if gate.is_some() { "present" } else { "missing" },
-                        if up.is_some() { "present" } else { "missing" },
-                    )));
-                }
-            };
-            let value = concatenate_axis(&[gate, up], 1, weights_stream)?;
-            load_named_array_strict(
-                &mut model,
-                format!("{target_prefix}.gate_up_proj{target_suffix}"),
-                value,
-                quantization.map(|quantization| (quantization, stream)),
-                &config,
-                &mut report,
-            )?;
-        }
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(LoadedKimiLinearGguf { model })
 }
 
 pub(crate) fn prepare_gguf_checkpoint(
@@ -3230,7 +2996,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        load_gguf, load_model, load_tokenizer, model_args_from_config_value, normalize_gguf_weight,
+        load_tokenizer, model_args_from_config_value, normalize_gguf_weight,
         prompt_cache_architecture_fingerprint, translate_gguf_weight_name, AttentionKind, Cache,
         FeedForwardPolicy, LayerCache, LayerPolicy, Model, ModelInput,
     };
@@ -3615,21 +3381,26 @@ mod tests {
             .encode("Hello 世界! I'm testing Kimi.", false)
             .unwrap();
         assert!(!encoded.get_ids().is_empty());
-        let mut model = load_model(&dir, stream, stream).unwrap();
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model =
+            crate::architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
+                &dir,
+                crate::LayerWeightResidency::FullyResident,
+                None,
+                stream,
+                weights.stream(),
+            )
+            .unwrap();
         let mut cache = model.new_cache();
         let logits = model
-            .forward_logits(
-                ModelInput {
-                    inputs: &Array::from_slice(&[163584i32, 42], &[1, 2]),
-                    mask: None,
-                    cache: Some(&mut cache),
-                },
-                true,
+            .forward(
+                &Array::from_slice(&[163584i32, 42], &[1, 2]),
+                &mut cache,
                 stream,
             )
             .unwrap();
         let _ = logits.evaluated().unwrap();
-        assert_eq!(logits.shape(), &[1, model.args.vocab_size]);
+        assert_eq!(logits.shape(), &[1, 2, model.args().vocab_size]);
         assert_eq!(cache.offset(), 2);
     }
 
@@ -3641,21 +3412,29 @@ mod tests {
             .expect("KIMI_LINEAR_GGUF");
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
-        let mut model = load_gguf(path, stream, stream).unwrap();
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(path).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let (mut model, _) =
+            crate::architectures::kimi_linear::layerwise::load_kimi_linear_gguf_layerwise_model(
+                &checkpoint,
+                &metadata,
+                crate::WeightResidency::fully_resident(),
+                None,
+                stream,
+                weights.stream(),
+            )
+            .unwrap();
         let mut cache = model.new_cache();
         let logits = model
-            .forward_logits(
-                ModelInput {
-                    inputs: &Array::from_slice(&[163584i32, 42], &[1, 2]),
-                    mask: None,
-                    cache: Some(&mut cache),
-                },
-                true,
+            .forward(
+                &Array::from_slice(&[163584i32, 42], &[1, 2]),
+                &mut cache,
                 stream,
             )
             .unwrap();
         let _ = logits.evaluated().unwrap();
-        assert_eq!(logits.shape(), &[1, model.args.vocab_size]);
+        assert_eq!(logits.shape(), &[1, 2, model.args().vocab_size]);
         assert_eq!(cache.offset(), 2);
     }
 }

@@ -4651,13 +4651,12 @@ mod tests {
     use crate::{
         api::{
             common::generation::CausalLm,
-            gemma4::{self as resident, Model, ModelInput},
+            gemma4::{self as resident, Model},
             gemma4_audio::Gemma4AudioConfig,
             gemma4_vision::Gemma4VisionConfig,
             input as runtime_input,
         },
         runtime::{
-            cache::ConcatKeyValueCache,
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
             distributed::{
                 parallel::{ParallelBuildContext, ShardingPolicy},
@@ -4941,31 +4940,19 @@ mod tests {
             serde_json::to_vec(&value).unwrap(),
         )
         .unwrap();
-        let eager_quantized = resident::load_gemma4_model_quantized(
+        let canonical_quantized = load_gemma4_layerwise_model(
             dir.path(),
-            quantization,
+            LayerWeightResidency::FullyResident,
+            Some(quantization),
             gpu.stream(),
             cpu.stream(),
         )
         .unwrap();
-        assert!(eager_quantized
-            .model
-            .vision_tower
-            .as_ref()
+        assert!(canonical_quantized
+            .residency_report()
             .unwrap()
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-        assert!(eager_quantized
-            .model
-            .audio_tower
-            .as_ref()
-            .unwrap()
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
+            .materialization()
+            .is_some_and(|report| report.transformed_weights > 0));
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {
@@ -5035,8 +5022,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture);
 
-        let mut eager =
-            resident::load_gemma4_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut eager = load_gemma4_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let mut layerwise = load_gemma4_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
@@ -5045,7 +5038,7 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        let mut eager_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut eager_cache = eager.new_cache();
         let mut layerwise_cache = layerwise.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2, 3], &[1, 3]),
@@ -5053,18 +5046,7 @@ mod tests {
             Array::from_slice(&[5u32], &[1, 1]),
         ] {
             let expected = eager
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: None,
-                        per_layer_input_ids: None,
-                        mask: None,
-                        sliding_masks: None,
-                        cache: &mut eager_cache,
-                    },
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut eager_cache, gpu.stream())
                 .unwrap();
             let actual = layerwise
                 .forward(&tokens, &mut layerwise_cache, gpu.stream())
@@ -5469,8 +5451,14 @@ mod tests {
         )
         .unwrap();
 
-        let mut resident =
-            resident::load_gemma4_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_gemma4_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let mut layerwise = load_gemma4_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),

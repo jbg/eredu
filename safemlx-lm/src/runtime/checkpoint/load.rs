@@ -246,18 +246,6 @@ fn load_iq_array_strict(
 }
 
 #[cfg(test)]
-pub(crate) fn load_named_iq_array_strict<M: ModuleParameters>(
-    model: &mut M,
-    name: String,
-    value: Array,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) {
-    let mut params = model.parameters_mut().flatten();
-    load_iq_array_strict(&mut params, name, value, config, report);
-}
-
-#[cfg(test)]
 pub(crate) fn load_named_array_strict<M: ModuleParameters>(
     model: &mut M,
     name: String,

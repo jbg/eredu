@@ -2185,9 +2185,7 @@ mod tests {
     };
     use crate::{
         api::ModelKind,
-        architectures::kimi_linear::model::{
-            load_model, model_args_from_config_value, Model, ModelInput,
-        },
+        architectures::kimi_linear::model::{model_args_from_config_value, Model},
         runtime::{
             checkpoint::store::{SafetensorsWeightStore, WeightStore},
             distributed::{
@@ -2729,7 +2727,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         write_official_style_fixture(directory.path(), &fixture, gpu.stream());
 
-        let mut resident = load_model(directory.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_kimi_linear_layerwise_model(
+            directory.path(),
+            crate::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
                 .unwrap();
@@ -2751,15 +2756,7 @@ mod tests {
             Array::from_slice(&[3i32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = sparse
                 .forward(&tokens, &mut sparse_cache, gpu.stream())

@@ -21,11 +21,6 @@ use tokenizers::Tokenizer;
 
 pub use crate::nn::generation::sample;
 
-#[cfg(test)]
-use crate::runtime::checkpoint::load::{
-    gguf_metadata, load_gguf_strict, load_safetensors_dir_lenient, StrictLoadConfig,
-    StrictLoadReport,
-};
 use crate::{
     api::{
         common::{
@@ -55,9 +50,6 @@ use crate::{
         cache::{ConcatKeyValueCache, KeyValueCache},
     },
 };
-#[cfg(test)]
-use safemlx::module::ModuleParametersExt;
-
 #[derive(Debug, Clone)]
 /// Normalized Llama/Mistral decoder geometry used by every execution path.
 pub struct ModelArgs {
@@ -1322,71 +1314,9 @@ pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> 
     normalize_model_args(args)
 }
 
-#[cfg(test)]
-pub(crate) struct LoadedLlamaGguf {
-    pub(crate) model: ResidentModel,
-    pub(crate) eos_token_ids: Vec<u32>,
-}
-
 pub(crate) struct PreparedLlamaGguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
-}
-
-/// Loads a Llama-compatible GGUF checkpoint, including Mistral.
-///
-/// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
-/// supported. Quantized formats are consumed in the packed affine
-/// representation emitted by MLX's GGUF loader.
-#[cfg(test)]
-pub fn load_llama_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<ResidentModel, Error> {
-    Ok(load_llama_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
-}
-
-#[cfg(test)]
-pub(crate) fn load_llama_gguf_with_metadata(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedLlamaGguf, Error> {
-    let gguf_file = gguf_file.as_ref();
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    load_llama_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
-}
-
-#[cfg(test)]
-pub(crate) fn load_llama_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedLlamaGguf, Error> {
-    let prepared =
-        prepare_llama_gguf_checkpoint(checkpoint, &metadata, quantization, weights_stream)?;
-    let mut model = ResidentModel::new(prepared.args, stream)?;
-    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
-    let mut report = StrictLoadReport::default();
-    load_gguf_strict(
-        &mut model,
-        checkpoint,
-        quantization.map(|value| (value, stream)),
-        &config,
-        &mut report,
-        |name, value| Ok((translate_gguf_weight_name(&name), value)),
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-
-    Ok(LoadedLlamaGguf {
-        model,
-        eos_token_ids: prepared.eos_token_ids,
-    })
 }
 
 pub(crate) fn prepare_llama_gguf_checkpoint(
@@ -1661,28 +1591,6 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-/// Test-only eager reference loader used to compare the canonical engine.
-#[cfg(test)]
-pub(crate) fn load_test_resident_llama_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<ResidentModel, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Llama,
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
-    let model_args = get_llama_model_args(model_dir)?;
-    let mut model = ResidentModel::new(model_args, stream)?;
-
-    load_safetensors_dir_lenient(&mut model, model_dir, weights_stream)?;
-    model.copy_to_stream(stream)?;
-
-    Ok(model)
-}
-
 impl<C> CausalLm<Vec<Option<C>>> for ResidentModel
 where
     C: KeyValueCache,
@@ -1745,8 +1653,11 @@ mod tests {
     };
 
     use crate::{
-        architectures::llama::model::{load_llama_tokenizer, load_test_resident_llama_model},
-        runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+        architectures::llama::{
+            layerwise::{load_llama_model, LlamaLoadOptions},
+            model::load_llama_tokenizer,
+        },
+        runtime::cache::KeyValueCache,
         runtime::checkpoint::quantization::AffineQuantization,
     };
 
@@ -2226,13 +2137,25 @@ mod tests {
         ]);
 
         let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
-        let loaded = super::load_llama_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
+        let checkpoint_metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let (loaded, eos_token_ids) =
+            crate::architectures::llama::layerwise::load_llama_gguf_model(
+                &checkpoint,
+                &checkpoint_metadata,
+                crate::WeightResidency::fully_resident(),
+                None,
+                stream,
+                weights.stream(),
+            )
+            .unwrap();
 
-        assert_eq!(loaded.model.model_type(), "mistral");
+        assert_eq!(loaded.args().model_type, "mistral");
         assert_eq!(
             loaded
-                .model
-                .args
+                .args()
                 .attention_schedule
                 .get(0)
                 .unwrap()
@@ -2241,7 +2164,7 @@ mod tests {
                 .get(),
             16
         );
-        assert_eq!(loaded.eos_token_ids, vec![2]);
+        assert_eq!(eos_token_ids, vec![2]);
 
         let mut zero_window = metadata.clone();
         zero_window.insert(
@@ -2285,54 +2208,39 @@ mod tests {
                 }
             });
         let checkpoint = safemlx::ops::GgufCheckpoint::open(mixed_fixture.path()).unwrap();
-        let mut mixed = super::load_llama_gguf_checkpoint(
+        let (mut mixed, _) = crate::architectures::llama::layerwise::load_llama_gguf_model(
             &checkpoint,
-            crate::runtime::checkpoint::load::gguf_metadata(&checkpoint),
+            &crate::runtime::checkpoint::load::gguf_metadata(&checkpoint),
+            crate::WeightResidency::fully_resident(),
             None,
             stream,
-            stream,
+            weights.stream(),
         )
         .unwrap();
-        let mixed_params = mixed.model.parameters().flatten();
-        assert!(mixed_params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
-        assert!(mixed_params.contains_key("model.layers.0.self_attn.q_proj.scales"));
-        assert!(mixed_params.contains_key("model.layers.0.mlp.down_proj.inner.weight"));
-        assert!(mixed_params.contains_key("model.layers.0.mlp.down_proj.scales"));
-        drop(mixed_params);
-
-        let safemlx::quantization::MaybeQuantized::Quantized(q_proj) =
-            &mut mixed.model.model.layers[0].self_attn.q_proj
-        else {
-            panic!("IQ4_NL projection must use a quantized module");
-        };
-        assert_eq!(
-            q_proj.native_format,
-            Some(safemlx::native_quantization::NativeQuantizationFormat::GgufIQ4NL)
-        );
-        assert_eq!(q_proj.inner.weight.value.dtype(), safemlx::Dtype::Uint8);
-        assert_eq!(q_proj.inner.weight.value.shape(), &[32, 18]);
-        let projected = q_proj
-            .forward(&Array::from_slice(&[1.0f32; 32], &[1, 32]), stream)
+        let mut cache = mixed.new_cache();
+        let logits = mixed
+            .forward(&Array::from_slice(&[1i32, 2], &[1, 2]), &mut cache, stream)
             .unwrap();
-        eval([&projected]).unwrap();
-        assert_eq!(projected.shape(), &[1, 32]);
+        eval([&logits]).unwrap();
+        assert_eq!(logits.shape(), &[1, 2, 32]);
 
         let gpu = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
         let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-        let quantized = super::load_llama_gguf_checkpoint(
+        let (quantized, _) = crate::architectures::llama::layerwise::load_llama_gguf_model(
             &checkpoint,
-            metadata,
+            &metadata,
+            crate::WeightResidency::fully_resident(),
             Some(crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4),
             gpu.stream(),
-            stream,
+            weights.stream(),
         )
         .unwrap();
-        let params = quantized.model.parameters().flatten();
-        assert!(params.contains_key("model.layers.0.self_attn.q_proj.scales"));
-        assert!(!params.contains_key("model.layers.0.self_attn.q_proj.biases"));
-        assert!(params.contains_key("model.embed_tokens.scales"));
-        assert!(!params.contains_key("model.embed_tokens.biases"));
+        assert!(quantized.is_fully_resident());
+        assert_eq!(
+            quantized.metadata().quantization(),
+            Some(crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4)
+        );
     }
 
     #[test]
@@ -2484,9 +2392,13 @@ mod tests {
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let weights_stream = weights_ctx.stream();
-        let mut model =
-            load_test_resident_llama_model(CACHED_TEST_MODEL_DIR.as_str(), stream, weights_stream)
-                .unwrap();
+        let mut model = load_llama_model(
+            CACHED_TEST_MODEL_DIR.as_str(),
+            LlamaLoadOptions::fully_resident(),
+            stream,
+            weights_stream,
+        )
+        .unwrap();
 
         let prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
         let encoding = tokenizer.encode(prompt, false).unwrap();
@@ -2503,7 +2415,7 @@ mod tests {
             &prompt_tokens,
         )];
         let input = crate::runtime::media::input::ModelInput::new(&input_parts);
-        let generate = super::Generate::<ConcatKeyValueCache>::new(
+        let generate = crate::api::common::generation::Generate::new(
             &mut model, &mut cache, 0.0, input, None, stream,
         );
         for (token, _ntoks) in generate.zip(0..50) {

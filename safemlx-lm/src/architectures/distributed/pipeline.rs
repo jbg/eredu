@@ -25939,13 +25939,16 @@ mod tests {
         initialize_parameters(&mut source, stream);
         let dir = tempfile::tempdir().unwrap();
         write_parameter_fixture(dir.path(), &config, &source);
-        let mut reference = crate::architectures::qwen::hybrid::qwen3_next::load_qwen3_next_model(
-            dir.path(),
-            stream,
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut reference_cache = qwen_hybrid::Cache::new(&reference.args).unwrap();
+        let mut reference =
+            crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_layerwise_model(
+                dir.path(),
+                crate::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
+                None,
+                stream,
+                cpu.stream(),
+            )
+            .unwrap();
+        let mut reference_cache = reference.new_cache();
         let token_batches = [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -25954,15 +25957,7 @@ mod tests {
             .iter()
             .map(|tokens| {
                 reference
-                    .forward(
-                        qwen_hybrid::ModelInput {
-                            inputs: tokens,
-                            inputs_embeds: None,
-                            mask: None,
-                            cache: Some(&mut reference_cache),
-                        },
-                        stream,
-                    )
+                    .forward(tokens, &mut reference_cache, stream)
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -26012,8 +26007,14 @@ mod tests {
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
         ];
-        let mut reference =
-            gpt_oss::load_test_resident_model(dir.path(), stream, cpu.stream()).unwrap();
+        let mut reference = crate::architectures::gpt_oss::layerwise::load_gpt_oss_layerwise_model(
+            dir.path(),
+            crate::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
+            None,
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
         let mut reference_cache = reference.new_cache();
         let expected = token_batches
             .iter()
@@ -26092,18 +26093,22 @@ mod tests {
         let mut qwen_source = dense_qwen::Model::new(qwen_args, stream).unwrap();
         initialize_parameters(&mut qwen_source, stream);
         let qwen_fixture = dense_qwen_gguf_fixture(&qwen_source, stream);
-        let mut qwen_reference =
-            dense_qwen::load_gguf(qwen_fixture.path(), stream, cpu.stream()).unwrap();
+        let qwen_checkpoint = safemlx::ops::GgufCheckpoint::open(qwen_fixture.path()).unwrap();
+        let qwen_metadata = crate::runtime::checkpoint::load::gguf_metadata(&qwen_checkpoint);
+        let (mut qwen_reference, _) =
+            crate::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
+                &qwen_checkpoint,
+                &qwen_metadata,
+                "qwen2",
+                WeightResidency::fully_resident(),
+                None,
+                stream,
+                cpu.stream(),
+            )
+            .unwrap();
         let mut qwen_cache = qwen_reference.new_cache();
         let qwen_expected = qwen_reference
-            .forward(
-                dense_qwen::ModelInput {
-                    inputs: &tokens[0],
-                    mask: None,
-                    cache: &mut qwen_cache,
-                },
-                stream,
-            )
+            .forward(&tokens[0], None, &mut qwen_cache, stream)
             .unwrap();
         let mut qwen_first = load_pipeline_model_with_options(
             qwen_fixture.path(),
@@ -26123,8 +26128,18 @@ mod tests {
         assert_close(&qwen_actual[0], &qwen_expected);
 
         let gpt_fixture = gpt_oss_gguf_fixture(stream);
-        let mut gpt_reference =
-            gpt_oss::load_gguf(gpt_fixture.path(), stream, cpu.stream()).unwrap();
+        let gpt_checkpoint = safemlx::ops::GgufCheckpoint::open(gpt_fixture.path()).unwrap();
+        let gpt_metadata = crate::runtime::checkpoint::load::gguf_metadata(&gpt_checkpoint);
+        let (mut gpt_reference, _) =
+            crate::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
+                &gpt_checkpoint,
+                &gpt_metadata,
+                WeightResidency::fully_resident(),
+                None,
+                stream,
+                cpu.stream(),
+            )
+            .unwrap();
         let mut gpt_cache = gpt_reference.new_cache();
         let gpt_expected = gpt_reference
             .forward(&tokens[0], &mut gpt_cache, stream)
@@ -27101,20 +27116,25 @@ mod tests {
         initialize_parameters(&mut source, stream);
         let fixture = dense_qwen_gguf_fixture(&source, stream);
 
-        let mut reference = dense_qwen::load_gguf(fixture.path(), stream, cpu.stream()).unwrap();
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let (mut reference, _) =
+            crate::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
+                &checkpoint,
+                &metadata,
+                "qwen3moe",
+                WeightResidency::fully_resident(),
+                None,
+                stream,
+                cpu.stream(),
+            )
+            .unwrap();
         let mut reference_cache = reference.new_cache();
         let expected = token_batches
             .iter()
             .map(|tokens| {
                 reference
-                    .forward(
-                        dense_qwen::ModelInput {
-                            inputs: tokens,
-                            mask: None,
-                            cache: &mut reference_cache,
-                        },
-                        stream,
-                    )
+                    .forward(tokens, None, &mut reference_cache, stream)
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -27159,7 +27179,18 @@ mod tests {
         let mut source = lfm2::Model::new(args, stream).unwrap();
         initialize_parameters(&mut source, stream);
         let fixture = lfm2_gguf_fixture(&source, stream);
-        let mut reference = lfm2::load_gguf(fixture.path(), stream, cpu.stream()).unwrap();
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let (mut reference, _) =
+            crate::architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
+                &checkpoint,
+                &metadata,
+                WeightResidency::fully_resident(),
+                None,
+                stream,
+                cpu.stream(),
+            )
+            .unwrap();
         let mut reference_cache = reference.new_cache();
         let token_batches = [
             Array::from_slice(&[1u32, 2], &[1, 2]),
@@ -27169,7 +27200,7 @@ mod tests {
         for tokens in &token_batches {
             expected.push(
                 reference
-                    .forward_logits(tokens, Some(&mut reference_cache), false, stream)
+                    .forward(tokens, &mut reference_cache, stream)
                     .unwrap(),
             );
         }
@@ -27934,7 +27965,14 @@ mod tests {
         initialize_parameters(&mut source, stream);
         let dir = tempfile::tempdir().unwrap();
         write_gemma_fixture(dir.path(), &source);
-        let mut reference = gemma4::load_gemma4_model(dir.path(), stream, cpu.stream()).unwrap();
+        let mut reference = crate::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
+            dir.path(),
+            crate::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
+            None,
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
         let mut first = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0)),
@@ -27953,7 +27991,7 @@ mod tests {
         assert_eq!(first.stage_info().global_layer_range, 0..1);
         assert_eq!(last.stage_info().global_layer_range, 1..4);
 
-        let mut reference_cache = Vec::<Option<ConcatKeyValueCache>>::new();
+        let mut reference_cache = reference.new_cache();
         let mut first_cache = first.new_cache().unwrap();
         let mut last_cache = last.new_cache().unwrap();
         for tokens in [
@@ -27961,18 +27999,7 @@ mod tests {
             Array::from_slice(&[3u32], &[1, 1]),
         ] {
             let expected = reference
-                .forward_logits(
-                    gemma4::ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: None,
-                        per_layer_input_ids: None,
-                        mask: None,
-                        sliding_masks: None,
-                        cache: &mut reference_cache,
-                    },
-                    false,
-                    stream,
-                )
+                .forward(&tokens, &mut reference_cache, stream)
                 .unwrap();
             let step = PipelineStep::new(1, tokens.shape()[1]).unwrap();
             let payload = match first
@@ -28703,7 +28730,17 @@ mod tests {
         let mut source = llama::ResidentModel::new(llama_args(true), stream).unwrap();
         initialize_parameters(&mut source, stream);
         let fixture = llama_gguf_fixture(&source);
-        let mut reference = llama::load_llama_gguf(fixture.path(), stream, cpu.stream()).unwrap();
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let (mut reference, _) = crate::architectures::llama::layerwise::load_llama_gguf_model(
+            &checkpoint,
+            &metadata,
+            WeightResidency::fully_resident(),
+            None,
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
         let mut first = load_pipeline_model_with_options(
             fixture.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0)),
@@ -28729,14 +28766,7 @@ mod tests {
             Array::from_slice(&[3u32], &[1, 1]),
         ] {
             let expected = reference
-                .forward(
-                    llama::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut reference_cache,
-                    },
-                    stream,
-                )
+                .forward(&tokens, &mut reference_cache, stream)
                 .unwrap();
             let step = PipelineStep::new(1, tokens.shape()[1]).unwrap();
             let hidden = match first
@@ -28771,7 +28801,7 @@ mod tests {
             };
             assert_close(&actual, &expected);
         }
-        assert_eq!(reference_cache[0].as_ref().unwrap().offset(), 3);
+        assert_eq!(reference_cache.offset(), 3);
         assert_eq!(first_cache.global_layers(), [0]);
         assert_eq!(last_cache.global_layers(), [1]);
     }

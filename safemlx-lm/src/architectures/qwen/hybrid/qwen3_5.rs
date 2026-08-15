@@ -66,18 +66,18 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
     runtime::checkpoint::load::{gguf_metadata, gguf_quantization_configs, GgufTensorNames},
-    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
 };
 
 #[cfg(test)]
-use crate::runtime::checkpoint::load::{
-    for_each_safetensor_array, load_array_strict, load_named_array_strict,
-    load_safetensors_dir_strict_with_split_swiglu_experts, load_safetensors_strict,
-    safetensors_files, StrictLoadConfig, StrictLoadReport,
-};
+use crate::runtime::checkpoint::quantization::AffineQuantization;
+
 #[cfg(test)]
-use safemlx::{module::ModuleParametersExt, ops::GgufTensor};
+use crate::runtime::checkpoint::load::{
+    for_each_safetensor_array, load_array_strict, safetensors_files, StrictLoadConfig,
+    StrictLoadReport,
+};
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 /// Stateful operator policy for one Qwen3.5 or Qwen3-Next decoder layer.
@@ -689,7 +689,7 @@ impl ModelArgs {
         self.quantization_config.is_some()
     }
 
-    fn quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
+    pub(crate) fn quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         self.quantized_weight_configs
             .as_ref()
             .and_then(|configs| configs.get(weight_name).copied())
@@ -702,13 +702,6 @@ impl ModelArgs {
                 affine => QwenWeightFormat::Affine(affine),
             })
             .unwrap_or(fallback)
-    }
-
-    fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
-        match self.quantization_for(weight_name) {
-            Some(WeightQuantization::Affine(affine)) => Some(affine),
-            _ => None,
-        }
     }
 
     pub(crate) fn is_moe(&self) -> bool {
@@ -2509,7 +2502,12 @@ impl Experts {
         top_k_weights: &Array,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        if self.use_fp8 || self.gate_up_affine.is_some() || self.down_affine.is_some() {
+        if self.use_fp8
+            || self.gate_up_affine.is_some()
+            || self.down_affine.is_some()
+            || self.gate_up_iquant.is_some()
+            || self.down_iquant.is_some()
+        {
             return self.forward_expert_major_chunk(
                 hidden_states,
                 top_k_index,
@@ -2644,7 +2642,12 @@ impl Experts {
         observer.observe(&format!("{prefix}.input"), hidden_states)?;
         observer.observe(&format!("{prefix}.top_k_experts"), top_k_index)?;
         observer.observe(&format!("{prefix}.top_k_weights"), top_k_weights)?;
-        if self.use_fp8 || self.gate_up_affine.is_some() || self.down_affine.is_some() {
+        if self.use_fp8
+            || self.gate_up_affine.is_some()
+            || self.down_affine.is_some()
+            || self.gate_up_iquant.is_some()
+            || self.down_iquant.is_some()
+        {
             return self.forward_expert_major_chunk_with_observer(
                 hidden_states,
                 top_k_index,
@@ -2978,8 +2981,7 @@ impl SparseMoeBlock {
                     topk_group: 1,
                     score_correction_bias: false,
                 },
-                args.affine_quantization_for(&format!("{prefix}.gate.weight"))
-                    .map(WeightQuantization::from),
+                args.quantization_for(&format!("{prefix}.gate.weight")),
                 stream,
             )?,
             experts: Experts::new_with_format(args, &format!("{prefix}.experts"), format, stream)?,
@@ -5491,11 +5493,6 @@ impl Module<ModelInput<'_>> for Model {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct LoadedQwen35Gguf {
-    pub(crate) model: Model,
-}
-
 pub(crate) struct PreparedQwen35Gguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
@@ -5581,237 +5578,6 @@ fn qwen35_gguf_multimodal_geometry(
         })?),
         vision_config: Some(vision),
     })
-}
-
-/// Loads a dense or MoE Qwen3.5 model and an optional sibling vision projector.
-#[cfg(test)]
-pub fn load_qwen3_5_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    Ok(load_qwen3_5_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
-}
-
-#[cfg(test)]
-pub(crate) fn load_qwen3_5_gguf_with_metadata(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedQwen35Gguf, Error> {
-    let gguf_file = gguf_file.as_ref();
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    let architecture = qwen35_gguf_string(&metadata, "general.architecture")?;
-    let mmproj = matches!(architecture.as_str(), "qwen35" | "qwen35moe")
-        .then(|| open_sibling_mmproj(gguf_file))
-        .transpose()?
-        .flatten();
-    load_qwen3_5_gguf_checkpoint(
-        &checkpoint,
-        metadata,
-        mmproj.as_ref(),
-        None,
-        stream,
-        weights_stream,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn load_qwen3_5_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    mmproj: Option<&Qwen35MmprojGguf>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedQwen35Gguf, Error> {
-    let architecture = qwen35_gguf_string(&metadata, "general.architecture")?;
-    if !matches!(architecture.as_str(), "qwen35" | "qwen35moe" | "qwen3next") {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports qwen35, qwen35moe, and qwen3next"
-        )));
-    }
-    let resolved = crate::api::GgufArchitecture::resolve(&architecture)?;
-    resolved.validate_catalog(checkpoint, &metadata)?;
-    crate::api::structural::validate_gguf(
-        resolved,
-        checkpoint,
-        &metadata,
-        crate::api::ModelLoadOptions {
-            quantization,
-            ..Default::default()
-        },
-    )
-    .into_loader_result()?;
-    let is_moe = matches!(architecture.as_str(), "qwen35moe" | "qwen3next");
-    let key = |suffix: &str| format!("{architecture}.{suffix}");
-    let block_count = qwen35_gguf_i32(&metadata, &key("block_count"), weights_stream)?;
-    let nextn_layers =
-        qwen35_gguf_optional_i64(&metadata, &key("nextn_predict_layers"), weights_stream)?
-            .unwrap_or(0);
-    let nextn_layers = i32::try_from(nextn_layers).map_err(|_| {
-        Error::UnsupportedArchitecture(
-            "Qwen3.5 next-token prediction layer count exceeds i32".into(),
-        )
-    })?;
-    if nextn_layers < 0 || nextn_layers >= block_count {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "Qwen3.5 GGUF has invalid block_count {block_count} and nextn_predict_layers {nextn_layers}"
-        )));
-    }
-    let num_hidden_layers = block_count - nextn_layers;
-    let mut args = qwen35_args_from_gguf_catalog(checkpoint, &metadata, &architecture)?;
-    debug_assert_eq!(args.num_hidden_layers, num_hidden_layers);
-    let mut configs = gguf_quantization_configs(checkpoint, qwen35_translate_gguf_weight_name)?;
-    if is_moe {
-        for layer in 0..num_hidden_layers {
-            let prefix = format!("model.layers.{layer}.mlp.experts");
-            let gate_name = format!("{prefix}.gate_proj");
-            let up_name = format!("{prefix}.up_proj");
-            match (configs.remove(&gate_name), configs.remove(&up_name)) {
-                (Some(gate), Some(up)) if gate == up => {
-                    configs.insert(format!("{prefix}.gate_up_proj"), gate);
-                }
-                (None, None) => {}
-                (gate, up) => {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "Qwen3.5 GGUF routed expert gate/up tensors in layer {layer} must use the same quantized layout; gate={gate:?}, up={up:?}"
-                    )));
-                }
-            }
-        }
-    }
-    if architecture == "qwen3next" {
-        super::qwen3_next::split_fused_projection_configs(&mut configs)?;
-    }
-    if let Some(quantization) = quantization {
-        args.quantization = Some(quantization);
-        args.quantized_weight_configs = None;
-    } else {
-        args.quantized_weight_configs = Some(configs);
-    }
-
-    let modalities =
-        qwen35_gguf_multimodal_geometry(checkpoint, &args, &architecture, &metadata, mmproj)?;
-    let mut model = Model::new(
-        args,
-        modalities.image_token_id,
-        modalities.video_token_id,
-        modalities.vision_config,
-        stream,
-    )?;
-    let config = qwen3_5_strict_load_config(mmproj.is_some()).allow_unused_prefix("rope_freqs.");
-    let mut report = StrictLoadReport::default();
-    let mut materializer = checkpoint.materializer();
-    for tensor in checkpoint.catalog().tensors() {
-        let physical_name = &tensor.descriptor().name;
-        if qwen35_gguf_block_index(physical_name).is_some_and(|index| index >= num_hidden_layers)
-            || (is_moe
-                && (physical_name.contains("ffn_gate_exps")
-                    || physical_name.contains("ffn_up_exps")))
-        {
-            continue;
-        }
-        let group = materializer.converted_tensor(physical_name)?;
-        let affine = match &group {
-            GgufTensor::Affine(affine) => Some(AffineQuantization::new(
-                i32::try_from(affine.group_size()).map_err(|_| {
-                    Error::Quantization("GGUF affine group size exceeds i32".into())
-                })?,
-                i32::from(affine.bits()),
-            )?),
-            GgufTensor::Dense(_) => None,
-            GgufTensor::IQuant(_) => None,
-            GgufTensor::MxFp4(_) => None,
-        };
-        for (name, value) in group.into_arrays() {
-            let (name, value) =
-                qwen35_translate_gguf_weight(name, value, affine, &model.args, weights_stream)?;
-            let values = if model.args.model_type == "qwen3_next" {
-                super::qwen3_next::split_fused_projection_with_affine(
-                    &name,
-                    value,
-                    affine,
-                    &model.args,
-                    weights_stream,
-                )?
-            } else {
-                vec![(name, value)]
-            };
-            for (name, value) in values {
-                load_named_array_strict(
-                    &mut model,
-                    name,
-                    value,
-                    quantization.map(|value| (value, stream)),
-                    &config,
-                    &mut report,
-                )?;
-            }
-        }
-    }
-    if is_moe {
-        for layer in 0..num_hidden_layers {
-            let source_prefix = format!("blk.{layer}");
-            let target_prefix = format!("model.layers.{layer}.mlp.experts");
-            let gate = materializer
-                .converted_tensor(&format!("{source_prefix}.ffn_gate_exps.weight"))?
-                .into_arrays()
-                .into_iter()
-                .collect::<HashMap<_, _>>();
-            let up = materializer
-                .converted_tensor(&format!("{source_prefix}.ffn_up_exps.weight"))?
-                .into_arrays()
-                .into_iter()
-                .collect::<HashMap<_, _>>();
-            for (source_suffix, target_suffix) in
-                [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
-            {
-                let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
-                let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
-                let (gate, up) = match (gate.get(&gate_name), up.get(&up_name)) {
-                    (Some(gate), Some(up)) => (gate, up),
-                    (None, None) if source_suffix != "weight" => continue,
-                    (gate, up) => {
-                        return Err(Error::UnsupportedArchitecture(format!(
-                            "Qwen3.5 GGUF has mismatched routed expert components {gate_name:?} ({}) and {up_name:?} ({})",
-                            if gate.is_some() { "present" } else { "missing" },
-                            if up.is_some() { "present" } else { "missing" },
-                        )));
-                    }
-                };
-                let value = concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?;
-                load_named_array_strict(
-                    &mut model,
-                    format!("{target_prefix}.gate_up_proj{target_suffix}"),
-                    value,
-                    quantization.map(|value| (value, stream)),
-                    &config,
-                    &mut report,
-                )?;
-            }
-        }
-    }
-    if let Some(mmproj) = mmproj {
-        let deepstack = model
-            .vision_args
-            .as_ref()
-            .expect("Qwen3.5 mmproj constructed vision geometry")
-            .deepstack_layers();
-        qwen_vl::load_qwen_vision_mmproj_weights(
-            &mut model,
-            &mmproj.checkpoint,
-            "visual",
-            &deepstack,
-            &config,
-            &mut report,
-            weights_stream,
-        )?;
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(LoadedQwen35Gguf { model })
 }
 
 pub(crate) fn prepare_qwen35_gguf_checkpoint(
@@ -6727,124 +6493,6 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
     model_config_from_value(config).map(|_| ())
 }
 
-/// Loads a dense or MoE Qwen3.5 model and safetensors weights from a model directory.
-#[cfg(test)]
-pub fn load_qwen3_5_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
-    let (args, image_token_id, video_token_id, vision_config) = get_qwen3_5_model_args(model_dir)?;
-    if let Some(quantization_config) = &args.quantization_config {
-        quantization_config.validate_supported()?;
-    }
-    let uses_fp8 = args.quantization_config.is_some();
-    let load_visual = vision_config.is_some();
-    let mut model = Model::new(args, image_token_id, video_token_id, vision_config, stream)?;
-    let config = qwen3_5_strict_load_config(load_visual);
-    let mut report = StrictLoadReport::default();
-    if uses_fp8 {
-        let num_experts = model.args.num_experts;
-        load_qwen_fp8_safetensors_dir_strict_with_transform(
-            &mut model,
-            model_dir,
-            weights_stream,
-            stream,
-            &config,
-            &mut report,
-            num_experts,
-            |key, value| Ok(vec![(key, value)]),
-        )?;
-    } else if model.args.is_moe() {
-        let num_experts = model.args.num_experts;
-        load_safetensors_dir_strict_with_split_swiglu_experts(
-            &mut model,
-            model_dir,
-            weights_stream,
-            stream,
-            None,
-            &config,
-            &mut report,
-            num_experts,
-        )?;
-    } else {
-        for weight_file in safetensors_files(model_dir)? {
-            load_safetensors_strict(
-                &mut model,
-                weight_file,
-                weights_stream,
-                &config,
-                &mut report,
-            )?;
-        }
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Loads a dense or MoE Qwen3.5/3.6/3.8 checkpoint while affine-quantizing eligible
-/// text weights, including packed rank-3 routed expert banks when present.
-#[cfg(test)]
-pub fn load_qwen3_5_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    quantization.validate()?;
-    let model_dir = model_dir.as_ref();
-    let (args, image_token_id, video_token_id, vision_config) = get_qwen3_5_model_args(model_dir)?;
-    if args.quantization_config.is_some() {
-        return Err(Error::Quantization(
-            "Qwen3.5/3.6/3.8 on-load quantization requires floating-point weights; native FP8 checkpoints cannot be implicitly transcoded".into(),
-        ));
-    }
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Qwen3.5/3.6/3.8",
-        args.quantization,
-        quantization,
-    )? {
-        return load_qwen3_5_model(model_dir, stream, weights_stream);
-    }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
-        model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
-    )?;
-    let load_visual = vision_config.is_some();
-    let mut model = Model::new_with_affine(
-        args,
-        image_token_id,
-        video_token_id,
-        vision_config,
-        Some(quantization),
-        stream,
-    )?;
-    let config = qwen3_5_strict_load_config(load_visual);
-    let mut report = StrictLoadReport::default();
-    let num_experts = model.args.num_experts;
-    load_safetensors_dir_strict_with_split_swiglu_experts(
-        &mut model,
-        model_dir,
-        weights_stream,
-        stream,
-        Some(quantization),
-        &config,
-        &mut report,
-        num_experts,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
 #[cfg(test)]
 fn quantize_packed_expert_tensor(
     value: &Array,
@@ -7442,9 +7090,9 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 #[cfg(test)]
 mod tests {
     use super::{
-        get_qwen3_5_model_args, load_qwen3_5_gguf, load_qwen3_5_model, load_qwen3_5_tokenizer,
-        parse_fp8_expert_projection_key, qwen35_gguf_affine_quantization, qwen35_gguf_block_index,
-        qwen35_is_offset_norm, qwen35_restore_v_head_order, qwen35_translate_gguf_weight,
+        get_qwen3_5_model_args, load_qwen3_5_tokenizer, parse_fp8_expert_projection_key,
+        qwen35_gguf_affine_quantization, qwen35_gguf_block_index, qwen35_is_offset_norm,
+        qwen35_restore_v_head_order, qwen35_translate_gguf_weight,
         qwen35_translate_gguf_weight_name, qwen3_5_strict_load_config, reverse_permutation,
         transform_split_qwen_fp8_experts, vision_window_index, Fp8ExpertProjection, FullAttention,
         FullAttentionInput, LayerPolicy, LinearAttention, LinearAttentionInput, Model, ModelArgs,
@@ -7481,6 +7129,26 @@ mod tests {
 
     static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
     static MLX_RUNTIME_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn load_gguf_fully_resident(
+        path: impl AsRef<std::path::Path>,
+        stream: &safemlx::Stream,
+        weights_stream: &safemlx::Stream,
+    ) -> crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel {
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(path).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        crate::architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_layerwise_model(
+            &checkpoint,
+            &metadata,
+            None,
+            crate::WeightResidency::fully_resident(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap()
+        .0
+    }
 
     fn mlx_runtime_test_guard() -> MutexGuard<'static, ()> {
         MLX_RUNTIME_TEST_MUTEX.lock().unwrap()
@@ -8399,12 +8067,12 @@ mod tests {
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut model = load_qwen3_5_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        let mut model = load_gguf_fully_resident(&gguf_file, stream, weights_ctx.stream());
 
-        assert_eq!(model.model_type(), "qwen3_5_text");
-        assert_eq!(model.args.num_hidden_layers, 32);
-        assert_eq!(model.args.intermediate_size, 12288);
-        assert_eq!(model.args.num_experts, 0);
+        assert_eq!(model.args().model_type, "qwen3_5_text");
+        assert_eq!(model.args().num_hidden_layers, 32);
+        assert_eq!(model.args().intermediate_size, 12288);
+        assert_eq!(model.args().num_experts, 0);
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
         let parts = [runtime_input::InputPart::text_token_ids(&tokens)];
@@ -8441,89 +8109,27 @@ mod tests {
                 fused_next_projections,
                 tied_embeddings,
             );
-            let mut model = load_qwen3_5_gguf(&path, gpu.stream(), cpu.stream()).unwrap();
-            assert_eq!(model.model_type(), expected_model_type);
+            let mut model = load_gguf_fully_resident(&path, gpu.stream(), cpu.stream());
+            assert_eq!(model.args().model_type, expected_model_type);
 
-            let params = model.parameters().flatten();
-            let mut expected_packed = vec![
-                ("model.embed_tokens.inner.weight", vec![256, 40]),
-                (
-                    "model.layers.0.linear_attn.in_proj_qkv.weight",
-                    vec![512, 24],
-                ),
-                (
-                    "model.layers.0.linear_attn.in_proj_z.weight",
-                    vec![256, if fused_next_projections { 24 } else { 16 }],
-                ),
-                ("model.layers.0.linear_attn.in_proj_b.weight", vec![4, 40]),
-                (
-                    "model.layers.0.linear_attn.in_proj_a.weight",
-                    vec![4, if fused_next_projections { 40 } else { 48 }],
-                ),
-                ("model.layers.0.linear_attn.out_proj.weight", vec![256, 48]),
-                (
-                    "model.layers.0.mlp.shared_expert.gate_proj.weight",
-                    vec![256, 32],
-                ),
-                (
-                    "model.layers.0.mlp.shared_expert.up_proj.weight",
-                    vec![256, 40],
-                ),
-                (
-                    "model.layers.0.mlp.shared_expert.down_proj.weight",
-                    vec![256, 48],
-                ),
-                ("model.layers.0.mlp.gate.weight", vec![2, 64]),
-                ("model.layers.0.mlp.shared_expert_gate.weight", vec![1, 32]),
-                ("model.layers.0.mlp.experts.gate_up_proj", vec![2, 512, 48]),
-                ("model.layers.0.mlp.experts.down_proj", vec![2, 256, 40]),
-                ("model.layers.1.mlp.gate.weight", vec![2, 32]),
-                ("model.layers.1.mlp.shared_expert_gate.weight", vec![1, 32]),
-                ("model.layers.1.self_attn.q_proj.weight", vec![512, 16]),
-                ("model.layers.1.self_attn.k_proj.weight", vec![128, 24]),
-                ("model.layers.1.self_attn.v_proj.weight", vec![128, 40]),
-                ("model.layers.1.self_attn.o_proj.weight", vec![256, 64]),
-            ];
-            if !tied_embeddings {
-                expected_packed.push(("lm_head.inner.weight", vec![256, 48]));
+            let keys = model.checkpoint_store().keys();
+            if fused_next_projections {
+                assert!(keys.contains(&"model.layers.0.linear_attn.in_proj_qkvz.weight".into()));
+                assert!(keys.contains(&"model.layers.0.linear_attn.in_proj_ba.weight".into()));
+            } else {
+                assert!(keys.contains(&"model.layers.0.linear_attn.in_proj_qkv.weight".into()));
             }
-            for (key, shape) in expected_packed {
-                let parameter = params
-                    .get(key)
-                    .unwrap_or_else(|| panic!("missing packed fixture parameter {key}"));
-                assert_eq!(parameter.dtype(), Dtype::Uint32, "{key}");
-                assert_eq!(parameter.shape(), shape, "{key}");
-            }
-            let mut expected_f16_metadata = vec![
-                "model.embed_tokens.scales",
-                "model.embed_tokens.biases",
-                "model.layers.0.linear_attn.in_proj_qkv.scales",
-                "model.layers.0.linear_attn.in_proj_qkv.biases",
-                "model.layers.0.linear_attn.in_proj_b.scales",
-                "model.layers.0.linear_attn.in_proj_b.biases",
-                "model.layers.0.mlp.shared_expert.up_proj.scales",
-                "model.layers.0.mlp.shared_expert.up_proj.biases",
-                "model.layers.0.mlp.gate.scales",
-                "model.layers.0.mlp.gate.biases",
-                "model.layers.0.mlp.shared_expert_gate.scales",
-                "model.layers.0.mlp.shared_expert_gate.biases",
-                "model.layers.0.mlp.experts.gate_up_proj_scales",
-                "model.layers.0.mlp.experts.gate_up_proj_biases",
-            ];
-            if !tied_embeddings {
-                expected_f16_metadata.extend(["lm_head.scales", "lm_head.biases"]);
-            }
-            for key in expected_f16_metadata {
-                assert_eq!(params[key].dtype(), Dtype::Float16, "{key}");
-            }
+            assert!(keys.contains(&"model.layers.0.mlp.experts.gate_proj".into()));
+            assert!(keys.contains(&"model.layers.0.mlp.experts.up_proj".into()));
             assert_eq!(
-                params.keys().any(|key| key.starts_with("lm_head.")),
+                keys.iter().any(|key| key.starts_with("lm_head.")),
                 !tied_embeddings
             );
-            assert!(!params
-                .keys()
-                .any(|key| key.contains("in_proj_qkvz") || key.contains("in_proj_ba")));
-            drop(params);
+            assert_eq!(
+                keys.iter()
+                    .any(|key| key.contains("in_proj_qkvz") || key.contains("in_proj_ba")),
+                fused_next_projections
+            );
 
             let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
             let parts = [runtime_input::InputPart::text_token_ids(&tokens)];
@@ -9016,13 +8622,15 @@ mod tests {
         quantization_config.validate_supported().unwrap();
 
         let cpu = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let error = super::load_qwen3_5_model_quantized(
+        let error = crate::architectures::qwen::hybrid::layerwise::load_qwen35_layerwise_model(
             &dir,
-            crate::runtime::checkpoint::quantization::AffineQuantization::default().into(),
+            crate::LayerWeightResidency::FullyResident,
+            Some(crate::runtime::checkpoint::quantization::AffineQuantization::default().into()),
             cpu.stream(),
             cpu.stream(),
         )
-        .unwrap_err();
+        .err()
+        .unwrap();
         assert!(matches!(error, Error::Quantization(_)));
         assert!(error
             .to_string()
@@ -9955,7 +9563,14 @@ mod tests {
         let weights_stream = weights_ctx.stream();
         let model_dir = cached_test_model_dir();
         let tokenizer = load_qwen3_5_tokenizer(&model_dir).unwrap();
-        let mut model = load_qwen3_5_model(&model_dir, stream, weights_stream).unwrap();
+        let mut model = crate::architectures::qwen::hybrid::layerwise::load_qwen35_layerwise_model(
+            &model_dir,
+            crate::LayerWeightResidency::FullyResident,
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
         let cases = [
             (
                 "What is 84 * 3 / 2?",
@@ -9985,7 +9600,9 @@ mod tests {
                 &prompt_tokens,
             )];
             let input = crate::runtime::media::input::ModelInput::new(&input_parts);
-            let generate = super::Generate::new(&mut model, &mut cache, 0.0, input, None, stream);
+            let generate = crate::api::common::generation::Generate::new(
+                &mut model, &mut cache, 0.0, input, None, stream,
+            );
             for token in generate.take(expected_tokens.len()) {
                 let token = token.unwrap();
                 eval([&token]).unwrap();

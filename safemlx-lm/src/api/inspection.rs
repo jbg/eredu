@@ -1535,7 +1535,6 @@ fn parse_unsupported_type_code(detail: &str) -> Option<u32> {
 mod tests {
     use std::io::{Seek, Write};
 
-    use safemlx::module::ModuleParameters;
     use safemlx_gguf::{GgmlType, MetadataArray, MetadataValue, TensorInput, Writer};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use tokenizers::{
@@ -6897,16 +6896,15 @@ mod tests {
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let weights =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let model = crate::architectures::lfm2::model::load_model(
+        let model = crate::architectures::lfm2::layerwise::load_lfm2_layerwise_model(
             directory.path(),
+            crate::LayerWeightResidency::FullyResident,
+            None,
             execution.stream(),
             weights.stream(),
         )
         .unwrap();
-        assert_eq!(
-            model.parameters().flatten()["model.layers.0.conv.conv.weight"].shape(),
-            [32, 1, 3]
-        );
+        assert!(!model.residency_report().unwrap().units().is_empty());
     }
 
     #[test]

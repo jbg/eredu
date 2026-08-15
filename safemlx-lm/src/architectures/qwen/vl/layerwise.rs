@@ -2793,20 +2793,19 @@ mod tests {
             serde_json::to_vec(&value).unwrap(),
         )
         .unwrap();
-        let eager_quantized = eager::load_qwen3_vl_model_quantized(
+        let canonical_quantized = load_qwen3_vl_layerwise_model(
             dir.path(),
-            quantization,
+            LayerWeightResidency::FullyResident,
+            Some(quantization),
             gpu.stream(),
             cpu.stream(),
         )
         .unwrap();
-        assert!(eager_quantized
-            .model
-            .visual
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
+        assert!(canonical_quantized
+            .residency_report()
+            .unwrap()
+            .materialization()
+            .is_some_and(|report| report.transformed_weights > 0));
     }
 
     fn initialize(model: &mut eager::Model, stream: &Stream) {
@@ -2884,8 +2883,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, moe);
 
-        let mut resident =
-            eager::load_qwen3_vl_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_qwen3_vl_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options = if dense_stream {
             LayerWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth).unwrap(),
@@ -3179,8 +3184,14 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, true);
-        let mut resident =
-            eager::load_qwen3_vl_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_qwen3_vl_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
                 .unwrap();

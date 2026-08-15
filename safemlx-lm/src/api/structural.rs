@@ -1,33 +1,33 @@
 //! Pure checkpoint-structure plans shared by inspection and high-level loading.
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::Path;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
 
 use super::{GgufArchitecture, ModelKind, ModelLoadOptions};
-use crate::{
-    architectures::{
-        deepseek_v3::checkpoint as deepseek_v3_checkpoint,
-        deepseek_v4::checkpoint as deepseek_v4_checkpoint,
-        gemma4::{checkpoint as gemma4_checkpoint, model as gemma4},
-        gpt_oss::checkpoint as gpt_oss_checkpoint,
-        inkling::{checkpoint as inkling_checkpoint, model as inkling},
-        kimi_linear::checkpoint as kimi_linear_checkpoint,
-        lfm2::checkpoint as lfm2_checkpoint,
-        llama::checkpoint as llama_checkpoint,
-        moshi::personaplex_checkpoint,
-        muse_glimmer::checkpoint as muse_glimmer_checkpoint,
-        nemotron_h::checkpoint as nemotron_h_checkpoint,
-        qwen::{
-            dense::checkpoint as dense_qwen_checkpoint,
-            hybrid::checkpoint as qwen_hybrid_checkpoint, vl::checkpoint as qwen_vl_checkpoint,
-        },
+use crate::architectures::{
+    deepseek_v3::checkpoint as deepseek_v3_checkpoint,
+    deepseek_v4::checkpoint as deepseek_v4_checkpoint,
+    gemma4::{checkpoint as gemma4_checkpoint, model as gemma4},
+    gpt_oss::checkpoint as gpt_oss_checkpoint,
+    inkling::{checkpoint as inkling_checkpoint, model as inkling},
+    kimi_linear::checkpoint as kimi_linear_checkpoint,
+    lfm2::checkpoint as lfm2_checkpoint,
+    llama::checkpoint as llama_checkpoint,
+    moshi::personaplex_checkpoint,
+    muse_glimmer::checkpoint as muse_glimmer_checkpoint,
+    nemotron_h::checkpoint as nemotron_h_checkpoint,
+    qwen::{
+        dense::checkpoint as dense_qwen_checkpoint, hybrid::checkpoint as qwen_hybrid_checkpoint,
+        vl::checkpoint as qwen_vl_checkpoint,
     },
-    error::Error,
-    runtime::checkpoint::store::SafetensorsWeightStore,
 };
+#[cfg(test)]
+use crate::error::Error;
+use crate::runtime::checkpoint::store::SafetensorsWeightStore;
 
 pub(crate) use crate::runtime::checkpoint::contract::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
@@ -148,6 +148,7 @@ pub(crate) fn validate_safetensors(
     validation.with_strict_catalog(options.weight_residency.strict_loading())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_safetensors_load_path(
     kind: ModelKind,
     model_dir: &Path,

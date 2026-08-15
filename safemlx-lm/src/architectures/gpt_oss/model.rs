@@ -41,17 +41,6 @@ use crate::{
     },
 };
 
-#[cfg(test)]
-use crate::runtime::checkpoint::load::gguf_metadata;
-#[cfg(test)]
-use crate::runtime::checkpoint::load::{
-    load_named_array_strict, load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
-};
-#[cfg(test)]
-use safemlx::module::ModuleParametersExt;
-#[cfg(test)]
-use safemlx::ops::stack_axis;
-
 fn default_head_dim() -> i32 {
     64
 }
@@ -1604,162 +1593,9 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
-#[cfg(test)]
-pub(crate) struct LoadedGptOssGguf {
-    pub(crate) model: Model,
-}
-
 pub(crate) struct PreparedGptOssGguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
-}
-
-/// Loads a canonical llama.cpp `gpt-oss` GGUF checkpoint.
-#[cfg(test)]
-pub fn load_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
-}
-
-#[cfg(test)]
-pub(crate) fn load_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedGptOssGguf, Error> {
-    let mut prepared = prepare_gguf_checkpoint(checkpoint, &metadata, weights_stream)?;
-    if let Some(quantization) = quantization {
-        if quantization != WeightQuantization::MxFp4 {
-            return Err(Error::Quantization(
-                "GPT-OSS GGUF load-time quantization only supports MXFP4 dense projections".into(),
-            ));
-        }
-        prepared.args.quantization = Some(quantization);
-        prepared.args.quantized_weight_configs = None;
-    }
-    let mut model = Model::new(prepared.args, stream)?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    let mut materializer = checkpoint.materializer();
-
-    for tensor in checkpoint.catalog().tensors() {
-        let physical = &tensor.descriptor().name;
-        if physical.contains("ffn_gate_exps")
-            || physical.contains("ffn_up_exps")
-            || physical.contains("ffn_down_exps")
-        {
-            continue;
-        }
-        for (name, value) in materializer.converted_tensor(physical)?.into_arrays() {
-            load_named_array_strict(
-                &mut model,
-                translate_gguf_weight_name(&name),
-                value,
-                quantization.map(|value| (value, stream)),
-                &config,
-                &mut report,
-            )?;
-        }
-    }
-
-    for layer in 0..model.args.num_hidden_layers as usize {
-        let source = format!("blk.{layer}");
-        let target = format!("model.layers.{layer}.mlp.experts");
-        let converted = |materializer: &mut safemlx::ops::GgufMaterializer,
-                         physical: String|
-         -> Result<HashMap<String, Array>, Error> {
-            Ok(materializer
-                .converted_tensor(&physical)?
-                .into_arrays()
-                .into_iter()
-                .collect())
-        };
-        let gate_physical = format!("{source}.ffn_gate_exps.weight");
-        let up_physical = format!("{source}.ffn_up_exps.weight");
-        let down_physical = format!("{source}.ffn_down_exps.weight");
-        let gate = converted(&mut materializer, gate_physical.clone())?;
-        let up = converted(&mut materializer, up_physical.clone())?;
-        let down = converted(&mut materializer, down_physical.clone())?;
-        let get = |arrays: &HashMap<String, Array>, name: String| {
-            arrays.get(&name).cloned().ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "GPT-OSS GGUF is missing converted tensor {name:?}"
-                ))
-            })
-        };
-        let gate_weight = get(&gate, gate_physical.clone())?;
-        let up_weight = get(&up, up_physical.clone())?;
-        let gate_scales = get(&gate, gate_physical.replace(".weight", ".scales"))?;
-        let up_scales = get(&up, up_physical.replace(".weight", ".scales"))?;
-        let experts = model.args.num_local_experts;
-        let intermediate = model.args.intermediate_size;
-        let hidden = model.args.hidden_size;
-        let gate_up_weight = stack_axis(&[gate_weight, up_weight], 2, weights_stream)?
-            .reshape(&[experts, 2 * intermediate, hidden / 8], weights_stream)?
-            .view::<u8>(weights_stream)?
-            .reshape(
-                &[experts, 2 * intermediate, hidden / 32, 16],
-                weights_stream,
-            )?;
-        let gate_up_scales = stack_axis(&[gate_scales, up_scales], 2, weights_stream)?
-            .reshape(&[experts, 2 * intermediate, hidden / 32], weights_stream)?;
-        let down_weight = get(&down, down_physical.clone())?
-            .view::<u8>(weights_stream)?
-            .reshape(&[experts, hidden, intermediate / 32, 16], weights_stream)?;
-        let down_scales = get(&down, down_physical.replace(".weight", ".scales"))?;
-
-        for (name, value) in [
-            (format!("{target}.gate_up_proj_blocks"), gate_up_weight),
-            (format!("{target}.gate_up_proj_scales"), gate_up_scales),
-            (format!("{target}.down_proj_blocks"), down_weight),
-            (format!("{target}.down_proj_scales"), down_scales),
-        ] {
-            load_named_array_strict(&mut model, name, value, None, &config, &mut report)?;
-        }
-
-        let gate_bias_name = format!("{source}.ffn_gate_exps.bias");
-        let up_bias_name = format!("{source}.ffn_up_exps.bias");
-        let down_bias_name = format!("{source}.ffn_down_exps.bias");
-        let gate_bias = materializer
-            .converted_tensor(&gate_bias_name)?
-            .into_arrays()
-            .into_iter()
-            .next()
-            .map(|(_, value)| value)
-            .ok_or_else(|| Error::UnsupportedArchitecture("empty GPT-OSS gate bias".into()))?;
-        let up_bias = materializer
-            .converted_tensor(&up_bias_name)?
-            .into_arrays()
-            .into_iter()
-            .next()
-            .map(|(_, value)| value)
-            .ok_or_else(|| Error::UnsupportedArchitecture("empty GPT-OSS up bias".into()))?;
-        let gate_up_bias = stack_axis(&[gate_bias, up_bias], 2, weights_stream)?
-            .reshape(&[experts, 2 * intermediate], weights_stream)?;
-        let down_bias = materializer
-            .converted_tensor(&down_bias_name)?
-            .into_arrays()
-            .into_iter()
-            .next()
-            .map(|(_, value)| value)
-            .ok_or_else(|| Error::UnsupportedArchitecture("empty GPT-OSS down bias".into()))?;
-        for (name, value) in [
-            (format!("{target}.gate_up_proj_bias"), gate_up_bias),
-            (format!("{target}.down_proj_bias"), down_bias),
-        ] {
-            load_named_array_strict(&mut model, name, value, None, &config, &mut report)?;
-        }
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(LoadedGptOssGguf { model })
 }
 
 pub(crate) fn prepare_gguf_checkpoint(
@@ -2023,28 +1859,6 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let config =
         serde_json::from_reader(std::fs::File::open(model_dir.as_ref().join("config.json"))?)?;
     model_args_from_config_value(&config)
-}
-
-/// Test-only eager reference loader used to compare the canonical engine.
-#[cfg(test)]
-pub(crate) fn load_test_resident_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
-    let mut model = Model::new(get_model_args(model_dir)?, stream)?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    load_safetensors_dir_strict(&mut model, model_dir, weights_stream, &config, &mut report)?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
 }
 
 /// Loads `tokenizer.json` from a GPT-OSS model directory.
@@ -2326,11 +2140,24 @@ mod tests {
                 name.contains("_exps.weight")
                     .then_some(safemlx_gguf::GgmlType::MxFp4)
             });
-        let loaded = super::load_gguf(fixture.path(), stream, stream).unwrap();
-        assert_eq!(loaded.args.num_hidden_layers, args.num_hidden_layers);
-        assert_eq!(loaded.args.num_local_experts, args.num_local_experts);
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let (loaded, _) =
+            crate::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
+                &checkpoint,
+                &metadata,
+                crate::WeightResidency::fully_resident(),
+                None,
+                stream,
+                weights.stream(),
+            )
+            .unwrap();
+        assert_eq!(loaded.args().num_hidden_layers, args.num_hidden_layers);
+        assert_eq!(loaded.args().num_local_experts, args.num_local_experts);
         assert_eq!(
-            loaded.args.attention_schedule.fingerprint_component(),
+            loaded.args().attention_schedule.fingerprint_component(),
             "s8,f"
         );
     }

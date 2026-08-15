@@ -2484,8 +2484,14 @@ mod tests {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let dir = fixture(&gpu);
-        let mut resident =
-            eager::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_moshi_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let mut layerwise = load_moshi_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
@@ -2511,7 +2517,7 @@ mod tests {
             assert_close(expected, actual);
         }
 
-        let mut resident_state = resident::GenerationState::new(&resident);
+        let mut resident_state = resident.new_generation_state();
         let mut layerwise_state = layerwise.new_generation_state();
         let input = Array::from_slice(&[4i32, 5], &[1, 2]);
         let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
@@ -2602,8 +2608,14 @@ mod tests {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let dir = fixture(&gpu);
-        let mut resident =
-            eager::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_moshi_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
         let mut streamed = load_moshi_layerwise_model(
             dir.path(),
@@ -2646,7 +2658,7 @@ mod tests {
             assert_close(expected, actual);
         }
 
-        let mut resident_state = resident::GenerationState::new(&resident);
+        let mut resident_state = resident.new_generation_state();
         let mut streamed_state = streamed.new_generation_state();
         let input = Array::from_slice(&[4i32, 5], &[1, 2]);
         let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
@@ -2758,9 +2770,12 @@ mod tests {
         let path = dir.path().join("model.safetensors");
         write_pytorch_fixture(&path, &fixture, gpu.stream());
 
-        let mut resident = eager::load_test_pytorch_resident_model(
-            args.clone(),
+        let mut resident = load_with_layout(
             &path,
+            args.clone(),
+            CheckpointLayout::Pytorch,
+            LayerWeightResidency::FullyResident,
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -2775,7 +2790,7 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        let mut resident_state = resident::GenerationState::new(&resident);
+        let mut resident_state = resident.new_generation_state();
         let mut layerwise_state = layerwise.new_generation_state();
         let user = Array::from_slice(&[3i32, 4], &[1, 2]);
         let agent = Array::from_slice(&[1i32, 2], &[1, 2]);

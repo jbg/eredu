@@ -38,7 +38,17 @@ use safemlx_lm::{
         kimi_linear::model as kimi_linear,
         lfm2::model as lfm2,
         nemotron_h::model as nemotron_h,
-        qwen::{dense as dense_qwen, hybrid::qwen3_5, vl::model as qwen3_vl},
+        qwen::{
+            dense::{
+                self as dense_qwen,
+                layerwise::{
+                    load_safetensors as load_qwen_safetensors,
+                    LayerwiseDecoder as DenseQwenLayerwiseDecoder,
+                },
+            },
+            hybrid::qwen3_5,
+            vl::model as qwen3_vl,
+        },
     },
     runtime::cache::{ConcatKeyValueCache, SlidingKeyValueCache},
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
@@ -940,76 +950,96 @@ fn save_expected(
     save_arrays(path, &arrays);
 }
 
-fn save_qwen_expected(model: &mut dense_qwen::Model, path: &Path, stream: &Stream) {
+trait QwenReference {
+    fn forward_reference(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Vec<Option<ConcatKeyValueCache>>,
+        stream: &Stream,
+    ) -> Array;
+
+    fn forward_sliding_reference(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Vec<Option<SlidingKeyValueCache>>,
+        stream: &Stream,
+    ) -> Array;
+}
+
+impl QwenReference for dense_qwen::Model {
+    fn forward_reference(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Vec<Option<ConcatKeyValueCache>>,
+        stream: &Stream,
+    ) -> Array {
+        self.forward(
+            dense_qwen::ModelInput {
+                inputs: tokens,
+                mask: None,
+                cache,
+            },
+            stream,
+        )
+        .unwrap()
+    }
+
+    fn forward_sliding_reference(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Vec<Option<SlidingKeyValueCache>>,
+        stream: &Stream,
+    ) -> Array {
+        self.forward(
+            dense_qwen::ModelInput {
+                inputs: tokens,
+                mask: None,
+                cache,
+            },
+            stream,
+        )
+        .unwrap()
+    }
+}
+
+impl QwenReference for DenseQwenLayerwiseDecoder {
+    fn forward_reference(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Vec<Option<ConcatKeyValueCache>>,
+        stream: &Stream,
+    ) -> Array {
+        self.forward(tokens, None, cache, stream).unwrap()
+    }
+
+    fn forward_sliding_reference(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Vec<Option<SlidingKeyValueCache>>,
+        stream: &Stream,
+    ) -> Array {
+        self.forward_sliding(tokens, None, cache, stream).unwrap()
+    }
+}
+
+fn save_qwen_expected(model: &mut impl QwenReference, path: &Path, stream: &Stream) {
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-    let prefill = model
-        .forward(
-            dense_qwen::ModelInput {
-                inputs: &prompt,
-                mask: None,
-                cache: &mut cache,
-            },
-            stream,
-        )
-        .unwrap();
+    let prefill = model.forward_reference(&prompt, &mut cache, stream);
     let first = greedy_token(&prefill, stream);
-    let decode = model
-        .forward(
-            dense_qwen::ModelInput {
-                inputs: &first,
-                mask: None,
-                cache: &mut cache,
-            },
-            stream,
-        )
-        .unwrap();
+    let decode = model.forward_reference(&first, &mut cache, stream);
     let second = greedy_token(&decode, stream);
-    let decode_second = model
-        .forward(
-            dense_qwen::ModelInput {
-                inputs: &second,
-                mask: None,
-                cache: &mut cache,
-            },
-            stream,
-        )
-        .unwrap();
+    let decode_second = model.forward_reference(&second, &mut cache, stream);
     let third = greedy_token(&decode_second, stream);
 
     let mut sliding_cache = vec![Some(SlidingKeyValueCache::new(2))];
-    let sliding_prefill = model
-        .forward(
-            dense_qwen::ModelInput {
-                inputs: &prompt,
-                mask: None,
-                cache: &mut sliding_cache,
-            },
-            stream,
-        )
-        .unwrap();
+    let sliding_prefill = model.forward_sliding_reference(&prompt, &mut sliding_cache, stream);
     let sliding_first = greedy_token(&sliding_prefill, stream);
-    let sliding_decode = model
-        .forward(
-            dense_qwen::ModelInput {
-                inputs: &sliding_first,
-                mask: None,
-                cache: &mut sliding_cache,
-            },
-            stream,
-        )
-        .unwrap();
+    let sliding_decode =
+        model.forward_sliding_reference(&sliding_first, &mut sliding_cache, stream);
     let sliding_second = greedy_token(&sliding_decode, stream);
-    let sliding_decode_second = model
-        .forward(
-            dense_qwen::ModelInput {
-                inputs: &sliding_second,
-                mask: None,
-                cache: &mut sliding_cache,
-            },
-            stream,
-        )
-        .unwrap();
+    let sliding_decode_second =
+        model.forward_sliding_reference(&sliding_second, &mut sliding_cache, stream);
     save_expected(
         path,
         prefill,
@@ -1139,9 +1169,15 @@ fn write_qwen_fixture(directory: &Path, packed_directory: &Path) {
     split_qwen_checkpoint(&model, directory, stream);
     save_qwen_expected(&mut model, &directory.join("expected.safetensors"), stream);
     let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
-    let mut quantized =
-        dense_qwen::load_safetensors_quantized(packed_directory, quantization, stream, stream)
-            .unwrap();
+    let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let mut quantized = load_qwen_safetensors(
+        packed_directory,
+        LayerWeightResidency::FullyResident,
+        Some(quantization),
+        stream,
+        weights.stream(),
+    )
+    .unwrap();
     save_qwen_expected(
         &mut quantized,
         &packed_directory.join("expected-affine.safetensors"),
@@ -1634,10 +1670,10 @@ fn write_qwen3_vl_moe_gguf_fixture(root: &Path) -> PathBuf {
         .unwrap();
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
-    let model = qwen3_vl::load_qwen3_vl_model(&source, stream, stream).unwrap();
+    let parameters = Array::load_safetensors(source.join("model.safetensors"), stream).unwrap();
     let mut text = HashMap::new();
     let mut vision = HashMap::new();
-    for (name, value) in model.parameters().flatten() {
+    for (name, value) in parameters {
         if let Some(name) = name.strip_prefix("model.language_model.") {
             if let Some(rest) = name.strip_prefix("layers.") {
                 let (layer, suffix) = rest.split_once('.').unwrap();

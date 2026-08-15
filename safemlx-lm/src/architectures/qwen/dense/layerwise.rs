@@ -303,6 +303,25 @@ impl LayerwiseDecoder {
         result
     }
 
+    /// Runs Qwen2/Qwen2.5 or Qwen3 with an explicitly sliding KV cache.
+    pub fn forward_sliding(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<SlidingKeyValueCache>>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
+        let result =
+            self.execution
+                .forward(DenseQwenAdapterInput { inputs, mask }, &mut owned, stream);
+        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
+            unreachable!("dense-Qwen sliding cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
     /// Runs dense Qwen through the canonical observer contract.
     pub fn forward_with_observer(
         &mut self,
@@ -2842,8 +2861,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, false, gpu.stream());
 
-        let mut resident =
-            dense_qwen::load_safetensors(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_safetensors(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let mut layerwise = load_safetensors(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
@@ -2861,14 +2886,7 @@ mod tests {
             Array::from_slice(&[5u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward(
-                    dense_qwen::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut resident_cache,
-                    },
-                    gpu.stream(),
-                )
+                .forward(&tokens, None, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = layerwise
                 .forward(&tokens, None, &mut layerwise_cache, gpu.stream())
@@ -3282,23 +3300,22 @@ mod tests {
                     && !unit.device_resident()
             }));
 
-        let mut resident =
-            dense_qwen::load_safetensors(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut resident_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut resident = load_safetensors(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut resident_cache = resident.new_cache();
         let mut cached_cache = cached.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward(
-                    dense_qwen::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut resident_cache,
-                    },
-                    gpu.stream(),
-                )
+                .forward(&tokens, None, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = cached
                 .forward(&tokens, None, &mut cached_cache, gpu.stream())
@@ -3490,8 +3507,14 @@ mod tests {
         let resident_dir = tempfile::tempdir().unwrap();
         write_fixture(resident_dir.path(), &fixture, false, gpu.stream());
 
-        let mut resident =
-            dense_qwen::load_safetensors(resident_dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_safetensors(
+            resident_dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let non_expert = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
         let expert_options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
@@ -3505,7 +3528,7 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        let mut resident_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut resident_cache = resident.new_cache();
         let mut cached_cache = cached.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
@@ -3513,14 +3536,7 @@ mod tests {
             Array::from_slice(&[4u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward(
-                    dense_qwen::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut resident_cache,
-                    },
-                    gpu.stream(),
-                )
+                .forward(&tokens, None, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = cached
                 .forward(&tokens, None, &mut cached_cache, gpu.stream())

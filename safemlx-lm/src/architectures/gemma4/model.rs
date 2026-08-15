@@ -70,18 +70,10 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache,
     },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_safetensors_quantized_strict,
-        load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
+    runtime::checkpoint::load::{gguf_metadata, gguf_quantization_configs, GgufTensorNames},
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::ActivationObserver,
 };
-
-#[cfg(test)]
-use crate::runtime::checkpoint::load::{load_named_array_strict, load_named_iq_array_strict};
-#[cfg(test)]
-use safemlx::ops::GgufType;
 
 #[derive(Debug, Clone, Default)]
 /// Profiling counters accumulated by Gemma 4 when profiling is enabled.
@@ -4333,11 +4325,6 @@ pub fn load_gemma4_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, E
     Tokenizer::from_file(file).map_err(Into::into)
 }
 
-#[cfg(test)]
-pub(crate) struct LoadedGemma4Gguf {
-    pub(crate) model: Model,
-}
-
 pub(crate) struct PreparedGemma4Gguf {
     pub(crate) args: ModelArgs,
     pub(crate) vision_config: Option<Gemma4VisionConfig>,
@@ -4366,136 +4353,6 @@ pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<Gemma4Mmpro
         checkpoint,
         metadata,
     }))
-}
-
-/// Loads a Gemma 4 GGUF and its optional sibling multimodal projector.
-///
-/// Dense tensors and every GGUF quantization supported by the shared backend are
-/// accepted for both dense and MoE text checkpoints. A unique nearby
-/// `mmproj-*.gguf` supplies the vision/audio towers when present.
-#[cfg(test)]
-pub fn load_gemma4_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    Ok(load_gemma4_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
-}
-
-/// Loads a Gemma 4 text GGUF with an explicit vision/audio projector GGUF.
-#[cfg(test)]
-pub fn load_gemma4_gguf_with_mmproj(
-    gguf_file: impl AsRef<Path>,
-    mmproj_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    let projector_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-    let projector = Gemma4MmprojGguf {
-        metadata: gguf_metadata(&projector_checkpoint),
-        checkpoint: projector_checkpoint,
-    };
-    validate_mmproj_metadata(&projector.metadata)?;
-    Ok(load_gemma4_gguf_checkpoint(
-        &checkpoint,
-        metadata,
-        Some(&projector),
-        None,
-        stream,
-        weights_stream,
-    )?
-    .model)
-}
-
-#[cfg(test)]
-pub(crate) fn load_gemma4_gguf_with_metadata(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedGemma4Gguf, Error> {
-    let gguf_file = gguf_file.as_ref();
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    let projector = open_sibling_mmproj(gguf_file)?;
-    load_gemma4_gguf_checkpoint(
-        &checkpoint,
-        metadata,
-        projector.as_ref(),
-        None,
-        stream,
-        weights_stream,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn load_gemma4_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    projector: Option<&Gemma4MmprojGguf>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedGemma4Gguf, Error> {
-    let prepared = prepare_gemma4_gguf_checkpoint(checkpoint, &metadata, projector, quantization)?;
-    let mut model = Model::new_with_modalities(
-        prepared.args,
-        prepared.image_token_id,
-        prepared.vision_config,
-        prepared.video_token_id,
-        prepared.audio_token_id,
-        prepared.audio_config,
-        stream,
-    )?;
-    if quantization.is_none() {
-        for tensor in checkpoint
-            .catalog()
-            .tensors()
-            .filter(|tensor| tensor.affine().is_some())
-        {
-            model
-                .native_quantization_stats
-                .record_fallback(tensor.descriptor().byte_len);
-        }
-    }
-    let mut config = StrictLoadConfig::default()
-        .allow_unused_prefix("rope_freqs.")
-        .allow_missing_suffix(".bias");
-    for (layer, policy) in model.args.layer_schedule.iter().enumerate() {
-        if policy.key_value != KeyValuePolicy::Shared {
-            continue;
-        }
-        let prefix = format!("model.language_model.layers.{layer}.self_attn");
-        config = config
-            .allow_unused_prefix(format!("{prefix}.k_proj."))
-            .allow_unused_prefix(format!("{prefix}.v_proj."))
-            .allow_unused_prefix(format!("{prefix}.k_norm."));
-    }
-    let mut report = StrictLoadReport::default();
-    load_gemma4_gguf_weights(
-        &mut model,
-        checkpoint,
-        quantization,
-        stream,
-        weights_stream,
-        &config,
-        &mut report,
-    )?;
-    if let Some(projector) = projector {
-        load_gemma4_mmproj_weights(
-            &mut model,
-            projector,
-            quantization,
-            stream,
-            &config,
-            &mut report,
-        )?;
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-
-    Ok(LoadedGemma4Gguf { model })
 }
 
 pub(crate) fn prepare_gemma4_gguf_checkpoint(
@@ -4904,39 +4761,6 @@ pub(crate) fn translate_mmproj_weight_name(name: &str) -> String {
     name.to_string()
 }
 
-#[cfg(test)]
-fn load_gemma4_mmproj_weights(
-    model: &mut Model,
-    projector: &Gemma4MmprojGguf,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    let mut materializer = projector.checkpoint.materializer();
-    for tensor in projector.checkpoint.catalog().tensors() {
-        let physical = &tensor.descriptor().name;
-        for (name, value) in materializer.converted_tensor(physical)?.into_arrays() {
-            let target = translate_mmproj_weight_name(&name);
-            let quantization = quantization
-                .filter(|_| target.starts_with("model.embed_vision.embedding_projection."))
-                .or_else(|| {
-                    quantization
-                        .filter(|_| target.starts_with("model.embed_audio.embedding_projection."))
-                });
-            load_named_array_strict(
-                model,
-                target,
-                value,
-                quantization.map(|value| (value, stream)),
-                config,
-                report,
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn gguf_optional_bool(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
@@ -4947,431 +4771,6 @@ fn gguf_optional_bool(
             "GGUF metadata key {key:?} must be boolean"
         ))),
         None => Ok(None),
-    }
-}
-
-#[cfg(test)]
-fn load_gemma4_gguf_weights(
-    model: &mut Model,
-    checkpoint: &GgufCheckpoint,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    for (layer, policy) in model.args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe {
-            let prefix = format!("blk.{layer}");
-            let fused =
-                checkpoint.contains_gguf_tensor(&format!("{prefix}.ffn_gate_up_exps.weight"));
-            let gate = checkpoint.contains_gguf_tensor(&format!("{prefix}.ffn_gate_exps.weight"));
-            let up = checkpoint.contains_gguf_tensor(&format!("{prefix}.ffn_up_exps.weight"));
-            if fused && (gate || up) {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "Gemma 4 GGUF layer {layer} mixes fused and separate gate/up expert tensors"
-                )));
-            }
-            if !fused && (!gate || !up) {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "Gemma 4 GGUF layer {layer} has incomplete gate/up expert tensors"
-                )));
-            }
-        }
-    }
-
-    let mut materializer = checkpoint.materializer();
-    for tensor in checkpoint.catalog().tensors() {
-        let physical_name = &tensor.descriptor().name;
-        if physical_name.contains(".ffn_gate_up_exps.") {
-            continue;
-        }
-        let native_format = if quantization.is_none() {
-            match tensor.descriptor().ggml_type {
-                GgufType::Q4K => Some(NativeQuantizationFormat::GgufQ4K),
-                GgufType::Q8_0 => Some(NativeQuantizationFormat::GgufQ8_0),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(native_format) = native_format {
-            let raw = materializer.raw_tensor(physical_name)?;
-            if raw.endian() == GgufEndian::Little {
-                let shape = native_gguf_shape(raw.descriptor().mlx_shape(), physical_name)?;
-                let native = match native_format {
-                    NativeQuantizationFormat::GgufQ4K => {
-                        NativeQuantizedTensor::from_q4k_bytes(raw.data(), &shape, stream)?
-                    }
-                    NativeQuantizationFormat::GgufQ8_0 => {
-                        NativeQuantizedTensor::from_q8_0_bytes(raw.data(), &shape, stream)?
-                    }
-                    NativeQuantizationFormat::GgufQ5_1 => unreachable!(),
-                    _ => unreachable!("IQ tensors are loaded through the general native path"),
-                };
-                let target = translate_gguf_weight_name(physical_name);
-                if attach_native_quantized(model, &target, native, report)? {
-                    model
-                        .native_quantization_stats
-                        .promote_native(native_format, raw.data().len() as u64);
-                    continue;
-                }
-            }
-        }
-        if quantization.is_none()
-            && physical_name.ends_with(".ffn_down_exps.weight")
-            && tensor.descriptor().ggml_type == GgufType::Q5_1
-        {
-            let raw = materializer.raw_tensor(physical_name)?;
-            if raw.endian() == GgufEndian::Little {
-                let shape = native_gguf_shape(raw.descriptor().mlx_shape(), physical_name)?;
-                let native = NativeQuantizedTensor::from_q5_1_bytes(raw.data(), &shape, stream)?;
-                let layer = physical_name
-                    .strip_prefix("blk.")
-                    .and_then(|rest| rest.split_once('.'))
-                    .and_then(|(layer, _)| layer.parse::<usize>().ok())
-                    .ok_or_else(|| {
-                        Error::UnsupportedArchitecture(format!(
-                            "cannot identify Gemma 4 layer for {physical_name:?}"
-                        ))
-                    })?;
-                let projection = &mut model.model.language_model.layers[layer]
-                    .experts
-                    .as_mut()
-                    .expect("Gemma 4 MoE layer has experts")
-                    .switch_glu
-                    .down_proj;
-                projection.native = Some(native);
-                projection.weight.value = Array::from_slice(&[] as &[u32], &[0]);
-                projection.scales.value = None;
-                projection.biases.value = None;
-                model
-                    .native_quantization_stats
-                    .promote_native(NativeQuantizationFormat::GgufQ5_1, raw.data().len() as u64);
-                report.record_loaded(format!(
-                    "model.language_model.layers.{layer}.experts.switch_glu.down_proj.weight"
-                ));
-                continue;
-            }
-        }
-        let converted = materializer.converted_tensor(physical_name)?;
-        let native_blocks = matches!(&converted, safemlx::ops::GgufTensor::IQuant(_));
-        for (name, value) in converted.into_arrays() {
-            let name = translate_gguf_weight_name(&name);
-            if native_blocks {
-                load_named_iq_array_strict(model, name, value, config, report);
-            } else {
-                load_named_array_strict(
-                    model,
-                    name,
-                    value,
-                    quantization.map(|value| (value, stream)),
-                    config,
-                    report,
-                )?;
-            }
-        }
-    }
-
-    for layer in 0..model.args.num_hidden_layers {
-        let source_prefix = format!("blk.{layer}");
-        let fused_name = format!("{source_prefix}.ffn_gate_up_exps.weight");
-        if !checkpoint.contains_gguf_tensor(&fused_name) {
-            continue;
-        }
-        let target_prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
-        let catalog_tensor = checkpoint
-            .catalog()
-            .tensors()
-            .find(|tensor| tensor.descriptor().name == fused_name)
-            .expect("checked fused GGUF tensor exists");
-        if quantization.is_none() && catalog_tensor.descriptor().ggml_type == GgufType::Q4K {
-            let raw = materializer.raw_tensor(&fused_name)?;
-            if raw.endian() == GgufEndian::Little {
-                let shape = native_gguf_shape(raw.descriptor().mlx_shape(), &fused_name)?;
-                let native = NativeQuantizedTensor::from_q4k_bytes(raw.data(), &shape, stream)?;
-                let intermediate = model.args.moe_intermediate_size.ok_or_else(|| {
-                    Error::UnsupportedArchitecture(
-                        "Gemma 4 MoE config is missing moe_intermediate_size".into(),
-                    )
-                })?;
-                if native.rows() != 2 * intermediate {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "Gemma 4 native fused gate/up layer {layer} has {} rows per expert; expected {}",
-                        native.rows(),
-                        2 * intermediate
-                    )));
-                }
-                let experts = model.model.language_model.layers[layer as usize]
-                    .experts
-                    .as_mut()
-                    .expect("Gemma 4 MoE layer has experts");
-                experts.switch_glu.gate_proj.native = Some(native.row_view(0, intermediate)?);
-                experts.switch_glu.up_proj.native =
-                    Some(native.row_view(intermediate, intermediate)?);
-                model
-                    .native_quantization_stats
-                    .promote_native(NativeQuantizationFormat::GgufQ4K, raw.data().len() as u64);
-                for projection in ["gate_proj", "up_proj"] {
-                    report.record_loaded(format!("{target_prefix}.{projection}.weight"));
-                }
-                for projection in [
-                    &mut experts.switch_glu.gate_proj,
-                    &mut experts.switch_glu.up_proj,
-                ] {
-                    // Native execution owns the only persistent weight bytes.
-                    // Clear unloaded affine placeholders before the model-wide
-                    // stream copy, otherwise their declared shapes allocate a
-                    // second checkpoint-sized device buffer.
-                    projection.weight.value = Array::from_slice(&[] as &[u32], &[0]);
-                    projection.scales.value = None;
-                    projection.biases.value = None;
-                }
-                continue;
-            }
-        }
-        let fused = materializer
-            .converted_tensor(&fused_name)?
-            .into_arrays()
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        for suffix in ["weight", "scales", "biases"] {
-            let source_name = format!("{source_prefix}.ffn_gate_up_exps.{suffix}");
-            let Some(value) = fused.get(&source_name) else {
-                if suffix == "weight" {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "Gemma 4 GGUF is missing fused gate/up expert weights in layer {layer}"
-                    )));
-                }
-                continue;
-            };
-            let shape = value.shape();
-            let intermediate = model.args.moe_intermediate_size.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "Gemma 4 MoE config is missing moe_intermediate_size".into(),
-                )
-            })?;
-            if shape.len() != 3 || shape[1] != 2 * intermediate {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "Gemma 4 GGUF fused expert {suffix} in layer {layer} has shape {shape:?}; expected output dimension {}",
-                    2 * intermediate
-                )));
-            }
-            let gate = value.try_index_device((.., ..intermediate, ..), weights_stream)?;
-            let up = value.try_index_device((.., intermediate.., ..), weights_stream)?;
-            for (projection, value) in [("gate_proj", gate), ("up_proj", up)] {
-                load_named_array_strict(
-                    model,
-                    format!("{target_prefix}.{projection}.{suffix}"),
-                    value,
-                    quantization.map(|value| (value, stream)),
-                    config,
-                    report,
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn native_gguf_shape(shape: Vec<u64>, name: &str) -> Result<Vec<i32>, Error> {
-    shape
-        .into_iter()
-        .map(|dimension| {
-            i32::try_from(dimension).map_err(|_| {
-                Error::UnsupportedArchitecture(format!(
-                    "native tensor {name:?} dimension {dimension} exceeds MLX limits"
-                ))
-            })
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn attach_native_linear(
-    linear: &mut MaybeQuantized<nn::Linear>,
-    target: &str,
-    native: NativeQuantizedTensor,
-    report: &mut StrictLoadReport,
-) -> Result<bool, Error> {
-    let MaybeQuantized::Quantized(linear) = linear else {
-        return Ok(false);
-    };
-    let expected_output = linear.inner.weight.dim(0);
-    let expected_input = if linear.native_format.is_some() {
-        linear.native_columns
-    } else {
-        linear.scales.dim(1) * linear.group_size
-    };
-    if native.shape() != [expected_output, expected_input] {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "native tensor {target:?} has shape {:?}; expected [{expected_output}, {expected_input}]",
-            native.shape()
-        )));
-    }
-    linear.native = Some(native);
-    linear.inner.weight.value = Array::from_slice(&[] as &[u32], &[0]);
-    linear.inner.bias.value = None;
-    linear.scales.value = Array::from_slice(&[] as &[f32], &[0]);
-    linear.biases.value = None;
-    let prefix = target
-        .strip_suffix(".weight")
-        .expect("native linear target ends in .weight");
-    report.record_loaded(format!("{prefix}.inner.weight"));
-    report.record_loaded(format!("{prefix}.scales"));
-    Ok(true)
-}
-
-#[cfg(test)]
-fn attach_native_expert_projection(
-    projection: &mut ExpertProjection,
-    target: &str,
-    native: NativeQuantizedTensor,
-    report: &mut StrictLoadReport,
-) -> Result<bool, Error> {
-    if projection.quantization.is_none() && projection.iquant.is_none() {
-        return Ok(false);
-    }
-    let expected = [
-        projection.weight.dim(0),
-        projection.weight.dim(1),
-        native.columns(),
-    ];
-    if native.shape() != expected {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "native expert tensor {target:?} has shape {:?}; expected {expected:?}",
-            native.shape()
-        )));
-    }
-    projection.native = Some(native);
-    projection.weight.value = Array::from_slice(&[] as &[u32], &[0]);
-    projection.scales.value = None;
-    projection.biases.value = None;
-    report.record_loaded(target.to_string());
-    Ok(true)
-}
-
-#[cfg(test)]
-fn attach_native_embedding(
-    embedding: &mut Gemma4Embedding,
-    target: &str,
-    native: NativeQuantizedTensor,
-    report: &mut StrictLoadReport,
-) -> Result<bool, Error> {
-    if !embedding.quantized {
-        return Ok(false);
-    }
-    let expected = [embedding.weight.dim(0), embedding.hidden_size];
-    if native.shape() != expected {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "native embedding {target:?} has shape {:?}; expected {expected:?}",
-            native.shape()
-        )));
-    }
-    embedding.native = Some(native);
-    embedding.weight.value = if embedding.native_format.is_some() {
-        Array::from_slice(&[] as &[u8], &[0])
-    } else {
-        Array::from_slice(&[] as &[u32], &[0])
-    };
-    embedding.scales.value = None;
-    embedding.biases.value = None;
-    report.record_loaded(target.to_string());
-    Ok(true)
-}
-
-/// Installs one native checkpoint tensor into a general Gemma module interface.
-///
-/// The dispatch is model-layer integration only: physical decoding and
-/// device policy remain in `safemlx::native_quantization`.
-#[cfg(test)]
-fn attach_native_quantized(
-    model: &mut Model,
-    target: &str,
-    native: NativeQuantizedTensor,
-    report: &mut StrictLoadReport,
-) -> Result<bool, Error> {
-    match target {
-        "model.language_model.embed_tokens.weight" => {
-            return attach_native_embedding(
-                &mut model.model.language_model.embed_tokens,
-                target,
-                native,
-                report,
-            );
-        }
-        "model.language_model.embed_tokens_per_layer.weight" => {
-            let Some(embedding) = model.model.language_model.embed_tokens_per_layer.as_mut() else {
-                return Ok(false);
-            };
-            return attach_native_embedding(embedding, target, native, report);
-        }
-        "model.language_model.per_layer_model_projection.weight" => {
-            let Some(linear) = model
-                .model
-                .language_model
-                .per_layer_model_projection
-                .as_mut()
-            else {
-                return Ok(false);
-            };
-            return attach_native_linear(linear, target, native, report);
-        }
-        "lm_head.weight" => {
-            let Some(linear) = model.lm_head.as_mut() else {
-                return Ok(false);
-            };
-            return attach_native_linear(linear, target, native, report);
-        }
-        _ => {}
-    }
-
-    let Some(rest) = target.strip_prefix("model.language_model.layers.") else {
-        return Ok(false);
-    };
-    let Some((layer, parameter)) = rest.split_once('.') else {
-        return Ok(false);
-    };
-    let Ok(layer) = layer.parse::<usize>() else {
-        return Ok(false);
-    };
-    let Some(layer) = model.model.language_model.layers.get_mut(layer) else {
-        return Ok(false);
-    };
-
-    if let Some(projection) = parameter
-        .strip_prefix("experts.switch_glu.")
-        .and_then(|name| name.strip_suffix(".weight"))
-    {
-        let Some(experts) = layer.experts.as_mut() else {
-            return Ok(false);
-        };
-        let projection = match projection {
-            "gate_proj" => &mut experts.switch_glu.gate_proj,
-            "up_proj" => &mut experts.switch_glu.up_proj,
-            "down_proj" => &mut experts.switch_glu.down_proj,
-            _ => return Ok(false),
-        };
-        return attach_native_expert_projection(projection, target, native, report);
-    }
-
-    let linear = match parameter {
-        "self_attn.q_proj.weight" => Some(&mut layer.self_attn.q_proj),
-        "self_attn.k_proj.weight" => layer.self_attn.k_proj.as_mut(),
-        "self_attn.v_proj.weight" => layer.self_attn.v_proj.as_mut(),
-        "self_attn.o_proj.weight" => Some(&mut layer.self_attn.o_proj),
-        "mlp.gate_proj.weight" => Some(&mut layer.mlp.gate_proj),
-        "mlp.down_proj.weight" => Some(&mut layer.mlp.down_proj),
-        "mlp.up_proj.weight" => Some(&mut layer.mlp.up_proj),
-        "router.proj.weight" => layer.router.as_mut().map(|router| &mut router.proj),
-        "per_layer_input_gate.weight" => layer.per_layer_input_gate.as_mut(),
-        "per_layer_projection.weight" => layer.per_layer_projection.as_mut(),
-        _ => None,
-    };
-    match linear {
-        Some(linear) => attach_native_linear(linear, target, native, report),
-        None => Ok(false),
     }
 }
 
@@ -5969,162 +5368,6 @@ pub struct WeightMap {
     pub metadata: HashMap<String, Value>,
     /// Mapping from tensor name to shard file name.
     pub weight_map: HashMap<String, String>,
-}
-
-/// Loads a Gemma 4 model and safetensors weights from a model directory.
-pub fn load_gemma4_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Gemma4,
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
-    let (model_args, vision_config, image_token_id, video_token_id, audio_config, audio_token_id) =
-        get_gemma4_model_config(model_dir)?;
-    let mut model = Model::new_with_modalities(
-        model_args,
-        image_token_id,
-        vision_config,
-        video_token_id,
-        audio_token_id,
-        audio_config,
-        stream,
-    )?;
-    let config = gemma4_strict_load_config();
-    let mut report = StrictLoadReport::default();
-    load_gemma4_weights(
-        &mut model,
-        model_dir,
-        weights_stream,
-        stream,
-        None,
-        &config,
-        &mut report,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Loads a Gemma 4 checkpoint while affine-quantizing supported weights.
-///
-/// Transformer weights and every aligned modality projection use affine
-/// storage. Convolution kernels, normalization vectors, and position tables
-/// retain their native dense representation.
-pub fn load_gemma4_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Gemma4,
-        model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
-    )?;
-    let (
-        mut model_args,
-        mut vision_config,
-        image_token_id,
-        video_token_id,
-        mut audio_config,
-        audio_token_id,
-    ) = get_gemma4_model_config(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Gemma 4",
-        model_args.weight_quantization(),
-        quantization,
-    )? {
-        return load_gemma4_model(model_dir, stream, weights_stream);
-    }
-    model_args.quantized = true;
-    model_args.weight_quantization = Some(quantization);
-    model_args.quantization_group_size = quantization.group_size();
-    model_args.quantization_bits = quantization.bits();
-    if let Some(config) = &mut vision_config {
-        config.weight_quantization = Some(quantization);
-    }
-    if let Some(config) = &mut audio_config {
-        config.weight_quantization = Some(quantization);
-    }
-    let mut model = Model::new_with_modalities(
-        model_args,
-        image_token_id,
-        vision_config,
-        video_token_id,
-        audio_token_id,
-        audio_config,
-        stream,
-    )?;
-    let config = gemma4_strict_load_config();
-    let mut report = StrictLoadReport::default();
-    load_gemma4_weights(
-        &mut model,
-        model_dir,
-        weights_stream,
-        stream,
-        Some(quantization),
-        &config,
-        &mut report,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-fn gemma4_strict_load_config() -> StrictLoadConfig {
-    StrictLoadConfig::default()
-        .rewrite_prefix("language_model.model.", "model.language_model.")
-        .rewrite_prefix("model.language_model.", "model.language_model.")
-        .rewrite_prefix("vision_tower.", "model.vision_tower.")
-        .rewrite_prefix("embed_vision.", "model.embed_vision.")
-        .rewrite_prefix("audio_tower.", "model.audio_tower.")
-        .rewrite_prefix("embed_audio.", "model.embed_audio.")
-        .allow_unused_prefix("multi_modal_projector.")
-        .allow_unused_prefix("model.multi_modal_projector.")
-        .allow_unused_prefix("model.vision_embedder.")
-        .allow_missing_suffix(".bias")
-}
-
-fn load_gemma4_weights(
-    model: &mut Model,
-    model_dir: &Path,
-    weights_stream: &Stream,
-    quantization_stream: &Stream,
-    quantization: Option<WeightQuantization>,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    let weights_index = model_dir.join("model.safetensors.index.json");
-    let mut load_file = |path: &Path| match quantization {
-        Some(quantization) => load_safetensors_quantized_strict(
-            model,
-            path,
-            weights_stream,
-            quantization_stream,
-            quantization,
-            config,
-            report,
-        ),
-        None => load_safetensors_strict(model, path, weights_stream, config, report),
-    };
-    if weights_index.exists() {
-        let json = std::fs::read_to_string(weights_index)?;
-        let weight_map: WeightMap = serde_json::from_str(&json)?;
-        let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
-        for weight_file in weight_files {
-            let weights_filename = model_dir.join(weight_file);
-            load_file(&weights_filename)?;
-        }
-    } else {
-        load_file(&model_dir.join("model.safetensors"))?;
-    }
-    Ok(())
 }
 
 impl Model {
@@ -6747,9 +5990,9 @@ mod tests {
     };
 
     use super::{
-        load_gemma4_model, native_embedding_layout, needs_generated_sliding_mask,
-        partial_rotary_dims, Attention, Cache, FeedForwardPolicy, FloatOrString, KeyValuePolicy,
-        LayerPolicy, ModelArgs, ValuePolicy,
+        native_embedding_layout, needs_generated_sliding_mask, partial_rotary_dims, Attention,
+        Cache, FeedForwardPolicy, FloatOrString, KeyValuePolicy, LayerPolicy, ModelArgs,
+        ValuePolicy,
     };
     use crate::api::{
         common::generation::CausalLm,
@@ -7224,7 +6467,14 @@ mod tests {
             .unwrap();
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut model = load_gemma4_model(&model_dir, gpu.stream(), weights.stream()).unwrap();
+        let mut model = crate::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
+            &model_dir,
+            crate::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            weights.stream(),
+        )
+        .unwrap();
         let tokens = Array::from_slice(&[2u32, 258880, 7], &[1, 3]);
         let patches = Array::from_slice(&vec![0.5f32; 9 * 16 * 16 * 3], &[1, 9, 768]);
         let positions = Array::from_slice(
@@ -7235,7 +6485,7 @@ mod tests {
             InputPart::text_token_ids(&tokens),
             InputPart::image_tensor(&patches, InputMetadata::patch_position_ids(&positions)),
         ];
-        let mut cache = Cache::default();
+        let mut cache = model.new_cache();
         let logits = model
             .prefill_input_logits(ModelInput::new(&parts), &mut cache, gpu.stream())
             .unwrap();
@@ -7261,7 +6511,14 @@ mod tests {
             .unwrap();
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut model = load_gemma4_model(&model_dir, gpu.stream(), weights.stream()).unwrap();
+        let mut model = crate::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
+            &model_dir,
+            crate::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            weights.stream(),
+        )
+        .unwrap();
         let tokens = Array::from_slice(&[2u32, 258884, 7, 258884, 8], &[1, 5]);
         let patches = Array::from_slice(&vec![0.5f32; 2 * 9 * 16 * 16 * 3], &[2, 9, 768]);
         let frame_positions = [0i32, 0, 1, 0, 2, 0, 0, 1, 1, 1, 2, 1, 0, 2, 1, 2, 2, 2];
@@ -7270,7 +6527,7 @@ mod tests {
             InputPart::text_token_ids(&tokens),
             InputPart::video_tensor(&patches, InputMetadata::patch_position_ids(&positions)),
         ];
-        let mut cache = Cache::default();
+        let mut cache = model.new_cache();
         let logits = model
             .prefill_input_logits(ModelInput::new(&parts), &mut cache, gpu.stream())
             .unwrap();
@@ -7296,7 +6553,14 @@ mod tests {
             .unwrap();
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut model = load_gemma4_model(&model_dir, gpu.stream(), weights.stream()).unwrap();
+        let mut model = crate::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
+            &model_dir,
+            crate::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            weights.stream(),
+        )
+        .unwrap();
         let tokens = Array::from_slice(&[2u32, 258881, 7], &[1, 3]);
         let features = Array::from_slice(&vec![0.0f32; 16 * 128], &[1, 16, 128]);
         let mask = Array::from_slice(&[true; 16], &[1, 16]);
@@ -7304,7 +6568,7 @@ mod tests {
             InputPart::text_token_ids(&tokens),
             InputPart::audio_tensor(&features, InputMetadata::audio_mask(&mask)),
         ];
-        let mut cache = Cache::default();
+        let mut cache = model.new_cache();
         let logits = model
             .prefill_input_logits(ModelInput::new(&parts), &mut cache, gpu.stream())
             .unwrap();

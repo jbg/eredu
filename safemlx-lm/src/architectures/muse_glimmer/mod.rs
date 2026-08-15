@@ -18,7 +18,7 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt},
+    module::{Module, ModuleParameters as ModuleParametersTrait},
     nn,
     ops::{
         indexing::TryIndexOp, mean_axis, rsqrt, sigmoid, tanh, GgufCheckpoint, GgufMetadataValue,
@@ -61,18 +61,10 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_safetensors_dir_quantized_strict,
-        load_safetensors_dir_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
+    runtime::checkpoint::load::{gguf_metadata, gguf_quantization_configs, GgufTensorNames},
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
 };
-
-#[cfg(test)]
-use crate::runtime::checkpoint::load::{load_gguf_strict, load_named_array_strict};
-#[cfg(test)]
-use safemlx::ops::concatenate_axis;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Source-specific weight and rotary layout.
@@ -316,10 +308,6 @@ impl DecoderConfigSource {
 }
 
 impl DecoderConfig {
-    pub(crate) fn model_kind(&self) -> crate::api::ModelKind {
-        crate::api::ModelKind::MuseGlimmer
-    }
-
     /// Whether this architecture carries learned Q/K/V projection biases.
     pub fn qkv_bias(&self) -> bool {
         false
@@ -2282,11 +2270,6 @@ fn validate_rope_scaling(args: &DecoderConfig) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) struct LoadedGguf {
-    pub(crate) model: Model,
-}
-
 /// Official image-only Muse-Glimmer GGUF vision sidecar.
 pub(crate) struct MuseGlimmerMmprojGguf {
     pub(crate) checkpoint: GgufCheckpoint,
@@ -2362,155 +2345,6 @@ pub(crate) fn translate_mmproj_weight_name(name: &str) -> String {
 
 pub(crate) fn translate_mmproj_store_weight_name(name: &str) -> String {
     format!("model.{}", translate_mmproj_weight_name(name))
-}
-
-/// Loads a Muse-Glimmer GGUF checkpoint.
-///
-/// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
-/// supported. The quantized formats are consumed in the packed affine
-/// representation emitted by MLX's GGUF loader.
-#[cfg(test)]
-pub fn load_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    Ok(load_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
-}
-
-#[cfg(test)]
-pub(crate) fn load_gguf_with_metadata(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedGguf, Error> {
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
-}
-
-#[cfg(test)]
-pub(crate) fn load_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedGguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
-    if architecture != "muse-glimmer" {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports muse-glimmer"
-        )));
-    }
-    let is_moe = false;
-    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
-    crate::api::structural::validate_gguf(
-        gguf_architecture,
-        checkpoint,
-        &metadata,
-        crate::api::ModelLoadOptions::default(),
-    )
-    .into_loader_result()?;
-    let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
-    checkpoint
-        .catalog()
-        .translated_outputs(translate)
-        .map_err(safemlx::error::IoError::from)?;
-    let mut args = config_from_gguf_catalog(checkpoint, &metadata, &architecture, is_moe)?;
-    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
-    if is_moe {
-        for layer in 0..args.num_hidden_layers {
-            let prefix = format!("model.layers.{layer}.mlp.experts");
-            if let Some(config) = configs.remove(&format!("{prefix}.gate_proj")) {
-                configs.remove(&format!("{prefix}.up_proj"));
-                configs.insert(format!("{prefix}.gate_up_proj"), config);
-            }
-        }
-    }
-    args.quantized_weights = Some(configs.keys().cloned().collect());
-    args.quantized_weight_configs = Some(configs);
-    args.quantization = None;
-    if let Some(quantization) = quantization {
-        args.quantization = Some(quantization);
-        args.quantization_config = None;
-        args.quantized_weights = None;
-        args.quantized_weight_configs = None;
-    }
-
-    let mut model = Model::new(args, stream)?;
-    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
-    let mut report = StrictLoadReport::default();
-    if !is_moe {
-        load_gguf_strict(
-            &mut model,
-            checkpoint,
-            quantization.map(|value| (value, stream)),
-            &config,
-            &mut report,
-            |name, value| Ok((translate_gguf_weight_name(&name, false), value)),
-        )?;
-    } else {
-        let mut materializer = checkpoint.materializer();
-        for tensor in checkpoint.catalog().tensors() {
-            let physical_name = &tensor.descriptor().name;
-            if physical_name.contains("ffn_gate_exps") || physical_name.contains("ffn_up_exps") {
-                continue;
-            }
-            for (name, value) in materializer.converted_tensor(physical_name)?.into_arrays() {
-                load_named_array_strict(
-                    &mut model,
-                    translate_gguf_weight_name(&name, true),
-                    value,
-                    quantization.map(|value| (value, stream)),
-                    &config,
-                    &mut report,
-                )?;
-            }
-        }
-        for layer in 0..model.args.num_hidden_layers {
-            let source_prefix = format!("blk.{layer}");
-            let target_prefix = format!("model.layers.{layer}.mlp.experts");
-            let gate = materializer
-                .converted_tensor(&format!("{source_prefix}.ffn_gate_exps.weight"))?
-                .into_arrays()
-                .into_iter()
-                .collect::<HashMap<_, _>>();
-            let up = materializer
-                .converted_tensor(&format!("{source_prefix}.ffn_up_exps.weight"))?
-                .into_arrays()
-                .into_iter()
-                .collect::<HashMap<_, _>>();
-            for (source_suffix, target_suffix) in
-                [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
-            {
-                let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
-                let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
-                match (gate.get(&gate_name), up.get(&up_name)) {
-                    (Some(gate), Some(up)) => {
-                        let value = concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?;
-                        load_named_array_strict(
-                            &mut model,
-                            format!("{target_prefix}.gate_up_proj{target_suffix}"),
-                            value,
-                            quantization.map(|value| (value, stream)),
-                            &config,
-                            &mut report,
-                        )?;
-                    }
-                    (None, None) if source_suffix != "weight" => {}
-                    _ => {
-                        return Err(Error::UnsupportedArchitecture(format!(
-                            "Qwen3 MoE GGUF has incomplete gate/up expert tensors under {source_prefix}"
-                        )))
-                    }
-                }
-            }
-        }
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(LoadedGguf { model })
 }
 
 pub(crate) fn prepare_gguf_checkpoint(
@@ -2902,16 +2736,6 @@ pub(crate) fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
     name.to_string()
 }
 
-#[cfg(test)]
-pub(crate) fn gguf_string(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-) -> Result<String, Error> {
-    gguf_optional_string(metadata, key)?.ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
-    })
-}
-
 fn gguf_optional_string(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
@@ -3259,42 +3083,6 @@ mod tests {
     }
 
     #[test]
-    fn strictly_binds_release_safetensors_text_namespace() {
-        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let stream = ctx.stream();
-        let args = config_from_hf_value(&tiny_config()).unwrap();
-        let source = Model::new(args.clone(), stream).unwrap();
-        let mut checkpoint = source
-            .parameters()
-            .flatten()
-            .into_iter()
-            .map(|(name, value)| {
-                let name = name.strip_prefix("model.").map_or_else(
-                    || name.to_string(),
-                    |rest| format!("model.language_model.{rest}"),
-                );
-                (name, value.clone())
-            })
-            .collect::<HashMap<_, _>>();
-        checkpoint.insert(
-            "model.vision_projection.weight".into(),
-            Array::from_slice(&[0.0_f32], &[1]),
-        );
-
-        let mut loaded = Model::new(args, stream).unwrap();
-        let config = safetensors_strict_load_config();
-        let mut report = StrictLoadReport::default();
-        crate::runtime::checkpoint::load::load_arrays_strict(
-            &mut loaded,
-            checkpoint,
-            &config,
-            &mut report,
-        )
-        .unwrap();
-        report.finish(&loaded, &config).unwrap();
-    }
-
-    #[test]
     fn ordinary_block_matches_observed_centered_norm_execution() {
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let stream = ctx.stream();
@@ -3423,78 +3211,6 @@ pub struct WeightMap {
     pub metadata: HashMap<String, Value>,
     /// Mapping from tensor name to shard file name.
     pub weight_map: HashMap<String, String>,
-}
-
-/// Loads a Muse-Glimmer model and SafeTensors weights from a model directory.
-pub fn load_safetensors(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    let model_args = load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
-        model_args.model_kind(),
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
-    let mut model = Model::new(model_args, stream)?;
-    let config = safetensors_strict_load_config();
-    let mut report = StrictLoadReport::default();
-    load_safetensors_dir_strict(&mut model, model_dir, weights_stream, &config, &mut report)?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-
-    Ok(model)
-}
-
-/// Loads a Muse-Glimmer checkpoint while quantizing matrices tensor-by-tensor.
-pub fn load_safetensors_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    let mut model_args = load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
-        model_args.model_kind(),
-        model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
-    )?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Muse-Glimmer",
-        model_args.weight_quantization(),
-        quantization,
-    )? {
-        return load_safetensors(model_dir, stream, weights_stream);
-    }
-    model_args.quantization = Some(quantization);
-    let mut model = Model::new(model_args, stream)?;
-    let config = safetensors_strict_load_config();
-    let mut report = StrictLoadReport::default();
-    load_safetensors_dir_quantized_strict(
-        &mut model,
-        model_dir,
-        weights_stream,
-        stream,
-        quantization,
-        &config,
-        &mut report,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-fn safetensors_strict_load_config() -> StrictLoadConfig {
-    StrictLoadConfig::default()
-        .rewrite_prefix("model.language_model.", "model.")
-        // The resident causal-LM object owns only the text model. The processor's
-        // architecture adapter loads these independently for multimodal requests.
-        .allow_unused_prefix("model.vision_tower.")
-        .allow_unused_prefix("model.vision_adapter.")
-        .allow_unused_prefix("model.vision_projection.")
 }
 
 impl<C> CausalLm<Vec<Option<C>>> for Model

@@ -3309,7 +3309,7 @@ mod tests {
     };
     use crate::{
         architectures::nemotron_h::model::{
-            self as resident, Cache, LayerCache, LayerPolicy, Model, ModelArgs, ModelInput,
+            self as resident, LayerCache, LayerPolicy, Model, ModelArgs,
         },
         runtime::cache::residency::{
             CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
@@ -3936,8 +3936,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
 
-        let mut resident =
-            resident::load_nemotron_h_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_nemotron_h_layerwise_model(
+            dir.path(),
+            crate::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let mut layerwise = load_nemotron_h_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
@@ -3947,10 +3953,7 @@ mod tests {
         )
         .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
+        let mut layerwise_cache = layerwise.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -3958,15 +3961,7 @@ mod tests {
             Array::from_slice(&[5u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = layerwise
                 .forward(&tokens, &mut layerwise_cache, gpu.stream())
@@ -4035,8 +4030,14 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
-        let mut resident =
-            resident::load_nemotron_h_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_nemotron_h_layerwise_model(
+            dir.path(),
+            crate::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
                 .unwrap();
@@ -4052,24 +4053,13 @@ mod tests {
         )
         .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut cached_cache = Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
+        let mut cached_cache = cached.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = cached
                 .forward(&tokens, &mut cached_cache, gpu.stream())
@@ -4102,8 +4092,14 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
-        let mut resident =
-            resident::load_nemotron_h_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_nemotron_h_layerwise_model(
+            dir.path(),
+            crate::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let expert_options = ExpertCacheLoadOptions::new(
             OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
             1 << 16,
@@ -4130,15 +4126,7 @@ mod tests {
             Array::from_slice(&[3u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = cached
                 .forward(&tokens, &mut cached_cache, gpu.stream())

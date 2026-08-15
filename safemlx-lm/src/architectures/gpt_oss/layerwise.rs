@@ -1754,7 +1754,7 @@ mod tests {
 
     use super::{load_gpt_oss_expert_cache_model, load_gpt_oss_layerwise_model};
     use crate::{
-        architectures::gpt_oss::model::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
+        architectures::gpt_oss::model::{Cache, Model, ModelArgs, MxFp4Config},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
@@ -1990,8 +1990,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture);
 
-        let mut resident =
-            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_gpt_oss_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options = if dense_stream {
             LayerWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth).unwrap(),
@@ -2075,8 +2081,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture);
 
-        let mut expected =
-            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut expected = load_gpt_oss_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
         let mut delegated =
             load_gpt_oss_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
@@ -2121,8 +2133,14 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture);
-        let mut resident =
-            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_gpt_oss_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
                 .unwrap();

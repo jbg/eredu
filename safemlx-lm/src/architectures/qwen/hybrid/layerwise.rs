@@ -12,7 +12,7 @@ use safemlx::{
     module::{Module, ModuleParameters, Param},
     ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
-    Array, Stream,
+    Array, Dtype, Stream,
 };
 
 use crate::{
@@ -41,7 +41,7 @@ use crate::{
     },
     runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
-        canonical_checkpoint_name, populate_module_from_lease,
+        canonical_checkpoint_name, is_materialized_module_parameter, populate_module_from_lease,
         populate_module_from_lease_excluding, ModuleBindingPlan,
     },
     runtime::checkpoint::store::{
@@ -1546,17 +1546,8 @@ fn load_qwen_hybrid_sparse_model(
         stream,
     )?;
     source_adapter.sparse_expert_cache = true;
-    let quantize_on_load = quantization
-        .map(|requested| {
-            should_quantize_on_load(
-                "Qwen hybrid independent expert cache",
-                args.quantization,
-                requested,
-            )
-            .map(|required| required.then_some(requested))
-        })
-        .transpose()?
-        .flatten();
+    let quantize_on_load =
+        resolve_on_load_quantization(&args, quantization, "Qwen hybrid independent expert cache")?;
     let store = open_safetensors_weight_store(model_dir, non_expert.max_mapped_shards())?;
     let mut execution = load_layerwise_model_with_quantization(
         store,
@@ -1690,13 +1681,7 @@ fn load_qwen_hybrid_layerwise_model_with_vision(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let options = options.into();
-    let quantize_on_load = quantization
-        .map(|requested| {
-            should_quantize_on_load("Qwen hybrid", args.quantization, requested)
-                .map(|required| required.then_some(requested))
-        })
-        .transpose()?
-        .flatten();
+    let quantize_on_load = resolve_on_load_quantization(&args, quantization, "Qwen hybrid")?;
     let adapter = QwenHybridLayerwiseAdapter::new(
         args,
         family,
@@ -1716,6 +1701,23 @@ fn load_qwen_hybrid_layerwise_model_with_vision(
             weights_stream,
         )?,
     })
+}
+
+fn resolve_on_load_quantization(
+    args: &ModelArgs,
+    requested: Option<WeightQuantization>,
+    architecture: &str,
+) -> Result<Option<WeightQuantization>, Error> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if args.uses_fp8() {
+        return Err(Error::Quantization(format!(
+            "{architecture} on-load quantization requires floating-point weights; the checkpoint uses native FP8 weights"
+        )));
+    }
+    should_quantize_on_load(architecture, args.quantization, requested)
+        .map(|required| required.then_some(requested))
 }
 
 /// Shared adapter for recurrent linear-attention and full-attention Qwen blocks.
@@ -1838,7 +1840,8 @@ impl QwenHybridLayerwiseAdapter {
         let embedding = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.quantization,
+            args.quantization_for("model.embed_tokens.weight")
+                .or(args.quantization),
             stream,
         )?;
         let norm = Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?;
@@ -1849,7 +1852,8 @@ impl QwenHybridLayerwiseAdapter {
                 common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.hidden_size,
                     args.vocab_size,
-                    args.quantization,
+                    args.quantization_for("lm_head.weight")
+                        .or(args.quantization),
                     stream,
                 )?,
             )
@@ -2115,7 +2119,11 @@ impl QwenHybridLayerwiseAdapter {
             )?;
         }
 
-        for local_name in module.parameters().flatten().keys() {
+        let parameters = module.parameters().flatten();
+        for (local_name, parameter) in &parameters {
+            if !is_materialized_module_parameter(local_name, parameter, &parameters) {
+                continue;
+            }
             if recipes.contains_key(local_name.as_ref()) {
                 continue;
             }
@@ -2165,7 +2173,13 @@ impl QwenHybridLayerwiseAdapter {
                 )?;
             }
         }
-        for local_name in mtp.parameters().flatten().keys() {
+        let parameters = mtp.parameters().flatten();
+        for (local_name, parameter) in &parameters {
+            if !is_materialized_module_parameter(local_name, parameter, &parameters)
+                || (self.sparse_expert_cache && local_name.contains(".mlp.experts."))
+            {
+                continue;
+            }
             if recipes.contains_key(local_name.as_ref()) {
                 continue;
             }
@@ -2380,19 +2394,27 @@ fn add_fused_projection_recipes(
                 (format!("linear_attn.in_proj_qkv.{suffix}"), vec![0, 1, 2]),
                 (format!("linear_attn.in_proj_z.{suffix}"), vec![3]),
             ] {
+                let selected = DerivedWeightRecipe::source(
+                    raw.clone(),
+                    TensorSelection::Indices {
+                        axis: 0,
+                        indices: grouped_component_indices(
+                            self::usize_from_i32(args.linear_num_key_heads)?,
+                            &qkvz_widths,
+                            &components,
+                        )?,
+                    },
+                );
                 recipes.insert(
                     local,
-                    DerivedWeightRecipe::source(
-                        raw.clone(),
-                        TensorSelection::Indices {
-                            axis: 0,
-                            indices: grouped_component_indices(
-                                self::usize_from_i32(args.linear_num_key_heads)?,
-                                &qkvz_widths,
-                                &components,
-                            )?,
-                        },
-                    ),
+                    if suffix == "weight" {
+                        selected
+                    } else {
+                        DerivedWeightRecipe::Cast {
+                            input: Box::new(selected),
+                            dtype: Dtype::Float32,
+                        }
+                    },
                 );
             }
         }
@@ -2402,19 +2424,27 @@ fn add_fused_projection_recipes(
                 (format!("linear_attn.in_proj_b.{suffix}"), 0),
                 (format!("linear_attn.in_proj_a.{suffix}"), 1),
             ] {
+                let selected = DerivedWeightRecipe::source(
+                    raw.clone(),
+                    TensorSelection::Indices {
+                        axis: 0,
+                        indices: grouped_component_indices(
+                            usize_from_i32(args.linear_num_key_heads)?,
+                            &[ba_width, ba_width],
+                            &[component],
+                        )?,
+                    },
+                );
                 recipes.insert(
                     local,
-                    DerivedWeightRecipe::source(
-                        raw.clone(),
-                        TensorSelection::Indices {
-                            axis: 0,
-                            indices: grouped_component_indices(
-                                usize_from_i32(args.linear_num_key_heads)?,
-                                &[ba_width, ba_width],
-                                &[component],
-                            )?,
-                        },
-                    ),
+                    if suffix == "weight" {
+                        selected
+                    } else {
+                        DerivedWeightRecipe::Cast {
+                            input: Box::new(selected),
+                            dtype: Dtype::Float32,
+                        }
+                    },
                 );
             }
         }
@@ -4559,8 +4589,7 @@ mod tests {
         api::{
             common::generation::CausalLm,
             input as runtime_input,
-            qwen3_5::{self as resident, Cache, LayerCache, Model, ModelArgs, ModelInput},
-            qwen3_next,
+            qwen3_5::{self as resident, LayerCache, Model, ModelArgs},
             qwen_vl::VisionConfig,
         },
         runtime::distributed::{
@@ -4953,9 +4982,23 @@ mod tests {
         write_fixture(dir.path(), &fixture, next, gpu.stream());
 
         let mut resident = if next {
-            qwen3_next::load_qwen3_next_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
+            load_qwen3_next_layerwise_model(
+                dir.path(),
+                crate::LayerWeightResidency::FullyResident,
+                None,
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap()
         } else {
-            resident::load_qwen3_5_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
+            load_qwen35_layerwise_model(
+                dir.path(),
+                crate::LayerWeightResidency::FullyResident,
+                None,
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap()
         };
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
         let mut layerwise = if next {
@@ -4966,10 +5009,7 @@ mod tests {
                 .unwrap()
         };
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
+        let mut layerwise_cache = layerwise.new_cache();
         let paged_options = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
             .unwrap()
             .with_full_attention(true);
@@ -4983,16 +5023,7 @@ mod tests {
             Array::from_slice(&[5u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: None,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = layerwise
                 .forward(&tokens, &mut layerwise_cache, gpu.stream())
@@ -5094,9 +5125,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, next, gpu.stream());
         let mut resident = if next {
-            qwen3_next::load_qwen3_next_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
+            load_qwen3_next_layerwise_model(
+                dir.path(),
+                crate::LayerWeightResidency::FullyResident,
+                None,
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap()
         } else {
-            resident::load_qwen3_5_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
+            load_qwen35_layerwise_model(
+                dir.path(),
+                crate::LayerWeightResidency::FullyResident,
+                None,
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap()
         };
         let options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
@@ -5127,25 +5172,13 @@ mod tests {
             .unwrap()
         };
         let mut resident_cache = resident.new_cache();
-        let mut cached_cache = Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
+        let mut cached_cache = cached.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: None,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = cached
                 .forward(&tokens, &mut cached_cache, gpu.stream())
@@ -5258,8 +5291,14 @@ mod tests {
         )
         .unwrap();
 
-        let mut resident =
-            resident::load_qwen3_5_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_qwen35_layerwise_model(
+            dir.path(),
+            crate::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let mut layerwise = load_qwen35_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),

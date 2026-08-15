@@ -30,15 +30,6 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::nn as common;
-#[cfg(test)]
-use crate::runtime::checkpoint::load::gguf_metadata;
-#[cfg(test)]
-use crate::runtime::checkpoint::load::{
-    for_each_safetensor_array, load_array_quantized_strict, load_array_strict, safetensors_files,
-    StrictLoadConfig, StrictLoadReport,
-};
-#[cfg(test)]
-use crate::runtime::checkpoint::quantization::quantize_tensor;
 use crate::{
     api::{
         input as runtime_input,
@@ -70,9 +61,6 @@ use crate::{
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
 };
-#[cfg(test)]
-use safemlx::{module::ModuleParametersExt, ops::stack_axis, transforms::async_eval_with_event};
-
 type ObserverOption<'a> = Option<&'a mut dyn ActivationObserver>;
 
 fn activation_name(prefix: &str, suffix: &str) -> String {
@@ -3299,549 +3287,9 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
     model_args_from_config_value(config).map(|_| ())
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-#[cfg(test)]
-enum ExpertProjection {
-    Gate,
-    Up,
-    Down,
-}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-#[cfg(test)]
-enum ExpertComponent {
-    Weight,
-    Fp8Scale,
-    AffineScales,
-    AffineBiases,
-}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-#[cfg(test)]
-struct ExpertBankKey {
-    layer: usize,
-    projection: ExpertProjection,
-    component: ExpertComponent,
-}
-
-#[cfg(test)]
-struct PendingExpertBank {
-    values: Vec<Option<Array>>,
-}
-
-#[cfg(test)]
-impl PendingExpertBank {
-    fn new(num_experts: i32) -> Self {
-        Self {
-            values: (0..num_experts).map(|_| None).collect(),
-        }
-    }
-
-    fn insert(&mut self, expert: usize, value: Array) -> Result<(), Error> {
-        let slot = self.values.get_mut(expert).ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "DeepSeek-V3 checkpoint expert index {expert} is out of range"
-            ))
-        })?;
-        if slot.is_some() {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "DeepSeek-V3 checkpoint contains duplicate expert index {expert}"
-            )));
-        }
-        *slot = Some(value);
-        Ok(())
-    }
-
-    fn is_complete(&self) -> bool {
-        self.values.iter().all(Option::is_some)
-    }
-
-    fn stack(self, stream: &Stream) -> Result<Array, Error> {
-        let values = self
-            .values
-            .into_iter()
-            .map(|value| value.expect("completed expert bank"))
-            .collect::<Vec<_>>();
-        Ok(stack_axis(&values, 0, stream)?)
-    }
-}
-
-#[cfg(test)]
-fn parse_expert_key(key: &str) -> Option<(ExpertBankKey, usize)> {
-    let rest = key.strip_prefix("model.layers.")?;
-    let (layer, rest) = rest.split_once(".mlp.experts.")?;
-    let layer = layer.parse().ok()?;
-    let mut parts = rest.split('.');
-    let expert = parts.next()?.parse().ok()?;
-    let projection = match parts.next()? {
-        "gate_proj" => ExpertProjection::Gate,
-        "up_proj" => ExpertProjection::Up,
-        "down_proj" => ExpertProjection::Down,
-        _ => return None,
-    };
-    let component = match (parts.next()?, parts.next(), parts.next()) {
-        ("weight", None, None) => ExpertComponent::Weight,
-        ("weight_scale_inv", None, None) => ExpertComponent::Fp8Scale,
-        ("scales", None, None) => ExpertComponent::AffineScales,
-        ("biases", None, None) => ExpertComponent::AffineBiases,
-        _ => return None,
-    };
-    Some((
-        ExpertBankKey {
-            layer,
-            projection,
-            component,
-        },
-        expert,
-    ))
-}
-
-#[cfg(test)]
-fn target_expert_key(key: ExpertBankKey) -> String {
-    let projection = match key.projection {
-        ExpertProjection::Gate => "gate_proj",
-        ExpertProjection::Up => "up_proj",
-        ExpertProjection::Down => "down_proj",
-    };
-    let suffix = match key.component {
-        ExpertComponent::Weight => "",
-        ExpertComponent::Fp8Scale => "_scale_inv",
-        ExpertComponent::AffineScales => "_scales",
-        ExpertComponent::AffineBiases => "_biases",
-    };
-    format!(
-        "model.layers.{}.mlp.experts.{projection}{suffix}",
-        key.layer
-    )
-}
-
-#[cfg(test)]
-fn assign_expert_bank(model: &mut Model, key: ExpertBankKey, value: Array) -> Result<(), Error> {
-    let layer = model.model.layers.get_mut(key.layer).ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!(
-            "DeepSeek-V3 expert bank references nonexistent layer {}",
-            key.layer
-        ))
-    })?;
-    let moe = layer.mlp.moe_mut().ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!(
-            "DeepSeek-V3 checkpoint contains routed experts for dense layer {}",
-            key.layer
-        ))
-    })?;
-    let destination = match (key.projection, key.component) {
-        (ExpertProjection::Gate, ExpertComponent::Weight) => &mut moe.experts.gate_proj,
-        (ExpertProjection::Gate, ExpertComponent::Fp8Scale) => &mut moe.experts.gate_proj_scale_inv,
-        (ExpertProjection::Gate, ExpertComponent::AffineScales) => {
-            &mut moe.experts.gate_proj_scales
-        }
-        (ExpertProjection::Gate, ExpertComponent::AffineBiases) => {
-            &mut moe.experts.gate_proj_biases
-        }
-        (ExpertProjection::Up, ExpertComponent::Weight) => &mut moe.experts.up_proj,
-        (ExpertProjection::Up, ExpertComponent::Fp8Scale) => &mut moe.experts.up_proj_scale_inv,
-        (ExpertProjection::Up, ExpertComponent::AffineScales) => &mut moe.experts.up_proj_scales,
-        (ExpertProjection::Up, ExpertComponent::AffineBiases) => &mut moe.experts.up_proj_biases,
-        (ExpertProjection::Down, ExpertComponent::Weight) => &mut moe.experts.down_proj,
-        (ExpertProjection::Down, ExpertComponent::Fp8Scale) => &mut moe.experts.down_proj_scale_inv,
-        (ExpertProjection::Down, ExpertComponent::AffineScales) => {
-            &mut moe.experts.down_proj_scales
-        }
-        (ExpertProjection::Down, ExpertComponent::AffineBiases) => {
-            &mut moe.experts.down_proj_biases
-        }
-    };
-    *destination = Param::new(Some(value));
-    Ok(())
-}
-
-#[cfg(test)]
-fn strict_load_config(args: &ModelArgs) -> StrictLoadConfig {
-    let mut config = StrictLoadConfig::default();
-    for index in 0..args.num_nextn_predict_layers {
-        config =
-            config.allow_unused_prefix(format!("model.layers.{}.", args.num_hidden_layers + index));
-    }
-    config
-}
-
-#[cfg(test)]
-fn expert_affine_quantization(
-    args: &ModelArgs,
-    layer: usize,
-    projection: ExpertProjection,
-) -> Option<WeightQuantization> {
-    let projection = match projection {
-        ExpertProjection::Gate => "gate_proj",
-        ExpertProjection::Up => "up_proj",
-        ExpertProjection::Down => "down_proj",
-    };
-    args.weight_format_for(&format!("model.layers.{layer}.mlp.experts.{projection}"))
-        .affine()
-}
-
-#[cfg(test)]
-fn expected_expert_banks(args: &ModelArgs) -> Vec<ExpertBankKey> {
-    let mut expected = Vec::new();
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if *policy != LayerPolicy::SparseMoe {
-            continue;
-        }
-        for projection in [
-            ExpertProjection::Gate,
-            ExpertProjection::Up,
-            ExpertProjection::Down,
-        ] {
-            expected.push(ExpertBankKey {
-                layer,
-                projection,
-                component: ExpertComponent::Weight,
-            });
-            if args.native_fp8_config().is_some() {
-                expected.push(ExpertBankKey {
-                    layer,
-                    projection,
-                    component: ExpertComponent::Fp8Scale,
-                });
-            } else if let Some(affine) = expert_affine_quantization(args, layer, projection) {
-                expected.push(ExpertBankKey {
-                    layer,
-                    projection,
-                    component: ExpertComponent::AffineScales,
-                });
-                if affine.has_biases() {
-                    expected.push(ExpertBankKey {
-                        layer,
-                        projection,
-                        component: ExpertComponent::AffineBiases,
-                    });
-                }
-            }
-        }
-    }
-    expected
-}
-
-#[cfg(test)]
-fn expected_expert_tensor_shape(
-    args: &ModelArgs,
-    key: ExpertBankKey,
-    quantize_on_load: bool,
-) -> Vec<i32> {
-    let (out, input) = match key.projection {
-        ExpertProjection::Gate | ExpertProjection::Up => {
-            (args.moe_intermediate_size, args.hidden_size)
-        }
-        ExpertProjection::Down => (args.hidden_size, args.moe_intermediate_size),
-    };
-    match key.component {
-        ExpertComponent::Weight => {
-            if quantize_on_load {
-                vec![out, input]
-            } else if let Some(affine) = expert_affine_quantization(args, key.layer, key.projection)
-            {
-                vec![out, quantized_packed_dimension(input, affine.bits())]
-            } else {
-                vec![out, input]
-            }
-        }
-        ExpertComponent::Fp8Scale => vec![(out + 127) / 128, (input + 127) / 128],
-        ExpertComponent::AffineScales | ExpertComponent::AffineBiases => {
-            let affine = expert_affine_quantization(args, key.layer, key.projection)
-                .expect("affine expert component requires metadata");
-            vec![out, input / affine.group_size()]
-        }
-    }
-}
-
-/// Test-only eager reference loader used to compare the canonical engine.
-#[cfg(test)]
-pub(crate) fn load_test_resident_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    let args = get_model_args(model_dir)?;
-    load_model_impl(model_dir, args, None, stream, weights_stream)
-}
-
-#[cfg(test)]
-fn load_model_impl(
-    model_dir: &Path,
-    args: ModelArgs,
-    quantize_on_load: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let options = quantize_on_load.map_or_else(
-        crate::api::ModelLoadOptions::default,
-        crate::api::ModelLoadOptions::with_quantization,
-    );
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV3,
-        model_dir,
-        options,
-    )?;
-    let mut model = Model::new(args.clone(), stream)?;
-    let config = strict_load_config(&args);
-    let mut report = StrictLoadReport::default();
-    let mut pending: HashMap<ExpertBankKey, PendingExpertBank> = HashMap::new();
-    let mut completed = std::collections::HashSet::new();
-
-    for file in safetensors_files(model_dir)? {
-        for_each_safetensor_array(file, weights_stream, |key, value| {
-            if let Some((bank, expert)) = parse_expert_key(&key) {
-                if bank.layer >= args.layer_schedule.len() {
-                    report.record_unused(key);
-                    return Ok(());
-                }
-                if quantize_on_load.is_some() && bank.component != ExpertComponent::Weight {
-                    return Err(Error::Quantization(format!(
-                        "DeepSeek-V3 on-load quantization expected floating-point expert weight {key}, not prequantized metadata"
-                    )));
-                }
-                let expected_component = expected_expert_banks(&args).contains(&bank)
-                    || (quantize_on_load.is_some() && bank.component == ExpertComponent::Weight);
-                if !expected_component {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "DeepSeek-V3 config contains unexpected expert component {key}"
-                    )));
-                }
-                let expected =
-                    expected_expert_tensor_shape(&args, bank, quantize_on_load.is_some());
-                if value.shape() != expected {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "DeepSeek-V3 expert tensor {key} has shape {:?}, expected {expected:?}",
-                        value.shape()
-                    )));
-                }
-                if let Some(quantization) = quantize_on_load {
-                    let quantized = quantize_tensor(&value, quantization, stream)?;
-                    let scales_bank = ExpertBankKey {
-                        component: ExpertComponent::AffineScales,
-                        ..bank
-                    };
-                    let biases_bank = ExpertBankKey {
-                        component: ExpertComponent::AffineBiases,
-                        ..bank
-                    };
-                    let mut arrays = vec![&quantized.weight, &quantized.scales];
-                    if let Some(biases) = &quantized.biases {
-                        arrays.push(biases);
-                    }
-                    async_eval_with_event(arrays)?.synchronize()?;
-                    pending
-                        .entry(bank)
-                        .or_insert_with(|| PendingExpertBank::new(args.n_routed_experts))
-                        .insert(expert, quantized.weight)?;
-                    pending
-                        .entry(scales_bank)
-                        .or_insert_with(|| PendingExpertBank::new(args.n_routed_experts))
-                        .insert(expert, quantized.scales)?;
-                    if let Some(biases) = quantized.biases {
-                        pending
-                            .entry(biases_bank)
-                            .or_insert_with(|| PendingExpertBank::new(args.n_routed_experts))
-                            .insert(expert, biases)?;
-                    }
-                } else {
-                    pending
-                        .entry(bank)
-                        .or_insert_with(|| PendingExpertBank::new(args.n_routed_experts))
-                        .insert(expert, value)?;
-                }
-            } else {
-                let mut params = model.parameters_mut().flatten();
-                if let Some(quantization) = quantize_on_load {
-                    load_array_quantized_strict(
-                        &mut params,
-                        key,
-                        value,
-                        stream,
-                        quantization,
-                        &config,
-                        &mut report,
-                    )?;
-                } else {
-                    load_array_strict(&mut params, key, value, &config, &mut report);
-                }
-            }
-            Ok(())
-        })?;
-
-        let ready = pending
-            .iter()
-            .filter_map(|(key, bank)| bank.is_complete().then_some(*key))
-            .collect::<Vec<_>>();
-        for key in ready {
-            let packed = pending
-                .remove(&key)
-                .expect("ready expert bank")
-                .stack(stream)?;
-            async_eval_with_event([&packed])?.synchronize()?;
-            assign_expert_bank(&mut model, key, packed)?;
-            report.record_loaded(target_expert_key(key));
-            completed.insert(key);
-        }
-    }
-
-    let mut missing_banks = expected_expert_banks(&args)
-        .into_iter()
-        .filter(|key| !completed.contains(key))
-        .map(target_expert_key)
-        .collect::<Vec<_>>();
-    if !pending.is_empty() {
-        missing_banks.extend(pending.keys().copied().map(target_expert_key));
-    }
-    if !missing_banks.is_empty() {
-        missing_banks.sort();
-        missing_banks.dedup();
-        return Err(Error::StrictLoadValidation {
-            missing: missing_banks,
-            unused: Vec::new(),
-        });
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Test-only eager quantized reference loader.
-#[cfg(test)]
-pub(crate) fn load_test_resident_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    quantization.validate()?;
-    let model_dir = model_dir.as_ref();
-    let mut args = get_model_args(model_dir)?;
-    if args.native_fp8_config().is_some() {
-        return Err(Error::Quantization(
-            "native DeepSeek block-FP8 weights cannot be implicitly dequantized and requantized"
-                .into(),
-        ));
-    }
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "DeepSeek-V3",
-        args.affine_quantization()?,
-        quantization,
-    )? {
-        return load_test_resident_model(model_dir, stream, weights_stream);
-    }
-    args.quantization_config = None;
-    args.quantization = Some(quantization);
-    load_model_impl(model_dir, args, Some(quantization), stream, weights_stream)
-}
-
-#[cfg(test)]
-pub(crate) struct LoadedDeepSeekGguf {
-    pub(crate) model: Model,
-}
-
 pub(crate) struct PreparedDeepSeekGguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
-}
-
-/// Loads a llama.cpp `deepseek2` GGUF checkpoint.
-#[cfg(test)]
-pub fn load_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
-}
-
-#[cfg(test)]
-pub(crate) fn load_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedDeepSeekGguf, Error> {
-    let options = quantization.map_or_else(
-        crate::api::ModelLoadOptions::default,
-        crate::api::ModelLoadOptions::with_quantization,
-    );
-    crate::api::structural::validate_gguf(
-        crate::api::GgufArchitecture::DeepSeek2,
-        checkpoint,
-        &metadata,
-        options,
-    )
-    .into_loader_result()?;
-    let prepared = prepare_gguf_checkpoint(checkpoint, &metadata, quantization, weights_stream)?;
-    let mut model = Model::new(prepared.args, stream)?;
-    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
-    let mut report = StrictLoadReport::default();
-    let expert_keys = expected_expert_banks(&model.args)
-        .into_iter()
-        .map(|key| (target_expert_key(key), key))
-        .collect::<HashMap<_, _>>();
-    for tensor in checkpoint.converted_tensors() {
-        for (source_name, value) in tensor?.into_arrays() {
-            let name = translate_gguf_weight_name(&source_name);
-            if let Some(&key) = expert_keys.get(&name) {
-                if let Some(quantization) = quantization {
-                    if key.component != ExpertComponent::Weight {
-                        continue;
-                    }
-                    let quantized =
-                        common::moe::quantize_expert_bank(&value, quantization, stream)?;
-                    let scales_key = ExpertBankKey {
-                        component: ExpertComponent::AffineScales,
-                        ..key
-                    };
-                    let biases_key = ExpertBankKey {
-                        component: ExpertComponent::AffineBiases,
-                        ..key
-                    };
-                    let mut evaluated = vec![&quantized.weight, &quantized.scales];
-                    if let Some(biases) = &quantized.biases {
-                        evaluated.push(biases);
-                    }
-                    async_eval_with_event(evaluated)?.synchronize()?;
-                    assign_expert_bank(&mut model, key, quantized.weight)?;
-                    assign_expert_bank(&mut model, scales_key, quantized.scales)?;
-                    report.record_loaded(name);
-                    report.record_loaded(target_expert_key(scales_key));
-                    if let Some(biases) = quantized.biases {
-                        assign_expert_bank(&mut model, biases_key, biases)?;
-                        report.record_loaded(target_expert_key(biases_key));
-                    }
-                } else {
-                    assign_expert_bank(&mut model, key, value)?;
-                    report.record_loaded(name);
-                }
-                continue;
-            }
-
-            let mut params = model.parameters_mut().flatten();
-            if let Some(quantization) = quantization {
-                load_array_quantized_strict(
-                    &mut params,
-                    name,
-                    value,
-                    stream,
-                    quantization,
-                    &config,
-                    &mut report,
-                )?;
-            } else {
-                load_array_strict(&mut params, name, value, &config, &mut report);
-            }
-        }
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(LoadedDeepSeekGguf { model })
 }
 
 pub(crate) fn prepare_gguf_checkpoint(
@@ -4144,12 +3592,14 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deepseek_layer_schedule, load_test_resident_model, parse_config_value,
-        prompt_cache_architecture_fingerprint, Cache, FeedForward, LayerPolicy, Model, ModelArgs,
-        ModelInput,
+        deepseek_layer_schedule, parse_config_value, prompt_cache_architecture_fingerprint, Cache,
+        FeedForward, LayerPolicy, Model, ModelArgs, ModelInput,
     };
     use crate::{
         api::{LoadedModel, ModelKind},
+        architectures::deepseek_v3::layerwise::{
+            load_deepseek_v3_layerwise_model, DeepSeekV3LayerwiseModel,
+        },
         error::Error,
         runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
         runtime::cache::CompressedLatentCache,
@@ -4165,6 +3615,40 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::{collections::HashMap, fs, path::Path, time::SystemTime};
+
+    fn load_fully_resident(
+        model_dir: impl AsRef<Path>,
+        quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+        stream: &safemlx::Stream,
+    ) -> Result<DeepSeekV3LayerwiseModel, Error> {
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        load_deepseek_v3_layerwise_model(
+            model_dir,
+            crate::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
+            quantization,
+            stream,
+            weights.stream(),
+        )
+    }
+
+    fn load_gguf_fully_resident(
+        path: impl AsRef<Path>,
+        quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+        stream: &safemlx::Stream,
+    ) -> Result<DeepSeekV3LayerwiseModel, Error> {
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(path)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_gguf_layerwise_model(
+            &checkpoint,
+            &metadata,
+            crate::WeightResidency::fully_resident(),
+            quantization,
+            stream,
+            weights.stream(),
+        )
+        .map(|(model, _)| model)
+    }
 
     fn tiny_config_value(q_lora_rank: Option<i32>) -> Value {
         json!({
@@ -5105,8 +4589,8 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_test_resident_model(&dir, stream, weights_stream).unwrap();
-        assert_eq!(loaded.model_type(), "deepseek_v3");
+        let loaded = load_fully_resident(&dir, None, stream).unwrap();
+        assert_eq!(loaded.args().model_type, "deepseek_v3");
         let loaded = LoadedModel::load(&dir, stream, weights_stream).unwrap();
         assert_eq!(loaded.model_type(), "deepseek_v3");
         assert_eq!(loaded.eos_token_ids(), &[1]);
@@ -5122,8 +4606,8 @@ mod tests {
                 Array::zeros::<f32>(&[8, 16], stream).unwrap(),
             )],
         );
-        let error = load_test_resident_model(&dir, stream, stream).unwrap_err();
-        assert!(matches!(error, Error::StrictLoadValidation { .. }));
+        let error = load_fully_resident(&dir, None, stream).err().unwrap();
+        assert!(!error.to_string().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5135,8 +4619,8 @@ mod tests {
         initialize_dense_model(&mut source, stream);
         let dir = temp_dir();
         save_fixture(&dir, &source, stream, Some("lm_head.weight"), Vec::new());
-        let error = load_test_resident_model(&dir, stream, stream).unwrap_err();
-        assert!(matches!(error, Error::StrictLoadValidation { .. }));
+        let error = load_fully_resident(&dir, None, stream).err().unwrap();
+        assert!(!error.to_string().is_empty());
 
         save_fixture(
             &dir,
@@ -5148,8 +4632,8 @@ mod tests {
                 Array::zeros::<f32>(&[1], stream).unwrap(),
             )],
         );
-        let error = load_test_resident_model(&dir, stream, stream).unwrap_err();
-        assert!(matches!(error, Error::StrictLoadValidation { .. }));
+        let error = load_fully_resident(&dir, None, stream).err().unwrap();
+        assert!(!error.to_string().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5161,28 +4645,14 @@ mod tests {
         initialize_fp8_model(&mut source, stream);
         let dir = temp_dir();
         save_fixture(&dir, &source, stream, None, Vec::new());
-        let mut loaded = load_test_resident_model(&dir, stream, stream).unwrap();
+        let mut loaded = load_fully_resident(&dir, None, stream).unwrap();
         let mut cache = loaded.new_cache();
         let prefill = loaded
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[1i32, 2], &[1, 2]),
-                    mask: None,
-                    cache: Some(&mut cache),
-                },
-                stream,
-            )
+            .forward(&Array::from_slice(&[1i32, 2], &[1, 2]), &mut cache, stream)
             .unwrap();
         assert_eq!(prefill.shape(), &[1, 2, 32]);
         let chunk = loaded
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[3i32, 4], &[1, 2]),
-                    mask: None,
-                    cache: Some(&mut cache),
-                },
-                stream,
-            )
+            .forward(&Array::from_slice(&[3i32, 4], &[1, 2]), &mut cache, stream)
             .unwrap();
         assert_eq!(chunk.shape(), &[1, 2, 32]);
         assert_eq!(cache.offset(), 4);
@@ -5262,14 +4732,12 @@ mod tests {
             .collect::<Vec<_>>();
         let context = test_context();
         let stream = context.stream();
-        let mut model = load_test_resident_model(&dir, stream, stream).unwrap();
+        let mut model = load_fully_resident(&dir, None, stream).unwrap();
+        let mut cache = model.new_cache();
         let logits = model
             .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&ids, &[1, ids.len() as i32]),
-                    mask: None,
-                    cache: None,
-                },
+                &Array::from_slice(&ids, &[1, ids.len() as i32]),
+                &mut cache,
                 stream,
             )
             .unwrap();
@@ -5286,7 +4754,7 @@ mod tests {
     }
 
     #[test]
-    fn affine_and_mxfp4_on_load_and_prequantized_expert_banks_run() {
+    fn affine_and_mxfp4_on_load_run_through_canonical_loader() {
         use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
         let context = test_context();
         let stream = context.stream();
@@ -5296,85 +4764,26 @@ mod tests {
         let dir = temp_dir();
         save_fixture(&dir, &source, stream, None, Vec::new());
         let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
-        let mut quantized =
-            super::load_test_resident_model_quantized(&dir, quantization, stream, stream).unwrap();
-        let experts = quantized.model.layers[1]
-            .mlp
-            .moe_mut()
-            .unwrap()
-            .experts
-            .clone();
-        assert_eq!(experts.gate_affine, Some(quantization));
-        assert_eq!(experts.up_affine, Some(quantization));
-        assert_eq!(experts.down_affine, Some(quantization));
-        assert_eq!(
-            experts.gate_proj.as_ref().as_ref().unwrap().dtype(),
-            Dtype::Uint32
-        );
-        assert!(experts.gate_proj_scales.as_ref().is_some());
-        assert!(experts.gate_proj_biases.as_ref().is_some());
+        let mut quantized = load_fully_resident(&dir, Some(quantization), stream).unwrap();
 
         let mut cache = quantized.new_cache();
         let logits = quantized
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[1i32, 2], &[1, 2]),
-                    mask: None,
-                    cache: Some(&mut cache),
-                },
-                stream,
-            )
+            .forward(&Array::from_slice(&[1i32, 2], &[1, 2]), &mut cache, stream)
             .unwrap();
         assert_eq!(logits.shape(), &[1, 2, 32]);
 
-        let prequantized_dir = temp_dir();
-        save_fixture(&prequantized_dir, &quantized, stream, None, Vec::new());
-        let mut reloaded = load_test_resident_model(&prequantized_dir, stream, stream).unwrap();
-        let logits = reloaded
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[1i32, 2], &[1, 2]),
-                    mask: None,
-                    cache: None,
-                },
-                stream,
-            )
-            .unwrap();
-        assert_eq!(logits.shape(), &[1, 2, 32]);
-
-        let mut mxfp4 = super::load_test_resident_model_quantized(
-            &dir,
-            WeightQuantization::MxFp4,
-            stream,
-            stream,
-        )
-        .unwrap();
-        let experts = mxfp4.model.layers[1].mlp.moe_mut().unwrap().experts.clone();
-        assert_eq!(experts.gate_affine, Some(WeightQuantization::MxFp4));
-        assert!(experts.gate_proj_scales.as_ref().is_some());
-        assert!(experts.gate_proj_biases.as_ref().is_none());
-        let mxfp4_dir = temp_dir();
-        save_fixture(&mxfp4_dir, &mxfp4, stream, None, Vec::new());
-        let mut mxfp4_reloaded = load_test_resident_model(&mxfp4_dir, stream, stream).unwrap();
-        let logits = mxfp4_reloaded
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[1i32, 2], &[1, 2]),
-                    mask: None,
-                    cache: None,
-                },
-                stream,
-            )
+        let mut mxfp4 = load_fully_resident(&dir, Some(WeightQuantization::MxFp4), stream).unwrap();
+        let mut cache = mxfp4.new_cache();
+        let logits = mxfp4
+            .forward(&Array::from_slice(&[1i32, 2], &[1, 2]), &mut cache, stream)
             .unwrap();
         assert_eq!(logits.shape(), &[1, 2, 32]);
         fs::remove_dir_all(dir).unwrap();
-        fs::remove_dir_all(prequantized_dir).unwrap();
-        fs::remove_dir_all(mxfp4_dir).unwrap();
     }
 
     #[test]
     fn loads_dense_and_mixed_quantized_deepseek2_gguf_checkpoints() {
-        use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
+        use crate::runtime::checkpoint::quantization::AffineQuantization;
         use safemlx_gguf::GgmlType;
         let context = test_context();
         let stream = context.stream();
@@ -5393,48 +4802,28 @@ mod tests {
         );
         let metadata = gguf_metadata();
         let dense_fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
-        let mut dense = super::load_gguf(dense_fixture.path(), stream, stream).unwrap();
+        let mut dense = load_gguf_fully_resident(dense_fixture.path(), None, stream).unwrap();
         assert_eq!(
             dense
-                .args
+                .args()
                 .layer_schedule
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
             vec![LayerPolicy::DenseMlp, LayerPolicy::SparseMoe]
         );
+        let mut cache = dense.new_cache();
         let logits = dense
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[1i32, 2], &[1, 2]),
-                    mask: None,
-                    cache: None,
-                },
-                stream,
-            )
+            .forward(&Array::from_slice(&[1i32, 2], &[1, 2]), &mut cache, stream)
             .unwrap();
         assert_eq!(logits.shape(), &[1, 2, 32]);
 
         let q4 = AffineQuantization::new(32, 4).unwrap();
-        let checkpoint = safemlx::ops::GgufCheckpoint::open(dense_fixture.path()).unwrap();
-        let mut on_load = super::load_gguf_checkpoint(
-            &checkpoint,
-            crate::runtime::checkpoint::load::gguf_metadata(&checkpoint),
-            Some(q4.into()),
-            stream,
-            stream,
-        )
-        .unwrap()
-        .model;
+        let mut on_load =
+            load_gguf_fully_resident(dense_fixture.path(), Some(q4.into()), stream).unwrap();
+        let mut cache = on_load.new_cache();
         let logits = on_load
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[1i32], &[1, 1]),
-                    mask: None,
-                    cache: None,
-                },
-                stream,
-            )
+            .forward(&Array::from_slice(&[1i32], &[1, 1]), &mut cache, stream)
             .unwrap();
         assert_eq!(logits.shape(), &[1, 1, 32]);
 
@@ -5453,32 +4842,10 @@ mod tests {
                 })
             },
         );
-        let mut quantized = super::load_gguf(packed_fixture.path(), stream, stream).unwrap();
-        let experts = quantized.model.layers[1]
-            .mlp
-            .moe_mut()
-            .unwrap()
-            .experts
-            .clone();
-        assert_eq!(experts.gate_affine.unwrap().bits(), 4);
-        assert!(experts.up_affine.is_none());
-        assert!(matches!(
-            experts.up_iquant,
-            Some(WeightQuantization::GgufIQuant {
-                ggml_type: GgmlType::Q8_0,
-                ..
-            })
-        ));
-        assert_eq!(experts.down_affine.unwrap().bits(), 4);
+        let mut quantized = load_gguf_fully_resident(packed_fixture.path(), None, stream).unwrap();
+        let mut cache = quantized.new_cache();
         let logits = quantized
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[1i32, 2], &[1, 2]),
-                    mask: None,
-                    cache: None,
-                },
-                stream,
-            )
+            .forward(&Array::from_slice(&[1i32, 2], &[1, 2]), &mut cache, stream)
             .unwrap();
         assert_eq!(logits.shape(), &[1, 2, 32]);
     }
@@ -5492,13 +4859,15 @@ mod tests {
         initialize_fp8_model(&mut source, stream);
         let dir = temp_dir();
         save_fixture(&dir, &source, stream, None, Vec::new());
-        let error = super::load_test_resident_model_quantized(
+        let error = load_fully_resident(
             &dir,
-            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
-            stream,
+            Some(WeightQuantization::Affine(
+                AffineQuantization::new(32, 4).unwrap(),
+            )),
             stream,
         )
-        .unwrap_err();
+        .err()
+        .unwrap();
         assert!(error.to_string().contains("block-FP8"));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -5511,30 +4880,16 @@ mod tests {
             .expect("DEEPSEEK_V3_GGUF");
         let context = test_context();
         let stream = context.stream();
-        let mut model = super::load_gguf(&file, stream, stream).unwrap();
+        let mut model = load_gguf_fully_resident(&file, None, stream).unwrap();
         let mut cache = model.new_cache();
         let prefill = model
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[0i32, 1], &[1, 2]),
-                    mask: None,
-                    cache: Some(&mut cache),
-                },
-                stream,
-            )
+            .forward(&Array::from_slice(&[0i32, 1], &[1, 2]), &mut cache, stream)
             .unwrap();
         assert_eq!(prefill.dim(1), 2);
         let decode = model
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[2i32], &[1, 1]),
-                    mask: None,
-                    cache: Some(&mut cache),
-                },
-                stream,
-            )
+            .forward(&Array::from_slice(&[2i32], &[1, 1]), &mut cache, stream)
             .unwrap();
-        assert_eq!(decode.shape(), &[1, 1, model.args.vocab_size]);
+        assert_eq!(decode.shape(), &[1, 1, model.args().vocab_size]);
         assert_eq!(cache.offset(), 3);
     }
 
@@ -5546,19 +4901,12 @@ mod tests {
             .expect("DEEPSEEK_V3_MODEL_DIR");
         let context = test_context();
         let stream = context.stream();
-        let mut model = load_test_resident_model(&dir, stream, stream).unwrap();
+        let mut model = load_fully_resident(&dir, None, stream).unwrap();
         let mut cache = model.new_cache();
         let logits = model
-            .forward(
-                ModelInput {
-                    inputs: &Array::from_slice(&[0i32, 1], &[1, 2]),
-                    mask: None,
-                    cache: Some(&mut cache),
-                },
-                stream,
-            )
+            .forward(&Array::from_slice(&[0i32, 1], &[1, 2]), &mut cache, stream)
             .unwrap();
-        assert_eq!(logits.dim(-1), model.args.vocab_size);
+        assert_eq!(logits.dim(-1), model.args().vocab_size);
         assert_eq!(cache.offset(), 2);
     }
 }

@@ -1467,18 +1467,7 @@ impl DeepSeekV3LayerwiseAdapter {
             }
             let destination = format!("{prefix}.{local_name}");
             let canonical = canonical_checkpoint_name(&destination);
-            if keys.contains(&destination) {
-                recipes.insert(
-                    local_name.to_string(),
-                    DerivedWeightRecipe::source(destination, TensorSelection::Full),
-                );
-                continue;
-            }
-            if keys.contains(&canonical) {
-                recipes.insert(
-                    local_name.to_string(),
-                    DerivedWeightRecipe::source(canonical, TensorSelection::Full),
-                );
+            if keys.contains(&destination) || keys.contains(&canonical) {
                 continue;
             }
             if let Some((projection, component)) = expert_destination(local_name.as_ref()) {
@@ -3260,17 +3249,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, fp8, true, false, gpu.stream());
 
-        let mut resident =
-            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_deepseek_v3_layerwise_model(
+            dir.path(),
+            crate::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
         let mut layerwise =
             load_deepseek_v3_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
                 .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = resident::Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
+        let mut layerwise_cache = layerwise.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -3278,15 +3270,7 @@ mod tests {
             Array::from_slice(&[5u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = layerwise
                 .forward(&tokens, &mut layerwise_cache, gpu.stream())
@@ -3504,11 +3488,14 @@ mod tests {
             gpu.stream(),
         );
 
-        let mut resident = if split_experts {
-            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
-        } else {
-            fixture
-        };
+        let mut resident = load_deepseek_v3_layerwise_model(
+            dir.path(),
+            crate::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let expert_options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
                 .unwrap();
@@ -3524,25 +3511,14 @@ mod tests {
         )
         .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut cached_cache = resident::Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
+        let mut cached_cache = cached.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
             Array::from_slice(&[4u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = cached
                 .forward(&tokens, &mut cached_cache, gpu.stream())

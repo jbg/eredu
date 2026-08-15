@@ -57,14 +57,6 @@ use crate::{
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
 };
 
-#[cfg(test)]
-use crate::runtime::checkpoint::load::{
-    gguf_metadata, load_gguf_strict, load_safetensors_dir_strict_with_split_relu2_experts,
-    transform_split_relu2_experts, StrictLoadConfig, StrictLoadReport,
-};
-#[cfg(test)]
-use safemlx::module::ModuleParametersExt;
-
 /// Executable operator and state policy for one Nemotron-H decoder layer.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum LayerPolicy {
@@ -3982,88 +3974,9 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
-#[cfg(test)]
-pub(crate) struct LoadedNemotronHGguf {
-    pub(crate) model: Model,
-}
-
 pub(crate) struct PreparedNemotronHGguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
-}
-
-/// Loads a dense or sparse-MoE Nemotron-H text model from a GGUF checkpoint.
-#[cfg(test)]
-pub fn load_nemotron_h_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    Ok(load_nemotron_h_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
-}
-
-#[cfg(test)]
-pub(crate) fn load_nemotron_h_gguf_with_metadata(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedNemotronHGguf, Error> {
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    load_nemotron_h_gguf_checkpoint(&checkpoint, metadata, stream, weights_stream)
-}
-
-#[cfg(test)]
-pub(crate) fn load_nemotron_h_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedNemotronHGguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
-    if !matches!(architecture.as_str(), "nemotron_h" | "nemotron_h_moe") {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports nemotron_h and nemotron_h_moe"
-        )));
-    }
-    checkpoint
-        .catalog()
-        .translated_outputs(translate_gguf_weight_name)
-        .map_err(safemlx::error::IoError::from)?;
-
-    let gguf_architecture = if architecture == "nemotron_h_moe" {
-        crate::api::GgufArchitecture::NemotronHMoe
-    } else {
-        crate::api::GgufArchitecture::NemotronH
-    };
-    crate::api::structural::validate_gguf(
-        gguf_architecture,
-        checkpoint,
-        &metadata,
-        crate::api::ModelLoadOptions::default(),
-    )
-    .into_loader_result()?;
-    let mut args = model_args_from_gguf_catalog(checkpoint, &metadata, &architecture)?;
-    let quantized_weight_configs =
-        gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
-    args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
-    args.quantization = None;
-    args.quantized_weight_configs = Some(quantized_weight_configs);
-
-    let mut model = Model::new(args, stream)?;
-    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
-    let mut report = StrictLoadReport::default();
-    load_gguf_strict(
-        &mut model,
-        checkpoint,
-        None,
-        &config,
-        &mut report,
-        |name, value| translate_gguf_weight(name, value, weights_stream),
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(LoadedNemotronHGguf { model })
 }
 
 pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
@@ -4388,28 +4301,6 @@ fn unique_nonzero_layer_value(key: &str, values: &[i32]) -> Result<i32, Error> {
     Ok(value)
 }
 
-#[cfg(test)]
-fn translate_gguf_weight(
-    name: String,
-    value: Array,
-    stream: &Stream,
-) -> Result<(String, Array), Error> {
-    let translated = translate_gguf_weight_name(&name);
-    let value = if name.ends_with(".ssm_conv1d.weight") {
-        value.reshape(&[value.shape()[0], 1, value.shape()[1]], stream)?
-    } else if name.ends_with(".ssm_a") {
-        value
-            .multiply(Array::from_f32(-1.0), stream)?
-            .log(stream)?
-            .reshape(&[-1], stream)?
-    } else if name.ends_with(".ssm_d") || name.ends_with(".ssm_norm.weight") {
-        value.reshape(&[-1], stream)?
-    } else {
-        value
-    };
-    Ok((translated, value))
-}
-
 pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     const ROOTS: [(&str, &str); 3] = [
         ("token_embd", "model.embeddings"),
@@ -4578,59 +4469,6 @@ pub fn get_nemotron_h_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArg
     model_args_from_config_value(&serde_json::from_reader(file)?)
 }
 
-/// Loads a Nemotron-H model and safetensors weights from a model directory.
-#[cfg(test)]
-pub fn load_nemotron_h_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::NemotronH,
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
-    let args = get_nemotron_h_model_args(model_dir)?;
-    let mut model = Model::new(args.clone(), stream)?;
-    let config = nemotron_h_strict_load_config();
-    let mut report = StrictLoadReport::default();
-    load_nemotron_h_safetensors_strict(
-        &mut model,
-        model_dir,
-        &args,
-        weights_stream,
-        stream,
-        &config,
-        &mut report,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Strict-loading key rules for Nemotron-H checkpoints.
-#[cfg(test)]
-pub fn nemotron_h_strict_load_config() -> StrictLoadConfig {
-    StrictLoadConfig::default()
-        .rewrite_prefix("backbone.", "model.")
-        .rewrite_prefix("model.backbone.", "model.")
-}
-
-/// Remaps public Nemotron-H checkpoint tensors to the runtime parameter tree.
-#[cfg(test)]
-pub fn transform_nemotron_h_weights(
-    loaded: std::collections::HashMap<String, Array>,
-    args: &ModelArgs,
-    stream: &Stream,
-) -> Result<std::collections::HashMap<String, Array>, Error> {
-    let mut rewritten = std::collections::HashMap::with_capacity(loaded.len());
-    for (key, value) in loaded {
-        rewritten.insert(rewrite_nemotron_h_weight_key(&key, args)?, value);
-    }
-    transform_split_relu2_experts(rewritten, args.n_routed_experts, stream)
-}
-
 pub(crate) fn rewrite_nemotron_h_weight_key(key: &str, args: &ModelArgs) -> Result<String, Error> {
     let Some(rest) = key.strip_prefix("backbone.layers.") else {
         return Ok(key.to_string());
@@ -4650,29 +4488,6 @@ pub(crate) fn rewrite_nemotron_h_weight_key(key: &str, args: &ModelArgs) -> Resu
         LayerPolicy::SparseMoe => "moe",
     };
     Ok(format!("backbone.layers.{layer_idx}.{field}.{suffix}"))
-}
-
-/// Strict-loads Nemotron-H safetensors into a module after applying checkpoint remaps.
-#[cfg(test)]
-pub fn load_nemotron_h_safetensors_strict<M: safemlx::module::ModuleParameters>(
-    model: &mut M,
-    model_dir: impl AsRef<Path>,
-    args: &ModelArgs,
-    weights_stream: &Stream,
-    transform_stream: &Stream,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    load_safetensors_dir_strict_with_split_relu2_experts(
-        model,
-        model_dir,
-        weights_stream,
-        transform_stream,
-        config,
-        report,
-        args.n_routed_experts,
-        |key| rewrite_nemotron_h_weight_key(key, args),
-    )
 }
 
 /// Validates a parsed Nemotron-H config value.
@@ -4842,12 +4657,10 @@ pub(crate) fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
 mod tests {
     use super::{
         expand_layer_values, gguf_affine_quantization, hybrid_pattern_from_gguf_layers,
-        load_nemotron_h_gguf, load_nemotron_h_model, load_nemotron_h_safetensors_strict,
         model_args_from_config_value, rewrite_nemotron_h_weight_key, translate_gguf_weight_name,
         unique_nonzero_layer_value, validate_model_config_value, AttentionCache, Experts,
         LayerCache, LayerPolicy, Model, ModelArgs, ModelInput, SparseMoeBlock,
     };
-    use crate::runtime::checkpoint::load::{StrictLoadConfig, StrictLoadReport};
     use crate::{
         nn::{
             generation::CausalLm,
@@ -4858,18 +4671,11 @@ mod tests {
     };
     use safemlx::{
         module::{Module, ModuleParameters, Param},
-        ops::{dequantize_with_mode, indexing::TryIndexOp},
+        ops::dequantize_with_mode,
         Array, Device, DeviceType, ExecutionContext,
     };
     use serde_json::json;
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicUsize, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    use std::path::PathBuf;
 
     fn nemotron_nano_config() -> serde_json::Value {
         serde_json::from_str(
@@ -4920,33 +4726,6 @@ mod tests {
             }"#,
         )
         .unwrap()
-    }
-
-    fn temp_model_dir() -> std::path::PathBuf {
-        let id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "nemotron_h_test_{}_{}_{}",
-            std::process::id(),
-            id,
-            counter
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn tiny_moe_args() -> ModelArgs {
-        let mut config = nemotron_nano_config();
-        config["hidden_size"] = json!(4);
-        config["intermediate_size"] = json!(3);
-        config["moe_intermediate_size"] = json!(3);
-        config["moe_shared_expert_intermediate_size"] = json!(5);
-        config["n_routed_experts"] = json!(2);
-        config["num_experts_per_tok"] = json!(2);
-        model_args_from_config_value(&config).unwrap()
     }
 
     fn tiny_full_args() -> ModelArgs {
@@ -5247,71 +5026,6 @@ mod tests {
                 "{quantization:?} maximum error {maximum_error}"
             );
         }
-    }
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn strict_load_packs_public_split_moe_expert_weights() {
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let stream = ctx.stream();
-        let args = tiny_moe_args();
-        let dir = temp_model_dir();
-        let weights_path = dir.join("model.safetensors");
-        let arrays = [
-            (
-                "backbone.layers.1.mixer.gate.weight",
-                Array::zeros::<f32>(&[2, 4], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.gate.e_score_correction_bias",
-                Array::zeros::<f32>(&[2], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.experts.0.up_proj.weight",
-                Array::zeros::<f32>(&[3, 4], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.experts.0.down_proj.weight",
-                Array::zeros::<f32>(&[4, 3], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.experts.1.up_proj.weight",
-                Array::zeros::<f32>(&[3, 4], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.experts.1.down_proj.weight",
-                Array::zeros::<f32>(&[4, 3], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.shared_experts.up_proj.weight",
-                Array::zeros::<f32>(&[5, 4], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.shared_experts.down_proj.weight",
-                Array::zeros::<f32>(&[4, 5], stream).unwrap(),
-            ),
-        ];
-        Array::save_safetensors(
-            arrays.iter().map(|(key, value)| (*key, value)),
-            None,
-            &weights_path,
-        )
-        .unwrap();
-
-        let mut moe = SparseMoeBlock::new(&args, 1, stream).unwrap();
-        let config = StrictLoadConfig::default().rewrite_prefix("backbone.layers.1.moe.", "");
-        let mut report = StrictLoadReport::default();
-        load_nemotron_h_safetensors_strict(
-            &mut moe,
-            &dir,
-            &args,
-            stream,
-            stream,
-            &config,
-            &mut report,
-        )
-        .unwrap();
-        report.finish(&moe, &config).unwrap();
     }
 
     #[test]
@@ -5704,86 +5418,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn strict_load_full_model_from_public_checkpoint_key_shapes() {
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let weights_stream = weights_ctx.stream();
-        let args = tiny_full_args();
-        let source = Model::new(args.clone(), stream).unwrap();
-        let dir = temp_model_dir();
-        let weights_path = dir.join("model.safetensors");
-        let mut arrays = Vec::new();
-        for (key, value) in source.parameters().flatten() {
-            if key.as_ref() == "model.layers.2.moe.experts.up_proj" {
-                for expert in 0..args.n_routed_experts {
-                    arrays.push((
-                        format!("backbone.layers.2.mixer.experts.{expert}.up_proj.weight"),
-                        value.try_index_device((expert, .., ..), stream).unwrap(),
-                    ));
-                }
-                continue;
-            }
-            if key.as_ref() == "model.layers.2.moe.experts.down_proj" {
-                for expert in 0..args.n_routed_experts {
-                    arrays.push((
-                        format!("backbone.layers.2.mixer.experts.{expert}.down_proj.weight"),
-                        value.try_index_device((expert, .., ..), stream).unwrap(),
-                    ));
-                }
-                continue;
-            }
-
-            let public_key = key
-                .strip_prefix("model.embeddings.")
-                .map(|rest| format!("backbone.embeddings.{rest}"))
-                .or_else(|| {
-                    key.strip_prefix("model.norm_f.")
-                        .map(|rest| format!("backbone.norm_f.{rest}"))
-                })
-                .or_else(|| {
-                    key.strip_prefix("model.layers.").map(|rest| {
-                        let (layer, suffix) = rest.split_once('.').unwrap();
-                        if suffix.starts_with("norm.") {
-                            return format!("backbone.layers.{layer}.{suffix}");
-                        }
-                        let suffix = suffix
-                            .strip_prefix("mamba.")
-                            .or_else(|| suffix.strip_prefix("attention."))
-                            .or_else(|| suffix.strip_prefix("mlp."))
-                            .or_else(|| suffix.strip_prefix("moe."))
-                            .unwrap_or(suffix);
-                        format!("backbone.layers.{layer}.mixer.{suffix}")
-                    })
-                })
-                .unwrap_or_else(|| key.to_string());
-            arrays.push((public_key, value.clone()));
-        }
-        Array::save_safetensors(
-            arrays.iter().map(|(key, value)| (key.as_str(), value)),
-            None,
-            &weights_path,
-        )
-        .unwrap();
-
-        let mut target = Model::new(args.clone(), stream).unwrap();
-        let config = super::nemotron_h_strict_load_config();
-        let mut report = StrictLoadReport::default();
-        load_nemotron_h_safetensors_strict(
-            &mut target,
-            &dir,
-            &args,
-            weights_stream,
-            stream,
-            &config,
-            &mut report,
-        )
-        .unwrap();
-        report.finish(&target, &config).unwrap();
-    }
-
-    #[test]
     #[ignore = "requires a local Nemotron-H checkpoint and MLX runtime execution"]
     fn strict_loads_real_public_checkpoint() {
         let model_dir = PathBuf::from(
@@ -5795,11 +5429,18 @@ mod tests {
         let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let weights_stream = weights_ctx.stream();
 
-        let model = load_nemotron_h_model(&model_dir, stream, weights_stream).unwrap();
-        assert_eq!(model.model_type(), "nemotron_h");
-        assert_eq!(model.args.num_hidden_layers, 52);
-        assert_eq!(model.args.n_routed_experts, 128);
-        assert_eq!(model.args.num_experts_per_tok, 6);
+        let model = crate::architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
+            &model_dir,
+            crate::LayerWeightResidency::FullyResident,
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+        assert_eq!(model.args().model_type, "nemotron_h");
+        assert_eq!(model.args().num_hidden_layers, 52);
+        assert_eq!(model.args().n_routed_experts, 128);
+        assert_eq!(model.args().num_experts_per_tok, 6);
         assert_eq!(model.new_cache().layers.len(), 52);
     }
 
@@ -5813,13 +5454,24 @@ mod tests {
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut model = load_nemotron_h_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        let checkpoint = safemlx::ops::GgufCheckpoint::open(&gguf_file).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let (mut model, _) =
+            crate::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
+                &checkpoint,
+                &metadata,
+                crate::WeightResidency::fully_resident(),
+                None,
+                stream,
+                weights_ctx.stream(),
+            )
+            .unwrap();
 
-        assert_eq!(model.args.num_hidden_layers, 52);
-        assert_eq!(model.args.n_routed_experts, 128);
-        assert_eq!(model.args.num_experts_per_tok, 6);
+        assert_eq!(model.args().num_hidden_layers, 52);
+        assert_eq!(model.args().n_routed_experts, 128);
+        assert_eq!(model.args().num_experts_per_tok, 6);
         assert!(model
-            .args
+            .args()
             .layer_schedule
             .iter()
             .any(|policy| *policy == LayerPolicy::SparseMoe));

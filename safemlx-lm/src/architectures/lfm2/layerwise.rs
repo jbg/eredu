@@ -2511,7 +2511,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
 
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_lfm2_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options = if dense_stream {
             LayerWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth).unwrap(),
@@ -2538,7 +2545,7 @@ mod tests {
                 }));
         }
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = Cache { layers: Vec::new() };
+        let mut layerwise_cache = layerwise.new_cache();
         let paged_options = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
             .unwrap()
             .with_full_attention(true);
@@ -2552,7 +2559,7 @@ mod tests {
             Array::from_slice(&[5u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(&tokens, Some(&mut resident_cache), false, gpu.stream())
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = layerwise
                 .forward(&tokens, &mut layerwise_cache, gpu.stream())
@@ -2684,7 +2691,14 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident = load_lfm2_layerwise_model(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
                 .unwrap();
@@ -2706,7 +2720,7 @@ mod tests {
             Array::from_slice(&[3u32], &[1, 1]),
         ] {
             let expected = resident
-                .forward_logits(&tokens, Some(&mut resident_cache), false, gpu.stream())
+                .forward(&tokens, &mut resident_cache, gpu.stream())
                 .unwrap();
             let actual = cached
                 .forward(&tokens, &mut cached_cache, gpu.stream())
