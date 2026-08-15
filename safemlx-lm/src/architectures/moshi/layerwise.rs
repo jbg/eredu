@@ -13,8 +13,7 @@ use safemlx::{
 use crate::{
     api::realtime::{RealtimeSpeechConfig, RealtimeStepOutput},
     architectures::moshi::model::{
-        self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
-        MoshiTransformerLayer, SampleStepOutput, TokenStepOutput,
+        self as resident, DepFormerSlice, MoshiLayerwiseStatic, MoshiTransformerLayer,
     },
     error::Error,
     runtime::cache::KeyValueCache,
@@ -36,6 +35,11 @@ use crate::{
     runtime::residency::manager::{
         ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease, WeightBinding,
     },
+};
+
+pub use crate::architectures::moshi::model::{
+    GenerationState, GenerationStepWithLogits, ModelArgs, MoshiCache, SampleStepOutput,
+    TokenStepOutput,
 };
 
 #[cfg(test)]
@@ -468,7 +472,7 @@ impl MoshiLayerwiseModel {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_step_forced<TS: Sampler, AS: Sampler>(
         &mut self,
-        state: &mut resident::GenerationState,
+        state: &mut GenerationState,
         input_audio_tokens: &Array,
         forced_generated_audio_tokens: Option<&Array>,
         forced_text_token: Option<&Array>,
@@ -479,8 +483,39 @@ impl MoshiLayerwiseModel {
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<RealtimeStepOutput, Exception> {
+        Ok(self
+            .generate_step_forced_with_logits(
+                state,
+                input_audio_tokens,
+                forced_generated_audio_tokens,
+                forced_text_token,
+                text_sampler,
+                audio_samplers,
+                text_temperature,
+                audio_temperature,
+                prng_state,
+                stream,
+            )?
+            .output)
+    }
+
+    /// Advances generation while retaining the text and audio decision logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_step_forced_with_logits<TS: Sampler, AS: Sampler>(
+        &mut self,
+        state: &mut GenerationState,
+        input_audio_tokens: &Array,
+        forced_generated_audio_tokens: Option<&Array>,
+        forced_text_token: Option<&Array>,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<GenerationStepWithLogits, Exception> {
         if self.args().existing_text_padding_id.is_some() && self.args().dep_q == self.args().n_q {
-            return self.generate_step_pytorch_style(
+            return self.generate_step_pytorch_style_with_logits(
                 state,
                 input_audio_tokens,
                 forced_generated_audio_tokens,
@@ -493,7 +528,7 @@ impl MoshiLayerwiseModel {
                 stream,
             );
         }
-        self.generate_step_native_style(
+        self.generate_step_native_style_with_logits(
             state,
             input_audio_tokens,
             forced_generated_audio_tokens,
@@ -508,9 +543,9 @@ impl MoshiLayerwiseModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn generate_step_native_style<TS: Sampler, AS: Sampler>(
+    fn generate_step_native_style_with_logits<TS: Sampler, AS: Sampler>(
         &mut self,
-        state: &mut resident::GenerationState,
+        state: &mut GenerationState,
         input_audio_tokens: &Array,
         forced_generated_audio_tokens: Option<&Array>,
         forced_text_token: Option<&Array>,
@@ -520,7 +555,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<RealtimeStepOutput, Exception> {
+    ) -> Result<GenerationStepWithLogits, Exception> {
         let args = self.args().clone();
         let input_codebooks = args.input_audio_codebooks();
         if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
@@ -660,17 +695,21 @@ impl MoshiLayerwiseModel {
             .transpose()?;
         state.previous_text = Some(sampled.text_token.clone());
         state.step += 1;
-        Ok(RealtimeStepOutput {
-            text_token: sampled.text_token,
-            sampled_audio_tokens: sampled.audio_tokens,
-            output_audio_tokens,
+        Ok(GenerationStepWithLogits {
+            output: RealtimeStepOutput {
+                text_token: sampled.text_token,
+                sampled_audio_tokens: sampled.audio_tokens,
+                output_audio_tokens,
+            },
+            text_logits: Some(sampled.logits.text_logits),
+            audio_logits: sampled.logits.audio_logits,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn generate_step_pytorch_style<TS: Sampler, AS: Sampler>(
+    fn generate_step_pytorch_style_with_logits<TS: Sampler, AS: Sampler>(
         &mut self,
-        state: &mut resident::GenerationState,
+        state: &mut GenerationState,
         input_audio_tokens: &Array,
         forced_generated_audio_tokens: Option<&Array>,
         forced_text_token: Option<&Array>,
@@ -680,7 +719,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<RealtimeStepOutput, Exception> {
+    ) -> Result<GenerationStepWithLogits, Exception> {
         let args = self.args().clone();
         let input_codebooks = args.input_audio_codebooks();
         if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
@@ -746,18 +785,22 @@ impl MoshiLayerwiseModel {
         }
         if offset == 0 {
             state.step += 1;
-            return Ok(RealtimeStepOutput {
-                text_token: Array::full::<i32>(
-                    &[batch, 1],
-                    Array::from_int(args.text_card),
-                    stream,
-                )?,
-                sampled_audio_tokens: Array::full::<i32>(
-                    &[batch, args.dep_q],
-                    Array::from_int(args.audio_padding_token()),
-                    stream,
-                )?,
-                output_audio_tokens: None,
+            return Ok(GenerationStepWithLogits {
+                output: RealtimeStepOutput {
+                    text_token: Array::full::<i32>(
+                        &[batch, 1],
+                        Array::from_int(args.text_card),
+                        stream,
+                    )?,
+                    sampled_audio_tokens: Array::full::<i32>(
+                        &[batch, args.dep_q],
+                        Array::from_int(args.audio_padding_token()),
+                        stream,
+                    )?,
+                    output_audio_tokens: None,
+                },
+                text_logits: None,
+                audio_logits: Vec::new(),
             });
         }
 
@@ -826,10 +869,14 @@ impl MoshiLayerwiseModel {
         };
         state.previous_text = Some(sampled.text_token.clone());
         state.step += 1;
-        Ok(RealtimeStepOutput {
-            text_token: sampled.text_token,
-            sampled_audio_tokens: sampled.audio_tokens,
-            output_audio_tokens,
+        Ok(GenerationStepWithLogits {
+            output: RealtimeStepOutput {
+                text_token: sampled.text_token,
+                sampled_audio_tokens: sampled.audio_tokens,
+                output_audio_tokens,
+            },
+            text_logits: Some(sampled.logits.text_logits),
+            audio_logits: sampled.logits.audio_logits,
         })
     }
 }
@@ -2437,7 +2484,8 @@ mod tests {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let dir = fixture(&gpu);
-        let mut resident = eager::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident =
+            eager::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let mut layerwise = load_moshi_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
@@ -2554,7 +2602,8 @@ mod tests {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let dir = fixture(&gpu);
-        let mut resident = eager::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident =
+            eager::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
         let mut streamed = load_moshi_layerwise_model(
             dir.path(),
@@ -2709,9 +2758,13 @@ mod tests {
         let path = dir.path().join("model.safetensors");
         write_pytorch_fixture(&path, &fixture, gpu.stream());
 
-        let mut resident =
-            eager::load_pytorch_safetensors_model(args.clone(), &path, gpu.stream(), cpu.stream())
-                .unwrap();
+        let mut resident = eager::load_test_pytorch_resident_model(
+            args.clone(),
+            &path,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         let mut layerwise = load_with_layout(
             &path,
             args,
@@ -2737,70 +2790,55 @@ mod tests {
             .collect::<Vec<_>>();
 
         for forced in [true, true, false] {
-            let expected = if forced {
-                resident
-                    .generate_step_forced(
-                        &mut resident_state,
-                        &user,
-                        Some(&agent),
-                        Some(&forced_text),
-                        &mut resident_text,
-                        &mut resident_audio,
-                        0.0,
-                        0.0,
-                        None,
-                        gpu.stream(),
-                    )
-                    .unwrap()
-            } else {
-                resident
-                    .generate_step(
-                        &mut resident_state,
-                        &user,
-                        &mut resident_text,
-                        &mut resident_audio,
-                        0.0,
-                        0.0,
-                        None,
-                        gpu.stream(),
-                    )
-                    .unwrap()
-            };
-            let actual = if forced {
-                layerwise
-                    .generate_step_forced(
-                        &mut layerwise_state,
-                        &user,
-                        Some(&agent),
-                        Some(&forced_text),
-                        &mut layerwise_text,
-                        &mut layerwise_audio,
-                        0.0,
-                        0.0,
-                        None,
-                        gpu.stream(),
-                    )
-                    .unwrap()
-            } else {
-                layerwise
-                    .generate_step(
-                        &mut layerwise_state,
-                        &user,
-                        &mut layerwise_text,
-                        &mut layerwise_audio,
-                        0.0,
-                        0.0,
-                        None,
-                        gpu.stream(),
-                    )
-                    .unwrap()
-            };
-            assert_tokens_equal(&expected.text_token, &actual.text_token, gpu.stream());
+            let forced_agent = forced.then_some(&agent);
+            let forced_text = forced.then_some(&forced_text);
+            let expected = resident
+                .generate_step_forced_with_logits(
+                    &mut resident_state,
+                    &user,
+                    forced_agent,
+                    forced_text,
+                    &mut resident_text,
+                    &mut resident_audio,
+                    0.0,
+                    0.0,
+                    None,
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = layerwise
+                .generate_step_forced_with_logits(
+                    &mut layerwise_state,
+                    &user,
+                    forced_agent,
+                    forced_text,
+                    &mut layerwise_text,
+                    &mut layerwise_audio,
+                    0.0,
+                    0.0,
+                    None,
+                    gpu.stream(),
+                )
+                .unwrap();
             assert_tokens_equal(
-                &expected.sampled_audio_tokens,
-                &actual.sampled_audio_tokens,
+                &expected.output.text_token,
+                &actual.output.text_token,
                 gpu.stream(),
             );
+            assert_tokens_equal(
+                &expected.output.sampled_audio_tokens,
+                &actual.output.sampled_audio_tokens,
+                gpu.stream(),
+            );
+            match (&expected.text_logits, &actual.text_logits) {
+                (Some(expected), Some(actual)) => assert_close(expected, actual),
+                (None, None) => {}
+                _ => panic!("resident and canonical logits availability differs"),
+            }
+            assert_eq!(expected.audio_logits.len(), actual.audio_logits.len());
+            for (expected, actual) in expected.audio_logits.iter().zip(&actual.audio_logits) {
+                assert_close(expected, actual);
+            }
         }
         assert_eq!(resident_state.step(), 3);
         assert_eq!(resident_state.step(), layerwise_state.step());

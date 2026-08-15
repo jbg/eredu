@@ -13,7 +13,7 @@ use safemlx::{
     error::Exception,
     fast::scaled_dot_product_attention,
     macros::ModuleParameters,
-    module::{Module, ModuleParameters, ModuleParametersExt, Param},
+    module::{Module, Param},
     nn,
     ops::{
         addmm, dequantize_with_mode, indexing::TryIndexOp, matmul, maximum,
@@ -33,14 +33,17 @@ use crate::{
     api::realtime::{self, RealtimeSpeechConfig},
     error::Error,
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
-    runtime::checkpoint::load::{
-        for_each_safetensor_array, load_array_quantized_strict, load_array_strict,
-        load_safetensors_dir_strict, load_safetensors_quantized_strict, load_safetensors_strict,
-        StrictLoadConfig, StrictLoadReport,
-    },
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::generation::sampler::{DefaultSampler, Sampler},
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{
+    for_each_safetensor_array, load_array_strict, load_safetensors_dir_strict,
+    load_safetensors_strict, StrictLoadConfig, StrictLoadReport,
+};
+#[cfg(test)]
+use safemlx::module::{ModuleParameters, ModuleParametersExt};
 
 const RMS_NORM_EPS: f32 = 1e-8;
 
@@ -2621,8 +2624,9 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     Ok(args)
 }
 
-/// Loads a dense or MLX affine-quantized Moshi checkpoint for token-only inference.
-pub fn load_model(
+/// Test-only eager reference loader used to compare the canonical engine.
+#[cfg(test)]
+pub(crate) fn load_test_resident_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -2644,67 +2648,9 @@ pub fn load_model(
     Ok(model)
 }
 
-/// Loads a dense Moshi checkpoint while quantizing each matrix as it is read.
-///
-/// This is the experimental, no-conversion counterpart to
-/// [`crate::runtime::checkpoint::quantization::quantize_checkpoint`]. Both paths call the same
-/// affine tensor transform and produce the same in-memory parameter layout.
-pub fn load_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    let mut args = get_model_args(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Moshi",
-        args.quantization,
-        quantization,
-    )? {
-        return load_model(model_dir, stream, weights_stream);
-    }
-    let source = super::checkpoint::source_path(model_dir, &args);
-    super::checkpoint::validate_safetensors_path(&source, &args)?;
-    args.quantization = Some(quantization);
-    let mut model = Model::new(args, stream)?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    if source == model_dir {
-        for file in crate::runtime::checkpoint::load::safetensors_files(&source)? {
-            load_safetensors_quantized_strict(
-                &mut model,
-                file,
-                weights_stream,
-                stream,
-                quantization,
-                &config,
-                &mut report,
-            )?;
-        }
-    } else {
-        load_safetensors_quantized_strict(
-            &mut model,
-            source,
-            weights_stream,
-            stream,
-            quantization,
-            &config,
-            &mut report,
-        )?;
-    }
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Loads a PyTorch Moshi-family safetensors checkpoint into this model.
-///
-/// This supports the public Kyutai/NVIDIA PyTorch Moshi layout, where the
-/// depth transformer stores per-codebook `weights_per_step` projections packed
-/// along the output dimension. The loader rewrites those tensors into this
-/// crate's explicit per-depth-slice parameter tree before strict validation.
-pub fn load_pytorch_safetensors_model(
+/// Test-only eager PyTorch-layout reference loader.
+#[cfg(test)]
+pub(crate) fn load_test_pytorch_resident_model(
     args: ModelArgs,
     weights_path: impl AsRef<Path>,
     stream: &Stream,
@@ -2716,8 +2662,8 @@ pub fn load_pytorch_safetensors_model(
     Ok(model)
 }
 
-/// Strict-loads one PyTorch Moshi-family safetensors file into an existing model.
-pub fn load_pytorch_safetensors_strict(
+#[cfg(test)]
+pub(crate) fn load_pytorch_safetensors_strict(
     model: &mut Model,
     path: impl AsRef<Path>,
     weights_stream: &Stream,
@@ -2725,8 +2671,8 @@ pub fn load_pytorch_safetensors_strict(
     load_pytorch_safetensors_files_strict(model, [path.as_ref()], weights_stream)
 }
 
-/// Strict-loads one or more PyTorch Moshi-family safetensors shards.
-pub fn load_pytorch_safetensors_files_strict<P, I>(
+#[cfg(test)]
+pub(crate) fn load_pytorch_safetensors_files_strict<P, I>(
     model: &mut Model,
     paths: I,
     weights_stream: &Stream,
@@ -2751,43 +2697,7 @@ where
     report.finish(model, &config)
 }
 
-/// Loads dense PyTorch Moshi-family shards while quantizing transformed tensors.
-pub fn load_pytorch_safetensors_files_quantized_strict<P, I>(
-    model: &mut Model,
-    paths: I,
-    weights_stream: &Stream,
-    quantization_stream: &Stream,
-    quantization: WeightQuantization,
-) -> Result<(), Error>
-where
-    P: AsRef<Path>,
-    I: IntoIterator<Item = P>,
-{
-    quantization.validate()?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    let args = model.args.clone();
-    for path in paths {
-        let mut params = model.parameters_mut().flatten();
-        for_each_safetensor_array(path.as_ref(), weights_stream, |source_key, value| {
-            let transformed = transform_pytorch_tensor(&args, &source_key, value, weights_stream)?;
-            for (key, value) in transformed {
-                load_array_quantized_strict(
-                    &mut params,
-                    key,
-                    value,
-                    quantization_stream,
-                    quantization,
-                    &config,
-                    &mut report,
-                )?;
-            }
-            Ok(())
-        })?;
-    }
-    report.finish(model, &config)
-}
-
+#[cfg(test)]
 fn transform_pytorch_tensor(
     args: &ModelArgs,
     key: &str,
@@ -2880,11 +2790,13 @@ fn transform_pytorch_tensor(
     Ok(vec![(key.to_string(), value)])
 }
 
+#[cfg(test)]
 fn squeeze_norm(value: Array, stream: &Stream) -> Result<Array, Exception> {
     let dim = value.dim(-1);
     value.reshape(&[dim], stream)
 }
 
+#[cfg(test)]
 fn split_first_axis(
     value: &Array,
     parts: i32,
@@ -2903,16 +2815,19 @@ fn split_first_axis(
     value.try_index_device((start..end, ..), stream)
 }
 
+#[cfg(test)]
 fn tensor_suffix(suffix: &str) -> Option<&str> {
     matches!(suffix, "weight" | "scales" | "biases").then_some(suffix)
 }
 
+#[cfg(test)]
 fn parse_indexed_tensor<'a>(key: &'a str, prefix: &str) -> Option<(i32, &'a str)> {
     let rest = key.strip_prefix(prefix)?.strip_prefix('.')?;
     let (index, suffix) = rest.split_once('.')?;
     Some((index.parse().ok()?, tensor_suffix(suffix)?))
 }
 
+#[cfg(test)]
 fn parse_norm_alpha(key: &str, prefix: &str) -> Option<(i32, &'static str)> {
     let rest = key.strip_prefix(prefix)?.strip_prefix('.')?;
     let (layer, suffix) = rest.split_once('.')?;
@@ -2924,6 +2839,7 @@ fn parse_norm_alpha(key: &str, prefix: &str) -> Option<(i32, &'static str)> {
     Some((layer.parse().ok()?, norm))
 }
 
+#[cfg(test)]
 fn parse_depformer_attention_weight(key: &str) -> Option<(i32, &'static str)> {
     let rest = key.strip_prefix("depformer.layers.")?;
     let (layer, suffix) = rest.split_once('.')?;
@@ -2940,6 +2856,7 @@ fn parse_depformer_attention_weight(key: &str) -> Option<(i32, &'static str)> {
     Some((layer.parse().ok()?, suffix))
 }
 
+#[cfg(test)]
 fn parse_depformer_gating_weight(key: &str) -> Option<(i32, i32, &'static str)> {
     let rest = key.strip_prefix("depformer.layers.")?;
     let (layer, rest) = rest.split_once(".gating.")?;

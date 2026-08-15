@@ -4,7 +4,7 @@
 pub(crate) mod checkpoint;
 /// Bounded-residency execution.
 pub mod layerwise;
-/// Fully resident Moshi implementation.
+/// Reusable Moshi operators; checkpoint loading is exposed only by [`layerwise`].
 pub mod model;
 /// PersonaPlex specialization.
 pub mod personaplex;

@@ -1,12 +1,10 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use safemlx::{
-    module::ModuleParameters, ops::indexing::TryIndexOp, Array, Device, DeviceType,
-    ExecutionContext,
-};
+use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::realtime::{generate_encoded_greedy, load_model as load_realtime_model},
-    architectures::moshi::model as moshi,
+    architectures::moshi::layerwise::{load_moshi_layerwise_model, MoshiLayerwiseModel},
+    LayerWeightResidency,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -33,10 +31,14 @@ fn main() -> anyhow::Result<()> {
     let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = gpu.stream();
-    let mut model = moshi::load_model(&model_dir, stream, cpu.stream())?;
+    let mut model = load_moshi_layerwise_model(
+        &model_dir,
+        LayerWeightResidency::FullyResident,
+        None,
+        stream,
+        cpu.stream(),
+    )?;
     let fixture = Array::load_safetensors(&fixture_path, cpu.stream())?;
-    let checkpoint = Array::load_safetensors(model_dir.join("model.safetensors"), cpu.stream())?;
-    verify_loaded_weights(&model, &checkpoint, stream)?;
     let text = required(&fixture, "input.text")?;
     let audio = required(&fixture, "input.audio")?;
     let depth = required(&fixture, "input.depth")?;
@@ -183,28 +185,6 @@ fn compare_tokens(
     Ok(())
 }
 
-fn verify_loaded_weights(
-    model: &moshi::Model,
-    weights: &HashMap<String, Array>,
-    stream: &safemlx::Stream,
-) -> anyhow::Result<()> {
-    let params = model.parameters().flatten();
-    anyhow::ensure!(
-        params.len() == weights.len(),
-        "parameter count differs: Rust {}, checkpoint {}",
-        params.len(),
-        weights.len()
-    );
-    for (key, expected) in weights {
-        let actual = params
-            .get(key.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Rust model is missing checkpoint parameter {key}"))?;
-        compare(actual, expected, 0.0, 0.0, stream, &format!("weight {key}"))?;
-    }
-    println!("verified {} loaded checkpoint tensors", weights.len());
-    Ok(())
-}
-
 fn required<'a>(fixture: &'a HashMap<String, Array>, key: &str) -> anyhow::Result<&'a Array> {
     fixture
         .get(key)
@@ -215,7 +195,7 @@ fn validate_inputs(
     text: &Array,
     audio: &Array,
     depth: &Array,
-    model: &moshi::Model,
+    model: &MoshiLayerwiseModel,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         text.shape().len() == 3 && text.dim(2) == 1,
@@ -226,7 +206,7 @@ fn validate_inputs(
         audio.shape().len() == 3
             && audio.dim(0) == text.dim(0)
             && audio.dim(1) == text.dim(1)
-            && audio.dim(2) == model.args.n_q,
+            && audio.dim(2) == model.args().n_q,
         "input.audio must be [steps, batch, n_q], got {:?}",
         audio.shape()
     );
@@ -234,7 +214,7 @@ fn validate_inputs(
         depth.shape().len() == 3
             && depth.dim(0) == text.dim(0)
             && depth.dim(1) == text.dim(1)
-            && depth.dim(2) == model.args.dep_q,
+            && depth.dim(2) == model.args().dep_q,
         "input.depth must be [steps, batch, dep_q], got {:?}",
         depth.shape()
     );

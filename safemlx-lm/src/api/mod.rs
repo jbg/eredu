@@ -494,7 +494,7 @@ pub fn load_model_with_options(
     let kind = ModelKind::from_model_type(&effective_model_type(&metadata))?;
     match kind {
         ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
-            "PersonaPlex is a realtime speech-to-speech token model; use architectures::moshi::personaplex::load_model".into(),
+            "PersonaPlex is a realtime speech-to-speech token model; use load_realtime_model or api::realtime::load_model".into(),
         )),
         _ => load_model_for_kind(kind, model_dir, options, stream, weights_stream),
     }

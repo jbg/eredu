@@ -3260,7 +3260,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, fp8, true, false, gpu.stream());
 
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident =
+            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
         let mut layerwise =
             load_deepseek_v3_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
@@ -3504,7 +3505,7 @@ mod tests {
         );
 
         let mut resident = if split_experts {
-            resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
+            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
         } else {
             fixture
         };

@@ -12,17 +12,17 @@ use safemlx::{
     error::Exception,
     fast::ScaledDotProductAttentionMask,
     macros::ModuleParameters,
-    module::{Module, ModuleParameters, ModuleParametersExt, Param},
+    module::{Module, ModuleParameters, Param},
     native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     nn,
     ops::{
         broadcast_to, concatenate_axis, einsum, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        quantized_packed_dimension, r#where, softmax_axis, stack_axis, topk_route_plan,
-        GgufCheckpoint, GgufMetadataValue,
+        quantized_packed_dimension, r#where, softmax_axis, topk_route_plan, GgufCheckpoint,
+        GgufMetadataValue,
     },
     quantization::MaybeQuantized,
-    transforms::{async_eval_with_event, eval},
+    transforms::eval,
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
@@ -32,6 +32,13 @@ use tokenizers::Tokenizer;
 use crate::nn as common;
 #[cfg(test)]
 use crate::runtime::checkpoint::load::gguf_metadata;
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{
+    for_each_safetensor_array, load_array_quantized_strict, load_array_strict, safetensors_files,
+    StrictLoadConfig, StrictLoadReport,
+};
+#[cfg(test)]
+use crate::runtime::checkpoint::quantization::quantize_tensor;
 use crate::{
     api::{
         input as runtime_input,
@@ -59,13 +66,12 @@ use crate::{
     runtime::cache::{
         BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock,
     },
-    runtime::checkpoint::load::{
-        for_each_safetensor_array, gguf_quantization_configs, load_array_quantized_strict,
-        load_array_strict, safetensors_files, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
+    runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
+    runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
 };
+#[cfg(test)]
+use safemlx::{module::ModuleParametersExt, ops::stack_axis, transforms::async_eval_with_event};
 
 type ObserverOption<'a> = Option<&'a mut dyn ActivationObserver>;
 
@@ -3294,6 +3300,7 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[cfg(test)]
 enum ExpertProjection {
     Gate,
     Up,
@@ -3301,6 +3308,7 @@ enum ExpertProjection {
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[cfg(test)]
 enum ExpertComponent {
     Weight,
     Fp8Scale,
@@ -3309,16 +3317,19 @@ enum ExpertComponent {
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[cfg(test)]
 struct ExpertBankKey {
     layer: usize,
     projection: ExpertProjection,
     component: ExpertComponent,
 }
 
+#[cfg(test)]
 struct PendingExpertBank {
     values: Vec<Option<Array>>,
 }
 
+#[cfg(test)]
 impl PendingExpertBank {
     fn new(num_experts: i32) -> Self {
         Self {
@@ -3355,6 +3366,7 @@ impl PendingExpertBank {
     }
 }
 
+#[cfg(test)]
 fn parse_expert_key(key: &str) -> Option<(ExpertBankKey, usize)> {
     let rest = key.strip_prefix("model.layers.")?;
     let (layer, rest) = rest.split_once(".mlp.experts.")?;
@@ -3384,6 +3396,7 @@ fn parse_expert_key(key: &str) -> Option<(ExpertBankKey, usize)> {
     ))
 }
 
+#[cfg(test)]
 fn target_expert_key(key: ExpertBankKey) -> String {
     let projection = match key.projection {
         ExpertProjection::Gate => "gate_proj",
@@ -3402,6 +3415,7 @@ fn target_expert_key(key: ExpertBankKey) -> String {
     )
 }
 
+#[cfg(test)]
 fn assign_expert_bank(model: &mut Model, key: ExpertBankKey, value: Array) -> Result<(), Error> {
     let layer = model.model.layers.get_mut(key.layer).ok_or_else(|| {
         Error::UnsupportedArchitecture(format!(
@@ -3441,6 +3455,7 @@ fn assign_expert_bank(model: &mut Model, key: ExpertBankKey, value: Array) -> Re
     Ok(())
 }
 
+#[cfg(test)]
 fn strict_load_config(args: &ModelArgs) -> StrictLoadConfig {
     let mut config = StrictLoadConfig::default();
     for index in 0..args.num_nextn_predict_layers {
@@ -3450,6 +3465,7 @@ fn strict_load_config(args: &ModelArgs) -> StrictLoadConfig {
     config
 }
 
+#[cfg(test)]
 fn expert_affine_quantization(
     args: &ModelArgs,
     layer: usize,
@@ -3464,6 +3480,7 @@ fn expert_affine_quantization(
         .affine()
 }
 
+#[cfg(test)]
 fn expected_expert_banks(args: &ModelArgs) -> Vec<ExpertBankKey> {
     let mut expected = Vec::new();
     for (layer, policy) in args.layer_schedule.iter().enumerate() {
@@ -3505,6 +3522,7 @@ fn expected_expert_banks(args: &ModelArgs) -> Vec<ExpertBankKey> {
     expected
 }
 
+#[cfg(test)]
 fn expected_expert_tensor_shape(
     args: &ModelArgs,
     key: ExpertBankKey,
@@ -3536,10 +3554,9 @@ fn expected_expert_tensor_shape(
     }
 }
 
-/// Loads official sharded safetensors while packing completed routed banks
-/// independently. Split expert tensors are the sole checkpoint-name
-/// transformation; the full checkpoint is never materialized in host memory.
-pub fn load_model(
+/// Test-only eager reference loader used to compare the canonical engine.
+#[cfg(test)]
+pub(crate) fn load_test_resident_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -3549,6 +3566,7 @@ pub fn load_model(
     load_model_impl(model_dir, args, None, stream, weights_stream)
 }
 
+#[cfg(test)]
 fn load_model_impl(
     model_dir: &Path,
     args: ModelArgs,
@@ -3689,10 +3707,9 @@ fn load_model_impl(
     Ok(model)
 }
 
-/// Loads a dense DeepSeek checkpoint while quantizing all eligible weights,
-/// including split routed experts, or directly loads a matching prequantized
-/// affine checkpoint.
-pub fn load_model_quantized(
+/// Test-only eager quantized reference loader.
+#[cfg(test)]
+pub(crate) fn load_test_resident_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
     stream: &Stream,
@@ -3712,7 +3729,7 @@ pub fn load_model_quantized(
         args.affine_quantization()?,
         quantization,
     )? {
-        return load_model(model_dir, stream, weights_stream);
+        return load_test_resident_model(model_dir, stream, weights_stream);
     }
     args.quantization_config = None;
     args.quantization = Some(quantization);
@@ -4127,7 +4144,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deepseek_layer_schedule, load_model, parse_config_value,
+        deepseek_layer_schedule, load_test_resident_model, parse_config_value,
         prompt_cache_architecture_fingerprint, Cache, FeedForward, LayerPolicy, Model, ModelArgs,
         ModelInput,
     };
@@ -5088,7 +5105,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_model(&dir, stream, weights_stream).unwrap();
+        let loaded = load_test_resident_model(&dir, stream, weights_stream).unwrap();
         assert_eq!(loaded.model_type(), "deepseek_v3");
         let loaded = LoadedModel::load(&dir, stream, weights_stream).unwrap();
         assert_eq!(loaded.model_type(), "deepseek_v3");
@@ -5105,7 +5122,7 @@ mod tests {
                 Array::zeros::<f32>(&[8, 16], stream).unwrap(),
             )],
         );
-        let error = load_model(&dir, stream, stream).unwrap_err();
+        let error = load_test_resident_model(&dir, stream, stream).unwrap_err();
         assert!(matches!(error, Error::StrictLoadValidation { .. }));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -5118,7 +5135,7 @@ mod tests {
         initialize_dense_model(&mut source, stream);
         let dir = temp_dir();
         save_fixture(&dir, &source, stream, Some("lm_head.weight"), Vec::new());
-        let error = load_model(&dir, stream, stream).unwrap_err();
+        let error = load_test_resident_model(&dir, stream, stream).unwrap_err();
         assert!(matches!(error, Error::StrictLoadValidation { .. }));
 
         save_fixture(
@@ -5131,7 +5148,7 @@ mod tests {
                 Array::zeros::<f32>(&[1], stream).unwrap(),
             )],
         );
-        let error = load_model(&dir, stream, stream).unwrap_err();
+        let error = load_test_resident_model(&dir, stream, stream).unwrap_err();
         assert!(matches!(error, Error::StrictLoadValidation { .. }));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -5144,7 +5161,7 @@ mod tests {
         initialize_fp8_model(&mut source, stream);
         let dir = temp_dir();
         save_fixture(&dir, &source, stream, None, Vec::new());
-        let mut loaded = load_model(&dir, stream, stream).unwrap();
+        let mut loaded = load_test_resident_model(&dir, stream, stream).unwrap();
         let mut cache = loaded.new_cache();
         let prefill = loaded
             .forward(
@@ -5245,7 +5262,7 @@ mod tests {
             .collect::<Vec<_>>();
         let context = test_context();
         let stream = context.stream();
-        let mut model = load_model(&dir, stream, stream).unwrap();
+        let mut model = load_test_resident_model(&dir, stream, stream).unwrap();
         let logits = model
             .forward(
                 ModelInput {
@@ -5280,7 +5297,7 @@ mod tests {
         save_fixture(&dir, &source, stream, None, Vec::new());
         let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
         let mut quantized =
-            super::load_model_quantized(&dir, quantization, stream, stream).unwrap();
+            super::load_test_resident_model_quantized(&dir, quantization, stream, stream).unwrap();
         let experts = quantized.model.layers[1]
             .mlp
             .moe_mut()
@@ -5312,7 +5329,7 @@ mod tests {
 
         let prequantized_dir = temp_dir();
         save_fixture(&prequantized_dir, &quantized, stream, None, Vec::new());
-        let mut reloaded = load_model(&prequantized_dir, stream, stream).unwrap();
+        let mut reloaded = load_test_resident_model(&prequantized_dir, stream, stream).unwrap();
         let logits = reloaded
             .forward(
                 ModelInput {
@@ -5325,15 +5342,20 @@ mod tests {
             .unwrap();
         assert_eq!(logits.shape(), &[1, 2, 32]);
 
-        let mut mxfp4 =
-            super::load_model_quantized(&dir, WeightQuantization::MxFp4, stream, stream).unwrap();
+        let mut mxfp4 = super::load_test_resident_model_quantized(
+            &dir,
+            WeightQuantization::MxFp4,
+            stream,
+            stream,
+        )
+        .unwrap();
         let experts = mxfp4.model.layers[1].mlp.moe_mut().unwrap().experts.clone();
         assert_eq!(experts.gate_affine, Some(WeightQuantization::MxFp4));
         assert!(experts.gate_proj_scales.as_ref().is_some());
         assert!(experts.gate_proj_biases.as_ref().is_none());
         let mxfp4_dir = temp_dir();
         save_fixture(&mxfp4_dir, &mxfp4, stream, None, Vec::new());
-        let mut mxfp4_reloaded = load_model(&mxfp4_dir, stream, stream).unwrap();
+        let mut mxfp4_reloaded = load_test_resident_model(&mxfp4_dir, stream, stream).unwrap();
         let logits = mxfp4_reloaded
             .forward(
                 ModelInput {
@@ -5470,7 +5492,7 @@ mod tests {
         initialize_fp8_model(&mut source, stream);
         let dir = temp_dir();
         save_fixture(&dir, &source, stream, None, Vec::new());
-        let error = super::load_model_quantized(
+        let error = super::load_test_resident_model_quantized(
             &dir,
             WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
             stream,
@@ -5524,7 +5546,7 @@ mod tests {
             .expect("DEEPSEEK_V3_MODEL_DIR");
         let context = test_context();
         let stream = context.stream();
-        let mut model = load_model(&dir, stream, stream).unwrap();
+        let mut model = load_test_resident_model(&dir, stream, stream).unwrap();
         let mut cache = model.new_cache();
         let logits = model
             .forward(

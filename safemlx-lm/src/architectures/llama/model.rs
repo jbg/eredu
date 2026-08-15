@@ -8,7 +8,7 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt},
+    module::Module,
     nn,
     ops::indexing::TryIndexOp,
     ops::{GgufCheckpoint, GgufMetadataValue},
@@ -22,7 +22,10 @@ use tokenizers::Tokenizer;
 pub use crate::nn::generation::sample;
 
 #[cfg(test)]
-use crate::runtime::checkpoint::load::{gguf_metadata, load_gguf_strict};
+use crate::runtime::checkpoint::load::{
+    gguf_metadata, load_gguf_strict, load_safetensors_dir_lenient, StrictLoadConfig,
+    StrictLoadReport,
+};
 use crate::{
     api::{
         common::{
@@ -43,10 +46,7 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
-    runtime::checkpoint::load::{
-        gguf_quantization_configs, load_safetensors_dir_lenient,
-        load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
+    runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::ActivationObserver,
     runtime::{
@@ -55,6 +55,8 @@ use crate::{
         cache::{ConcatKeyValueCache, KeyValueCache},
     },
 };
+#[cfg(test)]
+use safemlx::module::ModuleParametersExt;
 
 #[derive(Debug, Clone)]
 /// Normalized Llama/Mistral decoder geometry used by every execution path.
@@ -1659,8 +1661,9 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-/// Loads a Llama model and safetensors weights from a model directory.
-pub fn load_resident_llama_model(
+/// Test-only eager reference loader used to compare the canonical engine.
+#[cfg(test)]
+pub(crate) fn load_test_resident_llama_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1677,45 +1680,6 @@ pub fn load_resident_llama_model(
     load_safetensors_dir_lenient(&mut model, model_dir, weights_stream)?;
     model.copy_to_stream(stream)?;
 
-    Ok(model)
-}
-
-/// Loads a dense Llama checkpoint while quantizing matrices tensor-by-tensor.
-pub fn load_resident_llama_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<ResidentModel, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Llama,
-        model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
-    )?;
-    let mut model_args = get_llama_model_args(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Llama",
-        model_args.weight_quantization(),
-        quantization,
-    )? {
-        return load_resident_llama_model(model_dir, stream, weights_stream);
-    }
-    model_args.quantization = Some(quantization);
-    let mut model = ResidentModel::new(model_args, stream)?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    load_safetensors_dir_quantized_strict(
-        &mut model,
-        model_dir,
-        weights_stream,
-        stream,
-        quantization,
-        &config,
-        &mut report,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
     Ok(model)
 }
 
@@ -1781,7 +1745,7 @@ mod tests {
     };
 
     use crate::{
-        architectures::llama::model::{load_llama_tokenizer, load_resident_llama_model},
+        architectures::llama::model::{load_llama_tokenizer, load_test_resident_llama_model},
         runtime::cache::{ConcatKeyValueCache, KeyValueCache},
         runtime::checkpoint::quantization::AffineQuantization,
     };
@@ -2521,7 +2485,7 @@ mod tests {
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let weights_stream = weights_ctx.stream();
         let mut model =
-            load_resident_llama_model(CACHED_TEST_MODEL_DIR.as_str(), stream, weights_stream)
+            load_test_resident_llama_model(CACHED_TEST_MODEL_DIR.as_str(), stream, weights_stream)
                 .unwrap();
 
         let prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";

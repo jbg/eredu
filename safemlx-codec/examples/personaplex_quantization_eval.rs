@@ -9,8 +9,11 @@ use std::{
 use safemlx::{random::RandomState, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
-    architectures::moshi::{model as moshi, personaplex},
-    runtime::generation::sampler::{DefaultSampler, GenerationSampler},
+    architectures::moshi::{layerwise as moshi, personaplex},
+    runtime::{
+        execution::layerwise::LayerWeightResidency,
+        generation::sampler::{DefaultSampler, GenerationSampler},
+    },
 };
 use sentencepiece_rs::SentencePieceProcessor;
 use serde::Serialize;
@@ -158,7 +161,13 @@ fn main() -> EvalResult<()> {
     println!("mimi_streaming_offline_token_agreement={streaming_offline_token_agreement:.4}");
 
     let dense_load_start = Instant::now();
-    let mut dense = personaplex::load_model(&dense_dir, stream, weights_stream)?;
+    let mut dense = moshi::load_personaplex_layerwise_model(
+        &dense_dir,
+        LayerWeightResidency::FullyResident,
+        None,
+        stream,
+        weights_stream,
+    )?;
     stream.synchronize()?;
     let dense_load_s = dense_load_start.elapsed().as_secs_f64();
     warmup(&mut dense, &input_tokens[0], stream)?;
@@ -168,7 +177,13 @@ fn main() -> EvalResult<()> {
     safemlx::transforms::compile::clear_cache()?;
 
     let quantized_load_start = Instant::now();
-    let mut quantized = personaplex::load_model(&quantized_dir, stream, weights_stream)?;
+    let mut quantized = moshi::load_personaplex_layerwise_model(
+        &quantized_dir,
+        LayerWeightResidency::FullyResident,
+        None,
+        stream,
+        weights_stream,
+    )?;
     stream.synchronize()?;
     let quantized_load_s = quantized_load_start.elapsed().as_secs_f64();
     warmup(&mut quantized, &input_tokens[0], stream)?;
@@ -433,13 +448,17 @@ fn encode_pcm(mimi: &mut Mimi, pcm: &[f32], stream: &Stream) -> EvalResult<Vec<V
     Ok(output)
 }
 
-fn warmup(model: &mut moshi::Model, input: &[i32], stream: &Stream) -> EvalResult<()> {
-    let mut state = moshi::GenerationState::new(model);
+fn warmup(
+    model: &mut moshi::MoshiLayerwiseModel,
+    input: &[i32],
+    stream: &Stream,
+) -> EvalResult<()> {
+    let mut state = model.new_generation_state();
     let mut text_sampler = DefaultSampler;
-    let mut audio_samplers = (0..model.args.dep_q)
+    let mut audio_samplers = (0..model.args().dep_q)
         .map(|_| DefaultSampler)
         .collect::<Vec<_>>();
-    let input = Array::from_slice(input, &[1, model.args.input_audio_codebooks()]);
+    let input = Array::from_slice(input, &[1, model.args().input_audio_codebooks()]);
     for _ in 0..4 {
         let output = model.generate_step(
             &mut state,
@@ -463,13 +482,13 @@ struct PromptConditioning {
 }
 
 fn prompted_state(
-    model: &mut moshi::Model,
+    model: &mut moshi::MoshiLayerwiseModel,
     prompt: &PromptConditioning,
     stream: &Stream,
 ) -> EvalResult<moshi::GenerationState> {
-    let mut state = moshi::GenerationState::new(model);
+    let mut state = model.new_generation_state();
     let mut text_sampler = DefaultSampler;
-    let mut audio_samplers = (0..model.args.dep_q)
+    let mut audio_samplers = (0..model.args().dep_q)
         .map(|_| DefaultSampler)
         .collect::<Vec<_>>();
     let silence = personaplex::silence_frame(1, stream)?;
@@ -531,7 +550,7 @@ fn prompted_state(
 
 #[allow(clippy::too_many_arguments)]
 fn force_prompt_frame(
-    model: &mut moshi::Model,
+    model: &mut moshi::MoshiLayerwiseModel,
     state: &mut moshi::GenerationState,
     agent_audio: &Array,
     user_audio: &Array,
@@ -588,14 +607,14 @@ fn reference_tokens(reference: &[ReferenceFrame]) -> Vec<serde_json::Value> {
 }
 
 fn run_dense(
-    model: &mut moshi::Model,
+    model: &mut moshi::MoshiLayerwiseModel,
     prompt: &PromptConditioning,
     input_tokens: &[Vec<i32>],
     stream: &Stream,
 ) -> EvalResult<ModelRun> {
     let mut state = prompted_state(model, prompt, stream)?;
     let mut text_sampler = DefaultSampler;
-    let mut audio_samplers = (0..model.args.dep_q)
+    let mut audio_samplers = (0..model.args().dep_q)
         .map(|_| DefaultSampler)
         .collect::<Vec<_>>();
     let mut reference = Vec::with_capacity(input_tokens.len());
@@ -603,7 +622,7 @@ fn run_dense(
     let mut latencies_ms = Vec::with_capacity(input_tokens.len());
 
     for input in input_tokens {
-        let input = Array::from_slice(input, &[1, model.args.input_audio_codebooks()]);
+        let input = Array::from_slice(input, &[1, model.args().input_audio_codebooks()]);
         let start = Instant::now();
         let step = model.generate_step_forced_with_logits(
             &mut state,
@@ -760,7 +779,7 @@ struct QualitySummary {
 }
 
 fn run_teacher_forced_quality(
-    model: &mut moshi::Model,
+    model: &mut moshi::MoshiLayerwiseModel,
     prompt: &PromptConditioning,
     input_tokens: &[Vec<i32>],
     reference: &[ReferenceFrame],
@@ -768,18 +787,18 @@ fn run_teacher_forced_quality(
 ) -> EvalResult<QualitySummary> {
     let mut state = prompted_state(model, prompt, stream)?;
     let mut text_sampler = DefaultSampler;
-    let mut audio_samplers = (0..model.args.dep_q)
+    let mut audio_samplers = (0..model.args().dep_q)
         .map(|_| DefaultSampler)
         .collect::<Vec<_>>();
     let mut text = DistributionAccumulator::default();
-    let mut audio = (0..model.args.dep_q)
+    let mut audio = (0..model.args().dep_q)
         .map(|_| DistributionAccumulator::default())
         .collect::<Vec<_>>();
 
     for (input, reference) in input_tokens.iter().zip(reference) {
-        let input = Array::from_slice(input, &[1, model.args.input_audio_codebooks()]);
+        let input = Array::from_slice(input, &[1, model.args().input_audio_codebooks()]);
         let forced_text = Array::from_slice(&[reference.text_token], &[1, 1]);
-        let generated = model.args.generated_audio_codebooks() as usize;
+        let generated = model.args().generated_audio_codebooks() as usize;
         let forced_audio = Array::from_slice(
             &reference.sampled_audio[..generated],
             &[1, generated as i32],
@@ -828,7 +847,7 @@ fn run_teacher_forced_quality(
     for accumulator in &audio {
         overall.merge(accumulator);
     }
-    let generated_codebooks = model.args.generated_audio_codebooks() as usize;
+    let generated_codebooks = model.args().generated_audio_codebooks() as usize;
     let mut generated = DistributionAccumulator::default();
     for accumulator in audio.iter().take(generated_codebooks) {
         generated.merge(accumulator);
@@ -848,7 +867,7 @@ fn run_teacher_forced_quality(
 }
 
 fn run_free(
-    model: &mut moshi::Model,
+    model: &mut moshi::MoshiLayerwiseModel,
     prompt: &PromptConditioning,
     input_tokens: &[Vec<i32>],
     sampling_seed: u64,
@@ -859,7 +878,7 @@ fn run_free(
         .top_k(TEXT_TOP_K)
         .top_p(1.0)
         .min_p(0.0);
-    let mut audio_samplers = (0..model.args.dep_q)
+    let mut audio_samplers = (0..model.args().dep_q)
         .map(|_| {
             GenerationSampler::new()
                 .top_k(AUDIO_TOP_K)
@@ -873,7 +892,7 @@ fn run_free(
     let mut latencies_ms = Vec::with_capacity(input_tokens.len());
 
     for input in input_tokens {
-        let input = Array::from_slice(input, &[1, model.args.input_audio_codebooks()]);
+        let input = Array::from_slice(input, &[1, model.args().input_audio_codebooks()]);
         let start = Instant::now();
         let output = model.generate_step(
             &mut state,

@@ -15,7 +15,7 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt, Param},
+    module::{Module, ModuleParameters as ModuleParametersTrait, Param},
     nn,
     ops::{
         arange, argpartition_axis, broadcast_to, clip, concatenate_axis,
@@ -54,15 +54,17 @@ use crate::{
     runtime::cache::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
-    runtime::checkpoint::load::{
-        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
-        safetensors_files, StrictLoadConfig, StrictLoadReport,
-    },
+    runtime::checkpoint::load::{gguf_metadata, gguf_quantization_configs},
     runtime::checkpoint::quantization::WeightQuantization,
 };
 
 #[cfg(test)]
-use crate::runtime::checkpoint::load::load_named_array_strict;
+use crate::runtime::checkpoint::load::{
+    for_each_safetensor_array, load_array_strict, load_named_array_strict, safetensors_files,
+    StrictLoadConfig, StrictLoadReport,
+};
+#[cfg(test)]
+use safemlx::module::ModuleParametersExt;
 
 fn default_model_type() -> String {
     "inkling_mm_model".into()
@@ -4857,7 +4859,9 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn load_model(
+/// Test-only eager reference loader used to compare the canonical engine.
+#[cfg(test)]
+pub(crate) fn load_test_resident_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -4887,6 +4891,7 @@ pub fn load_model(
     Ok(model)
 }
 
+#[cfg(test)]
 pub(crate) fn transform_weight(
     key: String,
     mut value: Array,
@@ -4970,6 +4975,7 @@ pub(crate) fn transform_weight(
     Ok(vec![(key, value)])
 }
 
+#[cfg(test)]
 fn deinterleave_w13(value: Array, stream: &Stream) -> Result<(Array, Array), Error> {
     let shape = value.shape().to_vec();
     if shape.len() < 2 || shape[shape.len() - 2] % 2 != 0 {

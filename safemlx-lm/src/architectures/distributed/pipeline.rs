@@ -26012,7 +26012,8 @@ mod tests {
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
         ];
-        let mut reference = gpt_oss::load_model(dir.path(), stream, cpu.stream()).unwrap();
+        let mut reference =
+            gpt_oss::load_test_resident_model(dir.path(), stream, cpu.stream()).unwrap();
         let mut reference_cache = reference.new_cache();
         let expected = token_batches
             .iter()

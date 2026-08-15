@@ -6,7 +6,7 @@ use safemlx::{
     error::Exception,
     fast::ScaledDotProductAttentionMask,
     macros::ModuleParameters,
-    module::{Module, ModuleParametersExt, Param},
+    module::{Module, Param},
     nn,
     ops::{
         arange, clip, gather_grouped_rows, gather_qmm_with_mode,
@@ -33,10 +33,7 @@ use crate::{
         CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
         PromptCacheManifest, PromptCacheModelIdentity,
     },
-    runtime::checkpoint::load::{
-        gguf_quantization_configs, load_safetensors_dir_quantized_strict,
-        load_safetensors_dir_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
+    runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::{
         attention::{AttentionPolicy, LayerSchedule},
@@ -47,7 +44,11 @@ use crate::{
 #[cfg(test)]
 use crate::runtime::checkpoint::load::gguf_metadata;
 #[cfg(test)]
-use crate::runtime::checkpoint::load::load_named_array_strict;
+use crate::runtime::checkpoint::load::{
+    load_named_array_strict, load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
+};
+#[cfg(test)]
+use safemlx::module::ModuleParametersExt;
 #[cfg(test)]
 use safemlx::ops::stack_axis;
 
@@ -2024,8 +2025,9 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     model_args_from_config_value(&config)
 }
 
-/// Loads a GPT-OSS safetensors checkpoint strictly, without rewriting keys.
-pub fn load_model(
+/// Test-only eager reference loader used to compare the canonical engine.
+#[cfg(test)]
+pub(crate) fn load_test_resident_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -2040,55 +2042,6 @@ pub fn load_model(
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
     load_safetensors_dir_strict(&mut model, model_dir, weights_stream, &config, &mut report)?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Loads GPT-OSS while MXFP4-quantizing eligible dense matrices one at a time.
-///
-/// Checkpoint-native routed experts are loaded unchanged. The router remains
-/// dense; attention projections, token embeddings, and the LM head use the
-/// requested MXFP4 encoding.
-pub fn load_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    if quantization != WeightQuantization::MxFp4 {
-        return Err(Error::Quantization(
-            "GPT-OSS native MXFP4 experts cannot be implicitly dequantized and requantized to affine"
-                .into(),
-        ));
-    }
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
-        model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
-    )?;
-    let mut args = get_model_args(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "GPT-OSS dense matrices",
-        args.quantization,
-        quantization,
-    )? {
-        return load_model(model_dir, stream, weights_stream);
-    }
-    args.quantization = Some(quantization);
-    let mut model = Model::new(args, stream)?;
-    let config = StrictLoadConfig::default();
-    let mut report = StrictLoadReport::default();
-    load_safetensors_dir_quantized_strict(
-        &mut model,
-        model_dir,
-        weights_stream,
-        stream,
-        quantization,
-        &config,
-        &mut report,
-    )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(model)

@@ -28,7 +28,10 @@ use safemlx_lm::{
     },
     architectures::distributed::pipeline::load_pipeline_model_with_options,
     architectures::{
-        deepseek_v3::model as deepseek_v3,
+        deepseek_v3::{
+            layerwise::{load_deepseek_v3_layerwise_model, DeepSeekV3LayerwiseModel},
+            model as deepseek_v3,
+        },
         gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
         inkling::model as inkling,
@@ -46,9 +49,9 @@ use safemlx_lm::{
     runtime::residency::{
         dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions,
     },
-    CacheResidencyPolicy, CartesianExecution, DeviceAssignment, NonExpertWeightResidency,
-    PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
-    PromptCacheTopology, WeightResidency,
+    CacheResidencyPolicy, CartesianExecution, DeviceAssignment, LayerWeightResidency,
+    NonExpertWeightResidency, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
+    PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 
 const WORKER_RANK: &str = "SAFEMLX_LM_EXPERT_MODEL_RING_WORKER";
@@ -1081,6 +1084,32 @@ fn save_deepseek_expected(model: &mut deepseek_v3::Model, path: &Path, stream: &
     );
 }
 
+fn save_deepseek_layerwise_expected(
+    model: &mut DeepSeekV3LayerwiseModel,
+    path: &Path,
+    stream: &Stream,
+) {
+    let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
+    let mut cache = model.new_cache();
+    let prefill = model.forward(&prompt, &mut cache, stream).unwrap();
+    let first = greedy_token(&prefill, stream);
+    let decode = model.forward(&first, &mut cache, stream).unwrap();
+    let second = greedy_token(&decode, stream);
+    let decode_second = model.forward(&second, &mut cache, stream).unwrap();
+    let third = greedy_token(&decode_second, stream);
+    save_expected(
+        path,
+        prefill,
+        decode,
+        decode_second,
+        first,
+        second,
+        third,
+        Vec::new(),
+        stream,
+    );
+}
+
 fn write_qwen_fixture(directory: &Path, packed_directory: &Path) {
     let config = r#"{
       "model_type":"qwen3_moe","hidden_size":32,"num_hidden_layers":1,
@@ -1159,9 +1188,15 @@ fn write_deepseek_fixture(directory: &Path) {
 
     save_deepseek_expected(&mut model, &directory.join("expected.safetensors"), stream);
     let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
-    let mut quantized =
-        deepseek_v3::load_model_quantized(directory, quantization, stream, stream).unwrap();
-    save_deepseek_expected(
+    let mut quantized = load_deepseek_v3_layerwise_model(
+        directory,
+        LayerWeightResidency::FullyResident,
+        Some(quantization),
+        stream,
+        stream,
+    )
+    .unwrap();
+    save_deepseek_layerwise_expected(
         &mut quantized,
         &directory.join("expected-affine.safetensors"),
         stream,

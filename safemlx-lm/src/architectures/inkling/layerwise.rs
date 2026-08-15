@@ -4904,7 +4904,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
 
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident =
+            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
         let mut layerwise =
             load_inkling_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
@@ -5084,7 +5085,8 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident =
+            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 768, 768)
                 .unwrap();
@@ -5148,7 +5150,8 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident =
+            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let expert_options = ExpertCacheLoadOptions::new(
             OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
             1 << 16,
@@ -5327,7 +5330,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident =
+            resident::load_test_resident_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let mut layerwise = load_inkling_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
