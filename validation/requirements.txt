@@ -1,0 +1,7 @@
+# Install a CUDA-matched PyTorch wheel in the job image before this file when
+# the default package index does not provide the required CUDA build.
+torch>=2.5,<3
+transformers>=4.48,<6
+safetensors>=0.4.5,<1
+accelerate>=1,<2
+PyYAML>=6,<7
