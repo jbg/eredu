@@ -13,7 +13,7 @@ use std::{
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
 
-use super::{self as model, vision::VisionConfig, DecoderConfig};
+use super::{vision::VisionConfig, DecoderConfig};
 use crate::runtime::checkpoint::{
     contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
     quantization::WeightQuantization,
@@ -30,7 +30,7 @@ pub(crate) fn validate_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
 ) -> CheckpointValidation {
-    let args = match model::config_from_hf_value(config) {
+    let args = match super::config_from_hf_value(config) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
@@ -340,11 +340,11 @@ pub(crate) fn validate_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> CheckpointValidation {
-    let translate = |name: &str| model::translate_gguf_weight_name(name, false);
+    let translate = |name: &str| super::translate_gguf_weight_name(name, false);
     if let Err(error) = checkpoint.catalog().translated_outputs(translate) {
         return conflicting(error.to_string());
     }
-    let args = match model::config_from_gguf_catalog(checkpoint, metadata, "muse-glimmer", false) {
+    let args = match super::config_from_gguf_catalog(checkpoint, metadata, "muse-glimmer", false) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
@@ -459,7 +459,7 @@ pub(crate) fn validate_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> CheckpointValidation {
-    let text = match model::config_from_gguf_catalog(
+    let text = match super::config_from_gguf_catalog(
         model_checkpoint,
         model_metadata,
         "muse-glimmer",
@@ -474,7 +474,7 @@ pub(crate) fn validate_projector_gguf(
     };
     if let Err(error) = checkpoint
         .catalog()
-        .translated_outputs(model::translate_mmproj_weight_name)
+        .translated_outputs(super::translate_mmproj_weight_name)
     {
         return conflicting(error.to_string());
     }
@@ -663,7 +663,7 @@ mod tests {
     use super::*;
 
     fn args() -> DecoderConfig {
-        model::config_from_hf_value(&serde_json::json!({
+        super::super::config_from_hf_value(&serde_json::json!({
             "architectures": ["MuseGlimmerForConditionalGeneration"],
             "model_type": "muse_glimmer",
             "image_token_id": 30, "video_token_id": 29,

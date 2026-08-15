@@ -1090,7 +1090,7 @@ pub fn grouped_linear(
         &input.values,
         &input.scales,
         weight,
-        scale,
+        &scale,
         group_ids,
         routes,
         in_dim,
