@@ -198,6 +198,13 @@ class ReferenceRunnerTests(unittest.TestCase):
             (pathlib.Path("result.json"), pathlib.Path("result.safetensors")),
         )
 
+    def test_qwen3_vl_uses_image_text_auto_model(self):
+        fake_transformers = mock.Mock()
+        selected = reference_runner.auto_model_class(fake_transformers, "qwen3_vl")
+        self.assertIs(selected, fake_transformers.AutoModelForImageTextToText)
+        selected = reference_runner.auto_model_class(fake_transformers, "qwen3")
+        self.assertIs(selected, fake_transformers.AutoModelForCausalLM)
+
 
 if __name__ == "__main__":
     unittest.main()

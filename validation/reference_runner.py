@@ -104,6 +104,12 @@ def dtype_from_name(torch, name: str):
     }[name]
 
 
+def auto_model_class(transformers, model_type: Optional[str]):
+    if model_type in ("qwen3_vl", "qwen3_vl_moe"):
+        return transformers.AutoModelForImageTextToText
+    return transformers.AutoModelForCausalLM
+
+
 def synchronize(torch, device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -255,7 +261,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             load_kwargs["device_map"] = args.device_map
 
         load_started = time.perf_counter()
-        model = transformers.AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs)
+        model_loader = auto_model_class(
+            transformers, probe.get("model", {}).get("model_type")
+        )
+        model = model_loader.from_pretrained(model_source, **load_kwargs)
         model.eval()
         if not args.device_map:
             model.to(device)
@@ -310,6 +319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "revision": args.revision,
                 "model_type": getattr(model.config, "model_type", None),
                 "class": type(model).__name__,
+                "auto_model_class": model_loader.__name__,
             },
             "runtime": {
                 "python_version": platform.python_version(),
