@@ -1989,6 +1989,10 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         }
     }
 
+    fn ignores_checkpoint_key(&self, key: &str) -> bool {
+        super::checkpoint::is_redundant_tied_output_head_key(&self.args, key)
+    }
+
     fn forward_layer(
         &mut self,
         _group: usize,
@@ -2764,6 +2768,16 @@ mod tests {
     }
 
     fn write_fixture(dir: &Path, model: &dense_qwen::Model, split_experts: bool, stream: &Stream) {
+        write_fixture_with_options(dir, model, split_experts, false, stream);
+    }
+
+    fn write_fixture_with_options(
+        dir: &Path,
+        model: &dense_qwen::Model,
+        split_experts: bool,
+        redundant_tied_head: bool,
+        stream: &Stream,
+    ) {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
@@ -2799,6 +2813,15 @@ mod tests {
                 }
             }
             arrays.push((name, value.clone()));
+        }
+        if redundant_tied_head {
+            assert!(model.args.tie_word_embeddings);
+            let embedding = arrays
+                .iter()
+                .find(|(name, _)| name == "model.embed_tokens.weight")
+                .map(|(_, value)| value.clone())
+                .expect("tied Qwen fixture embedding");
+            arrays.push(("lm_head.weight".into(), embedding));
         }
         Array::save_safetensors(
             arrays.iter().map(|(name, value)| (name.as_str(), value)),
@@ -2843,6 +2866,28 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn strict_layerwise_load_accepts_shape_checked_redundant_tied_head() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model_args = args(false);
+        model_args.tie_word_embeddings = true;
+        let mut fixture = dense_qwen::Model::new(model_args, execution.stream()).unwrap();
+        initialize(&mut fixture, execution.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_with_options(dir.path(), &fixture, false, true, execution.stream());
+
+        let loaded = load_safetensors(
+            dir.path(),
+            LayerWeightResidency::FullyResident,
+            None,
+            execution.stream(),
+            weights.stream(),
+        )
+        .unwrap();
+        assert!(loaded.args().tie_word_embeddings);
     }
 
     fn assert_close(left: &Array, right: &Array) {

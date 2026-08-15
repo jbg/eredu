@@ -403,6 +403,21 @@ mod dense_qwen_tests {
         assert!(!names.contains("model.layers.0.self_attn.q_norm.weight"));
         assert!(!names.contains("model.layers.0.self_attn.k_norm.weight"));
         assert!(!names.contains("lm_head.weight"));
+        let redundant_head = tied
+            .layout_groups
+            .iter()
+            .find(|group| group.id == "redundant tied output head")
+            .expect("optional redundant tied head layout");
+        assert!(!redundant_head.required);
+        assert_eq!(redundant_head.variants[0].tensors[0].key, "lm_head.weight");
+        assert!(dense_qwen_checkpoint::is_redundant_tied_output_head_key(
+            &qwen2_args(true),
+            "lm_head.weight"
+        ));
+        assert!(!dense_qwen_checkpoint::is_redundant_tied_output_head_key(
+            &qwen2_args(false),
+            "lm_head.weight"
+        ));
 
         let untied = dense_qwen_checkpoint::safetensors_plan(&qwen2_args(false)).unwrap();
         assert!(untied

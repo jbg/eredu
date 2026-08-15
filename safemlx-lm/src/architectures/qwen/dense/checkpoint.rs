@@ -108,7 +108,23 @@ pub(crate) fn safetensors_plan_with_root(
         TensorOperation::Vector,
         None,
     )?;
-    if !args.tie_word_embeddings {
+    if args.tie_word_embeddings {
+        let tensors = matrix_constraints(
+            "lm_head.weight",
+            vec![vocab, hidden],
+            args.weight_quantization_for("lm_head.weight"),
+            Vec::new(),
+        )?;
+        groups.push(AlternativeLayoutGroup {
+            id: "redundant tied output head".into(),
+            required: false,
+            variants: vec![LayoutVariant {
+                id: "present".into(),
+                discriminator_keys: tensors.iter().map(|tensor| tensor.key.clone()).collect(),
+                tensors,
+            }],
+        });
+    } else {
         add_tensor(
             args,
             &mut common,
@@ -233,6 +249,14 @@ pub(crate) fn safetensors_plan_with_root(
         CatalogPolicy::strict(),
     )
     .map_err(|error| error.to_string())
+}
+
+pub(crate) fn is_redundant_tied_output_head_key(args: &DecoderConfig, key: &str) -> bool {
+    args.tie_word_embeddings
+        && matches!(
+            key,
+            "lm_head.weight" | "lm_head.inner.weight" | "lm_head.scales" | "lm_head.biases"
+        )
 }
 
 fn expert_layout_group(

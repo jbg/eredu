@@ -6587,6 +6587,32 @@ mod tests {
     }
 
     #[test]
+    fn redundant_tied_qwen3_output_head_is_optional_but_shape_checked() {
+        let directory = write_complete_qwen3_safetensors_dir(|specs| {
+            specs.push(("lm_head.weight".into(), vec![32, 32]));
+        });
+        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        assert_eq!(report.structural_binding, InspectionReadiness::Ready);
+        assert!(report.is_loadable());
+        structural::validate_safetensors_load_path(
+            ModelKind::Qwen3,
+            directory.path(),
+            ModelLoadOptions::default(),
+        )
+        .unwrap();
+
+        let wrong_shape = write_complete_qwen3_safetensors_dir(|specs| {
+            specs.push(("lm_head.weight".into(), vec![32, 16]));
+        });
+        let report = inspect_model(wrong_shape.path(), ModelInspectionOptions::default()).unwrap();
+        assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::TensorShapeMismatch
+                && issue.tensor_name.as_deref() == Some("lm_head.weight")
+        }));
+    }
+
+    #[test]
     fn qwen2_tied_and_untied_safetensors_catalogs_are_exactly_loadable() {
         for tied in [true, false] {
             let directory = write_complete_qwen2_safetensors_dir(tied, |_| {});

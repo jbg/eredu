@@ -2139,6 +2139,13 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         }
     }
 
+    fn ignores_checkpoint_key(&self, key: &str) -> bool {
+        crate::architectures::qwen::dense::checkpoint::is_redundant_tied_output_head_key(
+            &self.args.text_config,
+            key,
+        )
+    }
+
     fn forward_layer(
         &mut self,
         group: usize,
