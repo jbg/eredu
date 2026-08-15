@@ -7,7 +7,7 @@
 # hardware profile is a reviewed baseline change, not routine test churn.
 
 schema_version: 1
-manifest_revision: 1
+manifest_revision: 2
 observed_at: "2026-08-14"
 
 policy:
@@ -79,6 +79,16 @@ correctness_profiles:
     teacher_forced_decode_steps: 16
     relative_l2_max: 0.02
     cosine_similarity_min: 0.999
+    top_k: 5
+    top_k_overlap_min: 4
+    require_unambiguous_argmax_match: true
+    require_cached_vs_full_recompute: true
+  lfm2_bf16_reference:
+    reference_dtype: bf16
+    sampled_prefill_positions: [0, 7, -1]
+    teacher_forced_decode_steps: 16
+    relative_l2_max: 0.06
+    cosine_similarity_min: 0.9985
     top_k: 5
     top_k_overlap_min: 4
     require_unambiguous_argmax_match: true
@@ -612,7 +622,7 @@ cases:
     reference:
       implementation: transformers
       trust_remote_code: false
-    correctness_profile: bf16_reference
+    correctness_profile: lfm2_bf16_reference
     benchmark_profile: decoder_standard
     hardware_profile: l4x1
     timeout_minutes: 35
