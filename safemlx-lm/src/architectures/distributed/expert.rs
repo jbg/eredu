@@ -3280,7 +3280,7 @@ pub(crate) fn execute_cached_nemotron_h(
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
             let prefix = format!("model.layers.{layer}.moe.experts");
-            let mut bank = nemotron_h::Experts::new(
+            let mut bank = nemotron_h::Experts::new_with_dtype(
                 acquired.identities().len() as i32,
                 args.hidden_size,
                 args.moe_intermediate_size,
@@ -3288,6 +3288,7 @@ pub(crate) fn execute_cached_nemotron_h(
                     args.weight_quantization_for(&format!("{prefix}.up_proj")),
                     args.weight_quantization_for(&format!("{prefix}.down_proj")),
                 ],
+                args.weight_dtype(),
                 stream,
             )?;
             bank.up_proj = Param::new(acquired.compact_binding("up_proj", stream)?);

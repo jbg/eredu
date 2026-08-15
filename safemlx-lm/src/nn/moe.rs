@@ -310,6 +310,16 @@ impl TopKRouter {
         quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_quantization_and_dtype(config, quantization, Dtype::Float32, stream)
+    }
+
+    /// Creates an unloaded dense or affine-packed router with an explicit dense dtype.
+    pub fn new_with_quantization_and_dtype(
+        config: TopKRouterConfig,
+        quantization: Option<WeightQuantization>,
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         if let Some(quantization) = quantization {
             if config.hidden_size <= 0 || config.hidden_size % quantization.group_size() != 0 {
                 return Err(Exception::custom(format!(
@@ -357,7 +367,7 @@ impl TopKRouter {
                 )?,
                 None => Param::<Array>::unloaded(
                     &[config.num_experts, config.hidden_size],
-                    Dtype::Float32,
+                    dense_dtype,
                     stream,
                 )?,
             },
@@ -390,11 +400,7 @@ impl TopKRouter {
                 Param::new(None)
             },
             e_score_correction_bias: if config.score_correction_bias {
-                Param::<Option<Array>>::unloaded_some(
-                    &[config.num_experts],
-                    Dtype::Float32,
-                    stream,
-                )?
+                Param::<Option<Array>>::unloaded_some(&[config.num_experts], dense_dtype, stream)?
             } else {
                 Param::new(None)
             },

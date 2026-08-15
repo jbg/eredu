@@ -468,6 +468,17 @@ impl ModelArgsSource {
 }
 
 impl ModelArgs {
+    pub(crate) fn weight_dtype(&self) -> Dtype {
+        match self.torch_dtype.as_deref() {
+            Some("bfloat16" | "bf16") => Dtype::Bfloat16,
+            Some("float16") => Dtype::Float16,
+            Some("float32") | None => Dtype::Float32,
+            Some(_) => {
+                unreachable!("Nemotron-H torch_dtype is validated before model construction")
+            }
+        }
+    }
+
     pub(crate) fn mtp_policies(&self) -> Result<Vec<LayerPolicy>, Error> {
         if self.num_nextn_predict_layers == 0 {
             return Ok(Vec::new());
@@ -872,8 +883,19 @@ impl MambaRmsNormGated {
         eps: f32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_dtype(intermediate_size, n_groups, eps, Dtype::Float32, stream)
+    }
+
+    /// Creates an unloaded gated RMSNorm with an explicit weight dtype.
+    pub fn new_with_dtype(
+        intermediate_size: i32,
+        n_groups: i32,
+        eps: f32,
+        dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::<Array>::unloaded(&[intermediate_size], Dtype::Float32, stream)?,
+            weight: Param::<Array>::unloaded(&[intermediate_size], dtype, stream)?,
             eps,
             n_groups,
             group_size: intermediate_size / n_groups,
@@ -925,19 +947,40 @@ impl Mlp {
         quantization: [Option<WeightQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_dtype(
+            hidden_size,
+            intermediate_size,
+            bias,
+            quantization,
+            Dtype::Float32,
+            stream,
+        )
+    }
+
+    /// Creates an unloaded MLP with an explicit dense weight dtype.
+    pub fn new_with_dtype(
+        hidden_size: i32,
+        intermediate_size: i32,
+        bias: bool,
+        quantization: [Option<WeightQuantization>; 2],
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            up_proj: common::linear::unloaded_maybe_quantized_linear(
+            up_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 hidden_size,
                 intermediate_size,
                 bias,
                 quantization[0],
+                dense_dtype,
                 stream,
             )?,
-            down_proj: common::linear::unloaded_maybe_quantized_linear(
+            down_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 intermediate_size,
                 hidden_size,
                 bias,
                 quantization[1],
+                dense_dtype,
                 stream,
             )?,
         })
@@ -1034,6 +1077,25 @@ impl Experts {
         quantization: [Option<WeightQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_dtype(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            quantization,
+            Dtype::Float32,
+            stream,
+        )
+    }
+
+    /// Creates an unloaded expert bank with an explicit dense weight dtype.
+    pub fn new_with_dtype(
+        num_experts: i32,
+        hidden_size: i32,
+        intermediate_size: i32,
+        quantization: [Option<WeightQuantization>; 2],
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let split = |quantization| {
             Ok::<_, Exception>(match quantization {
                 Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
@@ -1107,7 +1169,7 @@ impl Experts {
                 None => Ok((
                     Param::<Array>::unloaded(
                         &[num_experts, out_features, in_features],
-                        Dtype::Float32,
+                        dense_dtype,
                         stream,
                     )?,
                     Param::new(None),
@@ -1258,7 +1320,7 @@ impl SparseMoeBlock {
     ) -> Result<Self, Exception> {
         let prefix = format!("model.layers.{layer_idx}.moe");
         Ok(Self {
-            gate: TopKRouter::new(
+            gate: TopKRouter::new_with_quantization_and_dtype(
                 common::moe::TopKRouterConfig {
                     top_k: args.num_experts_per_tok,
                     num_experts: args.n_routed_experts,
@@ -1271,9 +1333,11 @@ impl SparseMoeBlock {
                     topk_group: args.topk_group,
                     score_correction_bias: true,
                 },
+                None,
+                args.weight_dtype(),
                 stream,
             )?,
-            experts: Experts::new(
+            experts: Experts::new_with_dtype(
                 args.n_routed_experts,
                 args.hidden_size,
                 routed_intermediate,
@@ -1281,9 +1345,10 @@ impl SparseMoeBlock {
                     args.weight_quantization_for(&format!("{prefix}.experts.up_proj")),
                     args.weight_quantization_for(&format!("{prefix}.experts.down_proj")),
                 ],
+                args.weight_dtype(),
                 stream,
             )?,
-            shared_experts: Mlp::new(
+            shared_experts: Mlp::new_with_dtype(
                 args.hidden_size,
                 shared_intermediate,
                 args.mlp_bias,
@@ -1295,6 +1360,7 @@ impl SparseMoeBlock {
                         "{prefix}.shared_experts.down_proj.weight"
                     )),
                 ],
+                args.weight_dtype(),
                 stream,
             )?,
         })
@@ -1507,32 +1573,36 @@ impl Attention {
             n_kv_heads: kv_heads,
             scale: (args.head_dim as f32).sqrt().recip(),
             policy,
-            q_proj: common::linear::unloaded_maybe_quantized_linear(
+            q_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 query_heads * args.head_dim,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.q_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            k_proj: common::linear::unloaded_maybe_quantized_linear(
+            k_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 kv_heads * args.head_dim,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.k_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            v_proj: common::linear::unloaded_maybe_quantized_linear(
+            v_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 kv_heads * args.head_dim,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.v_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            o_proj: common::linear::unloaded_maybe_quantized_linear(
+            o_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 query_heads * args.head_dim,
                 args.hidden_size,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.o_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
         })
@@ -1735,32 +1805,41 @@ impl Mamba2Mixer {
             conv_kernel_size: args.conv_kernel,
             d_mlp,
             chunk_size: args.chunk_size,
-            in_proj: common::linear::unloaded_maybe_quantized_linear(
+            in_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 projection_size,
                 args.use_bias,
                 args.weight_quantization_for(&format!(
                     "model.layers.{layer_idx}.mamba.in_proj.weight"
                 )),
+                args.weight_dtype(),
                 stream,
             )?,
-            conv1d: DepthwiseConv1d::new(conv_dim, args.conv_kernel, args.use_conv_bias, stream)?,
-            dt_bias: Param::<Array>::unloaded(&[heads], Dtype::Float32, stream)?,
-            A_log: Param::<Array>::unloaded(&[heads], Dtype::Float32, stream)?,
-            D: Param::<Array>::unloaded(&[heads], Dtype::Float32, stream)?,
-            norm: MambaRmsNormGated::new(
+            conv1d: DepthwiseConv1d::new_with_dtype(
+                conv_dim,
+                args.conv_kernel,
+                args.use_conv_bias,
+                args.weight_dtype(),
+                stream,
+            )?,
+            dt_bias: Param::<Array>::unloaded(&[heads], args.weight_dtype(), stream)?,
+            A_log: Param::<Array>::unloaded(&[heads], args.weight_dtype(), stream)?,
+            D: Param::<Array>::unloaded(&[heads], args.weight_dtype(), stream)?,
+            norm: MambaRmsNormGated::new_with_dtype(
                 intermediate_size,
                 groups,
                 args.layer_norm_epsilon,
+                args.weight_dtype(),
                 stream,
             )?,
-            out_proj: common::linear::unloaded_maybe_quantized_linear(
+            out_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 intermediate_size,
                 args.hidden_size,
                 args.use_bias,
                 args.weight_quantization_for(&format!(
                     "model.layers.{layer_idx}.mamba.out_proj.weight"
                 )),
+                args.weight_dtype(),
                 stream,
             )?,
         })
@@ -2489,7 +2568,7 @@ impl TransformerBlock {
             norm: nn::RmsNorm::unloaded(
                 args.hidden_size,
                 args.layer_norm_epsilon,
-                Dtype::Float32,
+                args.weight_dtype(),
                 stream,
             )?,
             mamba: if policy == LayerPolicy::Mamba {
@@ -2525,7 +2604,7 @@ impl TransformerBlock {
                     unreachable!()
                 };
                 let prefix = format!("model.layers.{layer_idx}.mlp");
-                Some(Mlp::new(
+                Some(Mlp::new_with_dtype(
                     args.hidden_size,
                     intermediate,
                     args.mlp_bias,
@@ -2533,6 +2612,7 @@ impl TransformerBlock {
                         args.weight_quantization_for(&format!("{prefix}.up_proj.weight")),
                         args.weight_quantization_for(&format!("{prefix}.down_proj.weight")),
                     ],
+                    args.weight_dtype(),
                     stream,
                 )?)
             } else {
@@ -3463,10 +3543,11 @@ pub struct NemotronHModel {
 impl NemotronHModel {
     /// Creates an unloaded Nemotron-H transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let embeddings = common::linear::unloaded_maybe_quantized_embedding(
+        let embeddings = common::linear::unloaded_maybe_quantized_embedding_with_dtype(
             args.vocab_size,
             args.hidden_size,
             args.weight_quantization_for("model.embeddings.weight"),
+            args.weight_dtype(),
             stream,
         )?;
         let layers = (0..args.num_hidden_layers)
@@ -3474,7 +3555,7 @@ impl NemotronHModel {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| Exception::custom(error.to_string()))?;
         let norm_f =
-            nn::RmsNorm::unloaded(args.hidden_size, args.norm_eps, Dtype::Float32, stream)?;
+            nn::RmsNorm::unloaded(args.hidden_size, args.norm_eps, args.weight_dtype(), stream)?;
         Ok(Self {
             vocab_size: args.vocab_size,
             num_hidden_layers: args.num_hidden_layers,
@@ -3618,11 +3699,12 @@ impl Model {
         validate_model_args(&args).map_err(|error| Exception::custom(error.to_string()))?;
         let model = NemotronHModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(common::linear::unloaded_maybe_quantized_linear(
+            Some(common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 args.vocab_size,
                 false,
                 args.weight_quantization_for("lm_head.weight"),
+                args.weight_dtype(),
                 stream,
             )?)
         } else {
@@ -4800,6 +4882,36 @@ mod tests {
     }
 
     #[test]
+    fn bfloat16_config_builds_bfloat16_checkpoint_targets() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let model = Model::new(tiny_full_args(), execution.stream()).unwrap();
+        let parameters = model.parameters().flatten();
+
+        for key in [
+            "model.embeddings.weight",
+            "model.layers.0.norm.weight",
+            "model.layers.0.mamba.in_proj.weight",
+            "model.layers.0.mamba.conv1d.weight",
+            "model.layers.0.mamba.conv1d.bias",
+            "model.layers.0.mamba.dt_bias",
+            "model.layers.0.mamba.A_log",
+            "model.layers.0.mamba.D",
+            "model.layers.0.mamba.norm.weight",
+            "model.layers.0.mamba.out_proj.weight",
+            "model.layers.1.mlp.up_proj.weight",
+            "model.layers.2.moe.gate.weight",
+            "model.layers.2.moe.gate.e_score_correction_bias",
+            "model.layers.2.moe.experts.up_proj",
+            "model.layers.2.moe.shared_experts.up_proj.weight",
+            "model.layers.3.attention.q_proj.weight",
+            "model.norm_f.weight",
+            "lm_head.weight",
+        ] {
+            assert_eq!(parameters[key].dtype(), Dtype::Bfloat16, "{key}");
+        }
+    }
+
+    #[test]
     fn prompt_cache_layout_records_mamba_attention_and_stateless_layers() {
         use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
 
@@ -4972,8 +5084,15 @@ mod tests {
             let down_scales = down.scales.clone();
             let down_biases = down.biases.clone();
 
-            let mut packed =
-                Experts::new(3, 32, 32, [Some(quantization), Some(quantization)], stream).unwrap();
+            let mut packed = Experts::new_with_dtype(
+                3,
+                32,
+                32,
+                [Some(quantization), Some(quantization)],
+                Dtype::Float32,
+                stream,
+            )
+            .unwrap();
             packed.up_proj = Param::new(up.weight.clone());
             packed.up_proj_scales = Param::new(Some(up_scales.clone()));
             packed.up_proj_biases = Param::new(up_biases.clone());
@@ -4981,7 +5100,8 @@ mod tests {
             packed.down_proj_scales = Param::new(Some(down_scales.clone()));
             packed.down_proj_biases = Param::new(down_biases.clone());
 
-            let mut reference = Experts::new(3, 32, 32, [None, None], stream).unwrap();
+            let mut reference =
+                Experts::new_with_dtype(3, 32, 32, [None, None], Dtype::Float32, stream).unwrap();
             reference.up_proj = Param::new(
                 dequantize_with_mode(
                     &up.weight,

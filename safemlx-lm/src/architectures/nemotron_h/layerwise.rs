@@ -123,7 +123,7 @@ impl NemotronMtpModule {
                 nn::RmsNorm::unloaded(
                     args.hidden_size,
                     args.layer_norm_epsilon,
-                    Dtype::Float32,
+                    args.weight_dtype(),
                     stream,
                 )
             })
@@ -134,7 +134,7 @@ impl NemotronMtpModule {
                     nn::RmsNorm::unloaded(
                         args.hidden_size,
                         args.layer_norm_epsilon,
-                        Dtype::Float32,
+                        args.weight_dtype(),
                         stream,
                     )
                 })
@@ -144,14 +144,14 @@ impl NemotronMtpModule {
                     nn::RmsNorm::unloaded(
                         args.hidden_size,
                         args.layer_norm_epsilon,
-                        Dtype::Float32,
+                        args.weight_dtype(),
                         stream,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
             eh_proj: (0..steps)
                 .map(|step| {
-                    common::linear::unloaded_maybe_quantized_linear(
+                    common::linear::unloaded_maybe_quantized_linear_with_dtype(
                         args.hidden_size * 2,
                         args.hidden_size,
                         false,
@@ -159,6 +159,7 @@ impl NemotronMtpModule {
                             "mtp.layers.{}.eh_proj.weight",
                             step * pattern_len
                         )),
+                        args.weight_dtype(),
                         stream,
                     )
                 })
@@ -1693,21 +1694,24 @@ impl NemotronHLayerwiseAdapter {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         resident::validate_model_args(&args)?;
         let mtp = NemotronMtpModule::new(&args, stream)?;
-        let embeddings = common::linear::unloaded_maybe_quantized_embedding(
+        let embeddings = common::linear::unloaded_maybe_quantized_embedding_with_dtype(
             args.vocab_size,
             args.hidden_size,
             args.weight_quantization_for("model.embeddings.weight"),
+            args.weight_dtype(),
             stream,
         )?;
-        let norm = nn::RmsNorm::unloaded(args.hidden_size, args.norm_eps, Dtype::Float32, stream)?;
+        let norm =
+            nn::RmsNorm::unloaded(args.hidden_size, args.norm_eps, args.weight_dtype(), stream)?;
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(common::linear::unloaded_maybe_quantized_linear(
+            Some(common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 args.vocab_size,
                 false,
                 args.weight_quantization_for("lm_head.weight"),
+                args.weight_dtype(),
                 stream,
             )?)
         };
@@ -2100,7 +2104,7 @@ fn execute_cached_nemotron_experts(
                         layer - args.num_hidden_layers as usize
                     )
                 };
-                let mut bank = Experts::new(
+                let mut bank = Experts::new_with_dtype(
                     acquired.identities().len() as i32,
                     args.hidden_size,
                     args.moe_intermediate_size,
@@ -2108,6 +2112,7 @@ fn execute_cached_nemotron_experts(
                         args.weight_quantization_for(&format!("{prefix}.up_proj")),
                         args.weight_quantization_for(&format!("{prefix}.down_proj")),
                     ],
+                    args.weight_dtype(),
                     stream,
                 )?;
                 bank.up_proj = Param::new(
@@ -2586,7 +2591,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         let mut layer = self.new_layer(group, index, stream)?;
         if let Some(moe) = &mut layer.moe {
             let prefix = format!("model.layers.{index}.moe.experts");
-            moe.experts = Experts::new(
+            moe.experts = Experts::new_with_dtype(
                 if self.sparse_expert_cache {
                     0
                 } else {
@@ -2602,6 +2607,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                     self.args
                         .weight_quantization_for(&format!("{prefix}.down_proj")),
                 ],
+                self.args.weight_dtype(),
                 stream,
             )?;
         }
@@ -2620,7 +2626,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         if let Some(moe) = &mut layer.moe {
             let prefix = format!("model.layers.{index}.moe.experts");
             let intermediate = moe.experts.intermediate_size;
-            moe.experts = Experts::new(
+            moe.experts = Experts::new_with_dtype(
                 if self.sparse_expert_cache {
                     0
                 } else {
@@ -2636,6 +2642,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                     self.args
                         .weight_quantization_for(&format!("{prefix}.down_proj")),
                 ],
+                self.args.weight_dtype(),
                 stream,
             )?;
         }

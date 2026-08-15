@@ -32,10 +32,21 @@ impl DepthwiseConv1d {
         bias: bool,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_dtype(channels, kernel_size, bias, Dtype::Float32, stream)
+    }
+
+    /// Creates unloaded depthwise-convolution parameters with an explicit dtype.
+    pub fn new_with_dtype(
+        channels: i32,
+        kernel_size: i32,
+        bias: bool,
+        dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::<Array>::unloaded(&[channels, 1, kernel_size], Dtype::Float32, stream)?,
+            weight: Param::<Array>::unloaded(&[channels, 1, kernel_size], dtype, stream)?,
             bias: if bias {
-                Param::<Option<Array>>::unloaded_some(&[channels], Dtype::Float32, stream)?
+                Param::<Option<Array>>::unloaded_some(&[channels], dtype, stream)?
             } else {
                 Param::new(None)
             },
