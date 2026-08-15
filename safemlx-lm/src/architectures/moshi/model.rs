@@ -208,7 +208,7 @@ impl ModelArgs {
         self.n_q - self.generated_audio_codebooks()
     }
 
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if let Some(quantization) = self.quantization {
             quantization.validate()?;
         }
@@ -2629,25 +2629,15 @@ pub fn load_model(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let args = get_model_args(model_dir)?;
-    let weights_name = args
-        .moshi_name
-        .clone()
-        .unwrap_or_else(|| "model.safetensors".to_string());
+    let source = super::checkpoint::source_path(model_dir, &args);
+    super::checkpoint::validate_safetensors_path(&source, &args)?;
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    if weights_name == "model.safetensors"
-        && model_dir.join("model.safetensors.index.json").exists()
-    {
-        load_safetensors_dir_strict(&mut model, model_dir, weights_stream, &config, &mut report)?;
+    if source == model_dir {
+        load_safetensors_dir_strict(&mut model, &source, weights_stream, &config, &mut report)?;
     } else {
-        load_safetensors_strict(
-            &mut model,
-            model_dir.join(&weights_name),
-            weights_stream,
-            &config,
-            &mut report,
-        )?;
+        load_safetensors_strict(&mut model, source, weights_stream, &config, &mut report)?;
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
@@ -2674,18 +2664,14 @@ pub fn load_model_quantized(
     )? {
         return load_model(model_dir, stream, weights_stream);
     }
+    let source = super::checkpoint::source_path(model_dir, &args);
+    super::checkpoint::validate_safetensors_path(&source, &args)?;
     args.quantization = Some(quantization);
-    let weights_name = args
-        .moshi_name
-        .clone()
-        .unwrap_or_else(|| "model.safetensors".to_string());
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    if weights_name == "model.safetensors"
-        && model_dir.join("model.safetensors.index.json").exists()
-    {
-        for file in crate::runtime::checkpoint::load::safetensors_files(model_dir)? {
+    if source == model_dir {
+        for file in crate::runtime::checkpoint::load::safetensors_files(&source)? {
             load_safetensors_quantized_strict(
                 &mut model,
                 file,
@@ -2699,7 +2685,7 @@ pub fn load_model_quantized(
     } else {
         load_safetensors_quantized_strict(
             &mut model,
-            model_dir.join(weights_name),
+            source,
             weights_stream,
             stream,
             quantization,

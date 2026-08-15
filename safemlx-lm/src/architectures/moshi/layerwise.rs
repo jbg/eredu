@@ -877,17 +877,7 @@ pub fn load_moshi_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let args = resident::get_model_args(model_dir)?;
-    let weights_name = args
-        .moshi_name
-        .clone()
-        .unwrap_or_else(|| "model.safetensors".to_string());
-    let source = if weights_name == "model.safetensors"
-        && model_dir.join("model.safetensors.index.json").exists()
-    {
-        model_dir.to_path_buf()
-    } else {
-        model_dir.join(weights_name)
-    };
+    let source = super::checkpoint::source_path(model_dir, &args);
     load_with_layout(
         source,
         args,
@@ -909,17 +899,8 @@ pub fn load_moshi_tensor_parallel_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let args = resident::get_model_args(model_dir)?;
-    let weights_name = args
-        .moshi_name
-        .clone()
-        .unwrap_or_else(|| "model.safetensors".to_string());
-    let source = if weights_name == "model.safetensors"
-        && model_dir.join("model.safetensors.index.json").exists()
-    {
-        model_dir.to_path_buf()
-    } else {
-        model_dir.join(weights_name)
-    };
+    let source = super::checkpoint::source_path(model_dir, &args);
+    super::checkpoint::validate_safetensors_path(&source, &args)?;
     let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Native, stream)?;
     Ok(MoshiLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
@@ -1041,6 +1022,10 @@ fn load_with_layout(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
+    let source = source.as_ref();
+    if layout == CheckpointLayout::Native {
+        super::checkpoint::validate_safetensors_path(source, &args)?;
+    }
     let adapter = MoshiLayerwiseAdapter::new(args, layout, stream)?;
     Ok(MoshiLayerwiseModel {
         execution: load_safetensors_layerwise_model(

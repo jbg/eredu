@@ -99,11 +99,20 @@ pub(crate) fn validate_safetensors(
 ) -> StructuralValidation {
     let validation = match safetensors_policy(kind) {
         StructuralValidationPolicy::Exact => match kind {
-            ModelKind::DeepSeekV3 => validate_deepseek_v3_safetensors(config, store, options),
-            ModelKind::DeepSeekV4 => validate_deepseek_v4_safetensors(config, store),
-            ModelKind::Gemma4 => validate_gemma4_safetensors(config, store, options),
-            ModelKind::GptOss => validate_gpt_oss_safetensors(config, store),
-            ModelKind::Inkling => validate_inkling_safetensors(config, store),
+            ModelKind::DeepSeekV3 => deepseek_v3_checkpoint::validate_safetensors(
+                config,
+                store,
+                !options.weight_residency.is_fully_resident(),
+            ),
+            ModelKind::DeepSeekV4 => deepseek_v4_checkpoint::validate_safetensors(config, store),
+            ModelKind::Gemma4 => gemma4_checkpoint::validate_safetensors(
+                config,
+                store,
+                !options.weight_residency.is_fully_resident(),
+                options.weight_residency.expert_cache().is_some(),
+            ),
+            ModelKind::GptOss => gpt_oss_checkpoint::validate_safetensors(config, store),
+            ModelKind::Inkling => inkling_checkpoint::validate_safetensors(config, store),
             ModelKind::KimiLinear => kimi_linear_checkpoint::validate_safetensors(config, store),
             ModelKind::Lfm2 => lfm2_checkpoint::validate_safetensors(
                 config,
@@ -114,13 +123,25 @@ pub(crate) fn validate_safetensors(
             ModelKind::MuseGlimmer => muse_glimmer_checkpoint::validate_safetensors(config, store),
             ModelKind::NemotronH => nemotron_h_checkpoint::validate_safetensors(config, store),
             ModelKind::PersonaPlex => personaplex_checkpoint::validate_safetensors(config, store),
-            ModelKind::Qwen2 => validate_dense_qwen_safetensors(config, store),
-            ModelKind::Qwen3 => validate_dense_qwen_safetensors(config, store),
-            ModelKind::Qwen3Next => validate_qwen3_next_safetensors(config, store, options),
-            ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-                validate_qwen3_vl_safetensors(kind, config, store, options)
+            ModelKind::Qwen2 | ModelKind::Qwen3 => {
+                dense_qwen_checkpoint::validate_safetensors(config, store)
             }
-            ModelKind::Qwen35 => validate_qwen35_safetensors(config, store, options),
+            ModelKind::Qwen3Next => qwen_hybrid_checkpoint::validate_qwen3_next_safetensors(
+                config,
+                store,
+                options.weight_residency.expert_cache().is_some(),
+            ),
+            ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => qwen_vl_checkpoint::validate_safetensors(
+                kind == ModelKind::Qwen3VlMoe,
+                config,
+                store,
+                !options.weight_residency.is_fully_resident(),
+            ),
+            ModelKind::Qwen35 => qwen_hybrid_checkpoint::validate_qwen35_safetensors(
+                config,
+                store,
+                options.weight_residency.expert_cache().is_some(),
+            ),
         },
         StructuralValidationPolicy::Unverified => unverified(kind.model_type_name()),
     };
@@ -146,11 +167,27 @@ pub(crate) fn validate_gguf(
 ) -> StructuralValidation {
     let validation = match gguf_policy(architecture) {
         StructuralValidationPolicy::Exact => match architecture {
-            GgufArchitecture::DeepSeek2 => validate_deepseek2_gguf(checkpoint, metadata),
-            GgufArchitecture::DeepSeek4 => validate_deepseek4_gguf(checkpoint, metadata),
-            GgufArchitecture::GptOss => validate_gpt_oss_gguf(checkpoint, metadata),
-            GgufArchitecture::Gemma4 => validate_gemma4_gguf(checkpoint, metadata, options),
-            GgufArchitecture::Inkling => validate_inkling_gguf(checkpoint, metadata, options),
+            GgufArchitecture::DeepSeek2 => {
+                deepseek_v3_checkpoint::validate_gguf(checkpoint, metadata)
+            }
+            GgufArchitecture::DeepSeek4 => {
+                deepseek_v4_checkpoint::validate_gguf(checkpoint, metadata)
+            }
+            GgufArchitecture::GptOss => gpt_oss_checkpoint::validate_gguf(checkpoint, metadata),
+            GgufArchitecture::Gemma4 => {
+                if let Err(error) = architecture.validate_load_policy(options) {
+                    invalid_geometry(error.to_string())
+                } else {
+                    gemma4_checkpoint::validate_gguf(checkpoint, metadata)
+                }
+            }
+            GgufArchitecture::Inkling => {
+                if let Err(error) = architecture.validate_load_policy(options) {
+                    invalid_geometry(error.to_string())
+                } else {
+                    inkling_checkpoint::validate_gguf(checkpoint, metadata)
+                }
+            }
             GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
                 let variant = if architecture == GgufArchitecture::Lfm2Moe {
                     lfm2_checkpoint::GgufVariant::Moe
@@ -178,10 +215,25 @@ pub(crate) fn validate_gguf(
                 }
             }
             GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-                validate_dense_qwen_gguf(architecture, checkpoint, metadata)
+                let variant = match architecture {
+                    GgufArchitecture::Qwen2 => dense_qwen_checkpoint::GgufVariant::Qwen2,
+                    GgufArchitecture::Qwen3 => dense_qwen_checkpoint::GgufVariant::Qwen3,
+                    GgufArchitecture::Qwen3Moe => dense_qwen_checkpoint::GgufVariant::Qwen3Moe,
+                    _ => unreachable!("covered by the outer architecture match"),
+                };
+                dense_qwen_checkpoint::validate_gguf(variant, checkpoint, metadata)
             }
             architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
-                validate_qwen3_vl_gguf(architecture, checkpoint, metadata, options)
+                if let Err(error) = architecture.validate_load_policy(options) {
+                    invalid_geometry(error.to_string())
+                } else {
+                    let variant = match architecture {
+                        GgufArchitecture::Qwen3Vl => qwen_vl_checkpoint::GgufVariant::Dense,
+                        GgufArchitecture::Qwen3VlMoe => qwen_vl_checkpoint::GgufVariant::Moe,
+                        _ => unreachable!("covered by the outer architecture match"),
+                    };
+                    qwen_vl_checkpoint::validate_gguf(variant, checkpoint, metadata)
+                }
             }
             GgufArchitecture::KimiLinear => {
                 kimi_linear_checkpoint::validate_gguf(checkpoint, metadata)
@@ -189,7 +241,18 @@ pub(crate) fn validate_gguf(
             GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe
             | GgufArchitecture::Qwen3Next => {
-                validate_qwen35_gguf(architecture, checkpoint, metadata, options)
+                let variant = match architecture {
+                    GgufArchitecture::Qwen35 => qwen_hybrid_checkpoint::GgufVariant::Qwen35,
+                    GgufArchitecture::Qwen35Moe => qwen_hybrid_checkpoint::GgufVariant::Qwen35Moe,
+                    GgufArchitecture::Qwen3Next => qwen_hybrid_checkpoint::GgufVariant::Qwen3Next,
+                    _ => unreachable!("covered by the outer architecture match"),
+                };
+                qwen_hybrid_checkpoint::validate_gguf(
+                    variant,
+                    checkpoint,
+                    metadata,
+                    options.weight_residency.expert_cache().is_some(),
+                )
             }
         },
         StructuralValidationPolicy::Unverified => unverified(architecture.metadata_name()),
@@ -209,122 +272,6 @@ fn unverified(architecture: &str) -> StructuralValidation {
     })
 }
 
-fn validate_inkling_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> StructuralValidation {
-    inkling_checkpoint::validate_safetensors(config, store)
-}
-
-fn validate_gemma4_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    gemma4_checkpoint::validate_safetensors(
-        config,
-        store,
-        !options.weight_residency.is_fully_resident(),
-        options.weight_residency.expert_cache().is_some(),
-    )
-}
-
-fn validate_deepseek_v4_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> StructuralValidation {
-    deepseek_v4_checkpoint::validate_safetensors(config, store)
-}
-
-fn validate_deepseek_v3_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    deepseek_v3_checkpoint::validate_safetensors(
-        config,
-        store,
-        !options.weight_residency.is_fully_resident(),
-    )
-}
-
-fn validate_gpt_oss_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> StructuralValidation {
-    gpt_oss_checkpoint::validate_safetensors(config, store)
-}
-
-fn validate_qwen3_next_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    qwen_hybrid_checkpoint::validate_qwen3_next_safetensors(
-        config,
-        store,
-        options.weight_residency.expert_cache().is_some(),
-    )
-}
-
-fn validate_qwen35_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    qwen_hybrid_checkpoint::validate_qwen35_safetensors(
-        config,
-        store,
-        options.weight_residency.expert_cache().is_some(),
-    )
-}
-
-fn validate_dense_qwen_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> StructuralValidation {
-    dense_qwen_checkpoint::validate_safetensors(config, store)
-}
-
-fn validate_qwen3_vl_safetensors(
-    kind: ModelKind,
-    config: &Value,
-    store: &SafetensorsWeightStore,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    qwen_vl_checkpoint::validate_safetensors(
-        kind == ModelKind::Qwen3VlMoe,
-        config,
-        store,
-        !options.weight_residency.is_fully_resident(),
-    )
-}
-
-fn validate_deepseek2_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> StructuralValidation {
-    deepseek_v3_checkpoint::validate_gguf(checkpoint, metadata)
-}
-
-fn validate_deepseek4_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> StructuralValidation {
-    deepseek_v4_checkpoint::validate_gguf(checkpoint, metadata)
-}
-
-fn validate_inkling_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    if let Err(error) = GgufArchitecture::Inkling.validate_load_policy(options) {
-        return invalid_geometry(error.to_string());
-    }
-    inkling_checkpoint::validate_gguf(checkpoint, metadata)
-}
-
 pub(crate) fn validate_inkling_mmproj_gguf(
     model_metadata: &HashMap<String, GgufMetadataValue>,
     mmproj: &inkling::InklingMmprojGguf,
@@ -340,38 +287,6 @@ pub(crate) fn validate_gemma4_mmproj_gguf(
     gemma4_checkpoint::validate_mmproj_gguf(model_checkpoint, model_metadata, mmproj)
 }
 
-fn validate_gemma4_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    if let Err(error) = GgufArchitecture::Gemma4.validate_load_policy(options) {
-        return invalid_geometry(error.to_string());
-    }
-    gemma4_checkpoint::validate_gguf(checkpoint, metadata)
-}
-
-fn validate_gpt_oss_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> StructuralValidation {
-    gpt_oss_checkpoint::validate_gguf(checkpoint, metadata)
-}
-
-fn validate_dense_qwen_gguf(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> StructuralValidation {
-    let variant = match architecture {
-        GgufArchitecture::Qwen2 => dense_qwen_checkpoint::GgufVariant::Qwen2,
-        GgufArchitecture::Qwen3 => dense_qwen_checkpoint::GgufVariant::Qwen3,
-        GgufArchitecture::Qwen3Moe => dense_qwen_checkpoint::GgufVariant::Qwen3Moe,
-        _ => unreachable!("dense Qwen GGUF validator received another architecture"),
-    };
-    dense_qwen_checkpoint::validate_gguf(variant, checkpoint, metadata)
-}
-
 pub(crate) fn validate_muse_glimmer_projector_gguf(
     model_checkpoint: &GgufCheckpoint,
     model_metadata: &HashMap<String, GgufMetadataValue>,
@@ -384,23 +299,6 @@ pub(crate) fn validate_muse_glimmer_projector_gguf(
         checkpoint,
         metadata,
     )
-}
-
-fn validate_qwen3_vl_gguf(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    if let Err(error) = architecture.validate_load_policy(options) {
-        return invalid_geometry(error.to_string());
-    }
-    let variant = match architecture {
-        GgufArchitecture::Qwen3Vl => qwen_vl_checkpoint::GgufVariant::Dense,
-        GgufArchitecture::Qwen3VlMoe => qwen_vl_checkpoint::GgufVariant::Moe,
-        _ => unreachable!("Qwen-VL GGUF validator received another architecture"),
-    };
-    qwen_vl_checkpoint::validate_gguf(variant, checkpoint, metadata)
 }
 
 pub(crate) fn validate_qwen3_vl_projector_gguf(
@@ -430,26 +328,6 @@ pub(crate) fn validate_qwen35_projector_gguf(
         metadata,
     )
 }
-fn validate_qwen35_gguf(
-    architecture: GgufArchitecture,
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-    options: ModelLoadOptions,
-) -> StructuralValidation {
-    let variant = match architecture {
-        GgufArchitecture::Qwen35 => qwen_hybrid_checkpoint::GgufVariant::Qwen35,
-        GgufArchitecture::Qwen35Moe => qwen_hybrid_checkpoint::GgufVariant::Qwen35Moe,
-        GgufArchitecture::Qwen3Next => qwen_hybrid_checkpoint::GgufVariant::Qwen3Next,
-        _ => unreachable!("Qwen hybrid GGUF validator received another architecture"),
-    };
-    qwen_hybrid_checkpoint::validate_gguf(
-        variant,
-        checkpoint,
-        metadata,
-        options.weight_residency.expert_cache().is_some(),
-    )
-}
-
 fn invalid_geometry(detail: String) -> StructuralValidation {
     StructuralValidation::Invalid(vec![StructuralIssue {
         kind: StructuralIssueKind::InvalidGeometry,
