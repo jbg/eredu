@@ -1,0 +1,816 @@
+# CUDA checkpoint validation manifest.
+#
+# Hub revisions and exact checkpoint byte counts were resolved from the public
+# Hugging Face model API on 2026-08-14. Exact byte counts sum root-level
+# `model*.safetensors` blobs only; tokenizer/codec and draft-model companions
+# are listed separately. Keep revisions immutable. Updating a revision or a
+# hardware profile is a reviewed baseline change, not routine test churn.
+
+schema_version: 1
+manifest_revision: 1
+observed_at: "2026-08-14"
+
+policy:
+  artifact_format: safetensors
+  comparison_scope: family_branch_modality
+  require_immutable_hub_revision: true
+  require_exact_input_token_ids: true
+  require_finite_logits: true
+  correctness_is_blocking: true
+  performance_is_blocking: false
+  remote_code:
+    allow_only_publisher_owned_repositories: true
+    require_pinned_revision: true
+    model_mount_read_only: true
+    allow_write_capable_hub_token: false
+  result_states:
+    - validated_real_checkpoint
+    - validated_reduced_checkpoint
+    - deferred_with_reason
+
+input_sets:
+  text_correctness:
+    kind: text
+    generation: deterministic
+    prompts:
+      - id: short_ascii
+        text: "Explain why deterministic validation inputs matter in one sentence."
+      - id: unicode_and_code
+        text: "Return the UTF-8 text 'café Δ' and the Rust expression 7_u32 * 6."
+    teacher_forced_decode_tokens: 16
+  text_performance:
+    kind: token_ids
+    generation: deterministic_repetition
+    prompt_lengths: [128, 2048, 8192]
+    generated_tokens: 128
+  image_correctness:
+    kind: generated_image
+    generator: rgb_grid_v1
+    width: 320
+    height: 224
+    seed: 1729
+  video_correctness:
+    kind: generated_video
+    generator: moving_rgb_grid_v1
+    width: 224
+    height: 224
+    frames: 8
+    fps: 4
+    seed: 1729
+  audio_16khz_correctness:
+    kind: generated_audio
+    generator: sine_chirp_v1
+    sample_rate_hz: 16000
+    channels: 1
+    duration_seconds: 2
+    seed: 1729
+  audio_24khz_correctness:
+    kind: generated_audio
+    generator: sine_chirp_v1
+    sample_rate_hz: 24000
+    channels: 1
+    duration_seconds: 2
+    seed: 1729
+
+correctness_profiles:
+  bf16_reference:
+    reference_dtype: bf16
+    sampled_prefill_positions: [0, 7, -1]
+    teacher_forced_decode_steps: 16
+    relative_l2_max: 0.02
+    cosine_similarity_min: 0.999
+    top_k: 5
+    top_k_overlap_min: 4
+    require_unambiguous_argmax_match: true
+    require_cached_vs_full_recompute: true
+  native_mxfp4_reference:
+    reference_dtype: checkpoint_native
+    sampled_prefill_positions: [0, 7, -1]
+    teacher_forced_decode_steps: 16
+    relative_l2_max: 0.05
+    cosine_similarity_min: 0.995
+    top_k: 5
+    top_k_overlap_min: 3
+    require_unambiguous_argmax_match: true
+    require_cached_vs_full_recompute: true
+  native_block_fp8_reference:
+    reference_dtype: checkpoint_native
+    sampled_prefill_positions: [0, 7, -1]
+    teacher_forced_decode_steps: 16
+    relative_l2_max: 0.05
+    cosine_similarity_min: 0.995
+    top_k: 5
+    top_k_overlap_min: 3
+    require_unambiguous_argmax_match: true
+    require_cached_vs_full_recompute: true
+  native_nvfp4_reference:
+    reference_dtype: checkpoint_native
+    sampled_prefill_positions: [0, 7, -1]
+    teacher_forced_decode_steps: 16
+    relative_l2_max: 0.08
+    cosine_similarity_min: 0.99
+    top_k: 5
+    top_k_overlap_min: 3
+    require_unambiguous_argmax_match: true
+    require_cached_vs_full_recompute: true
+  realtime_bf16_reference:
+    reference_dtype: bf16
+    teacher_forced_temporal_steps: 8
+    teacher_forced_depth_steps: 8
+    relative_l2_max: 0.02
+    cosine_similarity_min: 0.999
+    require_unambiguous_argmax_match: true
+
+benchmark_profiles:
+  decoder_standard:
+    warmup_runs: 1
+    measured_runs: 5
+    batch_size: 1
+    prompt_lengths: [128, 2048, 8192]
+    generated_tokens: 128
+    report:
+      - load_seconds
+      - time_to_first_token_seconds
+      - prefill_tokens_per_second
+      - decode_tokens_per_second
+      - mlx_peak_bytes
+      - cuda_peak_bytes
+    modes:
+      - fully_resident_no_speculation
+      - automatic_best_supported
+  multimodal_standard:
+    warmup_runs: 1
+    measured_runs: 5
+    batch_size: 1
+    text_prompt_lengths: [128, 2048]
+    generated_tokens: 128
+    report:
+      - load_seconds
+      - media_encode_seconds
+      - time_to_first_token_seconds
+      - decode_tokens_per_second
+      - mlx_peak_bytes
+      - cuda_peak_bytes
+    modes:
+      - fully_resident_no_speculation
+      - automatic_best_supported
+  realtime_standard:
+    warmup_runs: 1
+    measured_runs: 5
+    input_seconds: 10
+    report:
+      - load_seconds
+      - first_output_frame_seconds
+      - realtime_factor
+      - generated_frames_per_second
+      - mlx_peak_bytes
+      - cuda_peak_bytes
+
+# Names are current Hugging Face Jobs flavor identifiers. Prices are metadata
+# for cost planning only and must be refreshed before enforcing a budget.
+hardware_profiles:
+  l4x1:
+    hf_jobs_flavor: l4x1
+    gpu_model: NVIDIA L4
+    gpu_count: 1
+    cuda_compute_capability: 89
+    device_memory_bytes: 24000000000
+    host_memory_bytes: 30000000000
+    ephemeral_storage_bytes: 400000000000
+    usd_per_hour_observed: 0.80
+  a100_large:
+    hf_jobs_flavor: a100-large
+    gpu_model: NVIDIA A100
+    gpu_count: 1
+    cuda_compute_capability: 80
+    device_memory_bytes: 80000000000
+    host_memory_bytes: 142000000000
+    ephemeral_storage_bytes: 1000000000000
+    usd_per_hour_observed: 2.50
+  h200:
+    hf_jobs_flavor: h200
+    gpu_model: NVIDIA H200
+    gpu_count: 1
+    cuda_compute_capability: 90
+    device_memory_bytes: 141000000000
+    host_memory_bytes: 256000000000
+    ephemeral_storage_bytes: 3000000000000
+    usd_per_hour_observed: 5.00
+  h200x2:
+    hf_jobs_flavor: h200x2
+    gpu_model: NVIDIA H200
+    gpu_count: 2
+    cuda_compute_capability: 90
+    aggregate_device_memory_bytes: 282000000000
+    host_memory_bytes: 512000000000
+    ephemeral_storage_bytes: 6000000000000
+    usd_per_hour_observed: 10.00
+  h200x8:
+    hf_jobs_flavor: h200x8
+    gpu_model: NVIDIA H200
+    gpu_count: 8
+    cuda_compute_capability: 90
+    aggregate_device_memory_bytes: 1128000000000
+    host_memory_bytes: 2048000000000
+    ephemeral_storage_bytes: 24000000000000
+    usd_per_hour_observed: 40.00
+
+cases:
+  - id: llama_dense_untied
+    family: llama_mistral
+    branch: llama_full_attention_dense
+    status: enabled
+    schedule: nightly
+    model:
+      repo: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      revision: fe8a4ea1ffedaf415f4da2f062534de366a451e6
+      model_type: llama
+      gated: false
+      expected_weight_bytes: 2200119864
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, full_attention, grouped_query_attention, untied_head]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 35
+
+  - id: llama_dense_tied
+    family: llama_mistral
+    branch: llama_full_attention_dense_tied_head
+    status: enabled
+    schedule: nightly
+    model:
+      repo: HuggingFaceTB/SmolLM2-360M-Instruct
+      revision: a10cc1512eabd3dde888204e902eca88bddb4951
+      model_type: llama
+      gated: false
+      expected_weight_bytes: 723674912
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, full_attention, grouped_query_attention, tied_head]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 30
+
+  - id: mistral_sliding_dense
+    family: llama_mistral
+    branch: mistral_sliding_attention_dense
+    status: enabled
+    schedule: nightly
+    model:
+      repo: mistralai/Mistral-7B-Instruct-v0.1
+      revision: ec5deb64f2c6e6fa90c1abf74a91d5c93a9669ca
+      model_type: mistral
+      gated: false
+      expected_weight_bytes: 14483498040
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, sliding_attention, grouped_query_attention, untied_head]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 45
+
+  - id: qwen2_dense
+    family: qwen2_qwen2_5
+    branch: dense_text
+    status: enabled
+    schedule: nightly
+    model:
+      repo: Qwen/Qwen2.5-0.5B-Instruct
+      revision: 7ae557604adf67be50417f59c2c2f167def9a775
+      model_type: qwen2
+      gated: false
+      expected_weight_bytes: 988097824
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, full_attention, grouped_query_attention]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 30
+
+  - id: qwen3_dense
+    family: qwen3
+    branch: dense_text
+    status: enabled
+    schedule: nightly
+    model:
+      repo: Qwen/Qwen3-0.6B
+      revision: c1899de289a04d12100db370d81485cdf75e47ca
+      model_type: qwen3
+      gated: false
+      expected_weight_bytes: 1503300328
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, dense, full_attention]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 30
+
+  - id: qwen3_moe
+    family: qwen3
+    branch: moe_text
+    status: enabled
+    schedule: weekly
+    model:
+      repo: Qwen/Qwen3-30B-A3B
+      revision: ad44e777bcd18fa416d9da3bd8f70d33ebb85d39
+      model_type: qwen3_moe
+      gated: false
+      expected_weight_bytes: 61066575648
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, routed_experts, expert_cache, full_attention]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: a100_large
+    timeout_minutes: 75
+
+  - id: qwen3_vl_dense
+    family: qwen3_vl
+    branch: dense_multimodal
+    status: enabled
+    schedule: nightly
+    model:
+      repo: Qwen/Qwen3-VL-2B-Instruct
+      revision: 89644892e4d85e24eaac8bacfd4f463576704203
+      model_type: qwen3_vl
+      gated: false
+      expected_weight_bytes: 4255140312
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, image, video, mrope, deepstack, dense]
+    inputs: [text_correctness, text_performance, image_correctness, video_correctness]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: multimodal_standard
+    hardware_profile: l4x1
+    timeout_minutes: 45
+
+  - id: qwen3_vl_moe
+    family: qwen3_vl
+    branch: moe_multimodal
+    status: enabled
+    schedule: weekly
+    model:
+      repo: Qwen/Qwen3-VL-30B-A3B-Instruct
+      revision: 9c4b90e1e4ba969fd3b5378b57d966d725f1b86c
+      model_type: qwen3_vl_moe
+      gated: false
+      expected_weight_bytes: 62141618016
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, image, video, mrope, deepstack, routed_experts, expert_cache]
+    inputs: [text_correctness, text_performance, image_correctness, video_correctness]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: multimodal_standard
+    hardware_profile: a100_large
+    timeout_minutes: 90
+
+  - id: qwen3_next_moe
+    family: qwen3_next_qwen3_5
+    branch: qwen3_next_hybrid_moe
+    status: enabled
+    schedule: weekly
+    model:
+      repo: Qwen/Qwen3-Next-80B-A3B-Instruct
+      revision: 9c7f2fbe84465e40164a94cc16cd30b6999b0cc7
+      model_type: qwen3_next
+      gated: false
+      expected_weight_bytes: 162659161528
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, recurrent_attention, full_attention, routed_experts, shared_experts]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: h200x2
+    timeout_minutes: 120
+
+  - id: qwen3_5_dense_multimodal
+    family: qwen3_next_qwen3_5
+    branch: qwen3_5_dense_multimodal
+    status: enabled
+    schedule: nightly
+    model:
+      repo: Qwen/Qwen3.5-0.8B
+      revision: 2fc06364715b967f1860aea9cf38778875588b17
+      model_type: qwen3_5
+      gated: false
+      expected_weight_bytes: 1746942600
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, image, video, recurrent_attention, full_attention, embedded_mtp]
+    inputs: [text_correctness, text_performance, image_correctness, video_correctness]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: multimodal_standard
+    hardware_profile: l4x1
+    timeout_minutes: 45
+
+  - id: qwen3_5_moe_multimodal
+    family: qwen3_next_qwen3_5
+    branch: qwen3_5_moe_multimodal
+    status: enabled
+    schedule: weekly
+    model:
+      repo: Qwen/Qwen3.5-35B-A3B
+      revision: 59d61f3ce65a6d9863b86d2e96597125219dc754
+      model_type: qwen3_5_moe
+      gated: false
+      expected_weight_bytes: 71903878016
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, image, video, recurrent_attention, full_attention, routed_experts, embedded_mtp]
+    inputs: [text_correctness, text_performance, image_correctness, video_correctness]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: multimodal_standard
+    hardware_profile: h200
+    timeout_minutes: 105
+
+  - id: deepseek_v3_moe_fp8
+    family: deepseek_v3_r1
+    branch: mla_moe_native_block_fp8
+    status: deferred
+    schedule: manual
+    model:
+      repo: deepseek-ai/DeepSeek-V3-0324
+      revision: e9b33add76883f293d6bf61f6bd89b497e80e335
+      model_type: deepseek_v3
+      gated: false
+      expected_weight_bytes: 688586727753
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, mla, dense_to_moe_schedule, routed_experts, shared_experts, native_block_fp8]
+    inputs: [text_correctness]
+    reference:
+      implementation: transformers
+      trust_remote_code: true
+    correctness_profile: native_block_fp8_reference
+    benchmark_profile: null
+    hardware_profile: h200x8
+    timeout_minutes: 180
+    defer:
+      rationale: "The pinned checkpoint is 688.6 GB before runtime state and requires the $40/hour eight-H200 tier plus validated distributed loading. Use a deterministic reduced checkpoint for routine CUDA correctness; run the real checkpoint only under an explicit budget."
+      reduced_checkpoint_case: deepseek_v3_reduced
+      performance_status: not_measured
+
+  - id: gpt_oss_mxfp4_moe
+    family: gpt_oss
+    branch: harmony_scheduled_attention_moe
+    status: enabled
+    schedule: nightly
+    model:
+      repo: openai/gpt-oss-20b
+      revision: 6cee5e81ee83917806bbde320786a8fb61efebee
+      model_type: gpt_oss
+      gated: false
+      expected_weight_bytes: 13761316904
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, harmony_chat, scheduled_attention, routed_experts, native_mxfp4]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: native_mxfp4_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 50
+
+  - id: gemma4_dense_multimodal
+    family: gemma4
+    branch: e2b_dense_multimodal
+    status: enabled
+    schedule: nightly
+    model:
+      repo: google/gemma-4-E2B-it
+      revision: 3e22461f65e89153144f8adb70e3b8c2cc9845a7
+      model_type: gemma4
+      gated: false
+      expected_weight_bytes: 10246621918
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, image, video, audio, dense, shared_kv, media_towers]
+    inputs: [text_correctness, text_performance, image_correctness, video_correctness, audio_16khz_correctness]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: multimodal_standard
+    hardware_profile: l4x1
+    timeout_minutes: 60
+
+  - id: gemma4_moe_multimodal
+    family: gemma4
+    branch: a4b_moe_multimodal
+    status: enabled
+    schedule: weekly
+    model:
+      repo: google/gemma-4-26B-A4B-it
+      revision: 4d7ae4984b7db7de8f8457170b3f1a419ee76d52
+      model_type: gemma4
+      gated: false
+      expected_weight_bytes: 51612009916
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, image, video, audio, routed_experts, shared_kv, media_towers]
+    inputs: [text_correctness, text_performance, image_correctness, video_correctness, audio_16khz_correctness]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: multimodal_standard
+    hardware_profile: a100_large
+    timeout_minutes: 90
+
+  - id: gemma4_assistant_e2b
+    family: gemma4_assistant
+    branch: external_multi_token_prediction
+    status: enabled
+    schedule: weekly
+    depends_on: [gemma4_dense_multimodal]
+    model:
+      repo: google/gemma-4-E2B-it-assistant
+      revision: 2d874ef7d29f9a30599a1e4b3c1cbc9595f005df
+      model_type: gemma4_assistant
+      gated: false
+      expected_weight_bytes: 157565344
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, external_mtp, target_verification]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 60
+
+  - id: kimi_linear_moe
+    family: kimi_linear
+    branch: kda_mla_moe
+    status: enabled
+    schedule: weekly
+    model:
+      repo: moonshotai/Kimi-Linear-48B-A3B-Instruct
+      revision: e1df551a447157d4658b573f9a695d57658590e9
+      model_type: kimi_linear
+      gated: false
+      expected_weight_bytes: 98248224120
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, kda, mla, routed_experts, shared_experts]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: h200
+    timeout_minutes: 105
+
+  - id: lfm2_5_dense
+    family: lfm2_lfm2_5
+    branch: causal_convolution_attention_dense
+    status: enabled
+    schedule: nightly
+    model:
+      repo: LiquidAI/LFM2.5-1.2B-Instruct
+      revision: df58c174f05ff733f83f8cae10ea9298224c8006
+      model_type: lfm2
+      gated: false
+      expected_weight_bytes: 2340697936
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, causal_convolution, attention, dense]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 35
+
+  - id: lfm2_5_moe
+    family: lfm2_lfm2_5
+    branch: causal_convolution_attention_moe
+    status: deferred
+    schedule: manual
+    model:
+      repo: LiquidAI/LFM2.5-8B-A1B
+      revision: b9aebfcbe28b6cb374042f495d733037550ab146
+      model_type: lfm2_moe
+      gated: true
+      expected_weight_bytes: 16000000000
+      expected_weight_bytes_source: estimated_from_8b_bf16_parameter_count
+    coverage: [text, causal_convolution, attention, routed_experts, shared_experts]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: true
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 60
+    defer:
+      rationale: "The immutable revision is known, but anonymous Hub API access does not expose the gated SafeTensors blob catalog. Enable after accepting the publisher terms and replace the estimated byte count with the exact root model shard sum."
+      performance_status: awaiting_checkpoint_access
+
+  - id: nemotron_h_dense
+    family: nemotron_h
+    branch: hybrid_mamba_attention_dense
+    status: enabled
+    schedule: nightly
+    model:
+      repo: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+      revision: dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f
+      model_type: nemotron_h
+      gated: false
+      expected_weight_bytes: 7947142640
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, mamba, attention, dense_mlp]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: true
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: l4x1
+    timeout_minutes: 50
+
+  - id: nemotron_h_moe
+    family: nemotron_h
+    branch: hybrid_mamba_attention_moe
+    status: enabled
+    schedule: weekly
+    model:
+      repo: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+      revision: 2d59de1cbd51c0adf384eb906b766d1aee0e0517
+      model_type: nemotron_h
+      gated: false
+      expected_weight_bytes: 63156694272
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, mamba, attention, routed_experts, expert_cache]
+    inputs: [text_correctness, text_performance]
+    reference:
+      implementation: transformers
+      trust_remote_code: true
+    correctness_profile: bf16_reference
+    benchmark_profile: decoder_standard
+    hardware_profile: a100_large
+    timeout_minutes: 90
+
+  - id: inkling_nvfp4_moe_multimodal
+    family: inkling
+    branch: hmlp_hybrid_attention_moe_nvfp4
+    status: deferred
+    schedule: manual
+    model:
+      repo: thinkingmachines/Inkling-NVFP4
+      revision: 42a75a99a40eb2ba1e0717db6357a0bf15205044
+      model_type: inkling_mm_model
+      gated: false
+      expected_weight_bytes: 581484697288
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, image, audio, hmlp, local_attention, global_attention, routed_experts, shared_experts, native_nvfp4]
+    inputs: [text_correctness, image_correctness, audio_16khz_correctness]
+    reference:
+      implementation: publisher_remote_code
+      trust_remote_code: true
+    correctness_profile: native_nvfp4_reference
+    benchmark_profile: null
+    hardware_profile: h200x8
+    timeout_minutes: 180
+    defer:
+      rationale: "The smallest publisher checkpoint is 581.5 GB and requires the $40/hour eight-H200 tier plus validated distributed NVFP4 execution. Use a deterministic reduced checkpoint for routine CUDA correctness; run the real checkpoint only under an explicit budget."
+      reduced_checkpoint_case: inkling_reduced
+      performance_status: not_measured
+
+  - id: muse_glimmer_dense_multimodal
+    family: muse_glimmer
+    branch: mixed_attention_atem_dflash
+    status: enabled
+    schedule: weekly
+    model:
+      repo: meta-models/Muse-Glimmer-30B
+      revision: a4e59da52a7bc87ae7251dd5545c0dd437c44b68
+      model_type: muse_glimmer
+      gated: false
+      expected_weight_bytes: 59553435272
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    companions:
+      - role: dflash_assistant
+        repo: meta-models/Muse-Glimmer-30B-assistant
+        revision: e8192f3a8f617f74be2ce220360c89ef4789f39f
+        model_type: muse_glimmer_assistant
+        gated: false
+        expected_weight_bytes: 5111976608
+        expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    coverage: [text, image, video, mixed_attention, atem, dflash, target_verification]
+    inputs: [text_correctness, text_performance, image_correctness, video_correctness]
+    reference:
+      implementation: transformers
+      trust_remote_code: false
+    correctness_profile: bf16_reference
+    benchmark_profile: multimodal_standard
+    hardware_profile: a100_large
+    timeout_minutes: 105
+
+  - id: moshi_realtime
+    family: moshi
+    branch: temporal_depth_codec_tokens
+    status: enabled
+    schedule: weekly
+    model:
+      repo: kyutai/moshiko-pytorch-bf16
+      revision: 2bfc9ae6e89079a5cc7ed2a68436010d91a3d289
+      model_type: moshi
+      gated: false
+      expected_weight_bytes: 15375500136
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    companions:
+      - role: mimi_codec
+        path: tokenizer-e351c8d8-checkpoint125.safetensors
+        expected_weight_bytes: 384644900
+        expected_weight_bytes_source: hub_api_blob_size
+      - role: text_tokenizer
+        path: tokenizer_spm_32k_3.model
+    coverage: [audio, realtime, temporal_generation, depth_generation, codec_tokens]
+    inputs: [audio_24khz_correctness]
+    reference:
+      implementation: kyutai_moshi
+      trust_remote_code: true
+    correctness_profile: realtime_bf16_reference
+    benchmark_profile: realtime_standard
+    hardware_profile: a100_large
+    timeout_minutes: 75
+
+  - id: personaplex_realtime
+    family: personaplex
+    branch: transformed_temporal_depth_voice_conditioning
+    status: enabled
+    schedule: weekly
+    model:
+      repo: nvidia/personaplex-7b-v1
+      revision: fdaf4090a61cb315c138a1faee287ffd6c716309
+      model_type: personaplex
+      gated: auto
+      expected_weight_bytes: 16742874000
+      expected_weight_bytes_source: hub_api_root_model_safetensors_sum
+    companions:
+      - role: mimi_codec
+        path: tokenizer-e351c8d8-checkpoint125.safetensors
+        expected_weight_bytes: 384644900
+        expected_weight_bytes_source: hub_api_blob_size
+      - role: text_tokenizer
+        path: tokenizer_spm_32k_3.model
+    coverage: [audio, realtime, temporal_generation, depth_generation, voice_conditioning, text_conditioning]
+    inputs: [text_correctness, audio_24khz_correctness]
+    reference:
+      implementation: nvidia_personaplex
+      trust_remote_code: true
+    correctness_profile: realtime_bf16_reference
+    benchmark_profile: realtime_standard
+    hardware_profile: a100_large
+    timeout_minutes: 90
+
+# Reduced cases are deliberately unresolved until the fixture generator exists.
+# Their IDs are reserved so deferred production checkpoints cannot accidentally
+# be reported as covered by an unrelated tiny community model.
+reduced_checkpoint_requirements:
+  - id: deepseek_v3_reduced
+    family: deepseek_v3_r1
+    required_features: [mla, dense_to_moe_schedule, routed_experts, shared_experts, native_block_fp8]
+    generation: deterministic_first_party_fixture
+    status: not_implemented
+  - id: inkling_reduced
+    family: inkling
+    required_features: [hmlp, image, audio, local_attention, global_attention, routed_experts, shared_experts, native_nvfp4]
+    generation: deterministic_first_party_fixture
+    status: not_implemented
