@@ -18,7 +18,10 @@ python -m pip install -r validation/requirements.txt
 ## Pinned CUDA image
 
 The published `linux/amd64` image contains the CUDA-enabled
-`checkpoint_probe`, PyTorch, Transformers, and the validation scripts:
+`checkpoint_probe`, an MXFP4 JIT smoke binary, PyTorch, Transformers, and the
+validation scripts. Its build compiles the installed CUDA, CuTe, and CUTLASS
+headers with NVRTC. At runtime, `MLX_CUDA_JIT_INCLUDE_DIRS` gives MLX explicit
+header roots instead of relying on the executable's installed location.
 
 ```text
 ghcr.io/jbg/safemlx-validation:cuda12.9.1-rust1.89.0-torch2.8.0-v1
@@ -38,6 +41,18 @@ docker run --rm --gpus all \
 Use the `-git-<12-character commit>` tag emitted by the publish workflow, or
 the registry digest reported by it, when a run must remain tied to one source
 revision. The version tag is intentionally not named `latest`.
+
+Qualify each newly published image once on an NVIDIA host by running its real
+MXFP4 JIT path:
+
+```bash
+docker run --rm --gpus all \
+  ghcr.io/jbg/safemlx-validation:<immutable-tag-or-digest> \
+  cuda_mxfp4_smoke
+```
+
+This is an image/runtime qualification check, so individual checkpoint pilots
+do not repeat it.
 
 Run SafeMLX:
 

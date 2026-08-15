@@ -48,9 +48,17 @@ RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/op
         --no-default-features \
         --features cuda,fancy-regex \
         --example checkpoint_probe; \
+    cargo build --locked --release \
+        -p safemlx \
+        --no-default-features \
+        --features cuda \
+        --example cuda_mxfp4_smoke; \
     install -m 0755 \
         /tmp/safemlx-target/release/examples/checkpoint_probe \
         /usr/local/bin/checkpoint_probe; \
+    install -m 0755 \
+        /tmp/safemlx-target/release/examples/cuda_mxfp4_smoke \
+        /usr/local/bin/cuda_mxfp4_smoke; \
     mlx_cute_header="$(find /tmp/safemlx-target/release/build \
         -path '*/include/cute/numeric/numeric_types.hpp' \
         -print -quit)"; \
@@ -118,13 +126,15 @@ ENV SAFEMLX_CUDA_ARCHITECTURES="80;89;90" \
     CUDA_HOME=/usr/local/cuda \
     CUDA_PATH=/usr/local/cuda \
     CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
-    CUDAToolkit_ROOT=/usr/local/cuda
+    CUDAToolkit_ROOT=/usr/local/cuda \
+    MLX_CUDA_JIT_INCLUDE_DIRS=/usr/local/include:/usr/local/include/cccl
 
 # MLX's CUDA backend compiles some execution plans with NVRTC on first use.
 # Keep the pinned toolkit headers available to those runtime compilations.
 COPY --from=checkpoint-probe-builder /usr/local/cuda/include /usr/local/cuda/include
 COPY --from=checkpoint-probe-builder /usr/local/include /usr/local/include
 COPY --from=checkpoint-probe-builder /usr/local/bin/checkpoint_probe /usr/local/bin/checkpoint_probe
+COPY --from=checkpoint-probe-builder /usr/local/bin/cuda_mxfp4_smoke /usr/local/bin/cuda_mxfp4_smoke
 
 COPY validation /opt/safemlx/validation
 RUN set -eux; \
@@ -138,6 +148,7 @@ RUN set -eux; \
         | LC_ALL=C sort > /etc/ld.so.conf.d/pytorch-nvidia.conf; \
     test -s /etc/ld.so.conf.d/pytorch-nvidia.conf; \
     ldconfig; \
+    python /opt/safemlx/validation/nvrtc_header_smoke.py; \
     ldd /usr/local/bin/checkpoint_probe > /tmp/checkpoint-probe.ldd; \
     unexpected_missing="$(awk '/not found/ && $1 != "libcuda.so.1" { print $1 }' /tmp/checkpoint-probe.ldd)"; \
     if [ -n "${unexpected_missing}" ]; then \
