@@ -9,7 +9,7 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt, Param},
+    module::{Module, Param},
     native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     nn,
     ops::{
@@ -53,13 +53,17 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict,
-        load_safetensors_dir_strict_with_split_relu2_experts, transform_split_relu2_experts,
-        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
+    runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{
+    gguf_metadata, load_gguf_strict, load_safetensors_dir_strict_with_split_relu2_experts,
+    transform_split_relu2_experts, StrictLoadConfig, StrictLoadReport,
+};
+#[cfg(test)]
+use safemlx::module::ModuleParametersExt;
 
 /// Executable operator and state policy for one Nemotron-H decoder layer.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -3478,78 +3482,6 @@ impl NemotronHModel {
             norm_f,
         })
     }
-
-    pub(crate) fn forward_with_expert_executor<F>(
-        &mut self,
-        input: ModelInput<'_>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let ModelInput {
-            inputs,
-            mask,
-            mut cache,
-        } = input;
-        let mut h = self.embeddings.forward(inputs, stream)?;
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => {
-                let offset = cache.as_ref().map(|cache| cache.offset()).unwrap_or(0);
-                if h.dim(1) > 1 {
-                    match create_attention_mask(&h, &offset_cache(offset), Some(true), stream)? {
-                        Some(AttentionMask::Array(mask)) => Some(mask),
-                        Some(AttentionMask::Causal) => {
-                            return Err(Exception::custom("Only `Array` mask is supported"));
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                }
-            }
-        };
-        let cache = cache.as_mut().ok_or_else(|| {
-            Exception::custom("cached expert parallelism requires a Nemotron-H cache")
-        })?;
-        if cache.layers.len() != self.layers.len() {
-            return Err(Exception::custom(format!(
-                "Nemotron-H cache has {} layers, expected {}",
-                cache.layers.len(),
-                self.layers.len()
-            )));
-        }
-        for (index, (layer, layer_cache)) in self
-            .layers
-            .iter_mut()
-            .zip(cache.layers.iter_mut())
-            .enumerate()
-        {
-            h = if layer.policy == LayerPolicy::SparseMoe {
-                layer.forward_sparse_experts(
-                    BlockInput {
-                        x: &h,
-                        mask: mask.as_ref(),
-                        cache: Some(layer_cache),
-                    },
-                    stream,
-                    |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
-                )?
-            } else {
-                layer.forward(
-                    BlockInput {
-                        x: &h,
-                        mask: mask.as_ref(),
-                        cache: Some(layer_cache),
-                    },
-                    stream,
-                )?
-            };
-        }
-        self.norm_f.forward(&h, stream)
-    }
 }
 
 /// Input for a Nemotron-H forward pass.
@@ -3987,28 +3919,6 @@ impl Model {
         };
         self.project_logits(&hidden_states, stream)
     }
-
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let hidden = self.model.forward_with_expert_executor(
-            ModelInput {
-                inputs,
-                mask: None,
-                cache: Some(cache),
-            },
-            execute,
-            stream,
-        )?;
-        self.project_logits(&hidden, stream)
-    }
 }
 
 impl Module<ModelInput<'_>> for Model {
@@ -4072,6 +3982,7 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
+#[cfg(test)]
 pub(crate) struct LoadedNemotronHGguf {
     pub(crate) model: Model,
 }
@@ -4082,6 +3993,7 @@ pub(crate) struct PreparedNemotronHGguf {
 }
 
 /// Loads a dense or sparse-MoE Nemotron-H text model from a GGUF checkpoint.
+#[cfg(test)]
 pub fn load_nemotron_h_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -4090,6 +4002,7 @@ pub fn load_nemotron_h_gguf(
     Ok(load_nemotron_h_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_nemotron_h_gguf_with_metadata(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -4100,6 +4013,7 @@ pub(crate) fn load_nemotron_h_gguf_with_metadata(
     load_nemotron_h_gguf_checkpoint(&checkpoint, metadata, stream, weights_stream)
 }
 
+#[cfg(test)]
 pub(crate) fn load_nemotron_h_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
@@ -4474,6 +4388,7 @@ fn unique_nonzero_layer_value(key: &str, values: &[i32]) -> Result<i32, Error> {
     Ok(value)
 }
 
+#[cfg(test)]
 fn translate_gguf_weight(
     name: String,
     value: Array,
@@ -4664,6 +4579,7 @@ pub fn get_nemotron_h_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArg
 }
 
 /// Loads a Nemotron-H model and safetensors weights from a model directory.
+#[cfg(test)]
 pub fn load_nemotron_h_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -4694,6 +4610,7 @@ pub fn load_nemotron_h_model(
 }
 
 /// Strict-loading key rules for Nemotron-H checkpoints.
+#[cfg(test)]
 pub fn nemotron_h_strict_load_config() -> StrictLoadConfig {
     StrictLoadConfig::default()
         .rewrite_prefix("backbone.", "model.")
@@ -4701,6 +4618,7 @@ pub fn nemotron_h_strict_load_config() -> StrictLoadConfig {
 }
 
 /// Remaps public Nemotron-H checkpoint tensors to the runtime parameter tree.
+#[cfg(test)]
 pub fn transform_nemotron_h_weights(
     loaded: std::collections::HashMap<String, Array>,
     args: &ModelArgs,
@@ -4735,6 +4653,7 @@ pub(crate) fn rewrite_nemotron_h_weight_key(key: &str, args: &ModelArgs) -> Resu
 }
 
 /// Strict-loads Nemotron-H safetensors into a module after applying checkpoint remaps.
+#[cfg(test)]
 pub fn load_nemotron_h_safetensors_strict<M: safemlx::module::ModuleParameters>(
     model: &mut M,
     model_dir: impl AsRef<Path>,

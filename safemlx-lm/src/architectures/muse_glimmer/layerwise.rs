@@ -66,8 +66,7 @@ use crate::{
         MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, SharedWeightStore,
         StaticUnitBindings, WeightResidency,
@@ -604,34 +603,7 @@ impl CausalLm<Vec<Option<PagedKeyValueCache>>> for LayerwiseDecoder {
 pub fn load_safetensors(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    let model_dir = model_dir.as_ref();
-    let options = options.into();
-    let residency = options.weight_residency();
-    let args = resident::load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
-        args.model_kind(),
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
-    let adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
-    Ok(LayerwiseDecoder {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn load_safetensors_quantized_residency(
-    model_dir: impl AsRef<Path>,
-    options: impl Into<LayerWeightResidency>,
-    quantization: WeightQuantization,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -639,28 +611,20 @@ pub(crate) fn load_safetensors_quantized_residency(
     let options = options.into();
     let args = resident::load_config(model_dir)?;
     let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
-    if !should_quantize_on_load(
-        "dense Qwen residency",
-        args.weight_quantization(),
-        quantization,
-    )? {
-        return Ok(LayerwiseDecoder {
-            execution: load_layerwise_model(
-                store,
-                MuseGlimmerLayerwiseAdapter::new(args, stream)?,
-                options,
-                stream,
-                weights_stream,
-            )?,
-        });
-    }
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Muse-Glimmer", args.weight_quantization(), requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let source_adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_layerwise_model_with_quantization(
             store,
             source_adapter,
             options,
-            Some(quantization),
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -678,7 +642,6 @@ pub fn load_tensor_parallel_model(
 ) -> Result<LayerwiseDecoder, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -710,11 +673,6 @@ pub fn load_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     let args = resident::load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
-        args.model_kind(),
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_tensor_parallel_layerwise_model(
@@ -750,7 +708,12 @@ pub(crate) fn load_gguf_tensor_parallel_model(
     let (mut args, eos_token_ids) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
     apply_mmproj_config(checkpoint, metadata, &mut args, mmproj.as_ref())?;
-    let store = muse_gguf_store(checkpoint, mmproj.as_ref(), options.max_mapped_shards())?;
+    let store = muse_gguf_store(
+        checkpoint,
+        mmproj.as_ref(),
+        &args,
+        options.max_mapped_shards(),
+    )?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
         MuseGlimmerLayerwiseAdapter::new(args, stream)?,
@@ -781,7 +744,12 @@ pub(crate) fn load_gguf_checkpoint(
     let (mut args, eos_token_ids) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
     apply_mmproj_config(checkpoint, metadata, &mut args, mmproj.as_ref())?;
-    let store = muse_gguf_store(checkpoint, mmproj.as_ref(), residency.max_mapped_shards())?;
+    let store = muse_gguf_store(
+        checkpoint,
+        mmproj.as_ref(),
+        &args,
+        residency.max_mapped_shards(),
+    )?;
 
     if let Some(expert_options) = residency.expert_cache() {
         let _ = expert_options;
@@ -847,16 +815,26 @@ fn apply_mmproj_config(
 fn muse_gguf_store(
     checkpoint: &GgufCheckpoint,
     mmproj: Option<&resident::MuseGlimmerMmprojGguf>,
+    args: &DecoderConfig,
     max_mapped_shards: usize,
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
-        .add_checkpoint(checkpoint.clone(), |name| {
+        .add_checkpoint(checkpoint.clone(), &text_plan, |name| {
             resident::translate_gguf_weight_name(name, false)
         })?;
     if let Some(mmproj) = mmproj {
+        let vision = args.vision_config.as_ref().ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "Muse-Glimmer projector is present without validated vision geometry".into(),
+            )
+        })?;
+        let projector_plan = super::checkpoint::projector_gguf_plan(args, vision)
+            .map_err(Error::UnsupportedArchitecture)?;
         builder = builder.add_checkpoint(
             mmproj.checkpoint.clone(),
+            &projector_plan,
             resident::translate_mmproj_store_weight_name,
         )?;
     }
@@ -872,7 +850,7 @@ pub(crate) fn prepare_gguf_pipeline_source(
     let (mut args, _) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, "muse-glimmer", false)?;
     apply_mmproj_config(checkpoint, metadata, &mut args, mmproj.as_ref())?;
-    let store = muse_gguf_store(checkpoint, mmproj.as_ref(), max_mapped_shards)?;
+    let store = muse_gguf_store(checkpoint, mmproj.as_ref(), &args, max_mapped_shards)?;
     Ok((args, store))
 }
 
@@ -1630,6 +1608,14 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {

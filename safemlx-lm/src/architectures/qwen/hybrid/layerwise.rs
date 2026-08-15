@@ -60,8 +60,7 @@ use crate::{
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
         LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
@@ -462,6 +461,10 @@ impl QwenHybridLayerwiseModel {
         self.execution.adapter().args()
     }
 
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
+    }
+
     pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
         self.execution.bind_parallel_topology(topology);
     }
@@ -582,6 +585,10 @@ impl QwenHybridLayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Runs the shared hybrid decoder while preserving recurrent and KV state.
@@ -1041,17 +1048,12 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for QwenHybridTensor
 pub fn load_qwen3_next_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3Next,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -1061,6 +1063,7 @@ pub fn load_qwen3_next_layerwise_model(
         args,
         QwenHybridFamily::Qwen3Next,
         options,
+        quantization,
         stream,
         weights_stream,
     )
@@ -1076,7 +1079,6 @@ pub fn load_qwen3_next_tensor_parallel_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1099,11 +1101,6 @@ pub fn load_qwen3_next_tensor_parallel_model(
         }
         return Ok(model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3Next,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -1123,17 +1120,12 @@ pub fn load_qwen3_next_tensor_parallel_model(
 pub fn load_qwen35_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let (args, image_token_id, video_token_id, vision) =
         resident::get_qwen3_5_model_args(model_dir)?;
     load_qwen_hybrid_layerwise_model_with_vision(
@@ -1144,42 +1136,10 @@ pub fn load_qwen35_layerwise_model(
         video_token_id,
         vision,
         options,
+        quantization,
         stream,
         weights_stream,
     )
-}
-
-pub(crate) fn execute_transformed_qwen_hybrid_model(
-    model: resident::Model,
-    quantization: crate::runtime::checkpoint::quantization::WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<QwenHybridLayerwiseModel, Error> {
-    let mut args = model.args.clone();
-    args.quantization = Some(quantization);
-    let family = if args.model_type == "qwen3_next" {
-        QwenHybridFamily::Qwen3Next
-    } else {
-        QwenHybridFamily::Qwen35
-    };
-    let adapter = QwenHybridLayerwiseAdapter::new(
-        args,
-        family,
-        model.image_token_id,
-        model.video_token_id,
-        model.vision_args.clone(),
-        stream,
-    )?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(QwenHybridLayerwiseModel {
-        execution: load_layerwise_model(
-            store,
-            adapter,
-            LayerWeightResidency::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    })
 }
 
 /// Loads a Qwen3.5 dense or MoE checkpoint through the generalized tensor-parallel engine.
@@ -1192,7 +1152,6 @@ pub fn load_qwen35_tensor_parallel_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1216,11 +1175,6 @@ pub fn load_qwen35_tensor_parallel_model(
         }
         return Ok(model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let (args, _, _, vision) = resident::get_qwen3_5_model_args(model_dir)?;
     if vision.is_some() {
         return Err(Error::Parallel("the token-only Qwen3.5 TP loader does not accept a vision tower; use the multimodal execution-group loader".into()));
@@ -1284,9 +1238,12 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
     } else {
         QwenHybridFamily::Qwen35
     };
+    let gguf_variant = qwen_hybrid_gguf_variant(&prepared.args, is_next);
     let store = qwen_hybrid_gguf_store(
         checkpoint,
         mmproj,
+        &prepared.args,
+        gguf_variant,
         prepared.modalities.vision_config.as_ref(),
         options.max_mapped_shards(),
     )?;
@@ -1339,9 +1296,12 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     } else {
         QwenHybridFamily::Qwen35
     };
+    let gguf_variant = qwen_hybrid_gguf_variant(&args, is_next);
     let store = qwen_hybrid_gguf_store(
         checkpoint,
         mmproj,
+        &args,
+        gguf_variant,
         modalities.vision_config.as_ref(),
         residency.max_mapped_shards(),
     )?;
@@ -1387,13 +1347,18 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
 pub(crate) fn qwen_hybrid_gguf_store(
     checkpoint: &GgufCheckpoint,
     mmproj: Option<&resident::Qwen35MmprojGguf>,
+    args: &resident::ModelArgs,
+    variant: super::checkpoint::GgufVariant,
     vision_config: Option<&VisionConfig>,
     max_mapped_shards: usize,
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let text_plan = super::checkpoint::gguf_plan(args, checkpoint, variant)
+        .map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
         .add_checkpoint(
             checkpoint.clone(),
+            &text_plan,
             resident::qwen35_translate_gguf_weight_name,
         )?;
     if let Some(mmproj) = mmproj {
@@ -1404,17 +1369,35 @@ pub(crate) fn qwen_hybrid_gguf_store(
                 )
             })?
             .deepstack_layers();
-        builder = builder.add_checkpoint(mmproj.checkpoint.clone(), move |name| {
-            let translated = crate::architectures::qwen::vl::model::translate_qwen3_vl_mmproj_name(
-                name, &deepstack,
-            );
-            translated
-                .strip_prefix("model.")
-                .unwrap_or(&translated)
-                .to_string()
-        })?;
+        let vision = vision_config.expect("vision geometry checked above");
+        let projector_plan = super::checkpoint::projector_gguf_plan(vision, args.hidden_size)
+            .map_err(Error::UnsupportedArchitecture)?;
+        builder =
+            builder.add_checkpoint(mmproj.checkpoint.clone(), &projector_plan, move |name| {
+                let translated =
+                    crate::architectures::qwen::vl::model::translate_qwen3_vl_mmproj_name(
+                        name, &deepstack,
+                    );
+                translated
+                    .strip_prefix("model.")
+                    .unwrap_or(&translated)
+                    .to_string()
+            })?;
     }
     Ok(Arc::new(builder.build()?))
+}
+
+fn qwen_hybrid_gguf_variant(
+    args: &resident::ModelArgs,
+    is_next: bool,
+) -> super::checkpoint::GgufVariant {
+    if is_next {
+        super::checkpoint::GgufVariant::Qwen3Next
+    } else if args.num_experts > 0 {
+        super::checkpoint::GgufVariant::Qwen35Moe
+    } else {
+        super::checkpoint::GgufVariant::Qwen35
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1483,12 +1466,6 @@ pub fn load_qwen3_next_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3Next,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -1523,12 +1500,6 @@ pub fn load_qwen35_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let (args, image_token_id, video_token_id, vision) =
         resident::get_qwen3_5_model_args(model_dir)?;
     if !args.is_moe() {
@@ -1687,6 +1658,7 @@ fn load_qwen_hybrid_layerwise_model(
     args: ModelArgs,
     family: QwenHybridFamily,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1698,6 +1670,7 @@ fn load_qwen_hybrid_layerwise_model(
         None,
         None,
         options,
+        quantization,
         stream,
         weights_stream,
     )
@@ -1712,9 +1685,18 @@ fn load_qwen_hybrid_layerwise_model_with_vision(
     video_token_id: Option<i32>,
     vision_config: Option<VisionConfig>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
+    let options = options.into();
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Qwen hybrid", args.quantization, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = QwenHybridLayerwiseAdapter::new(
         args,
         family,
@@ -1723,11 +1705,13 @@ fn load_qwen_hybrid_layerwise_model_with_vision(
         vision_config,
         stream,
     )?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(QwenHybridLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
+        execution: load_layerwise_model_with_quantization(
+            store,
             adapter,
             options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -3305,6 +3289,18 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        let variant = match self.family {
+            QwenHybridFamily::Qwen3Next => super::checkpoint::SafetensorsVariant::Qwen3Next,
+            QwenHybridFamily::Qwen35 => super::checkpoint::SafetensorsVariant::Qwen35,
+        };
+        super::checkpoint::safetensors_plan(&self.args, self.vision_config.as_ref(), variant)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
@@ -4963,10 +4959,11 @@ mod tests {
         };
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
         let mut layerwise = if next {
-            load_qwen3_next_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream())
+            load_qwen3_next_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
                 .unwrap()
         } else {
-            load_qwen35_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap()
+            load_qwen35_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
+                .unwrap()
         };
         let mut resident_cache = resident.new_cache();
         let mut layerwise_cache = Cache {
@@ -5266,6 +5263,7 @@ mod tests {
         let mut layerwise = load_qwen35_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )

@@ -63,8 +63,7 @@ use crate::{
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
@@ -261,6 +260,10 @@ impl LayerwiseDecoder {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Runs a rank-local tensor-parallel forward pass through the generalized
@@ -730,34 +733,7 @@ impl CausalLm<Vec<Option<PagedKeyValueCache>>> for LayerwiseDecoder {
 pub fn load_safetensors(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    let model_dir = model_dir.as_ref();
-    let options = options.into();
-    let residency = options.weight_residency();
-    let args = resident::load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
-        args.model_kind(),
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
-    let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
-    Ok(LayerwiseDecoder {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn load_safetensors_quantized_residency(
-    model_dir: impl AsRef<Path>,
-    options: impl Into<LayerWeightResidency>,
-    quantization: WeightQuantization,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -765,46 +741,20 @@ pub(crate) fn load_safetensors_quantized_residency(
     let options = options.into();
     let args = resident::load_config(model_dir)?;
     let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
-    if !should_quantize_on_load(
-        "dense Qwen residency",
-        args.weight_quantization(),
-        quantization,
-    )? {
-        return Ok(LayerwiseDecoder {
-            execution: load_layerwise_model(
-                store,
-                DenseQwenLayerwiseAdapter::new(args, stream)?,
-                options,
-                stream,
-                weights_stream,
-            )?,
-        });
-    }
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("dense Qwen", args.weight_quantization(), requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let source_adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_layerwise_model_with_quantization(
             store,
             source_adapter,
             options,
-            Some(quantization),
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    let adapter = DenseQwenLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(LayerwiseDecoder {
-        execution: load_layerwise_model(
-            store,
-            adapter,
-            LayerWeightResidency::FullyResident,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -822,7 +772,6 @@ pub fn load_tensor_parallel_model(
 ) -> Result<LayerwiseDecoder, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -854,11 +803,6 @@ pub fn load_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     let args = resident::load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
-        args.model_kind(),
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_tensor_parallel_layerwise_model(
@@ -887,9 +831,17 @@ pub(crate) fn load_gguf_tensor_parallel_model(
     let is_moe = architecture == "qwen3moe";
     let (args, eos_token_ids) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
+    let variant = match architecture {
+        "qwen2" => super::checkpoint::GgufVariant::Qwen2,
+        "qwen3moe" => super::checkpoint::GgufVariant::Qwen3Moe,
+        _ => super::checkpoint::GgufVariant::Qwen3,
+    };
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&args, variant).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             move |name| resident::translate_gguf_weight_name(name, is_moe),
             options.max_mapped_shards(),
         )?);
@@ -916,9 +868,17 @@ pub(crate) fn load_gguf_checkpoint(
     let is_moe = architecture == "qwen3moe";
     let (args, eos_token_ids) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
+    let variant = match architecture {
+        "qwen2" => super::checkpoint::GgufVariant::Qwen2,
+        "qwen3moe" => super::checkpoint::GgufVariant::Qwen3Moe,
+        _ => super::checkpoint::GgufVariant::Qwen3,
+    };
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&args, variant).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             |name| resident::translate_gguf_weight_name(name, is_moe),
             residency.max_mapped_shards(),
         )?);
@@ -1367,6 +1327,14 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
@@ -2879,6 +2847,7 @@ mod tests {
         let mut layerwise = load_safetensors(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -3030,6 +2999,7 @@ mod tests {
         let mut model = load_safetensors(
             dir.path(),
             LayerWeightResidency::FullyResident,
+            None,
             execution.stream(),
             weights.stream(),
         )
@@ -3093,6 +3063,7 @@ mod tests {
         let fully_resident = load_safetensors(
             dir.path(),
             LayerWeightResidency::FullyResident,
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -3100,6 +3071,7 @@ mod tests {
         let layerwise = load_safetensors(
             dir.path(),
             LayerwiseLoadOptions::default(),
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -3374,26 +3346,26 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        let mut complete = load_safetensors_quantized_residency(
+        let mut complete = load_safetensors(
             dir.path(),
             crate::LayerWeightResidency::FullyResident,
-            quantization,
+            Some(quantization),
             gpu.stream(),
             cpu.stream(),
         )
         .unwrap();
-        let mut streamed = load_safetensors_quantized_residency(
+        let mut streamed = load_safetensors(
             dir.path(),
             dense,
-            quantization,
+            Some(quantization),
             gpu.stream(),
             cpu.stream(),
         )
         .unwrap();
-        let mut layerwise = load_safetensors_quantized_residency(
+        let mut layerwise = load_safetensors(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            quantization,
+            Some(quantization),
             gpu.stream(),
             cpu.stream(),
         )
@@ -3487,10 +3459,12 @@ mod tests {
             1,
         )
         .unwrap();
-        let loaded = load_safetensors_quantized_residency(
+        let loaded = load_safetensors(
             dir.path(),
             dense,
-            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
+            Some(WeightQuantization::Affine(
+                AffineQuantization::new(32, 4).unwrap(),
+            )),
             gpu.stream(),
             cpu.stream(),
         )

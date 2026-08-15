@@ -59,8 +59,7 @@ use crate::{
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
@@ -423,6 +422,10 @@ impl Lfm2LayerwiseModel {
         self.execution.checkpoint_store()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Runs the hybrid decoder while preserving recurrent and KV state.
     pub fn forward(
         &mut self,
@@ -540,42 +543,28 @@ impl CausalLm<Cache> for Lfm2LayerwiseModel {
 pub fn load_lfm2_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Lfm2,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("LFM2", args.weight_quantization, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = Lfm2LayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(Lfm2LayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_lfm2_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Lfm2LayerwiseModel, Error> {
-    let adapter = Lfm2LayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(Lfm2LayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -592,7 +581,6 @@ pub fn load_lfm2_tensor_parallel_model(
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -609,11 +597,6 @@ pub fn load_lfm2_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Lfm2,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     Ok(Lfm2LayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
@@ -639,9 +622,12 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
     )?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let is_moe = prepared.args.model_type == "lfm2_moe";
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             move |name| resident::translate_gguf_weight_name(name, is_moe),
             options.max_mapped_shards(),
         )?);
@@ -667,9 +653,11 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let args = prepared.args;
     let is_moe = args.model_type == "lfm2_moe";
+    let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             |name| resident::translate_gguf_weight_name(name, is_moe),
             residency.max_mapped_shards(),
         )?);
@@ -1064,6 +1052,14 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args, true)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
@@ -2197,6 +2193,7 @@ mod tests {
         let mut model = load_lfm2_layerwise_model(
             directory.path(),
             options,
+            None,
             execution.stream(),
             weights.stream(),
         )
@@ -2525,7 +2522,8 @@ mod tests {
             ))
         };
         let mut layerwise =
-            load_lfm2_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
+            load_lfm2_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
+                .unwrap();
         if dense_stream {
             let report = layerwise.dense_stream_report().unwrap().unwrap();
             assert!(report

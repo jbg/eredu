@@ -33,7 +33,7 @@ use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters},
     nn,
-    ops::{quantized_packed_dimension, stack_axis, tanh, GgufCheckpoint, GgufMetadataValue},
+    ops::{tanh, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
@@ -85,9 +85,7 @@ use crate::{
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
     runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
-    runtime::checkpoint::quantization::{
-        quantize_tensor, should_quantize_on_load, WeightQuantization,
-    },
+    runtime::checkpoint::quantization::{should_quantize_on_load, WeightQuantization},
     runtime::checkpoint::store::{GgufWeightStore, WeightStore, WeightStoreDiagnostics},
     runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
     runtime::distributed::expert::{
@@ -100,9 +98,9 @@ use crate::{
     runtime::distributed::topology::{ParallelCoordinates, ParallelTopology},
     runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
-        open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
-        ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
-        ExecutionGroupReadySet, LayerWeightResidency, LayerwiseLoadOptions,
+        open_safetensors_weight_store, quantize_pipeline_stage_store, resolve_checkpoint_store,
+        shard_layer_bindings, ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController,
+        DenseTransferWindow, ExecutionGroupReadySet, LayerWeightResidency, LayerwiseLoadOptions,
         LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection, SharedWeightStore,
         StaticUnitBindings,
     },
@@ -8606,120 +8604,6 @@ fn validate_hidden_metadata(
     Ok(())
 }
 
-fn checkpoint_name(parameter_name: &str) -> String {
-    crate::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name)
-}
-
-pub(crate) fn assign_module(
-    module: &mut impl ModuleParameters,
-    prefix: &str,
-    tensors: &mut HashMap<String, Array>,
-    quantize_on_load: Option<WeightQuantization>,
-    stream: &Stream,
-) -> Result<(), Error> {
-    assign_module_excluding(module, prefix, tensors, quantize_on_load, stream, |_| false)
-}
-
-pub(crate) fn assign_module_excluding<F>(
-    module: &mut impl ModuleParameters,
-    prefix: &str,
-    tensors: &mut HashMap<String, Array>,
-    quantize_on_load: Option<WeightQuantization>,
-    stream: &Stream,
-    excluded: F,
-) -> Result<(), Error>
-where
-    F: Fn(&str) -> bool,
-{
-    let mut params = module.parameters_mut().flatten();
-    let destinations = params
-        .iter()
-        .map(|(name, value)| {
-            let name = if prefix.is_empty() {
-                name.to_string()
-            } else {
-                format!("{prefix}.{name}")
-            };
-            (name, value.shape().to_vec())
-        })
-        .filter(|(name, _)| !excluded(name))
-        .collect::<HashMap<_, _>>();
-    let mut loaded = HashMap::new();
-
-    for destination in destinations.keys() {
-        let source = checkpoint_name(destination);
-        if loaded.contains_key(destination) {
-            continue;
-        }
-        let tensor_key = if tensors.contains_key(destination) {
-            destination.as_str()
-        } else {
-            source.as_str()
-        };
-        let Some(value) = tensors.remove(tensor_key) else {
-            continue;
-        };
-        if destinations[destination] == value.shape() {
-            loaded.insert(destination.clone(), value);
-            continue;
-        }
-        let Some(quantization) = quantize_on_load.filter(|_| source.ends_with(".weight")) else {
-            return Err(Error::Parallel(format!(
-                "pipeline tensor {source} has shape {:?}, expected {:?}",
-                value.shape(),
-                destinations[destination]
-            )));
-        };
-        let quantized = quantize_tensor(&value, quantization, stream)?;
-        synchronize_outputs(
-            [&quantized.weight, &quantized.scales]
-                .into_iter()
-                .chain(quantized.biases.as_ref()),
-        )?;
-        loaded.insert(destination.clone(), quantized.weight);
-        let base = destination
-            .strip_suffix(".inner.weight")
-            .or_else(|| destination.strip_suffix(".weight"))
-            .expect("quantized destination weight");
-        loaded.insert(format!("{base}.scales"), quantized.scales);
-        if let Some(biases) = quantized.biases {
-            loaded.insert(format!("{base}.biases"), biases);
-        }
-    }
-
-    let mut missing = Vec::new();
-    for (local_name, parameter) in &mut params {
-        let destination = if prefix.is_empty() {
-            local_name.to_string()
-        } else {
-            format!("{prefix}.{local_name}")
-        };
-        if excluded(&destination) {
-            continue;
-        } else if let Some(value) = loaded.remove(&destination) {
-            if parameter.shape() != value.shape() {
-                return Err(Error::Parallel(format!(
-                    "pipeline tensor {destination} has shape {:?}, expected {:?}",
-                    value.shape(),
-                    parameter.shape()
-                )));
-            }
-            **parameter = value;
-        } else {
-            missing.push(destination);
-        }
-    }
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        missing.sort();
-        Err(Error::StrictLoadValidation {
-            missing,
-            unused: Vec::new(),
-        })
-    }
-}
-
 fn load_bound_module(
     module: &mut (impl ModuleParameters + ?Sized),
     store: &dyn WeightStore,
@@ -8959,6 +8843,19 @@ where
     ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error>,
 {
     let layer_count = range.len();
+    let strict_loading = match options {
+        PipelineLayerLoadOptions::LayerwiseHost(options) => options.strict_loading,
+        PipelineLayerLoadOptions::DenseDiskStream(options) => options.strict_loading,
+    };
+    if strict_loading {
+        let unused = store.unclaimed_checkpoint_keys();
+        if !unused.is_empty() {
+            return Err(Error::StrictLoadValidation {
+                missing: Vec::new(),
+                unused,
+            });
+        }
+    }
     let device_depth = match options {
         PipelineLayerLoadOptions::LayerwiseHost(options) => options.offload.prefetch_depth(),
         PipelineLayerLoadOptions::DenseDiskStream(options) => {
@@ -9321,9 +9218,13 @@ pub fn load_pipeline_model_with_options(
         return match architecture {
             crate::api::GgufArchitecture::DeepSeek4 => {
                 let prepared = deepseek_v4::prepare_gguf_checkpoint(&checkpoint, &metadata)?;
+                let gguf_plan =
+                    crate::architectures::deepseek_v4::checkpoint::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
+                        &gguf_plan,
                         deepseek_v4::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -9345,9 +9246,12 @@ pub fn load_pipeline_model_with_options(
                     None,
                     weights_stream,
                 )?;
+                let gguf_plan = crate::architectures::llama::checkpoint::gguf_plan(&prepared.args)
+                    .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
+                        &gguf_plan,
                         llama::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -9389,9 +9293,13 @@ pub fn load_pipeline_model_with_options(
                     None,
                     weights_stream,
                 )?;
+                let gguf_plan =
+                    crate::architectures::deepseek_v3::checkpoint::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
+                        &gguf_plan,
                         deepseek_v3::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -9417,6 +9325,9 @@ pub fn load_pipeline_model_with_options(
                 let store = crate::architectures::gemma4::layerwise::gemma4_gguf_store(
                     &checkpoint,
                     mmproj.as_ref(),
+                    &prepared.args,
+                    prepared.vision_config.as_ref(),
+                    prepared.audio_config.as_ref(),
                     max_mapped_shards,
                 )?;
                 load_gemma_pipeline(
@@ -9448,9 +9359,22 @@ pub fn load_pipeline_model_with_options(
                     architecture_name,
                     is_moe,
                 )?;
+                let variant = match architecture {
+                    crate::api::GgufArchitecture::Qwen2 => {
+                        crate::architectures::qwen::dense::checkpoint::GgufVariant::Qwen2
+                    }
+                    crate::api::GgufArchitecture::Qwen3Moe => {
+                        crate::architectures::qwen::dense::checkpoint::GgufVariant::Qwen3Moe
+                    }
+                    _ => crate::architectures::qwen::dense::checkpoint::GgufVariant::Qwen3,
+                };
+                let gguf_plan =
+                    crate::architectures::qwen::dense::checkpoint::gguf_plan(&args, variant)
+                        .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
+                        &gguf_plan,
                         move |name| dense_qwen::translate_gguf_weight_name(name, is_moe),
                         max_mapped_shards,
                     )?);
@@ -9496,9 +9420,13 @@ pub fn load_pipeline_model_with_options(
             crate::api::GgufArchitecture::GptOss => {
                 let prepared =
                     gpt_oss::prepare_gguf_checkpoint(&checkpoint, &metadata, weights_stream)?;
+                let gguf_plan =
+                    crate::architectures::gpt_oss::checkpoint::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
+                        &gguf_plan,
                         gpt_oss::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -9518,9 +9446,12 @@ pub fn load_pipeline_model_with_options(
                 let prepared =
                     lfm2::prepare_gguf_checkpoint(&checkpoint, &metadata, weights_stream)?;
                 let is_moe = architecture == crate::api::GgufArchitecture::Lfm2Moe;
+                let gguf_plan = crate::architectures::lfm2::checkpoint::gguf_plan(&prepared.args)
+                    .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
+                        &gguf_plan,
                         move |name| lfm2::translate_gguf_weight_name(name, is_moe),
                         max_mapped_shards,
                     )?);
@@ -9542,9 +9473,13 @@ pub fn load_pipeline_model_with_options(
                     &metadata,
                     weights_stream,
                 )?;
+                let gguf_plan =
+                    crate::architectures::nemotron_h::checkpoint::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
+                        &gguf_plan,
                         nemotron_h::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -9574,9 +9509,20 @@ pub fn load_pipeline_model_with_options(
                     mmproj.as_ref(),
                     weights_stream,
                 )?;
+                let variant = match architecture {
+                    crate::api::GgufArchitecture::Qwen3Next => {
+                        crate::architectures::qwen::hybrid::checkpoint::GgufVariant::Qwen3Next
+                    }
+                    crate::api::GgufArchitecture::Qwen35Moe => {
+                        crate::architectures::qwen::hybrid::checkpoint::GgufVariant::Qwen35Moe
+                    }
+                    _ => crate::architectures::qwen::hybrid::checkpoint::GgufVariant::Qwen35,
+                };
                 let store = crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_gguf_store(
                     &checkpoint,
                     mmproj.as_ref(),
+                    &prepared.args,
+                    variant,
                     prepared.modalities.vision_config.as_ref(),
                     max_mapped_shards,
                 )?;
@@ -9601,9 +9547,13 @@ pub fn load_pipeline_model_with_options(
                     options.quantization,
                     weights_stream,
                 )?;
+                let gguf_plan =
+                    crate::architectures::kimi_linear::checkpoint::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
+                        &gguf_plan,
                         kimi_linear::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
@@ -9628,6 +9578,7 @@ pub fn load_pipeline_model_with_options(
                 let store = crate::architectures::inkling::layerwise::inkling_gguf_store(
                     &checkpoint,
                     mmproj.as_ref(),
+                    &prepared.args,
                     max_mapped_shards,
                 )?;
                 load_inkling_pipeline(
@@ -9777,11 +9728,6 @@ pub fn load_pipeline_model_with_options(
     let store = open_safetensors_weight_store(model_dir, max_mapped_shards)?;
     match model_type {
         Some("llama" | "mistral") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::Llama,
-                model_dir,
-                options,
-            )?;
             load_llama_pipeline(
                 llama::get_llama_model_args(model_dir)?,
                 store,
@@ -9793,11 +9739,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("deepseek_v3") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::DeepSeekV3,
-                model_dir,
-                options,
-            )?;
             load_deepseek_pipeline(
                 deepseek_v3::get_model_args(model_dir)?,
                 store,
@@ -9810,11 +9751,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("deepseek_v4") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::DeepSeekV4,
-                model_dir,
-                options,
-            )?;
             load_deepseek_v4_pipeline(
                 deepseek_v4::get_model_args(model_dir)?,
                 store,
@@ -9827,11 +9763,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::Gemma4,
-                model_dir,
-                options,
-            )?;
             let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
                 gemma4::get_gemma4_model_config(model_dir)?;
             load_gemma_pipeline(
@@ -9854,11 +9785,6 @@ pub fn load_pipeline_model_with_options(
         }
         Some("qwen2" | "qwen3" | "qwen3_moe") => {
             let args = dense_qwen::load_config(model_dir)?;
-            crate::api::structural::validate_safetensors_load_path(
-                args.model_kind(),
-                model_dir,
-                options,
-            )?;
             load_dense_qwen_pipeline(
                 args,
                 store,
@@ -9877,11 +9803,6 @@ pub fn load_pipeline_model_with_options(
                 ));
             }
             let args = muse_glimmer::load_config(model_dir)?;
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::MuseGlimmer,
-                model_dir,
-                options,
-            )?;
             load_muse_glimmer_pipeline(
                 args,
                 store,
@@ -9894,12 +9815,6 @@ pub fn load_pipeline_model_with_options(
         }
         Some("qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text") => {
             let args = qwen3_vl::get_qwen3_vl_model_args(model_dir)?;
-            let kind = if args.text_config.is_moe() {
-                ModelKind::Qwen3VlMoe
-            } else {
-                ModelKind::Qwen3Vl
-            };
-            crate::api::structural::validate_safetensors_load_path(kind, model_dir, options)?;
             load_qwen3_vl_pipeline(
                 args,
                 store,
@@ -9912,11 +9827,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("gpt_oss") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::GptOss,
-                model_dir,
-                options,
-            )?;
             load_gpt_oss_pipeline(
                 gpt_oss::get_model_args(model_dir)?,
                 store,
@@ -9929,11 +9839,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("lfm2" | "lfm2_moe") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::Lfm2,
-                model_dir,
-                options,
-            )?;
             load_lfm2_pipeline(
                 lfm2::get_model_args(model_dir)?,
                 store,
@@ -9946,11 +9851,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("nemotron_h") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::NemotronH,
-                model_dir,
-                options,
-            )?;
             load_nemotron_h_pipeline(
                 nemotron_h::get_nemotron_h_model_args(model_dir)?,
                 store,
@@ -9963,11 +9863,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("qwen3_next") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::Qwen3Next,
-                model_dir,
-                options,
-            )?;
             load_qwen_hybrid_pipeline(
                 crate::architectures::qwen::hybrid::qwen3_next::get_qwen3_next_model_args(
                     model_dir,
@@ -9985,11 +9880,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::Qwen35,
-                model_dir,
-                options,
-            )?;
             let (args, image_token, video_token, vision) =
                 qwen_hybrid::get_qwen3_5_model_args(model_dir)?;
             load_qwen_hybrid_pipeline(
@@ -10007,11 +9897,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("kimi_linear") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::KimiLinear,
-                model_dir,
-                options,
-            )?;
             load_kimi_linear_pipeline(
                 kimi_linear::get_model_args(model_dir)?,
                 store,
@@ -10024,11 +9909,6 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("inkling_mm_model") => {
-            crate::api::structural::validate_safetensors_load_path(
-                ModelKind::Inkling,
-                model_dir,
-                options,
-            )?;
             let args = inkling::get_model_args(model_dir)?;
             load_inkling_pipeline(
                 args,
@@ -10111,6 +9991,7 @@ fn load_llama_pipeline(
         source_args.clone(),
         stream,
     )?;
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let mut stage = LlamaStage::new(target_args.clone(), range, &info, stream)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
@@ -11447,6 +11328,7 @@ fn load_dense_qwen_pipeline(
     } else {
         dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new(source_args.clone(), stream)?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.attention_schedule.len()),
@@ -11813,6 +11695,7 @@ fn load_muse_glimmer_pipeline(
         ));
     }
     let binding_adapter = MuseGlimmerLayerwiseAdapter::new(source_args.clone(), stream)?;
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     topology.preflight(Some(source_args.num_hidden_layers as usize), None)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
@@ -12150,6 +12033,7 @@ fn load_qwen3_vl_pipeline(
     } else {
         Qwen3VlLayerwiseAdapter::new(source_args.clone(), stream)?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.text_config.num_hidden_layers as usize),
@@ -13962,6 +13846,7 @@ fn load_gpt_oss_pipeline(
             stream,
         )?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.attention_schedule.len()),
@@ -14922,6 +14807,7 @@ fn load_lfm2_pipeline(
     } else {
         Lfm2LayerwiseAdapter::new(source_args.clone(), stream)?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.layer_schedule.len()),
@@ -16436,6 +16322,7 @@ fn load_nemotron_h_pipeline(
     } else {
         NemotronHLayerwiseAdapter::new(source_args.clone(), stream)?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.num_hidden_layers as usize),
@@ -17737,6 +17624,7 @@ fn load_qwen_hybrid_pipeline(
     } else {
         QwenHybridLayerwiseAdapter::new_text(source_args.clone(), stream)?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.num_hidden_layers as usize),
@@ -19292,6 +19180,7 @@ fn load_kimi_linear_pipeline(
     } else {
         KimiLinearLayerwiseAdapter::new(source_args.clone(), stream)?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.num_hidden_layers as usize),
@@ -20380,6 +20269,7 @@ fn load_inkling_pipeline(
     } else {
         InklingLayerwiseAdapter::new(args.clone(), stream)?
     };
+    let store = resolve_checkpoint_store(store, &source_binding_adapter)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -21913,6 +21803,7 @@ fn load_gemma_pipeline(
             stream,
         )?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.layer_schedule.len()),
@@ -23543,6 +23434,7 @@ fn load_deepseek_pipeline(
             stream,
         )?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.layer_schedule.len()),
@@ -23936,6 +23828,7 @@ fn load_deepseek_v4_pipeline(
     } else {
         DeepSeekV4LayerwiseAdapter::new(source_args.clone(), stream)?
     };
+    let store = resolve_checkpoint_store(store, &binding_adapter)?;
     let target_args = match quantize_on_load {
         Some(quantization) => source_args.with_load_time_quantization(quantization)?,
         None => source_args.clone(),
@@ -24344,144 +24237,6 @@ impl DeepSeekStage {
             PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
         };
         Ok(output)
-    }
-}
-
-pub(crate) fn load_deepseek_experts(
-    moe: &mut deepseek_v3::Moe,
-    layer: usize,
-    dimensions: (i32, i32, i32),
-    tensors: &mut HashMap<String, Array>,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-) -> Result<(), Error> {
-    let (num_experts, hidden_size, intermediate_size) = dimensions;
-    for projection in ["gate_proj", "up_proj", "down_proj"] {
-        let take_component = |component: &str,
-                              tensors: &mut HashMap<String, Array>|
-         -> Result<Option<Array>, Error> {
-            let mut values = Vec::with_capacity(num_experts as usize);
-            for expert in 0..num_experts {
-                let name =
-                    format!("model.layers.{layer}.mlp.experts.{expert}.{projection}.{component}");
-                match tensors.remove(&name) {
-                    Some(value) => values.push(value),
-                    None if expert == 0 => return Ok(None),
-                    None => {
-                        return Err(Error::StrictLoadValidation {
-                            missing: vec![name],
-                            unused: Vec::new(),
-                        })
-                    }
-                }
-            }
-            let refs = values.iter().collect::<Vec<_>>();
-            Ok(Some(stack_axis(&refs, 0, stream)?))
-        };
-        let weight =
-            take_component("weight", tensors)?.ok_or_else(|| Error::StrictLoadValidation {
-                missing: vec![format!(
-                    "model.layers.{layer}.mlp.experts.0.{projection}.weight"
-                )],
-                unused: Vec::new(),
-            })?;
-        let mut fp8_scale = take_component("weight_scale_inv", tensors)?;
-        let mut scales = take_component("scales", tensors)?;
-        let mut biases = take_component("biases", tensors)?;
-        let experts = &mut moe.experts;
-        let (output_dims, input_dims, affine) = match projection {
-            "gate_proj" => (intermediate_size, hidden_size, experts.gate_affine),
-            "up_proj" => (intermediate_size, hidden_size, experts.up_affine),
-            "down_proj" => (hidden_size, intermediate_size, experts.down_affine),
-            _ => unreachable!(),
-        };
-        let source_affine = quantization.is_none().then_some(affine).flatten();
-        let stored_input_dims = source_affine.map_or(input_dims, |quantization| {
-            quantized_packed_dimension(input_dims, quantization.bits())
-        });
-        validate_expert_bank_shape(
-            layer,
-            projection,
-            "weight",
-            &weight,
-            &[num_experts, output_dims, stored_input_dims],
-        )?;
-        if let Some(scale) = &fp8_scale {
-            validate_expert_bank_shape(
-                layer,
-                projection,
-                "weight_scale_inv",
-                scale,
-                &[
-                    num_experts,
-                    (output_dims + 127) / 128,
-                    (input_dims + 127) / 128,
-                ],
-            )?;
-        }
-        if let Some(affine) = source_affine {
-            let expected = [num_experts, output_dims, input_dims / affine.group_size()];
-            if let Some(value) = &scales {
-                validate_expert_bank_shape(layer, projection, "scales", value, &expected)?;
-            }
-            if let Some(value) = &biases {
-                validate_expert_bank_shape(layer, projection, "biases", value, &expected)?;
-            }
-        }
-        let weight = if let Some(quantization) = quantization {
-            let quantized = crate::nn::moe::quantize_expert_bank(&weight, quantization, stream)?;
-            scales = Some(quantized.scales);
-            biases = quantized.biases;
-            quantized.weight
-        } else {
-            weight
-        };
-        synchronize_outputs(
-            [&weight]
-                .into_iter()
-                .chain(fp8_scale.as_ref())
-                .chain(scales.as_ref())
-                .chain(biases.as_ref()),
-        )?;
-        match projection {
-            "gate_proj" => {
-                experts.gate_proj = safemlx::module::Param::new(Some(weight));
-                experts.gate_proj_scale_inv = safemlx::module::Param::new(fp8_scale.take());
-                experts.gate_proj_scales = safemlx::module::Param::new(scales.take());
-                experts.gate_proj_biases = safemlx::module::Param::new(biases.take());
-            }
-            "up_proj" => {
-                experts.up_proj = safemlx::module::Param::new(Some(weight));
-                experts.up_proj_scale_inv = safemlx::module::Param::new(fp8_scale.take());
-                experts.up_proj_scales = safemlx::module::Param::new(scales.take());
-                experts.up_proj_biases = safemlx::module::Param::new(biases.take());
-            }
-            "down_proj" => {
-                experts.down_proj = safemlx::module::Param::new(Some(weight));
-                experts.down_proj_scale_inv = safemlx::module::Param::new(fp8_scale.take());
-                experts.down_proj_scales = safemlx::module::Param::new(scales.take());
-                experts.down_proj_biases = safemlx::module::Param::new(biases.take());
-            }
-            _ => unreachable!(),
-        }
-    }
-    Ok(())
-}
-
-fn validate_expert_bank_shape(
-    layer: usize,
-    projection: &str,
-    component: &str,
-    value: &Array,
-    expected: &[i32],
-) -> Result<(), Error> {
-    if value.shape() == expected {
-        Ok(())
-    } else {
-        Err(Error::Parallel(format!(
-            "DeepSeek pipeline layer {layer} expert {projection}.{component} bank has shape {:?}, expected {expected:?}",
-            value.shape()
-        )))
     }
 }
 
@@ -26916,9 +26671,15 @@ mod tests {
         let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let (gguf_dense_args, _) =
             dense_qwen::prepare_gguf_checkpoint(&checkpoint, &metadata, "qwen3", false).unwrap();
+        let dense_plan = crate::architectures::qwen::dense::checkpoint::gguf_plan(
+            &gguf_dense_args,
+            crate::architectures::qwen::dense::checkpoint::GgufVariant::Qwen3,
+        )
+        .unwrap();
         let dense_store: SharedWeightStore = Arc::new(
             GgufWeightStore::new_with_max_mapped_shards(
                 checkpoint,
+                &dense_plan,
                 |name| dense_qwen::translate_gguf_weight_name(name, false),
                 1,
             )
@@ -26958,9 +26719,15 @@ mod tests {
         let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let (gguf_moe_args, _) =
             dense_qwen::prepare_gguf_checkpoint(&checkpoint, &metadata, "qwen3moe", true).unwrap();
+        let moe_plan = crate::architectures::qwen::dense::checkpoint::gguf_plan(
+            &gguf_moe_args,
+            crate::architectures::qwen::dense::checkpoint::GgufVariant::Qwen3Moe,
+        )
+        .unwrap();
         let moe_store: SharedWeightStore = Arc::new(
             GgufWeightStore::new_with_max_mapped_shards(
                 checkpoint,
+                &moe_plan,
                 |name| dense_qwen::translate_gguf_weight_name(name, true),
                 1,
             )

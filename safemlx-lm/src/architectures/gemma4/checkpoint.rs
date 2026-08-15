@@ -1108,7 +1108,7 @@ pub(crate) fn validate_mmproj_gguf(
     validation::validate_gguf_plan(&mmproj.checkpoint, &plan)
 }
 
-fn mmproj_plan(
+pub(crate) fn mmproj_plan(
     args: &ModelArgs,
     vision: Option<&Gemma4VisionConfig>,
     audio: Option<&Gemma4AudioConfig>,

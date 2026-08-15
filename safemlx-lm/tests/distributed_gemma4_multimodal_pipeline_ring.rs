@@ -22,9 +22,8 @@ use safemlx_lm::{
             load_pipeline_model_with_options, PipelineInferencePhase, PipelineInferenceScheduler,
             PipelineMicrobatchInput, PipelineStep,
         },
-        gemma4::model::{self as gemma4, Cache, Model},
+        gemma4::model::Model,
     },
-    nn::generation::CausalLm,
     runtime::{
         media::{
             input::{InputMetadata, InputPart, ModelInput},
@@ -590,7 +589,7 @@ fn typed_input<'a>(
 fn gemma4_gguf_mmproj_rejects_wrong_identity_before_materialization() {
     let directory = tempfile::tempdir().unwrap();
     let model_path = write_gguf_fixture(directory.path());
-    let projector_path = directory.path().join("wrong-projector.gguf");
+    let projector_path = directory.path().join("mmproj-gemma4-f32.gguf");
     let stream = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let array = Array::zeros::<f32>(&[1], stream.stream()).unwrap();
     let mut metadata = projector_metadata();
@@ -603,13 +602,9 @@ fn gemma4_gguf_mmproj_rejects_wrong_identity_before_materialization() {
         &HashMap::from([("dummy".into(), array)]),
         metadata,
     );
-    let error = gemma4::load_gemma4_gguf_with_mmproj(
-        model_path,
-        projector_path,
-        stream.stream(),
-        stream.stream(),
-    )
-    .unwrap_err();
+    let error = safemlx_lm::api::load_model(model_path, stream.stream(), stream.stream())
+        .err()
+        .expect("wrong projector identity must fail");
     assert!(error.to_string().contains("projector type \"gemma4\""));
 }
 
@@ -617,7 +612,7 @@ fn gemma4_gguf_mmproj_rejects_wrong_identity_before_materialization() {
 fn gemma4_gguf_mmproj_rejects_incomplete_catalog_before_materialization() {
     let directory = tempfile::tempdir().unwrap();
     let model_path = write_gguf_fixture(directory.path());
-    let projector_path = directory.path().join("incomplete-projector.gguf");
+    let projector_path = directory.path().join("mmproj-gemma4-f32.gguf");
     let stream = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let array = Array::zeros::<f32>(&[1], stream.stream()).unwrap();
     write_dense_gguf(
@@ -625,13 +620,9 @@ fn gemma4_gguf_mmproj_rejects_incomplete_catalog_before_materialization() {
         &HashMap::from([("vision_tower.unexpected".into(), array)]),
         projector_metadata(),
     );
-    let error = gemma4::load_gemma4_gguf_with_mmproj(
-        model_path,
-        projector_path,
-        stream.stream(),
-        stream.stream(),
-    )
-    .unwrap_err();
+    let error = safemlx_lm::api::load_model(model_path, stream.stream(), stream.stream())
+        .err()
+        .expect("incomplete projector must fail");
     let detail = error.to_string();
     assert!(
         detail.contains("missing") || detail.contains("Missing"),
@@ -803,17 +794,13 @@ fn gemma4_multimodal_pipeline_ring_worker() {
     let mut cache = scheduler.release_request_cache(request).unwrap();
     assert_eq!(logits.is_some(), topology.pipeline_parallel_rank == 1);
 
-    let mut resident_cache = Cache::default();
-    let mut resident = (topology.pipeline_parallel_rank == 1).then(|| {
-        if checkpoint.extension().is_some_and(|value| value == "gguf") {
-            gemma4::load_gemma4_gguf(&checkpoint, &stream, &stream).unwrap()
-        } else {
-            gemma4::load_gemma4_model(&checkpoint, &stream, &stream).unwrap()
-        }
-    });
+    let mut resident_cache = None;
+    let mut resident = (topology.pipeline_parallel_rank == 1)
+        .then(|| safemlx_lm::api::load_model(&checkpoint, &stream, &stream).unwrap());
     if let (Some(logits), Some(resident)) = (&logits, &mut resident) {
+        let cache = resident_cache.get_or_insert_with(|| resident.new_cache());
         let expected = resident
-            .prefill_input_logits(input, &mut resident_cache, &stream)
+            .prefill_input_with_cache(input, cache, &stream)
             .unwrap();
         assert_close(logits, &expected, &stream);
     }
@@ -912,8 +899,13 @@ fn gemma4_multimodal_pipeline_ring_worker() {
         _ => panic!("prompt-cache reload changed Gemma 4 pipeline output ownership"),
     }
     if let (Some(decoded), Some(resident)) = (&decoded, &mut resident) {
+        let parts = [InputPart::text_token_ids(&token)];
         let expected = resident
-            .decode_logits(&token, &mut resident_cache, &stream)
+            .prefill_input_with_cache(
+                ModelInput::new(&parts),
+                resident_cache.as_mut().expect("resident cache initialized"),
+                &stream,
+            )
             .unwrap();
         assert_close(decoded, &expected, &stream);
     }

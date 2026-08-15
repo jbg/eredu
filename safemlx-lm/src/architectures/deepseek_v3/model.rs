@@ -30,6 +30,8 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::nn as common;
+#[cfg(test)]
+use crate::runtime::checkpoint::load::gguf_metadata;
 use crate::{
     api::{
         input as runtime_input,
@@ -58,9 +60,8 @@ use crate::{
         BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock,
     },
     runtime::checkpoint::load::{
-        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs,
-        load_array_quantized_strict, load_array_strict, safetensors_files, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
+        for_each_safetensor_array, gguf_quantization_configs, load_array_quantized_strict,
+        load_array_strict, safetensors_files, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
@@ -3074,14 +3075,6 @@ impl Model {
         Cache::new_with_options(&self.args.layer_schedule, policy)
     }
 
-    pub(crate) fn new_cache_with_manager(
-        &self,
-        manager: CacheResidencyManager,
-        rank: Option<CacheRankIdentity>,
-    ) -> Result<Cache, Exception> {
-        Cache::new_with_manager(&self.args.layer_schedule, manager, rank)
-    }
-
     /// Lazily catalogs a compatible persisted compressed prefix.
     pub fn load_prompt_cache(
         &self,
@@ -3162,113 +3155,6 @@ impl Model {
     ) -> Result<Array, Exception> {
         let mut observer: ObserverOption<'_> = Some(observer);
         self.forward_logits_impl(input, false, stream, &mut observer)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_expert_parallel(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Cache,
-        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
-        group: &safemlx::distributed::Group,
-        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
-        mut observer: ObserverOption<'_>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let mut hidden = self.model.embed_tokens.forward(inputs, stream)?;
-        let offset = cache.offset();
-        let generated_mask = if mask.is_none() && hidden.dim(1) > 1 && offset > 0 {
-            Some(create_causal_mask(
-                hidden.dim(1),
-                Some(offset),
-                None,
-                None,
-                stream,
-            )?)
-        } else {
-            None
-        };
-        let mask = mask.or(generated_mask.as_ref());
-        if cache.layers.len() != self.model.layers.len() {
-            return Err(Exception::custom(
-                "DeepSeek EP cache layer count does not match model",
-            ));
-        }
-        for (index, (layer, layer_cache)) in self
-            .model
-            .layers
-            .iter_mut()
-            .zip(&mut cache.layers)
-            .enumerate()
-        {
-            let layer_observer = observer
-                .as_mut()
-                .map(|observer| &mut **observer as &mut dyn ActivationObserver);
-            hidden = layer.forward_expert_parallel(
-                &hidden,
-                mask,
-                Some(layer_cache),
-                assignment,
-                group,
-                statistics,
-                &format!("model.layers.{index}"),
-                layer_observer,
-                stream,
-            )?;
-        }
-        hidden = self.model.norm.forward(&hidden, stream)?;
-        self.lm_head.forward(&hidden, stream)
-    }
-
-    /// Runs pure expert parallelism with externally supplied cache-backed experts.
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Cache,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut hidden = self.model.embed_tokens.forward(inputs, stream)?;
-        let offset = cache.offset();
-        let generated_mask = if mask.is_none() && hidden.dim(1) > 1 && offset > 0 {
-            Some(create_causal_mask(
-                hidden.dim(1),
-                Some(offset),
-                None,
-                None,
-                stream,
-            )?)
-        } else {
-            None
-        };
-        let mask = mask.or(generated_mask.as_ref());
-        if cache.layers.len() != self.model.layers.len() {
-            return Err(Exception::custom(
-                "DeepSeek EP cache layer count does not match model",
-            ));
-        }
-        for (index, (layer, layer_cache)) in self
-            .model
-            .layers
-            .iter_mut()
-            .zip(&mut cache.layers)
-            .enumerate()
-        {
-            hidden = layer.forward_sparse_experts(
-                &hidden,
-                mask,
-                Some(layer_cache),
-                stream,
-                |flat, indices, weights, stream| execute(index, flat, indices, weights, stream),
-            )?;
-        }
-        hidden = self.model.norm.forward(&hidden, stream)?;
-        self.lm_head.forward(&hidden, stream)
     }
 }
 
@@ -3833,9 +3719,9 @@ pub fn load_model_quantized(
     load_model_impl(model_dir, args, Some(quantization), stream, weights_stream)
 }
 
+#[cfg(test)]
 pub(crate) struct LoadedDeepSeekGguf {
     pub(crate) model: Model,
-    pub(crate) eos_token_ids: Vec<u32>,
 }
 
 pub(crate) struct PreparedDeepSeekGguf {
@@ -3844,6 +3730,7 @@ pub(crate) struct PreparedDeepSeekGguf {
 }
 
 /// Loads a llama.cpp `deepseek2` GGUF checkpoint.
+#[cfg(test)]
 pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -3854,6 +3741,7 @@ pub fn load_gguf(
     Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
@@ -3936,10 +3824,7 @@ pub(crate) fn load_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    Ok(LoadedDeepSeekGguf {
-        model,
-        eos_token_ids: prepared.eos_token_ids,
-    })
+    Ok(LoadedDeepSeekGguf { model })
 }
 
 pub(crate) fn prepare_gguf_checkpoint(
@@ -4870,6 +4755,7 @@ mod tests {
             crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
                 &directory,
                 crate::LayerWeightResidency::FullyResident,
+                None,
                 stream,
                 weights.stream(),
             )

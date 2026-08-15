@@ -35,10 +35,7 @@ use safemlx_lm::{
             layerwise::{load_lfm2_tensor_parallel_model, Lfm2LayerwiseModel},
             model::{self as lfm2_model, Cache as Lfm2Cache},
         },
-        llama::{
-            layerwise::{load_llama_tensor_parallel_model, LlamaCache, LlamaModel},
-            model as llama_model,
-        },
+        llama::layerwise::{load_llama_tensor_parallel_model, LlamaCache, LlamaModel},
         nemotron_h::{
             layerwise::{load_nemotron_h_tensor_parallel_model, NemotronHLayerwiseModel},
             model::{self as nemotron_model, Cache as NemotronCache},
@@ -51,7 +48,6 @@ use safemlx_lm::{
             },
         },
     },
-    nn::generation::CausalLm,
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::canonical_checkpoint_name,
     runtime::generation::sampler::DefaultSampler,
@@ -1082,27 +1078,18 @@ fn tensor_ring_worker() {
     assert_eq!(logits.shape(), &[1, 2, vocab_size as i32]);
 
     if family.is_deepseek() {
-        let mut reference = match family {
-            FixtureFamily::DeepSeekSafetensors => {
-                deepseek_v3::load_model(&checkpoint, &stream, &stream).unwrap()
-            }
-            FixtureFamily::DeepSeekGguf => {
-                deepseek_v3::load_gguf(&checkpoint, &stream, &stream).unwrap()
-            }
-            _ => unreachable!(),
-        };
+        let mut reference = safemlx_lm::api::load_model(&checkpoint, &stream, &stream).unwrap();
         let mut reference_cache = reference.new_cache();
+        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
-            .forward(
-                deepseek_v3::ModelInput {
-                    inputs: &prompt,
-                    mask: None,
-                    cache: Some(&mut reference_cache),
-                },
+            .prefill_input_with_cache(
+                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                &mut reference_cache,
                 &stream,
             )
             .unwrap();
-        assert_arrays_close(&logits, &reference_logits, 8e-5);
+        let distributed_last = logits.try_index_device((.., -1, ..), &stream).unwrap();
+        assert_arrays_close(&distributed_last, &reference_logits, 8e-5);
         if family == FixtureFamily::DeepSeekGguf {
             let diagnostics = model.checkpoint_diagnostics();
             assert!(diagnostics.physical_reads > 0);
@@ -1116,19 +1103,11 @@ fn tensor_ring_worker() {
     }
 
     if family.is_nemotron() {
-        let mut reference = match family {
-            FixtureFamily::NemotronSafetensors => {
-                nemotron_model::load_nemotron_h_model(&checkpoint, &stream, &stream).unwrap()
-            }
-            FixtureFamily::NemotronGguf => {
-                nemotron_model::load_nemotron_h_gguf(&checkpoint, &stream, &stream).unwrap()
-            }
-            _ => unreachable!(),
-        };
+        let mut reference = safemlx_lm::api::load_model(&checkpoint, &stream, &stream).unwrap();
         let mut reference_cache = reference.new_cache();
         let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
-            .prefill_input_logits(
+            .prefill_input_with_cache(
                 safemlx_lm::runtime::media::input::ModelInput::new(&parts),
                 &mut reference_cache,
                 &stream,
@@ -1187,19 +1166,11 @@ fn tensor_ring_worker() {
     }
 
     if family.is_gpt_oss() {
-        let mut reference = match family {
-            FixtureFamily::GptOssSafetensors => {
-                gpt_oss_model::load_model(&checkpoint, &stream, &stream).unwrap()
-            }
-            FixtureFamily::GptOssGguf => {
-                gpt_oss_model::load_gguf(&checkpoint, &stream, &stream).unwrap()
-            }
-            _ => unreachable!(),
-        };
+        let mut reference = safemlx_lm::api::load_model(&checkpoint, &stream, &stream).unwrap();
         let mut reference_cache = reference.new_cache();
         let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
-            .prefill_input_logits(
+            .prefill_input_with_cache(
                 safemlx_lm::runtime::media::input::ModelInput::new(&parts),
                 &mut reference_cache,
                 &stream,
@@ -1211,19 +1182,11 @@ fn tensor_ring_worker() {
     }
 
     if family.is_lfm2() {
-        let mut reference = match family {
-            FixtureFamily::Lfm2Safetensors => {
-                lfm2_model::load_model(&checkpoint, &stream, &stream).unwrap()
-            }
-            FixtureFamily::Lfm2Gguf | FixtureFamily::Lfm2Q8Gguf => {
-                lfm2_model::load_gguf(&checkpoint, &stream, &stream).unwrap()
-            }
-            _ => unreachable!(),
-        };
+        let mut reference = safemlx_lm::api::load_model(&checkpoint, &stream, &stream).unwrap();
         let mut reference_cache = reference.new_cache();
         let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
-            .prefill_input_logits(
+            .prefill_input_with_cache(
                 safemlx_lm::runtime::media::input::ModelInput::new(&parts),
                 &mut reference_cache,
                 &stream,
@@ -1255,27 +1218,18 @@ fn tensor_ring_worker() {
     }
 
     if family.is_kimi_linear() {
-        let mut reference = match family {
-            FixtureFamily::KimiLinearSafetensors => {
-                kimi_model::load_model(&checkpoint, &stream, &stream).unwrap()
-            }
-            FixtureFamily::KimiLinearGguf => {
-                kimi_model::load_gguf(&checkpoint, &stream, &stream).unwrap()
-            }
-            _ => unreachable!(),
-        };
+        let mut reference = safemlx_lm::api::load_model(&checkpoint, &stream, &stream).unwrap();
         let mut reference_cache = reference.new_cache();
+        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
-            .forward(
-                kimi_model::ModelInput {
-                    inputs: &prompt,
-                    mask: None,
-                    cache: Some(&mut reference_cache),
-                },
+            .prefill_input_with_cache(
+                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                &mut reference_cache,
                 &stream,
             )
             .unwrap();
-        assert_arrays_close(&logits, &reference_logits, 8e-5);
+        let distributed_last = logits.try_index_device((.., -1, ..), &stream).unwrap();
+        assert_arrays_close(&distributed_last, &reference_logits, 8e-5);
         cache.assert_kimi_local_cache_geometry(if expected_rank == 0 { 2 } else { 1 }, 2);
         if family == FixtureFamily::KimiLinearGguf {
             let diagnostics = model.checkpoint_diagnostics();
@@ -1293,39 +1247,28 @@ fn tensor_ring_worker() {
         family,
         FixtureFamily::LlamaSafetensors | FixtureFamily::LlamaGguf
     ) {
-        let mut reference = match family {
-            FixtureFamily::LlamaSafetensors => {
-                llama_model::load_resident_llama_model(&checkpoint, &stream, &stream).unwrap()
-            }
-            FixtureFamily::LlamaGguf => {
-                llama_model::load_llama_gguf(&checkpoint, &stream, &stream).unwrap()
-            }
-            _ => unreachable!(),
-        };
+        let mut reference = safemlx_lm::api::load_model(&checkpoint, &stream, &stream).unwrap();
         let mut reference_cache = reference.new_cache();
+        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
-            .forward(
-                llama_model::ModelInput {
-                    inputs: &prompt,
-                    mask: None,
-                    cache: &mut reference_cache,
-                },
+            .prefill_input_with_cache(
+                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                &mut reference_cache,
                 &stream,
             )
             .unwrap();
-        assert_arrays_close(&logits, &reference_logits, 5e-5);
+        let distributed_last = logits.try_index_device((.., -1, ..), &stream).unwrap();
+        assert_arrays_close(&distributed_last, &reference_logits, 5e-5);
     }
 
     if family.is_qwen2() {
-        let mut reference = dense_qwen::load_gguf(&checkpoint, &stream, &stream).unwrap();
+        let mut reference = safemlx_lm::api::load_model(&checkpoint, &stream, &stream).unwrap();
         let mut reference_cache = reference.new_cache();
+        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
-            .forward(
-                dense_qwen::ModelInput {
-                    inputs: &prompt,
-                    mask: None,
-                    cache: &mut reference_cache,
-                },
+            .prefill_input_with_cache(
+                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                &mut reference_cache,
                 &stream,
             )
             .unwrap();
@@ -1334,7 +1277,8 @@ fn tensor_ring_worker() {
         } else {
             5e-5
         };
-        assert_arrays_close(&logits, &reference_logits, tolerance);
+        let distributed_last = logits.try_index_device((.., -1, ..), &stream).unwrap();
+        assert_arrays_close(&distributed_last, &reference_logits, tolerance);
         let local_kv_heads = if family == FixtureFamily::Qwen2Gguf {
             if expected_rank == 0 {
                 2
@@ -1356,15 +1300,14 @@ fn tensor_ring_worker() {
         );
 
         let zero_bias_checkpoint = PathBuf::from(std::env::var_os(ZERO_BIAS_CHECKPOINT).unwrap());
-        let mut zero_bias = dense_qwen::load_gguf(zero_bias_checkpoint, &stream, &stream).unwrap();
+        let mut zero_bias =
+            safemlx_lm::api::load_model(zero_bias_checkpoint, &stream, &stream).unwrap();
         let mut zero_bias_cache = zero_bias.new_cache();
+        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let zero_bias_logits = zero_bias
-            .forward(
-                dense_qwen::ModelInput {
-                    inputs: &prompt,
-                    mask: None,
-                    cache: &mut zero_bias_cache,
-                },
+            .prefill_input_with_cache(
+                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                &mut zero_bias_cache,
                 &stream,
             )
             .unwrap();
@@ -1372,13 +1315,11 @@ fn tensor_ring_worker() {
 
         let token = Array::from_slice(&[3u32], &[1, 1]);
         let distributed_decode = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
+        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&token)];
         let reference_decode = reference
-            .forward(
-                dense_qwen::ModelInput {
-                    inputs: &token,
-                    mask: None,
-                    cache: &mut reference_cache,
-                },
+            .prefill_input_with_cache(
+                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                &mut reference_cache,
                 &stream,
             )
             .unwrap();

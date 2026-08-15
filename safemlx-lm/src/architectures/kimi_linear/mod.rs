@@ -8,7 +8,6 @@ pub use layerwise::{
     load_kimi_linear_expert_cache_model, load_kimi_linear_layerwise_model,
     Generate as LayerwiseGenerate, KimiLinearLayerwiseModel,
 };
-pub use model::{
-    load_gguf, load_model, load_model_quantized, load_tokenizer, Cache, Generate, Model, ModelArgs,
-    ModelInput,
-};
+#[cfg(test)]
+pub use model::{load_gguf, load_model, load_model_quantized};
+pub use model::{load_tokenizer, Cache, Generate, Model, ModelArgs, ModelInput};

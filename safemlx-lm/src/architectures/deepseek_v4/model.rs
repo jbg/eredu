@@ -16,7 +16,7 @@ use serde_json::Value;
 use safemlx::{
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, ModuleParametersExt},
+    module::Module,
     nn,
     ops::{
         broadcast_to, concatenate_axis, indexing::NewAxis, indexing::TryIndexOp, mean_axis,
@@ -46,13 +46,17 @@ use crate::{
         PromptCacheTopology, StateTensorDimension, StateTensorDtype, StateTensorPolicy,
         StateTensorRole,
     },
-    runtime::checkpoint::load::{
-        gguf_quantization_configs,
-        load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadConfig,
-        StrictLoadReport,
-    },
+    runtime::checkpoint::load::gguf_quantization_configs,
     runtime::checkpoint::quantization::WeightQuantization,
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{
+    load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadConfig,
+    StrictLoadReport,
+};
+#[cfg(test)]
+use safemlx::module::ModuleParametersExt;
 
 use super::{
     attention::{Attention, AttentionCache},
@@ -2220,6 +2224,7 @@ fn gguf_uniform_f32_array(
 }
 
 /// Loads an official dense or mixed FP4/FP8 V4 SafeTensors checkpoint.
+#[cfg(test)]
 pub fn load_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -2251,6 +2256,7 @@ pub fn load_model(
     Ok(model)
 }
 
+#[cfg(test)]
 fn transform_checkpoint_tensor(
     args: &ModelArgs,
     mut key: String,

@@ -56,10 +56,13 @@ use crate::{
     },
     runtime::checkpoint::load::{
         for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
-        load_named_array_strict, safetensors_files, StrictLoadConfig, StrictLoadReport,
+        safetensors_files, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::load_named_array_strict;
 
 fn default_model_type() -> String {
     "inkling_mm_model".into()
@@ -2749,37 +2752,6 @@ impl TextModel {
         }
         self.norm.forward(&hidden, stream)
     }
-
-    fn forward_with_expert_executor<F>(
-        &mut self,
-        tokens: &Array,
-        cache: &mut Cache,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut hidden = self.embed(tokens, stream)?;
-        for (index, (layer, layer_cache)) in self
-            .layers
-            .iter_mut()
-            .zip(cache.layers.iter_mut())
-            .enumerate()
-        {
-            hidden = if layer.moe.is_some() {
-                layer.forward_with_expert_executor(
-                    &hidden,
-                    Some(layer_cache),
-                    stream,
-                    |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
-                )?
-            } else {
-                layer.forward(&hidden, Some(layer_cache), stream)?
-            };
-        }
-        self.norm.forward(&hidden, stream)
-    }
 }
 
 /// Applies Inkling's authoritative post-decoder output policy around a caller-
@@ -3533,14 +3505,6 @@ impl Model {
         Ok((cache, manifest))
     }
 
-    pub(crate) fn new_paged_cache_with_manager(
-        &self,
-        manager: CacheResidencyManager,
-        rank: Option<CacheRankIdentity>,
-    ) -> Result<Cache, Exception> {
-        Cache::new_paged_with_manager(&self.args.text_config, manager, rank)
-    }
-
     pub(crate) fn forward_logits(
         &mut self,
         tokens: &Array,
@@ -3559,28 +3523,6 @@ impl Model {
             &hidden,
             &self.args.text_config,
             last_token_only,
-            stream,
-            |hidden, stream| self.lm_head.forward(hidden, stream),
-        )
-    }
-
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        tokens: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let hidden = self
-            .model
-            .forward_with_expert_executor(tokens, cache, execute, stream)?;
-        project_text_logits(
-            &hidden,
-            &self.args.text_config,
-            false,
             stream,
             |hidden, stream| self.lm_head.forward(hidden, stream),
         )
@@ -3673,6 +3615,7 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
+#[cfg(test)]
 pub(crate) struct LoadedInklingGguf {
     pub(crate) model: Model,
 }
@@ -3703,6 +3646,7 @@ pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<InklingMmpr
 }
 
 /// Loads an `inkling` GGUF and its optional sibling multimodal projector.
+#[cfg(test)]
 pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -3723,6 +3667,7 @@ pub fn load_gguf(
 }
 
 /// Loads an Inkling text GGUF with an explicit combined audio/vision mmproj.
+#[cfg(test)]
 pub fn load_gguf_with_mmproj(
     gguf_file: impl AsRef<Path>,
     mmproj_file: impl AsRef<Path>,
@@ -3747,6 +3692,7 @@ pub fn load_gguf_with_mmproj(
     .model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_gguf_checkpoint_with_mmproj(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
@@ -3876,6 +3822,7 @@ pub(crate) fn load_gguf_checkpoint_with_mmproj(
     Ok(LoadedInklingGguf { model })
 }
 
+#[cfg(test)]
 fn paired_inkling_gguf_component<'a, T>(
     gate: Option<&'a T>,
     up: Option<&'a T>,
@@ -5441,6 +5388,7 @@ mod tests {
         };
         let mut args = super::args_from_gguf_catalog(&tiny_gguf_metadata()).unwrap();
         super::apply_mmproj_args(&mut args, &tiny_gguf_metadata(), &mmproj).unwrap();
+        let store_args = args.clone();
         assert_eq!(args.audio_token_id, 62);
         assert_eq!(args.image_token_id, 63);
         let audio = args.audio_config.unwrap();
@@ -5519,20 +5467,23 @@ mod tests {
         audio_report.finish(&audio_model, &config).unwrap();
         vision_report.finish(&vision_layer, &config).unwrap();
 
-        let store = crate::architectures::inkling::layerwise::inkling_gguf_store(
+        let error = match crate::architectures::inkling::layerwise::inkling_gguf_store(
             &checkpoint,
             Some(&mmproj),
+            &store_args,
             2,
-        )
-        .unwrap();
-        let keys = store.keys();
-        for expected in [
-            "model.embed_tokens.weight",
-            "audio.encoder.weight",
-            "visual.layers.0.projection.weight",
-        ] {
-            assert!(keys.iter().any(|key| key == expected), "missing {expected}");
-        }
+        ) {
+            Ok(_) => panic!("incomplete Inkling text checkpoint must fail its contract"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            crate::error::Error::WeightStore(
+                crate::runtime::checkpoint::store::WeightStoreError::Gguf {
+                message,
+                ..
+            }) if message.contains("Inkling GGUF") && message.contains("MissingTensor")
+        ));
     }
 
     #[test]

@@ -49,9 +49,8 @@ use crate::{
         },
         execution::layerwise::{
             load_layerwise_model, load_layerwise_model_with_quantization,
-            load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-            open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
-            LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
+            load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+            ArchitectureAdapter, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
             LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
         },
         residency::{
@@ -490,6 +489,10 @@ impl KimiLinearLayerwiseModel {
         self.execution.checkpoint_store()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Returns current weight-residency telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
@@ -647,43 +650,29 @@ impl CausalLm<Cache> for KimiLinearLayerwiseModel {
 pub fn load_kimi_linear_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::KimiLinear,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Kimi Linear", args.quantization, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = KimiLinearLayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(KimiLinearLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_kimi_linear_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<KimiLinearLayerwiseModel, Error> {
-    let adapter = KimiLinearLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(KimiLinearLayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -700,7 +689,6 @@ pub fn load_kimi_linear_tensor_parallel_model(
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -717,11 +705,6 @@ pub fn load_kimi_linear_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::KimiLinear,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     Ok(KimiLinearLayerwiseModel {
@@ -748,9 +731,12 @@ pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
         checkpoint, metadata, options,
     )?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -778,9 +764,11 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
 ) -> Result<(KimiLinearLayerwiseModel, Vec<u32>), Error> {
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let args = prepared.args;
+    let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -823,12 +811,6 @@ pub fn load_kimi_linear_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::KimiLinear,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let quantize_on_load = quantization
@@ -1190,6 +1172,14 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn prompt_cache_model_identity(
@@ -2615,6 +2605,7 @@ mod tests {
         let fully_resident = load_kimi_linear_layerwise_model(
             directory.path(),
             LayerWeightResidency::FullyResident,
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -2622,6 +2613,7 @@ mod tests {
         let layerwise = load_kimi_linear_layerwise_model(
             directory.path(),
             LayerwiseLoadOptions::default(),
+            None,
             gpu.stream(),
             cpu.stream(),
         )

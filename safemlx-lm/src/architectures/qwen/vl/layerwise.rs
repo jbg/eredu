@@ -61,8 +61,7 @@ use crate::{
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
@@ -224,6 +223,10 @@ impl Qwen3VlLayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Runs typed multimodal prefill through vision and text execution groups.
@@ -430,47 +433,32 @@ impl CausalLm<Cache> for Qwen3VlLayerwiseModel {
 pub fn load_qwen3_vl_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
-    let residency = options.weight_residency();
-    let kind = if args.text_config.is_moe() {
-        crate::api::ModelKind::Qwen3VlMoe
-    } else {
-        crate::api::ModelKind::Qwen3Vl
-    };
-    crate::api::structural::validate_safetensors_load_path(
-        kind,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Qwen3-VL",
+                args.text_config.weight_quantization(),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(Qwen3VlLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_qwen3_vl_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Qwen3VlLayerwiseModel, Error> {
-    let adapter = Qwen3VlLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(Qwen3VlLayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -508,17 +496,6 @@ pub fn load_qwen3_vl_tensor_parallel_layerwise_model(
         .map(|(model, _)| model);
     }
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
-    let residency = options.weight_residency();
-    let kind = if args.text_config.is_moe() {
-        crate::api::ModelKind::Qwen3VlMoe
-    } else {
-        crate::api::ModelKind::Qwen3Vl
-    };
-    crate::api::structural::validate_safetensors_load_path(
-        kind,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     Ok(Qwen3VlLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
@@ -673,17 +650,28 @@ pub(crate) fn qwen3_vl_gguf_store(
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
     let deepstack = args.vision_config.deepstack_layers();
     let is_moe = args.text_config.is_moe();
+    let text_variant = if is_moe {
+        crate::architectures::qwen::dense::checkpoint::GgufVariant::Qwen3Moe
+    } else {
+        crate::architectures::qwen::dense::checkpoint::GgufVariant::Qwen3
+    };
+    let text_plan =
+        crate::architectures::qwen::dense::checkpoint::gguf_plan(&args.text_config, text_variant)
+            .map_err(Error::UnsupportedArchitecture)?;
+    let vision_plan =
+        super::checkpoint::projector_gguf_plan(&args.vision_config, args.text_config.hidden_size)
+            .map_err(Error::UnsupportedArchitecture)?;
     Ok(Arc::new(
         GgufWeightStore::builder()
             .max_cached_readers(max_mapped_shards)?
-            .add_checkpoint(checkpoint.clone(), move |name| {
+            .add_checkpoint(checkpoint.clone(), &text_plan, move |name| {
                 let name =
                     crate::architectures::qwen::dense::translate_gguf_weight_name(name, is_moe);
                 name.strip_prefix("model.")
                     .map(|name| format!("model.language_model.{name}"))
                     .unwrap_or(name)
             })?
-            .add_checkpoint(vision_checkpoint.clone(), move |name| {
+            .add_checkpoint(vision_checkpoint.clone(), &vision_plan, move |name| {
                 resident::translate_qwen3_vl_mmproj_name(name, &deepstack)
             })?
             .build()?,
@@ -700,12 +688,6 @@ pub fn load_qwen3_vl_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3VlMoe,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
     if !args.text_config.is_moe() {
         return Err(Error::UnsupportedArchitecture(
@@ -1512,6 +1494,14 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         } else {
             "qwen3_vl"
         }
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args, true)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
@@ -2609,6 +2599,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::execution::layerwise::transformed_module_weight_store;
     use std::{fs, path::Path};
 
     use safemlx::{
@@ -2905,7 +2896,8 @@ mod tests {
             ))
         };
         let mut layerwise =
-            load_qwen3_vl_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
+            load_qwen3_vl_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
+                .unwrap();
         let graph = layerwise.execution.execution_graph();
         assert_eq!(
             graph

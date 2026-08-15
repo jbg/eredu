@@ -11,7 +11,7 @@ use safemlx::{
     ops::{
         arange, clip, gather_grouped_rows, gather_qmm_with_mode,
         indexing::{IntoStrideBy, TryIndexOp},
-        sigmoid, stack_axis, topk_route_plan, GgufCheckpoint, GgufMetadataValue, QuantizationMode,
+        sigmoid, topk_route_plan, GgufCheckpoint, GgufMetadataValue, QuantizationMode,
     },
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
@@ -34,9 +34,8 @@ use crate::{
         PromptCacheManifest, PromptCacheModelIdentity,
     },
     runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
-        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
+        gguf_quantization_configs, load_safetensors_dir_quantized_strict,
+        load_safetensors_dir_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::{
@@ -44,6 +43,13 @@ use crate::{
         cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     },
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::gguf_metadata;
+#[cfg(test)]
+use crate::runtime::checkpoint::load::load_named_array_strict;
+#[cfg(test)]
+use safemlx::ops::stack_axis;
 
 fn default_head_dim() -> i32 {
     64
@@ -1444,42 +1450,6 @@ impl GptOssModel {
         self.norm.forward(&hidden, stream)
     }
 
-    pub(crate) fn forward_with_expert_executor<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        if cache.layers.is_empty() {
-            *cache = self.new_cache();
-        }
-        self.validate_cache(cache)?;
-        let mut hidden = self.embed_tokens.forward(inputs, stream)?;
-        let length = hidden.dim(1);
-        for (index, ((layer, layer_cache), policy)) in self
-            .layers
-            .iter_mut()
-            .zip(cache.layers.iter_mut())
-            .zip(self.attention_schedule.iter())
-            .enumerate()
-        {
-            let offset = layer_cache.offset();
-            let mask = attention_mask(policy, length, offset, stream)?;
-            hidden = layer.forward_with_expert_executor(
-                &hidden,
-                mask.as_ref(),
-                layer_cache,
-                stream,
-                |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
-            )?;
-        }
-        self.norm.forward(&hidden, stream)
-    }
-
     fn validate_cache(&self, cache: &Cache) -> Result<(), Exception> {
         if cache.layers.len() != self.attention_schedule.len() {
             return Err(Exception::custom(format!(
@@ -1604,22 +1574,6 @@ impl Model {
         let hidden = self.model.forward(inputs, cache, stream)?;
         self.lm_head.forward(&hidden, stream)
     }
-
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let hidden = self
-            .model
-            .forward_with_expert_executor(inputs, cache, execute, stream)?;
-        self.lm_head.forward(&hidden, stream)
-    }
 }
 
 impl CausalLm<Cache> for Model {
@@ -1649,9 +1603,9 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
+#[cfg(test)]
 pub(crate) struct LoadedGptOssGguf {
     pub(crate) model: Model,
-    pub(crate) eos_token_ids: Vec<u32>,
 }
 
 pub(crate) struct PreparedGptOssGguf {
@@ -1660,6 +1614,7 @@ pub(crate) struct PreparedGptOssGguf {
 }
 
 /// Loads a canonical llama.cpp `gpt-oss` GGUF checkpoint.
+#[cfg(test)]
 pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -1670,6 +1625,7 @@ pub fn load_gguf(
     Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
@@ -1802,10 +1758,7 @@ pub(crate) fn load_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    Ok(LoadedGptOssGguf {
-        model,
-        eos_token_ids: prepared.eos_token_ids,
-    })
+    Ok(LoadedGptOssGguf { model })
 }
 
 pub(crate) fn prepare_gguf_checkpoint(

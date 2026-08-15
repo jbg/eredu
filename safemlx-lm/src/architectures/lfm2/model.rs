@@ -8,7 +8,7 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt, Param},
+    module::{Module, Param},
     nn,
     ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
@@ -56,13 +56,19 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
-        load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
-    },
+    runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
     runtime::checkpoint::quantization::WeightQuantization,
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{
+    gguf_metadata, load_named_array_strict, StrictLoadConfig, StrictLoadReport,
+};
+#[cfg(test)]
+use safemlx::module::ModuleParametersExt;
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::load_safetensors_dir_strict_with_split_swiglu_experts_and_transform;
 
 fn default_true() -> bool {
     true
@@ -506,6 +512,7 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
     )
 }
 
+#[cfg(test)]
 pub(crate) fn prompt_cache_layer_layout(
     args: &ModelArgs,
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
@@ -1889,50 +1896,6 @@ impl Lfm2Model {
         }
         self.embedding_norm.forward(&h, stream)
     }
-
-    fn forward_with_expert_executor<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut h = self.embed_tokens.forward(inputs, stream)?;
-        let offset = cache.offset();
-        let mask = if h.dim(1) > 1 {
-            match create_attention_mask(&h, &offset_cache(offset), Some(true), stream)? {
-                Some(AttentionMask::Array(mask)) => Some(mask),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("LFM2 requires an array causal mask"));
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        for (index, (layer, layer_cache)) in self
-            .layers
-            .iter_mut()
-            .zip(cache.layers.iter_mut())
-            .enumerate()
-        {
-            h = if layer.layer_policy.feed_forward == FeedForwardPolicy::SparseMoe {
-                layer.forward_with_expert_executor(
-                    &h,
-                    mask.as_ref(),
-                    Some(layer_cache),
-                    stream,
-                    |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
-                )?
-            } else {
-                layer.forward(&h, mask.as_ref(), Some(layer_cache), stream)?
-            };
-        }
-        self.embedding_norm.forward(&h, stream)
-    }
 }
 
 fn offset_cache(offset: i32) -> Vec<Option<OffsetOnlyCache>> {
@@ -2264,27 +2227,6 @@ impl Model {
             stream,
         )
     }
-
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let hidden = self
-            .model
-            .forward_with_expert_executor(inputs, cache, execute, stream)?;
-        project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.model.embed_tokens,
-            &hidden,
-            stream,
-        )
-    }
 }
 
 impl CausalLm<Cache> for Model {
@@ -2319,6 +2261,7 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     model_args_from_config_value(&value)
 }
 
+#[cfg(test)]
 fn transform_safetensors_weight(
     key: String,
     value: Array,
@@ -2340,6 +2283,7 @@ fn transform_safetensors_weight(
 }
 
 /// Loads an LFM2 safetensors checkpoint.
+#[cfg(test)]
 pub fn load_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -2372,6 +2316,7 @@ pub fn load_model(
 }
 
 /// Loads an LFM2 checkpoint while quantizing eligible projections.
+#[cfg(test)]
 pub fn load_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
@@ -2419,9 +2364,9 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     )?)
 }
 
+#[cfg(test)]
 pub(crate) struct LoadedLfm2Gguf {
     pub(crate) model: Model,
-    pub(crate) eos_token_ids: Vec<u32>,
 }
 
 pub(crate) struct PreparedLfm2Gguf {
@@ -2430,6 +2375,7 @@ pub(crate) struct PreparedLfm2Gguf {
 }
 
 /// Loads an LFM2 or LFM2-MoE GGUF checkpoint.
+#[cfg(test)]
 pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -2440,6 +2386,7 @@ pub fn load_gguf(
     Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
@@ -2571,11 +2518,7 @@ pub(crate) fn load_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
-    Ok(LoadedLfm2Gguf {
-        model,
-        eos_token_ids,
-    })
+    Ok(LoadedLfm2Gguf { model })
 }
 
 pub(crate) fn prepare_gguf_checkpoint(

@@ -47,17 +47,16 @@ use crate::{
         build_module_binding_plan_with_recipes, populate_module_from_lease,
     },
     runtime::checkpoint::{
-        quantization::WeightQuantization,
+        quantization::{should_quantize_on_load, WeightQuantization},
         store::{GgufWeightStore, WeightStore},
     },
     runtime::distributed::parallel::{register_replicated_module, ParallelPlanBuilder},
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
-        DenseDiskStreamReport, ExecutionResidency, LayerWeightResidency, LayerwiseForwardState,
-        LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter,
-        StaticUnitBindings, WeightResidency,
+        load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
+        ExecutionResidency, LayerWeightResidency, LayerwiseForwardState, LayerwiseLoadOptions,
+        LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings,
+        WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
 };
@@ -71,6 +70,8 @@ const HEAD_UNIT: &str = "llama.static.output";
 pub struct LlamaLoadOptions {
     /// Determines where decoder weights live and how they execute.
     pub weight_residency: WeightResidency,
+    /// Optional load-time conversion applied through the bounded checkpoint overlay.
+    pub quantization: Option<WeightQuantization>,
 }
 
 impl LlamaLoadOptions {
@@ -78,6 +79,7 @@ impl LlamaLoadOptions {
     pub const fn fully_resident() -> Self {
         Self {
             weight_residency: WeightResidency::fully_resident(),
+            quantization: None,
         }
     }
 
@@ -85,6 +87,7 @@ impl LlamaLoadOptions {
     pub const fn layerwise_host(options: LayerwiseLoadOptions) -> Self {
         Self {
             weight_residency: WeightResidency::layerwise_host(options),
+            quantization: None,
         }
     }
 
@@ -94,6 +97,7 @@ impl LlamaLoadOptions {
     ) -> Self {
         Self {
             weight_residency: WeightResidency::dense_disk_stream(options),
+            quantization: None,
         }
     }
 }
@@ -501,11 +505,6 @@ pub fn load_llama_model(
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Llama,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency),
-    )?;
     if options.weight_residency.expert_cache().is_some() {
         return Err(Error::UnsupportedArchitecture(
             "independent expert caching is not supported for Llama checkpoints".into(),
@@ -513,30 +512,22 @@ pub fn load_llama_model(
     }
     let execution_options = options.weight_residency.layers();
     let args = resident::get_llama_model_args(model_dir)?;
+    let quantize_on_load = options
+        .quantization
+        .map(|requested| {
+            should_quantize_on_load("Llama", args.weight_quantization(), requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, execution_options.max_mapped_shards())?;
     Ok(LlamaModel {
-        execution: Box::new(load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            execution_options,
-            stream,
-            weights_stream,
-        )?),
-    })
-}
-
-pub(crate) fn execute_transformed_llama_model(
-    model: resident::ResidentModel,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LlamaModel, Error> {
-    let adapter = LlamaLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(LlamaModel {
-        execution: Box::new(load_layerwise_model(
+        execution: Box::new(load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            execution_options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?),
@@ -553,7 +544,6 @@ pub fn load_llama_tensor_parallel_model(
 ) -> Result<LlamaModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -570,11 +560,6 @@ pub fn load_llama_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Llama,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_llama_model_args(model_dir)?;
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
     Ok(LlamaModel {
@@ -602,9 +587,12 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     )?;
     let prepared =
         resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -636,9 +624,12 @@ pub(crate) fn load_llama_gguf_model(
 ) -> Result<(LlamaModel, Vec<u32>), Error> {
     let prepared =
         resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -804,6 +795,14 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {

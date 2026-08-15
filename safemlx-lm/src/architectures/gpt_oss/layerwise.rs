@@ -49,8 +49,7 @@ use crate::{
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
@@ -255,6 +254,10 @@ impl GptOssLayerwiseModel {
         self.execution.checkpoint_store()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Runs a rank-local tensor-parallel forward pass through the generalized engine.
     pub fn forward_tensor_parallel(
         &mut self,
@@ -392,42 +395,28 @@ impl CausalLm<Cache> for GptOssLayerwiseModel {
 pub fn load_gpt_oss_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("GPT-OSS", args.quantization, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = GptOssLayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(GptOssLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_gpt_oss_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<GptOssLayerwiseModel, Error> {
-    let adapter = GptOssLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(GptOssLayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -444,7 +433,6 @@ pub fn load_gpt_oss_tensor_parallel_model(
 ) -> Result<GptOssLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -461,11 +449,6 @@ pub fn load_gpt_oss_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let adapter = GptOssLayerwiseAdapter::new(resident::get_model_args(model_dir)?, stream)?;
     Ok(GptOssLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
@@ -491,9 +474,12 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
         checkpoint, metadata, options,
     )?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -517,9 +503,12 @@ pub(crate) fn load_gpt_oss_gguf_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<(GptOssLayerwiseModel, Vec<u32>), Error> {
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -600,12 +589,6 @@ pub fn load_gpt_oss_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     let quantize_on_load = quantization
         .map(|requested| {
@@ -967,6 +950,14 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
@@ -2010,7 +2001,8 @@ mod tests {
             ))
         };
         let mut layerwise =
-            load_gpt_oss_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
+            load_gpt_oss_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
+                .unwrap();
         if dense_stream {
             let report = layerwise.dense_stream_report().unwrap().unwrap();
             assert!(report
@@ -2085,7 +2077,8 @@ mod tests {
         let mut expected = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
         let mut delegated =
-            load_gpt_oss_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
+            load_gpt_oss_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
+                .unwrap();
         let mut expected_cache = Cache::default();
         let mut delegated_cache = Cache::default();
 

@@ -22,19 +22,24 @@ use crate::{
     runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes, build_module_bindings, populate_module_from_lease,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{TensorSelection, WeightStore},
+    runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, ArchitectureAdapter, LayerWeightResidency,
+        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
     runtime::residency::manager::{
         ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease, WeightBinding,
     },
 };
+
+#[cfg(test)]
+use crate::runtime::execution::layerwise::{load_layerwise_model, transformed_module_weight_store};
 
 const STATIC_UNIT: &str = "moshi.static";
 
@@ -871,6 +876,7 @@ fn token_position(
 pub fn load_moshi_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -883,6 +889,7 @@ pub fn load_moshi_layerwise_model(
         args,
         CheckpointLayout::Native,
         options,
+        quantization,
         stream,
         weights_stream,
     )
@@ -919,16 +926,12 @@ pub fn load_moshi_tensor_parallel_layerwise_model(
 pub fn load_personaplex_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::PersonaPlex,
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
     let metadata = crate::architectures::moshi::personaplex::get_model_metadata(model_dir)?;
     let mut args = crate::architectures::moshi::personaplex::model_args_7b_v1();
     args.quantization = metadata.quantization;
@@ -937,6 +940,7 @@ pub fn load_personaplex_layerwise_model(
         args,
         CheckpointLayout::Pytorch,
         options,
+        quantization,
         stream,
         weights_stream,
     )
@@ -948,6 +952,7 @@ pub fn load_pytorch_layerwise_model(
     args: ModelArgs,
     checkpoint: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -956,23 +961,22 @@ pub fn load_pytorch_layerwise_model(
         args,
         CheckpointLayout::Pytorch,
         options,
+        quantization,
         stream,
         weights_stream,
     )
 }
 
-/// Hands a completed Moshi/PersonaPlex load-time transformation to the
-/// canonical generalized execution engine.
-pub(crate) fn execute_transformed_model(
+#[cfg(test)]
+pub(crate) fn test_model_from_resident(
     model: resident::Model,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let adapter = MoshiLayerwiseAdapter::new(model.args.clone(), CheckpointLayout::Native, stream)?;
-    let store = transformed_module_weight_store(&model)?;
     Ok(MoshiLayerwiseModel {
         execution: load_layerwise_model(
-            store,
+            transformed_module_weight_store(&model)?,
             adapter,
             LayerWeightResidency::FullyResident,
             stream,
@@ -992,11 +996,6 @@ pub fn load_personaplex_tensor_parallel_layerwise_model(
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::PersonaPlex,
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
     let metadata = crate::architectures::moshi::personaplex::get_model_metadata(model_dir)?;
     let mut args = crate::architectures::moshi::personaplex::model_args_7b_v1();
     args.quantization = metadata.quantization;
@@ -1019,24 +1018,44 @@ fn load_with_layout(
     args: ModelArgs,
     layout: CheckpointLayout,
     options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let source = source.as_ref();
-    if layout == CheckpointLayout::Native {
-        super::checkpoint::validate_safetensors_path(source, &args)?;
-    }
+    let options = options.into();
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Moshi family", args.quantization, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = MoshiLayerwiseAdapter::new(args, layout, stream)?;
+    let store = open_safetensors_weight_store(source, options.max_mapped_shards())?;
     Ok(MoshiLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            source,
+        execution: load_layerwise_model_with_quantization(
+            store,
             adapter,
             options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
         artifact_identity: LoadedArtifactIdentity::in_memory(),
     })
+}
+
+impl LoadTimeQuantizableAdapter for MoshiLayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.quantization = Some(quantization);
+        Self::new(args, self.layout, stream)
+    }
 }
 
 /// Family-specific input for teacher-forced or autoregressive depth execution.
@@ -1174,6 +1193,21 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
     type Cache = MoshiCache;
     type Layer = MoshiExecutionUnit;
     type ForwardContext = MoshiForwardContext;
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        match self.layout {
+            CheckpointLayout::Native => super::checkpoint::safetensors_plan(&self.args)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map(Into::into),
+            CheckpointLayout::Pytorch => {
+                super::personaplex_checkpoint::safetensors_plan(&self.args)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map(Into::into)
+            }
+        }
+    }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
         let bindings = match self.layout {
@@ -2407,6 +2441,7 @@ mod tests {
         let mut layerwise = load_moshi_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -2524,6 +2559,7 @@ mod tests {
         let mut streamed = load_moshi_layerwise_model(
             dir.path(),
             LayerWeightResidency::DenseDiskStream(dense),
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -2633,6 +2669,7 @@ mod tests {
         let resident = load_moshi_layerwise_model(
             dir.path(),
             LayerWeightResidency::FullyResident,
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -2640,6 +2677,7 @@ mod tests {
         let layerwise = load_moshi_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -2679,6 +2717,7 @@ mod tests {
             args,
             CheckpointLayout::Pytorch,
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )

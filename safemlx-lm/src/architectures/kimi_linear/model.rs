@@ -8,11 +8,10 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, ModuleParameters, ModuleParametersExt, Param},
+    module::{Module, ModuleParameters, Param},
     nn,
     ops::{
-        concatenate_axis, exp, indexing::TryIndexOp, mean_axis, rsqrt, sigmoid, GgufCheckpoint,
-        GgufMetadataValue,
+        exp, indexing::TryIndexOp, mean_axis, rsqrt, sigmoid, GgufCheckpoint, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
@@ -58,16 +57,22 @@ use crate::{
             CompressedLatentCache,
         },
         checkpoint::{
-            load::{
-                gguf_metadata, gguf_quantization_configs, load_named_array_strict,
-                load_safetensors_dir_strict_with_split_swiglu_experts_and_transform,
-                GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-            },
+            load::{gguf_quantization_configs, GgufTensorNames},
             quantization::WeightQuantization,
         },
         execution::inspection::{ActivationObserver, MoeRoutingObservation},
     },
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{
+    gguf_metadata, load_named_array_strict, StrictLoadConfig, StrictLoadReport,
+};
+#[cfg(test)]
+use safemlx::{module::ModuleParametersExt, ops::concatenate_axis};
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::load_safetensors_dir_strict_with_split_swiglu_experts_and_transform;
 
 #[cfg(test)]
 use crate::runtime::cache::residency::open_prompt_cache_snapshot;
@@ -2050,59 +2055,6 @@ impl DecoderLayer {
         hidden.add(feed_forward, stream)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_expert_parallel(
-        &mut self,
-        input: &Array,
-        mask: Option<&Array>,
-        cache: Option<&mut LayerCache>,
-        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
-        group: &safemlx::distributed::Group,
-        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
-        stream: &Stream,
-        observer: &mut Option<&mut dyn ActivationObserver>,
-        prefix: &str,
-    ) -> Result<Array, Exception> {
-        let normalized = self.input_layernorm.forward(input, stream)?;
-        let attention = match (&mut self.self_attn, cache) {
-            (Attention::Kda(attention), Some(LayerCache::Kda(cache))) => attention.forward_impl(
-                &normalized,
-                Some(cache),
-                stream,
-                &format!("{prefix}.self_attn"),
-                observer,
-            )?,
-            (Attention::Mla(attention), Some(LayerCache::Mla(cache))) => attention.forward_shared(
-                &normalized,
-                mask,
-                Some(cache),
-                stream,
-                &format!("{prefix}.self_attn"),
-                observer,
-            )?,
-            _ => {
-                return Err(Exception::custom(
-                    "Kimi Linear expert-parallel cache layer kind mismatch",
-                ))
-            }
-        };
-        let hidden = input.add(attention, stream)?;
-        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
-        let feed_forward = match &mut self.mlp {
-            FeedForward::Dense(mlp) => mlp.forward(&normalized, stream)?,
-            FeedForward::Moe(moe) => moe.forward_expert_parallel(
-                &normalized,
-                assignment,
-                group,
-                statistics,
-                stream,
-                observer,
-                &format!("{prefix}.mlp"),
-            )?,
-        };
-        hidden.add(feed_forward, stream)
-    }
-
     /// Executes EP-local routed experts from semantic operator state.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_expert_parallel_with_operator_cache(
@@ -2578,170 +2530,6 @@ impl Model {
     ) -> Result<Array, Exception> {
         self.forward_logits_impl(input, false, stream, Some(observer))
     }
-
-    /// Runs pure expert-parallel Kimi inference with replicated nonexpert weights.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_expert_parallel(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Cache,
-        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
-        group: &safemlx::distributed::Group,
-        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
-        mut observer: Option<&mut dyn ActivationObserver>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let mut hidden = self.model.embed_tokens.forward(inputs, stream)?;
-        let offset = cache.offset();
-        let generated_mask = if mask.is_none() && hidden.dim(1) > 1 && offset > 0 {
-            Some(create_causal_mask(
-                hidden.dim(1),
-                Some(offset),
-                None,
-                None,
-                stream,
-            )?)
-        } else {
-            None
-        };
-        let mask = mask.or(generated_mask.as_ref());
-        cache
-            .validate(&self.args.layer_schedule)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        for (index, (layer, layer_cache)) in self
-            .model
-            .layers
-            .iter_mut()
-            .zip(&mut cache.layers)
-            .enumerate()
-        {
-            hidden = layer.forward_expert_parallel(
-                &hidden,
-                mask,
-                Some(layer_cache),
-                assignment,
-                group,
-                statistics,
-                stream,
-                &mut observer,
-                &format!("model.layers.{index}"),
-            )?;
-        }
-        let hidden = self.model.norm.forward(&hidden, stream)?;
-        project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.model.embed_tokens,
-            &hidden,
-            stream,
-        )
-    }
-
-    /// Runs Kimi inference with routed experts supplied by a sparse cache.
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Cache,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut hidden = self.model.embed_tokens.forward(inputs, stream)?;
-        let offset = cache.offset();
-        let generated_mask = if mask.is_none() && hidden.dim(1) > 1 && offset > 0 {
-            Some(create_causal_mask(
-                hidden.dim(1),
-                Some(offset),
-                None,
-                None,
-                stream,
-            )?)
-        } else {
-            None
-        };
-        let mask = mask.or(generated_mask.as_ref());
-        cache
-            .validate(&self.args.layer_schedule)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        for (index, (layer, layer_cache)) in self
-            .model
-            .layers
-            .iter_mut()
-            .zip(&mut cache.layers)
-            .enumerate()
-        {
-            hidden = layer.forward_sparse_experts(
-                &hidden,
-                mask,
-                Some(layer_cache),
-                stream,
-                |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
-            )?;
-        }
-        let hidden = self.model.norm.forward(&hidden, stream)?;
-        project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.model.embed_tokens,
-            &hidden,
-            stream,
-        )
-    }
-
-    /// Retains only the routed experts owned by this EP rank.
-    pub(crate) fn partition_routed_experts(
-        &mut self,
-        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
-        stream: &Stream,
-    ) -> Result<usize, Error> {
-        let ids = assignment.local_global_expert_ids();
-        if ids.is_empty() {
-            return Err(Error::Parallel(
-                "Kimi Linear expert assignment owns no local experts".into(),
-            ));
-        }
-        let indices = Array::from_slice(
-            &ids.iter().map(|id| *id as i32).collect::<Vec<_>>(),
-            &[ids.len() as i32],
-        );
-        let mut bytes = 0usize;
-        for layer in &mut self.model.layers {
-            let FeedForward::Moe(moe) = &mut layer.mlp else {
-                continue;
-            };
-            let select = |value: &Array| value.take_axis(&indices, 0, stream);
-            let gate_up = select(moe.experts.gate_up_proj.as_ref())?;
-            bytes += gate_up.nbytes();
-            moe.experts.gate_up_proj = Param::new(gate_up);
-            if let Some(value) = moe.experts.gate_up_proj_scales.as_ref() {
-                let value = select(value)?;
-                bytes += value.nbytes();
-                moe.experts.gate_up_proj_scales = Param::new(Some(value));
-            }
-            if let Some(value) = moe.experts.gate_up_proj_biases.as_ref() {
-                let value = select(value)?;
-                bytes += value.nbytes();
-                moe.experts.gate_up_proj_biases = Param::new(Some(value));
-            }
-            let down = select(moe.experts.down_proj.as_ref())?;
-            bytes += down.nbytes();
-            moe.experts.down_proj = Param::new(down);
-            if let Some(value) = moe.experts.down_proj_scales.as_ref() {
-                let value = select(value)?;
-                bytes += value.nbytes();
-                moe.experts.down_proj_scales = Param::new(Some(value));
-            }
-            if let Some(value) = moe.experts.down_proj_biases.as_ref() {
-                let value = select(value)?;
-                bytes += value.nbytes();
-                moe.experts.down_proj_biases = Param::new(Some(value));
-            }
-            moe.experts.num_experts = ids.len() as i32;
-        }
-        Ok(bytes)
-    }
 }
 
 impl Module<ModelInput<'_>> for Model {
@@ -2800,6 +2588,7 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, Model, Cache, S>;
 
+#[cfg(test)]
 pub(crate) fn transform_safetensors_weight(
     args: &ModelArgs,
     mut key: String,
@@ -2840,11 +2629,13 @@ pub(crate) fn transform_safetensors_weight(
     Ok(vec![(key, value)])
 }
 
+#[cfg(test)]
 fn strict_load_config() -> StrictLoadConfig {
     StrictLoadConfig::default()
 }
 
 /// Loads the official sharded safetensors checkpoint.
+#[cfg(test)]
 pub fn load_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -2853,6 +2644,7 @@ pub fn load_model(
     load_model_impl(model_dir.as_ref(), None, stream, weights_stream)
 }
 
+#[cfg(test)]
 fn load_model_impl(
     model_dir: &Path,
     quantization: Option<WeightQuantization>,
@@ -2892,6 +2684,7 @@ fn load_model_impl(
 }
 
 /// Loads a floating-point checkpoint while quantizing eligible weights.
+#[cfg(test)]
 pub fn load_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
@@ -2911,9 +2704,9 @@ pub fn load_model_quantized(
 }
 
 /// Kimi Linear model plus architecture-owned GGUF stop IDs.
+#[cfg(test)]
 pub(crate) struct LoadedKimiLinearGguf {
     pub(crate) model: Model,
-    pub(crate) eos_token_ids: Vec<u32>,
 }
 
 pub(crate) struct PreparedKimiLinearGguf {
@@ -2922,6 +2715,7 @@ pub(crate) struct PreparedKimiLinearGguf {
 }
 
 /// Loads a llama.cpp `kimi-linear` GGUF checkpoint.
+#[cfg(test)]
 pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -2932,6 +2726,7 @@ pub fn load_gguf(
     Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
@@ -3020,10 +2815,7 @@ pub(crate) fn load_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    Ok(LoadedKimiLinearGguf {
-        model,
-        eos_token_ids: prepared.eos_token_ids,
-    })
+    Ok(LoadedKimiLinearGguf { model })
 }
 
 pub(crate) fn prepare_gguf_checkpoint(
@@ -3084,6 +2876,7 @@ fn combine_expert_gate_up_formats(
     Ok(())
 }
 
+#[cfg(test)]
 fn normalize_gguf_weight(
     name: &str,
     value: Array,

@@ -25,7 +25,6 @@ use safemlx_lm::{
         },
         qwen::vl::model as qwen3_vl,
     },
-    nn::generation::CausalLm,
     runtime::generation::sampler::DefaultSampler,
     runtime::media::input::{InputMetadata, InputPart, ModelInput},
     runtime::media::PreparedModelInput,
@@ -635,23 +634,10 @@ fn qwen3_vl_pipeline_ring_worker() {
     assert_eq!(synchronized.token.shape(), &[1, 1]);
 
     if topology.pipeline_parallel_rank == 1 && topology.tensor_parallel_rank == 0 {
-        let mut resident = if checkpoint.extension().is_some_and(|value| value == "gguf") {
-            qwen3_vl::load_qwen3_vl_gguf(
-                &checkpoint,
-                checkpoint
-                    .parent()
-                    .unwrap()
-                    .join("mmproj-qwen3vlmoe-f32.gguf"),
-                &stream,
-                &stream,
-            )
-            .unwrap()
-        } else {
-            qwen3_vl::load_qwen3_vl_model(&checkpoint, &stream, &stream).unwrap()
-        };
+        let mut resident = safemlx_lm::api::load_model(&checkpoint, &stream, &stream).unwrap();
         let mut resident_cache = resident.new_cache();
         let expected = resident
-            .prefill_input_logits(input, &mut resident_cache, &stream)
+            .prefill_input_with_cache(input, &mut resident_cache, &stream)
             .unwrap();
         assert_close(
             &logits

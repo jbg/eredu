@@ -36,6 +36,7 @@ fn main() -> anyhow::Result<()> {
         args,
         model_dir.join(personaplex::MODEL_SAFETENSORS),
         LayerWeightResidency::FullyResident,
+        None,
         stream,
         cpu.stream(),
     )?;

@@ -52,8 +52,7 @@ use crate::{
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
     },
@@ -281,6 +280,10 @@ impl DeepSeekV3LayerwiseModel {
     /// Returns the validated architecture arguments.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
+    }
+
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
     }
 
     pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
@@ -545,6 +548,10 @@ impl DeepSeekV3LayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Runs a rank-local tensor-parallel forward pass through the generalized engine.
@@ -1000,43 +1007,34 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekTen
 pub fn load_deepseek_v3_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV3,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
+    if quantization.is_some() && args.native_fp8_config().is_some() {
+        return Err(Error::Quantization(
+            "native DeepSeek block-FP8 weights cannot be implicitly transcoded".into(),
+        ));
+    }
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("DeepSeek-V3", args.affine_quantization()?, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = DeepSeekV3LayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(DeepSeekV3LayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_deepseek_v3_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<DeepSeekV3LayerwiseModel, Error> {
-    let adapter = DeepSeekV3LayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(DeepSeekV3LayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -1053,7 +1051,6 @@ pub fn load_deepseek_v3_tensor_parallel_model(
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1070,11 +1067,6 @@ pub fn load_deepseek_v3_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV3,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let adapter = DeepSeekV3LayerwiseAdapter::new(args, stream)?;
@@ -1107,9 +1099,12 @@ pub(crate) fn load_deepseek_v3_gguf_tensor_parallel_model(
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -1144,9 +1139,11 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let args = prepared.args;
+    let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -1265,12 +1262,6 @@ pub fn load_deepseek_v3_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV3,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let quantize_on_load = quantization
@@ -1940,6 +1931,14 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args, true)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn prompt_cache_model_identity(
@@ -3264,7 +3263,7 @@ mod tests {
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
         let mut layerwise =
-            load_deepseek_v3_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream())
+            load_deepseek_v3_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
                 .unwrap();
         let mut resident_cache = resident.new_cache();
         let mut layerwise_cache = resident::Cache {
@@ -3409,9 +3408,14 @@ mod tests {
         let parts = [crate::api::input::InputPart::text_token_ids(&prompt)];
         let input = crate::api::input::ModelInput::new(&parts);
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-        let mut ordinary =
-            load_deepseek_v3_layerwise_model(directory.path(), options, gpu.stream(), cpu.stream())
-                .unwrap();
+        let mut ordinary = load_deepseek_v3_layerwise_model(
+            directory.path(),
+            options,
+            None,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
         assert_eq!(ordinary.mtp_len(), 1);
         let mut ordinary_cache = ordinary.new_cache();
         let expected = crate::nn::generation::Generate::new(
@@ -3440,6 +3444,7 @@ mod tests {
             let mut model = load_deepseek_v3_layerwise_model(
                 directory.path(),
                 options,
+                None,
                 gpu.stream(),
                 cpu.stream(),
             )

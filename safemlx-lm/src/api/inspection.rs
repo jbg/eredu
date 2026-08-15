@@ -9178,6 +9178,8 @@ mod tests {
         let store = crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_gguf_store(
             &checkpoint,
             Some(&mmproj),
+            &prepared.args,
+            crate::architectures::qwen::hybrid::checkpoint::GgufVariant::Qwen35,
             Some(vision),
             1,
         )

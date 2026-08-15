@@ -2073,249 +2073,9 @@ pub(super) fn load_gguf_model_data(
     #[cfg(feature = "media-processing")]
     let mut processor = None;
 
-    let (model, architecture_eos_token_ids) = if let Some(quantization) = options
-        .quantization
-        .filter(|_| options.weight_residency.is_fully_resident())
-    {
-        match gguf_architecture {
-            GgufArchitecture::KimiLinear => {
-                let loaded = kimi_linear::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model = crate::architectures::kimi_linear::layerwise::execute_transformed_kimi_linear_model(
-                    loaded.model, stream, weights_stream,
-                )?;
-                (Model::KimiLinear(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::DeepSeek2 => {
-                let loaded = deepseek_v3::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model = crate::architectures::deepseek_v3::layerwise::execute_transformed_deepseek_v3_model(
-                    loaded.model, stream, weights_stream,
-                )?;
-                (Model::DeepSeekV3(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::DeepSeek4 => {
-                let (loaded, eos_token_ids) = crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
-                    &checkpoint,
-                    &metadata,
-                    options.weight_residency,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::DeepSeekV4Layerwise(Box::new(loaded)), eos_token_ids)
-            }
-            GgufArchitecture::GptOss => {
-                let loaded = gpt_oss::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                    crate::architectures::gpt_oss::layerwise::execute_transformed_gpt_oss_model(
-                        loaded.model,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::GptOss(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::Gemma4 => {
-                let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
-                #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-                if let Some(mmproj) = &mmproj {
-                    processor = Some(ModelProcessor::load_gemma4_gguf(
-                        &metadata,
-                        &mmproj.metadata,
-                    )?);
-                }
-                let loaded = gemma4::load_gemma4_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    mmproj.as_ref(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                    crate::architectures::gemma4::layerwise::execute_transformed_gemma4_model_with_modalities(
-                        loaded.model,
-                        loaded.vision_config,
-                        loaded.audio_config,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Gemma4(Box::new(model)), loaded.eos_token_ids)
-            }
-            GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-                let loaded = llama::load_llama_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                    crate::architectures::llama::layerwise::execute_transformed_llama_model(
-                        loaded.model,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Llama(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::MuseGlimmer => {
-                #[cfg(feature = "image-processing")]
-                if let Some(mmproj) =
-                    crate::architectures::muse_glimmer::open_sibling_mmproj(gguf_file)?
-                {
-                    processor = Some(ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata)?);
-                }
-                let (loaded, eos_token_ids) =
-                    crate::architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
-                        &checkpoint,
-                        &metadata,
-                        &architecture,
-                        options.weight_residency,
-                        Some(quantization),
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::MuseGlimmer(loaded), eos_token_ids)
-            }
-            GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-                let loaded = lfm2::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model = crate::architectures::lfm2::layerwise::execute_transformed_lfm2_model(
-                    loaded.model,
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::Lfm2(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-                let loaded = dense_qwen::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                    crate::architectures::qwen::dense::layerwise::execute_transformed_model(
-                        loaded.model,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::DenseQwen(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-                let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
-                let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-                let vision_metadata =
-                    crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
-                let loaded = qwen3_vl::load_qwen3_vl_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    &vision_checkpoint,
-                    vision_metadata,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                    crate::architectures::qwen::vl::layerwise::execute_transformed_qwen3_vl_model(
-                        loaded.model,
-                        stream,
-                        weights_stream,
-                    )?;
-                let model = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
-                    Model::Qwen3VlMoe(model)
-                } else {
-                    Model::Qwen3Vl(model)
-                };
-                (model, loaded.eos_token_ids)
-            }
-            GgufArchitecture::Qwen35
-            | GgufArchitecture::Qwen35Moe
-            | GgufArchitecture::Qwen3Next => {
-                let mmproj = if gguf_architecture == GgufArchitecture::Qwen3Next {
-                    None
-                } else {
-                    qwen3_5::open_sibling_mmproj(gguf_file)?
-                };
-                #[cfg(feature = "image-processing")]
-                if mmproj.is_some() {
-                    processor = ModelProcessor::load_qwen(gguf_sidecar_dir(gguf_file))?;
-                }
-                let loaded = qwen3_5::load_qwen3_5_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    mmproj.as_ref(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let is_next = gguf_architecture == GgufArchitecture::Qwen3Next;
-                let model = crate::architectures::qwen::hybrid::layerwise::execute_transformed_qwen_hybrid_model(
-                    loaded.model, quantization, stream, weights_stream,
-                )?;
-                let model = if is_next {
-                    Model::Qwen3Next(model)
-                } else {
-                    Model::Qwen35(model)
-                };
-                (model, loaded.eos_token_ids)
-            }
-            GgufArchitecture::Inkling => {
-                let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
-                #[cfg(feature = "media-processing")]
-                if mmproj.is_some() {
-                    processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
-                }
-                let (loaded, eos_token_ids) =
-                    crate::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        mmproj.as_ref(),
-                        options.weight_residency,
-                        Some(quantization),
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Inkling(loaded), eos_token_ids)
-            }
-            GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-                let (loaded, eos_token_ids) = crate::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
-                    &checkpoint,
-                    &metadata,
-                    options.weight_residency,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::NemotronH(loaded), eos_token_ids)
-            }
-        }
-    } else {
-        match gguf_architecture {
-            GgufArchitecture::KimiLinear => {
-                let (loaded, eos_token_ids) =
+    let (model, architecture_eos_token_ids) = match gguf_architecture {
+        GgufArchitecture::KimiLinear => {
+            let (loaded, eos_token_ids) =
                     crate::architectures::kimi_linear::layerwise::load_kimi_linear_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
@@ -2324,10 +2084,10 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::KimiLinear(loaded), eos_token_ids)
-            }
-            GgufArchitecture::DeepSeek2 => {
-                let (loaded, eos_token_ids) =
+            (Model::KimiLinear(loaded), eos_token_ids)
+        }
+        GgufArchitecture::DeepSeek2 => {
+            let (loaded, eos_token_ids) =
                     crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
@@ -2336,10 +2096,10 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::DeepSeekV3(loaded), eos_token_ids)
-            }
-            GgufArchitecture::DeepSeek4 => {
-                let (loaded, eos_token_ids) = crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
+            (Model::DeepSeekV3(loaded), eos_token_ids)
+        }
+        GgufArchitecture::DeepSeek4 => {
+            let (loaded, eos_token_ids) = crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
                     &checkpoint,
                     &metadata,
                     options.weight_residency,
@@ -2347,104 +2107,104 @@ pub(super) fn load_gguf_model_data(
                     stream,
                     weights_stream,
                 )?;
-                (Model::DeepSeekV4Layerwise(Box::new(loaded)), eos_token_ids)
+            (Model::DeepSeekV4Layerwise(Box::new(loaded)), eos_token_ids)
+        }
+        GgufArchitecture::GptOss => {
+            let (loaded, eos_token_ids) =
+                crate::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::GptOss(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Inkling => {
+            let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
+            #[cfg(feature = "media-processing")]
+            if mmproj.is_some() {
+                processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
             }
-            GgufArchitecture::GptOss => {
-                let (loaded, eos_token_ids) =
-                    crate::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::GptOss(loaded), eos_token_ids)
+            let (loaded, eos_token_ids) =
+                crate::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    mmproj.as_ref(),
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::Inkling(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Gemma4 => {
+            let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
+            #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+            if let Some(mmproj) = &mmproj {
+                processor = Some(ModelProcessor::load_gemma4_gguf(
+                    &metadata,
+                    &mmproj.metadata,
+                )?);
             }
-            GgufArchitecture::Inkling => {
-                let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
-                #[cfg(feature = "media-processing")]
-                if mmproj.is_some() {
-                    processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
-                }
-                let (loaded, eos_token_ids) =
-                    crate::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        mmproj.as_ref(),
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Inkling(loaded), eos_token_ids)
+            let (loaded, eos_token_ids) =
+                crate::architectures::gemma4::layerwise::load_gemma4_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    mmproj.as_ref(),
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::Gemma4(Box::new(loaded)), eos_token_ids)
+        }
+        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+            let (loaded, eos_token_ids) =
+                crate::architectures::llama::layerwise::load_llama_gguf_model(
+                    &checkpoint,
+                    &metadata,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::Llama(loaded), eos_token_ids)
+        }
+        GgufArchitecture::MuseGlimmer => {
+            #[cfg(feature = "image-processing")]
+            if let Some(mmproj) =
+                crate::architectures::muse_glimmer::open_sibling_mmproj(gguf_file)?
+            {
+                processor = Some(ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata)?);
             }
-            GgufArchitecture::Gemma4 => {
-                let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
-                #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-                if let Some(mmproj) = &mmproj {
-                    processor = Some(ModelProcessor::load_gemma4_gguf(
-                        &metadata,
-                        &mmproj.metadata,
-                    )?);
-                }
-                let (loaded, eos_token_ids) =
-                    crate::architectures::gemma4::layerwise::load_gemma4_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        mmproj.as_ref(),
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Gemma4(Box::new(loaded)), eos_token_ids)
-            }
-            GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-                let (loaded, eos_token_ids) =
-                    crate::architectures::llama::layerwise::load_llama_gguf_model(
-                        &checkpoint,
-                        &metadata,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Llama(loaded), eos_token_ids)
-            }
-            GgufArchitecture::MuseGlimmer => {
-                #[cfg(feature = "image-processing")]
-                if let Some(mmproj) =
-                    crate::architectures::muse_glimmer::open_sibling_mmproj(gguf_file)?
-                {
-                    processor = Some(ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata)?);
-                }
-                let (loaded, eos_token_ids) =
-                    crate::architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
-                        &checkpoint,
-                        &metadata,
-                        &architecture,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::MuseGlimmer(loaded), eos_token_ids)
-            }
-            GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-                let (loaded, eos_token_ids) =
-                    crate::architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Lfm2(loaded), eos_token_ids)
-            }
-            GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-                let (loaded, eos_token_ids) =
+            let (loaded, eos_token_ids) =
+                crate::architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    &architecture,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::MuseGlimmer(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
+            let (loaded, eos_token_ids) =
+                crate::architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::Lfm2(loaded), eos_token_ids)
+        }
+        GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
+            let (loaded, eos_token_ids) =
                 crate::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
                     &checkpoint,
                     &metadata,
@@ -2453,57 +2213,55 @@ pub(super) fn load_gguf_model_data(
                     stream,
                     weights_stream,
                 )?;
-                (Model::NemotronH(loaded), eos_token_ids)
+            (Model::NemotronH(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+            let (loaded, eos_token_ids) =
+                crate::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    &architecture,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::DenseQwen(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+            let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
+            let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
+            let vision_metadata =
+                crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+            let (loaded, eos_token_ids) =
+                crate::architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    &vision_checkpoint,
+                    &vision_metadata,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            let model = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
+                Model::Qwen3VlMoe(loaded)
+            } else {
+                Model::Qwen3Vl(loaded)
+            };
+            (model, eos_token_ids)
+        }
+        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
+            let mmproj = if gguf_architecture == GgufArchitecture::Qwen3Next {
+                None
+            } else {
+                qwen3_5::open_sibling_mmproj(gguf_file)?
+            };
+            #[cfg(feature = "image-processing")]
+            if mmproj.is_some() {
+                processor = ModelProcessor::load_qwen(gguf_sidecar_dir(gguf_file))?;
             }
-            GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-                let (loaded, eos_token_ids) =
-                    crate::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
-                        &checkpoint,
-                        &metadata,
-                        &architecture,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::DenseQwen(loaded), eos_token_ids)
-            }
-            GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-                let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
-                let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-                let vision_metadata =
-                    crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
-                let (loaded, eos_token_ids) =
-                    crate::architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        &vision_checkpoint,
-                        &vision_metadata,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                let model = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
-                    Model::Qwen3VlMoe(loaded)
-                } else {
-                    Model::Qwen3Vl(loaded)
-                };
-                (model, eos_token_ids)
-            }
-            GgufArchitecture::Qwen35
-            | GgufArchitecture::Qwen35Moe
-            | GgufArchitecture::Qwen3Next => {
-                let mmproj = if gguf_architecture == GgufArchitecture::Qwen3Next {
-                    None
-                } else {
-                    qwen3_5::open_sibling_mmproj(gguf_file)?
-                };
-                #[cfg(feature = "image-processing")]
-                if mmproj.is_some() {
-                    processor = ModelProcessor::load_qwen(gguf_sidecar_dir(gguf_file))?;
-                }
-                let (loaded, eos_token_ids, is_next) =
+            let (loaded, eos_token_ids, is_next) =
                     crate::architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
@@ -2513,13 +2271,12 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                let model = if is_next {
-                    Model::Qwen3Next(loaded)
-                } else {
-                    Model::Qwen35(loaded)
-                };
-                (model, eos_token_ids)
-            }
+            let model = if is_next {
+                Model::Qwen3Next(loaded)
+            } else {
+                Model::Qwen35(loaded)
+            };
+            (model, eos_token_ids)
         }
     };
     let eos_token_ids = merge_eos_token_id_sources([

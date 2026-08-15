@@ -1,13 +1,8 @@
 //! Declarative runtime targets backed by checkpoint-derived recipes.
 
-#![allow(dead_code)] // The bridge is intentionally available before loader migrations consume it.
-
 use std::collections::{BTreeMap, BTreeSet};
 
-use safemlx::{Array, Stream};
-
 use super::{
-    binding::{materialize_module_bindings, ModuleBindingError},
     recipe::{DerivedWeightRecipe, RecipeDtype, WeightRecipeError},
     store::{TensorSelection, WeightStore},
 };
@@ -23,6 +18,7 @@ pub(crate) struct PlannedBinding {
 }
 
 impl PlannedBinding {
+    #[cfg(test)]
     pub(crate) fn direct(
         target_name: impl Into<String>,
         source_key: impl Into<String>,
@@ -113,10 +109,12 @@ impl BindingPlan {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn bindings(&self) -> &[PlannedBinding] {
         &self.bindings
     }
 
+    #[cfg(test)]
     pub(crate) fn source_keys(&self) -> Vec<&str> {
         let mut keys = BTreeSet::new();
         for binding in &self.bindings {
@@ -125,6 +123,7 @@ impl BindingPlan {
         keys.into_iter().collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_source_keys(&self) -> &BTreeSet<String> {
         &self.shared_source_keys
     }
@@ -171,23 +170,6 @@ impl BindingPlan {
         }
         Ok(output)
     }
-
-    /// Materializes all validated targets through the existing bounded recipe path.
-    #[allow(dead_code)] // The bridge is ready for architecture loader migrations.
-    pub(crate) fn materialize(
-        &self,
-        store: &dyn WeightStore,
-        source_stream: &Stream,
-        execution_stream: &Stream,
-    ) -> Result<BTreeMap<String, Array>, BindingPlanError> {
-        let bindings = self.build_bindings(store)?;
-        Ok(materialize_module_bindings(
-            store,
-            &bindings,
-            source_stream,
-            execution_stream,
-        )?)
-    }
 }
 
 fn recipe_dtype_matches(expected: &RecipeDtype, actual: &RecipeDtype) -> bool {
@@ -231,8 +213,6 @@ pub(crate) enum BindingPlanError {
     Recipe(#[from] WeightRecipeError),
     #[error(transparent)]
     Residency(#[from] ResidencyError),
-    #[error(transparent)]
-    Module(#[from] ModuleBindingError),
 }
 
 #[cfg(test)]

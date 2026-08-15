@@ -508,7 +508,6 @@ fn load_model_for_kind(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     validate_load_policy(kind, ArtifactLoadKind::Safetensors, options)?;
-    structural::validate_safetensors_load_path(kind, model_dir, options)?;
     if let (Some(expert_cache), Some(non_expert)) = (
         options.weight_residency.expert_cache(),
         options.weight_residency.non_experts(),
@@ -586,147 +585,22 @@ fn load_model_for_kind(
     let execution = options.weight_residency.layers();
     if let Some(quantization) = options.quantization {
         quantization.validate()?;
-        return match kind {
-            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
-                crate::architectures::deepseek_v3::layerwise::execute_transformed_deepseek_v3_model(
-                    deepseek_v3::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
-                crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_layerwise_model(
-                    model_dir,
-                    execution,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?,
-            ))),
-            ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
-                crate::architectures::gemma4::layerwise::execute_transformed_gemma4_model(
-                    model_dir,
-                    gemma4::load_gemma4_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            ))),
-            ModelKind::Inkling => Ok(Model::Inkling(
-                crate::architectures::inkling::layerwise::load_inkling_layerwise_model(
-                    model_dir,
-                    execution,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::GptOss => Ok(Model::GptOss(
-                crate::architectures::gpt_oss::layerwise::execute_transformed_gpt_oss_model(
-                    gpt_oss::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::KimiLinear => Ok(Model::KimiLinear(
-                crate::architectures::kimi_linear::layerwise::execute_transformed_kimi_linear_model(
-                    kimi_linear::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Llama => Ok(Model::Llama(
-                crate::architectures::llama::layerwise::execute_transformed_llama_model(
-                    llama::load_resident_llama_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
-                crate::architectures::muse_glimmer::layerwise::load_safetensors_quantized_residency(
-                    model_dir,
-                    execution,
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Lfm2 => Ok(Model::Lfm2(
-                crate::architectures::lfm2::layerwise::execute_transformed_lfm2_model(
-                    lfm2::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::NemotronH => Ok(Model::NemotronH(
-                crate::architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
-                    model_dir,
-                    execution,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(
-                crate::architectures::qwen::dense::layerwise::load_safetensors_quantized_residency(
-                    model_dir,
-                    execution,
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
-                crate::architectures::qwen::hybrid::layerwise::execute_transformed_qwen_hybrid_model(
-                    qwen3_next::load_qwen3_next_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(
-                crate::architectures::qwen::vl::layerwise::execute_transformed_qwen3_vl_model(
-                    qwen3_vl::load_qwen3_vl_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
-                crate::architectures::qwen::vl::layerwise::execute_transformed_qwen3_vl_model(
-                    qwen3_vl_moe::load_qwen3_vl_moe_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen35 => Ok(Model::Qwen35(
-                crate::architectures::qwen::hybrid::layerwise::execute_transformed_qwen_hybrid_model(
-                    qwen3_5::load_qwen3_5_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::PersonaPlex => {
-                unreachable!("load policy rejects unsupported load-time transformations")
-            }
-        };
     }
     match kind {
         ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
             crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
         )),
-        ModelKind::DeepSeekV4 if execution.is_fully_resident() => Ok(Model::DeepSeekV4(Box::new(
-            deepseek_v4::load_model(model_dir, stream, weights_stream)?,
-        ))),
         ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
             crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_layerwise_model(
                 model_dir,
                 execution,
-                None,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -735,6 +609,7 @@ fn load_model_for_kind(
             crate::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -743,7 +618,7 @@ fn load_model_for_kind(
             crate::architectures::inkling::layerwise::load_inkling_layerwise_model(
                 model_dir,
                 execution,
-                None,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -752,6 +627,7 @@ fn load_model_for_kind(
             crate::architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -761,6 +637,7 @@ fn load_model_for_kind(
                 model_dir,
                 crate::architectures::llama::layerwise::LlamaLoadOptions {
                     weight_residency: execution.weight_residency(),
+                    quantization: options.quantization,
                 },
                 stream,
                 weights_stream,
@@ -770,6 +647,7 @@ fn load_model_for_kind(
             crate::architectures::muse_glimmer::layerwise::load_safetensors(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -778,6 +656,7 @@ fn load_model_for_kind(
             crate::architectures::qwen::dense::layerwise::load_safetensors(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -786,6 +665,7 @@ fn load_model_for_kind(
             crate::architectures::gpt_oss::layerwise::load_gpt_oss_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -794,6 +674,7 @@ fn load_model_for_kind(
             crate::architectures::lfm2::layerwise::load_lfm2_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -802,7 +683,7 @@ fn load_model_for_kind(
             crate::architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
                 model_dir,
                 execution,
-                None,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -811,6 +692,7 @@ fn load_model_for_kind(
             crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -819,6 +701,7 @@ fn load_model_for_kind(
             crate::architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -827,6 +710,7 @@ fn load_model_for_kind(
             crate::architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -835,6 +719,7 @@ fn load_model_for_kind(
             crate::architectures::qwen::hybrid::layerwise::load_qwen35_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,

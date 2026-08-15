@@ -6,21 +6,26 @@
 
 use std::path::Path;
 
+#[cfg(test)]
 use safemlx::{
-    module::ModuleParametersExt,
     ops::{concatenate_axis, indexing::TryIndexOp, quantized_packed_dimension},
     transforms::eval,
     Array, Dtype, Stream,
 };
 use tokenizers::Tokenizer;
 
-use crate::{
-    error::Error,
-    runtime::checkpoint::load::{
-        load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+use crate::error::Error;
+#[cfg(test)]
+use crate::runtime::checkpoint::quantization::AffineQuantization;
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{
+    load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadReport,
 };
+#[cfg(test)]
+use crate::runtime::checkpoint::quantization::WeightQuantization;
+#[cfg(test)]
+use safemlx::module::ModuleParametersExt;
 
 pub use super::qwen3_5::{
     sample, Cache, Generate, LayerCache, LayerPolicy, LinearAttentionCache, Model, ModelArgs,
@@ -54,6 +59,7 @@ pub fn load_qwen3_next_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenize
 }
 
 /// Loads a Qwen3-Next safetensors checkpoint.
+#[cfg(test)]
 pub fn load_qwen3_next_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -63,6 +69,7 @@ pub fn load_qwen3_next_model(
 }
 
 /// Loads a Qwen3-Next checkpoint while affine-quantizing eligible weights.
+#[cfg(test)]
 pub fn load_qwen3_next_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
@@ -87,6 +94,7 @@ pub fn load_qwen3_next_model_quantized(
     load_qwen3_next_model_with_quantization(model_dir, Some(quantization), stream, weights_stream)
 }
 
+#[cfg(test)]
 fn load_qwen3_next_model_with_quantization(
     model_dir: &Path,
     quantization: Option<WeightQuantization>,
@@ -141,6 +149,7 @@ fn load_qwen3_next_model_with_quantization(
     Ok(model)
 }
 
+#[cfg(test)]
 pub(crate) fn split_fused_projection(
     key: &str,
     value: Array,
@@ -150,6 +159,7 @@ pub(crate) fn split_fused_projection(
     split_fused_projection_with_affine(key, value, None, args, stream)
 }
 
+#[cfg(test)]
 pub(crate) fn split_fused_projection_with_affine(
     key: &str,
     value: Array,
@@ -229,6 +239,7 @@ pub(crate) fn split_fused_projection_with_affine(
     Ok(vec![(key.to_string(), value)])
 }
 
+#[cfg(test)]
 fn validate_affine_fused_component(
     key: &str,
     value: &Array,
@@ -311,6 +322,7 @@ pub(crate) fn split_fused_projection_configs<T: Copy>(
     Ok(())
 }
 
+#[cfg(test)]
 fn evaluate_fused_projection_outputs(
     outputs: Vec<(String, Array)>,
 ) -> Result<Vec<(String, Array)>, Error> {
@@ -371,6 +383,7 @@ pub(crate) fn fp8_block_row_widths(widths: &[i32]) -> Result<Vec<i32>, Error> {
         .collect()
 }
 
+#[cfg(test)]
 fn split_grouped_rows(
     value: Array,
     groups: i32,

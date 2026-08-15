@@ -879,7 +879,7 @@ mod tests {
             (name == "proj.weight").then_some(GgmlType::Q4K)
         });
         let checkpoint = GgufCheckpoint::open(fixture.path()).unwrap();
-        let store = GgufWeightStore::new(checkpoint, str::to_string).unwrap();
+        let store = GgufWeightStore::new_for_test(checkpoint, str::to_string).unwrap();
 
         assert_eq!(full_parameter_names(&module, "proj"), ["proj.inner.weight"]);
         let bindings = build_module_bindings(&module, "proj", &store).unwrap();

@@ -602,6 +602,10 @@ impl NemotronHLayerwiseModel {
         self.execution.adapter().args()
     }
 
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
+    }
+
     pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
         self.execution.bind_parallel_topology(topology);
     }
@@ -868,6 +872,10 @@ impl NemotronHLayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Runs the hybrid decoder while preserving KV and Mamba state.
@@ -1342,16 +1350,6 @@ pub fn load_nemotron_h_layerwise_model(
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    let load_options = quantization
-        .map(crate::api::ModelLoadOptions::with_quantization)
-        .unwrap_or_default()
-        .with_weight_residency(residency);
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::NemotronH,
-        model_dir,
-        load_options,
-    )?;
     let args = resident::get_nemotron_h_model_args(model_dir)?;
     let quantize_on_load = quantization
         .map(|requested| {
@@ -1383,7 +1381,6 @@ pub fn load_nemotron_h_tensor_parallel_model(
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1400,11 +1397,6 @@ pub fn load_nemotron_h_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::NemotronH,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     Ok(NemotronHLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
@@ -1433,9 +1425,12 @@ pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
     )?;
     let prepared =
         resident::prepare_nemotron_h_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -1493,9 +1488,11 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
     let prepared =
         resident::prepare_nemotron_h_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let args = prepared.args;
+    let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -1623,12 +1620,6 @@ pub fn load_nemotron_h_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::NemotronH,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_nemotron_h_model_args(model_dir)?;
     if !args
         .layer_schedule
@@ -2273,6 +2264,14 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<WeightQuantization> {

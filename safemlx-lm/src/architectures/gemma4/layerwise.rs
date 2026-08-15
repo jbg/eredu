@@ -56,7 +56,7 @@ use crate::{
     },
     runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     runtime::checkpoint::{
-        quantization::WeightQuantization,
+        quantization::{should_quantize_on_load, WeightQuantization},
         recipe::DerivedWeightRecipe,
         store::{GgufWeightStore, TensorSelection, WeightStore},
     },
@@ -68,8 +68,7 @@ use crate::{
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
@@ -652,6 +651,10 @@ impl Gemma4LayerwiseModel {
         self.execution.checkpoint_store()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Runs the text decoder while preserving alternating and shared KV state.
     pub fn forward(
         &mut self,
@@ -926,19 +929,21 @@ impl CausalLm<Cache> for Gemma4LayerwiseModel {
 pub fn load_gemma4_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Gemma4,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
         resident::get_gemma4_model_config(model_dir)?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Gemma 4", args.weight_quantization(), requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = Gemma4LayerwiseAdapter::new(
         args,
         vision,
@@ -948,49 +953,13 @@ pub fn load_gemma4_layerwise_model(
         audio_token_id,
         stream,
     )?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(Gemma4LayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_gemma4_model(
-    model_dir: &Path,
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Gemma4LayerwiseModel, Error> {
-    let (_, vision, _, _, audio, _) = resident::get_gemma4_model_config(model_dir)?;
-    execute_transformed_gemma4_model_with_modalities(model, vision, audio, stream, weights_stream)
-}
-
-pub(crate) fn execute_transformed_gemma4_model_with_modalities(
-    model: resident::Model,
-    vision: Option<Gemma4VisionConfig>,
-    audio: Option<Gemma4AudioConfig>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Gemma4LayerwiseModel, Error> {
-    let adapter = Gemma4LayerwiseAdapter::new(
-        model.args.clone(),
-        vision,
-        model.image_token_id,
-        model.video_token_id,
-        audio,
-        model.audio_token_id,
-        stream,
-    )?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(Gemma4LayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -1007,7 +976,6 @@ pub fn load_gemma4_tensor_parallel_layerwise_model(
 ) -> Result<Gemma4LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1026,11 +994,6 @@ pub fn load_gemma4_tensor_parallel_layerwise_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Gemma4,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
         resident::get_gemma4_model_config(model_dir)?;
     let adapter = Gemma4LayerwiseAdapter::new(
@@ -1072,7 +1035,14 @@ pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, mmproj, None)?;
-    let store = gemma4_gguf_store(checkpoint, mmproj, options.max_mapped_shards())?;
+    let store = gemma4_gguf_store(
+        checkpoint,
+        mmproj,
+        &prepared.args,
+        prepared.vision_config.as_ref(),
+        prepared.audio_config.as_ref(),
+        options.max_mapped_shards(),
+    )?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
         Gemma4LayerwiseAdapter::new(
@@ -1110,6 +1080,14 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
     .into_loader_result()?;
     let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, mmproj, None)?;
     let has_routed_experts = prepared.args.num_experts.is_some();
+    let store = gemma4_gguf_store(
+        checkpoint,
+        mmproj,
+        &prepared.args,
+        prepared.vision_config.as_ref(),
+        prepared.audio_config.as_ref(),
+        residency.max_mapped_shards(),
+    )?;
     let adapter = Gemma4LayerwiseAdapter::new(
         prepared.args,
         prepared.vision_config,
@@ -1119,7 +1097,6 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
         prepared.audio_token_id,
         stream,
     )?;
-    let store = gemma4_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
     if let Some(options) = residency.expert_cache() {
         if !has_routed_experts {
             return Err(Error::UnsupportedArchitecture(
@@ -1171,14 +1148,25 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
 pub(crate) fn gemma4_gguf_store(
     checkpoint: &GgufCheckpoint,
     mmproj: Option<&resident::Gemma4MmprojGguf>,
+    args: &ModelArgs,
+    vision: Option<&Gemma4VisionConfig>,
+    audio: Option<&Gemma4AudioConfig>,
     max_mapped_shards: usize,
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
-        .add_checkpoint(checkpoint.clone(), resident::translate_gguf_weight_name)?;
+        .add_checkpoint(
+            checkpoint.clone(),
+            &text_plan,
+            resident::translate_gguf_weight_name,
+        )?;
     if let Some(mmproj) = mmproj {
+        let projector_plan = super::checkpoint::mmproj_plan(args, vision, audio)
+            .map_err(Error::UnsupportedArchitecture)?;
         builder = builder.add_checkpoint(
             mmproj.checkpoint.clone(),
+            &projector_plan,
             resident::translate_mmproj_weight_name,
         )?;
     }
@@ -2520,6 +2508,19 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(
+            &self.args,
+            self.vision_config.as_ref(),
+            self.audio_config.as_ref(),
+            true,
+        )
+        .map_err(Error::UnsupportedArchitecture)
+        .map(Into::into)
     }
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
@@ -4636,6 +4637,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::execution::layerwise::transformed_module_weight_store;
     use std::{collections::HashMap, fs, path::Path};
 
     use safemlx::{
@@ -5038,6 +5040,7 @@ mod tests {
         let mut layerwise = load_gemma4_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -5471,6 +5474,7 @@ mod tests {
         let mut layerwise = load_gemma4_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -5478,6 +5482,7 @@ mod tests {
         let mut serial = load_gemma4_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -5590,6 +5595,7 @@ mod tests {
         let mut dense = load_gemma4_layerwise_model(
             dir.path(),
             LayerWeightResidency::DenseDiskStream(dense_options),
+            None,
             gpu.stream(),
             cpu.stream(),
         )

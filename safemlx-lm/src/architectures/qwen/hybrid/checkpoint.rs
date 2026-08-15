@@ -1128,7 +1128,7 @@ pub(crate) fn validate_projector_gguf(
     validation::validate_gguf_plan(checkpoint, &plan)
 }
 
-fn projector_gguf_plan(
+pub(crate) fn projector_gguf_plan(
     vision: &qwen35::VisionConfig,
     text_hidden_size: i32,
 ) -> Result<GgufCheckpointPlan, String> {

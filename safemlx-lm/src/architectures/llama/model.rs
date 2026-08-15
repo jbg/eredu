@@ -21,6 +21,8 @@ use tokenizers::Tokenizer;
 
 pub use crate::nn::generation::sample;
 
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{gguf_metadata, load_gguf_strict};
 use crate::{
     api::{
         common::{
@@ -42,7 +44,7 @@ use crate::{
         AttentionMask,
     },
     runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_safetensors_dir_lenient,
+        gguf_quantization_configs, load_safetensors_dir_lenient,
         load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
@@ -1318,6 +1320,7 @@ pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> 
     normalize_model_args(args)
 }
 
+#[cfg(test)]
 pub(crate) struct LoadedLlamaGguf {
     pub(crate) model: ResidentModel,
     pub(crate) eos_token_ids: Vec<u32>,
@@ -1333,6 +1336,7 @@ pub(crate) struct PreparedLlamaGguf {
 /// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
 /// supported. Quantized formats are consumed in the packed affine
 /// representation emitted by MLX's GGUF loader.
+#[cfg(test)]
 pub fn load_llama_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -1341,6 +1345,7 @@ pub fn load_llama_gguf(
     Ok(load_llama_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_llama_gguf_with_metadata(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -1352,6 +1357,7 @@ pub(crate) fn load_llama_gguf_with_metadata(
     load_llama_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
 }
 
+#[cfg(test)]
 pub(crate) fn load_llama_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,

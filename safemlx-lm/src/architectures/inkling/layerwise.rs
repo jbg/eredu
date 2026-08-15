@@ -547,6 +547,10 @@ impl InklingLayerwiseModel {
         self.execution.checkpoint_store()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Runs the text decoder while preserving KV and convolution state.
     pub fn forward(
         &mut self,
@@ -1073,16 +1077,6 @@ pub fn load_inkling_layerwise_model(
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    let load_options = quantization
-        .map(crate::api::ModelLoadOptions::with_quantization)
-        .unwrap_or_default()
-        .with_weight_residency(residency);
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Inkling,
-        model_dir,
-        load_options,
-    )?;
     let args = resident::get_model_args(model_dir)?;
     let quantize_on_load = quantization
         .map(|requested| {
@@ -1119,7 +1113,6 @@ pub fn load_inkling_tensor_parallel_layerwise_model(
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1138,11 +1131,6 @@ pub fn load_inkling_tensor_parallel_layerwise_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Inkling,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
     Ok(InklingLayerwiseModel {
@@ -1175,7 +1163,12 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint_with_mmproj(checkpoint, metadata, mmproj)?;
-    let store = inkling_gguf_store(checkpoint, mmproj, options.max_mapped_shards())?;
+    let store = inkling_gguf_store(
+        checkpoint,
+        mmproj,
+        &prepared.args,
+        options.max_mapped_shards(),
+    )?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
         InklingLayerwiseAdapter::new(prepared.args, stream)?,
@@ -1208,7 +1201,12 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint_with_mmproj(checkpoint, metadata, mmproj)?;
-    let store = inkling_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
+    let store = inkling_gguf_store(
+        checkpoint,
+        mmproj,
+        &prepared.args,
+        residency.max_mapped_shards(),
+    )?;
     let args = prepared.args;
     if let Some(expert_options) = residency.expert_cache() {
         return Ok((
@@ -1238,14 +1236,23 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
 pub(crate) fn inkling_gguf_store(
     checkpoint: &GgufCheckpoint,
     mmproj: Option<&resident::InklingMmprojGguf>,
+    args: &ModelArgs,
     max_mapped_shards: usize,
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
-        .add_checkpoint(checkpoint.clone(), resident::translate_gguf_weight_name)?;
+        .add_checkpoint(
+            checkpoint.clone(),
+            &text_plan,
+            resident::translate_gguf_weight_name,
+        )?;
     if let Some(mmproj) = mmproj {
+        let projector_plan =
+            super::checkpoint::mmproj_gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
         builder = builder.add_checkpoint(
             mmproj.checkpoint.clone(),
+            &projector_plan,
             resident::translate_mmproj_weight_name,
         )?;
     }
@@ -1303,12 +1310,6 @@ pub fn load_inkling_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Inkling,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     if args.text_config.n_routed_experts <= 0
         || !args
@@ -2355,6 +2356,14 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<WeightQuantization> {

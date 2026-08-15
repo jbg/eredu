@@ -17,7 +17,7 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt},
     nn,
-    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -58,13 +58,17 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
     runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
-        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
+        gguf_quantization_configs, load_safetensors_dir_lenient,
+        load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{gguf_metadata, load_gguf_strict, load_named_array_strict};
+#[cfg(test)]
+use safemlx::ops::concatenate_axis;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Dense Qwen decoder generation selected by checkpoint metadata.
@@ -2196,54 +2200,6 @@ impl Decoder {
         observer.observe("model.norm", &output)?;
         Ok(output)
     }
-
-    pub(crate) fn forward_expert_parallel<C>(
-        &mut self,
-        input: ModelInput<'_, C>,
-        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
-        group: &safemlx::distributed::Group,
-        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
-        mut observer: Option<&mut dyn ActivationObserver>,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        C: KeyValueCache + Default,
-    {
-        let ModelInput {
-            inputs,
-            mask,
-            cache,
-        } = input;
-        let mut hidden = self.embed_tokens.forward(inputs, stream)?;
-        let full_mask = full_attention_mask(&hidden, cache, mask.is_some(), stream)?;
-        if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
-        }
-        for (index, (layer, cache)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
-            let layer_mask = match mask {
-                Some(mask) => Some(mask),
-                None if layer.self_attn.sliding_window.is_none() => full_mask.as_ref(),
-                None => None,
-            };
-            let layer_observer = observer
-                .as_mut()
-                .map(|observer| &mut **observer as &mut dyn ActivationObserver);
-            hidden = layer.forward_expert_parallel(
-                AttentionInput {
-                    x: &hidden,
-                    mask: layer_mask,
-                    cache: cache.as_mut(),
-                },
-                assignment,
-                group,
-                statistics,
-                &format!("model.layers.{index}"),
-                layer_observer,
-                stream,
-            )?;
-        }
-        self.norm.forward(&hidden, stream)
-    }
 }
 
 /// Input for a dense-Qwen forward pass.
@@ -2394,83 +2350,6 @@ impl Model {
         )?;
         observer.observe("lm_head.logits", &logits)?;
         Ok(logits)
-    }
-
-    pub(crate) fn forward_expert_parallel<C>(
-        &mut self,
-        input: ModelInput<'_, C>,
-        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
-        group: &safemlx::distributed::Group,
-        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
-        observer: Option<&mut dyn ActivationObserver>,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        C: KeyValueCache + Default,
-    {
-        let hidden = self
-            .model
-            .forward_expert_parallel(input, assignment, group, statistics, observer, stream)?;
-        project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.model.embed_tokens,
-            &hidden,
-            stream,
-        )
-    }
-
-    /// Runs pure expert parallelism with externally supplied cache-backed experts.
-    pub(crate) fn forward_cached_expert_parallel<C, F>(
-        &mut self,
-        input: ModelInput<'_, C>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        C: KeyValueCache + Default,
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let ModelInput {
-            inputs,
-            mask,
-            cache,
-        } = input;
-        let mut hidden = self.model.embed_tokens.forward(inputs, stream)?;
-        let full_mask = full_attention_mask(&hidden, cache, mask.is_some(), stream)?;
-        if cache.is_empty() {
-            *cache = (0..self.model.layers.len())
-                .map(|_| Some(C::default()))
-                .collect();
-        }
-        for (index, (layer, layer_cache)) in self
-            .model
-            .layers
-            .iter_mut()
-            .zip(cache.iter_mut())
-            .enumerate()
-        {
-            let layer_mask = match mask {
-                Some(mask) => Some(mask),
-                None if layer.self_attn.sliding_window.is_none() => full_mask.as_ref(),
-                None => None,
-            };
-            hidden = layer.forward_sparse_experts(
-                AttentionInput {
-                    x: &hidden,
-                    mask: layer_mask,
-                    cache: layer_cache.as_mut(),
-                },
-                stream,
-                |flat, indices, weights, stream| execute(index, flat, indices, weights, stream),
-            )?;
-        }
-        let hidden = self.model.norm.forward(&hidden, stream)?;
-        project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.model.embed_tokens,
-            &hidden,
-            stream,
-        )
     }
 }
 
@@ -2970,6 +2849,7 @@ fn validate_rope_scaling(args: &DecoderConfig) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) struct LoadedGguf {
     pub(crate) model: Model,
     pub(crate) eos_token_ids: Vec<u32>,
@@ -2980,6 +2860,7 @@ pub(crate) struct LoadedGguf {
 /// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
 /// supported. The quantized formats are consumed in the packed affine
 /// representation emitted by MLX's GGUF loader.
+#[cfg(test)]
 pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -2988,6 +2869,7 @@ pub fn load_gguf(
     Ok(load_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_gguf_with_metadata(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -2998,6 +2880,7 @@ pub(crate) fn load_gguf_with_metadata(
     load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
 }
 
+#[cfg(test)]
 pub(crate) fn load_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,

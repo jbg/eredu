@@ -362,6 +362,14 @@ pub(crate) enum PlanError {
     Companion { name: String, detail: String },
 }
 
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Geometry(detail) | Self::Companion { detail, .. } => formatter.write_str(detail),
+        }
+    }
+}
+
 fn invalid_geometry(detail: String) -> CheckpointValidation {
     CheckpointValidation::Invalid(vec![CheckpointIssue {
         kind: CheckpointIssueKind::InvalidGeometry,

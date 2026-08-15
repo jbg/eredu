@@ -1,7 +1,5 @@
 //! Declarative physical checkpoint schemas.
 
-#![allow(dead_code)] // Some schema variants are reserved for staged architecture migrations.
-
 use std::collections::BTreeSet;
 
 use safemlx::ops::GgufType;
@@ -131,26 +129,17 @@ pub(crate) enum TensorOperation {
 /// Declarative GGUF physical encoding constraint.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum GgufTypeConstraint {
-    Exact(GgufType),
-    OneOf(Vec<GgufType>),
     OperationClass(TensorOperation),
 }
 
 impl GgufTypeConstraint {
     pub(crate) fn accepts(&self, actual: GgufType) -> bool {
         match self {
-            Self::Exact(expected) => *expected == actual,
-            Self::OneOf(expected) => expected.contains(&actual),
             Self::OperationClass(operation) => gguf_encoding_supported(*operation, actual),
         }
     }
 
-    fn normalize(&mut self) {
-        if let Self::OneOf(types) = self {
-            types.sort_by_key(|encoding| encoding.code());
-            types.dedup();
-        }
-    }
+    fn normalize(&mut self) {}
 }
 
 /// Generic mapping from a numerical operation to accepted GGUF encodings.
@@ -212,11 +201,6 @@ impl GgufTensorConstraint {
         }
     }
 
-    pub(crate) fn optional(mut self) -> Self {
-        self.requirement = TensorRequirement::Optional;
-        self
-    }
-
     pub(crate) fn with_aliases(
         mut self,
         aliases: impl IntoIterator<Item = impl Into<String>>,
@@ -235,11 +219,6 @@ impl GgufTensorConstraint {
 
     pub(crate) fn with_element_count(mut self, element_count: usize) -> Self {
         self.element_count = Some(element_count);
-        self
-    }
-
-    pub(crate) fn companion(mut self) -> Self {
-        self.role = TensorRole::Companion;
         self
     }
 }
@@ -398,7 +377,7 @@ impl PhysicalConstraint for GgufTensorConstraint {
         self.alternate_shapes.retain(|shape| shape != &self.shape);
     }
     fn has_empty_encoding_set(&self) -> bool {
-        matches!(&self.encoding, GgufTypeConstraint::OneOf(types) if types.is_empty())
+        false
     }
 }
 
@@ -709,7 +688,7 @@ mod tests {
                 vec![GgufTensorConstraint::required(
                     "a",
                     vec![1],
-                    GgufTypeConstraint::Exact(GgufType::F32),
+                    GgufTypeConstraint::OperationClass(TensorOperation::Dense),
                 )
                 .with_alternate_shapes([vec![1, 0]])],
                 Vec::new(),

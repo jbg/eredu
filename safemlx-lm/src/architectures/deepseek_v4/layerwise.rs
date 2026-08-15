@@ -309,6 +309,10 @@ impl DeepSeekV4LayerwiseModel {
         self.execution.residency_report()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Dense disk-stream telemetry when that policy is active.
     pub fn dense_stream_report(
         &self,
@@ -887,6 +891,14 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<WeightQuantization> {
@@ -1525,9 +1537,12 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
     let quantization = prepared
         .args
         .resolve_load_time_quantization("DeepSeek V4 GGUF", requested_quantization)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             super::model::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -1592,9 +1607,12 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
         "DeepSeek V4 GGUF tensor parallel",
         requested_quantization,
     )?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             super::model::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -1641,11 +1659,6 @@ pub fn load_deepseek_v4_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV4,
-        model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency()),
-    )?;
     let args = super::model::get_model_args(model_dir)?;
     let quantization =
         args.resolve_load_time_quantization("DeepSeek V4 tensor parallel", requested_quantization)?;

@@ -16,6 +16,44 @@ use super::{
     store::{SafetensorsWeightStore, StoredDtype, WeightMetadata, WeightStore, WeightStoreError},
 };
 
+/// The single physical layout selected from an architecture checkpoint plan.
+///
+/// Loaders consume this value through `ContractWeightStore`; they cannot read
+/// aliases from an unselected layout or tensors that were not admitted by the
+/// architecture contract.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ResolvedCheckpointPlan {
+    identity: String,
+    source_keys: BTreeSet<String>,
+    unclaimed_keys: BTreeSet<String>,
+}
+
+impl ResolvedCheckpointPlan {
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub(crate) fn source_keys(&self) -> &BTreeSet<String> {
+        &self.source_keys
+    }
+
+    pub(crate) fn unclaimed_keys(&self) -> &BTreeSet<String> {
+        &self.unclaimed_keys
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        identity: impl Into<String>,
+        source_keys: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            source_keys: source_keys.into_iter().map(Into::into).collect(),
+            unclaimed_keys: BTreeSet::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct PhysicalMetadata<E> {
     shape: Vec<usize>,
@@ -105,11 +143,8 @@ impl Constraint<GgufType> for GgufTensorConstraint {
         self.encoding.accepts(*encoding)
     }
     fn encoding_detail(&self) -> String {
-        match &self.encoding {
-            GgufTypeConstraint::Exact(encoding) => format!("{encoding:?}"),
-            GgufTypeConstraint::OneOf(encodings) => format!("one of {encodings:?}"),
-            GgufTypeConstraint::OperationClass(operation) => format!("a {operation:?} operation"),
-        }
+        let GgufTypeConstraint::OperationClass(operation) = &self.encoding;
+        format!("a {operation:?} operation")
     }
     fn unsupported_detail(&self, identity: &str, actual: &GgufType) -> String {
         format!(
@@ -160,12 +195,73 @@ pub(crate) fn validate_safetensors_plan(
     CheckpointValidation::from_issues(metadata_issues)
 }
 
+/// Resolves and validates the one SafeTensors layout that loading may consume.
+pub(crate) fn resolve_safetensors_plan(
+    store: &SafetensorsWeightStore,
+    plan: &SafetensorsCheckpointPlan,
+) -> Result<ResolvedCheckpointPlan, CheckpointValidation> {
+    let mut catalog = BTreeMap::new();
+    let mut metadata_issues = Vec::new();
+    for key in store.keys() {
+        match store.metadata(&key) {
+            Ok(WeightMetadata {
+                shape,
+                stored_dtype,
+                ..
+            }) => {
+                catalog.insert(
+                    key,
+                    PhysicalMetadata {
+                        shape,
+                        encoding: stored_dtype,
+                    },
+                );
+            }
+            Err(error) => metadata_issues.push(metadata_failure(&key, error)),
+        }
+    }
+    resolve_catalog(
+        &catalog,
+        &plan.identity,
+        &plan.common_tensors,
+        &plan.layout_groups,
+        &plan.catalog_policy,
+        metadata_issues,
+    )
+}
+
 /// Validates a GGUF catalog without decoding tensor payloads.
 pub(crate) fn validate_gguf_plan(
     checkpoint: &GgufCheckpoint,
     plan: &GgufCheckpointPlan,
 ) -> CheckpointValidation {
-    let catalog = checkpoint
+    let catalog = gguf_catalog(checkpoint);
+    CheckpointValidation::from_issues(validate_catalog(
+        &catalog,
+        &plan.identity,
+        &plan.common_tensors,
+        &plan.layout_groups,
+        &plan.catalog_policy,
+    ))
+}
+
+/// Resolves and validates the one GGUF layout that loading may consume.
+pub(crate) fn resolve_gguf_plan(
+    checkpoint: &GgufCheckpoint,
+    plan: &GgufCheckpointPlan,
+) -> Result<ResolvedCheckpointPlan, CheckpointValidation> {
+    resolve_catalog(
+        &gguf_catalog(checkpoint),
+        &plan.identity,
+        &plan.common_tensors,
+        &plan.layout_groups,
+        &plan.catalog_policy,
+        Vec::new(),
+    )
+}
+
+fn gguf_catalog(checkpoint: &GgufCheckpoint) -> BTreeMap<String, PhysicalMetadata<GgufType>> {
+    checkpoint
         .catalog()
         .tensors()
         .map(|tensor| {
@@ -182,14 +278,74 @@ pub(crate) fn validate_gguf_plan(
                 },
             )
         })
-        .collect::<BTreeMap<_, _>>();
-    CheckpointValidation::from_issues(validate_catalog(
-        &catalog,
-        &plan.identity,
-        &plan.common_tensors,
-        &plan.layout_groups,
-        &plan.catalog_policy,
-    ))
+        .collect()
+}
+
+fn resolve_catalog<E, T>(
+    catalog: &BTreeMap<String, PhysicalMetadata<E>>,
+    identity: &str,
+    common: &[T],
+    groups: &[AlternativeLayoutGroup<T>],
+    policy: &CatalogPolicy,
+    mut issues: Vec<CheckpointIssue>,
+) -> Result<ResolvedCheckpointPlan, CheckpointValidation>
+where
+    E: std::fmt::Debug,
+    T: Constraint<E>,
+{
+    issues.extend(validate_catalog(catalog, identity, common, groups, policy));
+    if !issues.is_empty() {
+        return Err(CheckpointValidation::from_issues(issues));
+    }
+
+    let mut source_keys = BTreeSet::new();
+    let mut select_constraint = |constraint: &T| {
+        if let Some(key) = std::iter::once(constraint.key())
+            .chain(constraint.aliases().iter().map(String::as_str))
+            .find(|key| catalog.contains_key(*key))
+        {
+            source_keys.insert(key.to_string());
+        }
+    };
+    for constraint in common {
+        select_constraint(constraint);
+    }
+
+    for group in groups {
+        if let Some(variant) = group.variants.iter().find(|variant| {
+            variant
+                .discriminator_keys
+                .iter()
+                .all(|key| discriminator_present(catalog, variant, key))
+        }) {
+            for constraint in &variant.tensors {
+                select_constraint(constraint);
+            }
+        }
+    }
+
+    let unclaimed_keys = if policy.strict {
+        BTreeSet::new()
+    } else {
+        catalog
+            .keys()
+            .filter(|key| !source_keys.contains(*key))
+            .filter(|key| !policy.explicitly_allowed_keys.contains(*key))
+            .filter(|key| {
+                !policy
+                    .allowed_prefixes
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            })
+            .cloned()
+            .collect()
+    };
+
+    Ok(ResolvedCheckpointPlan {
+        identity: identity.into(),
+        source_keys,
+        unclaimed_keys,
+    })
 }
 
 /// Validates that architecture-supplied tensor pairs use identical encodings.
@@ -886,25 +1042,40 @@ mod tests {
     }
 
     #[test]
-    fn gguf_exact_and_operation_class_constraints_are_checked() {
+    fn resolution_selects_one_layout_and_only_its_physical_sources() {
+        let plan = safe_plan(Vec::new(), alternatives(), CatalogPolicy::strict());
+        let catalog = BTreeMap::from([safe("packed", &[4, 2], StoredDtype::BF16)]);
+        let resolved = resolve_catalog(
+            &catalog,
+            &plan.identity,
+            &plan.common_tensors,
+            &plan.layout_groups,
+            &plan.catalog_policy,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.source_keys().iter().cloned().collect::<Vec<_>>(),
+            ["packed"]
+        );
+        assert!(!resolved.source_keys().contains("gate"));
+        assert!(!resolved.source_keys().contains("up"));
+    }
+
+    #[test]
+    fn gguf_operation_class_constraints_are_checked() {
         let constraints = vec![
             GgufTensorConstraint::required(
                 "index",
                 vec![2],
-                GgufTypeConstraint::OneOf(vec![GgufType::I32]),
+                GgufTypeConstraint::OperationClass(TensorOperation::I32),
             ),
             GgufTensorConstraint::required(
                 "matrix",
                 vec![2, 2],
                 GgufTypeConstraint::OperationClass(TensorOperation::Matrix),
-            )
-            .companion(),
-            GgufTensorConstraint::required(
-                "optional",
-                vec![1],
-                GgufTypeConstraint::Exact(GgufType::F32),
-            )
-            .optional(),
+            ),
             GgufTensorConstraint::required(
                 "flexible",
                 vec![2, 2],

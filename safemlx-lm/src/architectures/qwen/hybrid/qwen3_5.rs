@@ -4,14 +4,14 @@ use safemlx::{
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, ModuleParameters, ModuleParametersExt, Param},
+    module::{Module, ModuleParameters, Param},
     native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     nn,
     ops::{
         broadcast_to, concatenate_axis, conv1d, exp, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
         matmul, quantized_matmul_with_mode, quantized_packed_dimension, sigmoid, sum_axis,
-        topk_route_plan, zeros, GgufCheckpoint, GgufMetadataValue, GgufTensor, QuantizationMode,
+        topk_route_plan, zeros, GgufCheckpoint, GgufMetadataValue, QuantizationMode,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -65,15 +65,19 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
-    runtime::checkpoint::load::{
-        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
-        load_named_array_strict, load_safetensors_dir_strict_with_split_swiglu_experts,
-        load_safetensors_strict, safetensors_files, GgufTensorNames, StrictLoadConfig,
-        StrictLoadReport,
-    },
+    runtime::checkpoint::load::{gguf_metadata, gguf_quantization_configs, GgufTensorNames},
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{
+    for_each_safetensor_array, load_array_strict, load_named_array_strict,
+    load_safetensors_dir_strict_with_split_swiglu_experts, load_safetensors_strict,
+    safetensors_files, StrictLoadConfig, StrictLoadReport,
+};
+#[cfg(test)]
+use safemlx::{module::ModuleParametersExt, ops::GgufTensor};
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 /// Stateful operator policy for one Qwen3.5 or Qwen3-Next decoder layer.
@@ -4877,77 +4881,6 @@ impl Qwen35TextModel {
         profile_array(PerfComponent::FinalNorm, &h)?;
         Ok(h)
     }
-
-    pub(crate) fn forward_with_expert_executor<F>(
-        &mut self,
-        input: ModelInput<'_>,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let hidden = self.forward_hidden_with_expert_executor(input, execute, stream)?;
-        self.norm.forward(&hidden, stream)
-    }
-
-    pub(crate) fn forward_hidden_with_expert_executor<F>(
-        &mut self,
-        input: ModelInput<'_>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let ModelInput {
-            inputs,
-            inputs_embeds,
-            mask,
-            mut cache,
-        } = input;
-        let mut h = match inputs_embeds {
-            Some(inputs_embeds) => inputs_embeds.clone(),
-            None => self.embed_tokens.forward(inputs, stream)?,
-        };
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => {
-                let offset = cache.as_ref().map(|cache| cache.offset()).unwrap_or(0);
-                if h.dim(1) > 1 {
-                    match create_attention_mask(&h, &offset_cache(offset), Some(true), stream)? {
-                        Some(AttentionMask::Array(mask)) => Some(mask),
-                        Some(AttentionMask::Causal) => {
-                            return Err(Exception::custom("Only `Array` mask is supported"));
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                }
-            }
-        };
-        let cache = cache.as_mut().ok_or_else(|| {
-            Exception::custom("cached expert parallelism requires a Qwen hybrid cache")
-        })?;
-        for (index, (layer, layer_cache)) in self
-            .layers
-            .iter_mut()
-            .zip(cache.layers.iter_mut())
-            .enumerate()
-        {
-            h = layer.forward_sparse_experts(
-                BlockInput {
-                    x: &h,
-                    mask: mask.as_ref(),
-                    cache: Some(layer_cache),
-                },
-                stream,
-                |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
-            )?;
-        }
-        Ok(h)
-    }
 }
 
 /// Input for a Qwen3.5 MoE text forward pass.
@@ -5514,56 +5447,6 @@ impl Model {
         self.project_logits(&hidden_states, stream)
     }
 
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        self.reject_multimodal_tokens(inputs, false, stream)?;
-        let hidden = self.model.forward_with_expert_executor(
-            ModelInput {
-                inputs,
-                inputs_embeds: None,
-                mask: None,
-                cache: Some(cache),
-            },
-            execute,
-            stream,
-        )?;
-        self.project_logits(&hidden, stream)
-    }
-
-    pub(crate) fn forward_cached_expert_parallel_mtp<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<QwenMtpStepOutput, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        self.reject_multimodal_tokens(inputs, false, stream)?;
-        let hidden = self.model.forward_hidden_with_expert_executor(
-            ModelInput {
-                inputs,
-                inputs_embeds: None,
-                mask: None,
-                cache: Some(cache),
-            },
-            execute,
-            stream,
-        )?;
-        let normalized = self.model.norm.forward(&hidden, stream)?;
-        let logits = self.project_logits(&normalized, stream)?;
-        Ok(QwenMtpStepOutput { logits, hidden })
-    }
-
     /// Forward pass that reports activations to an observer.
     pub fn forward_with_observer(
         &mut self,
@@ -5608,9 +5491,9 @@ impl Module<ModelInput<'_>> for Model {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct LoadedQwen35Gguf {
     pub(crate) model: Model,
-    pub(crate) eos_token_ids: Vec<u32>,
 }
 
 pub(crate) struct PreparedQwen35Gguf {
@@ -5701,6 +5584,7 @@ fn qwen35_gguf_multimodal_geometry(
 }
 
 /// Loads a dense or MoE Qwen3.5 model and an optional sibling vision projector.
+#[cfg(test)]
 pub fn load_qwen3_5_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -5709,6 +5593,7 @@ pub fn load_qwen3_5_gguf(
     Ok(load_qwen3_5_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_qwen3_5_gguf_with_metadata(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -5732,6 +5617,7 @@ pub(crate) fn load_qwen3_5_gguf_with_metadata(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn load_qwen3_5_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
@@ -5925,11 +5811,7 @@ pub(crate) fn load_qwen3_5_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
-    Ok(LoadedQwen35Gguf {
-        model,
-        eos_token_ids,
-    })
+    Ok(LoadedQwen35Gguf { model })
 }
 
 pub(crate) fn prepare_qwen35_gguf_checkpoint(
@@ -6159,10 +6041,12 @@ fn qwen35_args_from_gguf_geometry(
     })
 }
 
+#[cfg(test)]
 fn qwen35_gguf_block_index(name: &str) -> Option<i32> {
     name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
 }
 
+#[cfg(test)]
 fn qwen35_translate_gguf_weight(
     name: String,
     mut value: Array,
@@ -6256,12 +6140,14 @@ fn qwen35_translate_gguf_weight(
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[cfg(test)]
 enum Qwen35AffineComponent {
     Weight,
     Scales,
     Biases,
 }
 
+#[cfg(test)]
 fn qwen35_affine_component(
     name: &str,
     value: &Array,
@@ -6289,6 +6175,7 @@ fn qwen35_affine_component(
     Ok(component)
 }
 
+#[cfg(test)]
 fn qwen35_affine_packed_head_width(
     head_dim: i32,
     affine: AffineQuantization,
@@ -6305,6 +6192,7 @@ fn qwen35_affine_packed_head_width(
     Ok(packed_bits / 32)
 }
 
+#[cfg(test)]
 fn qwen35_affine_scale_head_width(head_dim: i32, affine: AffineQuantization) -> Result<i32, Error> {
     if head_dim <= 0 || head_dim % affine.group_size != 0 {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -6315,6 +6203,7 @@ fn qwen35_affine_scale_head_width(head_dim: i32, affine: AffineQuantization) -> 
     Ok(head_dim / affine.group_size)
 }
 
+#[cfg(test)]
 fn qwen35_restore_v_tail(
     value: Array,
     prefix: i32,
@@ -6339,6 +6228,7 @@ fn qwen35_restore_v_tail(
     Ok(concatenate_axis(&[leading, tail], 0, stream)?)
 }
 
+#[cfg(test)]
 fn qwen35_restore_v_head_order(
     value: Array,
     axis: usize,
@@ -6373,6 +6263,7 @@ fn qwen35_restore_v_head_order(
         .reshape(&original_shape, stream)?)
 }
 
+#[cfg(test)]
 fn qwen35_is_offset_norm(name: &str) -> bool {
     name == "output_norm.weight"
         || (name.starts_with("blk.")
@@ -6837,6 +6728,7 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
 }
 
 /// Loads a dense or MoE Qwen3.5 model and safetensors weights from a model directory.
+#[cfg(test)]
 pub fn load_qwen3_5_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
@@ -6899,6 +6791,7 @@ pub fn load_qwen3_5_model(
 
 /// Loads a dense or MoE Qwen3.5/3.6/3.8 checkpoint while affine-quantizing eligible
 /// text weights, including packed rank-3 routed expert banks when present.
+#[cfg(test)]
 pub fn load_qwen3_5_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
@@ -6962,6 +6855,7 @@ fn quantize_packed_expert_tensor(
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct Fp8ExpertParts {
     gate: Option<Array>,
     gate_scale: Option<Array>,
@@ -6971,6 +6865,7 @@ struct Fp8ExpertParts {
     down_scale: Option<Array>,
 }
 
+#[cfg(test)]
 impl Fp8ExpertParts {
     fn is_complete(&self) -> bool {
         self.gate.is_some()
@@ -6990,6 +6885,7 @@ impl Fp8ExpertParts {
 /// and block-scale tensors without dequantizing them. Expert state spans shard
 /// boundaries, and a complete layer is packed immediately to bound residency.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn load_qwen_fp8_safetensors_dir_strict_with_transform<F>(
     model: &mut Model,
     model_dir: impl AsRef<Path>,
@@ -7093,6 +6989,7 @@ pub(crate) fn transform_split_qwen_fp8_experts(
     Ok(transformed)
 }
 
+#[cfg(test)]
 fn set_fp8_expert_part(
     parts: &mut Fp8ExpertParts,
     projection: Fp8ExpertProjection,
@@ -7109,6 +7006,7 @@ fn set_fp8_expert_part(
     }
 }
 
+#[cfg(test)]
 fn pack_fp8_expert_prefix(
     expert_parts: &mut HashMap<(String, i32), Fp8ExpertParts>,
     prefix: &str,
@@ -7256,6 +7154,7 @@ fn pack_fp8_expert_prefix(
     ]))
 }
 
+#[cfg(test)]
 fn record_fp8_expert_part_shape(
     expected: &mut Option<[i32; 2]>,
     value: &Array,
@@ -7284,12 +7183,14 @@ fn record_fp8_expert_part_shape(
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 enum Fp8ExpertProjection {
     Gate,
     Up,
     Down,
 }
 
+#[cfg(test)]
 fn parse_fp8_expert_projection_key(key: &str) -> Option<(String, i32, Fp8ExpertProjection)> {
     let (prefix, rest) = key.split_once(".mlp.experts.")?;
     let mut parts = rest.split('.');
@@ -7306,6 +7207,7 @@ fn parse_fp8_expert_projection_key(key: &str) -> Option<(String, i32, Fp8ExpertP
     Some((format!("{prefix}.mlp.experts"), expert, projection))
 }
 
+#[cfg(test)]
 fn parse_fp8_expert_scale_key(key: &str) -> Option<(String, i32, Fp8ExpertProjection)> {
     let weight_key = key
         .strip_suffix(".weight_scale_inv")
@@ -7313,6 +7215,7 @@ fn parse_fp8_expert_scale_key(key: &str) -> Option<(String, i32, Fp8ExpertProjec
     parse_fp8_expert_projection_key(&weight_key)
 }
 
+#[cfg(test)]
 pub(crate) fn qwen3_5_strict_load_config(load_visual: bool) -> StrictLoadConfig {
     let config = StrictLoadConfig::default()
         .rewrite_prefix("model.language_model.", "model.")

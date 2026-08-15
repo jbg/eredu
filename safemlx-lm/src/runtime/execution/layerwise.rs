@@ -30,7 +30,7 @@ use crate::{
     },
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::checkpoint::recipe::RecipeDtype,
-    runtime::checkpoint::store::{MemoryWeightStore, SafetensorsWeightStore, WeightStore},
+    runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
     runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
     runtime::residency::dense_stream::{
         BackgroundLayerPrefetch, BackgroundPrefetchReport, DenseDiskStreamLoadOptions,
@@ -46,8 +46,58 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use crate::runtime::checkpoint::store::MemoryWeightStore;
+
 /// Type-erased checkpoint store accepted by the generalized execution engine.
 pub type SharedWeightStore = Arc<dyn WeightStore + Send + Sync>;
+
+/// Opaque architecture-owned SafeTensors contract consumed by the generic
+/// execution engine before it asks an adapter for any runtime binding.
+pub struct ArchitectureCheckpointPlan {
+    plan: crate::runtime::checkpoint::schema::SafetensorsCheckpointPlan,
+}
+
+impl From<crate::runtime::checkpoint::schema::SafetensorsCheckpointPlan>
+    for ArchitectureCheckpointPlan
+{
+    fn from(plan: crate::runtime::checkpoint::schema::SafetensorsCheckpointPlan) -> Self {
+        Self { plan }
+    }
+}
+
+pub(crate) fn resolve_checkpoint_store<A: ArchitectureAdapter>(
+    store: SharedWeightStore,
+    adapter: &A,
+) -> Result<SharedWeightStore, Error> {
+    if store.is_checkpoint_contract_resolved()
+        || store.backend() != crate::runtime::checkpoint::store::WeightStoreBackend::Safetensors
+    {
+        return Ok(store);
+    }
+    let raw = store
+        .as_any()
+        .downcast_ref::<SafetensorsWeightStore>()
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "SafeTensors store for {} is not a raw or contract-resolved checkpoint",
+                adapter.model_type()
+            ))
+        })?;
+    let plan = adapter.safetensors_checkpoint_plan()?;
+    let resolved = crate::runtime::checkpoint::validation::resolve_safetensors_plan(
+        raw, &plan.plan,
+    )
+    .map_err(|validation| {
+        Error::UnsupportedArchitecture(format!(
+            "{} checkpoint contract did not resolve: {validation:?}",
+            adapter.model_type()
+        ))
+    })?;
+    Ok(Arc::new(
+        crate::runtime::checkpoint::store::ContractWeightStore::new(store, resolved),
+    ))
+}
 
 pub(crate) fn open_safetensors_weight_store(
     model_dir: &Path,
@@ -64,6 +114,7 @@ pub(crate) fn open_safetensors_weight_store(
 /// so it cannot be represented as a one-to-one lazy binding. The transformation
 /// is performed once, then this store hands the resulting arrays to the same
 /// generalized residency and execution engine used by native packed artifacts.
+#[cfg(test)]
 pub(crate) fn transformed_module_weight_store(
     module: &impl ModuleParameters,
 ) -> Result<SharedWeightStore, Error> {
@@ -1916,6 +1967,10 @@ pub trait ArchitectureAdapter: Sized {
     fn model_type(&self) -> &str {
         std::any::type_name::<Self>()
     }
+
+    /// Returns the architecture-owned physical contract used to resolve the
+    /// SafeTensors store before any binding recipe is inferred or materialized.
+    fn safetensors_checkpoint_plan(&self) -> Result<ArchitectureCheckpointPlan, Error>;
 
     /// Model-wide checkpoint quantization, when one uniform encoding exists.
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
@@ -3954,6 +4009,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
 }
 
 /// Builds a generalized layerwise model with independently bounded groups.
+#[cfg(test)]
 pub(crate) fn load_safetensors_layerwise_model<A, O>(
     model_dir: impl AsRef<Path>,
     adapter: A,
@@ -4128,6 +4184,7 @@ where
     O: Into<LayerWeightResidency>,
 {
     let options = options.into();
+    let store = resolve_checkpoint_store(store, &source_adapter)?;
     match quantization {
         Some(quantization) => {
             let target_adapter = source_adapter.load_time_quantized(quantization, stream)?;
@@ -4163,6 +4220,7 @@ where
     O: Into<LayerWeightResidency>,
 {
     let options = options.into();
+    let store = resolve_checkpoint_store(store, &source_adapter)?;
     match quantization {
         Some(quantization) => {
             let target_adapter = source_adapter.load_time_quantized(quantization, stream)?;
@@ -4449,6 +4507,7 @@ where
     A: ArchitectureAdapter,
     O: Into<LayerWeightResidency>,
 {
+    let store = resolve_checkpoint_store(store, &adapter)?;
     let options = options.into();
     let fully_resident = options.is_fully_resident();
     let dense = options.dense();
@@ -4674,6 +4733,7 @@ where
     A: ArchitectureAdapter,
     O: Into<LayerWeightResidency>,
 {
+    let store = resolve_checkpoint_store(store, &adapter)?;
     let options = options.into();
     let fully_resident = options.is_fully_resident();
     let dense = options.dense();
@@ -5285,6 +5345,7 @@ where
     let unused = store
         .keys()
         .into_iter()
+        .chain(store.unclaimed_checkpoint_keys())
         .filter(|key| !consumed.contains(key))
         .filter(|key| !ignored(key))
         .collect::<Vec<_>>();

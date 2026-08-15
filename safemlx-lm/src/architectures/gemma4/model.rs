@@ -24,7 +24,7 @@ use safemlx::{
         concatenate_axis, dequantize_with_mode, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
         mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt,
-        sum_axis, tanh, topk_route_plan, GgufCheckpoint, GgufEndian, GgufMetadataValue, GgufType,
+        sum_axis, tanh, topk_route_plan, GgufCheckpoint, GgufEndian, GgufMetadataValue,
         QuantizationMode,
     },
     quantization::MaybeQuantized,
@@ -71,13 +71,17 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache,
     },
     runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
-        load_named_iq_array_strict, load_safetensors_quantized_strict, load_safetensors_strict,
-        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
+        gguf_metadata, gguf_quantization_configs, load_safetensors_quantized_strict,
+        load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::ActivationObserver,
 };
+
+#[cfg(test)]
+use crate::runtime::checkpoint::load::{load_named_array_strict, load_named_iq_array_strict};
+#[cfg(test)]
+use safemlx::ops::GgufType;
 
 #[derive(Debug, Clone, Default)]
 /// Profiling counters accumulated by Gemma 4 when profiling is enabled.
@@ -4329,11 +4333,9 @@ pub fn load_gemma4_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, E
     Tokenizer::from_file(file).map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) struct LoadedGemma4Gguf {
     pub(crate) model: Model,
-    pub(crate) vision_config: Option<Gemma4VisionConfig>,
-    pub(crate) audio_config: Option<Gemma4AudioConfig>,
-    pub(crate) eos_token_ids: Vec<u32>,
 }
 
 pub(crate) struct PreparedGemma4Gguf {
@@ -4371,6 +4373,7 @@ pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<Gemma4Mmpro
 /// Dense tensors and every GGUF quantization supported by the shared backend are
 /// accepted for both dense and MoE text checkpoints. A unique nearby
 /// `mmproj-*.gguf` supplies the vision/audio towers when present.
+#[cfg(test)]
 pub fn load_gemma4_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -4380,6 +4383,7 @@ pub fn load_gemma4_gguf(
 }
 
 /// Loads a Gemma 4 text GGUF with an explicit vision/audio projector GGUF.
+#[cfg(test)]
 pub fn load_gemma4_gguf_with_mmproj(
     gguf_file: impl AsRef<Path>,
     mmproj_file: impl AsRef<Path>,
@@ -4405,6 +4409,7 @@ pub fn load_gemma4_gguf_with_mmproj(
     .model)
 }
 
+#[cfg(test)]
 pub(crate) fn load_gemma4_gguf_with_metadata(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -4424,6 +4429,7 @@ pub(crate) fn load_gemma4_gguf_with_metadata(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn load_gemma4_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
@@ -4433,8 +4439,6 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
     weights_stream: &Stream,
 ) -> Result<LoadedGemma4Gguf, Error> {
     let prepared = prepare_gemma4_gguf_checkpoint(checkpoint, &metadata, projector, quantization)?;
-    let vision_config = prepared.vision_config.clone();
-    let audio_config = prepared.audio_config.clone();
     let mut model = Model::new_with_modalities(
         prepared.args,
         prepared.image_token_id,
@@ -4491,12 +4495,7 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
-    Ok(LoadedGemma4Gguf {
-        model,
-        vision_config,
-        audio_config,
-        eos_token_ids: prepared.eos_token_ids,
-    })
+    Ok(LoadedGemma4Gguf { model })
 }
 
 pub(crate) fn prepare_gemma4_gguf_checkpoint(
@@ -4905,6 +4904,7 @@ pub(crate) fn translate_mmproj_weight_name(name: &str) -> String {
     name.to_string()
 }
 
+#[cfg(test)]
 fn load_gemma4_mmproj_weights(
     model: &mut Model,
     projector: &Gemma4MmprojGguf,
@@ -4950,6 +4950,7 @@ fn gguf_optional_bool(
     }
 }
 
+#[cfg(test)]
 fn load_gemma4_gguf_weights(
     model: &mut Model,
     checkpoint: &GgufCheckpoint,
@@ -5173,6 +5174,7 @@ fn load_gemma4_gguf_weights(
     Ok(())
 }
 
+#[cfg(test)]
 fn native_gguf_shape(shape: Vec<u64>, name: &str) -> Result<Vec<i32>, Error> {
     shape
         .into_iter()
@@ -5186,6 +5188,7 @@ fn native_gguf_shape(shape: Vec<u64>, name: &str) -> Result<Vec<i32>, Error> {
         .collect()
 }
 
+#[cfg(test)]
 fn attach_native_linear(
     linear: &mut MaybeQuantized<nn::Linear>,
     target: &str,
@@ -5220,6 +5223,7 @@ fn attach_native_linear(
     Ok(true)
 }
 
+#[cfg(test)]
 fn attach_native_expert_projection(
     projection: &mut ExpertProjection,
     target: &str,
@@ -5248,6 +5252,7 @@ fn attach_native_expert_projection(
     Ok(true)
 }
 
+#[cfg(test)]
 fn attach_native_embedding(
     embedding: &mut Gemma4Embedding,
     target: &str,
@@ -5280,6 +5285,7 @@ fn attach_native_embedding(
 ///
 /// The dispatch is model-layer integration only: physical decoding and
 /// device policy remain in `safemlx::native_quantization`.
+#[cfg(test)]
 fn attach_native_quantized(
     model: &mut Model,
     target: &str,
