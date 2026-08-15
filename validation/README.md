@@ -89,7 +89,7 @@ modality-specific reference runners.
 The pilot uses this immutable image reference:
 
 ```text
-ghcr.io/jbg/safemlx-validation@sha256:80ee8fd1393b1db2e3954b206faa3fa6beb5c0631d762d99fb60c68dbf8542f9
+ghcr.io/jbg/safemlx-validation@sha256:3a2cd1dff93aa3dac986b1b21392fe4518f0cc6d674aa8d57a934b71097cdff0
 ```
 
 Mount this directory at `/opt/pilot` and a persistent artifact destination at
@@ -104,3 +104,5 @@ python /opt/pilot/run_pilot_case.py \
 
 The case directory always receives `pilot-summary.json`, including partial
 phase evidence if a download, load, correctness, or performance phase fails.
+The first five-family L4 pilot and its findings are recorded in
+`doc/cuda-validation-pilot-2026-08-15.md`.

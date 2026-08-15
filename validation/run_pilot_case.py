@@ -18,12 +18,14 @@ from typing import Optional, Sequence
 import yaml
 from huggingface_hub import snapshot_download
 
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", required=True)
     parser.add_argument(
-        "--manifest", type=pathlib.Path, default=pathlib.Path("/opt/pilot/models.yaml")
+        "--manifest", type=pathlib.Path, default=SCRIPT_DIR / "models.yaml"
     )
     parser.add_argument("--output-root", type=pathlib.Path, required=True)
     parser.add_argument(
@@ -258,7 +260,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         profile = manifest["correctness_profiles"][case["correctness_profile"]]
         reference_command = [
             "python",
-            "/opt/pilot/reference_runner.py",
+            str(SCRIPT_DIR / "reference_runner.py"),
             "--probe",
             str(actual_json),
             "--model",
@@ -289,7 +291,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         comparison_status = run_command(
             [
                 "python",
-                "/opt/pilot/compare_checkpoints.py",
+                str(SCRIPT_DIR / "compare_checkpoints.py"),
                 "--actual",
                 str(actual_json),
                 "--reference",
