@@ -5,11 +5,8 @@ use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
     api::realtime::{RealtimeInferenceScheduler, RealtimeSampling, RealtimeStepInput},
     load_realtime_model,
-    runtime::{
-        generation::sampler::DefaultSampler,
-        scheduler::{RequestId, SchedulerLimits},
-    },
-    LoadedRealtimeModel,
+    runtime::generation::sampler::DefaultSampler,
+    LoadedRealtimeModel, RequestId, SchedulerLimits,
 };
 
 const SAMPLE_RATE: f64 = 24_000.0;

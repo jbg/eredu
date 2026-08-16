@@ -29,11 +29,10 @@ use safemlx_lm::{
     runtime::generation::sampler::DefaultSampler,
     runtime::media::input::{InputMetadata, InputPart, ModelInput},
     runtime::media::PreparedModelInput,
-    runtime::scheduler::{RequestId, RequestStatus, SchedulerLimits},
     CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
     LayerwiseLoadOptions, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions,
-    ParallelTopology, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-    WeightResidency,
+    ParallelTopology, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, RequestId,
+    RequestStatus, SchedulerLimits, WeightResidency,
 };
 
 const WORKER: &str = "SAFEMLX_QWEN3_VL_PIPELINE_WORKER";

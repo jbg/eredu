@@ -65,7 +65,8 @@ architectures. The MLX backend performs architecture dispatch internally.
 Realtime Moshi/PersonaPlex requests use the backend-neutral core scheduler;
 only their tensor execution and exact MLX completion adapter remain here.
 Distributed pipeline schedule, cancellation, and completion agreement use the
-core consensus protocol through the MLX collective adapter.
+same core scheduler through the MLX collective and completion adapters; the
+facade does not maintain a second lifecycle implementation.
 
 ## Automatic execution planning
 

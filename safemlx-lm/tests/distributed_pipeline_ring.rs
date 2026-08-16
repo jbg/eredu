@@ -38,12 +38,11 @@ use safemlx_lm::{
         checkpoint::quantization::{AffineQuantization, WeightQuantization},
         media::{input::InputPayload, PreparedModelInput},
         residency::policy::OffloadConfig,
-        scheduler::{RequestId, RequestStatus, SchedulerLimits},
     },
     CacheResidencyPolicy, CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment,
     ExpertCacheLoadOptions, LayerwiseLoadOptions, ModelLoadOptions, NonExpertWeightResidency,
     PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
-    PromptCacheTopology, WeightResidency,
+    PromptCacheTopology, RequestId, RequestStatus, SchedulerLimits, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 

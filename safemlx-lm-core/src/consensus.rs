@@ -288,9 +288,11 @@ mod tests {
     use super::*;
     use std::{cell::RefCell, convert::Infallible};
 
+    type GatherMutation = dyn FnMut(&mut [u32], usize);
+
     struct MockTransport {
         participants: usize,
-        mutate: RefCell<Option<Box<dyn FnMut(&mut [u32], usize)>>>,
+        mutate: RefCell<Option<Box<GatherMutation>>>,
     }
 
     impl MockTransport {

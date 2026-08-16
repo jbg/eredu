@@ -12,9 +12,10 @@ prefill/decode without implementing a primitive tensor algebra.
 The production Moshi/PersonaPlex realtime scheduler uses the core request state
 machine. Its MLX adapter supplies opaque work, session branches, submissions,
 and exact completions while core owns fairness and transactional publication.
-Core also owns distributed scheduler protocol framing and fail-closed schedule,
-disposition, and completion agreement. Backends implement only the portable
-`ConsensusTransport` word collective.
+Distributed pipeline requests use that same state machine, including poisoning
+and exact failure retention. Core also owns protocol framing and fail-closed
+schedule, disposition, and completion agreement. Backends implement only the
+portable `ConsensusTransport` word collective.
 
 See [the backend architecture guide](../doc/backend-architecture.md) for the
 ownership boundary and backend implementation checklist.

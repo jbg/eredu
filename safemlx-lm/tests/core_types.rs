@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 #[test]
-fn moved_attention_types_keep_facade_paths() {
+fn facade_exports_are_the_canonical_core_types() {
     assert_eq!(
         TypeId::of::<safemlx_lm::AttentionPolicy>(),
         TypeId::of::<safemlx_lm::core::attention::AttentionPolicy>(),
@@ -15,5 +15,13 @@ fn moved_attention_types_keep_facade_paths() {
     assert_eq!(
         TypeId::of::<safemlx_lm::SchedulerLimits>(),
         TypeId::of::<safemlx_lm::core::scheduler::SchedulerLimits>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::SchedulerReport>(),
+        TypeId::of::<safemlx_lm::core::scheduler::SchedulerReport>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::SchedulerError>(),
+        TypeId::of::<safemlx_lm::core::scheduler::SchedulerError>(),
     );
 }

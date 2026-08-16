@@ -21,10 +21,8 @@ use crate::{
     },
     error::Error,
     runtime::checkpoint::quantization::WeightQuantization,
-    runtime::{
-        generation::sampler::Sampler,
-        scheduler::{RequestId, WorkId},
-    },
+    runtime::generation::sampler::Sampler,
+    RequestId, WorkId,
 };
 
 /// Hugging Face repository for the released PersonaPlex checkpoint.
@@ -484,10 +482,8 @@ mod tests {
         api::realtime::{
             RealtimeInferenceScheduler, RealtimeModelKind, RealtimeSampling, RealtimeStepInput,
         },
-        runtime::{
-            generation::sampler::DefaultSampler,
-            scheduler::{RequestId, SchedulerLimits},
-        },
+        runtime::generation::sampler::DefaultSampler,
+        RequestId, SchedulerLimits,
     };
     use safemlx::{Array, Device, DeviceType, ExecutionContext};
 

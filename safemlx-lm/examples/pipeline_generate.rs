@@ -10,8 +10,7 @@ use safemlx_lm::{
         PipelineMicrobatchInput, PipelineStep,
     },
     runtime::generation::sampler::DefaultSampler,
-    runtime::scheduler::{RequestId, RequestStatus, SchedulerLimits},
-    DeviceAssignment, ParallelTopology,
+    DeviceAssignment, ParallelTopology, RequestId, RequestStatus, SchedulerLimits,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -31,11 +31,10 @@ use safemlx_lm::{
             PreparedModelInput,
         },
         residency::policy::OffloadConfig,
-        scheduler::{RequestId, SchedulerLimits},
     },
     CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions,
     ModelLoadOptions, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology, WeightResidency,
+    PromptCacheOptions, PromptCacheTopology, RequestId, SchedulerLimits, WeightResidency,
 };
 
 const WORKER: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_WORKER";

@@ -20,5 +20,3 @@ pub mod generation;
 pub mod media;
 /// Weight-residency planning and execution.
 pub mod residency;
-/// Bounded fair local/distributed request scheduling.
-pub mod scheduler;

@@ -38,6 +38,10 @@ use safemlx::{
     transforms::eval,
     Array, Dtype, Stream,
 };
+use safemlx_lm_core::scheduler::{
+    RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerLimits, SchedulerReport,
+    SemanticStateTransaction, TransitionOutput, WorkDescriptor, WorkId,
+};
 
 use crate::{
     api::{
@@ -123,10 +127,6 @@ use crate::{
     },
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
-    },
-    runtime::scheduler::{
-        FairScheduler, RequestId, RequestStatus, SchedulerCapabilities, SchedulerLimits,
-        SchedulerReport, SemanticStateTransaction, TransitionOutput, WorkDescriptor, WorkId,
     },
 };
 
@@ -828,12 +828,19 @@ impl PipelineStageCompletion {
 }
 
 impl TransitionOutput for PipelineStageCompletion {
+    type Error = Error;
+
     fn is_complete(&self) -> Result<bool, Error> {
         self.inner.is_complete()
     }
 
-    fn backend(&self) -> Result<safemlx::EventBackend, Error> {
-        self.inner.backend()
+    fn backend_name(&self) -> Option<String> {
+        self.inner.backend().ok().map(|backend| match backend {
+            safemlx::EventBackend::None => "none".into(),
+            safemlx::EventBackend::Cpu => "cpu".into(),
+            safemlx::EventBackend::Metal => "metal".into(),
+            safemlx::EventBackend::Cuda => "cuda".into(),
+        })
     }
 
     fn retained_resources(&self) -> usize {
@@ -1303,6 +1310,7 @@ struct PipelineRequestState {
 
 impl SemanticStateTransaction for PipelineRequestState {
     type Branch = PipelineRequestBranch;
+    type Error = Error;
 
     fn branch(&self) -> Result<Self::Branch, Error> {
         // Array and sealed-cache backing is shared; only mutable cache tails
@@ -1346,6 +1354,8 @@ struct ScheduledPipelineMicrobatch {
 }
 
 impl WorkDescriptor for ScheduledPipelineMicrobatch {
+    type Error = Error;
+
     fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
         output.extend_from_slice(&[
             self.phase.wire_tag(),
@@ -1390,7 +1400,7 @@ pub struct PipelineInferenceScheduler {
     architecture_fingerprint: String,
     cache_pool: Option<CacheResidencyPool>,
     scheduler:
-        FairScheduler<ScheduledPipelineMicrobatch, PipelineRequestState, PipelineStageCompletion>,
+        Scheduler<ScheduledPipelineMicrobatch, PipelineRequestState, PipelineStageCompletion>,
 }
 
 impl PipelineInferenceScheduler {
@@ -1402,7 +1412,7 @@ impl PipelineInferenceScheduler {
             global_layer_range: model.info.global_layer_range.clone(),
             architecture_fingerprint: model.prompt_cache_architecture_fingerprint()?,
             cache_pool: None,
-            scheduler: FairScheduler::new(limits)?,
+            scheduler: Scheduler::new(limits)?,
         })
     }
 
@@ -1428,14 +1438,14 @@ impl PipelineInferenceScheduler {
         self.scheduler.validate_registration(request)?;
         let cache = model.new_cache()?;
         self.validate_cache(model, &cache)?;
-        self.scheduler.register(
+        Ok(self.scheduler.register(
             request,
             PipelineRequestState {
                 cache,
                 batch_size: None,
                 last_phase: None,
             },
-        )
+        )?)
     }
 
     /// Registers a request with a fresh cache under an explicit residency policy.
@@ -1450,14 +1460,14 @@ impl PipelineInferenceScheduler {
         let policy = self.bind_cache_policy(policy)?;
         let cache = model.new_cache_with_options(policy)?;
         self.validate_cache(model, &cache)?;
-        self.scheduler.register(
+        Ok(self.scheduler.register(
             request,
             PipelineRequestState {
                 cache,
                 batch_size: None,
                 last_phase: None,
             },
-        )
+        )?)
     }
 
     /// Registers a request with a restored or caller-created stage-local cache.
@@ -1473,14 +1483,14 @@ impl PipelineInferenceScheduler {
         if let Some(manager) = cache.residency_manager.as_ref() {
             self.bind_existing_cache_pool(manager.pool())?;
         }
-        self.scheduler.register(
+        Ok(self.scheduler.register(
             request,
             PipelineRequestState {
                 cache,
                 batch_size: None,
                 last_phase: None,
             },
-        )
+        )?)
     }
 
     /// Submits one rank-local microbatch and returns its ordered work identity.
@@ -1655,23 +1665,20 @@ impl PipelineInferenceScheduler {
                 }
             },
         )?;
-        if let Some(failure) = progress.failed.first() {
+        if let Some((work, failure)) = progress.failed.first() {
             return Err(Error::Parallel(format!(
                 "pipeline work {:?} failed asynchronously: {}",
-                failure.id, failure.error
+                work, failure
             )));
         }
         Ok(progress
             .committed
             .into_iter()
-            .map(|completed| {
-                let (work, input, completion) = completed.into_parts();
-                PipelineMicrobatchOutput {
-                    work,
-                    phase: input.phase,
-                    step: input.step,
-                    completion,
-                }
+            .map(|(work, input, completion)| PipelineMicrobatchOutput {
+                work,
+                phase: input.phase,
+                step: input.step,
+                completion,
             })
             .collect())
     }
@@ -1738,23 +1745,20 @@ impl PipelineInferenceScheduler {
                 }
             },
         )?;
-        if let Some(failure) = progress.failed.first() {
+        if let Some((work, failure)) = progress.failed.first() {
             return Err(Error::Parallel(format!(
                 "pipeline work {:?} failed asynchronously: {}",
-                failure.id, failure.error
+                work, failure
             )));
         }
         Ok(progress
             .committed
             .into_iter()
-            .map(|completed| {
-                let (work, input, completion) = completed.into_parts();
-                PipelineMicrobatchOutput {
-                    work,
-                    phase: input.phase,
-                    step: input.step,
-                    completion,
-                }
+            .map(|(work, input, completion)| PipelineMicrobatchOutput {
+                work,
+                phase: input.phase,
+                step: input.step,
+                completion,
             })
             .collect())
     }
@@ -1763,7 +1767,7 @@ impl PipelineInferenceScheduler {
     ///
     /// Any speculative work still queued for the request is discarded.
     pub fn finish_request(&mut self, request: RequestId) -> Result<(), Error> {
-        self.scheduler.finish(request)
+        Ok(self.scheduler.finish(request)?)
     }
 
     /// Cancels local work before distributed execution begins.
@@ -1771,7 +1775,7 @@ impl PipelineInferenceScheduler {
     /// Once ranks are executing, use [`Self::cancel_request_distributed`] or
     /// [`Self::cancel_request_cartesian`] so disposition reaches consensus.
     pub fn cancel_request(&mut self, request: RequestId) -> Result<(), Error> {
-        self.scheduler.cancel(request)
+        Ok(self.scheduler.cancel(request)?)
     }
 
     /// Reaches exact group consensus, then cancels or abandons this request.
@@ -1784,7 +1788,8 @@ impl PipelineInferenceScheduler {
         let protocol = 0x5049_5045_0002_0000u64 | self.model_kind as u64;
         let consensus = MlxConsensusTransport::new(group, stream);
         self.scheduler
-            .cancel_distributed(protocol, request, &consensus)
+            .cancel_distributed(protocol, request, &consensus, Instant::now())
+            .map_err(Into::into)
     }
 
     /// Reaches world consensus for a Cartesian pipeline cancellation.
@@ -1802,7 +1807,8 @@ impl PipelineInferenceScheduler {
         let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
         let consensus = MlxConsensusTransport::new(cartesian.world(), stream);
         self.scheduler
-            .cancel_distributed(protocol, request, &consensus)
+            .cancel_distributed(protocol, request, &consensus, Instant::now())
+            .map_err(Into::into)
     }
 
     /// Releases an idle active request and returns its cache to the caller.
@@ -1815,7 +1821,7 @@ impl PipelineInferenceScheduler {
 
     /// Removes a terminal identity so a caller may explicitly reuse it.
     pub fn forget_terminal_request(&mut self, request: RequestId) -> Result<RequestStatus, Error> {
-        self.scheduler.forget_terminal(request)
+        Ok(self.scheduler.forget_terminal(request)?)
     }
 
     /// Returns the known request lifecycle state.
@@ -1848,6 +1854,24 @@ impl PipelineInferenceScheduler {
                     .map_err(|error| Error::Parallel(error.to_string()))
             })
             .transpose()
+    }
+
+    /// Polls locally retained submissions after consensus poisoning.
+    ///
+    /// This performs no collective and never publishes request state. It
+    /// returns `true` once every MLX completion retained at the poison boundary
+    /// has reached an exact local terminal state and its resources were freed.
+    pub fn poll_poisoned_completions(&mut self) -> Result<bool, Error> {
+        if self.scheduler.poison_reason().is_none() {
+            return Err(Error::Parallel("pipeline scheduler is not poisoned".into()));
+        }
+        let progress = self.scheduler.poll_completions(Instant::now());
+        if let Some((work, error)) = progress.failed.first() {
+            return Err(Error::Parallel(format!(
+                "poisoned pipeline work {work:?} failed during local completion release: {error}"
+            )));
+        }
+        Ok(self.scheduler.report().current_in_flight_work == 0)
     }
 
     /// Returns the failure that invalidated this scheduler, if any.

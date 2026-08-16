@@ -1,5 +1,9 @@
 //! Fair transactional scheduling independent of event and tensor runtimes.
 
+use crate::consensus::{
+    resolve_completions, validate_disposition, validate_schedule, CompletionObservation,
+    CompletionResolution, ConsensusTransport, ScheduledWork,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -245,6 +249,7 @@ struct Queued<W> {
 struct Prepared<W, B> {
     id: WorkId,
     work: W,
+    descriptor: Vec<u32>,
     branch: B,
     deadline: Option<Instant>,
 }
@@ -253,6 +258,7 @@ struct Prepared<W, B> {
 enum Disposition {
     Publish,
     Abandon { cancelled_at: Instant },
+    Fail,
 }
 
 #[derive(Debug)]
@@ -313,6 +319,8 @@ pub struct SchedulerReport {
     pub completing_work: usize,
     /// Cancelled submitted work awaiting exact completion.
     pub abandoned_in_flight_work: usize,
+    /// Globally failed work retained until every rank reaches completion.
+    pub failed_in_flight_work: usize,
     /// All submitted work, including abandoned work.
     pub current_in_flight_work: usize,
     /// Peak submitted work.
@@ -353,9 +361,12 @@ pub struct SchedulerReport {
     pub configured_submission_bound: usize,
     /// Configured execution-slice bound.
     pub configured_slice_bound: usize,
+    /// Whether unsafe distributed ordering poisoned the scheduler.
+    pub poisoned: bool,
 }
 
 /// Fair scheduler whose state transitions are independent of backend objects.
+#[derive(Debug)]
 pub struct Scheduler<W, S: SemanticStateTransaction, O: TransitionOutput> {
     limits: SchedulerLimits,
     requests: BTreeMap<RequestId, Request<W, S>>,
@@ -383,6 +394,7 @@ pub struct Scheduler<W, S: SemanticStateTransaction, O: TransitionOutput> {
     drain_cycles: u64,
     observed_backends: BTreeSet<String>,
     all_outputs_preemptible: bool,
+    poisoned: Option<String>,
 }
 
 impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
@@ -423,11 +435,13 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             drain_cycles: 0,
             observed_backends: BTreeSet::new(),
             all_outputs_preemptible: true,
+            poisoned: None,
         })
     }
 
     /// Validates identity and active-request capacity before allocating state.
     pub fn validate_registration(&self, id: RequestId) -> Result<(), SchedulerError> {
+        self.ensure_ready()?;
         if self.requests.contains_key(&id) || self.terminal.contains_key(&id) {
             return Err(SchedulerError::DuplicateRequest(id));
         }
@@ -461,6 +475,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
 
     /// Returns mutable canonical state only while no branch exists.
     pub fn request_state_mut(&mut self, id: RequestId) -> Result<&mut S, SchedulerError> {
+        self.ensure_ready()?;
         if self.branch_count(id) != 0 {
             return Err(SchedulerError::State(format!(
                 "request {} has prepared or submitted state branches",
@@ -508,6 +523,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         request: RequestId,
         work: Vec<(W, Option<Instant>)>,
     ) -> Result<Vec<WorkId>, SchedulerError> {
+        self.ensure_ready()?;
         let requested = work.len();
         let accepted_after = self
             .accepted_work
@@ -552,6 +568,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
     where
         W: WorkDescriptor,
     {
+        self.ensure_ready()?;
         if limit == 0 {
             return Err(SchedulerError::Capacity(
                 "scheduler preparation bound must be positive".into(),
@@ -618,6 +635,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             self.prepared.push_back(Prepared {
                 id: queued.id,
                 work: queued.work,
+                descriptor,
                 branch,
                 deadline: queued.deadline,
             });
@@ -635,6 +653,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
     where
         E: std::error::Error,
     {
+        self.ensure_ready()?;
         self.expire_deadlines(now)?;
         let capacity = self
             .limits
@@ -700,9 +719,12 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 Ok(true) => self.resolve_completed(submitted, now, &mut progress),
                 Err(error) => {
                     let id = submitted.id;
+                    let already_failed = matches!(submitted.disposition, Disposition::Fail);
                     let discard = S::discard_branch(submitted.branch).err();
                     self.lifecycle.insert(id, WorkLifecycle::Failed);
-                    self.failed_work = self.failed_work.saturating_add(1);
+                    if !already_failed {
+                        self.failed_work = self.failed_work.saturating_add(1);
+                    }
                     self.accepted_work = self.accepted_work.saturating_sub(1);
                     self.fail_request(id.request());
                     progress.failed.push((
@@ -733,8 +755,92 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         progress
     }
 
+    /// Runs one bounded local scheduling turn.
+    pub fn run_local_turn<E>(
+        &mut self,
+        now: Instant,
+        execute: impl FnMut(WorkId, &W, &mut S::Branch) -> Result<O, E>,
+    ) -> Result<SchedulerProgress<W, O>, SchedulerError>
+    where
+        W: WorkDescriptor,
+        E: std::error::Error,
+    {
+        self.ensure_ready()?;
+        let mut progress = self.poll_completions(now);
+        self.prepare_bounded(self.limits.max_new_submissions_per_turn, now)?;
+        progress.newly_submitted = self.submit_prepared(now, execute)?;
+        let after_submit = self.poll_completions(now);
+        progress.committed.extend(after_submit.committed);
+        progress.failed.extend(after_submit.failed);
+        Ok(progress)
+    }
+
+    /// Runs one bounded turn with topology-wide schedule and completion consensus.
+    pub fn run_distributed_turn<T, E>(
+        &mut self,
+        protocol: u64,
+        transport: &T,
+        now: Instant,
+        execute: impl FnMut(WorkId, &W, &mut S::Branch) -> Result<O, E>,
+    ) -> Result<SchedulerProgress<W, O>, SchedulerError>
+    where
+        W: WorkDescriptor,
+        T: ConsensusTransport,
+        E: std::error::Error,
+    {
+        self.ensure_ready()?;
+        self.expire_deadlines_distributed(protocol, transport, now)?;
+        let mut progress = self.poll_distributed(protocol, transport, now)?;
+        self.prepare_bounded(self.limits.max_new_submissions_per_turn, now)?;
+        let plan = self
+            .prepared
+            .iter()
+            .take(
+                self.limits
+                    .max_in_flight_global
+                    .saturating_sub(self.submitted.len())
+                    .min(self.limits.max_new_submissions_per_turn),
+            )
+            .map(|work| ScheduledWork {
+                id: work.id,
+                descriptor: &work.descriptor,
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = validate_schedule(transport, &plan, self.drain_cycles, protocol) {
+            self.poison(error.to_string(), now);
+            return Err(SchedulerError::Consensus(error.to_string()));
+        }
+        progress.newly_submitted = match self.submit_prepared(now, execute) {
+            Ok(count) => count,
+            Err(error) => {
+                self.poison(error.to_string(), now);
+                return Err(error);
+            }
+        };
+        Ok(progress)
+    }
+
+    /// Reaches topology-wide consensus before cancelling a request.
+    pub fn cancel_distributed<T: ConsensusTransport>(
+        &mut self,
+        protocol: u64,
+        request: RequestId,
+        transport: &T,
+        now: Instant,
+    ) -> Result<(), SchedulerError> {
+        self.ensure_ready()?;
+        if let Err(error) =
+            validate_disposition(transport, protocol, request, CancellationCause::Explicit)
+        {
+            self.poison(error.to_string(), now);
+            return Err(SchedulerError::Consensus(error.to_string()));
+        }
+        self.cancel_internal(request, CancellationCause::Explicit, now)
+    }
+
     /// Marks a request finished and discards its queued work.
     pub fn finish(&mut self, request: RequestId) -> Result<(), SchedulerError> {
+        self.ensure_ready()?;
         if self
             .submitted
             .iter()
@@ -777,6 +883,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
 
     /// Releases an idle request and returns its canonical state.
     pub fn release(&mut self, request: RequestId) -> Result<S, SchedulerError> {
+        self.ensure_ready()?;
         let entry = self
             .requests
             .get(&request)
@@ -796,6 +903,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
 
     /// Removes a terminal identity so it may be reused explicitly.
     pub fn forget_terminal(&mut self, request: RequestId) -> Result<RequestStatus, SchedulerError> {
+        self.ensure_ready()?;
         if self
             .submitted
             .iter()
@@ -850,6 +958,11 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             .iter()
             .filter(|work| matches!(work.disposition, Disposition::Abandon { .. }))
             .count();
+        let failed = self
+            .submitted
+            .iter()
+            .filter(|work| matches!(work.disposition, Disposition::Fail))
+            .count();
         SchedulerReport {
             active_requests: self.requests.len(),
             queued_work: self
@@ -858,9 +971,10 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 .map(|entry| entry.pending.len())
                 .sum(),
             prepared_work: self.prepared.len(),
-            submitted_in_flight_work: self.submitted.len() - abandoned,
+            submitted_in_flight_work: self.submitted.len() - abandoned - failed,
             completing_work: 0,
             abandoned_in_flight_work: abandoned,
+            failed_in_flight_work: failed,
             current_in_flight_work: self.submitted.len(),
             peak_in_flight_work: self.peak_in_flight_work,
             peak_queued_work: self.peak_accepted_work,
@@ -885,7 +999,13 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             drain_cycles: self.drain_cycles,
             configured_submission_bound: self.limits.max_new_submissions_per_turn,
             configured_slice_bound: self.limits.execution_slice,
+            poisoned: self.poisoned.is_some(),
         }
+    }
+
+    /// Returns the unsafe distributed-ordering failure, if one occurred.
+    pub fn poison_reason(&self) -> Option<&str> {
+        self.poisoned.as_deref()
     }
 
     fn resolve_completed(
@@ -953,7 +1073,88 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                     .committed
                     .push((submitted.id, submitted.work, submitted.output));
             }
+            Disposition::Fail => {
+                let discard = S::discard_branch(submitted.branch).err();
+                self.lifecycle.insert(submitted.id, WorkLifecycle::Failed);
+                self.accepted_work = self.accepted_work.saturating_sub(1);
+                self.fail_request(submitted.id.request());
+                progress.failed.push((
+                    submitted.id,
+                    SchedulerError::DistributedCompletion(discard.map_or_else(
+                        || "backend completion failed on at least one rank".into(),
+                        |error| {
+                            format!(
+                                "backend completion failed on at least one rank; branch discard also failed: {error}"
+                            )
+                        },
+                    )),
+                ));
+            }
         }
+    }
+
+    fn poll_distributed<T: ConsensusTransport>(
+        &mut self,
+        protocol: u64,
+        transport: &T,
+        now: Instant,
+    ) -> Result<SchedulerProgress<W, O>, SchedulerError> {
+        let local = self
+            .submitted
+            .iter()
+            .map(|work| {
+                let status = match work.output.is_complete() {
+                    Ok(false) => CompletionObservation::Incomplete,
+                    Ok(true) => CompletionObservation::Complete,
+                    Err(_) => CompletionObservation::Failed,
+                };
+                (work.id, status)
+            })
+            .collect::<Vec<_>>();
+        let global = match resolve_completions(transport, protocol, &local) {
+            Ok(global) => global,
+            Err(error) => {
+                self.poison(error.to_string(), now);
+                return Err(SchedulerError::Consensus(error.to_string()));
+            }
+        };
+
+        let mut progress = SchedulerProgress::default();
+        let mut retained = Vec::with_capacity(self.submitted.len());
+        for (mut work, status) in std::mem::take(&mut self.submitted).into_iter().zip(global) {
+            match status {
+                CompletionResolution::Incomplete => retained.push(work),
+                CompletionResolution::Complete => {
+                    self.resolve_completed(work, now, &mut progress);
+                }
+                CompletionResolution::FailedPending => {
+                    if !matches!(work.disposition, Disposition::Fail) {
+                        work.disposition = Disposition::Fail;
+                        self.lifecycle.insert(work.id, WorkLifecycle::Failed);
+                        self.failed_work = self.failed_work.saturating_add(1);
+                    }
+                    retained.push(work);
+                }
+                CompletionResolution::FailedComplete => {
+                    if !matches!(work.disposition, Disposition::Fail) {
+                        work.disposition = Disposition::Fail;
+                        self.failed_work = self.failed_work.saturating_add(1);
+                    }
+                    self.resolve_completed(work, now, &mut progress);
+                }
+            }
+        }
+        for work in &mut retained {
+            if !self.requests.contains_key(&work.id.request())
+                && matches!(work.disposition, Disposition::Publish)
+            {
+                work.disposition = Disposition::Abandon { cancelled_at: now };
+                self.lifecycle.insert(work.id, WorkLifecycle::Abandoned);
+            }
+        }
+        self.submitted = retained;
+        self.update_abandoned_resource_peak();
+        Ok(progress)
     }
 
     fn expire_deadlines(&mut self, now: Instant) -> Result<(), SchedulerError> {
@@ -978,12 +1179,46 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         Ok(())
     }
 
+    fn expire_deadlines_distributed<T: ConsensusTransport>(
+        &mut self,
+        protocol: u64,
+        transport: &T,
+        now: Instant,
+    ) -> Result<(), SchedulerError> {
+        let mut expired = BTreeSet::new();
+        for (request, entry) in &self.requests {
+            if entry
+                .pending
+                .iter()
+                .any(|work| work.deadline.is_some_and(|deadline| deadline <= now))
+            {
+                expired.insert(*request);
+            }
+        }
+        for work in &self.prepared {
+            if work.deadline.is_some_and(|deadline| deadline <= now) {
+                expired.insert(work.id.request());
+            }
+        }
+        for request in expired {
+            if let Err(error) =
+                validate_disposition(transport, protocol, request, CancellationCause::Deadline)
+            {
+                self.poison(error.to_string(), now);
+                return Err(SchedulerError::Consensus(error.to_string()));
+            }
+            self.cancel_internal(request, CancellationCause::Deadline, now)?;
+        }
+        Ok(())
+    }
+
     fn cancel_internal(
         &mut self,
         request: RequestId,
         cause: CancellationCause,
         now: Instant,
     ) -> Result<(), SchedulerError> {
+        self.ensure_ready()?;
         if self.terminal.contains_key(&request) {
             return Err(SchedulerError::State(format!(
                 "request {} is already terminal",
@@ -1108,6 +1343,54 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         self.terminal.insert(request, RequestStatus::Failed);
     }
 
+    fn ensure_ready(&self) -> Result<(), SchedulerError> {
+        self.poisoned.as_ref().map_or(Ok(()), |reason| {
+            Err(SchedulerError::Poisoned(reason.clone()))
+        })
+    }
+
+    fn poison(&mut self, reason: String, now: Instant) {
+        if self.poisoned.is_some() {
+            return;
+        }
+        let mut discarded = 0usize;
+        for (request, entry) in std::mem::take(&mut self.requests) {
+            self.terminal.insert(request, RequestStatus::Failed);
+            for work in entry.pending {
+                self.lifecycle.insert(work.id, WorkLifecycle::Failed);
+                discarded += 1;
+            }
+        }
+        self.ready.clear();
+        let mut cleanup_errors = Vec::new();
+        for work in std::mem::take(&mut self.prepared) {
+            let id = work.id;
+            if let Err(error) = S::discard_branch(work.branch) {
+                cleanup_errors.push(format!("work {id:?}: {error}"));
+                self.failed_work = self.failed_work.saturating_add(1);
+            }
+            self.lifecycle.insert(id, WorkLifecycle::Failed);
+            discarded += 1;
+        }
+        self.accepted_work = self.accepted_work.saturating_sub(discarded);
+        self.discarded_work = self.discarded_work.saturating_add(discarded as u64);
+        for work in &mut self.submitted {
+            if matches!(work.disposition, Disposition::Publish) {
+                work.disposition = Disposition::Abandon { cancelled_at: now };
+                self.lifecycle.insert(work.id, WorkLifecycle::Abandoned);
+            }
+        }
+        self.poisoned = Some(if cleanup_errors.is_empty() {
+            reason
+        } else {
+            format!(
+                "{reason}; prepared branch cleanup failed: {}",
+                cleanup_errors.join("; ")
+            )
+        });
+        self.update_abandoned_resource_peak();
+    }
+
     fn abandoned_retained_resources(&self) -> usize {
         self.submitted
             .iter()
@@ -1150,12 +1433,26 @@ pub enum SchedulerError {
     /// Exact completion observation failed.
     #[error("exact completion observation failed: {0}")]
     Completion(String),
+    /// Topology-wide scheduler agreement failed.
+    #[error("distributed scheduler consensus failed: {0}")]
+    Consensus(String),
+    /// A distributed backend failed and every rank reached a terminal completion.
+    #[error("distributed {0}")]
+    DistributedCompletion(String),
+    /// Unsafe distributed ordering prevents further scheduler mutation.
+    #[error("scheduler is poisoned after unsafe distributed ordering: {0}")]
+    Poisoned(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, convert::Infallible, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        convert::Infallible,
+        rc::Rc,
+    };
 
     #[derive(Default)]
     struct State(u32);
@@ -1187,6 +1484,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct Output {
         complete: Rc<Cell<bool>>,
         fail: bool,
@@ -1209,6 +1507,42 @@ mod tests {
 
         fn retained_resources(&self) -> usize {
             2
+        }
+    }
+
+    #[derive(Default)]
+    struct GatherStep {
+        replacements: Vec<(usize, usize, u32)>,
+    }
+
+    struct ScriptedTransport {
+        participants: usize,
+        steps: RefCell<VecDeque<GatherStep>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(participants: usize, steps: Vec<GatherStep>) -> Self {
+            Self {
+                participants,
+                steps: RefCell::new(steps.into()),
+            }
+        }
+    }
+
+    impl ConsensusTransport for ScriptedTransport {
+        type Error = Infallible;
+
+        fn participant_count(&self) -> usize {
+            self.participants
+        }
+
+        fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Self::Error> {
+            let mut gathered = local.repeat(self.participants);
+            let step = self.steps.borrow_mut().pop_front().unwrap_or_default();
+            for (rank, offset, value) in step.replacements {
+                gathered[rank * local.len() + offset] = value;
+            }
+            Ok(gathered)
         }
     }
 
@@ -1404,6 +1738,197 @@ mod tests {
         scheduler.prepare_bounded(1, Instant::now()).unwrap();
         assert_eq!(
             scheduler.request_status(expired),
+            Some(RequestStatus::DeadlineExceeded)
+        );
+    }
+
+    #[test]
+    fn distributed_schedule_mismatch_poisons_the_canonical_machine() {
+        let transport = ScriptedTransport::new(
+            2,
+            vec![
+                GatherStep::default(),
+                GatherStep {
+                    replacements: vec![(1, 10, 99)],
+                },
+            ],
+        );
+        let mut scheduler = scheduler();
+        let request = RequestId::new(50);
+        scheduler.register(request, State::default()).unwrap();
+        let work = scheduler.enqueue(request, 7).unwrap();
+
+        let error = scheduler
+            .run_distributed_turn(0xAA, &transport, Instant::now(), |_, _, _| {
+                Ok::<_, Infallible>(Output {
+                    complete: Rc::new(Cell::new(false)),
+                    fail: false,
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(error, SchedulerError::Consensus(_)));
+        assert!(scheduler.poison_reason().is_some());
+        assert!(scheduler.report().poisoned);
+        assert_eq!(
+            scheduler.request_status(request),
+            Some(RequestStatus::Failed)
+        );
+        assert_eq!(scheduler.work_lifecycle(work), Some(WorkLifecycle::Failed));
+        assert!(matches!(
+            scheduler.enqueue(request, 8),
+            Err(SchedulerError::Poisoned(_))
+        ));
+    }
+
+    #[test]
+    fn poisoned_submissions_remain_retained_until_local_exact_completion() {
+        let transport = ScriptedTransport::new(
+            2,
+            vec![
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep {
+                    replacements: vec![(1, 4, 99)],
+                },
+            ],
+        );
+        let done = Rc::new(Cell::new(false));
+        let mut scheduler = scheduler();
+        let request = RequestId::new(54);
+        scheduler.register(request, State::default()).unwrap();
+        scheduler.enqueue(request, 1).unwrap();
+        scheduler
+            .run_distributed_turn(0xEE, &transport, Instant::now(), |_, _, _| {
+                Ok::<_, Infallible>(Output {
+                    complete: done.clone(),
+                    fail: false,
+                })
+            })
+            .unwrap();
+
+        let error = scheduler
+            .run_distributed_turn(0xEE, &transport, Instant::now(), |_, _, _| {
+                Ok::<_, Infallible>(Output {
+                    complete: done.clone(),
+                    fail: false,
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(error, SchedulerError::Consensus(_)));
+        assert_eq!(scheduler.report().abandoned_in_flight_work, 1);
+        assert_eq!(scheduler.report().abandoned_retained_resources, 2);
+
+        assert!(scheduler
+            .poll_completions(Instant::now())
+            .committed
+            .is_empty());
+        assert_eq!(scheduler.report().current_in_flight_work, 1);
+        done.set(true);
+        assert!(scheduler
+            .poll_completions(Instant::now())
+            .committed
+            .is_empty());
+        assert_eq!(scheduler.report().current_in_flight_work, 0);
+        assert_eq!(scheduler.report().abandoned_released_work, 1);
+    }
+
+    #[test]
+    fn distributed_failure_retains_output_until_every_rank_is_terminal() {
+        let transport = ScriptedTransport::new(
+            3,
+            vec![
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep {
+                    replacements: vec![(1, 7, 2), (2, 7, 0)],
+                },
+                GatherStep::default(),
+                GatherStep {
+                    replacements: vec![(1, 7, 2), (2, 7, 1)],
+                },
+                GatherStep::default(),
+            ],
+        );
+        let mut scheduler = scheduler();
+        let request = RequestId::new(51);
+        scheduler.register(request, State::default()).unwrap();
+        scheduler.enqueue(request, 1).unwrap();
+        let output = || Output {
+            complete: Rc::new(Cell::new(true)),
+            fail: false,
+        };
+
+        scheduler
+            .run_distributed_turn(0xBB, &transport, Instant::now(), |_, _, _| {
+                Ok::<_, Infallible>(output())
+            })
+            .unwrap();
+        let pending = scheduler
+            .run_distributed_turn(0xBB, &transport, Instant::now(), |_, _, _| {
+                Ok::<_, Infallible>(output())
+            })
+            .unwrap();
+        assert!(pending.failed.is_empty());
+        assert_eq!(scheduler.report().failed_in_flight_work, 1);
+        assert_eq!(scheduler.report().current_in_flight_work, 1);
+
+        let terminal = scheduler
+            .run_distributed_turn(0xBB, &transport, Instant::now(), |_, _, _| {
+                Ok::<_, Infallible>(output())
+            })
+            .unwrap();
+        assert_eq!(terminal.failed.len(), 1);
+        assert_eq!(scheduler.report().current_in_flight_work, 0);
+        assert_eq!(
+            scheduler.request_status(request),
+            Some(RequestStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn distributed_cancellation_and_deadline_use_the_same_core_lifecycle() {
+        let transport = ScriptedTransport::new(2, vec![GatherStep::default()]);
+        let mut cancelled = scheduler();
+        let request = RequestId::new(52);
+        cancelled.register(request, State::default()).unwrap();
+        cancelled.enqueue(request, 1).unwrap();
+        cancelled
+            .cancel_distributed(0xCC, request, &transport, Instant::now())
+            .unwrap();
+        assert_eq!(
+            cancelled.request_status(request),
+            Some(RequestStatus::Cancelled)
+        );
+
+        let transport = ScriptedTransport::new(
+            2,
+            vec![
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep::default(),
+            ],
+        );
+        let mut scheduler = scheduler();
+        let request = RequestId::new(53);
+        scheduler.register(request, State::default()).unwrap();
+        scheduler
+            .enqueue_with_deadline(
+                request,
+                1,
+                Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap()),
+            )
+            .unwrap();
+        scheduler
+            .run_distributed_turn(0xDD, &transport, Instant::now(), |_, _, _| {
+                Ok::<_, Infallible>(Output {
+                    complete: Rc::new(Cell::new(true)),
+                    fail: false,
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            scheduler.request_status(request),
             Some(RequestStatus::DeadlineExceeded)
         );
     }

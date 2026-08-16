@@ -9,11 +9,8 @@ use safemlx_lm::{
         LoadedRealtimeModel, RealtimeInferenceScheduler, RealtimeSampling, RealtimeStepInput,
     },
     architectures::moshi::{layerwise, model as moshi, personaplex},
-    runtime::{
-        generation::sampler::DefaultSampler,
-        scheduler::{RequestId, SchedulerLimits},
-    },
-    LayerWeightResidency,
+    runtime::generation::sampler::DefaultSampler,
+    LayerWeightResidency, RequestId, SchedulerLimits,
 };
 
 fn main() -> anyhow::Result<()> {

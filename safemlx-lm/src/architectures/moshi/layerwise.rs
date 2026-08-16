@@ -2118,7 +2118,7 @@ mod tests {
         runtime::generation::sampler::DefaultSampler,
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig},
-        runtime::scheduler::{RequestId, SchedulerLimits},
+        RequestId, SchedulerLimits,
     };
 
     fn config() -> &'static str {

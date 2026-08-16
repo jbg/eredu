@@ -8,8 +8,7 @@ use safemlx_lm::{
     load_realtime_model, load_realtime_model_with_options,
     runtime::checkpoint::quantization::AffineQuantization,
     runtime::generation::sampler::DefaultSampler,
-    runtime::scheduler::{RequestId, SchedulerLimits},
-    LoadedRealtimeModel,
+    LoadedRealtimeModel, RequestId, SchedulerLimits,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
