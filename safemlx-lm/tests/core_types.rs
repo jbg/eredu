@@ -24,4 +24,16 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::SchedulerError>(),
         TypeId::of::<safemlx_lm::core::scheduler::SchedulerError>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::OffloadConfig>(),
+        TypeId::of::<safemlx_lm::core::residency::OffloadConfig>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::MemoryTier>(),
+        TypeId::of::<safemlx_lm::core::residency::MemoryTier>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::OffloadReport>(),
+        TypeId::of::<safemlx_lm::core::residency::OffloadReport>(),
+    );
 }

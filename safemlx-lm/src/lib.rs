@@ -81,6 +81,12 @@ pub use runtime::residency::dense_stream::{
     BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError,
 };
 pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
+pub use safemlx_lm_core::residency::{
+    AllocatorMemoryMetrics, CacheEvictionPolicy, EvictionMetrics, MemoryTier, OffloadConfig,
+    OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry, OffloadUnitId, OffloadUnitSpec,
+    PrefetchMetrics, PrefetchOutcome, ProcessMetrics, ResidencyPolicy, TierByteTotals,
+    TierUnitTotals, TransferDirection, TransferMetrics, OFFLOAD_PLAN_SCHEMA_VERSION,
+};
 pub use safemlx_lm_core::scheduler::{
     CancellationCause, RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,
     SchedulerLimits, SchedulerProgress, SchedulerReport, SemanticStateTransaction,

@@ -80,8 +80,13 @@ MLX arrays, streams, devices, events, executable layer modules, and concrete KV
 cache tensors remain wholly in `safemlx-lm`. Core sees only associated opaque
 types. Neutral checkpoint descriptors describe names, shapes, dtypes, and byte
 locations; MLX weight stores remain responsible for validating source formats
-and materializing arrays. Neutral residency plans account for logical resources;
-MLX managers execute transfers and report concrete memory counters.
+and materializing arrays. `OffloadPlan` is the only weight-residency plan:
+budgets, tier assignments, eviction policy, transfer accounting, prefetch and
+eviction telemetry, process observations, and allocator observations all live
+in core. Its deserializer re-runs the same validation as programmatic
+construction. The MLX residency manager consumes that plan, owns concrete
+arrays and transfer leases, and records allocator samples obtained by
+`backend::mlx::residency` into the neutral telemetry schema.
 
 ## Coupling left for the next milestone
 
@@ -92,11 +97,17 @@ The first vertical slice intentionally leaves these components MLX-coupled:
   telemetry adapters;
 - concrete topology device assignment, communicator construction, collectives,
   and tensor movement;
-- cache-residency array storage, prompt-cache materialization, and transfer
-  buffers;
+- weight/cache residency ownership state machines, array storage, prompt-cache
+  materialization, transfer buffers, and exact transfer completions;
 - checkpoint weight recipes/stores and MLX array materialization;
-- sampling, speculative decoding, activation observation, memory counters, and
-  Metal/CUDA kernels.
+- sampling, speculative decoding, activation observation, MLX allocator
+  sampling, and Metal/CUDA kernels.
+
+The former facade `runtime::residency::policy` module was deleted. It was not
+retained as a forwarding namespace. The earlier placeholder core
+`ResidencyPlan`, `ResourceSpec`, and `ResidencyReport` schemas were also deleted;
+the validated `OffloadPlan`, `OffloadUnitSpec`, and `OffloadReport` types used by
+production are now canonical and are reexported at the facade root.
 
 The neutral scheduler in core now owns both production single-rank realtime and
 distributed pipeline request lifecycles. Queueing, fairness, deadlines,

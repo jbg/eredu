@@ -67,6 +67,9 @@ only their tensor execution and exact MLX completion adapter remain here.
 Distributed pipeline schedule, cancellation, and completion agreement use the
 same core scheduler through the MLX collective and completion adapters; the
 facade does not maintain a second lifecycle implementation.
+Weight-residency plans and accounting likewise come directly from
+`safemlx-lm-core`; the MLX facade owns only weight materialization, transfer
+leases/completions, and allocator sampling.
 
 ## Automatic execution planning
 

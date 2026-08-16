@@ -32,6 +32,7 @@ use safemlx_lm::{
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
         ResidencyTelemetry, TextDecoder, TimingTelemetry, WeightTransformationPlan,
     },
+    core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     error::Error as LmError,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
@@ -52,9 +53,6 @@ use safemlx_lm::{
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     runtime::residency::expert_cache::{
         ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
-    },
-    runtime::residency::policy::{
-        CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection,
     },
 };
 use serde::{Deserialize, Serialize};

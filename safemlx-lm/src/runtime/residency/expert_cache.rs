@@ -1,4 +1,4 @@
-//! Architecture-independent sparse routed-expert caching.
+//! MLX sparse routed-expert caching over backend-neutral residency plans.
 //!
 //! Each logical expert is an atomic disk-planned residency unit. Route ids are
 //! inspected once per routed block, validated before acquisition, coalesced in
@@ -17,6 +17,9 @@ use safemlx::{
 };
 
 use crate::{
+    core::residency::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
+    },
     error::Error,
     runtime::checkpoint::{
         bounded_quantization::{
@@ -30,9 +33,6 @@ use crate::{
     runtime::residency::manager::{
         OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentTransfer,
         ResidentUnitLease, WeightBinding,
-    },
-    runtime::residency::policy::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
 };
 
@@ -1440,7 +1440,7 @@ pub enum ExpertCacheError {
     },
     /// Invalid offload plan configuration.
     #[error(transparent)]
-    Offload(#[from] crate::runtime::residency::policy::OffloadError),
+    Offload(#[from] crate::core::residency::OffloadError),
     /// Residency validation or materialization failed.
     #[error(transparent)]
     Residency(#[from] ResidencyError),
@@ -1461,12 +1461,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        core::residency::CacheEvictionPolicy,
         runtime::checkpoint::{
             recipe::DerivedWeightRecipe,
             store::{SafetensorsWeightStore, TensorSelection},
         },
         runtime::residency::manager::WeightBinding,
-        runtime::residency::policy::CacheEvictionPolicy,
     };
 
     fn stream() -> Stream {

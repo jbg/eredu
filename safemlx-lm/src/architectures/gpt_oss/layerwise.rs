@@ -1758,9 +1758,9 @@ mod tests {
     use super::{load_gpt_oss_expert_cache_model, load_gpt_oss_layerwise_model};
     use crate::{
         architectures::gpt_oss::model::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
+        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
         runtime::{
             attention::{AttentionPolicy, LayerSchedule},
             cache::KeyValueCache,

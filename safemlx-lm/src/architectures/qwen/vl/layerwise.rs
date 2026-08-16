@@ -2604,6 +2604,7 @@ mod tests {
     use super::*;
     use crate::{
         api::qwen3_vl as eager,
+        core::residency::{MemoryTier, OffloadConfig},
         runtime::{
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
             distributed::{
@@ -2616,7 +2617,6 @@ mod tests {
             },
             residency::dense_stream::DenseDiskStreamLoadOptions,
             residency::expert_cache::ExpertCacheLoadOptions,
-            residency::policy::{MemoryTier, OffloadConfig},
         },
     };
 

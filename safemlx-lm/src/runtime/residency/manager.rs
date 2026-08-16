@@ -1,4 +1,4 @@
-//! Budgeted, architecture-independent residency for immutable weight units.
+//! MLX materialization and transfer execution for immutable weight units.
 //!
 //! A [`crate::runtime::residency::manager::ResidencyManager`] moves caller-defined groups of
 //! checkpoint selections from a [`crate::runtime::checkpoint::store::WeightStore`] into
@@ -24,14 +24,15 @@ use safemlx::{
 };
 
 use crate::{
+    backend::mlx::residency::sample_allocator_memory,
+    core::residency::{
+        CacheEvictionPolicy, MemoryTier, OffloadPlan, OffloadReport, OffloadTelemetry,
+        OffloadUnitId, OffloadUnitSpec, PrefetchOutcome, ResidencyPolicy, TransferDirection,
+    },
     runtime::checkpoint::recipe::{DerivedWeightRecipe, WeightRecipeError},
     runtime::checkpoint::store::{
         PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore,
         WeightStoreDiagnostics, WeightStoreError,
-    },
-    runtime::residency::policy::{
-        CacheEvictionPolicy, MemoryTier, OffloadPlan, OffloadReport, OffloadTelemetry,
-        OffloadUnitId, OffloadUnitSpec, PrefetchOutcome, ResidencyPolicy, TransferDirection,
     },
 };
 
@@ -1620,14 +1621,12 @@ impl ResidencyManager {
     ) -> Result<(), ResidencyError> {
         let mut state = self.lock()?;
         if include_mlx {
-            state
-                .telemetry
-                .sample_mlx_memory()
-                .map_err(|source| ResidencyError::Mlx {
-                    id: internal_id(),
-                    operation: "allocator memory sampling",
-                    source,
-                })?;
+            let metrics = sample_allocator_memory().map_err(|source| ResidencyError::Mlx {
+                id: internal_id(),
+                operation: "allocator memory sampling",
+                source,
+            })?;
+            state.telemetry.record_allocator_memory(metrics);
         }
         if include_process {
             state.telemetry.sample_process_metrics();
@@ -2737,8 +2736,8 @@ mod tests {
 
     use super::*;
     use crate::{
+        core::residency::{OffloadConfig, OffloadUnitSpec},
         runtime::checkpoint::store::SafetensorsWeightStore,
-        runtime::residency::policy::{OffloadConfig, OffloadUnitSpec},
     };
 
     fn cpu_stream() -> Stream {

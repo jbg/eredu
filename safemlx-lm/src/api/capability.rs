@@ -10,11 +10,11 @@ use super::{
 };
 use crate::{
     architectures::{deepseek_v4, qwen::hybrid::qwen3_5::LayerPolicy as QwenHybridLayerPolicy},
+    core::residency::MemoryTier,
     nn::rope::FloatOrString,
     runtime::{
         attention::AttentionPolicy,
         media::input::{InputPayload, Modality},
-        residency::policy::MemoryTier,
     },
 };
 

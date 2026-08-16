@@ -2078,10 +2078,10 @@ mod tests {
             self as resident, Cache, FeedForwardPolicy, LayerCache, LayerPolicy, Model, ModelArgs,
             OperatorPolicy,
         },
+        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
         runtime::checkpoint::{quantization::AffineQuantization, recipe::DerivedWeightRecipe},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
         runtime::{
             attention::LayerSchedule,
             distributed::{

@@ -2188,6 +2188,7 @@ mod tests {
         architectures::kimi_linear::model::{
             load_model, model_args_from_config_value, Model, ModelInput,
         },
+        core::residency::OffloadConfig,
         runtime::{
             checkpoint::store::{SafetensorsWeightStore, WeightStore},
             distributed::{
@@ -2197,7 +2198,7 @@ mod tests {
             execution::layerwise::{
                 ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
             },
-            residency::{expert_cache::ExpertCacheLoadOptions, policy::OffloadConfig},
+            residency::expert_cache::ExpertCacheLoadOptions,
         },
     };
 

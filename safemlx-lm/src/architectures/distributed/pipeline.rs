@@ -67,6 +67,9 @@ use crate::{
         },
     },
     backend::mlx::consensus::MlxConsensusTransport,
+    core::residency::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
+    },
     error::Error,
     nn::{
         parallel::{
@@ -124,9 +127,6 @@ use crate::{
     runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyManager, ResidencyReport,
         ResidentLayerGroup,
-    },
-    runtime::residency::policy::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
 };
 
@@ -29264,7 +29264,7 @@ mod tests {
             assert!(!layers[0].host_resident());
             assert!(!layers[0].device_resident());
             assert_ne!(report.transfer_stream_index(), stream.get_index().unwrap());
-            assert!(report.residency().offload().mlx_memory().is_none());
+            assert!(report.residency().offload().allocator_memory().is_none());
             assert!(!report.residency().offload().process_sampled());
         }
 
@@ -29324,7 +29324,7 @@ mod tests {
             [(&first, first_requirements), (&last, last_requirements)]
         {
             let report = model.dense_stream_report().unwrap().unwrap();
-            assert!(report.residency().offload().mlx_memory().is_some());
+            assert!(report.residency().offload().allocator_memory().is_some());
             assert!(report.residency().offload().process_sampled());
             assert_eq!(report.pinned_static_device_bytes(), static_bytes);
             assert_eq!(report.planned_layer_bytes(), layer_bytes);

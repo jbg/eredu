@@ -7,10 +7,10 @@ use safemlx::{Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::Model,
     architectures::llama::model as llama,
+    core::residency::{MemoryTier, OffloadConfig, TransferDirection},
     load_model_with_options,
     runtime::execution::layerwise::LayerwiseLoadOptions,
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    runtime::residency::policy::{MemoryTier, OffloadConfig, TransferDirection},
     ModelLoadOptions, WeightResidency,
 };
 
@@ -216,7 +216,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
     println!("time to first token: {time_to_first_token:?}");
-    println!("MLX memory: {:?}", offload.mlx_memory());
+    println!("Backend allocator memory: {:?}", offload.allocator_memory());
     println!("weight-store diagnostics: {:?}", report.weight_store());
     if let Some(dense) = model.dense_stream_report()? {
         println!("background host-prefetch: {:?}", dense.background());

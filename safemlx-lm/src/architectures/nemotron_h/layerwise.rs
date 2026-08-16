@@ -3293,11 +3293,11 @@ mod tests {
         architectures::nemotron_h::model::{
             self as resident, Cache, LayerCache, LayerPolicy, Model, ModelArgs, ModelInput,
         },
+        core::residency::{OffloadConfig, ResidencyPolicy},
         runtime::cache::residency::{
             CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
         },
         runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch},
-        runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         runtime::{
             cache::KeyValueCache,
             checkpoint::quantization::{AffineQuantization, WeightQuantization},

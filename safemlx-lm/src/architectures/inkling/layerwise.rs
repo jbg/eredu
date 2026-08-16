@@ -4064,6 +4064,7 @@ mod tests {
             inkling::{self as resident, Model, ModelArgs},
             input as runtime_input,
         },
+        core::residency::{OffloadConfig, ResidencyPolicy},
         runtime::cache::{
             residency::{CacheResidencyPolicy, PromptCacheDescriptor, PromptCacheOptions},
             KeyValueCache,
@@ -4080,7 +4081,6 @@ mod tests {
         },
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch},
-        runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         PagedCacheOptions,
     };
 
@@ -4959,15 +4959,12 @@ mod tests {
         )
         .unwrap();
         let report = model.dense_stream_report().unwrap().unwrap();
-        assert!(
-            report
-                .residency()
-                .units()
-                .iter()
-                .filter(|unit| unit.id().as_str().contains("inkling.text."))
-                .all(|unit| unit.planned_tier()
-                    == crate::runtime::residency::policy::MemoryTier::Disk)
-        );
+        assert!(report
+            .residency()
+            .units()
+            .iter()
+            .filter(|unit| unit.id().as_str().contains("inkling.text."))
+            .all(|unit| unit.planned_tier() == crate::core::residency::MemoryTier::Disk));
     }
 
     #[test]

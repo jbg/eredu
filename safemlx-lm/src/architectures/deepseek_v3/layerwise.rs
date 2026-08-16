@@ -2903,6 +2903,7 @@ mod tests {
         architectures::deepseek_v3::model::{
             self as resident, FeedForward, LayerPolicy, Model, ModelArgs, ModelInput,
         },
+        core::residency::{OffloadConfig, ResidencyPolicy},
         runtime::attention::LayerSchedule,
         runtime::checkpoint::binding::canonical_checkpoint_name,
         runtime::distributed::{
@@ -2913,7 +2914,6 @@ mod tests {
             load_safetensors_layerwise_model, ArchitectureAdapter, LayerwiseLoadOptions,
         },
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         CacheResidencyPolicy, PagedCacheOptions,
     };
 

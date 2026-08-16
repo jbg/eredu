@@ -24,13 +24,11 @@ use safemlx_lm::{
         },
         gemma4::model::{self as gemma4, Cache, Model},
     },
+    core::residency::OffloadConfig,
     nn::generation::CausalLm,
-    runtime::{
-        media::{
-            input::{InputMetadata, InputPart, ModelInput},
-            PreparedModelInput,
-        },
-        residency::policy::OffloadConfig,
+    runtime::media::{
+        input::{InputMetadata, InputPart, ModelInput},
+        PreparedModelInput,
     },
     CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions,
     ModelLoadOptions, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,

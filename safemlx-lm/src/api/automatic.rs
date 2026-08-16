@@ -18,18 +18,17 @@ use super::{
     InspectionSeverity, ModelInspectionOptions, ModelKind, ModelLoadOptions,
     PhysicalMemorySemantics,
 };
-use crate::error::Error;
 use crate::runtime::{
     checkpoint::quantization::{AffineQuantization, WeightQuantization},
     execution::layerwise::{
         LayerwiseLoadOptions, LayerwiseModelError, NonExpertWeightResidency, WeightResidency,
     },
     generation::speculative::MtpStats,
-    residency::{
-        dense_stream::DenseDiskStreamLoadOptions,
-        expert_cache::ExpertCacheLoadOptions,
-        policy::{MemoryTier, OffloadConfig, TransferDirection},
-    },
+    residency::{dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions},
+};
+use crate::{
+    core::residency::{MemoryTier, OffloadConfig, TransferDirection},
+    error::Error,
 };
 
 /// Schema version shared by automatic-planning and telemetry documents.

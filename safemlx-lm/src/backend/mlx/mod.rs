@@ -2,6 +2,8 @@
 
 /// Distributed scheduler consensus over MLX collectives.
 pub mod consensus;
+/// MLX allocator observations for neutral residency telemetry.
+pub mod residency;
 
 use std::path::PathBuf;
 

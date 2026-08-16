@@ -1192,20 +1192,19 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, TensorView};
 
     use super::*;
-    use crate::runtime::{
-        checkpoint::{quantization::AffineQuantization, store::GgufWeightStore},
-        residency::{
-            manager::{
+    use crate::test_utils::SyntheticGguf;
+    use crate::{
+        core::residency::{
+            MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
+        },
+        runtime::{
+            checkpoint::{quantization::AffineQuantization, store::GgufWeightStore},
+            residency::manager::{
                 host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyManager,
                 WeightBinding,
             },
-            policy::{
-                MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec,
-                ResidencyPolicy,
-            },
         },
     };
-    use crate::test_utils::SyntheticGguf;
 
     fn cpu_context() -> ExecutionContext {
         ExecutionContext::new(Device::new(DeviceType::Cpu, 0))

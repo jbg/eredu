@@ -14,8 +14,8 @@ use std::{
 };
 
 use crate::{
+    core::residency::{CacheEvictionPolicy, MemoryTier, OffloadUnitId},
     runtime::residency::manager::{ResidencyManager, ResidentUnitLease},
-    runtime::residency::policy::{CacheEvictionPolicy, MemoryTier, OffloadUnitId},
 };
 
 /// Current plus next layer retained by dense streamed execution.
@@ -488,11 +488,9 @@ pub enum DenseStreamError {
 mod tests {
     use super::*;
     use crate::{
+        core::residency::{OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy},
         runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
         runtime::residency::manager::{OffloadUnit, WeightBinding},
-        runtime::residency::policy::{
-            OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy,
-        },
     };
     use safemlx::{
         host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy, Stream,

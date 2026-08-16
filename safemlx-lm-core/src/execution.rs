@@ -1,6 +1,6 @@
 //! Portable execution-plan, resource, and telemetry schemas.
 
-use crate::{backend::BackendCapabilities, model::ModelIdentity, residency::ResidencyPlan};
+use crate::{backend::BackendCapabilities, model::ModelIdentity, residency::OffloadPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -18,7 +18,7 @@ pub struct ExecutionPlan {
     /// Capabilities required by the plan.
     pub required_capabilities: BackendCapabilities,
     /// Logical residency plan.
-    pub residency: ResidencyPlan,
+    pub residency: OffloadPlan,
 }
 
 impl ExecutionPlan {

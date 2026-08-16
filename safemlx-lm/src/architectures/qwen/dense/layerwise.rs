@@ -2648,7 +2648,7 @@ mod tests {
     use super::*;
     use crate::{
         architectures::qwen::dense as dense_qwen,
-        runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
+        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
         runtime::{
             distributed::{
                 parallel::{ParallelBuildContext, ShardingPolicy},

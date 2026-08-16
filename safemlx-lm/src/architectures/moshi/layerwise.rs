@@ -2108,6 +2108,7 @@ mod tests {
             RealtimeSampling,
         },
         api::{moshi as eager, ModelLoadOptions},
+        core::residency::{MemoryTier, OffloadConfig},
         runtime::distributed::{
             parallel::{ParallelBuildContext, ShardingPolicy},
             topology::{DeviceAssignment, ParallelTopology},
@@ -2117,7 +2118,6 @@ mod tests {
         },
         runtime::generation::sampler::DefaultSampler,
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        runtime::residency::policy::{MemoryTier, OffloadConfig},
         RequestId, SchedulerLimits,
     };
 

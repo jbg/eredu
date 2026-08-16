@@ -15,6 +15,10 @@ use std::{
 use safemlx::{module::ModuleParameters, transforms::async_eval_with_event, Array, Event, Stream};
 
 use crate::{
+    core::residency::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
+        ResidencyPolicy, TransferDirection,
+    },
     error::Error,
     runtime::cache::residency::{
         validate_prompt_cache_model_identity, PagedCacheOptions, PromptCacheDescriptor,
@@ -39,10 +43,6 @@ use crate::{
     runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyError, ResidencyManager,
         ResidencyReport, ResidentLayerGroup, ResidentTransfer, ResidentUnitLease,
-    },
-    runtime::residency::policy::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
-        ResidencyPolicy, TransferDirection,
     },
 };
 
@@ -5576,8 +5576,8 @@ mod tests {
     use crate::{
         architectures::llama::layerwise::{load_llama_safetensors_mlx, LlamaCache, LlamaModel},
         architectures::llama::model::{self as llama, ModelArgs},
+        core::residency::TransferDirection,
         runtime::residency::manager::UnitResidencyReport,
-        runtime::residency::policy::TransferDirection,
     };
 
     #[test]

@@ -45,7 +45,7 @@ pub enum Error {
 
     /// Invalid architecture-independent offload planning request.
     #[error(transparent)]
-    Offload(#[from] crate::runtime::residency::policy::OffloadError),
+    Offload(#[from] crate::core::residency::OffloadError),
 
     /// Invalid or failed weight residency operation.
     #[error(transparent)]

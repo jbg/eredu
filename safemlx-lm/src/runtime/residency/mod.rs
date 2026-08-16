@@ -6,5 +6,3 @@ pub mod dense_stream;
 pub mod expert_cache;
 /// Budgeted residency manager for logical immutable weight units.
 pub mod manager;
-/// Residency policies, plans, and telemetry.
-pub mod policy;

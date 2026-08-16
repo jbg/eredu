@@ -7419,8 +7419,7 @@ mod tests {
         );
 
         let expert_options = ExpertCacheLoadOptions::new(
-            crate::runtime::residency::policy::OffloadConfig::new(Some(1 << 20), Some(0), 1)
-                .unwrap(),
+            crate::core::residency::OffloadConfig::new(Some(1 << 20), Some(0), 1).unwrap(),
             1 << 20,
             1 << 20,
         )

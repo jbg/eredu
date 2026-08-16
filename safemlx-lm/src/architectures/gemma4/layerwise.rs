@@ -4640,6 +4640,7 @@ mod tests {
             gemma4_vision::Gemma4VisionConfig,
             input as runtime_input,
         },
+        core::residency::{MemoryTier, OffloadConfig},
         runtime::{
             cache::ConcatKeyValueCache,
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
@@ -4652,10 +4653,7 @@ mod tests {
                 ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
                 LoadTimeQuantizableAdapter,
             },
-            residency::{
-                dense_stream::DenseDiskStreamLoadOptions,
-                policy::{MemoryTier, OffloadConfig},
-            },
+            residency::dense_stream::DenseDiskStreamLoadOptions,
         },
     };
 

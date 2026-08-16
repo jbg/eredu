@@ -4578,13 +4578,13 @@ mod tests {
             qwen3_next,
             qwen_vl::VisionConfig,
         },
+        core::residency::{OffloadConfig, ResidencyPolicy},
         runtime::distributed::{
             parallel::{ParallelBuildContext, ShardingPolicy},
             topology::{DeviceAssignment, ParallelTopology},
         },
         runtime::execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         CacheResidencyPolicy, PagedCacheOptions,
     };
 

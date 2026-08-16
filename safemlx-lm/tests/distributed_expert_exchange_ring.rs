@@ -21,6 +21,7 @@ use safemlx_lm::{
         dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
         DispatchedRoutes, ExpertAssignment, RoutedTransport, ShardedRouteBlocks,
     },
+    core::residency::OffloadConfig,
     error::Error,
     nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
     runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
@@ -29,7 +30,6 @@ use safemlx_lm::{
         ExpertRouteBatch,
     },
     runtime::residency::manager::{OffloadUnit, WeightBinding},
-    runtime::residency::policy::OffloadConfig,
 };
 use safetensors::tensor::{serialize_to_file, Dtype as TensorDtype, TensorView};
 

@@ -31,9 +31,9 @@ use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::runtime::{
-    attention::{AttentionPolicy, LayerSchedule},
-    residency::policy::CacheEvictionPolicy,
+use crate::{
+    core::residency::CacheEvictionPolicy,
+    runtime::attention::{AttentionPolicy, LayerSchedule},
 };
 
 const PROMPT_CACHE_SCHEMA_VERSION: u32 = 7;

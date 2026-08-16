@@ -16,7 +16,7 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
-use safemlx_lm::runtime::residency::policy::OffloadConfig;
+use safemlx_lm::core::residency::OffloadConfig;
 use safemlx_lm::{
     architectures::{
         distributed::pipeline::{
