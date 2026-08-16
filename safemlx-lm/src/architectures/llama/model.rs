@@ -2443,7 +2443,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires local model files"]
-    fn test_load_llama_model() {
+    fn test_load_resident_llama_model() {
         use safemlx::module::ModuleParameters;
 
         let model_dir = CACHED_TEST_MODEL_DIR.as_str();

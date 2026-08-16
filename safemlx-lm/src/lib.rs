@@ -1,9 +1,9 @@
-//! Language-model loading and generation utilities built on `safemlx`.
+//! Language-model loading and generation with the MLX backend enabled by default.
 //!
 //! [`api`] provides high-level loading and generation. Model-family
 //! implementations live under [`architectures`], reusable neural components
-//! under [`nn`], and architecture-independent execution infrastructure under
-//! [`runtime`].
+//! under [`nn`], and execution infrastructure under [`runtime`]. Portable
+//! contracts and orchestration are defined by [`core`].
 
 #![warn(missing_docs)]
 
@@ -11,12 +11,16 @@
 pub mod api;
 /// Model-family implementations and architecture-specific adapters.
 pub mod architectures;
+/// MLX implementation of the backend-neutral execution contract.
+pub mod backend;
 /// Error types returned by the language-model runtime.
 pub mod error;
-/// Architecture-neutral neural-network building blocks.
+/// Reusable MLX neural-network building blocks.
 pub mod nn;
-/// Architecture-independent model execution infrastructure.
+/// Facade execution infrastructure, including MLX-specific implementations.
 pub mod runtime;
+/// Canonical backend-neutral runtime types.
+pub use safemlx_lm_core as core;
 #[cfg(test)]
 mod test_utils;
 
@@ -26,22 +30,21 @@ pub use api::realtime::{
     RealtimeSampling, RealtimeSession, RealtimeSpeechConfig, RealtimeStepInput, RealtimeStepOutput,
 };
 pub use api::{
-    discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
-    AllocatorTelemetry, ArtifactKind, ArtifactModality, ArtifactTensorEncoding,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, BackendKind,
-    CheckpointGenerationConfig, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
-    ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry,
-    GenerationConfigOverrides, HardwareBackendProfile, HardwareDeviceProfile,
-    HardwareMemorySemantics, HardwareProfile, InspectionIssue, InspectionIssueCode,
-    InspectionReadiness, InspectionRequirement, InspectionSeverity, ModelInspectionOptions,
-    ModelInspectionReport, ModelLoadOptions, ModelResourceProfile, ObservationKind, Observed,
-    ParallelismPlan, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan,
-    ResidencyTelemetry, ResolvedGenerationConfig, TimingTelemetry, TransferTelemetry,
-    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    discover_hardware, execution_plan_load_options, inspect_model, load_model,
+    load_model_with_options, plan_automatic_execution, AllocatorTelemetry, ArtifactKind,
+    ArtifactModality, ArtifactTensorEncoding, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlannerPolicy, BackendKind, CheckpointGenerationConfig, DevicePlan,
+    DraftPlacementPlan, DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport,
+    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, GenerationConfigOverrides,
+    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
+    InspectionIssue, InspectionIssueCode, InspectionReadiness, InspectionRequirement,
+    InspectionSeverity, ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions,
+    ModelResourceProfile, ObservationKind, Observed, ParallelismPlan, PlanExplanation,
+    PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
+    ResolvedGenerationConfig, TimingTelemetry, TransferTelemetry, WeightTransformationPlan,
+    AUTOMATIC_SCHEMA_VERSION,
 };
-pub use architectures::llama::layerwise::{
-    load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,
-};
+pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
 pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheBlockId, CacheBlockLifecycle, CacheLayerResidencyReport,

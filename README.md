@@ -17,6 +17,7 @@ SafeMLX is independent of Apple and is not an official MLX project.
 | --- | --- |
 | [`safemlx`](safemlx/) | Arrays, operations, transforms, neural-network modules, optimizers, streams, and distributed MLX |
 | [`safemlx-lm`](safemlx-lm/) | Loading and running supported text, multimodal, and realtime speech models |
+| [`safemlx-lm-core`](safemlx-lm-core/) | Backend-neutral LM contracts, scheduling, validation, and portable schemas |
 | [`safemlx-gguf`](safemlx-gguf/) | Bounded, framework-independent GGUF reading, writing, and tensor conversion |
 | [`safemlx-codec`](safemlx-codec/) | Neural audio codecs, including Mimi |
 | [`safemlx-lm-utils`](safemlx-lm-utils/) | Tokenizer and chat-template utilities |
@@ -65,6 +66,7 @@ download models.
 
 - [Documentation index](doc/README.md)
 - [Model and checkpoint support](doc/model-support.md)
+- [Language-model backend architecture](doc/backend-architecture.md)
 - [Model loading, quantization, and memory](doc/model-loading.md)
 - [Parallel execution](doc/parallel-execution.md)
 - [Platform setup](doc/platforms.md)

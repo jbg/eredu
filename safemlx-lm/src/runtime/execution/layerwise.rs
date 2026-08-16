@@ -5574,9 +5574,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        architectures::llama::layerwise::{
-            load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,
-        },
+        architectures::llama::layerwise::{load_llama_safetensors_mlx, LlamaCache, LlamaModel},
         architectures::llama::model::{self as llama, ModelArgs},
         runtime::residency::manager::UnitResidencyReport,
         runtime::residency::policy::TransferDirection,
@@ -5818,9 +5816,9 @@ mod tests {
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<LlamaModel, Error> {
-        load_llama_model(
+        load_llama_safetensors_mlx(
             model_dir,
-            LlamaLoadOptions::layerwise_host(LayerwiseLoadOptions::new(offload)),
+            WeightResidency::layerwise_host(LayerwiseLoadOptions::new(offload)),
             stream,
             weights_stream,
         )
@@ -6057,9 +6055,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &reference);
 
-        let mut fully_resident = load_llama_model(
+        let mut fully_resident = load_llama_safetensors_mlx(
             dir.path(),
-            LlamaLoadOptions::fully_resident(),
+            WeightResidency::fully_resident(),
             stream,
             cpu.stream(),
         )
@@ -6296,9 +6294,9 @@ mod tests {
         drop(sizing);
 
         let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1).unwrap();
-        let mut streamed = load_llama_model(
+        let mut streamed = load_llama_safetensors_mlx(
             dir.path(),
-            LlamaLoadOptions::dense_disk_stream(options),
+            WeightResidency::dense_disk_stream(options),
             gpu.stream(),
             cpu.stream(),
         )
@@ -6326,9 +6324,9 @@ mod tests {
                     && !unit.device_resident()
             }));
 
-        let mut resident = load_llama_model(
+        let mut resident = load_llama_safetensors_mlx(
             dir.path(),
-            LlamaLoadOptions::fully_resident(),
+            WeightResidency::fully_resident(),
             gpu.stream(),
             cpu.stream(),
         )
@@ -6415,9 +6413,9 @@ mod tests {
         );
 
         let direct_options = DenseDiskStreamLoadOptions::new(device_budget, 0, 0, 0).unwrap();
-        let mut direct = load_llama_model(
+        let mut direct = load_llama_safetensors_mlx(
             dir.path(),
-            LlamaLoadOptions::dense_disk_stream(direct_options),
+            WeightResidency::dense_disk_stream(direct_options),
             gpu.stream(),
             cpu.stream(),
         )
@@ -6641,9 +6639,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut resident = load_llama_model(
+        let mut resident = load_llama_safetensors_mlx(
             &converted,
-            LlamaLoadOptions::fully_resident(),
+            WeightResidency::fully_resident(),
             gpu.stream(),
             cpu.stream(),
         )

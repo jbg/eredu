@@ -23,6 +23,8 @@ follow the relevant guide here.
 
 ## Core runtime
 
+- [Language-model backend architecture](backend-architecture.md): the neutral
+  core contract, MLX adapter, ownership boundary, and future backend path.
 - [Platform setup](platforms.md): native prerequisites for Apple, Linux, CUDA,
   and Windows builds.
 - [Completion events](completion-events.md): graph submission, host observation,

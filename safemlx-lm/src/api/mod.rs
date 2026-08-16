@@ -485,6 +485,21 @@ pub fn load_model_with_options(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    use safemlx_lm_core::Backend;
+    crate::backend::mlx::MlxBackend::new(stream, weights_stream)
+        .prepare_model(crate::backend::mlx::MlxModelConfig {
+            model_path: model_dir.as_ref().to_path_buf(),
+            options,
+        })
+        .map(safemlx_lm_core::PreparedModel::into_inner)
+}
+
+pub(crate) fn load_model_with_options_mlx(
+    model_dir: impl AsRef<Path>,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     ensure_executable_load_options(options)?;
     if is_gguf_file(model_dir) {
@@ -494,7 +509,8 @@ pub fn load_model_with_options(
     let kind = ModelKind::from_model_type(&effective_model_type(&metadata))?;
     match kind {
         ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
-            "PersonaPlex is a realtime speech-to-speech token model; use architectures::moshi::personaplex::load_model".into(),
+            "PersonaPlex is a realtime speech-to-speech token model; use api::realtime::load_model"
+                .into(),
         )),
         _ => load_model_for_kind(kind, model_dir, options, stream, weights_stream),
     }
@@ -757,11 +773,9 @@ fn load_model_for_kind(
             )?,
         )),
         ModelKind::Llama => Ok(Model::Llama(
-            crate::architectures::llama::layerwise::load_llama_model(
+            crate::architectures::llama::layerwise::load_llama_safetensors_mlx(
                 model_dir,
-                crate::architectures::llama::layerwise::LlamaLoadOptions {
-                    weight_residency: execution.weight_residency(),
-                },
+                execution.weight_residency(),
                 stream,
                 weights_stream,
             )?,

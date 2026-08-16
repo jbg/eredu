@@ -7,6 +7,7 @@ members = [
     "safemlx-internal-macros",
     "safemlx-tests",
     "safemlx-lm",
+    "safemlx-lm-core",
     "safemlx-lm-utils",
     "safemlx-codec",
     "examples/safemlx-lm-cli",
@@ -31,6 +32,7 @@ safemlx-sys = { version = "0.1.3", path = "safemlx-sys", default-features = fals
 safemlx-macros = { version = "0.1.1", path = "safemlx-macros" }
 safemlx-internal-macros = { version = "0.1.1", path = "safemlx-internal-macros" }
 safemlx-lm = { version = "0.4.1", path = "safemlx-lm" }
+safemlx-lm-core = { version = "0.1.0", path = "safemlx-lm-core" }
 safemlx-lm-utils = { version = "0.1.4", path = "safemlx-lm-utils", default-features = false }
 safemlx-codec = { version = "0.1.0", path = "safemlx-codec" }
 thiserror = "2"

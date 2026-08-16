@@ -1,7 +1,9 @@
-//! Architecture-independent model execution infrastructure.
+//! Facade execution infrastructure and MLX-specific runtime implementations.
 
 /// Validated decoder-layer schedules and attention geometry.
-pub mod attention;
+pub mod attention {
+    pub use safemlx_lm_core::attention::*;
+}
 /// Attention-cache storage and residency.
 pub mod cache;
 /// Chat preparation, output dialects, and constrained decoding.

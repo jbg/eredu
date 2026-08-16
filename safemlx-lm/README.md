@@ -1,7 +1,9 @@
 # safemlx-lm
 
-`safemlx-lm` is a Rust runtime for loading and running supported language,
-multimodal, and realtime speech models on MLX. It provides architecture
+`safemlx-lm` is the public Rust facade and MLX backend for loading and
+running supported language, multimodal, and realtime speech models. Portable
+contracts and orchestration live in the MLX-independent `safemlx-lm-core`
+crate. The facade provides architecture
 inspection, checkpoint validation, tokenization, chat preparation, generation,
 structured tool calls, quantization, bounded weight and cache residency, and
 distributed execution.
@@ -57,8 +59,9 @@ if !report.is_loadable() {
 ```
 
 Use the high-level `api` module for loading, prepared inputs, generation, cache
-creation, and memory admission. Architecture-specific modules expose lower-level
-construction and distributed adapters when an application needs them.
+creation, and memory admission. `safemlx_lm::load_model_with_options` is the
+single model-loading entry point for supported checkpoint formats and
+architectures. The MLX backend performs architecture dispatch internally.
 
 ## Automatic execution planning
 
@@ -120,6 +123,7 @@ also read [Parallel execution](../doc/parallel-execution.md).
 
 ## More documentation
 
+- [Backend architecture](../doc/backend-architecture.md)
 - [Native tool calling](../doc/tool-calling.md)
 - [Speculative decoding and MTP](../doc/speculative-decoding.md)
 - [Cancellation and bounded execution](../doc/cancellation.md)

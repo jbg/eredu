@@ -5,13 +5,13 @@ use std::{path::PathBuf, time::Instant};
 use clap::Parser;
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    architectures::llama::{
-        layerwise::{load_llama_model, LlamaLoadOptions},
-        model as llama,
-    },
+    api::Model,
+    architectures::llama::model as llama,
+    load_model_with_options,
     runtime::execution::layerwise::LayerwiseLoadOptions,
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     runtime::residency::policy::{MemoryTier, OffloadConfig, TransferDirection},
+    ModelLoadOptions, WeightResidency,
 };
 
 #[derive(Debug, Parser)]
@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
             || (args.device_budget_bytes.is_none() && args.host_budget_bytes.is_none()),
         "--device-budget-bytes and --host-budget-bytes apply only to layerwise host residency; use --stream-device-budget and --stream-host-budget with --dense-disk-stream"
     );
-    let load_options = if args.dense_disk_stream {
+    let weight_residency = if args.dense_disk_stream {
         let mut dense = DenseDiskStreamLoadOptions::new(
             args.stream_device_budget,
             args.stream_host_budget,
@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         dense.max_mapped_shards = args.mapped_shards;
         dense.sample_mlx_memory = true;
         dense.sample_process_memory = true;
-        LlamaLoadOptions::dense_disk_stream(dense)
+        WeightResidency::dense_disk_stream(dense)
     } else {
         let config = OffloadConfig::new(
             args.device_budget_bytes,
@@ -95,9 +95,21 @@ fn main() -> anyhow::Result<()> {
             sample_process_memory: true,
             ..LayerwiseLoadOptions::default()
         };
-        LlamaLoadOptions::layerwise_host(layerwise)
+        WeightResidency::layerwise_host(layerwise)
     };
-    let mut model = load_llama_model(&args.model_dir, load_options, stream, weights.stream())?;
+    let loaded = load_model_with_options(
+        &args.model_dir,
+        ModelLoadOptions::default().with_weight_residency(weight_residency),
+        stream,
+        weights.stream(),
+    )?;
+    let mut model = match loaded {
+        Model::Llama(model) => model,
+        model => anyhow::bail!(
+            "the Llama residency benchmark requires a Llama-compatible checkpoint, got {}",
+            model.model_type()
+        ),
+    };
     let metadata = model.metadata().clone();
     let mut cache = model.new_cache();
 

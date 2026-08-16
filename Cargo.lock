@@ -2696,6 +2696,7 @@ dependencies = [
  "rustfft",
  "safemlx",
  "safemlx-gguf",
+ "safemlx-lm-core",
  "safemlx-lm-utils",
  "safetensors",
  "serde",
@@ -2720,6 +2721,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "safemlx-lm-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

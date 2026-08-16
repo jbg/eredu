@@ -132,3 +132,9 @@ pub enum Error {
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
+
+impl From<safemlx_lm_core::scheduler::SchedulerError> for Error {
+    fn from(error: safemlx_lm_core::scheduler::SchedulerError) -> Self {
+        Self::Parallel(error.to_string())
+    }
+}

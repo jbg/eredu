@@ -18,41 +18,9 @@ use safemlx::{
 };
 
 use crate::error::Error;
-
-/// Stable caller-assigned identity for one scheduler-owned request.
-#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
-pub struct RequestId(u64);
-
-impl RequestId {
-    /// Creates an identity. Zero is valid; uniqueness is scheduler-local.
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the caller-assigned numeric identity.
-    pub const fn value(self) -> u64 {
-        self.0
-    }
-}
-
-/// Scheduler-assigned identity for one ordered request-state transition.
-#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
-pub struct WorkId {
-    request: RequestId,
-    sequence: u64,
-}
-
-impl WorkId {
-    /// Returns the request whose state this work updates.
-    pub const fn request(self) -> RequestId {
-        self.request
-    }
-
-    /// Returns the zero-based transition number within the request.
-    pub const fn sequence(self) -> u64 {
-        self.sequence
-    }
-}
+pub use safemlx_lm_core::scheduler::{
+    CancellationCause, RequestId, RequestStatus, SchedulerLimits, WorkId, WorkLifecycle,
+};
 
 /// Exact cross-rank descriptor for a program-specific work payload.
 pub trait WorkDescriptor {
@@ -113,125 +81,6 @@ pub trait TransitionOutput {
 
     /// Number of explicitly retained arrays and transfer/resource leases.
     fn retained_resources(&self) -> usize;
-}
-
-/// Capacity and cooperative-preemption controls shared by scheduler programs.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct SchedulerLimits {
-    /// Maximum number of simultaneously state-owning requests.
-    pub max_active_requests: usize,
-    /// Maximum accepted work which has not reached a terminal lifecycle state.
-    pub max_queued_work: usize,
-    /// Maximum new backend submissions in one scheduler turn.
-    pub max_new_submissions_per_turn: usize,
-    /// Maximum submitted transitions across all requests.
-    pub max_in_flight_global: usize,
-    /// Maximum submitted transitions for one request.
-    pub max_in_flight_per_request: usize,
-    /// Program-defined maximum operations represented by one transition.
-    pub execution_slice: usize,
-}
-
-impl SchedulerLimits {
-    /// Creates request and queue bounds with conservative single-transition turns.
-    pub fn new(max_active_requests: usize, max_queued_work: usize) -> Result<Self, Error> {
-        Self::with_execution_bounds(
-            max_active_requests,
-            max_queued_work,
-            1,
-            max_active_requests,
-            1,
-            usize::MAX,
-        )
-    }
-
-    /// Creates fully explicit scheduling and execution-slice bounds.
-    pub fn with_execution_bounds(
-        max_active_requests: usize,
-        max_queued_work: usize,
-        max_new_submissions_per_turn: usize,
-        max_in_flight_global: usize,
-        max_in_flight_per_request: usize,
-        execution_slice: usize,
-    ) -> Result<Self, Error> {
-        let values = [
-            max_active_requests,
-            max_queued_work,
-            max_new_submissions_per_turn,
-            max_in_flight_global,
-            max_in_flight_per_request,
-            execution_slice,
-        ];
-        if values.contains(&0) {
-            return Err(Error::Parallel(format!(
-                "scheduler limits must be positive, got {values:?}"
-            )));
-        }
-        Ok(Self {
-            max_active_requests,
-            max_queued_work,
-            max_new_submissions_per_turn,
-            max_in_flight_global,
-            max_in_flight_per_request,
-            execution_slice,
-        })
-    }
-}
-
-impl Default for SchedulerLimits {
-    fn default() -> Self {
-        Self {
-            max_active_requests: 64,
-            max_queued_work: 256,
-            max_new_submissions_per_turn: 1,
-            max_in_flight_global: 64,
-            max_in_flight_per_request: 1,
-            execution_slice: usize::MAX,
-        }
-    }
-}
-
-/// Authoritative lifecycle for one work transition.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum WorkLifecycle {
-    /// Accepted but not described or branched.
-    Queued,
-    /// Descriptor and semantic branch exist; no backend work was issued.
-    Prepared,
-    /// Exact backend completion exists and is incomplete.
-    Submitted,
-    /// Exact completion succeeded and publication is being resolved.
-    Completing,
-    /// Branch and output were published after successful completion.
-    Committed,
-    /// Work was cancelled after submission; resources await exact completion.
-    Abandoned,
-    /// Preparation, submission, completion, or commit failed.
-    Failed,
-}
-
-/// Observable lifecycle state for a scheduler-owned request.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum RequestStatus {
-    /// The request owns canonical state and may accept work.
-    Active,
-    /// A normal terminal condition released canonical state.
-    Finished,
-    /// Explicit cancellation discarded unpublished state.
-    Cancelled,
-    /// A deadline discarded unpublished state.
-    DeadlineExceeded,
-    /// A request-local failure invalidated this request only.
-    Failed,
-}
-
-/// Cause attached to a cancellation disposition.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum CancellationCause {
-    /// Caller-requested cancellation.
-    Explicit,
-    /// Scheduler-observed deadline expiry.
-    Deadline,
 }
 
 /// Static scheduler capabilities and configured bounds.
@@ -606,10 +455,7 @@ where
         let was_empty = entry.pending.is_empty();
         let mut ids = Vec::with_capacity(requested);
         for (offset, (work, deadline)) in work.into_iter().enumerate() {
-            let id = WorkId {
-                request,
-                sequence: entry.next_sequence + offset as u64,
-            };
+            let id = WorkId::new(request, entry.next_sequence + offset as u64);
             entry.pending.push_back(QueuedWork { id, work, deadline });
             self.lifecycle.insert(id, WorkLifecycle::Queued);
             ids.push(id);

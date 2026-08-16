@@ -50,8 +50,8 @@ use crate::{
         load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
         DenseDiskStreamReport, ExecutionResidency, LayerWeightResidency, LayerwiseForwardState,
-        LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter,
-        StaticUnitBindings, WeightResidency,
+        LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings,
+        WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
 };
@@ -59,38 +59,6 @@ use crate::{
 const EMBEDDING_UNIT: &str = "llama.static.embedding";
 const NORM_UNIT: &str = "llama.static.norm";
 const HEAD_UNIT: &str = "llama.static.output";
-
-/// Options for the unified Llama/Mistral loader.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub struct LlamaLoadOptions {
-    /// Determines where decoder weights live and how they execute.
-    pub weight_residency: WeightResidency,
-}
-
-impl LlamaLoadOptions {
-    /// Selects the eager engine with every parameter on the execution device.
-    pub const fn fully_resident() -> Self {
-        Self {
-            weight_residency: WeightResidency::fully_resident(),
-        }
-    }
-
-    /// Selects host-backed decoder layers with a bounded device window.
-    pub const fn layerwise_host(options: LayerwiseLoadOptions) -> Self {
-        Self {
-            weight_residency: WeightResidency::layerwise_host(options),
-        }
-    }
-
-    /// Selects experimental dense disk streaming with finite tier budgets.
-    pub const fn dense_disk_stream(
-        options: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    ) -> Self {
-        Self {
-            weight_residency: WeightResidency::dense_disk_stream(options),
-        }
-    }
-}
 
 /// Per-layer Llama/Mistral KV state selected from the canonical schedule.
 #[derive(Debug, Clone)]
@@ -175,9 +143,33 @@ impl LlamaCache {
 /// Llama/Mistral causal LM whose execution engine follows its residency policy.
 pub struct LlamaModel {
     execution: Box<LayerwiseModel<LlamaLayerwiseAdapter>>,
+    pending_backend_completions: Vec<crate::backend::mlx::MlxCompletion>,
 }
 
 impl LlamaModel {
+    pub(crate) fn retain_backend_completion(
+        &mut self,
+        completion: crate::backend::mlx::MlxCompletion,
+    ) -> Result<(), Error> {
+        use safemlx_lm_core::Completion;
+        self.pending_backend_completions.push(completion);
+        let mut pending = std::mem::take(&mut self.pending_backend_completions).into_iter();
+        let mut retained = Vec::with_capacity(pending.len());
+        while let Some(completion) = pending.next() {
+            match completion.is_complete() {
+                Ok(true) => {}
+                Ok(false) => retained.push(completion),
+                Err(error) => {
+                    retained.extend(pending);
+                    self.pending_backend_completions = retained;
+                    return Err(error);
+                }
+            }
+        }
+        self.pending_backend_completions = retained;
+        Ok(())
+    }
+
     /// Returns normalized model arguments regardless of execution engine.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
@@ -472,7 +464,8 @@ impl CausalLm<LlamaCache> for LlamaModel {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let tokens = input::text_token_ids(input, stream)?;
-        self.prefill(&tokens, cache, stream)
+        crate::backend::mlx::MlxLlamaExecutor::new(self, cache, stream)
+            .prefill_retained(tokens)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 
@@ -482,15 +475,15 @@ impl CausalLm<LlamaCache> for LlamaModel {
         cache: &mut LlamaCache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        self.decode(input_tokens, cache, stream)
+        crate::backend::mlx::MlxLlamaExecutor::new(self, cache, stream)
+            .decode_retained(input_tokens.clone())
             .map_err(|error| Exception::custom(error.to_string()))
     }
 }
 
-/// Loads a Llama/Mistral safetensors model using the selected residency policy.
-pub fn load_llama_model(
+pub(crate) fn load_llama_safetensors_mlx(
     model_dir: impl AsRef<Path>,
-    options: LlamaLoadOptions,
+    weight_residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
@@ -498,14 +491,14 @@ pub fn load_llama_model(
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency),
+        crate::api::ModelLoadOptions::default().with_weight_residency(weight_residency),
     )?;
-    if options.weight_residency.expert_cache().is_some() {
+    if weight_residency.expert_cache().is_some() {
         return Err(Error::UnsupportedArchitecture(
             "independent expert caching is not supported for Llama checkpoints".into(),
         ));
     }
-    let execution_options = options.weight_residency.layers();
+    let execution_options = weight_residency.layers();
     let args = resident::get_llama_model_args(model_dir)?;
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
     Ok(LlamaModel {
@@ -516,6 +509,7 @@ pub fn load_llama_model(
             stream,
             weights_stream,
         )?),
+        pending_backend_completions: Vec::new(),
     })
 }
 
@@ -534,6 +528,7 @@ pub(crate) fn execute_transformed_llama_model(
             stream,
             weights_stream,
         )?),
+        pending_backend_completions: Vec::new(),
     })
 }
 
@@ -580,6 +575,7 @@ pub fn load_llama_tensor_parallel_model(
             stream,
             weights_stream,
         )?),
+        pending_backend_completions: Vec::new(),
     })
 }
 
@@ -614,6 +610,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     Ok((
         LlamaModel {
             execution: Box::new(execution),
+            pending_backend_completions: Vec::new(),
         },
         prepared.eos_token_ids,
     ))
@@ -653,6 +650,7 @@ pub(crate) fn load_llama_gguf_model(
                 stream,
                 weights_stream,
             )?),
+            pending_backend_completions: Vec::new(),
         },
         prepared.eos_token_ids,
     ))
