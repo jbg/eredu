@@ -62,6 +62,8 @@ Use the high-level `api` module for loading, prepared inputs, generation, cache
 creation, and memory admission. `safemlx_lm::load_model_with_options` is the
 single model-loading entry point for supported checkpoint formats and
 architectures. The MLX backend performs architecture dispatch internally.
+Realtime Moshi/PersonaPlex requests use the backend-neutral core scheduler;
+only their tensor execution and exact MLX completion adapter remain here.
 
 ## Automatic execution planning
 

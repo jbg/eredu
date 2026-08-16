@@ -87,7 +87,7 @@ MLX managers execute transfers and report concrete memory counters.
 
 The first vertical slice intentionally leaves these components MLX-coupled:
 
-- non-Llama architectures and multimodal/realtime execution;
+- non-Llama tensor execution, including multimodal and realtime model math;
 - the facade's current distributed scheduler transport, MLX event backend
   reporting, and cross-rank descriptor/disposition consensus;
 - concrete topology device assignment, communicator construction, collectives,
@@ -98,17 +98,17 @@ The first vertical slice intentionally leaves these components MLX-coupled:
 - sampling, speculative decoding, activation observation, memory counters, and
   Metal/CUDA kernels.
 
-The neutral scheduler in core is canonical for new orchestration and is tested
-with controllable exact completions. The existing facade scheduler remains the
-MLX/distributed adapter during this milestone so its established
-paths and consensus behavior are unchanged. Request/work identities, lifecycle
-enums, cancellation causes, and scheduler limits are canonical core types
-reexported by the facade. Consequently, the concrete error type returned by
-`SchedulerLimits` constructors is now core's `SchedulerError`; the facade
-implements conversion to its existing `Error::Parallel`, so ordinary `?` use
-and error text remain compatible. Keeping the old concrete return type would
-require a duplicate facade definition. A follow-up can make the MLX transport
-delegate to the core machine after a separate extraction pass.
+The neutral scheduler in core now owns the production single-rank realtime
+request lifecycle. Moshi and PersonaPlex queueing, fairness, deadlines,
+branching, commit/discard, cancellation, abandonment, capacity accounting, and
+telemetry execute in `safemlx-lm-core`. The facade adapter supplies only stable
+work descriptors, MLX submission closures, exact MLX completion observation,
+and retained arrays. The two Metal realtime lifecycle tests exercise this path.
+
+The separate distributed pipeline scheduler remains in the facade because its
+descriptor and disposition consensus still uses MLX groups and collectives.
+Extracting a neutral consensus transport is the next scheduler step; it does
+not require moving the single-rank state machine again.
 
 ## Adding IREE or native Slang later
 

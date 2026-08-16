@@ -27,7 +27,8 @@ mod test_utils;
 pub use api::realtime::{
     load_model as load_realtime_model, load_model_with_options as load_realtime_model_with_options,
     LoadedRealtimeModel, RealtimeCompletedStep, RealtimeInferenceScheduler, RealtimeModelKind,
-    RealtimeSampling, RealtimeSession, RealtimeSpeechConfig, RealtimeStepInput, RealtimeStepOutput,
+    RealtimeSampling, RealtimeSchedulerCapabilities, RealtimeSchedulerReport, RealtimeSession,
+    RealtimeSpeechConfig, RealtimeStepInput, RealtimeStepOutput,
 };
 pub use api::{
     discover_hardware, execution_plan_load_options, inspect_model, load_model,

@@ -9,7 +9,15 @@ use safemlx::{
     ops::{indexing::TryIndexOp, stack_axis},
     random::RandomState,
     transforms::async_eval_with_event,
-    Array, Dtype, Event, EventBackend, Stream,
+    Array, Dtype, Event, Stream,
+};
+use safemlx_lm_core::scheduler::{
+    RequestId, RequestStatus, Scheduler, SchedulerLimits, SemanticStateTransaction,
+    TransitionOutput, WorkDescriptor, WorkId,
+};
+pub use safemlx_lm_core::scheduler::{
+    SchedulerCapabilities as RealtimeSchedulerCapabilities,
+    SchedulerReport as RealtimeSchedulerReport,
 };
 use serde::Deserialize;
 use std::{path::Path, time::Instant};
@@ -20,10 +28,6 @@ use crate::{
     error::Error,
     runtime::checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
     runtime::generation::sampler::{DefaultSampler, Sampler},
-    runtime::scheduler::{
-        FairScheduler, RequestId, RequestStatus, SchedulerCapabilities, SchedulerLimits,
-        SchedulerReport, SemanticStateTransaction, TransitionOutput, WorkDescriptor, WorkId,
-    },
 };
 
 /// Static token-stream metadata needed to pair a realtime model with a codec.
@@ -87,6 +91,8 @@ impl RealtimeStepInput {
 }
 
 impl WorkDescriptor for RealtimeStepInput {
+    type Error = Error;
+
     fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
         encode_array_descriptor(&self.input_audio_tokens, output)?;
         encode_optional_array_descriptor(self.forced_generated_audio_tokens.as_ref(), output)?;
@@ -466,6 +472,7 @@ where
     AS: Clone,
 {
     type Branch = Self;
+    type Error = Error;
 
     fn branch(&self) -> Result<Self::Branch, Error> {
         // MLX arrays share immutable graph/backing ownership. Mutable cache
@@ -501,12 +508,22 @@ impl RealtimeTransitionOutput {
 }
 
 impl TransitionOutput for RealtimeTransitionOutput {
+    type Error = Error;
+
     fn is_complete(&self) -> Result<bool, Error> {
         Ok(self.event.is_complete()?)
     }
 
-    fn backend(&self) -> Result<EventBackend, Error> {
-        Ok(self.event.backend()?)
+    fn backend_name(&self) -> Option<String> {
+        self.event.backend().ok().map(|backend| {
+            match backend {
+                safemlx::EventBackend::None => "none",
+                safemlx::EventBackend::Cpu => "cpu",
+                safemlx::EventBackend::Metal => "metal",
+                safemlx::EventBackend::Cuda => "cuda",
+            }
+            .into()
+        })
     }
 
     fn retained_resources(&self) -> usize {
@@ -657,7 +674,7 @@ impl RealtimeCompletedStep {
 /// temporal/depth execution closure.
 pub struct RealtimeInferenceScheduler<TS: Clone, AS: Clone> {
     model_identity: RealtimeModelIdentity,
-    scheduler: FairScheduler<RealtimeStepInput, RealtimeSession<TS, AS>, RealtimeTransitionOutput>,
+    scheduler: Scheduler<RealtimeStepInput, RealtimeSession<TS, AS>, RealtimeTransitionOutput>,
 }
 
 impl<TS, AS> RealtimeInferenceScheduler<TS, AS>
@@ -669,7 +686,7 @@ where
     pub fn new(model: &LoadedRealtimeModel, limits: SchedulerLimits) -> Result<Self, Error> {
         Ok(Self {
             model_identity: RealtimeModelIdentity::new(model),
-            scheduler: FairScheduler::new(limits)?,
+            scheduler: Scheduler::new(limits)?,
         })
     }
 
@@ -685,7 +702,7 @@ where
         self.validate_model(model)?;
         self.scheduler.validate_registration(request)?;
         self.validate_audio_samplers(model, audio_samplers.len())?;
-        self.scheduler.register(
+        Ok(self.scheduler.register(
             request,
             RealtimeSession {
                 model_identity: self.model_identity.clone(),
@@ -695,7 +712,7 @@ where
                 sampling,
                 batch_size: None,
             },
-        )
+        )?)
     }
 
     /// Registers a released request session.
@@ -714,7 +731,7 @@ where
         }
         self.validate_audio_samplers(model, session.audio_samplers.len())?;
         validate_generation_state(model, &session.generation)?;
-        self.scheduler.register(request, session)
+        Ok(self.scheduler.register(request, session)?)
     }
 
     /// Enqueues one encoded or forced prompt frame.
@@ -843,33 +860,30 @@ where
         let completed_now = self.scheduler.poll_completions(now);
         progress.committed.extend(completed_now.committed);
         progress.failed.extend(completed_now.failed);
-        if let Some(failure) = progress.failed.first() {
+        if let Some((work, failure)) = progress.failed.first() {
             return Err(Error::Parallel(format!(
                 "realtime work {:?} failed asynchronously: {}",
-                failure.id, failure.error
+                work, failure
             )));
         }
         Ok(progress
             .committed
             .into_iter()
-            .map(|completed| {
-                let (work, _, output) = completed.into_parts();
-                RealtimeCompletedStep {
-                    work,
-                    output: output.output,
-                }
+            .map(|(work, _, output)| RealtimeCompletedStep {
+                work,
+                output: output.output,
             })
             .collect())
     }
 
     /// Completes a request and drops its temporal/depth state and samplers.
     pub fn finish_request(&mut self, request: RequestId) -> Result<(), Error> {
-        self.scheduler.finish(request)
+        Ok(self.scheduler.finish(request)?)
     }
 
     /// Cancels a request and discards all queued frames and owned state.
     pub fn cancel_request(&mut self, request: RequestId) -> Result<(), Error> {
-        self.scheduler.cancel(request)
+        Ok(self.scheduler.cancel(request)?)
     }
 
     /// Releases an idle request for explicit persistence or later resumption.
@@ -877,12 +891,12 @@ where
         &mut self,
         request: RequestId,
     ) -> Result<RealtimeSession<TS, AS>, Error> {
-        self.scheduler.release(request)
+        Ok(self.scheduler.release(request)?)
     }
 
     /// Removes a terminal identity so it may be explicitly reused.
     pub fn forget_terminal_request(&mut self, request: RequestId) -> Result<RequestStatus, Error> {
-        self.scheduler.forget_terminal(request)
+        Ok(self.scheduler.forget_terminal(request)?)
     }
 
     /// Returns the lifecycle state for a known request.
@@ -916,18 +930,13 @@ where
     }
 
     /// Returns generic scheduler occupancy and lifecycle telemetry.
-    pub fn report(&self) -> SchedulerReport {
+    pub fn report(&self) -> RealtimeSchedulerReport {
         self.scheduler.report()
     }
 
     /// Returns configured bounds, backend identity, and physical-preemption support.
-    pub fn capabilities(&self) -> SchedulerCapabilities {
+    pub fn capabilities(&self) -> RealtimeSchedulerCapabilities {
         self.scheduler.capabilities()
-    }
-
-    /// Returns the error that poisoned all request state, if any.
-    pub fn poison_reason(&self) -> Option<&str> {
-        self.scheduler.poison_reason()
     }
 
     fn validate_model(&self, model: &LoadedRealtimeModel) -> Result<(), Error> {
