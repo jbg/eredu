@@ -11,10 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use safemlx::{
-    distributed::{self, Group},
-    transforms::async_eval_with_event,
-    Array, EventBackend, Stream,
+use safemlx::EventBackend;
+use safemlx_lm_core::consensus::{
+    resolve_completions, validate_disposition, validate_schedule, CompletionObservation,
+    CompletionResolution, ConsensusTransport, ScheduledWork,
 };
 
 use crate::error::Error;
@@ -669,11 +669,10 @@ where
     }
 
     /// Runs one bounded distributed turn with exact descriptor and disposition consensus.
-    pub fn run_distributed_turn(
+    pub fn run_distributed_turn<T: ConsensusTransport>(
         &mut self,
         protocol: u64,
-        group: &Group,
-        stream: &Stream,
+        transport: &T,
         now: Instant,
         execute: impl FnMut(WorkId, &W, &mut S::Branch) -> Result<O, Error>,
     ) -> Result<SchedulerProgress<W, O>, Error>
@@ -681,8 +680,8 @@ where
         W: WorkDescriptor,
     {
         self.ensure_ready()?;
-        self.expire_deadlines_distributed(protocol, group, stream, now)?;
-        let mut progress = self.poll_distributed(protocol, group, stream, now)?;
+        self.expire_deadlines_distributed(protocol, transport, now)?;
+        let mut progress = self.poll_distributed(protocol, transport, now)?;
         self.prepare_bounded(self.limits.max_new_submissions_per_turn, now)?;
         let descriptors = self
             .prepared
@@ -693,16 +692,15 @@ where
                     .saturating_sub(self.in_flight.len())
                     .min(self.limits.max_new_submissions_per_turn),
             )
-            .map(|work| PlannedWork {
+            .map(|work| ScheduledWork {
                 id: work.id,
-                descriptor: work.descriptor.clone(),
+                descriptor: &work.descriptor,
             })
             .collect::<Vec<_>>();
-        if let Err(error) =
-            validate_schedule_consensus(&descriptors, self.drain_cycles, protocol, group, stream)
+        if let Err(error) = validate_schedule(transport, &descriptors, self.drain_cycles, protocol)
         {
             self.poison(error.to_string());
-            return Err(error);
+            return Err(Error::Parallel(error.to_string()));
         }
         progress.newly_submitted = match self.submit_prepared(now, execute) {
             Ok(count) => count,
@@ -758,21 +756,18 @@ where
     }
 
     /// Reaches exact topology-scoped cancellation consensus before disposition.
-    pub fn cancel_distributed(
+    pub fn cancel_distributed<T: ConsensusTransport>(
         &mut self,
         protocol: u64,
         request: RequestId,
-        group: &Group,
-        stream: &Stream,
+        transport: &T,
     ) -> Result<(), Error> {
-        validate_disposition_consensus(
-            protocol,
-            request,
-            CancellationCause::Explicit,
-            group,
-            stream,
-        )
-        .inspect_err(|error| self.poison(error.to_string()))?;
+        validate_disposition(transport, protocol, request, CancellationCause::Explicit).map_err(
+            |error| {
+                self.poison(error.to_string());
+                Error::Parallel(error.to_string())
+            },
+        )?;
         self.cancel_internal(request, CancellationCause::Explicit, Instant::now())
     }
 
@@ -983,32 +978,33 @@ where
         }
     }
 
-    fn poll_distributed(
+    fn poll_distributed<T: ConsensusTransport>(
         &mut self,
         protocol: u64,
-        group: &Group,
-        stream: &Stream,
+        transport: &T,
         now: Instant,
     ) -> Result<SchedulerProgress<W, O>, Error> {
         let mut local = Vec::with_capacity(self.in_flight.len());
         for work in &self.in_flight {
             let status = match work.output.is_complete() {
-                Ok(false) => 0,
-                Ok(true) => 1,
-                Err(_) => 2,
+                Ok(false) => CompletionObservation::Incomplete,
+                Ok(true) => CompletionObservation::Complete,
+                Err(_) => CompletionObservation::Failed,
             };
             local.push((work.id, status));
         }
-        let global = validate_completion_consensus(protocol, &local, group, stream)
-            .inspect_err(|error| self.poison(error.to_string()))?;
+        let global = resolve_completions(transport, protocol, &local).map_err(|error| {
+            self.poison(error.to_string());
+            Error::Parallel(error.to_string())
+        })?;
         let mut progress = SchedulerProgress::default();
         let mut retained = Vec::with_capacity(self.in_flight.len());
         let submitted_work = std::mem::take(&mut self.in_flight);
         for (work, status) in submitted_work.into_iter().zip(global) {
             match status {
-                0 => retained.push(work),
-                1 => self.resolve_completed(work, now, &mut progress),
-                3 => {
+                CompletionResolution::Incomplete => retained.push(work),
+                CompletionResolution::Complete => self.resolve_completed(work, now, &mut progress),
+                CompletionResolution::FailedPending => {
                     let mut work = work;
                     if !matches!(work.disposition, SubmittedDisposition::Fail) {
                         work.disposition = SubmittedDisposition::Fail;
@@ -1017,7 +1013,7 @@ where
                     }
                     retained.push(work);
                 }
-                _ => {
+                CompletionResolution::FailedComplete => {
                     let id = work.id;
                     if !matches!(work.disposition, SubmittedDisposition::Fail) {
                         self.failed_work = self.failed_work.saturating_add(1);
@@ -1062,11 +1058,10 @@ where
         Ok(())
     }
 
-    fn expire_deadlines_distributed(
+    fn expire_deadlines_distributed<T: ConsensusTransport>(
         &mut self,
         protocol: u64,
-        group: &Group,
-        stream: &Stream,
+        transport: &T,
         now: Instant,
     ) -> Result<(), Error> {
         let expired = self
@@ -1081,14 +1076,11 @@ where
             })
             .collect::<Vec<_>>();
         for request in expired {
-            validate_disposition_consensus(
-                protocol,
-                request,
-                CancellationCause::Deadline,
-                group,
-                stream,
-            )
-            .inspect_err(|error| self.poison(error.to_string()))?;
+            validate_disposition(transport, protocol, request, CancellationCause::Deadline)
+                .map_err(|error| {
+                    self.poison(error.to_string());
+                    Error::Parallel(error.to_string())
+                })?;
             self.cancel_internal(request, CancellationCause::Deadline, now)?;
         }
         Ok(())
@@ -1287,12 +1279,6 @@ where
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct PlannedWork {
-    id: WorkId,
-    descriptor: Vec<u32>,
-}
-
 fn backend_wire(backend: EventBackend) -> u8 {
     match backend {
         EventBackend::None => 0,
@@ -1312,149 +1298,6 @@ fn backend_from_wire(value: u8) -> EventBackend {
     }
 }
 
-fn validate_schedule_consensus(
-    plan: &[PlannedWork],
-    drain_cycle: u64,
-    protocol: u64,
-    group: &Group,
-    stream: &Stream,
-) -> Result<(), Error> {
-    let mut packed = vec![
-        plan.len() as u32,
-        drain_cycle as u32,
-        (drain_cycle >> 32) as u32,
-        protocol as u32,
-        (protocol >> 32) as u32,
-    ];
-    for work in plan {
-        push_u64(&mut packed, work.id.request().value());
-        push_u64(&mut packed, work.id.sequence());
-        packed.push(u32::try_from(work.descriptor.len()).map_err(|_| {
-            Error::Parallel("distributed work descriptor length exceeds u32".into())
-        })?);
-        packed.extend_from_slice(&work.descriptor);
-    }
-    validate_equal_words(&packed, "distributed schedule", group, stream)
-}
-
-fn validate_disposition_consensus(
-    protocol: u64,
-    request: RequestId,
-    cause: CancellationCause,
-    group: &Group,
-    stream: &Stream,
-) -> Result<(), Error> {
-    let mut words = vec![protocol as u32, (protocol >> 32) as u32];
-    push_u64(&mut words, request.value());
-    words.push(match cause {
-        CancellationCause::Explicit => 1,
-        CancellationCause::Deadline => 2,
-    });
-    validate_equal_words(
-        &words,
-        "distributed cancellation disposition",
-        group,
-        stream,
-    )
-}
-
-fn validate_completion_consensus(
-    protocol: u64,
-    local: &[(WorkId, u32)],
-    group: &Group,
-    stream: &Stream,
-) -> Result<Vec<u32>, Error> {
-    if group.size() == 1 {
-        return Ok(local.iter().map(|(_, status)| *status).collect());
-    }
-    let mut words = vec![protocol as u32, (protocol >> 32) as u32, local.len() as u32];
-    for (id, status) in local {
-        push_u64(&mut words, id.request().value());
-        push_u64(&mut words, id.sequence());
-        words.push(*status);
-    }
-    let gathered = gather_words(&words, group, stream)?;
-    for rank in 0..group.size() {
-        let candidate = &gathered[rank * words.len()..(rank + 1) * words.len()];
-        if candidate[..3] != words[..3] {
-            return Err(Error::Parallel(format!(
-                "distributed completion header differs at rank {rank}"
-            )));
-        }
-        for (index, (id, _)) in local.iter().enumerate() {
-            let offset = 3 + index * 5;
-            let expected = [
-                id.request().value() as u32,
-                (id.request().value() >> 32) as u32,
-                id.sequence() as u32,
-                (id.sequence() >> 32) as u32,
-            ];
-            if candidate[offset..offset + 4] != expected {
-                return Err(Error::Parallel(format!(
-                    "distributed completion identity differs at rank {rank}"
-                )));
-            }
-            if candidate[offset + 4] > 2 {
-                return Err(Error::Parallel(format!(
-                    "distributed completion status is invalid at rank {rank}"
-                )));
-            }
-        }
-    }
-    Ok((0..local.len())
-        .map(|index| {
-            let statuses = (0..group.size()).map(|rank| {
-                let offset = rank * words.len() + 3 + index * 5;
-                gathered[offset + 4]
-            });
-            let statuses = statuses.collect::<Vec<_>>();
-            let failed = statuses.contains(&2);
-            let incomplete = statuses.contains(&0);
-            match (failed, incomplete) {
-                (true, true) => 3,
-                (true, false) => 2,
-                (false, true) => 0,
-                (false, false) => 1,
-            }
-        })
-        .collect())
-}
-
-fn validate_equal_words(
-    words: &[u32],
-    context: &str,
-    group: &Group,
-    stream: &Stream,
-) -> Result<(), Error> {
-    if group.size() == 1 {
-        return Ok(());
-    }
-    let gathered = gather_words(words, group, stream)?;
-    for rank in 0..group.size() {
-        let start = rank * words.len();
-        let end = start + words.len();
-        if gathered.get(start..end) != Some(words) {
-            return Err(Error::Parallel(format!("{context} differs at rank {rank}")));
-        }
-    }
-    Ok(())
-}
-
-fn gather_words(words: &[u32], group: &Group, stream: &Stream) -> Result<Vec<u32>, Error> {
-    let length = i32::try_from(words.len())
-        .map_err(|_| Error::Parallel("distributed scheduler metadata exceeds i32".into()))?;
-    let local = Array::from_slice(words, &[length]);
-    let gathered = distributed::all_gather(&local, group, stream).map_err(|error| {
-        Error::Parallel(format!("distributed scheduler consensus failed: {error}"))
-    })?;
-    async_eval_with_event([&gathered])?.synchronize()?;
-    Ok(gathered.evaluated()?.as_slice::<u32>().to_vec())
-}
-
-fn push_u64(output: &mut Vec<u32>, value: u64) {
-    output.extend_from_slice(&[value as u32, (value >> 32) as u32]);
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1465,6 +1308,8 @@ mod tests {
             Arc,
         },
     };
+
+    use safemlx::{Array, Stream};
 
     use super::*;
 
@@ -1853,7 +1698,11 @@ mod tests {
 
     #[test]
     fn distributed_cancellation_reaches_single_rank_consensus_before_disposition() {
-        use safemlx::{distributed::Backend, Device, DeviceType};
+        use crate::backend::mlx::consensus::MlxConsensusTransport;
+        use safemlx::{
+            distributed::{Backend, Group},
+            Device, DeviceType, Stream,
+        };
 
         let group = Group::init(false, Backend::Any).unwrap();
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
@@ -1870,8 +1719,9 @@ mod tests {
             )
             .unwrap();
         scheduler.enqueue(request, work(1, &encodes)).unwrap();
+        let consensus = MlxConsensusTransport::new(&group, &stream);
         scheduler
-            .cancel_distributed(0xCA11_CE11, request, &group, &stream)
+            .cancel_distributed(0xCA11_CE11, request, &consensus)
             .unwrap();
         assert_eq!(
             scheduler.request_status(request),

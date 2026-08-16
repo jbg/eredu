@@ -62,6 +62,7 @@ use crate::{
             vl::layerwise::{Qwen3VlLayer, Qwen3VlLayerwiseAdapter, Qwen3VlPipelinePrepared},
         },
     },
+    backend::mlx::consensus::MlxConsensusTransport,
     error::Error,
     nn::{
         parallel::{
@@ -1612,10 +1613,10 @@ impl PipelineInferenceScheduler {
         self.validate_model(model)?;
         model.validate_group(group)?;
         let protocol = 0x5049_5045_0002_0000u64 | self.model_kind as u64;
+        let consensus = MlxConsensusTransport::new(group, stream);
         let progress = self.scheduler.run_distributed_turn(
             protocol,
-            group,
-            stream,
+            &consensus,
             Instant::now(),
             |_, work, request| {
                 request.stream = Some(stream.clone());
@@ -1695,10 +1696,10 @@ impl PipelineInferenceScheduler {
             )));
         }
         let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
+        let consensus = MlxConsensusTransport::new(cartesian.world(), stream);
         let progress = self.scheduler.run_distributed_turn(
             protocol,
-            cartesian.world(),
-            stream,
+            &consensus,
             Instant::now(),
             |_, work, request| {
                 request.stream = Some(stream.clone());
@@ -1781,8 +1782,9 @@ impl PipelineInferenceScheduler {
         stream: &Stream,
     ) -> Result<(), Error> {
         let protocol = 0x5049_5045_0002_0000u64 | self.model_kind as u64;
+        let consensus = MlxConsensusTransport::new(group, stream);
         self.scheduler
-            .cancel_distributed(protocol, request, group, stream)
+            .cancel_distributed(protocol, request, &consensus)
     }
 
     /// Reaches world consensus for a Cartesian pipeline cancellation.
@@ -1798,8 +1800,9 @@ impl PipelineInferenceScheduler {
             ));
         }
         let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
+        let consensus = MlxConsensusTransport::new(cartesian.world(), stream);
         self.scheduler
-            .cancel_distributed(protocol, request, cartesian.world(), stream)
+            .cancel_distributed(protocol, request, &consensus)
     }
 
     /// Releases an idle active request and returns its cache to the caller.

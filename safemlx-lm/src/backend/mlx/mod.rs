@@ -1,5 +1,8 @@
 //! MLX backend adapter.
 
+/// Distributed scheduler consensus over MLX collectives.
+pub mod consensus;
+
 use std::path::PathBuf;
 
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};

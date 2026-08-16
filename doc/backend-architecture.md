@@ -88,8 +88,8 @@ MLX managers execute transfers and report concrete memory counters.
 The first vertical slice intentionally leaves these components MLX-coupled:
 
 - non-Llama tensor execution, including multimodal and realtime model math;
-- the facade's current distributed scheduler transport, MLX event backend
-  reporting, and cross-rank descriptor/disposition consensus;
+- the facade's distributed pipeline lifecycle machine and MLX event-backend
+  reporting;
 - concrete topology device assignment, communicator construction, collectives,
   and tensor movement;
 - cache-residency array storage, prompt-cache materialization, and transfer
@@ -105,10 +105,26 @@ telemetry execute in `safemlx-lm-core`. The facade adapter supplies only stable
 work descriptors, MLX submission closures, exact MLX completion observation,
 and retained arrays. The two Metal realtime lifecycle tests exercise this path.
 
-The separate distributed pipeline scheduler remains in the facade because its
-descriptor and disposition consensus still uses MLX groups and collectives.
-Extracting a neutral consensus transport is the next scheduler step; it does
-not require moving the single-rank state machine again.
+Distributed scheduler consensus is also backend-neutral. Core owns protocol
+framing and fail-closed validation for schedule descriptors, cancellation and
+deadline dispositions, work identities, and exact completion observations.
+`ConsensusTransport` exposes only a participant count and topology-scoped
+all-gather of portable `u32` words. It contains no tensor, stream, device,
+group, or MLX error type.
+
+The production pipeline scheduler constructs `MlxConsensusTransport` for its
+world group. That adapter materializes the portable word frame as an MLX array,
+runs `all_gather`, waits for its exact completion, and returns rank-major words
+to core. Core decides whether work is globally incomplete, complete, failed but
+still executing on a peer, or failed and safe to release. Backend errors are
+converted at the adapter boundary and consensus mismatches poison the facade
+scheduler before any new pipeline submission.
+
+The remaining scheduler duplication is the distributed pipeline lifecycle
+machine in the facade. A later milestone can make it delegate queueing and
+transaction publication to core while injecting consensus at its prepare,
+cancel, and completion boundaries. MLX events and retained arrays should remain
+facade-owned.
 
 ## Adding IREE or native Slang later
 
@@ -122,7 +138,9 @@ not require moving the single-rank state machine again.
 5. Implement prefill, decode, and exact completion; retain submitted resources
    until completion even after cancellation.
 6. Add explicit transfer/collective support only when the backend implements
-   exact ownership and synchronization semantics.
+   exact ownership and synchronization semantics. For distributed scheduling,
+   implement `ConsensusTransport` over a topology-wide, rank-ordered word
+   all-gather and run the core mismatch/failure tests.
 7. Run the core mock conformance tests plus backend-specific Llama load,
    prefill, multi-step decode, cancellation, checkpoint, and parity tests.
 8. Add backend selection at the facade/application boundary. Do not dispatch

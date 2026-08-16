@@ -64,6 +64,8 @@ single model-loading entry point for supported checkpoint formats and
 architectures. The MLX backend performs architecture dispatch internally.
 Realtime Moshi/PersonaPlex requests use the backend-neutral core scheduler;
 only their tensor execution and exact MLX completion adapter remain here.
+Distributed pipeline schedule, cancellation, and completion agreement use the
+core consensus protocol through the MLX collective adapter.
 
 ## Automatic execution planning
 

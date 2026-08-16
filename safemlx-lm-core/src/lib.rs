@@ -13,6 +13,8 @@ pub mod attention;
 pub mod backend;
 /// Neutral checkpoint tensor descriptions and validation.
 pub mod checkpoint;
+/// Backend-neutral distributed scheduler consensus.
+pub mod consensus;
 /// Portable execution plans, capabilities, and telemetry.
 pub mod execution;
 /// Backend-independent generation lifecycle and output events.
