@@ -56,10 +56,11 @@ not accept `Any`, raw pointers, or operation names as an execution escape hatch.
 ## Model, session, and completion lifecycle
 
 `Backend::prepare_model` selects one backend and produces an opaque
-`PreparedModel`. `Backend::create_session` creates backend-owned persistent
-decode/cache state. `BackendSession` then submits prefill and decode operations
-against that model and state. There is one session contract: the facade does
-not provide an architecture-specific or borrowing execution escape hatch.
+`PreparedModel`. `Backend::create_session` creates a backend-owned object which
+implements `BackendSession` directly. That object owns persistent decode/cache
+state and submits prefill and decode operations against the prepared model.
+There is one session contract: the facade does not provide an
+architecture-specific or borrowing execution escape hatch.
 
 Every submission returns an opaque output and an exact `Completion`. Completion
 can be polled or waited without draining unrelated work. A scheduler-owned
@@ -73,8 +74,10 @@ and executable ownership coherent and avoids hidden cross-runtime transfers or
 per-operation dispatch costs. Transfers and collectives are optional explicit
 capabilities and therefore fail closed when absent.
 
-`DistributedBackend` is the optional extension for sessions which communicate
-across ranks. Its `DistributedSession` exposes opaque values, typed world/axis
+`DistributedBackend` is the optional extension for model sessions which
+communicate across ranks. It exposes the `DistributedSession` attached to the
+selected model session; communicator construction is not a second independent
+core lifecycle. `DistributedSession` exposes opaque values, typed world/axis
 scopes, sum and gather collectives, variable-count all-to-all exchange,
 point-to-point transfer, portable scheduler-word consensus, and exact
 completion. Core contains no communicator, stream, native event, or tensor
@@ -97,10 +100,11 @@ metadata are not reopened: `GgufCheckpoint::from_portable` wraps the core-owned
 checkpoint for payload conversion. Combined model/tokenizer loading uses the
 same core plan; tokenizer and chat sidecars remain facade concerns.
 
-`MlxBackend` maps session creation to `ModelCache`.
-`MlxModelSession` is the sole architecture-erased prefill/decode
-implementation. It dispatches matching `Model` and `ModelCache` variants to
-their MLX architecture implementation, then wraps the output with
+`MlxBackend` maps session creation to `MlxModelSession`, which owns its
+`ModelCache` and, for pure tensor-parallel execution, its
+`MlxDistributedSession`. `MlxModelSession` is the sole architecture-erased
+prefill/decode implementation. It dispatches matching `Model` and `ModelCache`
+variants to their replicated or tensor-parallel MLX implementation, then wraps the output with
 `async_eval_with_event`. `MlxCompletion` owns that exact `Event`, retains the
 output array, and synchronizes on early drop so resources cannot be released
 before exact completion. Native exceptions are converted at the facade
@@ -156,6 +160,11 @@ promotion, cache-commit, callback ordering, or telemetry state machine.
 
 The public `api::load_model_with_options` route performs format, architecture,
 catalog, and policy planning in core before calling `Backend::prepare_model`.
+`ModelLoadOptions::with_parallel` selects pure tensor-parallel materialization
+through this same entry point. Architecture-specific tensor-parallel loaders
+are internal materializers, not public alternatives. The selected topology is
+then bound to cache state and communicators by
+`MlxBackend::create_distributed_model_session`.
 `MlxGeneration` is one
 architecture-erased iterator over `Model` and `ModelCache`; every supported
 text and multimodal model submits prompt prefill and every cached decode through
@@ -230,9 +239,11 @@ The current boundary leaves these components MLX-coupled:
 - MLX device assignment, concrete communicator construction, collective tensor
   math, and movement inside `MlxDistributedSession`; the portable session
   capability, topology/rank descriptor, scopes, operation availability, and
-  exact-completion contract are core-owned. Tensor-parallel-only architecture
-  entry points which have not yet been folded into the architecture-erased
-  model session remain an MLX integration seam;
+  exact-completion contract are core-owned. Complete-model tensor-parallel
+  loading, prefill, decode, cache ownership, and sampling synchronization now
+  cross the architecture-erased model session. Pipeline/expert executors still
+  operate on partial rank-local models and use an explicit MLX communication
+  session until those model forms are unified;
 - per-block MLX cache resources, native completion observation, physical
   transfer/disk worker execution, prompt-cache filesystem publication, safetensors payload
   mapping and materialization (container/header validation, the transition

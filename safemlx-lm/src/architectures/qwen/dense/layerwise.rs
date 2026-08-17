@@ -266,7 +266,7 @@ impl LayerwiseDecoder {
 
     /// Runs a rank-local tensor-parallel forward pass through the generalized
     /// execution-group engine.
-    pub fn forward_tensor_parallel(
+    pub(crate) fn forward_tensor_parallel(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
@@ -814,7 +814,7 @@ pub(crate) fn execute_transformed_model(
 
 /// Loads Qwen2/3 dense or MoE checkpoints through the generalized
 /// tensor-parallel execution-group engine.
-pub fn load_tensor_parallel_model(
+pub(crate) fn load_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,

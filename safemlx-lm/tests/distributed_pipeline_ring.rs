@@ -330,7 +330,7 @@ fn pipeline_ring_worker() {
     let pipeline_rank = topology.pipeline_parallel_rank;
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     let execution = MlxBackend::new(&stream)
-        .distributed(topology, &group)
+        .create_communication_session(topology, &group)
         .unwrap();
     let reference = (pipeline_rank == 1
         && (family.needs_resident_reference()

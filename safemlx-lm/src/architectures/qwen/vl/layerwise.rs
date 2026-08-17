@@ -248,7 +248,7 @@ impl Qwen3VlLayerwiseModel {
     }
 
     /// Runs a multimodal prefill through rank-local vision execution units.
-    pub fn prefill_tensor_parallel(
+    pub(crate) fn prefill_tensor_parallel(
         &mut self,
         input: input::ModelInput<'_>,
         cache: &mut Cache,
@@ -260,7 +260,7 @@ impl Qwen3VlLayerwiseModel {
     }
 
     /// Runs text decode on a TP-loaded multimodal model.
-    pub fn decode_tensor_parallel(
+    pub(crate) fn decode_tensor_parallel(
         &mut self,
         tokens: &Array,
         cache: &mut Cache,
@@ -477,7 +477,7 @@ pub(crate) fn execute_transformed_qwen3_vl_model(
 }
 
 /// Loads Qwen3-VL with rank-local vision execution groups.
-pub fn load_qwen3_vl_tensor_parallel_layerwise_model(
+pub(crate) fn load_qwen3_vl_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,

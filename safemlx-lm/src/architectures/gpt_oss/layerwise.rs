@@ -258,7 +258,7 @@ impl GptOssLayerwiseModel {
     }
 
     /// Runs a rank-local tensor-parallel forward pass through the generalized engine.
-    pub fn forward_tensor_parallel(
+    pub(crate) fn forward_tensor_parallel(
         &mut self,
         inputs: &Array,
         cache: &mut Cache,
@@ -437,7 +437,7 @@ pub(crate) fn execute_transformed_gpt_oss_model(
 }
 
 /// Loads GPT-OSS through the generalized tensor-parallel execution engine.
-pub fn load_gpt_oss_tensor_parallel_model(
+pub(crate) fn load_gpt_oss_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,

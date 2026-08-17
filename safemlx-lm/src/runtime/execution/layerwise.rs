@@ -3007,7 +3007,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     }
 
     /// Runs a rank-local layerwise model using the tensor-parallel subgroup.
-    pub fn forward_tensor_parallel<'a>(
+    pub(crate) fn forward_tensor_parallel<'a>(
         &mut self,
         input: A::Input<'a>,
         cache: &mut A::Cache,

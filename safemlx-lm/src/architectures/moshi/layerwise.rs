@@ -25,15 +25,19 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{TensorSelection, WeightStore},
     runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        load_layerwise_model, load_safetensors_layerwise_model, transformed_module_weight_store,
+        ArchitectureAdapter, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
+        StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
     runtime::residency::manager::{
         ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease, WeightBinding,
     },
+};
+
+#[cfg(test)]
+use crate::runtime::execution::layerwise::{
+    load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
 };
 
 const STATIC_UNIT: &str = "moshi.static";
@@ -899,7 +903,8 @@ pub fn load_moshi_layerwise_model(
 }
 
 /// Loads native Moshi with rank-local temporal and depth transformers.
-pub fn load_moshi_tensor_parallel_layerwise_model(
+#[cfg(test)]
+pub(crate) fn load_moshi_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
@@ -994,38 +999,6 @@ pub(crate) fn execute_transformed_model(
             store,
             adapter,
             LayerWeightResidency::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-        artifact_identity: LoadedArtifactIdentity::in_memory(),
-    })
-}
-
-/// Loads PersonaPlex with rank-local temporal and depth transformers.
-pub fn load_personaplex_tensor_parallel_layerwise_model(
-    model_dir: impl AsRef<Path>,
-    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MoshiLayerwiseModel, Error> {
-    let model_dir = model_dir.as_ref();
-    let options = options.into();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::PersonaPlex,
-        model_dir,
-        crate::api::ModelLoadOptions::default(),
-    )?;
-    let metadata = crate::architectures::moshi::personaplex::get_model_metadata(model_dir)?;
-    let mut args = crate::architectures::moshi::personaplex::model_args_7b_v1();
-    args.quantization = metadata.quantization;
-    let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Pytorch, stream)?;
-    Ok(MoshiLayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
-            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
-            adapter,
-            options,
-            build,
             stream,
             weights_stream,
         )?,

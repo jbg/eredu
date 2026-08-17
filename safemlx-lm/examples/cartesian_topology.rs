@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let report = topology.preflight((pp > 1).then_some(layers), (ep > 1).then_some(experts))?;
-    let _execution = MlxBackend::new(&stream).distributed(topology, &world)?;
+    let _execution = MlxBackend::new(&stream).create_communication_session(topology, &world)?;
     eprintln!(
         "global={}/{} coordinates={:?} layers={:?} experts={:?} embedding={} head={} TP={:?} PP={:?} EP={:?}",
         topology.global_rank,

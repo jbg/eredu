@@ -26,11 +26,11 @@ use crate::{
 use super::MlxBackend;
 
 /// Inputs needed to attach MLX communication to one selected backend session.
-pub struct MlxDistributedConfig<'a> {
+pub(crate) struct MlxDistributedConfig<'a> {
     /// Validated rank-local topology.
-    pub topology: ParallelTopology,
+    pub(crate) topology: ParallelTopology,
     /// MLX world communicator selected for this complete session.
-    pub world: &'a Group,
+    pub(crate) world: &'a Group,
 }
 
 /// MLX communication capability attached to one complete model/session.
@@ -47,7 +47,7 @@ pub struct MlxDistributedSession<'a> {
 }
 
 impl<'a> MlxDistributedSession<'a> {
-    fn new(config: MlxDistributedConfig<'a>, stream: &'a Stream) -> Result<Self, Error> {
+    pub(crate) fn new(config: MlxDistributedConfig<'a>, stream: &'a Stream) -> Result<Self, Error> {
         config.topology.validate_execution_stream(stream)?;
         let communicators = ParallelCommunicators::new(config.topology, config.world)?;
         Ok(Self {
@@ -78,6 +78,10 @@ impl<'a> MlxDistributedSession<'a> {
             }
             None => Ok(ParallelExecutionContext::replicated(self.stream)),
         }
+    }
+
+    pub(crate) fn tensor_group(&self) -> Option<&Group> {
+        self.communicators.tensor_group()
     }
 
     pub(crate) fn expert_group(&self) -> Option<&Group> {
@@ -273,14 +277,12 @@ impl<'a> MlxDistributedSession<'a> {
 }
 
 impl<'a> DistributedBackend for MlxBackend<'a> {
-    type DistributedConfig = MlxDistributedConfig<'a>;
     type DistributedSession = MlxDistributedSession<'a>;
 
-    fn create_distributed_session(
-        &self,
-        config: Self::DistributedConfig,
-    ) -> Result<Self::DistributedSession, Self::Error> {
-        MlxDistributedSession::new(config, self.stream())
+    fn distributed_session<'session>(
+        session: &'session super::MlxModelSession<'a>,
+    ) -> Option<&'session Self::DistributedSession> {
+        session.distributed()
     }
 }
 

@@ -114,7 +114,7 @@ impl DeepSeekV4LayerwiseModel {
     }
 
     /// Runs a rank-local tensor-parallel target pass through the generalized executor.
-    pub fn forward_tensor_parallel(
+    pub(crate) fn forward_tensor_parallel(
         &mut self,
         tokens: &Array,
         cache: &mut Cache,
@@ -1614,7 +1614,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
 }
 
 /// Loads V4 through the generalized tensor-parallel and residency engine.
-pub fn load_deepseek_v4_tensor_parallel_model(
+pub(crate) fn load_deepseek_v4_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     requested_quantization: Option<WeightQuantization>,

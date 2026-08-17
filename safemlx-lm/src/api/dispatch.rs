@@ -1261,13 +1261,7 @@ impl Model {
         cache: &mut ModelCache,
         stream: &Stream,
     ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        use safemlx_lm_core::BackendSession;
-        crate::backend::mlx::MlxModelSession::prefill(
-            &crate::backend::mlx::MlxBackend::new(stream),
-            self,
-            cache,
-            input.into(),
-        )
+        crate::backend::mlx::submit_prefill_with_cache(self, cache, input.into(), stream)
     }
 
     /// Submits cached decode through the selected MLX model session.
@@ -1277,13 +1271,7 @@ impl Model {
         cache: &mut ModelCache,
         stream: &Stream,
     ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        use safemlx_lm_core::BackendSession;
-        crate::backend::mlx::MlxModelSession::decode(
-            &crate::backend::mlx::MlxBackend::new(stream),
-            self,
-            cache,
-            input,
-        )
+        crate::backend::mlx::submit_decode_with_cache(self, cache, input, stream)
     }
 
     /// Creates a token iterator from typed input using a cache returned by [`Model::new_cache`].

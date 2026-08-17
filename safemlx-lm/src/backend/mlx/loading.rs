@@ -517,6 +517,25 @@ pub(super) fn materialize_model_plan(
 ) -> Result<Model, Error> {
     validate_plan_options(&plan, options)?;
     let (artifact, _policy, _route) = plan.into_parts();
+    if options
+        .parallel
+        .is_some_and(|topology| !topology.is_replicated())
+    {
+        if let ModelArtifact::SafeTensors {
+            path,
+            configuration,
+            ..
+        } = &artifact
+        {
+            return materialize_tensor_parallel(
+                configuration.kind,
+                path,
+                options,
+                stream,
+                weights_stream,
+            );
+        }
+    }
     match artifact {
         artifact @ ModelArtifact::Gguf { .. } => {
             Ok(materialize_gguf_artifact(artifact, options, stream, weights_stream)?.model)
@@ -526,6 +545,181 @@ pub(super) fn materialize_model_plan(
             configuration,
             ..
         } => materialize_safetensors(configuration.kind, &path, options, stream, weights_stream),
+    }
+}
+
+fn materialize_tensor_parallel(
+    kind: ModelKind,
+    path: &Path,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    let topology = options.parallel.ok_or_else(|| {
+        Error::Parallel("tensor-parallel materialization requires a topology".into())
+    })?;
+    if topology.tensor_parallel_size <= 1
+        || topology.pipeline_parallel_size != 1
+        || topology.expert_parallel_size != 1
+    {
+        return Err(Error::Parallel(
+            "complete Model materialization supports pure tensor parallelism only".into(),
+        ));
+    }
+    if options.weight_residency.expert_cache().is_some() {
+        return Err(Error::Parallel(
+            "tensor-parallel model materialization does not compose with independent expert caching"
+                .into(),
+        ));
+    }
+    if options.quantization.is_some() && kind != ModelKind::DeepSeekV4 {
+        return Err(Error::Quantization(format!(
+            "load-time quantization is not implemented for tensor-parallel {} materialization",
+            kind.model_type_name()
+        )));
+    }
+    let execution = options.weight_residency.layers();
+    let build = crate::runtime::distributed::parallel::ParallelBuildContext::new(
+        topology,
+        crate::runtime::distributed::parallel::ShardingPolicy::Require,
+    );
+    match kind {
+        ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
+            crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
+            crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_tensor_parallel_model(
+                path,
+                execution,
+                options.quantization,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        ))),
+        ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
+            crate::architectures::gemma4::layerwise::load_gemma4_tensor_parallel_layerwise_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        ))),
+        ModelKind::GptOss => Ok(Model::GptOss(
+            crate::architectures::gpt_oss::layerwise::load_gpt_oss_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Inkling => Ok(Model::Inkling(
+            crate::architectures::inkling::layerwise::load_inkling_tensor_parallel_layerwise_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::KimiLinear => Ok(Model::KimiLinear(
+            crate::architectures::kimi_linear::layerwise::load_kimi_linear_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Llama => Ok(Model::Llama(
+            crate::architectures::llama::layerwise::load_llama_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
+            crate::architectures::muse_glimmer::layerwise::load_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Lfm2 => Ok(Model::Lfm2(
+            crate::architectures::lfm2::layerwise::load_lfm2_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::NemotronH => Ok(Model::NemotronH(
+            crate::architectures::nemotron_h::layerwise::load_nemotron_h_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(
+            crate::architectures::qwen::dense::layerwise::load_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
+            crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
+            let model =
+                crate::architectures::qwen::vl::layerwise::load_qwen3_vl_tensor_parallel_layerwise_model(
+                    path,
+                    execution,
+                    build,
+                    stream,
+                    weights_stream,
+                )?;
+            Ok(if kind == ModelKind::Qwen3VlMoe {
+                Model::Qwen3VlMoe(model)
+            } else {
+                Model::Qwen3Vl(model)
+            })
+        }
+        ModelKind::Qwen35 => Ok(Model::Qwen35(
+            crate::architectures::qwen::hybrid::layerwise::load_qwen35_tensor_parallel_model(
+                path,
+                execution,
+                build,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
+            "PersonaPlex does not use the text Model tensor-parallel session".into(),
+        )),
     }
 }
 
@@ -578,6 +772,48 @@ fn materialize_gguf_artifact(
     structural::validate_gguf(architecture, &checkpoint, &metadata, options)
         .into_loader_result()?;
     validate_gguf_quantization_source(&checkpoint, &metadata, options.quantization)?;
+    if options
+        .parallel
+        .is_some_and(|topology| !topology.is_replicated())
+    {
+        let (model, eos_token_ids) = materialize_gguf_tensor_parallel(
+            &path,
+            &checkpoint,
+            &metadata,
+            architecture,
+            options,
+            stream,
+            weights_stream,
+        )?;
+        #[cfg(feature = "media-processing")]
+        let processor = match architecture {
+            GgufArchitecture::Inkling if inkling::open_sibling_mmproj(&path)?.is_some() => {
+                Some(ModelProcessor::load_inkling_gguf(&metadata)?)
+            }
+            GgufArchitecture::Gemma4 => gemma4::open_sibling_mmproj(&path)?
+                .as_ref()
+                .map(|mmproj| ModelProcessor::load_gemma4_gguf(&metadata, &mmproj.metadata))
+                .transpose()?,
+            GgufArchitecture::MuseGlimmer => {
+                crate::architectures::muse_glimmer::open_sibling_mmproj(&path)?
+                    .as_ref()
+                    .map(|mmproj| ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata))
+                    .transpose()?
+            }
+            GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe
+                if qwen3_5::open_sibling_mmproj(&path)?.is_some() =>
+            {
+                ModelProcessor::load_qwen(gguf_sidecar_dir(&path))?
+            }
+            _ => None,
+        };
+        return Ok(MaterializedGgufModel {
+            model,
+            #[cfg(feature = "media-processing")]
+            processor,
+            eos_token_ids,
+        });
+    }
     materialize_gguf_model(
         &path,
         &checkpoint,
@@ -587,6 +823,170 @@ fn materialize_gguf_artifact(
         stream,
         weights_stream,
     )
+}
+
+fn materialize_gguf_tensor_parallel(
+    gguf_path: &Path,
+    checkpoint: &GgufCheckpoint,
+    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    architecture: GgufArchitecture,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(Model, Vec<u32>), Error> {
+    let topology = options.parallel.ok_or_else(|| {
+        Error::Parallel("tensor-parallel GGUF materialization requires a topology".into())
+    })?;
+    if options.quantization.is_some() && architecture != GgufArchitecture::DeepSeek4 {
+        return Err(Error::Quantization(format!(
+            "load-time quantization is not implemented for tensor-parallel {} GGUF materialization",
+            architecture.metadata_name()
+        )));
+    }
+    let residency = options.weight_residency.layers();
+    let build = crate::runtime::distributed::parallel::ParallelBuildContext::new(
+        topology,
+        crate::runtime::distributed::parallel::ShardingPolicy::Require,
+    );
+    match architecture {
+        GgufArchitecture::KimiLinear => {
+            let (model, eos) = crate::architectures::kimi_linear::layerwise::load_kimi_linear_gguf_tensor_parallel_model(checkpoint, metadata, residency, build, stream, weights_stream)?;
+            Ok((Model::KimiLinear(model), eos))
+        }
+        GgufArchitecture::DeepSeek2 => {
+            let (model, eos) = crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_gguf_tensor_parallel_model(checkpoint, metadata, residency, build, stream, weights_stream)?;
+            Ok((Model::DeepSeekV3(model), eos))
+        }
+        GgufArchitecture::DeepSeek4 => {
+            let (model, eos) = crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_tensor_parallel_model(checkpoint, metadata, residency, options.quantization, build, stream, weights_stream)?;
+            Ok((Model::DeepSeekV4Layerwise(Box::new(model)), eos))
+        }
+        GgufArchitecture::GptOss => {
+            let (model, eos) =
+                crate::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_tensor_parallel_model(
+                    checkpoint,
+                    metadata,
+                    residency,
+                    build,
+                    stream,
+                    weights_stream,
+                )?;
+            Ok((Model::GptOss(model), eos))
+        }
+        GgufArchitecture::Inkling => {
+            let mmproj = inkling::open_sibling_mmproj(gguf_path)?;
+            let (model, eos) =
+                crate::architectures::inkling::layerwise::load_inkling_gguf_tensor_parallel_model(
+                    checkpoint,
+                    metadata,
+                    mmproj.as_ref(),
+                    residency,
+                    build,
+                    stream,
+                    weights_stream,
+                )?;
+            Ok((Model::Inkling(model), eos))
+        }
+        GgufArchitecture::Gemma4 => {
+            let mmproj = gemma4::open_sibling_mmproj(gguf_path)?;
+            let (model, eos) =
+                crate::architectures::gemma4::layerwise::load_gemma4_gguf_tensor_parallel_model(
+                    checkpoint,
+                    metadata,
+                    mmproj.as_ref(),
+                    residency,
+                    build,
+                    stream,
+                    weights_stream,
+                )?;
+            Ok((Model::Gemma4(Box::new(model)), eos))
+        }
+        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+            let (model, eos) =
+                crate::architectures::llama::layerwise::load_llama_gguf_tensor_parallel_model(
+                    checkpoint,
+                    metadata,
+                    residency,
+                    build,
+                    stream,
+                    weights_stream,
+                )?;
+            Ok((Model::Llama(model), eos))
+        }
+        GgufArchitecture::MuseGlimmer => {
+            let (model, eos) =
+                crate::architectures::muse_glimmer::layerwise::load_gguf_tensor_parallel_model(
+                    checkpoint,
+                    metadata,
+                    architecture.metadata_name(),
+                    residency,
+                    build,
+                    stream,
+                    weights_stream,
+                )?;
+            Ok((Model::MuseGlimmer(model), eos))
+        }
+        GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
+            let (model, eos) =
+                crate::architectures::lfm2::layerwise::load_lfm2_gguf_tensor_parallel_model(
+                    checkpoint,
+                    metadata,
+                    residency,
+                    build,
+                    stream,
+                    weights_stream,
+                )?;
+            Ok((Model::Lfm2(model), eos))
+        }
+        GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
+            let (model, eos) = crate::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_tensor_parallel_model(checkpoint, metadata, residency, build, stream, weights_stream)?;
+            Ok((Model::NemotronH(model), eos))
+        }
+        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+            let (model, eos) =
+                crate::architectures::qwen::dense::layerwise::load_gguf_tensor_parallel_model(
+                    checkpoint,
+                    metadata,
+                    architecture.metadata_name(),
+                    residency,
+                    build,
+                    stream,
+                    weights_stream,
+                )?;
+            Ok((Model::DenseQwen(model), eos))
+        }
+        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+            let vision_path = qwen3_vl::find_qwen3_vl_mmproj(gguf_path)?;
+            let vision_checkpoint = GgufCheckpoint::open(vision_path)?;
+            let vision_metadata =
+                crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+            let (model, eos) = crate::architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_tensor_parallel_model(checkpoint, metadata, (&vision_checkpoint, &vision_metadata), residency, build, stream, weights_stream)?;
+            Ok((
+                if architecture == GgufArchitecture::Qwen3VlMoe {
+                    Model::Qwen3VlMoe(model)
+                } else {
+                    Model::Qwen3Vl(model)
+                },
+                eos,
+            ))
+        }
+        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
+            let mmproj = if architecture == GgufArchitecture::Qwen3Next {
+                None
+            } else {
+                qwen3_5::open_sibling_mmproj(gguf_path)?
+            };
+            let (model, eos, is_next) = crate::architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_tensor_parallel_model(checkpoint, metadata, mmproj.as_ref(), residency, build, stream, weights_stream)?;
+            Ok((
+                if is_next {
+                    Model::Qwen3Next(model)
+                } else {
+                    Model::Qwen35(model)
+                },
+                eos,
+            ))
+        }
+    }
 }
 
 pub(crate) fn validate_gguf_quantization_source<

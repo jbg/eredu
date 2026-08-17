@@ -336,7 +336,7 @@ impl LlamaModel {
     }
 
     /// Runs a rank-local tensor-parallel forward pass.
-    pub fn forward_tensor_parallel(
+    pub(crate) fn forward_tensor_parallel(
         &mut self,
         inputs: &Array,
         cache: &mut LlamaCache,
@@ -510,7 +510,7 @@ pub(crate) fn execute_transformed_llama_model(
 }
 
 /// Loads Llama/Mistral through the generalized tensor-parallel execution engine.
-pub fn load_llama_tensor_parallel_model(
+pub(crate) fn load_llama_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,

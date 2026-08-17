@@ -41,7 +41,7 @@ pub struct SynchronizedToken {
 /// optional value lets pipeline stages avoid retaining full logits while TP and
 /// EP callers may pass their identical complete logits on every rank.
 #[allow(clippy::too_many_arguments)]
-pub fn sample_and_synchronize<S: Sampler>(
+pub(crate) fn sample_and_synchronize<S: Sampler>(
     logits: Option<&Array>,
     batch_size: i32,
     sampler: &mut S,
@@ -1052,7 +1052,7 @@ impl<'a> ParallelExecutionContext<'a> {
     }
 
     /// Creates a tensor-parallel context from a topology-derived subgroup.
-    pub fn tensor_parallel(
+    pub(crate) fn tensor_parallel(
         topology: ParallelTopology,
         group: &'a Group,
         stream: &'a Stream,
@@ -1104,7 +1104,7 @@ impl<'a> ParallelExecutionContext<'a> {
     }
 
     /// Returns the TP subgroup when collectives are active.
-    pub const fn group(&self) -> Option<&'a Group> {
+    pub(crate) const fn group(&self) -> Option<&'a Group> {
         self.group
     }
 

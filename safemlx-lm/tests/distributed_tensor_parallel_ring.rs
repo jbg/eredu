@@ -19,46 +19,19 @@ use safemlx::{
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
     architectures::{
-        deepseek_v3::{
-            layerwise::{load_deepseek_v3_tensor_parallel_model, DeepSeekV3LayerwiseModel},
-            model::{self as deepseek_v3, Cache as DeepSeekCache},
-        },
-        gpt_oss::{
-            layerwise::{load_gpt_oss_tensor_parallel_model, GptOssLayerwiseModel},
-            model::{self as gpt_oss_model, Cache as GptOssCache},
-        },
-        kimi_linear::{
-            layerwise::{load_kimi_linear_tensor_parallel_model, KimiLinearLayerwiseModel},
-            model::{self as kimi_model, Cache as KimiCache},
-        },
-        lfm2::{
-            layerwise::{load_lfm2_tensor_parallel_model, Lfm2LayerwiseModel},
-            model::{self as lfm2_model, Cache as Lfm2Cache},
-        },
-        llama::{
-            layerwise::{load_llama_tensor_parallel_model, LlamaCache, LlamaModel},
-            model as llama_model,
-        },
-        nemotron_h::{
-            layerwise::{load_nemotron_h_tensor_parallel_model, NemotronHLayerwiseModel},
-            model::{self as nemotron_model, Cache as NemotronCache},
-        },
-        qwen::dense::{
-            self as dense_qwen,
-            layerwise::{
-                load_tensor_parallel_model as load_qwen_tensor_parallel_model,
-                DenseQwenLayerwiseCache, LayerwiseDecoder as DenseQwenLayerwiseDecoder,
-            },
-        },
+        deepseek_v3::model as deepseek_v3, gpt_oss::model as gpt_oss_model,
+        kimi_linear::model as kimi_model, lfm2::model as lfm2_model, llama::model as llama_model,
+        nemotron_h::model as nemotron_model, qwen::dense as dense_qwen,
     },
+    core::BackendSession,
     nn::generation::CausalLm,
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::canonical_checkpoint_name,
     runtime::generation::sampler::DefaultSampler,
-    sample_and_synchronize, CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment,
-    LayerCachePolicy, LayerWeightResidency, LayerwiseLoadOptions, PagedCacheOptions,
-    ParallelBuildContext, ParallelModelInfo, ParallelTopology, PromptCacheDescriptor,
-    PromptCacheManifest, PromptCacheOptions, PromptCacheTopology, ShardingPolicy,
+    CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, LayerCachePolicy,
+    LayerWeightResidency, LayerwiseLoadOptions, MlxBackend, ModelLoadOptions, PagedCacheOptions,
+    ParallelModelInfo, ParallelTopology, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -330,25 +303,7 @@ impl FixtureFamily {
     }
 }
 
-enum GeneralizedTensorModel {
-    Llama(LlamaModel),
-    DeepSeek(DeepSeekV3LayerwiseModel),
-    Qwen(DenseQwenLayerwiseDecoder),
-    Lfm2(Lfm2LayerwiseModel),
-    GptOss(GptOssLayerwiseModel),
-    KimiLinear(KimiLinearLayerwiseModel),
-    Nemotron(NemotronHLayerwiseModel),
-}
-
-enum GeneralizedTensorCache {
-    Llama(LlamaCache),
-    DeepSeek(DeepSeekCache),
-    Qwen(DenseQwenLayerwiseCache),
-    Lfm2(Lfm2Cache),
-    GptOss(GptOssCache),
-    KimiLinear(KimiCache),
-    Nemotron(NemotronCache),
-}
+struct GeneralizedTensorModel(safemlx_lm::api::Model);
 
 impl GeneralizedTensorModel {
     fn load(
@@ -358,242 +313,81 @@ impl GeneralizedTensorModel {
         topology: ParallelTopology,
         stream: &Stream,
     ) -> Self {
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let options = residency.load_options();
-        match family {
-            FixtureFamily::DeepSeekSafetensors | FixtureFamily::DeepSeekGguf => Self::DeepSeek(
-                load_deepseek_v3_tensor_parallel_model(checkpoint, options, build, stream, stream)
-                    .unwrap(),
-            ),
-            FixtureFamily::LlamaSafetensors | FixtureFamily::LlamaGguf => Self::Llama(
-                load_llama_tensor_parallel_model(checkpoint, options, build, stream, stream)
-                    .unwrap(),
-            ),
-            FixtureFamily::Qwen3MoeSafetensors
-            | FixtureFamily::Qwen2Gguf
-            | FixtureFamily::Qwen2Q8Gguf => Self::Qwen(
-                load_qwen_tensor_parallel_model(checkpoint, options, build, stream, stream)
-                    .unwrap(),
-            ),
-            FixtureFamily::Lfm2Safetensors
-            | FixtureFamily::Lfm2Gguf
-            | FixtureFamily::Lfm2Q8Gguf => Self::Lfm2(
-                load_lfm2_tensor_parallel_model(checkpoint, options, build, stream, stream)
-                    .unwrap(),
-            ),
-            FixtureFamily::GptOssSafetensors | FixtureFamily::GptOssGguf => Self::GptOss(
-                load_gpt_oss_tensor_parallel_model(checkpoint, options, build, stream, stream)
-                    .unwrap(),
-            ),
-            FixtureFamily::KimiLinearSafetensors | FixtureFamily::KimiLinearGguf => {
-                Self::KimiLinear(
-                    load_kimi_linear_tensor_parallel_model(
-                        checkpoint, options, build, stream, stream,
-                    )
-                    .unwrap(),
-                )
-            }
-            FixtureFamily::NemotronSafetensors | FixtureFamily::NemotronGguf => Self::Nemotron(
-                load_nemotron_h_tensor_parallel_model(checkpoint, options, build, stream, stream)
-                    .unwrap(),
-            ),
-        }
+        let options = ModelLoadOptions::default()
+            .with_parallel_topology(topology)
+            .with_weight_residency(WeightResidency::with_layers(residency.load_options()));
+        let loaded =
+            safemlx_lm::load_model_with_options(checkpoint, options, stream, stream).unwrap();
+        assert_eq!(loaded.model_type(), family.model_type());
+        Self(loaded)
     }
 
     fn parallel_info(&self) -> &ParallelModelInfo {
-        match self {
-            Self::Llama(model) => model.parallel_info().unwrap(),
-            Self::DeepSeek(model) => model.parallel_info().unwrap(),
-            Self::Qwen(model) => model.parallel_info().unwrap(),
-            Self::Lfm2(model) => model.parallel_info().unwrap(),
-            Self::GptOss(model) => model.parallel_info().unwrap(),
-            Self::KimiLinear(model) => model.parallel_info().unwrap(),
-            Self::Nemotron(model) => model.parallel_info().unwrap(),
-        }
+        self.0.parallel_info().unwrap()
     }
 
     fn prompt_cache_architecture_fingerprint(&self) -> String {
-        match self {
-            Self::Llama(model) => model.prompt_cache_architecture_fingerprint(),
-            Self::DeepSeek(model) => model.prompt_cache_architecture_fingerprint(),
-            Self::Qwen(model) => model.prompt_cache_architecture_fingerprint(),
-            Self::Lfm2(model) => model.prompt_cache_architecture_fingerprint().unwrap(),
-            Self::GptOss(model) => model.prompt_cache_architecture_fingerprint(),
-            Self::KimiLinear(model) => model.prompt_cache_architecture_fingerprint(),
-            Self::Nemotron(model) => model.prompt_cache_architecture_fingerprint(),
-        }
+        self.0.prompt_cache_architecture_fingerprint().unwrap()
     }
 
     fn prompt_cache_layer_layout(&self) -> safemlx_lm::LayerSchedule<LayerCachePolicy> {
-        match self {
-            Self::Llama(model) => model.prompt_cache_layer_layout().unwrap(),
-            Self::DeepSeek(model) => model.prompt_cache_layer_layout().unwrap(),
-            Self::Qwen(model) => model.prompt_cache_layer_layout().unwrap(),
-            Self::Lfm2(model) => model.prompt_cache_layer_layout().unwrap(),
-            Self::GptOss(model) => model.prompt_cache_layer_layout().unwrap(),
-            Self::KimiLinear(model) => model.prompt_cache_layer_layout().unwrap(),
-            Self::Nemotron(model) => model.prompt_cache_layer_layout().unwrap(),
-        }
+        self.0.prompt_cache_layer_layout().unwrap()
     }
 
-    fn new_paged_cache(&self, options: PagedCacheOptions) -> GeneralizedTensorCache {
-        match self {
-            Self::Llama(model) => GeneralizedTensorCache::Llama(
-                model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .unwrap(),
-            ),
-            Self::DeepSeek(model) => GeneralizedTensorCache::DeepSeek(
-                model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .unwrap(),
-            ),
-            Self::Qwen(model) => {
-                GeneralizedTensorCache::Qwen(DenseQwenLayerwiseCache::Concat(model.new_cache()))
-            }
-            Self::Lfm2(model) => GeneralizedTensorCache::Lfm2(
-                model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .unwrap(),
-            ),
-            Self::GptOss(model) => GeneralizedTensorCache::GptOss(
-                model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .unwrap(),
-            ),
-            Self::KimiLinear(model) => GeneralizedTensorCache::KimiLinear(
-                model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .unwrap(),
-            ),
-            Self::Nemotron(model) => GeneralizedTensorCache::Nemotron(
-                model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .unwrap(),
-            ),
+    fn new_paged_cache(&self, options: PagedCacheOptions) -> safemlx_lm::api::ModelCache {
+        if let safemlx_lm::api::Model::DenseQwen(model) = &self.0 {
+            return safemlx_lm::api::ModelCache::KeyValue(model.new_cache());
         }
-    }
-
-    fn forward_tensor_parallel(
-        &mut self,
-        inputs: &Array,
-        cache: &mut GeneralizedTensorCache,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Array {
-        match (self, cache) {
-            (Self::Llama(model), GeneralizedTensorCache::Llama(cache)) => model
-                .forward_tensor_parallel(inputs, cache, group, stream)
-                .unwrap(),
-            (Self::DeepSeek(model), GeneralizedTensorCache::DeepSeek(cache)) => model
-                .forward_tensor_parallel(inputs, cache, group, stream)
-                .unwrap(),
-            (Self::Qwen(model), GeneralizedTensorCache::Qwen(cache)) => model
-                .forward_tensor_parallel(inputs, None, cache, group, stream)
-                .unwrap(),
-            (Self::Lfm2(model), GeneralizedTensorCache::Lfm2(cache)) => model
-                .forward_tensor_parallel(inputs, cache, group, stream)
-                .unwrap(),
-            (Self::GptOss(model), GeneralizedTensorCache::GptOss(cache)) => model
-                .forward_tensor_parallel(inputs, cache, group, stream)
-                .unwrap(),
-            (Self::KimiLinear(model), GeneralizedTensorCache::KimiLinear(cache)) => model
-                .forward_tensor_parallel(inputs, cache, group, stream)
-                .unwrap(),
-            (Self::Nemotron(model), GeneralizedTensorCache::Nemotron(cache)) => model
-                .forward_tensor_parallel(inputs, cache, group, stream)
-                .unwrap(),
-            _ => panic!("generalized tensor model/cache architecture mismatch"),
-        }
+        self.0
+            .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+            .unwrap()
     }
 
     fn checkpoint_diagnostics(
         &self,
     ) -> safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
-        match self {
-            Self::Llama(model) => model.checkpoint_store().diagnostics().unwrap(),
-            Self::DeepSeek(model) => model.checkpoint_store().diagnostics().unwrap(),
-            Self::Qwen(model) => model.checkpoint_store().diagnostics().unwrap(),
-            Self::Lfm2(model) => model.checkpoint_store().diagnostics().unwrap(),
-            Self::GptOss(model) => model.checkpoint_store().diagnostics().unwrap(),
-            Self::KimiLinear(model) => model.checkpoint_store().diagnostics().unwrap(),
-            Self::Nemotron(model) => model.checkpoint_store().diagnostics().unwrap(),
+        match &self.0 {
+            safemlx_lm::api::Model::Llama(model) => model.checkpoint_store().diagnostics().unwrap(),
+            safemlx_lm::api::Model::DeepSeekV3(model) => {
+                model.checkpoint_store().diagnostics().unwrap()
+            }
+            safemlx_lm::api::Model::DenseQwen(model) => {
+                model.checkpoint_store().diagnostics().unwrap()
+            }
+            safemlx_lm::api::Model::Lfm2(model) => model.checkpoint_store().diagnostics().unwrap(),
+            safemlx_lm::api::Model::GptOss(model) => {
+                model.checkpoint_store().diagnostics().unwrap()
+            }
+            safemlx_lm::api::Model::KimiLinear(model) => {
+                model.checkpoint_store().diagnostics().unwrap()
+            }
+            safemlx_lm::api::Model::NemotronH(model) => {
+                model.checkpoint_store().diagnostics().unwrap()
+            }
+            model => panic!(
+                "checkpoint diagnostics unavailable for {}",
+                model.model_type()
+            ),
         }
     }
 
     fn save_prompt_cache(
         &self,
-        cache: &mut GeneralizedTensorCache,
+        cache: &mut safemlx_lm::api::ModelCache,
         root: &Path,
         descriptor: PromptCacheDescriptor,
         stream: &Stream,
     ) -> PromptCacheManifest {
-        match (self, cache) {
-            (Self::Llama(model), GeneralizedTensorCache::Llama(cache)) => model
-                .save_prompt_cache(
-                    cache,
-                    root,
-                    descriptor,
-                    &[1, 2],
-                    &PromptCacheOptions::default(),
-                    stream,
-                )
-                .unwrap(),
-            (Self::DeepSeek(model), GeneralizedTensorCache::DeepSeek(cache)) => model
-                .save_prompt_cache(
-                    cache,
-                    root,
-                    descriptor,
-                    &[1, 2],
-                    &PromptCacheOptions::default(),
-                    stream,
-                )
-                .unwrap(),
-            (Self::Qwen(_), GeneralizedTensorCache::Qwen(_)) => {
-                panic!("Qwen2 GGUF fixture does not exercise prompt-cache persistence")
-            }
-            (Self::Lfm2(model), GeneralizedTensorCache::Lfm2(cache)) => model
-                .save_prompt_cache(
-                    cache,
-                    root,
-                    descriptor,
-                    &[1, 2],
-                    &PromptCacheOptions::default(),
-                    stream,
-                )
-                .unwrap(),
-            (Self::GptOss(model), GeneralizedTensorCache::GptOss(cache)) => model
-                .save_prompt_cache(
-                    cache,
-                    root,
-                    descriptor,
-                    &[1, 2],
-                    &PromptCacheOptions::default(),
-                    stream,
-                )
-                .unwrap(),
-            (Self::KimiLinear(model), GeneralizedTensorCache::KimiLinear(cache)) => model
-                .save_prompt_cache(
-                    cache,
-                    root,
-                    descriptor,
-                    &[1, 2],
-                    &PromptCacheOptions::default(),
-                    stream,
-                )
-                .unwrap(),
-            (Self::Nemotron(model), GeneralizedTensorCache::Nemotron(cache)) => model
-                .save_prompt_cache(
-                    cache,
-                    root,
-                    descriptor,
-                    &[1, 2],
-                    &PromptCacheOptions::default(),
-                    stream,
-                )
-                .unwrap(),
-            _ => panic!("generalized tensor model/cache architecture mismatch"),
-        }
+        self.0
+            .save_prompt_cache(
+                cache,
+                root,
+                descriptor,
+                &[1, 2],
+                &PromptCacheOptions::default(),
+                stream,
+            )
+            .unwrap()
     }
 
     fn load_prompt_cache(
@@ -602,65 +396,50 @@ impl GeneralizedTensorModel {
         descriptor: &PromptCacheDescriptor,
         options: PagedCacheOptions,
         stream: &Stream,
-    ) -> (GeneralizedTensorCache, PromptCacheManifest) {
-        match self {
-            Self::Llama(model) => {
-                let (cache, manifest) = model
-                    .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
-                    .unwrap();
-                (GeneralizedTensorCache::Llama(cache), manifest)
-            }
-            Self::DeepSeek(model) => {
-                let (cache, manifest) = model
-                    .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
-                    .unwrap();
-                (GeneralizedTensorCache::DeepSeek(cache), manifest)
-            }
-            Self::Qwen(_) => {
-                panic!("Qwen2 GGUF fixture does not exercise prompt-cache persistence")
-            }
-            Self::Lfm2(model) => {
-                let (cache, manifest) = model
-                    .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
-                    .unwrap();
-                (GeneralizedTensorCache::Lfm2(cache), manifest)
-            }
-            Self::GptOss(model) => {
-                let (cache, manifest) = model
-                    .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
-                    .unwrap();
-                (GeneralizedTensorCache::GptOss(cache), manifest)
-            }
-            Self::KimiLinear(model) => {
-                let (cache, manifest) = model
-                    .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
-                    .unwrap();
-                (GeneralizedTensorCache::KimiLinear(cache), manifest)
-            }
-            Self::Nemotron(model) => {
-                let (cache, manifest) = model
-                    .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
-                    .unwrap();
-                (GeneralizedTensorCache::Nemotron(cache), manifest)
-            }
-        }
+    ) -> (safemlx_lm::api::ModelCache, PromptCacheManifest) {
+        self.0
+            .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
+            .unwrap()
     }
 }
 
-impl GeneralizedTensorCache {
+trait GeneralizedTensorCacheExt {
+    fn offset(&self) -> i32;
+    fn assert_qwen2_local_cache_geometry(
+        &self,
+        local_kv_heads: i32,
+        full_sequence: i32,
+        head_dim: i32,
+    );
+    fn assert_qwen3_moe_local_cache_geometry(&self, full_sequence: i32);
+    fn assert_lfm2_local_cache_geometry(
+        &self,
+        local_kv_heads: i32,
+        local_convolution_channels: i32,
+        head_dim: i32,
+        sequence: i32,
+    );
+    fn assert_gpt_oss_local_cache_geometry(&self, local_kv_heads: i32, sequence: i32);
+    fn assert_kimi_local_cache_geometry(&self, local_heads: i32, sequence: i32);
+    fn assert_nemotron_local_cache_geometry(
+        &self,
+        local_mamba_heads: i32,
+        local_mamba_groups: i32,
+        local_kv_heads: i32,
+        sequence: i32,
+    );
+}
+
+impl GeneralizedTensorCacheExt for safemlx_lm::api::ModelCache {
     fn offset(&self) -> i32 {
         match self {
             Self::Llama(cache) => cache.offset(),
-            Self::DeepSeek(cache) => cache.offset(),
-            Self::Qwen(DenseQwenLayerwiseCache::Concat(cache)) => cache
+            Self::DeepSeekV3(cache) => cache.offset(),
+            Self::KeyValue(cache) => cache
                 .first()
                 .and_then(Option::as_ref)
                 .map_or(0, KeyValueCache::offset),
-            Self::Qwen(DenseQwenLayerwiseCache::Sliding(cache)) => cache
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
-            Self::Qwen(DenseQwenLayerwiseCache::Paged(cache)) => cache
+            Self::PagedKeyValue(cache) => cache
                 .first()
                 .and_then(Option::as_ref)
                 .map_or(0, KeyValueCache::offset),
@@ -671,7 +450,8 @@ impl GeneralizedTensorCache {
                 gpt_oss_model::LayerCache::Paged(cache) => cache.offset(),
             }),
             Self::KimiLinear(cache) => cache.offset(),
-            Self::Nemotron(cache) => cache.offset(),
+            Self::NemotronH(cache) => cache.offset(),
+            _ => panic!("offset unavailable for cache variant"),
         }
     }
 
@@ -681,7 +461,7 @@ impl GeneralizedTensorCache {
         full_sequence: i32,
         head_dim: i32,
     ) {
-        let Self::Qwen(DenseQwenLayerwiseCache::Concat(layers)) = self else {
+        let Self::KeyValue(layers) = self else {
             panic!("Qwen2 local cache assertion requires a concat dense-Qwen cache")
         };
         assert_eq!(layers.len(), 2);
@@ -707,7 +487,7 @@ impl GeneralizedTensorCache {
     }
 
     fn assert_qwen3_moe_local_cache_geometry(&self, full_sequence: i32) {
-        let Self::Qwen(DenseQwenLayerwiseCache::Concat(layers)) = self else {
+        let Self::KeyValue(layers) = self else {
             panic!("Qwen3 MoE local cache assertion requires a concat dense-Qwen cache")
         };
         assert_eq!(layers.len(), 1);
@@ -805,7 +585,7 @@ impl GeneralizedTensorCache {
         local_kv_heads: i32,
         sequence: i32,
     ) {
-        let Self::Nemotron(cache) = self else {
+        let Self::NemotronH(cache) = self else {
             panic!("Nemotron local cache assertion requires a Nemotron cache")
         };
         let nemotron_model::LayerCache::Mamba(mamba) = &cache.layers[0] else {
@@ -1076,10 +856,23 @@ fn tensor_ring_worker() {
     let paged = PagedCacheOptions::new(cache_block_size, 64 * 1024, 64 * 1024, 1)
         .unwrap()
         .with_full_attention(true);
-    let mut cache = model.new_paged_cache(paged.clone());
+    let cache = model.new_paged_cache(paged.clone());
+    let backend = MlxBackend::new(&stream);
+    let mut session = backend
+        .create_distributed_model_session_with_cache(cache, topology, &group)
+        .unwrap();
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
-    let logits = model.forward_tensor_parallel(&prompt, &mut cache, &group, &stream);
-    assert_eq!(logits.shape(), &[1, 2, vocab_size as i32]);
+    let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+    let logits = session
+        .prefill(
+            &backend,
+            &mut model.0,
+            safemlx_lm::runtime::media::input::ModelInput::new(&parts).into(),
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(logits.shape(), &[1, vocab_size as i32]);
 
     if family.is_deepseek() {
         let mut reference = match family {
@@ -1101,6 +894,9 @@ fn tensor_ring_worker() {
                 },
                 &stream,
             )
+            .unwrap();
+        let reference_logits = reference_logits
+            .try_index_device((.., -1, ..), &stream)
             .unwrap();
         assert_arrays_close(&logits, &reference_logits, 8e-5);
         if family == FixtureFamily::DeepSeekGguf {
@@ -1134,14 +930,18 @@ fn tensor_ring_worker() {
                 &stream,
             )
             .unwrap();
-        let distributed_last = logits.try_index_device((.., -1, ..), &stream).unwrap();
-        assert_arrays_close(&distributed_last, &reference_logits, 8e-5);
+        assert_arrays_close(&logits, &reference_logits, 8e-5);
         let (local_heads, local_groups, local_kv) = if expected_rank == 0 {
             (4, 2, 2)
         } else {
             (2, 1, 1)
         };
-        cache.assert_nemotron_local_cache_geometry(local_heads, local_groups, local_kv, 2);
+        session.cache().assert_nemotron_local_cache_geometry(
+            local_heads,
+            local_groups,
+            local_kv,
+            2,
+        );
         if family == FixtureFamily::NemotronGguf {
             let diagnostics = model.checkpoint_diagnostics();
             assert!(diagnostics.physical_reads > 0);
@@ -1167,10 +967,17 @@ fn tensor_ring_worker() {
                 &stream,
             )
             .unwrap();
+        let reference_logits = reference_logits
+            .try_index_device((.., -1, ..), &stream)
+            .unwrap();
         assert_arrays_close(&logits, &reference_logits, 5e-5);
-        cache.assert_qwen3_moe_local_cache_geometry(2);
+        session.cache().assert_qwen3_moe_local_cache_geometry(2);
         let token = Array::from_slice(&[3u32], &[1, 1]);
-        let distributed_decode = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
+        let distributed_decode = session
+            .decode(&backend, &mut model.0, token.clone())
+            .unwrap()
+            .wait()
+            .unwrap();
         let reference_decode = reference
             .forward(
                 dense_qwen::ModelInput {
@@ -1181,8 +988,11 @@ fn tensor_ring_worker() {
                 &stream,
             )
             .unwrap();
+        let reference_decode = reference_decode
+            .try_index_device((.., -1, ..), &stream)
+            .unwrap();
         assert_arrays_close(&distributed_decode, &reference_decode, 5e-5);
-        cache.assert_qwen3_moe_local_cache_geometry(3);
+        session.cache().assert_qwen3_moe_local_cache_geometry(3);
         return;
     }
 
@@ -1205,9 +1015,10 @@ fn tensor_ring_worker() {
                 &stream,
             )
             .unwrap();
-        let distributed_last = logits.try_index_device((.., -1, ..), &stream).unwrap();
-        assert_arrays_close(&distributed_last, &reference_logits, 2e-4);
-        cache.assert_gpt_oss_local_cache_geometry(if expected_rank == 0 { 2 } else { 1 }, 2);
+        assert_arrays_close(&logits, &reference_logits, 2e-4);
+        session
+            .cache()
+            .assert_gpt_oss_local_cache_geometry(if expected_rank == 0 { 2 } else { 1 }, 2);
     }
 
     if family.is_lfm2() {
@@ -1229,14 +1040,13 @@ fn tensor_ring_worker() {
                 &stream,
             )
             .unwrap();
-        let distributed_last = logits.try_index_device((.., -1, ..), &stream).unwrap();
         let tolerance = if family == FixtureFamily::Lfm2Q8Gguf {
             2e-4
         } else {
             5e-5
         };
-        assert_arrays_close(&distributed_last, &reference_logits, tolerance);
-        cache.assert_lfm2_local_cache_geometry(
+        assert_arrays_close(&logits, &reference_logits, tolerance);
+        session.cache().assert_lfm2_local_cache_geometry(
             family.lfm2_local_kv_heads(expected_rank),
             family.lfm2_local_convolution_channels(),
             family.lfm2_head_dim(),
@@ -1275,8 +1085,13 @@ fn tensor_ring_worker() {
                 &stream,
             )
             .unwrap();
+        let reference_logits = reference_logits
+            .try_index_device((.., -1, ..), &stream)
+            .unwrap();
         assert_arrays_close(&logits, &reference_logits, 8e-5);
-        cache.assert_kimi_local_cache_geometry(if expected_rank == 0 { 2 } else { 1 }, 2);
+        session
+            .cache()
+            .assert_kimi_local_cache_geometry(if expected_rank == 0 { 2 } else { 1 }, 2);
         if family == FixtureFamily::KimiLinearGguf {
             let diagnostics = model.checkpoint_diagnostics();
             assert!(diagnostics.physical_reads > 0);
@@ -1313,6 +1128,9 @@ fn tensor_ring_worker() {
                 &stream,
             )
             .unwrap();
+        let reference_logits = reference_logits
+            .try_index_device((.., -1, ..), &stream)
+            .unwrap();
         assert_arrays_close(&logits, &reference_logits, 5e-5);
     }
 
@@ -1334,7 +1152,10 @@ fn tensor_ring_worker() {
         } else {
             5e-5
         };
-        assert_arrays_close(&logits, &reference_logits, tolerance);
+        let reference_last = reference_logits
+            .try_index_device((.., -1, ..), &stream)
+            .unwrap();
+        assert_arrays_close(&logits, &reference_last, tolerance);
         let local_kv_heads = if family == FixtureFamily::Qwen2Gguf {
             if expected_rank == 0 {
                 2
@@ -1344,7 +1165,11 @@ fn tensor_ring_worker() {
         } else {
             1
         };
-        cache.assert_qwen2_local_cache_geometry(local_kv_heads, 2, family.qwen2_head_dim());
+        session.cache().assert_qwen2_local_cache_geometry(
+            local_kv_heads,
+            2,
+            family.qwen2_head_dim(),
+        );
 
         let diagnostics = model.checkpoint_diagnostics();
         assert!(diagnostics.physical_reads > 0);
@@ -1371,7 +1196,11 @@ fn tensor_ring_worker() {
         assert_arrays_materially_different(&reference_logits, &zero_bias_logits, 1e-5);
 
         let token = Array::from_slice(&[3u32], &[1, 1]);
-        let distributed_decode = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
+        let distributed_decode = session
+            .decode(&backend, &mut model.0, token.clone())
+            .unwrap()
+            .wait()
+            .unwrap();
         let reference_decode = reference
             .forward(
                 dense_qwen::ModelInput {
@@ -1382,9 +1211,16 @@ fn tensor_ring_worker() {
                 &stream,
             )
             .unwrap();
+        let reference_decode = reference_decode
+            .try_index_device((.., -1, ..), &stream)
+            .unwrap();
         assert_arrays_close(&distributed_decode, &reference_decode, tolerance);
-        cache.assert_qwen2_local_cache_geometry(local_kv_heads, 3, family.qwen2_head_dim());
-        assert_eq!(cache.offset(), 3);
+        session.cache().assert_qwen2_local_cache_geometry(
+            local_kv_heads,
+            3,
+            family.qwen2_head_dim(),
+        );
+        assert_eq!(session.cache().offset(), 3);
         return;
     }
 
@@ -1409,42 +1245,50 @@ fn tensor_ring_worker() {
             expert_parallel_cache_replicated: true,
         },
     };
-    let saved =
-        model.save_prompt_cache(&mut cache, &prompt_cache_root, descriptor.clone(), &stream);
+    let saved = model.save_prompt_cache(
+        session.cache_mut(),
+        &prompt_cache_root,
+        descriptor.clone(),
+        &stream,
+    );
     assert_eq!(saved.topology, descriptor.topology);
     let token = safemlx::Array::from_slice(&[0u32], &[1, 1]);
-    let uninterrupted = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
+    let uninterrupted = session
+        .decode(&backend, &mut model.0, token.clone())
+        .unwrap()
+        .wait()
+        .unwrap();
     let uninterrupted = uninterrupted.evaluated().unwrap();
     let uninterrupted_values = uninterrupted.as_slice::<f32>().to_vec();
     drop(uninterrupted);
-    let (mut cache, manifest) =
+    let (cache, manifest) =
         model.load_prompt_cache(&prompt_cache_root, &descriptor, paged, &stream);
+    let _ = session.replace_cache(cache);
     assert_eq!(manifest.topology, descriptor.topology);
-    let restored = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
+    let restored = session
+        .decode(&backend, &mut model.0, token)
+        .unwrap()
+        .wait()
+        .unwrap();
     let restored = restored.evaluated().unwrap();
     assert_eq!(uninterrupted_values, restored.as_slice::<f32>());
     let logits = restored.as_array().clone();
     drop(restored);
     let mut sampler = DefaultSampler;
     let mut prng = (expected_rank == 0).then(|| RandomState::from_key(random::key(7).unwrap()));
-    let synchronized = sample_and_synchronize(
-        Some(&logits),
-        1,
-        &mut sampler,
-        1.0,
-        prng.as_mut(),
-        false,
-        0,
-        &group,
-        &stream,
-    )
-    .unwrap();
+    let synchronized = session
+        .sample_and_synchronize(Some(&logits), 1, &mut sampler, 1.0, prng.as_mut(), false)
+        .unwrap();
     let sampled = synchronized.token.evaluated().unwrap();
     assert!(sampled.as_slice::<u32>()[0] < vocab_size as u32);
     drop(sampled);
-    let logits = model.forward_tensor_parallel(&synchronized.token, &mut cache, &group, &stream);
-    assert_eq!(logits.shape(), &[1, 1, vocab_size as i32]);
-    assert_eq!(cache.offset(), 4);
+    let logits = session
+        .decode(&backend, &mut model.0, synchronized.token)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(logits.shape(), &[1, vocab_size as i32]);
+    assert_eq!(session.cache().offset(), 4);
 }
 
 fn write_f32_shard(path: &Path, tensors: &[(&str, Vec<usize>, f32)]) {

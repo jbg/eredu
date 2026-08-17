@@ -150,7 +150,7 @@ fn main() -> anyhow::Result<()> {
     )?;
     let mut ep_model =
         load_expert_parallel_model(&args.model_dir, topology, &stream, &weights_stream)?;
-    let execution = MlxBackend::new(&stream).distributed(topology, &group)?;
+    let execution = MlxBackend::new(&stream).create_communication_session(topology, &group)?;
     let _profiling = profile_expert_parallel_timings();
     let ep = benchmark_replicated_ep(
         &mut ep_model,

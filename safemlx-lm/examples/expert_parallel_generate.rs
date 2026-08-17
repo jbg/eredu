@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let execution = MlxBackend::new(&stream).distributed(topology, &group)?;
+    let execution = MlxBackend::new(&stream).create_communication_session(topology, &group)?;
     let options = ModelLoadOptions::with_parallel(topology).with_weight_residency(
         WeightResidency::with_expert_cache(
             safemlx_lm::NonExpertWeightResidency::LayerwiseHost(Default::default()),

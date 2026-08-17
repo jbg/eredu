@@ -628,7 +628,7 @@ impl QwenHybridLayerwiseModel {
         )
     }
     /// Runs a rank-local tensor-parallel text forward pass.
-    pub fn forward_tensor_parallel(
+    pub(crate) fn forward_tensor_parallel(
         &mut self,
         inputs: &Array,
         cache: &mut Cache,
@@ -637,6 +637,21 @@ impl QwenHybridLayerwiseModel {
     ) -> Result<Array, Error> {
         self.execution.forward_tensor_parallel(
             QwenHybridInput::Decode(inputs),
+            cache,
+            group,
+            stream,
+        )
+    }
+
+    pub(crate) fn prefill_tensor_parallel(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution.forward_tensor_parallel(
+            QwenHybridInput::Prefill(input),
             cache,
             group,
             stream,
@@ -1068,7 +1083,7 @@ pub fn load_qwen3_next_layerwise_model(
 }
 
 /// Loads text-only Qwen3-Next through the generalized tensor-parallel engine.
-pub fn load_qwen3_next_tensor_parallel_model(
+pub(crate) fn load_qwen3_next_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
@@ -1184,7 +1199,7 @@ pub(crate) fn execute_transformed_qwen_hybrid_model(
 }
 
 /// Loads a Qwen3.5 dense or MoE checkpoint through the generalized tensor-parallel engine.
-pub fn load_qwen35_tensor_parallel_model(
+pub(crate) fn load_qwen35_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,

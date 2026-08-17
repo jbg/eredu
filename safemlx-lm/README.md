@@ -67,20 +67,23 @@ SafeTensors/GGUF header catalogs, and load-route validation happen without
 MLX. The selected MLX backend then consumes that plan to map payloads and
 construct executable arrays/modules; it never calls back into the public
 facade loader.
-All ordinary text and multimodal prefill/decode execution crosses the single
-`MlxModelSession` implementation of the core session contract. Direct
-submissions return their exact completion; callers either retain it or use
-`Submission::wait`. Raw generation retains in-flight completions internally.
+Complete-model tensor-parallel text and multimodal prefill/decode execution
+crosses the single stateful `MlxModelSession` implementation of the core
+session contract. The session owns cache state and its optional distributed
+capability. Direct submissions return their exact completion; callers either
+retain it or use `Submission::wait`. Raw generation retains in-flight
+completions internally.
 Realtime Moshi/PersonaPlex requests use the backend-neutral core scheduler;
 only their tensor execution and exact MLX completion adapter remain here.
 Distributed pipeline schedule, cancellation, and completion agreement use the
 same core scheduler through the MLX collective and completion adapters; the
 facade does not maintain a second lifecycle implementation.
-`MlxBackend::distributed` selects one `MlxDistributedSession` for the complete
-distributed model session. It owns world and TP/PP/EP communicators and is the
-public pipeline/expert route for transfers, collectives, sampling, scheduler
-consensus, and exact communication completion. Native `Group` values remain an
-internal MLX execution detail rather than an alternative orchestration API.
+`MlxBackend::create_distributed_model_session` binds a pure tensor-parallel
+model, cache, topology, and `MlxDistributedSession` as one lifecycle. Pipeline
+and expert executors operate on partial rank-local models and currently use
+`create_communication_session`; that object owns the world and derived
+TP/PP/EP communicators after construction and is their route for transfers,
+collectives, sampling, scheduler consensus, and exact completion.
 Weight-residency plans, atomic admission, ownership leases, protected windows,
 eviction decisions, exact transfer generations, and accounting likewise come
 directly from `safemlx-lm-core`. The MLX facade mirrors those transitions with

@@ -686,7 +686,7 @@ impl Gemma4LayerwiseModel {
     }
 
     /// Runs multimodal prefill through rank-local vision and audio groups.
-    pub fn prefill_tensor_parallel(
+    pub(crate) fn prefill_tensor_parallel(
         &mut self,
         input: input::ModelInput<'_>,
         cache: &mut Cache,
@@ -698,7 +698,7 @@ impl Gemma4LayerwiseModel {
     }
 
     /// Runs decode on a TP-loaded Gemma multimodal model.
-    pub fn decode_tensor_parallel(
+    pub(crate) fn decode_tensor_parallel(
         &mut self,
         tokens: &Array,
         cache: &mut Cache,
@@ -996,7 +996,7 @@ pub(crate) fn execute_transformed_gemma4_model_with_modalities(
 }
 
 /// Loads Gemma 4 with rank-local vision and audio execution groups.
-pub fn load_gemma4_tensor_parallel_layerwise_model(
+pub(crate) fn load_gemma4_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,

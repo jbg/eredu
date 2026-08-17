@@ -114,35 +114,36 @@ pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Resul
         .parallel
         .filter(|topology| !topology.is_replicated())
     {
-        Err(Error::Parallel(
-            if topology.tensor_parallel_size > 1
-                && topology.pipeline_parallel_size == 1
-                && topology.expert_parallel_size == 1
-            {
-                "non-replicated pure tensor-parallel loading requires an architecture adapter; use the selected model family's generalized tensor-parallel loader"
+        if topology.tensor_parallel_size > 1
+            && topology.pipeline_parallel_size == 1
+            && topology.expert_parallel_size == 1
+        {
+            Ok(())
+        } else {
+            Err(Error::Parallel(
+                if topology.pipeline_parallel_size > 1
+                    && topology.tensor_parallel_size == 1
+                    && topology.expert_parallel_size == 1
+                {
+                    "non-replicated pure pipeline loading cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options"
                     .into()
-            } else if topology.pipeline_parallel_size > 1
-                && topology.tensor_parallel_size == 1
-                && topology.expert_parallel_size == 1
-            {
-                "non-replicated pure pipeline loading cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options"
+                } else if topology.expert_parallel_size > 1
+                    && topology.tensor_parallel_size == 1
+                    && topology.pipeline_parallel_size == 1
+                {
+                    "non-replicated pure expert-parallel loading cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options"
                     .into()
-            } else if topology.expert_parallel_size > 1
-                && topology.tensor_parallel_size == 1
-                && topology.pipeline_parallel_size == 1
-            {
-                "non-replicated pure expert-parallel loading cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options"
-                    .into()
-            } else {
-                if topology.pipeline_parallel_size > 1 {
-                    "Cartesian pipeline topology cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options and PipelineModel::forward_distributed"
-                        .into()
                 } else {
-                    "Cartesian TP+EP topology cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options and ExpertParallelModel::forward_distributed"
+                    if topology.pipeline_parallel_size > 1 {
+                        "Cartesian pipeline topology cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options and PipelineModel::forward_distributed"
                         .into()
-                }
-            },
-        ))
+                    } else {
+                        "Cartesian TP+EP topology cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options and ExpertParallelModel::forward_distributed"
+                        .into()
+                    }
+                },
+            ))
+        }
     } else {
         Ok(())
     }

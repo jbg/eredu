@@ -32,8 +32,8 @@ pub use safemlx_lm_core::generation::{
     ResolvedGenerationConfig, SemanticEvent,
 };
 pub use safemlx_lm_core::{
-    CollectiveScope, DistributedBackend, DistributedCapabilities, DistributedSession,
-    DistributedSessionDescriptor, ValueDescriptor,
+    Backend, BackendSession, CollectiveScope, DistributedBackend, DistributedCapabilities,
+    DistributedSession, DistributedSessionDescriptor, ValueDescriptor,
 };
 #[cfg(test)]
 mod test_utils;
@@ -58,7 +58,7 @@ pub use api::{
     TimingTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
-pub use backend::mlx::{MlxBackend, MlxDistributedConfig, MlxDistributedSession};
+pub use backend::mlx::{MlxBackend, MlxDistributedSession, MlxModelInput, MlxModelSession};
 pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyError,
@@ -68,9 +68,9 @@ pub use runtime::cache::residency::{
 pub use runtime::cache::PagedKeyValueCache;
 pub use runtime::distributed::completion::DistributedCompletion;
 pub use runtime::distributed::parallel::{
-    sample_and_synchronize, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    ParallelBuildContext, ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, ShardingPolicy, SynchronizedToken,
+    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelBuildContext,
+    ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, ShardingPolicy, SynchronizedToken,
 };
 pub use runtime::distributed::topology::{
     DeviceAssignment, ParallelAxis, ParallelCoordinates, ParallelTopology, PlacementPlan,

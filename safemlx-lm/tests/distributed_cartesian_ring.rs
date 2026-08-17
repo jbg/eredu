@@ -119,7 +119,7 @@ fn cartesian_ring_worker() {
     // and [1, 3]. Both axes are logical subgroups under Ring.
     {
         let execution = MlxBackend::new(&stream)
-            .distributed(topology(expected_rank, 2, 2, 1), &world)
+            .create_communication_session(topology(expected_rank, 2, 2, 1), &world)
             .unwrap();
         let input = scalar(expected_rank as i32 + 1);
         let reduced = DistributedSession::all_reduce_sum(
@@ -153,7 +153,7 @@ fn cartesian_ring_worker() {
     // TP+EP: TP groups are [0, 2] and [1, 3]; EP groups are [0, 1] and [2, 3].
     {
         let execution = MlxBackend::new(&stream)
-            .distributed(topology(expected_rank, 2, 1, 2), &world)
+            .create_communication_session(topology(expected_rank, 2, 1, 2), &world)
             .unwrap();
         let input = scalar(expected_rank as i32 + 1);
         let reduced = DistributedSession::all_reduce_sum(
@@ -221,7 +221,7 @@ fn cartesian_ring_worker() {
     // PP+EP: stage-local EP reduction followed by matching-EP pipeline transport.
     {
         let execution = MlxBackend::new(&stream)
-            .distributed(topology(expected_rank, 1, 2, 2), &world)
+            .create_communication_session(topology(expected_rank, 1, 2, 2), &world)
             .unwrap();
         let input = scalar(expected_rank as i32 + 1);
         let reduced = DistributedSession::all_reduce_sum(
@@ -277,7 +277,7 @@ fn cartesian_triple_ring_worker() {
     .unwrap();
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let execution = MlxBackend::new(&stream)
-        .distributed(topology, &world)
+        .create_communication_session(topology, &world)
         .unwrap();
     let input = scalar(expected_rank as i32 + 1);
 

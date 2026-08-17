@@ -881,7 +881,7 @@ impl NemotronHLayerwiseModel {
         self.execution.forward(inputs, cache, stream)
     }
     /// Runs a rank-local tensor-parallel hybrid forward pass.
-    pub fn forward_tensor_parallel(
+    pub(crate) fn forward_tensor_parallel(
         &mut self,
         inputs: &Array,
         cache: &mut Cache,
@@ -1375,7 +1375,7 @@ pub fn load_nemotron_h_layerwise_model(
     })
 }
 /// Loads Nemotron-H through the generalized tensor-parallel engine.
-pub fn load_nemotron_h_tensor_parallel_model(
+pub(crate) fn load_nemotron_h_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,

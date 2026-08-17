@@ -17,17 +17,19 @@ pub(crate) use loading::{
 /// Architecture-erased model/session execution.
 mod session;
 
-pub use distributed::{MlxDistributedConfig, MlxDistributedSession};
+pub(crate) use distributed::MlxDistributedConfig;
+pub use distributed::MlxDistributedSession;
+pub(crate) use session::{submit_decode_with_cache, submit_prefill_with_cache};
 pub use session::{MlxGeneration, MlxModelInput, MlxModelSession};
 
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
 use safemlx_lm_core::backend::{
-    Backend, BackendCapabilities, BackendDescriptor, Completion, DeviceDescriptor,
-    DistributedBackend, PreparedModel, Submission,
+    Backend, BackendCapabilities, BackendDescriptor, Completion, DeviceDescriptor, PreparedModel,
+    Submission,
 };
 
 use crate::{
-    api::{Model, ModelCache, ModelLoadOptions},
+    api::{Model, ModelLoadOptions},
     error::Error,
 };
 
@@ -57,20 +59,53 @@ impl<'a> MlxBackend<'a> {
         self.stream
     }
 
-    /// Attaches topology-scoped MLX communication to this backend selection.
-    pub fn distributed(
+    /// Creates communication for pipeline/expert executors which do not yet
+    /// use the architecture-erased complete-model session.
+    pub fn create_communication_session(
         &self,
         topology: crate::ParallelTopology,
         world: &'a safemlx::distributed::Group,
     ) -> Result<MlxDistributedSession<'a>, Error> {
-        self.create_distributed_session(MlxDistributedConfig { topology, world })
+        MlxDistributedSession::new(MlxDistributedConfig { topology, world }, self.stream)
+    }
+
+    /// Creates a model session with topology-scoped MLX communication.
+    pub fn create_distributed_model_session(
+        &self,
+        model: &Model,
+        topology: crate::ParallelTopology,
+        world: &'a safemlx::distributed::Group,
+    ) -> Result<MlxModelSession<'a>, Error> {
+        self.create_distributed_model_session_with_cache(model.new_cache(), topology, world)
+    }
+
+    /// Creates a distributed model session from caller-selected cache policy.
+    pub fn create_distributed_model_session_with_cache(
+        &self,
+        cache: crate::api::ModelCache,
+        topology: crate::ParallelTopology,
+        world: &'a safemlx::distributed::Group,
+    ) -> Result<MlxModelSession<'a>, Error> {
+        if topology.tensor_parallel_size <= 1
+            || topology.pipeline_parallel_size != 1
+            || topology.expert_parallel_size != 1
+        {
+            return Err(Error::Parallel(
+                "architecture-erased distributed model sessions currently require a pure tensor-parallel topology"
+                    .into(),
+            ));
+        }
+        MlxModelSession::new_distributed(
+            cache,
+            MlxDistributedSession::new(MlxDistributedConfig { topology, world }, self.stream)?,
+        )
     }
 }
 
 impl<'a> Backend for MlxBackend<'a> {
     type ModelConfig = MlxModelConfig<'a>;
     type Model = Model;
-    type Session = ModelCache;
+    type Session = MlxModelSession<'a>;
     type Error = Error;
 
     fn descriptor(&self) -> BackendDescriptor {
@@ -119,7 +154,7 @@ impl<'a> Backend for MlxBackend<'a> {
         &self,
         model: &PreparedModel<Self::Model>,
     ) -> Result<Self::Session, Self::Error> {
-        Ok(model.get().new_cache())
+        Ok(MlxModelSession::new(model.get().new_cache()))
     }
 }
 

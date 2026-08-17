@@ -223,13 +223,13 @@ impl<M> PreparedModel<M> {
 }
 
 /// One backend selected for an entire prepared model and all its sessions.
-pub trait Backend {
+pub trait Backend: Sized {
     /// Portable model preparation request.
     type ModelConfig;
     /// Opaque backend model/executable.
     type Model;
-    /// Opaque backend session/cache state.
-    type Session;
+    /// Opaque backend session/cache state and execution implementation.
+    type Session: BackendSession<Self>;
     /// Backend error.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -265,17 +265,17 @@ pub trait BackendSession<B: Backend> {
 
     /// Submits prompt prefill against this session.
     fn prefill(
+        &mut self,
         backend: &B,
         model: &mut B::Model,
-        session: &mut B::Session,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
 
     /// Submits one or more cached decode positions against this session.
     fn decode(
+        &mut self,
         backend: &B,
         model: &mut B::Model,
-        session: &mut B::Session,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
 }
@@ -342,18 +342,13 @@ pub trait DistributedSession {
     fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Self::Error>;
 }
 
-/// Backend extension which prepares an optional distributed session.
+/// Backend extension exposing communication attached to a model session.
 pub trait DistributedBackend: Backend {
-    /// Backend-specific communicator/session preparation input.
-    type DistributedConfig;
     /// Selected distributed session implementation.
     type DistributedSession: DistributedSession<Error = Self::Error>;
 
-    /// Creates the communication capability attached to this backend selection.
-    fn create_distributed_session(
-        &self,
-        config: Self::DistributedConfig,
-    ) -> Result<Self::DistributedSession, Self::Error>;
+    /// Returns communication for a distributed model session.
+    fn distributed_session<'a>(session: &'a Self::Session) -> Option<&'a Self::DistributedSession>;
 }
 
 #[cfg(test)]
@@ -376,7 +371,7 @@ mod tests {
     impl Backend for Mock {
         type ModelConfig = u32;
         type Model = u32;
-        type Session = Vec<u32>;
+        type Session = MockSession;
         type Error = Infallible;
         fn descriptor(&self) -> BackendDescriptor {
             BackendDescriptor {
@@ -390,37 +385,43 @@ mod tests {
         fn prepare_model(&self, config: u32) -> Result<PreparedModel<u32>, Self::Error> {
             Ok(PreparedModel::new(config))
         }
-        fn create_session(&self, _: &PreparedModel<u32>) -> Result<Vec<u32>, Self::Error> {
-            Ok(vec![])
+        fn create_session(&self, _: &PreparedModel<u32>) -> Result<MockSession, Self::Error> {
+            Ok(MockSession {
+                tokens: vec![],
+                distributed: None,
+            })
         }
     }
-    struct MockSession;
+    struct MockSession {
+        tokens: Vec<u32>,
+        distributed: Option<MockDistributed>,
+    }
     impl BackendSession<Mock> for MockSession {
         type PrefillInput = Vec<u32>;
         type DecodeInput = u32;
         type Output = u32;
         type Completion = Done;
         fn prefill(
+            &mut self,
             _: &Mock,
             model: &mut u32,
-            session: &mut Vec<u32>,
             input: Vec<u32>,
         ) -> Result<Submission<u32, Done>, Infallible> {
-            session.extend(input);
+            self.tokens.extend(input);
             Ok(Submission {
-                output: session.len() as u32 + *model,
+                output: self.tokens.len() as u32 + *model,
                 completion: Done,
             })
         }
         fn decode(
+            &mut self,
             _: &Mock,
             model: &mut u32,
-            session: &mut Vec<u32>,
             input: u32,
         ) -> Result<Submission<u32, Done>, Infallible> {
-            session.push(input);
+            self.tokens.push(input);
             Ok(Submission {
-                output: session.len() as u32 + *model,
+                output: self.tokens.len() as u32 + *model,
                 completion: Done,
             })
         }
@@ -432,21 +433,11 @@ mod tests {
         let prepared = backend.prepare_model(10).unwrap();
         let mut session = backend.create_session(&prepared).unwrap();
         let mut model = prepared.into_inner();
-        let prefill = MockSession::prefill(&backend, &mut model, &mut session, vec![1, 2]).unwrap();
+        let prefill = session.prefill(&backend, &mut model, vec![1, 2]).unwrap();
         assert_eq!(prefill.output, 12);
         assert!(prefill.completion.is_complete().unwrap());
-        assert_eq!(
-            MockSession::decode(&backend, &mut model, &mut session, 3)
-                .unwrap()
-                .output,
-            13
-        );
-        assert_eq!(
-            MockSession::decode(&backend, &mut model, &mut session, 4)
-                .unwrap()
-                .output,
-            14
-        );
+        assert_eq!(session.decode(&backend, &mut model, 3).unwrap().output, 13);
+        assert_eq!(session.decode(&backend, &mut model, 4).unwrap().output, 14);
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -541,6 +532,16 @@ mod tests {
         }
     }
 
+    impl DistributedBackend for Mock {
+        type DistributedSession = MockDistributed;
+
+        fn distributed_session<'a>(
+            session: &'a MockSession,
+        ) -> Option<&'a Self::DistributedSession> {
+            session.distributed.as_ref()
+        }
+    }
+
     #[test]
     fn mock_distributed_session_owns_collective_and_transfer_lifecycle() {
         let topology = ParallelTopology::new(2, 1, 1, 1).unwrap();
@@ -574,6 +575,17 @@ mod tests {
             vec![1, 1]
         );
         assert_eq!(session.all_gather_words(&[7]).unwrap(), vec![7, 7]);
+
+        let model_session = MockSession {
+            tokens: Vec::new(),
+            distributed: Some(session),
+        };
+        assert_eq!(
+            Mock::distributed_session(&model_session)
+                .unwrap()
+                .descriptor(),
+            session.descriptor()
+        );
     }
 
     #[test]

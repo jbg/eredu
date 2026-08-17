@@ -698,7 +698,7 @@ fn gemma4_multimodal_pipeline_ring_worker() {
     )
     .unwrap();
     let execution = MlxBackend::new(&stream)
-        .distributed(topology, &group)
+        .create_communication_session(topology, &group)
         .unwrap();
     assert_eq!(
         model.stage_info().global_layer_range,

@@ -15,7 +15,7 @@ use crate::{
     runtime::generation::sampler::{DefaultSampler, Sampler},
 };
 
-use super::{MlxBackend, MlxCompletion};
+use super::{MlxBackend, MlxCompletion, MlxDistributedSession};
 
 /// MLX-owned prefill input.
 ///
@@ -104,9 +104,87 @@ impl MlxModelInput {
 }
 
 /// The single MLX implementation of architecture-erased prefill and decode.
-pub struct MlxModelSession;
+///
+/// Cache state and optional communication belong to the same selected model
+/// session so callers cannot accidentally execute a sharded model with an
+/// unrelated communicator.
+pub struct MlxModelSession<'a> {
+    cache: ModelCache,
+    distributed: Option<MlxDistributedSession<'a>>,
+}
 
-impl MlxModelSession {
+impl<'a> MlxModelSession<'a> {
+    pub(crate) const fn new(cache: ModelCache) -> Self {
+        Self {
+            cache,
+            distributed: None,
+        }
+    }
+
+    pub(crate) fn new_distributed(
+        cache: ModelCache,
+        distributed: MlxDistributedSession<'a>,
+    ) -> Result<Self, Error> {
+        if distributed.topology().is_replicated() {
+            return Err(Error::Parallel(
+                "distributed model sessions require a non-replicated topology".into(),
+            ));
+        }
+        Ok(Self {
+            cache,
+            distributed: Some(distributed),
+        })
+    }
+
+    /// Returns this session's cache state.
+    pub const fn cache(&self) -> &ModelCache {
+        &self.cache
+    }
+
+    /// Returns this session's mutable cache state.
+    pub fn cache_mut(&mut self) -> &mut ModelCache {
+        &mut self.cache
+    }
+
+    /// Replaces cache state after an explicitly validated restore.
+    pub fn replace_cache(&mut self, cache: ModelCache) -> ModelCache {
+        std::mem::replace(&mut self.cache, cache)
+    }
+
+    /// Returns communication when this is a distributed session.
+    pub const fn distributed(&self) -> Option<&MlxDistributedSession<'a>> {
+        self.distributed.as_ref()
+    }
+
+    /// Samples on the canonical rank and synchronizes the result for this
+    /// distributed model session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_and_synchronize<S: Sampler>(
+        &self,
+        logits: Option<&Array>,
+        batch_size: i32,
+        sampler: &mut S,
+        temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        finished: bool,
+    ) -> Result<crate::SynchronizedToken, Error> {
+        self.distributed
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Parallel(
+                    "sampling synchronization requires a distributed model session".into(),
+                )
+            })?
+            .sample_and_synchronize(
+                logits,
+                batch_size,
+                sampler,
+                temperature,
+                prng_state,
+                finished,
+            )
+    }
+
     /// Runs one MLX instrumented pass through the architecture-erased adapter.
     pub(crate) fn forward_with_observer(
         model: &mut Model,
@@ -214,30 +292,51 @@ impl MlxModelSession {
     }
 }
 
-impl BackendSession<MlxBackend<'_>> for MlxModelSession {
+impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
     type PrefillInput = MlxModelInput;
     type DecodeInput = Array;
     type Output = Array;
     type Completion = MlxCompletion;
 
     fn prefill(
-        backend: &MlxBackend<'_>,
+        &mut self,
+        backend: &MlxBackend<'a>,
         model: &mut Model,
-        cache: &mut ModelCache,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        let output =
-            input.with_borrowed(|input| prefill_model(model, cache, input, backend.stream()))?;
+        let output = match &self.distributed {
+            Some(distributed) => input.with_borrowed(|input| {
+                prefill_model_tensor_parallel(
+                    model,
+                    &mut self.cache,
+                    input,
+                    distributed,
+                    backend.stream(),
+                )
+            })?,
+            None => input.with_borrowed(|input| {
+                prefill_model(model, &mut self.cache, input, backend.stream())
+            })?,
+        };
         MlxCompletion::submission(output)
     }
 
     fn decode(
-        backend: &MlxBackend<'_>,
+        &mut self,
+        backend: &MlxBackend<'a>,
         model: &mut Model,
-        cache: &mut ModelCache,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        let output = decode_model(model, cache, &input, backend.stream())?;
+        let output = match &self.distributed {
+            Some(distributed) => decode_model_tensor_parallel(
+                model,
+                &mut self.cache,
+                &input,
+                distributed,
+                backend.stream(),
+            )?,
+            None => decode_model(model, &mut self.cache, &input, backend.stream())?,
+        };
         MlxCompletion::submission(output)
     }
 }
@@ -397,6 +496,211 @@ fn decode_model(
     }
 }
 
+pub(crate) fn submit_prefill_with_cache(
+    model: &mut Model,
+    cache: &mut ModelCache,
+    input: MlxModelInput,
+    stream: &Stream,
+) -> Result<Submission<Array, MlxCompletion>, Error> {
+    let output = input.with_borrowed(|input| prefill_model(model, cache, input, stream))?;
+    MlxCompletion::submission(output)
+}
+
+pub(crate) fn submit_decode_with_cache(
+    model: &mut Model,
+    cache: &mut ModelCache,
+    input: Array,
+    stream: &Stream,
+) -> Result<Submission<Array, MlxCompletion>, Error> {
+    let output = decode_model(model, cache, &input, stream)?;
+    MlxCompletion::submission(output)
+}
+
+fn last_token_logits(logits: Array, stream: &Stream) -> Result<Array, Error> {
+    logits
+        .try_index_device((.., -1, ..), stream)
+        .map_err(Into::into)
+}
+
+fn with_dense_qwen_cache<T>(
+    cache: &mut ModelCache,
+    execute: impl FnOnce(
+        &mut crate::architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache,
+    ) -> Result<T, Error>,
+) -> Result<T, Error> {
+    use crate::architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache;
+    let mut owned = match cache {
+        ModelCache::KeyValue(values) => DenseQwenLayerwiseCache::Concat(std::mem::take(values)),
+        ModelCache::PagedKeyValue(values) => DenseQwenLayerwiseCache::Paged(std::mem::take(values)),
+        _ => {
+            return Err(Error::UnsupportedArchitecture(
+                "dense Qwen cache does not match model".into(),
+            ))
+        }
+    };
+    let result = execute(&mut owned);
+    match (cache, owned) {
+        (ModelCache::KeyValue(values), DenseQwenLayerwiseCache::Concat(restored)) => {
+            *values = restored
+        }
+        (ModelCache::PagedKeyValue(values), DenseQwenLayerwiseCache::Paged(restored)) => {
+            *values = restored
+        }
+        _ => unreachable!("dense Qwen tensor-parallel cache wrapper changed variants"),
+    }
+    result
+}
+
+fn with_muse_cache<T>(
+    cache: &mut ModelCache,
+    execute: impl FnOnce(
+        &mut crate::architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache,
+    ) -> Result<T, Error>,
+) -> Result<T, Error> {
+    use crate::architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache;
+    let mut owned = match cache {
+        ModelCache::KeyValue(values) => MuseGlimmerLayerwiseCache::Concat(std::mem::take(values)),
+        ModelCache::PagedKeyValue(values) => {
+            MuseGlimmerLayerwiseCache::Paged(std::mem::take(values))
+        }
+        _ => {
+            return Err(Error::UnsupportedArchitecture(
+                "Muse-Glimmer cache does not match model".into(),
+            ))
+        }
+    };
+    let result = execute(&mut owned);
+    match (cache, owned) {
+        (ModelCache::KeyValue(values), MuseGlimmerLayerwiseCache::Concat(restored)) => {
+            *values = restored
+        }
+        (ModelCache::PagedKeyValue(values), MuseGlimmerLayerwiseCache::Paged(restored)) => {
+            *values = restored
+        }
+        _ => unreachable!("Muse-Glimmer tensor-parallel cache wrapper changed variants"),
+    }
+    result
+}
+
+fn prefill_model_tensor_parallel(
+    model: &mut Model,
+    cache: &mut ModelCache,
+    input: input::ModelInput<'_>,
+    distributed: &MlxDistributedSession<'_>,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let group = distributed.tensor_group().ok_or_else(|| {
+        Error::Parallel("tensor-parallel model session has no tensor communicator".into())
+    })?;
+    let logits = match (model, cache) {
+        (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
+            model.prefill_tensor_parallel(input, cache, group, stream)?
+        }
+        (Model::Inkling(model), ModelCache::Inkling(cache)) => {
+            model.prefill_tensor_parallel(input, cache, group, stream)?
+        }
+        (Model::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
+            model.prefill_tensor_parallel(input, cache, group, stream)?
+        }
+        (Model::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
+            model.prefill_tensor_parallel(input, cache, group, stream)?
+        }
+        (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
+        | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
+            model.prefill_tensor_parallel(input, cache, group, stream)?
+        }
+        (
+            Model::MuseGlimmer(model),
+            cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
+        ) => with_muse_cache(cache, |cache| {
+            model.prefill_tensor_parallel(input, cache, group, stream)
+        })?,
+        (model, cache) => {
+            let tokens = input::text_token_ids(input, stream)?;
+            forward_model_tensor_parallel(model, cache, &tokens, group, stream)?
+        }
+    };
+    last_token_logits(logits, stream)
+}
+
+fn decode_model_tensor_parallel(
+    model: &mut Model,
+    cache: &mut ModelCache,
+    input: &Array,
+    distributed: &MlxDistributedSession<'_>,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let group = distributed.tensor_group().ok_or_else(|| {
+        Error::Parallel("tensor-parallel model session has no tensor communicator".into())
+    })?;
+    let logits = forward_model_tensor_parallel(model, cache, input, group, stream)?;
+    last_token_logits(logits, stream)
+}
+
+fn forward_model_tensor_parallel(
+    model: &mut Model,
+    cache: &mut ModelCache,
+    input: &Array,
+    group: &safemlx::distributed::Group,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    match (model, cache) {
+        (Model::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::DeepSeekV4Layerwise(model), ModelCache::DeepSeekV4(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::GptOss(model), ModelCache::GptOss(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::Inkling(model), ModelCache::Inkling(cache)) => {
+            model.decode_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::Llama(model), ModelCache::Llama(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::Lfm2(model), ModelCache::Lfm2(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::NemotronH(model), ModelCache::NemotronH(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
+            model.decode_tensor_parallel(input, cache, group, stream)
+        }
+        (
+            Model::DenseQwen(model),
+            cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
+        ) => with_dense_qwen_cache(cache, |cache| {
+            model.forward_tensor_parallel(input, None, cache, group, stream)
+        }),
+        (
+            Model::MuseGlimmer(model),
+            cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
+        ) => with_muse_cache(cache, |cache| {
+            model.forward_tensor_parallel(input, None, cache, group, stream)
+        }),
+        (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
+        | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
+            model.decode_tensor_parallel(input, cache, group, stream)
+        }
+        (Model::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
+            model.decode_tensor_parallel(input, cache, group, stream)
+        }
+        (model, _) => Err(Error::UnsupportedArchitecture(format!(
+            "tensor-parallel MLX cache does not match model type {}",
+            model.model_type()
+        ))),
+    }
+}
+
 enum GenerationState {
     Prefill(MlxModelInput),
     Decode(Array),
@@ -491,15 +795,18 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let submission = match &self.state {
-            GenerationState::Prefill(input) => {
-                MlxModelSession::prefill(&self.backend, self.model, self.cache, input.clone())
-            }
+            GenerationState::Prefill(input) => submit_prefill_with_cache(
+                self.model,
+                self.cache,
+                input.clone(),
+                self.backend.stream(),
+            ),
             GenerationState::Decode(token) => {
                 let input = match token.try_index_device((.., NewAxis), self.backend.stream()) {
                     Ok(input) => input,
                     Err(error) => return Some(Err(error)),
                 };
-                MlxModelSession::decode(&self.backend, self.model, self.cache, input)
+                submit_decode_with_cache(self.model, self.cache, input, self.backend.stream())
             }
         };
         let submission = match submission {

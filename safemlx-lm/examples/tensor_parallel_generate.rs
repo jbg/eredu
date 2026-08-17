@@ -5,9 +5,10 @@ use safemlx::{
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    architectures::llama::layerwise::load_llama_tensor_parallel_model,
-    runtime::generation::sampler::DefaultSampler, sample_and_synchronize, DeviceAssignment,
-    LayerwiseLoadOptions, ParallelBuildContext, ParallelTopology, ShardingPolicy,
+    core::BackendSession,
+    load_model_with_options,
+    runtime::{generation::sampler::DefaultSampler, media::input},
+    DeviceAssignment, MlxBackend, ModelLoadOptions, ParallelTopology,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,29 +29,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-    let mut model = load_llama_tensor_parallel_model(
+    let mut model = load_model_with_options(
         &model_dir,
-        LayerwiseLoadOptions::default(),
-        build,
+        ModelLoadOptions::with_parallel(topology),
         &stream,
         &weights_stream,
     )?;
-    let mut cache = model.new_cache();
+    let backend = MlxBackend::new(&stream);
+    let mut session = backend.create_distributed_model_session(&model, topology, &group)?;
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-    let mut logits = model.forward_tensor_parallel(&prompt, &mut cache, &group, &stream)?;
+    let parts = [input::InputPart::text_token_ids(&prompt)];
+    let mut logits = session
+        .prefill(&backend, &mut model, input::ModelInput::new(&parts).into())?
+        .wait()?;
     let mut sampler = DefaultSampler;
     for _ in 0..8 {
-        let synchronized = sample_and_synchronize(
+        let synchronized = session.sample_and_synchronize(
             Some(&logits),
             logits.dim(0),
             &mut sampler,
             0.0,
             None,
             false,
-            0,
-            &group,
-            &stream,
         )?;
         if group.rank() == 0 {
             eprintln!(
@@ -61,7 +61,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if synchronized.finished {
             break;
         }
-        logits = model.forward_tensor_parallel(&synchronized.token, &mut cache, &group, &stream)?;
+        logits = session
+            .decode(&backend, &mut model, synchronized.token)?
+            .wait()?;
     }
     Ok(())
 }

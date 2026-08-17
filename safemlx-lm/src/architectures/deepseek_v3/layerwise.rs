@@ -548,7 +548,7 @@ impl DeepSeekV3LayerwiseModel {
     }
 
     /// Runs a rank-local tensor-parallel forward pass through the generalized engine.
-    pub fn forward_tensor_parallel(
+    pub(crate) fn forward_tensor_parallel(
         &mut self,
         inputs: &Array,
         cache: &mut Cache,
@@ -1044,7 +1044,7 @@ pub(crate) fn execute_transformed_deepseek_v3_model(
 }
 
 /// Loads DeepSeek-V3/R1 through the generalized tensor-parallel engine.
-pub fn load_deepseek_v3_tensor_parallel_model(
+pub(crate) fn load_deepseek_v3_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,

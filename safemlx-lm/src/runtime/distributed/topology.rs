@@ -1757,7 +1757,7 @@ mod tests {
     }
 
     #[test]
-    fn model_load_options_preserve_singleton_behavior_and_reject_partial_models() {
+    fn model_load_options_accept_complete_models_and_reject_partial_models() {
         let default = crate::api::ModelLoadOptions::default();
         assert_eq!(default.quantization, None);
         assert_eq!(default.parallel, None);
@@ -1775,9 +1775,13 @@ mod tests {
         );
         assert!(combined.parallel.unwrap().is_replicated());
 
-        let partitioned = crate::api::ModelLoadOptions::with_parallel(topology(2, 0, 2, 1, 1));
+        let tensor_parallel = crate::api::ModelLoadOptions::with_parallel(topology(2, 0, 2, 1, 1));
+        crate::api::ensure_executable_load_options(tensor_parallel).unwrap();
+
+        let pipeline_partitioned =
+            crate::api::ModelLoadOptions::with_parallel(topology(2, 0, 1, 2, 1));
         assert!(matches!(
-            crate::api::ensure_executable_load_options(partitioned),
+            crate::api::ensure_executable_load_options(pipeline_partitioned),
             Err(Error::Parallel(_))
         ));
     }

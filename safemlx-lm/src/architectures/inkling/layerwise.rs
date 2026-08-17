@@ -566,7 +566,7 @@ impl InklingLayerwiseModel {
     }
 
     /// Runs a typed multimodal prefill through rank-local hMLP units.
-    pub fn prefill_tensor_parallel(
+    pub(crate) fn prefill_tensor_parallel(
         &mut self,
         input: input::ModelInput<'_>,
         cache: &mut Cache,
@@ -585,7 +585,7 @@ impl InklingLayerwiseModel {
     }
 
     /// Runs decode on a TP-loaded Inkling model.
-    pub fn decode_tensor_parallel(
+    pub(crate) fn decode_tensor_parallel(
         &mut self,
         tokens: &Array,
         cache: &mut Cache,
@@ -1111,7 +1111,7 @@ pub fn load_inkling_layerwise_model(
 }
 
 /// Loads Inkling with a rank-local hierarchical vision execution group.
-pub fn load_inkling_tensor_parallel_layerwise_model(
+pub(crate) fn load_inkling_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,

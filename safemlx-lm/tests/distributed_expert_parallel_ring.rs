@@ -342,7 +342,7 @@ fn expert_parallel_model_ring_worker() {
             .collect::<HashMap<_, _>>();
     let _profiling = profile_expert_parallel_timings();
     let execution = MlxBackend::new(&stream)
-        .distributed(topology, &group)
+        .create_communication_session(topology, &group)
         .unwrap();
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let persist_prompt = artifact_dir.join(PROMPT_CACHE_MARKER).exists();

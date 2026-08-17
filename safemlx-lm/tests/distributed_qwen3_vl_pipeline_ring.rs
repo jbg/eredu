@@ -478,7 +478,7 @@ fn qwen3_vl_pipeline_ring_worker() {
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     let execution = MlxBackend::new(&stream)
-        .distributed(topology, &group)
+        .create_communication_session(topology, &group)
         .unwrap();
     let streamed = std::env::var_os(STREAMED).is_some();
     let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();

@@ -402,7 +402,7 @@ impl LayerwiseDecoder {
 
     /// Runs a rank-local tensor-parallel forward pass through the generalized
     /// execution-group engine.
-    pub fn forward_tensor_parallel(
+    pub(crate) fn forward_tensor_parallel(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
@@ -412,6 +412,21 @@ impl LayerwiseDecoder {
     ) -> Result<Array, Error> {
         self.execution.forward_tensor_parallel(
             MuseGlimmerAdapterInput::Decode { inputs, mask },
+            cache,
+            group,
+            stream,
+        )
+    }
+
+    pub(crate) fn prefill_tensor_parallel(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution.forward_tensor_parallel(
+            MuseGlimmerAdapterInput::Prefill(input),
             cache,
             group,
             stream,
@@ -669,7 +684,7 @@ pub(crate) fn load_safetensors_quantized_residency(
 
 /// Loads Muse-Glimmer checkpoints through the generalized
 /// tensor-parallel execution-group engine.
-pub fn load_tensor_parallel_model(
+pub(crate) fn load_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
