@@ -21,6 +21,11 @@ use safemlx::{
     Array, Stream,
 };
 
+use crate::core::cache::{
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+};
+
 use crate::{
     api::{
         deepseek_v3, deepseek_v4, gemma4, gpt_oss, inkling, input as runtime_input, kimi_linear,
@@ -30,9 +35,8 @@ use crate::{
     core::cache::CacheRankIdentity,
     error::Error,
     runtime::cache::residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions,
     },
     runtime::cache::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
@@ -1341,7 +1345,7 @@ impl ExpertParallelModel {
             _ => None,
         };
         if let Some(mut identity) = layerwise_identity {
-            identity.topology = PromptCacheTopology::for_parallel_topology(self.topology);
+            identity.topology = crate::backend::mlx::cache::prompt_cache_topology(self.topology);
             return Ok(identity);
         }
         let (model_family, effective_model_type, architecture_fingerprint, layer_count) =

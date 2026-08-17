@@ -17,6 +17,11 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::core::cache::{
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::{self, generation::CausalLm},
@@ -28,11 +33,7 @@ use crate::{
         parallel::{VocabParallelEmbedding, VocabParallelLmHead},
         tensor::create_causal_mask,
     },
-    runtime::cache::residency::{
-        validate_prompt_cache_model_identity, CacheResidencyPolicy, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheTopology,
-    },
+    runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
         canonical_checkpoint_name, populate_module_from_lease,
@@ -1941,7 +1942,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout: PromptCacheModelIdentity::compressed_layouts(
                 layer_count,

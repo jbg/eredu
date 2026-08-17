@@ -21,6 +21,11 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::{self, generation::CausalLm, moe::PackedSwiGluExperts},
@@ -34,10 +39,7 @@ use crate::{
         vocab_embedding_parameter_group, vocab_lm_head_parameter_group, VocabParallelEmbedding,
         VocabParallelLmHead,
     },
-    runtime::cache::residency::{
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-    },
+    runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
@@ -2414,7 +2416,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout,
         })
@@ -4064,11 +4066,11 @@ mod tests {
             inkling::{self as resident, Model, ModelArgs},
             input as runtime_input,
         },
-        core::residency::{OffloadConfig, ResidencyPolicy},
-        runtime::cache::{
-            residency::{CacheResidencyPolicy, PromptCacheDescriptor, PromptCacheOptions},
-            KeyValueCache,
+        core::{
+            cache::{PromptCacheDescriptor, PromptCacheOptions},
+            residency::{OffloadConfig, ResidencyPolicy},
         },
+        runtime::cache::{residency::CacheResidencyPolicy, KeyValueCache},
         runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
         runtime::distributed::{
             parallel::{ParallelBuildContext, ShardingPolicy},

@@ -27,6 +27,11 @@ use std::{
 };
 use tokenizers::Tokenizer;
 
+use crate::core::cache::{
+    derive_prompt_cache_architecture_fingerprint, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 use crate::architectures::qwen::vl::vision::VisionConfigSource;
 #[cfg(test)]
 pub(crate) use crate::architectures::qwen::vl::vision::{reverse_permutation, vision_window_index};
@@ -59,10 +64,8 @@ use crate::{
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
         residency::{
-            derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, CacheResidencyManager,
-            CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
+            CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
             PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
@@ -7787,9 +7790,7 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_hybrid_save_drop_reload_continue_matches_uninterrupted() {
-        use crate::runtime::cache::residency::{
-            PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-        };
+        use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
 
         let _guard = mlx_runtime_test_guard();
         let context = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));

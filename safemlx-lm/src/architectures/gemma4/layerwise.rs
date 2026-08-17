@@ -20,6 +20,11 @@ use safemlx::{
     Array, Stream,
 };
 
+use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::generation::CausalLm,
@@ -43,13 +48,7 @@ use crate::{
         tensor::create_causal_mask,
     },
     runtime::attention::AttentionPolicy,
-    runtime::cache::{
-        residency::{
-            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-        },
-        KeyValueCache,
-    },
+    runtime::cache::{residency::PagedCacheOptions, KeyValueCache},
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
@@ -2578,7 +2577,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout,
         })

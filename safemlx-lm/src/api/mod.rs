@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
+use crate::core::cache::{
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 pub(crate) use crate::nn as common;
 use crate::nn::generation::CausalLm;
 use crate::runtime::chat::constraints::ConstraintCompiler;
@@ -54,11 +59,7 @@ use crate::{
     core::cache::{CacheResidencyPool, LayerCachePolicy},
     error::Error,
     runtime::attention::LayerSchedule,
-    runtime::cache::residency::{
-        validate_prompt_cache_model_identity, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions,
-    },
+    runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::generation::speculative::{
         DrafterKind, LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind,

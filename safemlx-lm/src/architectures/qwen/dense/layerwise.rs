@@ -18,6 +18,11 @@ use safemlx::{
 };
 
 use super::{self as resident, DecoderConfig, Experts, FeedForward, TransformerBlock};
+use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::{
@@ -40,10 +45,7 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    runtime::cache::residency::{
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-    },
+    runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
     runtime::cache::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     },
@@ -1419,7 +1421,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout,
         })

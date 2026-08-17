@@ -12,6 +12,11 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::{
@@ -36,8 +41,7 @@ use crate::{
     },
     runtime::cache::residency::{
         open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheTopology,
+        PagedCacheOptions,
     },
     runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     runtime::checkpoint::binding::{build_module_bindings, populate_module_from_lease},
@@ -851,7 +855,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout,
         })

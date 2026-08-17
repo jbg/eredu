@@ -36,7 +36,10 @@ Core owns concepts whose meaning does not depend on tensor representation:
   reservation ownership, occupancy reports, and high-water accounting;
 - stable cache block/rank identity, logical tier vocabulary,
   per-layer attention-state geometry, fixed-state roles, symbolic shapes, dtype
-  families, and pure state-residency validation.
+  families, and pure state-residency validation;
+- reusable prompt-cache model/prefix identity, rank-local topology, versioned
+  manifests, stable fingerprints, catalog geometry and coverage, compatibility,
+  and safe relative-path validation.
 
 A backend owns executable models, tensor values, streams/queues, cache storage,
 sampling math, transfers, collectives, kernels, native errors, and the concrete
@@ -120,9 +123,11 @@ The current boundary leaves these components MLX-coupled:
 - concrete topology device assignment, communicator construction, collectives,
   and tensor movement;
 - per-block cache promotion/demotion ownership, mutable-tail and lease state,
-  prompt-cache manifest/catalog publication and materialization, and concrete
-  cache tensors (block identity, tier vocabulary, layer geometry,
-  fixed-state policy, and pure validation are already core-owned);
+  prompt-cache filesystem publication, safetensors payload validation and
+  materialization, and concrete cache tensors (prompt identity, topology,
+  manifests, catalogs, fingerprints, compatibility, block identity, tier
+  vocabulary, layer geometry, fixed-state policy, and pure validation are
+  already core-owned);
 - weight array/host-buffer materialization, native transfer events, retained
   source mappings, and physical-capacity queries (the corresponding ownership,
   admission, eviction, window, lease, and generation state is now in core);
@@ -158,6 +163,15 @@ Architecture modules import the canonical core contract directly. MLX manifest
 and array validation call core policy validation, symbolic shape resolution,
 and dtype-family matching; `runtime::cache::residency` does not forward these
 types.
+
+Prompt-cache identity, topology, descriptors, options, versioned manifests,
+catalog entries, fingerprints, and structural/compatibility errors likewise
+have a single definition in core. Architecture implementations construct those
+types directly. The MLX adapter converts `ParallelTopology` to the portable
+rank description and owns only arrays, mapped shard storage, payload hashes,
+safetensors I/O, and atomic filesystem publication. It invokes core validation
+before accepting or publishing a catalog; there is no facade copy of the
+catalog validator or its error taxonomy.
 
 The neutral scheduler in core now owns both production single-rank realtime and
 distributed pipeline request lifecycles. Queueing, fairness, deadlines,

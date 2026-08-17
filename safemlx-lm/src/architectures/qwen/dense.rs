@@ -22,6 +22,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+pub use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 pub use crate::nn::generation::sample;
 
 use crate::{
@@ -50,8 +54,7 @@ use crate::{
     runtime::cache::{
         residency::{
             open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            CacheResidencyManager, PromptCacheDescriptor, PromptCacheManifest,
-            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
+            CacheResidencyManager, PromptCacheSnapshotBlock,
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
@@ -3871,9 +3874,7 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_qwen2_ordinary_save_drop_reload_preserves_distinct_windows() {
-        use crate::runtime::cache::residency::{
-            PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-        };
+        use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
 
         let context =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
@@ -3979,9 +3980,9 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_qwen2_paged_save_drop_reload_preserves_distinct_windows() {
-        use crate::runtime::cache::residency::{
-            CacheResidencyManager, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
-            PromptCacheTopology,
+        use crate::{
+            core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
+            runtime::cache::residency::{CacheResidencyManager, PagedCacheOptions},
         };
 
         let context =

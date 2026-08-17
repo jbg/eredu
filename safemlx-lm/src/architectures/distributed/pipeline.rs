@@ -43,6 +43,11 @@ use safemlx_lm_core::scheduler::{
     SemanticStateTransaction, TransitionOutput, WorkDescriptor, WorkId,
 };
 
+use crate::core::cache::{
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
@@ -83,10 +88,8 @@ use crate::{
         tensor::create_causal_mask,
     },
     runtime::cache::residency::{
-        load_prompt_cache_state_tensors, open_prompt_cache, validate_prompt_cache_model_identity,
-        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheStateArray, PromptCacheTopology,
+        load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheStateArray,
     },
     runtime::cache::{
         CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -3840,7 +3843,7 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         };
         crate::architectures::deepseek_v4::model::prompt_cache_model_identity_for_range(
             &self.args,
-            PromptCacheTopology::for_parallel_topology(topology),
+            crate::backend::mlx::cache::prompt_cache_topology(topology),
             range,
         )
     }

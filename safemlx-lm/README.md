@@ -76,9 +76,11 @@ Aggregate live-cache admission is also canonical core state: the MLX pager
 registers each cache session with `CacheResidencyPool` and holds core RAII
 reservations while device/host transfers or disk writes own resources.
 Stable cache block identities, logical tiers, layer geometry, and
-fixed-state policies are also canonical core contracts. MLX cache code imports
-them directly and supplies only tensor storage, transfers, exact events, and
-persistence I/O.
+fixed-state policies are also canonical core contracts. The same is true of
+prompt-cache model/prefix identity, topology, versioned manifests,
+fingerprinting, compatibility, and catalog validation. MLX cache code imports
+them directly and supplies only tensor storage, transfers, exact events,
+safetensors payload verification, and filesystem publication.
 
 ## Automatic execution planning
 

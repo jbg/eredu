@@ -72,4 +72,16 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::StateTensorPolicy>(),
         TypeId::of::<safemlx_lm::core::cache::StateTensorPolicy>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::PromptCacheDescriptor>(),
+        TypeId::of::<safemlx_lm::core::cache::PromptCacheDescriptor>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::PromptCacheManifest>(),
+        TypeId::of::<safemlx_lm::core::cache::PromptCacheManifest>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::PromptCacheTopology>(),
+        TypeId::of::<safemlx_lm::core::cache::PromptCacheTopology>(),
+    );
 }

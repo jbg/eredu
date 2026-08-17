@@ -2935,11 +2935,13 @@ mod tests {
         SlidingKeyValueCache,
     };
     use crate::{
-        core::cache::{CacheRankIdentity, CacheRepresentation},
+        core::cache::{
+            CacheRankIdentity, CacheRepresentation, PromptCacheDescriptor,
+            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        },
         runtime::cache::residency::{
             inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheResidencyManager,
-            PagedCacheOptions, PromptCacheDescriptor, PromptCacheModelIdentity, PromptCacheOptions,
-            PromptCacheTopology,
+            PagedCacheOptions,
         },
     };
     use safemlx::{

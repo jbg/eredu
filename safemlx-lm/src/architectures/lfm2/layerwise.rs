@@ -16,6 +16,11 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::moe::PackedSwiGluExperts,
@@ -37,10 +42,7 @@ use crate::{
         tensor::{create_attention_mask, AttentionMask},
     },
     runtime::cache::{
-        residency::{
-            CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-        },
+        residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
         KeyValueCache,
     },
     runtime::checkpoint::binding::{
@@ -1111,7 +1113,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout: resident::prompt_cache_layer_layout_with_geometry(&self.args, &geometry)
                 .map_err(|error| Exception::custom(error.to_string()))?,

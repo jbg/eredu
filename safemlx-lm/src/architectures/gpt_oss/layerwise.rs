@@ -16,6 +16,11 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::core::cache::{
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::{self, generation::CausalLm},
@@ -28,9 +33,7 @@ use crate::{
         VocabParallelLmHead,
     },
     runtime::cache::residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
-        CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
     },
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
@@ -1009,7 +1012,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout: PromptCacheModelIdentity::key_value_layouts(
                 self.args

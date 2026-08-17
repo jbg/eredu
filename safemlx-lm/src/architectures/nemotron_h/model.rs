@@ -25,6 +25,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+use crate::core::cache::{
+    derive_prompt_cache_architecture_fingerprint, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 use crate::{
     api::{
         common::{
@@ -47,11 +52,9 @@ use crate::{
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
         residency::{
-            derive_prompt_cache_architecture_fingerprint, load_prompt_cache_state_tensors,
-            open_prompt_cache, save_prompt_cache_snapshot, CacheBlockArrays, CacheResidencyManager,
-            CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-            PromptCacheSnapshotBlock, PromptCacheStateArray,
+            load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
+            CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+            PagedCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
@@ -5448,9 +5451,9 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn heterogeneous_live_paging_matches_resident_mamba_and_attention() {
-        use crate::runtime::cache::residency::{
-            CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
-            PromptCacheTopology,
+        use crate::{
+            core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
+            runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
         };
 
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
@@ -5676,11 +5679,12 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_nemotron_h_save_drop_paged_reload_continue_matches_uninterrupted() {
-        use crate::runtime::{
-            cache::residency::{
-                PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+        use crate::{
+            core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
+            runtime::{
+                cache::residency::PagedCacheOptions,
+                media::input::{InputPart, ModelInput as RuntimeModelInput},
             },
-            media::input::{InputPart, ModelInput as RuntimeModelInput},
         };
 
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));

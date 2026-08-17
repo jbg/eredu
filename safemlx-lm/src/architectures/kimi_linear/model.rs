@@ -21,6 +21,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+use crate::core::cache::{
+    derive_prompt_cache_architecture_fingerprint, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 use crate::{
     api::{
         input as runtime_input,
@@ -51,11 +56,9 @@ use crate::{
         attention::{AttentionPolicy, LayerSchedule},
         cache::{
             residency::{
-                derive_prompt_cache_architecture_fingerprint, load_prompt_cache_state_tensors,
-                open_prompt_cache, save_prompt_cache_snapshot, CacheBlockArrays,
-                CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-                PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-                PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
+                load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
+                CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy,
+                CacheResidencyReport, PagedCacheOptions, PromptCacheSnapshotBlock,
                 PromptCacheStateArray,
             },
             CompressedLatentCache,
@@ -3628,9 +3631,7 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_kda_mla_save_drop_reload_continue_matches_uninterrupted() {
-        use crate::runtime::cache::residency::{
-            PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-        };
+        use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
 
         let args = model_args_from_config_value(&config()).unwrap();
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));

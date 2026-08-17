@@ -1,5 +1,7 @@
 //! MLX backend adapter.
 
+/// Prompt-cache topology conversion for MLX distributed execution.
+pub(crate) mod cache;
 /// Distributed scheduler consensus over MLX collectives.
 pub mod consensus;
 /// MLX allocator observations for neutral residency telemetry.

@@ -48,7 +48,7 @@ safetensors = "0.8"
 memmap2 = "0.9"
 tempfile.workspace = true
 half.workspace = true
-sha2 = "0.11"
+sha2.workspace = true
 llguidance = { version = "=1.7.6", default-features = false, features = ["ahash", "lark"] }
 toktrie_hf_tokenizers = "=1.7.6"
 libc = "0.2"

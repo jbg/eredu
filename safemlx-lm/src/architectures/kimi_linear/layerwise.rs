@@ -11,6 +11,11 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::input,
     error::Error,
@@ -27,10 +32,7 @@ use crate::{
         tensor::create_causal_mask,
     },
     runtime::{
-        cache::residency::{
-            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-        },
+        cache::residency::PagedCacheOptions,
         checkpoint::{
             binding::{
                 build_module_bindings_with_recipes, canonical_checkpoint_name,
@@ -1225,7 +1227,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout: resident::prompt_cache_layer_layout_with_geometry(&self.args, &geometry)
                 .map_err(|error| Exception::custom(error.to_string()))?,

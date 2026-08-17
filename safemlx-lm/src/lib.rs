@@ -50,9 +50,7 @@ pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError}
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyError,
     CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, LiveCacheDiskPolicy,
-    PagedCacheOptions, PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest,
-    PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology,
-    CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+    PagedCacheOptions, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 pub use runtime::cache::PagedKeyValueCache;
 pub use runtime::distributed::cartesian::CartesianExecution;
@@ -80,9 +78,11 @@ pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheRe
 pub use safemlx_lm_core::cache::{
     CacheBlockId, CachePolicyError, CachePoolError, CachePoolLimits, CachePoolReport,
     CachePoolResource, CacheRankIdentity, CacheRepresentation, CacheResidencyPool, CacheTier,
-    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateResidencyClass,
+    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, PromptCacheBlock,
+    PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
+    PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass,
     StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-    StateTensorPresence, StateTensorRole,
+    StateTensorPresence, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
 };
 pub use safemlx_lm_core::residency::{
     AllocatorMemoryMetrics, CacheEvictionPolicy, EvictionMetrics, MemoryTier, OffloadConfig,

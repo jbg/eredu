@@ -19,6 +19,11 @@ use safemlx::{
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
+use crate::core::cache::{
+    derive_prompt_cache_architecture_fingerprint, validate_prompt_cache_model_identity,
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+};
+
 use crate::{
     api::{common, common::generation::CausalLm, input},
     architectures::qwen::dense::gguf_string,
@@ -29,10 +34,8 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     runtime::cache::residency::{
-        derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
-        validate_prompt_cache_model_identity, CacheResidencyManager, CacheResidencyPolicy,
-        CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-        PromptCacheModelIdentity,
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions,
     },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
@@ -1324,10 +1327,10 @@ impl Cache {
     pub fn save_prompt_cache(
         &mut self,
         destination: impl AsRef<Path>,
-        descriptor: crate::runtime::cache::residency::PromptCacheDescriptor,
+        descriptor: crate::core::cache::PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        options: &crate::runtime::cache::residency::PromptCacheOptions,
-    ) -> Result<crate::runtime::cache::residency::PromptCacheManifest, Exception> {
+        options: &crate::core::cache::PromptCacheOptions,
+    ) -> Result<crate::core::cache::PromptCacheManifest, Exception> {
         let mut manager = None;
         for layer in &mut self.layers {
             if let LayerCache::Paged(cache) = layer {

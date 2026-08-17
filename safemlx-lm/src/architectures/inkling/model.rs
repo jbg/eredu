@@ -29,6 +29,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+use crate::core::cache::{
+    derive_prompt_cache_architecture_fingerprint, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 use crate::{
     api::{
         common::{
@@ -48,10 +53,9 @@ use crate::{
     error::Error,
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::residency::{
-        derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-        save_prompt_cache_snapshot, CacheBlockArrays, CacheResidencyManager, CacheResidencyReport,
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
+        open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
+        CacheResidencyManager, CacheResidencyReport, PagedCacheOptions, PromptCacheSnapshotBlock,
+        PromptCacheStateArray,
     },
     runtime::cache::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -5103,12 +5107,8 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_paged_multimodal_convolution_state_save_reload_parity() {
-        use crate::runtime::cache::{
-            residency::{
-                PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-            },
-            KeyValueCache,
-        };
+        use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
+        use crate::runtime::cache::{residency::PagedCacheOptions, KeyValueCache};
 
         let args = super::args_from_gguf_catalog(&tiny_gguf_metadata()).unwrap();
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));

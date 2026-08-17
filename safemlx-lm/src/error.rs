@@ -23,6 +23,10 @@ pub enum Error {
     #[error(transparent)]
     CachePolicy(#[from] safemlx_lm_core::cache::CachePolicyError),
 
+    /// Invalid reusable prompt-cache identity, schema, or catalog.
+    #[error(transparent)]
+    PromptCache(#[from] safemlx_lm_core::cache::PromptCacheError),
+
     /// Invalid dense disk streaming configuration or background work.
     #[error(transparent)]
     DenseStream(#[from] crate::runtime::residency::dense_stream::DenseStreamError),

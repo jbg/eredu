@@ -25,6 +25,11 @@ pub use super::vision::{
     QwenVisionTransformer, VisionAttentionPolicy, VisionConfig, VisionLayerPolicy,
 };
 
+use crate::core::cache::{
+    derive_prompt_cache_architecture_fingerprint, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 use crate::{
     api::{
         common::{self, attention::AttentionInput, generation::CausalLm},
@@ -41,9 +46,7 @@ use crate::{
     runtime::attention::LayerSchedule,
     runtime::cache::{
         residency::{
-            derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, PromptCacheDescriptor,
-            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
             PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache,
@@ -1745,10 +1748,8 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_multimodal_position_state_save_reload_parity() {
-        use crate::runtime::cache::{
-            residency::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
-            KeyValueCache,
-        };
+        use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
+        use crate::runtime::cache::KeyValueCache;
 
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();

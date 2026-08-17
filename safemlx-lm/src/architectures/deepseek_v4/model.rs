@@ -25,6 +25,12 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::core::cache::{
+    derive_prompt_cache_architecture_fingerprint, validate_prompt_cache_model_identity,
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::{
         input as runtime_input,
@@ -41,11 +47,9 @@ use crate::{
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::residency::{
-        derive_prompt_cache_architecture_fingerprint, load_prompt_cache_state_tensors,
-        open_prompt_cache, save_prompt_cache_snapshot, validate_prompt_cache_model_identity,
+        load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
         CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheTopology,
+        PagedCacheOptions, PromptCacheSnapshotBlock,
     },
     runtime::checkpoint::load::{
         gguf_quantization_configs,
@@ -2558,12 +2562,8 @@ mod tests {
         prompt_cache_model_identity_for_range, save_prompt_cache_with_rank, AttentionCache, Cache,
         ModelArgs,
     };
-    use crate::runtime::cache::{
-        residency::{
-            PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-        },
-        KeyValueCache, PoolingCache,
-    };
+    use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
+    use crate::runtime::cache::{residency::PagedCacheOptions, KeyValueCache, PoolingCache};
     use safemlx::{ops::zeros_dtype, Device, DeviceType, Dtype, Stream};
     use serde_json::json;
     use tempfile::TempDir;

@@ -16,15 +16,17 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::input,
     error::Error,
     nn::generation::CausalLm,
     runtime::{
-        cache::residency::{
-            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-        },
+        cache::residency::PagedCacheOptions,
         checkpoint::{
             binding::{
                 build_module_bindings_with_recipes, populate_module_from_lease,
@@ -913,7 +915,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
             &self.args,
             topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
         )
     }

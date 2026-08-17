@@ -40,6 +40,11 @@ use super::{
     multimodal::Gemma4ModalityEmbedder,
     vision::{Gemma4VisionConfig, Gemma4VisionTower},
 };
+pub use crate::core::cache::{
+    derive_prompt_cache_architecture_fingerprint, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 pub use crate::nn::generation::sample;
 
 use crate::{
@@ -66,9 +71,7 @@ use crate::{
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
         residency::{
-            derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, PromptCacheDescriptor,
-            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
             PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache,
@@ -7145,10 +7148,8 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_multimodal_prefix_embedding_save_reload_parity() {
-        use crate::runtime::cache::{
-            residency::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
-            KeyValueCache,
-        };
+        use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
+        use crate::runtime::cache::KeyValueCache;
 
         let stream = test_stream();
         let args = model_args(false);

@@ -15,6 +15,11 @@ use safemlx::{
     Array, Stream,
 };
 
+use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
@@ -35,10 +40,7 @@ use crate::{
         parallel::{VocabParallelEmbedding, VocabParallelLmHead},
         tensor::{create_attention_mask, AttentionMask},
     },
-    runtime::cache::residency::{
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-    },
+    runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
         canonical_checkpoint_name, populate_module_from_lease,
@@ -3330,7 +3332,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout,
         })

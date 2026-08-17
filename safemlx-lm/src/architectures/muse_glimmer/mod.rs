@@ -30,6 +30,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+pub use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 pub use crate::nn::generation::sample;
 
 use crate::{
@@ -57,8 +61,7 @@ use crate::{
     runtime::cache::{
         residency::{
             open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            CacheResidencyManager, PromptCacheDescriptor, PromptCacheManifest,
-            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
+            CacheResidencyManager, PromptCacheSnapshotBlock,
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },

@@ -14,16 +14,18 @@ use std::{
 
 use safemlx::{module::ModuleParameters, transforms::async_eval_with_event, Array, Event, Stream};
 
+use crate::core::cache::{
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 use crate::{
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
         ResidencyLedgerError, ResidencyPolicy, TransferDirection,
     },
     error::Error,
-    runtime::cache::residency::{
-        validate_prompt_cache_model_identity, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-    },
+    runtime::cache::residency::PagedCacheOptions,
     runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, is_materialized_module_parameter,
         populate_module_from_lease, ModuleBindingError,
@@ -2920,7 +2922,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         &self,
     ) -> Option<crate::core::cache::CacheRankIdentity> {
         self.parallel_topology
-            .map(PromptCacheTopology::for_parallel_topology)
+            .map(crate::backend::mlx::cache::prompt_cache_topology)
             .and_then(|topology| topology.cache_rank_identity())
     }
 

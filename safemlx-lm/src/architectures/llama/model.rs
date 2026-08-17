@@ -35,6 +35,7 @@ use crate::{
         },
         input,
     },
+    core::cache::derive_prompt_cache_architecture_fingerprint,
     error::Error,
     nn::tensor::{
         create_attention_mask,
@@ -49,7 +50,6 @@ use crate::{
     runtime::execution::inspection::ActivationObserver,
     runtime::{
         attention::{AttentionPolicy, LayerSchedule},
-        cache::residency::derive_prompt_cache_architecture_fingerprint,
         cache::{ConcatKeyValueCache, KeyValueCache},
     },
 };

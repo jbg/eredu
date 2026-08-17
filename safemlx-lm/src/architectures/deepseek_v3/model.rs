@@ -29,6 +29,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+use crate::core::cache::{
+    derive_prompt_cache_architecture_fingerprint, validate_prompt_cache_model_identity,
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+};
+
 use crate::nn as common;
 use crate::{
     api::{
@@ -50,10 +55,8 @@ use crate::{
     },
     runtime::attention::LayerSchedule,
     runtime::cache::residency::{
-        derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
-        validate_prompt_cache_model_identity, CacheBlockArrays, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        open_prompt_cache, CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy,
+        CacheResidencyReport, PagedCacheOptions,
     },
     runtime::cache::{
         BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock,

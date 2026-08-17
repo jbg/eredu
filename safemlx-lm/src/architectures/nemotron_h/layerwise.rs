@@ -17,6 +17,11 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
+};
+
 use crate::{
     api::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
@@ -35,10 +40,7 @@ use crate::{
         tensor::{create_attention_mask, AttentionMask},
     },
     runtime::cache::{
-        residency::{
-            CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-        },
+        residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
         KeyValueCache,
     },
     runtime::checkpoint::binding::{
@@ -2307,7 +2309,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
             layer_prefix_offsets: vec![0; layer_count],
             topology: topology.map_or_else(
                 PromptCacheTopology::default,
-                PromptCacheTopology::for_parallel_topology,
+                crate::backend::mlx::cache::prompt_cache_topology,
             ),
             layer_layout,
         })
@@ -3293,10 +3295,11 @@ mod tests {
         architectures::nemotron_h::model::{
             self as resident, Cache, LayerCache, LayerPolicy, Model, ModelArgs, ModelInput,
         },
-        core::residency::{OffloadConfig, ResidencyPolicy},
-        runtime::cache::residency::{
-            CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
+        core::{
+            cache::{PromptCacheDescriptor, PromptCacheOptions},
+            residency::{OffloadConfig, ResidencyPolicy},
         },
+        runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
         runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch},
         runtime::{
             cache::KeyValueCache,
