@@ -29,10 +29,10 @@ use safemlx_lm::{
     runtime::generation::sampler::DefaultSampler,
     runtime::media::input::{InputMetadata, InputPart, ModelInput},
     runtime::media::PreparedModelInput,
-    CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
-    LayerwiseLoadOptions, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions,
-    ParallelTopology, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, RequestId,
-    RequestStatus, SchedulerLimits, WeightResidency,
+    DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions, LayerwiseLoadOptions,
+    MlxBackend, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions, ParallelTopology,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, RequestId, RequestStatus,
+    SchedulerLimits, WeightResidency,
 };
 
 const WORKER: &str = "SAFEMLX_QWEN3_VL_PIPELINE_WORKER";
@@ -477,9 +477,9 @@ fn qwen3_vl_pipeline_ring_worker() {
             .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
-    let cartesian = axes
-        .as_ref()
-        .map(|_| CartesianExecution::new(topology, Some(2), moe.then_some(4), &group).unwrap());
+    let execution = MlxBackend::new(&stream)
+        .distributed(topology, &group)
+        .unwrap();
     let streamed = std::env::var_os(STREAMED).is_some();
     let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();
     let expert_cache = std::env::var_os(EXPERT_CACHE).is_some();
@@ -550,14 +550,7 @@ fn qwen3_vl_pipeline_ring_worker() {
             work.with_prepared_input_identity(identity)
         };
         scheduler.enqueue(work).unwrap();
-        let error = match &cartesian {
-            Some(cartesian) => scheduler
-                .run_queued_cartesian(&mut model, cartesian, &stream)
-                .unwrap_err(),
-            None => scheduler
-                .run_queued(&mut model, &group, &stream)
-                .unwrap_err(),
-        };
+        let error = scheduler.run_queued(&mut model, &execution).unwrap_err();
         assert!(error.to_string().contains("work descriptors differ"));
         assert!(scheduler.report().poisoned);
         assert_eq!(
@@ -604,12 +597,7 @@ fn qwen3_vl_pipeline_ring_worker() {
     scheduler.enqueue(work).unwrap();
     let mut completed = Vec::new();
     for _ in 0..64 {
-        completed.extend(match &cartesian {
-            Some(cartesian) => scheduler
-                .run_queued_cartesian(&mut model, cartesian, &stream)
-                .unwrap(),
-            None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
-        });
+        completed.extend(scheduler.run_queued(&mut model, &execution).unwrap());
         if !completed.is_empty() {
             break;
         }
@@ -627,8 +615,7 @@ fn qwen3_vl_pipeline_ring_worker() {
             0.0,
             None,
             false,
-            &group,
-            &stream,
+            &execution,
         )
         .unwrap();
     assert_eq!(synchronized.token.shape(), &[1, 1]);
@@ -696,24 +683,13 @@ fn qwen3_vl_pipeline_ring_worker() {
     let decode =
         |model: &mut safemlx_lm::architectures::distributed::pipeline::PipelineModel,
          cache: &mut safemlx_lm::architectures::distributed::pipeline::PipelineCache| {
-            match &cartesian {
-                Some(cartesian) => model.forward_cartesian(
-                    (topology.pipeline_parallel_rank == 0).then_some(&token),
-                    PipelineStep::new(1, 1).unwrap(),
-                    None,
-                    cache,
-                    cartesian,
-                    &stream,
-                ),
-                None => model.forward_pipeline(
-                    (topology.pipeline_parallel_rank == 0).then_some(&token),
-                    PipelineStep::new(1, 1).unwrap(),
-                    None,
-                    cache,
-                    &group,
-                    &stream,
-                ),
-            }
+            model.forward_distributed(
+                (topology.pipeline_parallel_rank == 0).then_some(&token),
+                PipelineStep::new(1, 1).unwrap(),
+                None,
+                cache,
+                &execution,
+            )
         };
     let uninterrupted = decode(&mut model, &mut cache)
         .unwrap()

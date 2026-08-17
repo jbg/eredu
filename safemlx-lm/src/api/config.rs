@@ -135,10 +135,10 @@ pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Resul
                     .into()
             } else {
                 if topology.pipeline_parallel_size > 1 {
-                    "Cartesian pipeline topology cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options and PipelineModel::forward_cartesian"
+                    "Cartesian pipeline topology cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options and PipelineModel::forward_distributed"
                         .into()
                 } else {
-                    "Cartesian TP+EP topology cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options and ExpertParallelModel::forward_cartesian"
+                    "Cartesian TP+EP topology cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options and ExpertParallelModel::forward_distributed"
                         .into()
                 }
             },

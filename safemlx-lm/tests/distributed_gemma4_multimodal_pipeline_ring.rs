@@ -30,7 +30,7 @@ use safemlx_lm::{
         input::{InputMetadata, InputPart, ModelInput},
         PreparedModelInput,
     },
-    CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions,
+    DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions, MlxBackend,
     ModelLoadOptions, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology, RequestId, SchedulerLimits, WeightResidency,
 };
@@ -697,9 +697,9 @@ fn gemma4_multimodal_pipeline_ring_worker() {
         &stream,
     )
     .unwrap();
-    let cartesian = (tp > 1 || ep > 1).then(|| {
-        CartesianExecution::new(topology, Some(2), (ep > 1).then_some(4), &group).unwrap()
-    });
+    let execution = MlxBackend::new(&stream)
+        .distributed(topology, &group)
+        .unwrap();
     assert_eq!(
         model.stage_info().global_layer_range,
         topology.pipeline_parallel_rank..topology.pipeline_parallel_rank + 1
@@ -765,12 +765,7 @@ fn gemma4_multimodal_pipeline_ring_worker() {
         .unwrap();
     let mut completed = Vec::new();
     for _ in 0..64 {
-        completed.extend(match &cartesian {
-            Some(cartesian) => scheduler
-                .run_queued_cartesian(&mut model, cartesian, &stream)
-                .unwrap(),
-            None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
-        });
+        completed.extend(scheduler.run_queued(&mut model, &execution).unwrap());
         if !completed.is_empty() {
             break;
         }
@@ -848,61 +843,31 @@ fn gemma4_multimodal_pipeline_ring_worker() {
         .unwrap();
 
     let token = Array::from_slice(&[3u32], &[1, 1]);
-    let decoded = match &cartesian {
-        Some(cartesian) => model
-            .forward_cartesian(
-                model.stage_info().is_first.then_some(&token),
-                PipelineStep::new(1, 1).unwrap(),
-                None,
-                &mut cache,
-                cartesian,
-                &stream,
-            )
-            .unwrap()
-            .into_logits()
-            .unwrap(),
-        None => model
-            .forward_pipeline(
-                model.stage_info().is_first.then_some(&token),
-                PipelineStep::new(1, 1).unwrap(),
-                None,
-                &mut cache,
-                &group,
-                &stream,
-            )
-            .unwrap()
-            .into_logits()
-            .unwrap(),
-    };
+    let decoded = model
+        .forward_distributed(
+            model.stage_info().is_first.then_some(&token),
+            PipelineStep::new(1, 1).unwrap(),
+            None,
+            &mut cache,
+            &execution,
+        )
+        .unwrap()
+        .into_logits()
+        .unwrap();
     let (mut restored_cache, _) = model
         .load_prompt_cache(&cache_root, &descriptor, &prefix_ids, paged, &stream)
         .unwrap();
-    let restored = match &cartesian {
-        Some(cartesian) => model
-            .forward_cartesian(
-                model.stage_info().is_first.then_some(&token),
-                PipelineStep::new(1, 1).unwrap(),
-                None,
-                &mut restored_cache,
-                cartesian,
-                &stream,
-            )
-            .unwrap()
-            .into_logits()
-            .unwrap(),
-        None => model
-            .forward_pipeline(
-                model.stage_info().is_first.then_some(&token),
-                PipelineStep::new(1, 1).unwrap(),
-                None,
-                &mut restored_cache,
-                &group,
-                &stream,
-            )
-            .unwrap()
-            .into_logits()
-            .unwrap(),
-    };
+    let restored = model
+        .forward_distributed(
+            model.stage_info().is_first.then_some(&token),
+            PipelineStep::new(1, 1).unwrap(),
+            None,
+            &mut restored_cache,
+            &execution,
+        )
+        .unwrap()
+        .into_logits()
+        .unwrap();
     match (&decoded, &restored) {
         (Some(decoded), Some(restored)) => assert_close(decoded, restored, &stream),
         (None, None) => {}

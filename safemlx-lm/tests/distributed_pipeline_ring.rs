@@ -39,8 +39,8 @@ use safemlx_lm::{
         checkpoint::quantization::{AffineQuantization, WeightQuantization},
         media::{input::InputPayload, PreparedModelInput},
     },
-    CacheResidencyPolicy, CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment,
-    ExpertCacheLoadOptions, LayerwiseLoadOptions, ModelLoadOptions, MtpConfig,
+    CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
+    LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, ModelLoadOptions, MtpConfig,
     NonExpertWeightResidency, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology, RequestId, RequestStatus, SchedulerLimits,
     WeightResidency,
@@ -328,38 +328,10 @@ fn pipeline_ring_worker() {
     .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let pipeline_rank = topology.pipeline_parallel_rank;
-    let cartesian = cartesian_axes.as_ref().map(|_| {
-        CartesianExecution::new(
-            topology,
-            Some(family.layer_count()),
-            matches!(
-                family,
-                FixtureFamily::DeepSeek
-                    | FixtureFamily::DeepSeekGguf
-                    | FixtureFamily::Inkling
-                    | FixtureFamily::InklingMultimodal
-                    | FixtureFamily::InklingGguf
-                    | FixtureFamily::KimiLinear
-                    | FixtureFamily::KimiLinearGguf
-                    | FixtureFamily::Lfm2Moe
-                    | FixtureFamily::Lfm2MoeGguf
-                    | FixtureFamily::NemotronH
-                    | FixtureFamily::NemotronHGguf
-                    | FixtureFamily::Qwen3NextMoe
-                    | FixtureFamily::Qwen35Moe
-                    | FixtureFamily::Qwen35MoeMultimodal
-                    | FixtureFamily::Qwen3Moe
-                    | FixtureFamily::Qwen3MoeTied
-                    | FixtureFamily::Qwen3MoeGguf
-                    | FixtureFamily::GptOss
-                    | FixtureFamily::GptOssGguf
-            )
-            .then_some(2),
-            &group,
-        )
-        .unwrap()
-    });
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let execution = MlxBackend::new(&stream)
+        .distributed(topology, &group)
+        .unwrap();
     let reference = (pipeline_rank == 1
         && (family.needs_resident_reference()
             || matches!(family, FixtureFamily::Lfm2 | FixtureFamily::Lfm2Moe)))
@@ -615,11 +587,11 @@ fn pipeline_ring_worker() {
     }
 
     if std::env::var_os(MICROBATCH).is_some() {
-        run_microbatch_worker(&mut model, expected_rank, &group, &stream);
+        run_microbatch_worker(&mut model, expected_rank, &execution);
         return;
     }
     if std::env::var_os(SCHEDULE_MISMATCH).is_some() {
-        run_schedule_mismatch_worker(&mut model, expected_rank, &group, &stream);
+        run_schedule_mismatch_worker(&mut model, expected_rank, &execution);
         return;
     }
 
@@ -669,12 +641,7 @@ fn pipeline_ring_worker() {
             .unwrap();
         let mut completed = Vec::new();
         for _ in 0..64 {
-            completed.extend(match cartesian.as_ref() {
-                Some(cartesian) => scheduler
-                    .run_queued_cartesian(&mut model, cartesian, &stream)
-                    .unwrap(),
-                None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
-            });
+            completed.extend(scheduler.run_queued(&mut model, &execution).unwrap());
             if !completed.is_empty() {
                 break;
             }
@@ -690,9 +657,7 @@ fn pipeline_ring_worker() {
             (pipeline_rank == 0).then_some(&prompt),
             PipelineStep::new(1, prompt_length).unwrap(),
             &mut cache,
-            &group,
-            cartesian.as_ref(),
-            &stream,
+            &execution,
         )
     };
     assert_eq!(logits.is_some(), pipeline_rank == 1);
@@ -740,9 +705,7 @@ fn pipeline_ring_worker() {
         (pipeline_rank == 0).then_some(&token),
         PipelineStep::new(1, 1).unwrap(),
         &mut cache,
-        &group,
-        cartesian.as_ref(),
-        &stream,
+        &execution,
     );
     let uninterrupted_values = uninterrupted.as_ref().map(|value| {
         let value = value.evaluated().unwrap();
@@ -761,9 +724,7 @@ fn pipeline_ring_worker() {
         (pipeline_rank == 0).then_some(&token),
         PipelineStep::new(1, 1).unwrap(),
         &mut cache,
-        &group,
-        cartesian.as_ref(),
-        &stream,
+        &execution,
     );
     match (&uninterrupted_values, &restored) {
         (Some(uninterrupted), Some(restored)) => {
@@ -785,8 +746,7 @@ fn pipeline_ring_worker() {
                 0.0,
                 None,
                 false,
-                &group,
-                &stream,
+                &execution,
             )
             .unwrap();
         let token = synchronized.token.evaluated().unwrap();
@@ -813,9 +773,7 @@ fn pipeline_ring_worker() {
             (pipeline_rank == 0).then_some(&synchronized.token),
             PipelineStep::new(1, 1).unwrap(),
             &mut cache,
-            &group,
-            cartesian.as_ref(),
-            &stream,
+            &execution,
         );
     }
     if dense_stream {
@@ -866,21 +824,11 @@ fn pipeline_ring_worker() {
             model.stage_info().embedded_mtp_layers,
             usize::from(pipeline_rank == 1)
         );
-        let owned_execution;
-        let execution = match cartesian.as_ref() {
-            Some(execution) => execution,
-            None => {
-                owned_execution =
-                    CartesianExecution::new(topology, Some(family.layer_count()), None, &group)
-                        .unwrap();
-                &owned_execution
-            }
-        };
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
         let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let mut mtp_cache = model.new_cache().unwrap();
         let (generated, stats) = model
-            .generate_embedded_mtp_cartesian(
+            .generate_embedded_mtp_distributed(
                 &mut mtp_cache,
                 safemlx_lm::runtime::media::input::ModelInput::new(&parts),
                 &MtpConfig {
@@ -891,8 +839,7 @@ fn pipeline_ring_worker() {
                 },
                 None,
                 &mut DefaultSampler,
-                execution,
-                &stream,
+                &execution,
             )
             .unwrap();
         assert_eq!(generated.len(), 3);
@@ -1040,22 +987,13 @@ fn forward_pipeline_model(
     tokens: Option<&Array>,
     step: PipelineStep,
     cache: &mut safemlx_lm::architectures::distributed::pipeline::PipelineCache,
-    group: &safemlx::distributed::Group,
-    cartesian: Option<&CartesianExecution<'_>>,
-    stream: &Stream,
+    execution: &MlxDistributedSession<'_>,
 ) -> Option<Array> {
-    match cartesian {
-        Some(cartesian) => model
-            .forward_cartesian(tokens, step, None, cache, cartesian, stream)
-            .unwrap()
-            .into_logits()
-            .unwrap(),
-        None => model
-            .forward_pipeline(tokens, step, None, cache, group, stream)
-            .unwrap()
-            .into_logits()
-            .unwrap(),
-    }
+    model
+        .forward_distributed(tokens, step, None, cache, execution)
+        .unwrap()
+        .into_logits()
+        .unwrap()
 }
 
 fn assert_family_cache(
@@ -1143,8 +1081,7 @@ fn assert_family_cache(
 fn run_microbatch_worker(
     model: &mut safemlx_lm::architectures::distributed::pipeline::PipelineModel,
     rank: usize,
-    group: &safemlx::distributed::Group,
-    stream: &Stream,
+    execution: &MlxDistributedSession<'_>,
 ) {
     let first_request = RequestId::new(101);
     let second_request = RequestId::new(202);
@@ -1189,13 +1126,12 @@ fn run_microbatch_worker(
             &mut second_reference_cache
         };
         let logits = model
-            .forward_pipeline(
+            .forward_distributed(
                 (rank == 0).then_some(*tokens),
                 *step,
                 None,
                 cache,
-                group,
-                stream,
+                execution,
             )
             .unwrap()
             .into_logits()
@@ -1234,7 +1170,7 @@ fn run_microbatch_worker(
     }
     let mut output = Vec::new();
     for _ in 0..16 {
-        output.extend(scheduler.run_queued(model, group, stream).unwrap());
+        output.extend(scheduler.run_queued(model, execution).unwrap());
         if output.len() == work.len() {
             break;
         }
@@ -1289,7 +1225,7 @@ fn run_microbatch_worker(
     };
     scheduler.enqueue(input).unwrap();
     scheduler
-        .cancel_request_distributed(first_request, group, stream)
+        .cancel_request_distributed(first_request, execution)
         .unwrap();
     assert_eq!(
         scheduler.request_status(first_request),
@@ -1315,19 +1251,13 @@ fn run_microbatch_worker(
         input
     };
     scheduler.enqueue(input).unwrap();
-    assert!(scheduler
-        .run_queued(model, group, stream)
-        .unwrap()
-        .is_empty());
+    assert!(scheduler.run_queued(model, execution).unwrap().is_empty());
     scheduler
-        .cancel_request_distributed(submitted_request, group, stream)
+        .cancel_request_distributed(submitted_request, execution)
         .unwrap();
     assert_eq!(scheduler.report().abandoned_in_flight_work, 1);
     for _ in 0..16 {
-        assert!(scheduler
-            .run_queued(model, group, stream)
-            .unwrap()
-            .is_empty());
+        assert!(scheduler.run_queued(model, execution).unwrap().is_empty());
         if scheduler.report().current_in_flight_work == 0 {
             break;
         }
@@ -1342,8 +1272,7 @@ fn run_microbatch_worker(
 fn run_schedule_mismatch_worker(
     model: &mut safemlx_lm::architectures::distributed::pipeline::PipelineModel,
     rank: usize,
-    group: &safemlx::distributed::Group,
-    stream: &Stream,
+    execution: &MlxDistributedSession<'_>,
 ) {
     let request = RequestId::new(if rank == 0 { 101 } else { 999 });
     let mut scheduler =
@@ -1360,7 +1289,7 @@ fn run_schedule_mismatch_worker(
         input
     };
     scheduler.enqueue(input).unwrap();
-    let error = scheduler.run_queued(model, group, stream).unwrap_err();
+    let error = scheduler.run_queued(model, execution).unwrap_err();
     assert!(error.to_string().contains("work descriptors differ"));
     assert!(scheduler.report().poisoned);
     assert_eq!(

@@ -2,8 +2,8 @@
 
 /// Prompt-cache topology conversion for MLX distributed execution.
 pub(crate) mod cache;
-/// Distributed scheduler consensus over MLX collectives.
-pub mod consensus;
+/// Session-owned MLX communicators, transfers, and collectives.
+pub mod distributed;
 mod loading;
 /// MLX allocator observations for neutral residency telemetry.
 pub mod residency;
@@ -17,12 +17,13 @@ pub(crate) use loading::{
 /// Architecture-erased model/session execution.
 mod session;
 
+pub use distributed::{MlxDistributedConfig, MlxDistributedSession};
 pub use session::{MlxGeneration, MlxModelInput, MlxModelSession};
 
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
 use safemlx_lm_core::backend::{
-    Backend, BackendCapabilities, BackendDescriptor, Completion, DeviceDescriptor, PreparedModel,
-    Submission,
+    Backend, BackendCapabilities, BackendDescriptor, Completion, DeviceDescriptor,
+    DistributedBackend, PreparedModel, Submission,
 };
 
 use crate::{
@@ -54,6 +55,15 @@ impl<'a> MlxBackend<'a> {
     /// Execution stream used by this backend instance.
     pub const fn stream(&self) -> &'a Stream {
         self.stream
+    }
+
+    /// Attaches topology-scoped MLX communication to this backend selection.
+    pub fn distributed(
+        &self,
+        topology: crate::ParallelTopology,
+        world: &'a safemlx::distributed::Group,
+    ) -> Result<MlxDistributedSession<'a>, Error> {
+        self.create_distributed_session(MlxDistributedConfig { topology, world })
     }
 }
 

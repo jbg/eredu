@@ -115,5 +115,11 @@ and exact failure retention. Core also owns protocol framing and fail-closed
 schedule, disposition, and completion agreement. Backends implement only the
 portable `ConsensusTransport` word collective.
 
+Optional distributed execution is described by `DistributedBackend` and
+`DistributedSession`. The contract uses opaque values, typed world/parallel-axis
+scopes, explicit fail-closed capabilities, high-level sum/gather/all-to-all and
+point-to-point submissions, and exact completion. It deliberately contains no
+tensor algebra, communicator, stream, native device, or runtime exception.
+
 See [the backend architecture guide](../doc/backend-architecture.md) for the
 ownership boundary and backend implementation checklist.

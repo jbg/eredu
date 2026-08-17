@@ -157,7 +157,7 @@ pub struct ParallelTopology {
 /// ranks must call [`Self::new`] in the same order. Singleton axes do not own a
 /// communication group, while an axis spanning the complete world borrows the
 /// original group without splitting it.
-pub struct ParallelCommunicators<'a> {
+pub(crate) struct ParallelCommunicators<'a> {
     topology: ParallelTopology,
     world: &'a Group,
     tensor: AxisCommunicator,
@@ -186,7 +186,7 @@ impl std::fmt::Debug for ParallelCommunicators<'_> {
 
 impl<'a> ParallelCommunicators<'a> {
     /// Validates the world group and materializes every required native subgroup.
-    pub fn new(topology: ParallelTopology, world: &'a Group) -> Result<Self, Error> {
+    pub(crate) fn new(topology: ParallelTopology, world: &'a Group) -> Result<Self, Error> {
         if world.rank() != topology.global_rank || world.size() != topology.world_size {
             return Err(Error::Parallel(format!(
                 "parallel topology expects world rank {}/{} but received {}/{}",
@@ -257,27 +257,13 @@ impl<'a> ParallelCommunicators<'a> {
         Ok(AxisCommunicator { membership, native })
     }
 
-    /// Returns the complete validated topology.
-    pub const fn topology(&self) -> ParallelTopology {
-        self.topology
-    }
-
     /// Returns the global communication group.
-    pub const fn world(&self) -> &Group {
+    pub(crate) const fn world(&self) -> &Group {
         self.world
     }
 
-    /// Returns topology membership for `axis`.
-    pub const fn membership(&self, axis: ParallelAxis) -> &SubgroupMembership {
-        match axis {
-            ParallelAxis::Tensor => &self.tensor.membership,
-            ParallelAxis::Pipeline => &self.pipeline.membership,
-            ParallelAxis::Expert => &self.expert.membership,
-        }
-    }
-
     /// Returns the native group for a non-singleton axis.
-    pub fn group(&self, axis: ParallelAxis) -> Option<&Group> {
+    pub(crate) fn group(&self, axis: ParallelAxis) -> Option<&Group> {
         let communicator = match axis {
             ParallelAxis::Tensor => &self.tensor,
             ParallelAxis::Pipeline => &self.pipeline,
@@ -293,17 +279,17 @@ impl<'a> ParallelCommunicators<'a> {
     }
 
     /// Returns the TP collective group, or `None` when TP is inactive.
-    pub fn tensor_group(&self) -> Option<&Group> {
+    pub(crate) fn tensor_group(&self) -> Option<&Group> {
         self.group(ParallelAxis::Tensor)
     }
 
     /// Returns the pipeline-lane consensus group, or `None` when PP is inactive.
-    pub fn pipeline_group(&self) -> Option<&Group> {
+    pub(crate) fn pipeline_group(&self) -> Option<&Group> {
         self.group(ParallelAxis::Pipeline)
     }
 
     /// Returns the EP exchange group, or `None` when EP is inactive.
-    pub fn expert_group(&self) -> Option<&Group> {
+    pub(crate) fn expert_group(&self) -> Option<&Group> {
         self.group(ParallelAxis::Expert)
     }
 }

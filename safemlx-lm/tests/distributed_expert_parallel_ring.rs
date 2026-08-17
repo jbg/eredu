@@ -46,7 +46,7 @@ use safemlx_lm::{
     runtime::residency::{
         dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions,
     },
-    CacheResidencyPolicy, CartesianExecution, DeviceAssignment, MtpConfig,
+    CacheResidencyPolicy, DeviceAssignment, MlxBackend, MlxDistributedSession, MtpConfig,
     NonExpertWeightResidency, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
@@ -125,16 +125,9 @@ fn forward_parallel_model(
     model: &mut ExpertParallelModel,
     tokens: &Array,
     cache: &mut ExpertParallelCache,
-    group: &safemlx::distributed::Group,
-    execution: Option<&CartesianExecution<'_>>,
-    stream: &Stream,
+    execution: &MlxDistributedSession<'_>,
 ) -> Array {
-    match execution {
-        Some(execution) => model
-            .forward_cartesian(tokens, None, cache, execution, stream)
-            .unwrap(),
-        None => model.forward(tokens, None, cache, group, stream).unwrap(),
-    }
+    model.forward(tokens, None, cache, execution).unwrap()
 }
 
 fn uses_external_expert_bank(architecture: &str) -> bool {
@@ -348,8 +341,9 @@ fn expert_parallel_model_ring_worker() {
             .map(|(name, value)| (name, value.copy(stream).unwrap()))
             .collect::<HashMap<_, _>>();
     let _profiling = profile_expert_parallel_timings();
-    let execution = tensor_expert
-        .then(|| CartesianExecution::new(topology, Some(num_layers), Some(4), &group).unwrap());
+    let execution = MlxBackend::new(&stream)
+        .distributed(topology, &group)
+        .unwrap();
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let persist_prompt = artifact_dir.join(PROMPT_CACHE_MARKER).exists();
     let paged_prompt = persist_prompt
@@ -367,14 +361,7 @@ fn expert_parallel_model_ring_worker() {
     } else {
         model.new_cache()
     };
-    let prefill = forward_parallel_model(
-        &mut model,
-        &prompt,
-        &mut cache,
-        &group,
-        execution.as_ref(),
-        stream,
-    );
+    let prefill = forward_parallel_model(&mut model, &prompt, &mut cache, &execution);
     assert_close(&prefill, &expected["prefill"]);
     if paged_prompt {
         let report = model.cache_residency_report(&cache).unwrap().unwrap();
@@ -401,7 +388,7 @@ fn expert_parallel_model_ring_worker() {
 
     let mut sampler = DefaultSampler;
     let first = model
-        .sample_and_synchronize(&prefill, &mut sampler, 0.0, None, false, 0, &group, stream)
+        .sample_and_synchronize(&prefill, &mut sampler, 0.0, None, false, 0, &execution)
         .unwrap();
     assert_close(
         &first.token.as_type::<f32>(stream).unwrap(),
@@ -409,14 +396,7 @@ fn expert_parallel_model_ring_worker() {
     );
     assert!(!first.finished);
 
-    let uninterrupted = forward_parallel_model(
-        &mut model,
-        &first.token,
-        &mut cache,
-        &group,
-        execution.as_ref(),
-        stream,
-    );
+    let uninterrupted = forward_parallel_model(&mut model, &first.token, &mut cache, &execution);
     let decode = if persist_prompt {
         let uninterrupted_values = uninterrupted.evaluated().unwrap();
         let uninterrupted_values = uninterrupted_values.as_slice::<f32>().to_vec();
@@ -459,14 +439,7 @@ fn expert_parallel_model_ring_worker() {
         let root = artifact_dir.join("prompt-cache");
         // Persist the prefix state, not the uninterrupted suffix token.
         cache.reset().unwrap();
-        let _ = forward_parallel_model(
-            &mut model,
-            &prompt,
-            &mut cache,
-            &group,
-            execution.as_ref(),
-            stream,
-        );
+        let _ = forward_parallel_model(&mut model, &prompt, &mut cache, &execution);
         model
             .save_prompt_cache(
                 &mut cache,
@@ -481,14 +454,8 @@ fn expert_parallel_model_ring_worker() {
             .load_prompt_cache(&root, &descriptor, &[1, 2, 3], paged, stream)
             .unwrap();
         assert_eq!(manifest.topology, descriptor.topology);
-        let restored_logits = forward_parallel_model(
-            &mut model,
-            &first.token,
-            &mut restored,
-            &group,
-            execution.as_ref(),
-            stream,
-        );
+        let restored_logits =
+            forward_parallel_model(&mut model, &first.token, &mut restored, &execution);
         let restored = (restored, restored_logits);
         let restored_values = restored.1.evaluated().unwrap();
         assert_eq!(uninterrupted_values, restored_values.as_slice::<f32>());
@@ -525,20 +492,13 @@ fn expert_parallel_model_ring_worker() {
     assert_eq!(cache.offset(), 4);
 
     let second = model
-        .sample_and_synchronize(&decode, &mut sampler, 0.0, None, false, 1, &group, stream)
+        .sample_and_synchronize(&decode, &mut sampler, 0.0, None, false, 1, &execution)
         .unwrap();
     assert_close(
         &second.token.as_type::<f32>(stream).unwrap(),
         &expected["second_token"],
     );
-    let decode_second = forward_parallel_model(
-        &mut model,
-        &second.token,
-        &mut cache,
-        &group,
-        execution.as_ref(),
-        stream,
-    );
+    let decode_second = forward_parallel_model(&mut model, &second.token, &mut cache, &execution);
     assert_close(&decode_second, &expected["decode_second"]);
     assert_eq!(
         model.latest_routing_statistics().total_routes,
@@ -564,8 +524,7 @@ fn expert_parallel_model_ring_worker() {
             None,
             false,
             0,
-            &group,
-            stream,
+            &execution,
         )
         .unwrap();
     assert_close(
@@ -590,9 +549,8 @@ fn expert_parallel_model_ring_worker() {
                 &prompt,
                 None,
                 &mut observed_cache,
-                &group,
+                &execution,
                 &mut observer,
-                stream,
             )
             .unwrap();
         assert_close(&observed, &expected["prefill"]);
@@ -622,7 +580,7 @@ fn expert_parallel_model_ring_worker() {
         let paging = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1).unwrap();
         let mut sliding_cache = model.new_qwen3_sliding_cache(2, paging).unwrap();
         let sliding_prefill = model
-            .forward(&prompt, None, &mut sliding_cache, &group, stream)
+            .forward(&prompt, None, &mut sliding_cache, &execution)
             .unwrap();
         assert_close(&sliding_prefill, &expected["sliding_prefill"]);
         let sliding_first = model
@@ -633,8 +591,7 @@ fn expert_parallel_model_ring_worker() {
                 None,
                 false,
                 0,
-                &group,
-                stream,
+                &execution,
             )
             .unwrap();
         assert_close(
@@ -642,13 +599,7 @@ fn expert_parallel_model_ring_worker() {
             &expected["sliding_first_token"],
         );
         let sliding_decode = model
-            .forward(
-                &sliding_first.token,
-                None,
-                &mut sliding_cache,
-                &group,
-                stream,
-            )
+            .forward(&sliding_first.token, None, &mut sliding_cache, &execution)
             .unwrap();
         assert_close(&sliding_decode, &expected["sliding_decode"]);
         let sliding_second = model
@@ -659,8 +610,7 @@ fn expert_parallel_model_ring_worker() {
                 None,
                 false,
                 1,
-                &group,
-                stream,
+                &execution,
             )
             .unwrap();
         assert_close(
@@ -668,13 +618,7 @@ fn expert_parallel_model_ring_worker() {
             &expected["sliding_second_token"],
         );
         let sliding_decode_second = model
-            .forward(
-                &sliding_second.token,
-                None,
-                &mut sliding_cache,
-                &group,
-                stream,
-            )
+            .forward(&sliding_second.token, None, &mut sliding_cache, &execution)
             .unwrap();
         assert_close(&sliding_decode_second, &expected["sliding_decode_second"]);
         assert_eq!(sliding_cache.offset(), 5);
@@ -694,9 +638,8 @@ fn expert_parallel_model_ring_worker() {
         let mtp_prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
         let input_parts = [runtime_input::InputPart::text_token_ids(&mtp_prompt)];
         let mtp_input = runtime_input::ModelInput::new(&input_parts);
-        let mut committed = Vec::new();
-        let (tokens, stats) = if let Some(execution) = execution.as_ref() {
-            model.generate_embedded_mtp_cartesian(
+        let (tokens, stats) = model
+            .generate_embedded_mtp_distributed(
                 &mut mtp_cache,
                 mtp_input,
                 &MtpConfig {
@@ -707,42 +650,13 @@ fn expert_parallel_model_ring_worker() {
                 },
                 None,
                 &mut sampler,
-                execution,
-                stream,
+                &execution,
             )
-        } else {
-            model.generate_embedded_mtp_input_with_sampler_callback(
-                &mut mtp_cache,
-                mtp_input,
-                &MtpConfig {
-                    max_tokens: 4,
-                    max_draft_tokens: 1,
-                    temperature: 0.0,
-                    eos_token_ids: Vec::new(),
-                },
-                None,
-                &mut sampler,
-                1,
-                &group,
-                stream,
-                |token| {
-                    committed.push(token);
-                    Ok(())
-                },
-            )
-        }
-        .unwrap();
+            .unwrap();
         assert_eq!(tokens, vec![0, 0, 0, 0]);
         assert_eq!(stats.emitted_tokens, 4);
         assert!(stats.draft_tokens > 0);
         assert_eq!(stats.accepted_tokens, stats.draft_tokens);
-        if tensor_expert {
-            assert!(committed.is_empty());
-        } else if expected_rank == 1 {
-            assert_eq!(committed, tokens);
-        } else {
-            assert!(committed.is_empty());
-        }
     } else if config["mtp_num_hidden_layers"].as_u64().unwrap_or(0) == 0 {
         assert_eq!(model.mtp_capability(), MtpCapability::Unavailable);
     }

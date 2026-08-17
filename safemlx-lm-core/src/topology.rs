@@ -69,7 +69,10 @@ impl ParallelTopology {
     pub fn world_size(self) -> usize {
         self.tensor * self.pipeline * self.expert * self.data
     }
-    /// Converts a row-major rank to coordinates.
+    /// Converts a pipeline-major, tensor, expert-minor rank to coordinates.
+    ///
+    /// Data parallelism is the outermost dimension. Within one data replica,
+    /// `rank = ((pipeline * tensor_size) + tensor) * expert_size + expert`.
     pub fn coordinates(self, rank: usize) -> Result<ParallelCoordinates, TopologyError> {
         if rank >= self.world_size() {
             return Err(TopologyError::RankOutOfRange {
@@ -77,16 +80,16 @@ impl ParallelTopology {
                 world_size: self.world_size(),
             });
         }
+        let expert = rank % self.expert;
+        let rank = rank / self.expert;
         let tensor = rank % self.tensor;
         let rank = rank / self.tensor;
         let pipeline = rank % self.pipeline;
-        let rank = rank / self.pipeline;
-        let expert = rank % self.expert;
         Ok(ParallelCoordinates {
             tensor,
             pipeline,
             expert,
-            data: rank / self.expert,
+            data: rank / self.pipeline,
         })
     }
     /// Returns all ranks matching the supplied coordinate on non-selected axes.
@@ -169,15 +172,15 @@ mod tests {
         assert_eq!(
             topology.coordinates(5).unwrap(),
             ParallelCoordinates {
-                tensor: 1,
-                pipeline: 0,
+                tensor: 0,
+                pipeline: 1,
                 expert: 1,
                 data: 0
             }
         );
         assert_eq!(
             topology.axis_members(5, ParallelAxis::Tensor).unwrap(),
-            vec![4, 5]
+            vec![5, 7]
         );
         assert!(topology.coordinates(8).is_err());
     }

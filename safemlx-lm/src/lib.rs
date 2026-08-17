@@ -31,6 +31,10 @@ pub use safemlx_lm_core::generation::{
     GenerationConfigOverrides, MtpConfig, MtpRequestId, MtpRequestPhase, MtpSchedulerOptions,
     ResolvedGenerationConfig, SemanticEvent,
 };
+pub use safemlx_lm_core::{
+    CollectiveScope, DistributedBackend, DistributedCapabilities, DistributedSession,
+    DistributedSessionDescriptor, ValueDescriptor,
+};
 #[cfg(test)]
 mod test_utils;
 
@@ -54,6 +58,7 @@ pub use api::{
     TimingTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
+pub use backend::mlx::{MlxBackend, MlxDistributedConfig, MlxDistributedSession};
 pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyError,
@@ -61,7 +66,6 @@ pub use runtime::cache::residency::{
     PagedCacheOptions, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 pub use runtime::cache::PagedKeyValueCache;
-pub use runtime::distributed::cartesian::CartesianExecution;
 pub use runtime::distributed::completion::DistributedCompletion;
 pub use runtime::distributed::parallel::{
     sample_and_synchronize, LocalModelLayout, LocalTensorLayout, MemberSharding,
@@ -69,8 +73,8 @@ pub use runtime::distributed::parallel::{
     ParameterMemberSpec, ParameterRole, ShardingPolicy, SynchronizedToken,
 };
 pub use runtime::distributed::topology::{
-    DeviceAssignment, ParallelAxis, ParallelCommunicators, ParallelCoordinates, ParallelTopology,
-    PlacementPlan, RankPartition, SubgroupMembership, TensorPlacement, TopologyPreflightReport,
+    DeviceAssignment, ParallelAxis, ParallelCoordinates, ParallelTopology, PlacementPlan,
+    RankPartition, SubgroupMembership, TensorPlacement, TopologyPreflightReport,
 };
 pub use runtime::execution::layerwise::{
     load_layerwise_model, ArchitectureAdapter, DenseCacheMetrics, DenseDiskStreamReport,

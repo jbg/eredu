@@ -3,6 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
+use crate::{
+    checkpoint::TensorDtype,
+    topology::{ParallelAxis, ParallelTopology},
+};
+
 /// Stable, extensible description of an execution backend.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendDescriptor {
@@ -36,6 +41,91 @@ pub struct BackendCapabilities {
     pub collectives: bool,
     /// Supports backend-managed persistent decode caches.
     pub persistent_cache: bool,
+}
+
+/// Fail-closed distributed operations exposed by one selected session.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedCapabilities {
+    /// World-scoped collectives are available.
+    pub world_collectives: bool,
+    /// Active topology axes with subgroup collective support.
+    pub collective_axes: Vec<ParallelAxis>,
+    /// Point-to-point transfers are available.
+    pub point_to_point: bool,
+    /// Variable-count all-to-all exchange is available.
+    pub variable_all_to_all: bool,
+    /// Collective and transfer submissions have exact completion objects.
+    pub exact_completion: bool,
+}
+
+/// Scope of a collective or point-to-point operation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "axis", rename_all = "snake_case")]
+pub enum CollectiveScope {
+    /// All ranks in the selected distributed session.
+    World,
+    /// The topology subgroup containing this rank on one axis.
+    Axis(ParallelAxis),
+}
+
+/// Portable shape and element type for a backend-owned received value.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ValueDescriptor {
+    /// Row-major logical shape. An empty shape describes a scalar.
+    pub shape: Vec<usize>,
+    /// Logical element type.
+    pub dtype: TensorDtype,
+}
+
+/// Portable identity of one selected distributed session.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+pub struct DistributedSessionDescriptor {
+    /// Backend-neutral Cartesian topology.
+    pub topology: ParallelTopology,
+    /// World rank represented by this process-local session.
+    pub rank: usize,
+}
+
+impl DistributedSessionDescriptor {
+    /// Validates that `rank` belongs to `topology`.
+    pub fn new(topology: ParallelTopology, rank: usize) -> Result<Self, BackendError> {
+        let topology = ParallelTopology::new(
+            topology.tensor,
+            topology.pipeline,
+            topology.expert,
+            topology.data,
+        )
+        .map_err(|error| BackendError::Preparation {
+            operation: "distributed session topology".into(),
+            message: error.to_string(),
+        })?;
+        if rank >= topology.world_size() {
+            return Err(BackendError::Preparation {
+                operation: "distributed session topology".into(),
+                message: format!(
+                    "rank {rank} is outside topology world size {}",
+                    topology.world_size()
+                ),
+            });
+        }
+        Ok(Self { topology, rank })
+    }
+}
+
+impl<'de> Deserialize<'de> for DistributedSessionDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawDescriptor {
+            topology: ParallelTopology,
+            rank: usize,
+        }
+
+        let raw = RawDescriptor::deserialize(deserializer)?;
+        Self::new(raw.topology, raw.rank).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Structured backend failure that does not expose a runtime exception type.
@@ -190,6 +280,82 @@ pub trait BackendSession<B: Backend> {
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
 }
 
+/// Optional high-level transfer and collective capability of a selected session.
+///
+/// This contract deliberately operates on an opaque backend value. It models
+/// the few communication submissions needed by model execution without making
+/// core define a tensor algebra or exposing native groups, streams, or events.
+/// Every operation is scoped to the session selected for the complete model.
+pub trait DistributedSession {
+    /// Backend-owned tensor or buffer value.
+    type Value;
+    /// Exact completion retaining the submitted communication resources.
+    type Completion: Completion<Error = Self::Error>;
+    /// Structured backend error.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Stable topology and rank identity.
+    fn descriptor(&self) -> DistributedSessionDescriptor;
+    /// Fail-closed communication support.
+    fn capabilities(&self) -> DistributedCapabilities;
+
+    /// Submits a sum reduction over `scope`.
+    fn all_reduce_sum(
+        &self,
+        scope: CollectiveScope,
+        input: &Self::Value,
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error>;
+
+    /// Submits a leading-rank-axis gather over `scope`.
+    fn all_gather(
+        &self,
+        scope: CollectiveScope,
+        input: &Self::Value,
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error>;
+
+    /// Submits a variable-count all-to-all exchange over `scope`.
+    fn all_to_all_v(
+        &self,
+        scope: CollectiveScope,
+        input: &Self::Value,
+        send_counts: &[usize],
+        receive_counts: &[usize],
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error>;
+
+    /// Submits a point-to-point send to a rank within `scope`.
+    fn send(
+        &self,
+        scope: CollectiveScope,
+        peer: usize,
+        input: &Self::Value,
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error>;
+
+    /// Submits a point-to-point receive from a rank within `scope`.
+    fn receive(
+        &self,
+        scope: CollectiveScope,
+        peer: usize,
+        value: &ValueDescriptor,
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error>;
+
+    /// Synchronously gathers portable scheduler metadata across the world.
+    fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Self::Error>;
+}
+
+/// Backend extension which prepares an optional distributed session.
+pub trait DistributedBackend: Backend {
+    /// Backend-specific communicator/session preparation input.
+    type DistributedConfig;
+    /// Selected distributed session implementation.
+    type DistributedSession: DistributedSession<Error = Self::Error>;
+
+    /// Creates the communication capability attached to this backend selection.
+    fn create_distributed_session(
+        &self,
+        config: Self::DistributedConfig,
+    ) -> Result<Self::DistributedSession, Self::Error>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +447,155 @@ mod tests {
                 .output,
             14
         );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct MockDistributed {
+        descriptor: DistributedSessionDescriptor,
+    }
+
+    impl DistributedSession for MockDistributed {
+        type Value = Vec<u32>;
+        type Completion = Done;
+        type Error = Infallible;
+
+        fn descriptor(&self) -> DistributedSessionDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn capabilities(&self) -> DistributedCapabilities {
+            DistributedCapabilities {
+                world_collectives: true,
+                collective_axes: vec![ParallelAxis::Tensor],
+                point_to_point: true,
+                variable_all_to_all: true,
+                exact_completion: true,
+            }
+        }
+
+        fn all_reduce_sum(
+            &self,
+            _: CollectiveScope,
+            input: &Vec<u32>,
+        ) -> Result<Submission<Vec<u32>, Done>, Infallible> {
+            Ok(Submission {
+                output: input.iter().map(|value| value * 2).collect(),
+                completion: Done,
+            })
+        }
+
+        fn all_gather(
+            &self,
+            _: CollectiveScope,
+            input: &Vec<u32>,
+        ) -> Result<Submission<Vec<u32>, Done>, Infallible> {
+            let mut output = input.clone();
+            output.extend(input);
+            Ok(Submission {
+                output,
+                completion: Done,
+            })
+        }
+
+        fn all_to_all_v(
+            &self,
+            _: CollectiveScope,
+            input: &Vec<u32>,
+            _: &[usize],
+            _: &[usize],
+        ) -> Result<Submission<Vec<u32>, Done>, Infallible> {
+            Ok(Submission {
+                output: input.clone(),
+                completion: Done,
+            })
+        }
+
+        fn send(
+            &self,
+            _: CollectiveScope,
+            _: usize,
+            input: &Vec<u32>,
+        ) -> Result<Submission<Vec<u32>, Done>, Infallible> {
+            Ok(Submission {
+                output: input.clone(),
+                completion: Done,
+            })
+        }
+
+        fn receive(
+            &self,
+            _: CollectiveScope,
+            peer: usize,
+            value: &ValueDescriptor,
+        ) -> Result<Submission<Vec<u32>, Done>, Infallible> {
+            Ok(Submission {
+                output: vec![peer as u32; value.shape.iter().product()],
+                completion: Done,
+            })
+        }
+
+        fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Infallible> {
+            let mut output = local.to_vec();
+            output.extend_from_slice(local);
+            Ok(output)
+        }
+    }
+
+    #[test]
+    fn mock_distributed_session_owns_collective_and_transfer_lifecycle() {
+        let topology = ParallelTopology::new(2, 1, 1, 1).unwrap();
+        let session = MockDistributed {
+            descriptor: DistributedSessionDescriptor::new(topology, 0).unwrap(),
+        };
+        let capabilities = session.capabilities();
+        assert!(capabilities.exact_completion);
+        assert_eq!(capabilities.collective_axes, vec![ParallelAxis::Tensor]);
+        assert_eq!(
+            session
+                .all_reduce_sum(CollectiveScope::Axis(ParallelAxis::Tensor), &vec![2, 3])
+                .unwrap()
+                .wait()
+                .unwrap(),
+            vec![4, 6]
+        );
+        assert_eq!(
+            session
+                .receive(
+                    CollectiveScope::World,
+                    1,
+                    &ValueDescriptor {
+                        shape: vec![2],
+                        dtype: TensorDtype::U32,
+                    },
+                )
+                .unwrap()
+                .wait()
+                .unwrap(),
+            vec![1, 1]
+        );
+        assert_eq!(session.all_gather_words(&[7]).unwrap(), vec![7, 7]);
+    }
+
+    #[test]
+    fn distributed_descriptors_round_trip_and_reject_invalid_ranks() {
+        let descriptor =
+            DistributedSessionDescriptor::new(ParallelTopology::new(2, 3, 1, 1).unwrap(), 4)
+                .unwrap();
+        let encoded = serde_json::to_string(&descriptor).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DistributedSessionDescriptor>(&encoded).unwrap(),
+            descriptor
+        );
+        let scope = CollectiveScope::Axis(ParallelAxis::Pipeline);
+        assert_eq!(
+            serde_json::from_str::<CollectiveScope>(&serde_json::to_string(&scope).unwrap())
+                .unwrap(),
+            scope
+        );
+        assert!(DistributedSessionDescriptor::new(descriptor.topology, 6).is_err());
+        assert!(serde_json::from_str::<DistributedSessionDescriptor>(
+            r#"{"topology":{"tensor":2,"pipeline":3,"expert":1,"data":1},"rank":6}"#
+        )
+        .is_err());
     }
 }

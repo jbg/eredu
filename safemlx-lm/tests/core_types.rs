@@ -164,4 +164,20 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::CacheStorageError>(),
         TypeId::of::<safemlx_lm::core::cache::CacheStorageError>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::DistributedCapabilities>(),
+        TypeId::of::<safemlx_lm::core::backend::DistributedCapabilities>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CollectiveScope>(),
+        TypeId::of::<safemlx_lm::core::backend::CollectiveScope>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::DistributedSessionDescriptor>(),
+        TypeId::of::<safemlx_lm::core::backend::DistributedSessionDescriptor>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::ValueDescriptor>(),
+        TypeId::of::<safemlx_lm::core::backend::ValueDescriptor>(),
+    );
 }

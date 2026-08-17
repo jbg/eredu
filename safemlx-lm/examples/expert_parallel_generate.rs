@@ -8,8 +8,8 @@ use safemlx_lm::{
     api::ModelLoadOptions,
     architectures::distributed::expert::load_expert_parallel_model_with_options,
     runtime::generation::sampler::DefaultSampler,
-    runtime::residency::expert_cache::ExpertCacheLoadOptions, DeviceAssignment, ParallelTopology,
-    WeightResidency,
+    runtime::residency::expert_cache::ExpertCacheLoadOptions, DeviceAssignment, MlxBackend,
+    ParallelTopology, WeightResidency,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
+    let execution = MlxBackend::new(&stream).distributed(topology, &group)?;
     let options = ModelLoadOptions::with_parallel(topology).with_weight_residency(
         WeightResidency::with_expert_cache(
             safemlx_lm::NonExpertWeightResidency::LayerwiseHost(Default::default()),
@@ -49,18 +50,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cache = model.new_cache();
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-    let mut logits = model.forward(&prompt, None, &mut cache, &group, &stream)?;
+    let mut logits = model.forward(&prompt, None, &mut cache, &execution)?;
     let mut sampler = DefaultSampler;
     for _ in 0..8 {
-        let synchronized = model.sample_and_synchronize(
-            &logits,
+        let synchronized = execution.sample_and_synchronize(
+            Some(&logits),
+            logits.dim(0),
             &mut sampler,
             0.0,
             None,
             false,
-            0,
-            &group,
-            &stream,
         )?;
         if group.rank() == 0 {
             eprintln!(
@@ -72,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if synchronized.finished {
             break;
         }
-        logits = model.forward(&synchronized.token, None, &mut cache, &group, &stream)?;
+        logits = model.forward(&synchronized.token, None, &mut cache, &execution)?;
     }
     Ok(())
 }

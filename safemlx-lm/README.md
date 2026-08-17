@@ -76,6 +76,11 @@ only their tensor execution and exact MLX completion adapter remain here.
 Distributed pipeline schedule, cancellation, and completion agreement use the
 same core scheduler through the MLX collective and completion adapters; the
 facade does not maintain a second lifecycle implementation.
+`MlxBackend::distributed` selects one `MlxDistributedSession` for the complete
+distributed model session. It owns world and TP/PP/EP communicators and is the
+public pipeline/expert route for transfers, collectives, sampling, scheduler
+consensus, and exact communication completion. Native `Group` values remain an
+internal MLX execution detail rather than an alternative orchestration API.
 Weight-residency plans, atomic admission, ownership leases, protected windows,
 eviction decisions, exact transfer generations, and accounting likewise come
 directly from `safemlx-lm-core`. The MLX facade mirrors those transitions with

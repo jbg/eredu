@@ -71,7 +71,6 @@ use crate::{
             vl::layerwise::{Qwen3VlLayer, Qwen3VlLayerwiseAdapter, Qwen3VlPipelinePrepared},
         },
     },
-    backend::mlx::consensus::MlxConsensusTransport,
     core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
     core::generation::MtpConfig,
     core::{
@@ -109,8 +108,7 @@ use crate::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     runtime::distributed::parallel::{
-        sample_and_synchronize, ParallelBuildContext, ParallelExecutionContext, ShardingPolicy,
-        SynchronizedToken,
+        ParallelBuildContext, ParallelExecutionContext, ShardingPolicy, SynchronizedToken,
     },
     runtime::distributed::topology::{ParallelCoordinates, ParallelTopology},
     runtime::execution::inspection::ActivationObserver,
@@ -1624,129 +1622,50 @@ impl PipelineInferenceScheduler {
     pub fn run_queued(
         &mut self,
         model: &mut PipelineModel,
-        group: &Group,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<Vec<PipelineMicrobatchOutput>, Error> {
         self.validate_model(model)?;
-        model.validate_group(group)?;
-        let protocol = 0x5049_5045_0002_0000u64 | self.model_kind as u64;
-        let consensus = MlxConsensusTransport::new(group, stream);
-        let progress = self.scheduler.run_distributed_turn(
-            protocol,
-            &consensus,
-            Instant::now(),
-            |_, work, request| {
-                request.stream = Some(stream.clone());
-                let request = &mut request.state;
-                match &work.ingress {
-                    ScheduledPipelineIngress::Tokens(tokens) => model.forward_pipeline(
-                        tokens.as_ref(),
-                        work.step,
-                        work.mask.as_ref(),
-                        &mut request.cache,
-                        group,
-                        stream,
-                    ),
-                    ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Payload(input)) => {
-                        input.with_model_input(|input| {
-                            model.prefill_pipeline(
-                                Some(input),
-                                work.step,
-                                work.mask.as_ref(),
-                                &mut request.cache,
-                                group,
-                                stream,
-                            )
-                        })
-                    }
-                    ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Identity(_)) => {
-                        model.prefill_pipeline(
-                            None,
-                            work.step,
-                            work.mask.as_ref(),
-                            &mut request.cache,
-                            group,
-                            stream,
-                        )
-                    }
-                }
-            },
-        )?;
-        if let Some((work, failure)) = progress.failed.first() {
+        if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
-                "pipeline work {:?} failed asynchronously: {}",
-                work, failure
-            )));
-        }
-        Ok(progress
-            .committed
-            .into_iter()
-            .map(|(work, input, completion)| PipelineMicrobatchOutput {
-                work,
-                phase: input.phase,
-                step: input.step,
-                completion,
-            })
-            .collect())
-    }
-
-    /// Advances one bounded scheduler turn over Cartesian subgroups.
-    ///
-    /// Global schedule consensus uses [`crate::CartesianExecution::world`],
-    /// pipeline payloads use matching-coordinate PP lanes, and stage-local TP
-    /// and EP work uses the corresponding Cartesian subgroups.
-    pub fn run_queued_cartesian(
-        &mut self,
-        model: &mut PipelineModel,
-        cartesian: &crate::CartesianExecution<'_>,
-        stream: &Stream,
-    ) -> Result<Vec<PipelineMicrobatchOutput>, Error> {
-        self.validate_model(model)?;
-        if cartesian.topology() != self.topology {
-            return Err(Error::Parallel(format!(
-                "pipeline scheduler topology {:?} does not match Cartesian execution topology {:?}",
+                "pipeline scheduler topology {:?} does not match distributed session topology {:?}",
                 self.topology,
-                cartesian.topology()
+                execution.topology()
             )));
         }
         let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
-        let consensus = MlxConsensusTransport::new(cartesian.world(), stream);
         let progress = self.scheduler.run_distributed_turn(
             protocol,
-            &consensus,
+            execution,
             Instant::now(),
             |_, work, request| {
-                request.stream = Some(stream.clone());
+                request.stream = Some(execution.stream().clone());
                 let request = &mut request.state;
                 match &work.ingress {
-                    ScheduledPipelineIngress::Tokens(tokens) => model.forward_cartesian(
+                    ScheduledPipelineIngress::Tokens(tokens) => model.forward_distributed(
                         tokens.as_ref(),
                         work.step,
                         work.mask.as_ref(),
                         &mut request.cache,
-                        cartesian,
-                        stream,
+                        execution,
                     ),
                     ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Payload(input)) => {
                         input.with_model_input(|input| {
-                            model.prefill_cartesian(
+                            model.prefill_distributed(
                                 Some(input),
                                 work.step,
                                 work.mask.as_ref(),
                                 &mut request.cache,
-                                cartesian,
-                                stream,
+                                execution,
                             )
                         })
                     }
                     ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Identity(_)) => {
-                        model.prefill_cartesian(
+                        model.prefill_distributed(
                             None,
                             work.step,
                             work.mask.as_ref(),
                             &mut request.cache,
-                            cartesian,
-                            stream,
+                            execution,
                         )
                     }
                 }
@@ -1779,8 +1698,8 @@ impl PipelineInferenceScheduler {
 
     /// Cancels local work before distributed execution begins.
     ///
-    /// Once ranks are executing, use [`Self::cancel_request_distributed`] or
-    /// [`Self::cancel_request_cartesian`] so disposition reaches consensus.
+    /// Once ranks are executing, use [`Self::cancel_request_distributed`] so
+    /// disposition reaches consensus through the selected session.
     pub fn cancel_request(&mut self, request: RequestId) -> Result<(), Error> {
         Ok(self.scheduler.cancel(request)?)
     }
@@ -1789,32 +1708,16 @@ impl PipelineInferenceScheduler {
     pub fn cancel_request_distributed(
         &mut self,
         request: RequestId,
-        group: &Group,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<(), Error> {
-        let protocol = 0x5049_5045_0002_0000u64 | self.model_kind as u64;
-        let consensus = MlxConsensusTransport::new(group, stream);
-        self.scheduler
-            .cancel_distributed(protocol, request, &consensus, Instant::now())
-            .map_err(Into::into)
-    }
-
-    /// Reaches world consensus for a Cartesian pipeline cancellation.
-    pub fn cancel_request_cartesian(
-        &mut self,
-        request: RequestId,
-        cartesian: &crate::CartesianExecution<'_>,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        if cartesian.topology() != self.topology {
+        if execution.topology() != self.topology {
             return Err(Error::Parallel(
-                "pipeline cancellation Cartesian topology mismatch".into(),
+                "pipeline cancellation distributed-session topology mismatch".into(),
             ));
         }
         let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
-        let consensus = MlxConsensusTransport::new(cartesian.world(), stream);
         self.scheduler
-            .cancel_distributed(protocol, request, &consensus, Instant::now())
+            .cancel_distributed(protocol, request, execution, Instant::now())
             .map_err(Into::into)
     }
 
@@ -3887,7 +3790,7 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_cartesian(input, step, mask, cache, None, None, stream)
+        self.forward_distributed(input, step, mask, cache, None, None, stream)
     }
 
     fn forward_with_execution(
@@ -3900,7 +3803,7 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_cartesian(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_distributed(input, step, mask, cache, execution, expert_group, stream)
     }
 }
 
@@ -4078,7 +3981,7 @@ impl PipelineStageSemantics for GemmaStage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_cartesian(input, step, mask, cache, None, stream)
+        self.forward_distributed(input, step, mask, cache, None, stream)
     }
 
     fn prefill(
@@ -4103,7 +4006,7 @@ impl PipelineStageSemantics for GemmaStage {
                 execution,
                 expert_group,
             ),
-            _ => self.forward_cartesian(
+            _ => self.forward_distributed(
                 PipelineStageInput::Hidden(&payload),
                 step,
                 mask,
@@ -4128,7 +4031,7 @@ impl PipelineStageSemantics for GemmaStage {
             Some(execution) if execution.is_tensor_parallel() => {
                 self.forward_tensor_parallel(input, step, mask, cache, execution, expert_group)
             }
-            _ => self.forward_cartesian(input, step, mask, cache, expert_group, stream),
+            _ => self.forward_distributed(input, step, mask, cache, expert_group, stream),
         }
     }
 }
@@ -6285,7 +6188,7 @@ pub struct PipelineModel {
 
 struct PipelineEmbeddedMtpTarget<'a> {
     model: &'a mut PipelineModel,
-    execution: &'a crate::CartesianExecution<'a>,
+    execution: &'a crate::MlxDistributedSession<'a>,
 }
 
 fn pipeline_mtp_token_identity(
@@ -6824,7 +6727,7 @@ impl PipelineModel {
     ///
     /// This complements [`Self::forward_stage`] for deterministic composition
     /// tests and custom schedulers. Distributed callers normally use
-    /// [`Self::prefill_pipeline`] or [`Self::prefill_cartesian`].
+    /// [`Self::prefill_pipeline`] or [`Self::prefill_distributed`].
     pub fn prefill_stage(
         &mut self,
         input: crate::api::input::ModelInput<'_>,
@@ -6851,65 +6754,29 @@ impl PipelineModel {
             .prefill(input, step, mask, &mut cache.layers, None, None, stream)
     }
 
-    /// Runs one distributed pipeline microbatch without queue management.
-    ///
-    /// Placed ingress groups follow their declared routes before decoder stages
-    /// receive/execute/send and the final stage returns logits. Every lazy point-to-
-    /// point operation is explicitly submitted before the operation returns.
-    /// The returned completion owns its exact backend event and must be waited
-    /// before host access. Multi-request inference should normally use
-    /// [`PipelineInferenceScheduler::run_queued`], which calls this primitive
-    /// in a collectively validated order that can fill different stages.
-    pub fn forward_pipeline(
+    /// Runs a microbatch through the selected distributed backend session.
+    pub fn forward_distributed(
         &mut self,
         tokens: Option<&Array>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
-        group: &Group,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<PipelineStageCompletion, Error> {
-        self.validate_group(group)?;
-        self.forward_pipeline_on_group(
-            tokens.map(PipelineIngress::Tokens),
-            step,
-            mask,
-            cache,
-            group,
-            self.info.predecessor_rank,
-            self.info.successor_rank,
-            None,
-            None,
-            false,
-            stream,
-        )?
-        .submit()
-    }
-
-    /// Runs a microbatch over topology-derived pipeline lanes while executing
-    /// stage-local TP and EP semantics through their own subgroup contexts.
-    pub fn forward_cartesian(
-        &mut self,
-        tokens: Option<&Array>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut PipelineCache,
-        cartesian: &crate::CartesianExecution<'_>,
-        stream: &Stream,
-    ) -> Result<PipelineStageCompletion, Error> {
-        if cartesian.topology() != self.topology {
+        if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
-                "pipeline model topology {:?} does not match Cartesian execution topology {:?}",
+                "pipeline model topology {:?} does not match distributed session topology {:?}",
                 self.topology,
-                cartesian.topology()
+                execution.topology()
             )));
         }
-        let pipeline = cartesian.pipeline_group().ok_or_else(|| {
-            Error::Parallel("Cartesian pipeline execution requires a PP lane group".into())
+        let pipeline = execution.pipeline_group().ok_or_else(|| {
+            Error::Parallel("distributed pipeline execution requires a PP lane group".into())
         })?;
         let tensor = (self.topology.tensor_parallel_size > 1)
-            .then(|| cartesian.tensor_context(stream))
+            .then(|| execution.tensor_context())
             .transpose()?;
+        let stream = execution.stream();
         let mut output = self.forward_pipeline_on_group(
             tokens.map(PipelineIngress::Tokens),
             step,
@@ -6923,73 +6790,45 @@ impl PipelineModel {
                 .successor_rank
                 .map(|_| self.topology.pipeline_parallel_rank + 1),
             tensor.as_ref(),
-            cartesian.expert_group(),
+            execution.expert_group(),
             false,
             stream,
         )?;
-        // A lane-local barrier keeps later world-wide sampling or consensus
-        // collectives from overtaking TP/EP work still running on a later
-        // pipeline stage. This is particularly important for backends whose
-        // subgroup support is implemented with topology-routed peer exchange.
-        let barrier = distributed::all_sum(&Array::from_int(0), pipeline, stream)?;
-        output.retain(barrier);
+        // A proper PP subgroup needs an explicit lane boundary before a later
+        // world collective. When PP is the complete world, inserting a
+        // collective into the same ordered Ring channel as point-to-point
+        // traffic can overtake a peer receive and deadlock; the world channel
+        // already provides the required ordering.
+        if self.topology.pipeline_parallel_size < self.topology.world_size {
+            let barrier = distributed::all_sum(&Array::from_int(0), pipeline, stream)?;
+            output.retain(barrier);
+        }
         output.submit()
     }
 
-    /// Runs typed multimodal prefill over the world pipeline group.
-    ///
-    /// Only stage zero supplies `input`; every later stage passes `None` and
-    /// receives the architecture-authored payload from its predecessor.
-    pub fn prefill_pipeline(
+    /// Runs typed multimodal prefill through the selected distributed session.
+    pub fn prefill_distributed(
         &mut self,
         input: Option<crate::api::input::ModelInput<'_>>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
-        group: &Group,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<PipelineStageCompletion, Error> {
-        self.validate_group(group)?;
-        self.forward_pipeline_on_group(
-            input.map(PipelineIngress::ModelInput),
-            step,
-            mask,
-            cache,
-            group,
-            self.info.predecessor_rank,
-            self.info.successor_rank,
-            None,
-            None,
-            true,
-            stream,
-        )?
-        .submit()
-    }
-
-    /// Runs typed multimodal prefill over topology-derived PP lanes while TP
-    /// or EP execution stays scoped to the corresponding stage subgroup.
-    pub fn prefill_cartesian(
-        &mut self,
-        input: Option<crate::api::input::ModelInput<'_>>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut PipelineCache,
-        cartesian: &crate::CartesianExecution<'_>,
-        stream: &Stream,
-    ) -> Result<PipelineStageCompletion, Error> {
-        if cartesian.topology() != self.topology {
+        if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
-                "pipeline model topology {:?} does not match Cartesian execution topology {:?}",
+                "pipeline model topology {:?} does not match distributed session topology {:?}",
                 self.topology,
-                cartesian.topology()
+                execution.topology()
             )));
         }
-        let pipeline = cartesian.pipeline_group().ok_or_else(|| {
-            Error::Parallel("Cartesian pipeline execution requires a PP lane group".into())
+        let pipeline = execution.pipeline_group().ok_or_else(|| {
+            Error::Parallel("distributed pipeline execution requires a PP lane group".into())
         })?;
         let tensor = (self.topology.tensor_parallel_size > 1)
-            .then(|| cartesian.tensor_context(stream))
+            .then(|| execution.tensor_context())
             .transpose()?;
+        let stream = execution.stream();
         let mut output = self.forward_pipeline_on_group(
             input.map(PipelineIngress::ModelInput),
             step,
@@ -7003,12 +6842,14 @@ impl PipelineModel {
                 .successor_rank
                 .map(|_| self.topology.pipeline_parallel_rank + 1),
             tensor.as_ref(),
-            cartesian.expert_group(),
+            execution.expert_group(),
             true,
             stream,
         )?;
-        let barrier = distributed::all_sum(&Array::from_int(0), pipeline, stream)?;
-        output.retain(barrier);
+        if self.topology.pipeline_parallel_size < self.topology.world_size {
+            let barrier = distributed::all_sum(&Array::from_int(0), pipeline, stream)?;
+            output.retain(barrier);
+        }
         output.submit()
     }
 
@@ -7049,7 +6890,7 @@ impl PipelineModel {
         local_logits: Option<Array>,
         local_hidden: Option<Array>,
         tokens: Array,
-        execution: &crate::CartesianExecution<'_>,
+        execution: &crate::MlxDistributedSession<'_>,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
         // Every TP/EP replica on the final PP coordinate owns the same gathered
@@ -7461,23 +7302,23 @@ impl PipelineModel {
     }
 
     /// Generates through final-stage-owned embedded predictor layers while the
-    /// target continues to execute over the ordinary Cartesian pipeline.
+    /// target executes through the selected distributed session.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_cartesian<S: SpeculativeSampler + Clone>(
+    pub fn generate_embedded_mtp_distributed<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut PipelineCache,
         input: crate::api::input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        execution: &crate::CartesianExecution<'_>,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         if execution.topology() != self.topology {
             return Err(Exception::custom(
-                "pipeline embedded MTP topology does not match Cartesian execution",
+                "pipeline embedded MTP topology does not match distributed session",
             ));
         }
+        let stream = execution.stream();
         if !matches!(
             self.mtp_capability(),
             MtpCapability::Ready {
@@ -7780,44 +7621,26 @@ impl PipelineModel {
         temperature: f32,
         prng_state: Option<&mut safemlx::random::RandomState>,
         finished: bool,
-        group: &Group,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<SynchronizedToken, Error> {
-        self.validate_group(group)?;
+        if execution.topology() != self.topology {
+            return Err(Error::Parallel(
+                "pipeline sampling distributed-session topology mismatch".into(),
+            ));
+        }
         if !self.info.is_last && logits.is_some() {
             return Err(Error::Parallel(
                 "only the last pipeline stage may supply logits".into(),
             ));
         }
-        let sampling_rank = self.topology.global_rank_for(ParallelCoordinates {
-            tensor: 0,
-            pipeline: self.topology.pipeline_parallel_size - 1,
-            expert: 0,
-        })?;
-        sample_and_synchronize(
+        execution.sample_and_synchronize(
             logits,
             step.batch_size,
             sampler,
             temperature,
             prng_state,
             finished,
-            sampling_rank,
-            group,
-            stream,
         )
-    }
-
-    fn validate_group(&self, group: &Group) -> Result<(), Error> {
-        if group.rank() != self.topology.global_rank || group.size() != self.topology.world_size {
-            return Err(Error::Parallel(format!(
-                "pipeline topology expects group rank {}/{} but received rank {}/{}",
-                self.topology.global_rank,
-                self.topology.world_size,
-                group.rank(),
-                group.size()
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -7845,27 +7668,25 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
         let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))
             .map_err(|error| Exception::custom(error.to_string()))?;
         let local = if multimodal {
-            self.model.prefill_cartesian(
+            self.model.prefill_distributed(
                 self.model.info.is_first.then_some(input),
                 step,
                 None,
                 cache,
                 self.execution,
-                stream,
             )
         } else {
-            self.model.forward_cartesian(
+            self.model.forward_distributed(
                 self.model.info.is_first.then_some(&tokens),
                 step,
                 None,
                 cache,
                 self.execution,
-                stream,
             )
         };
         let (failed, _) = self
             .execution
-            .operation_consensus(local.is_err(), false, stream)
+            .operation_consensus(local.is_err(), false)
             .map_err(|error| Exception::custom(error.to_string()))?;
         if failed {
             return Err(local.map_or_else(
@@ -7889,17 +7710,16 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
     ) -> Result<EmbeddedMtpOutput, Exception> {
         let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))
             .map_err(|error| Exception::custom(error.to_string()))?;
-        let local = self.model.forward_cartesian(
+        let local = self.model.forward_distributed(
             self.model.info.is_first.then_some(tokens),
             step,
             None,
             cache,
             self.execution,
-            stream,
         );
         let (failed, _) = self
             .execution
-            .operation_consensus(local.is_err(), false, stream)
+            .operation_consensus(local.is_err(), false)
             .map_err(|error| Exception::custom(error.to_string()))?;
         if failed {
             return Err(local.map_or_else(
@@ -7936,7 +7756,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
         };
         let (failed, _) = self
             .execution
-            .operation_consensus(handled.is_err(), false, stream)
+            .operation_consensus(handled.is_err(), false)
             .map_err(|error| Exception::custom(error.to_string()))?;
         if failed {
             return Err(handled.map_or_else(
@@ -8007,7 +7827,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
         };
         let (failed, _) = self
             .execution
-            .operation_consensus(handled.is_err(), false, stream)
+            .operation_consensus(handled.is_err(), false)
             .map_err(|error| Exception::custom(error.to_string()))?;
         if failed {
             return Err(handled.map_or_else(
@@ -8095,7 +7915,7 @@ impl PipelineEmbeddedMtpTarget<'_> {
     ) -> Result<Option<Array>, Exception> {
         let (failed, _) = self
             .execution
-            .operation_consensus(local.is_err(), false, stream)
+            .operation_consensus(local.is_err(), false)
             .map_err(|error| Exception::custom(error.to_string()))?;
         if failed {
             return Err(local.map_or_else(
@@ -8154,7 +7974,7 @@ impl PipelineEmbeddedMtpTarget<'_> {
         let local = if self.model.info.is_last {
             let tensor = self
                 .execution
-                .tensor_context(stream)
+                .tensor_context()
                 .map_err(|error| Exception::custom(error.to_string()))?;
             self.model
                 .stage
@@ -8173,7 +7993,7 @@ impl PipelineEmbeddedMtpTarget<'_> {
         };
         let (failed, _) = self
             .execution
-            .operation_consensus(local.is_err(), false, stream)
+            .operation_consensus(local.is_err(), false)
             .map_err(|error| Exception::custom(error.to_string()))?;
         if failed {
             return Err(local.map_or_else(
@@ -11082,7 +10902,7 @@ impl DeepSeekV4Stage {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_cartesian(
+    fn forward_distributed(
         &mut self,
         input: PipelineStageInput<'_>,
         step: PipelineStep,
@@ -23334,7 +23154,7 @@ impl GemmaStage {
         }
     }
 
-    fn forward_cartesian(
+    fn forward_distributed(
         &mut self,
         input: PipelineStageInput<'_>,
         step: PipelineStep,

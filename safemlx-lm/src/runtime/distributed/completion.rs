@@ -93,6 +93,18 @@ impl<T> DistributedCompletion<T> {
     }
 }
 
+impl<T> safemlx_lm_core::Completion for DistributedCompletion<T> {
+    type Error = Error;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        self.is_complete()
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        self.synchronize()
+    }
+}
+
 pub(crate) fn synchronize_outputs<'a>(
     outputs: impl IntoIterator<Item = &'a Array>,
 ) -> safemlx::error::Result<()> {

@@ -19,6 +19,10 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Backend capability discovery, preparation, execution, or completion failed.
+    #[error(transparent)]
+    Backend(#[from] safemlx_lm_core::BackendError),
+
     /// Backend-neutral artifact inspection or preparation planning failed.
     #[error(transparent)]
     Artifact(#[from] safemlx_lm_core::artifact::ArtifactError),

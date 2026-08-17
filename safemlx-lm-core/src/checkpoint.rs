@@ -17,6 +17,8 @@ pub enum TensorDtype {
     I8,
     /// Unsigned 8-bit integer.
     U8,
+    /// Unsigned 32-bit integer.
+    U32,
     /// Signed 32-bit integer.
     I32,
     /// Backend-independent encoded/quantized storage.

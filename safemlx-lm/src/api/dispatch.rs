@@ -317,37 +317,37 @@ impl Model {
         )
     }
 
-    /// Generates through embedded predictor layers on a non-pipeline
-    /// Cartesian model. TP collectives and rank-synchronized sampling are
+    /// Generates through embedded predictor layers on a tensor-parallel model.
+    /// TP collectives and rank-synchronized sampling are
     /// derived from `execution`; EP and PP models use their architecture-erased
     /// distributed model containers.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_cartesian<S: SpeculativeSampler + Clone>(
+    pub fn generate_embedded_mtp_distributed<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        execution: &crate::CartesianExecution<'_>,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         let topology = execution.topology();
         if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
             return Err(Exception::custom(
-                "architecture-erased Cartesian MTP requires a non-pipeline, non-EP model; use PipelineModel or ExpertParallelModel for active PP/EP axes",
+                "architecture-erased distributed MTP requires a non-pipeline, non-EP model; use PipelineModel or ExpertParallelModel for active PP/EP axes",
             ));
         }
         if self.parallel_info().map(|info| info.topology()) != Some(topology) {
             return Err(Exception::custom(
-                "embedded MTP model topology does not match Cartesian execution",
+                "embedded MTP model topology does not match distributed session",
             ));
         }
+        let stream = execution.stream();
         let tensor = execution
-            .tensor_context(stream)
+            .tensor_context()
             .map_err(|error| Exception::custom(error.to_string()))?;
         let tensor_group = tensor.group().ok_or_else(|| {
-            Exception::custom("Cartesian embedded MTP requires an active TP subgroup")
+            Exception::custom("distributed embedded MTP requires an active TP subgroup")
         })?;
         let sampling_rank = topology
             .global_rank_for(crate::ParallelCoordinates {
@@ -434,7 +434,7 @@ impl Model {
                 )
             }
             (model, _) => Err(Exception::custom(format!(
-                "Cartesian embedded MTP runtime adapter is unavailable for model type {} ({:?})",
+                "distributed embedded MTP runtime adapter is unavailable for model type {} ({:?})",
                 model.model_type(),
                 model.mtp_capability()
             ))),

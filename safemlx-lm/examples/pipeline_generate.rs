@@ -10,7 +10,7 @@ use safemlx_lm::{
         PipelineMicrobatchInput, PipelineStep,
     },
     runtime::generation::sampler::DefaultSampler,
-    DeviceAssignment, ParallelTopology, RequestId, RequestStatus, SchedulerLimits,
+    DeviceAssignment, MlxBackend, ParallelTopology, RequestId, RequestStatus, SchedulerLimits,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
+    let execution = MlxBackend::new(&stream).distributed(topology, &group)?;
     let mut model = load_pipeline_model(&model_dir, topology, &stream, &weights_stream)?;
     let is_first = model.stage_info().is_first;
     let requests = [RequestId::new(1), RequestId::new(2)];
@@ -58,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sampler = DefaultSampler;
     let mut output = Vec::with_capacity(requests.len());
     while output.len() < requests.len() {
-        output.extend(scheduler.run_queued(&mut model, &group, &stream)?);
+        output.extend(scheduler.run_queued(&mut model, &execution)?);
         std::thread::yield_now();
     }
     for generation_step in 0..8 {
@@ -72,8 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0.0,
                 None,
                 false,
-                &group,
-                &stream,
+                &execution,
             )?;
             if model.stage_info().is_last {
                 eprintln!(
@@ -106,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         output.clear();
         while output.len() < expected {
-            output.extend(scheduler.run_queued(&mut model, &group, &stream)?);
+            output.extend(scheduler.run_queued(&mut model, &execution)?);
             std::thread::yield_now();
         }
     }

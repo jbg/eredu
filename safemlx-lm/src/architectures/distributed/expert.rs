@@ -45,9 +45,7 @@ use crate::{
     runtime::checkpoint::load::{transform_split_swiglu_experts, StrictLoadConfig},
     runtime::checkpoint::quantization::{should_quantize_on_load, WeightQuantization},
     runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore, WeightStore},
-    runtime::distributed::parallel::{
-        sample_and_synchronize, ParallelBuildContext, ShardingPolicy, SynchronizedToken,
-    },
+    runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy, SynchronizedToken},
     runtime::distributed::topology::{
         load_partition_from_store_on_streams, ParallelTopology, PlacementPlan, TensorPlacement,
     },
@@ -55,7 +53,7 @@ use crate::{
     runtime::generation::embedded_mtp::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
-    runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
+    runtime::generation::sampler::{Sampler, SpeculativeSampler},
     runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpStats},
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -1553,35 +1551,22 @@ impl ExpertParallelModel {
         &self.cumulative_statistics
     }
 
-    /// Runs prefill or decode with identical input tokens on every EP rank.
+    /// Runs prefill or decode through the selected distributed backend session.
     pub fn forward(
         &mut self,
         tokens: &Array,
         mask: Option<&Array>,
         cache: &mut ExpertParallelCache,
-        group: &Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.forward_impl(tokens, mask, cache, None, group, None, stream)
-    }
-
-    /// Runs combined TP+EP inference with communicators derived from one topology.
-    pub fn forward_cartesian(
-        &mut self,
-        tokens: &Array,
-        mask: Option<&Array>,
-        cache: &mut ExpertParallelCache,
-        execution: &crate::CartesianExecution<'_>,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<Array, Error> {
         if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
-                "model topology {:?} does not match Cartesian execution topology {:?}",
+                "model topology {:?} does not match distributed session topology {:?}",
                 self.topology,
                 execution.topology()
             )));
         }
-        let tensor_context = execution.tensor_context(stream)?;
+        let tensor_context = execution.tensor_context()?;
         let tensor_group = tensor_context.group();
         let expert_group = execution.expert_group().ok_or_else(|| {
             Error::Parallel("combined tensor/expert execution requires an EP group".into())
@@ -1593,7 +1578,7 @@ impl ExpertParallelModel {
             tensor_group,
             expert_group,
             None,
-            stream,
+            execution.stream(),
         )
     }
 
@@ -1604,11 +1589,27 @@ impl ExpertParallelModel {
         tokens: &Array,
         mask: Option<&Array>,
         cache: &mut ExpertParallelCache,
-        group: &Group,
+        execution: &crate::MlxDistributedSession<'_>,
         observer: &mut impl ActivationObserver,
-        stream: &Stream,
     ) -> Result<Array, Error> {
-        self.forward_impl(tokens, mask, cache, None, group, Some(observer), stream)
+        if execution.topology() != self.topology {
+            return Err(Error::Parallel(
+                "observer distributed-session topology mismatch".into(),
+            ));
+        }
+        let tensor = execution.tensor_context()?;
+        let expert = execution.expert_group().ok_or_else(|| {
+            Error::Parallel("expert observation requires an active EP group".into())
+        })?;
+        self.forward_impl(
+            tokens,
+            mask,
+            cache,
+            tensor.group(),
+            expert,
+            Some(observer),
+            execution.stream(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3111,36 +3112,36 @@ impl ExpertParallelModel {
         Ok(output)
     }
 
-    /// Generates with Cartesian TP+EP predictor ownership and synchronized
+    /// Generates with session-owned TP+EP predictor ownership and synchronized
     /// sampling. Predictor TP collectives and expert exchanges are scoped to
     /// the topology-derived subgroups supplied by `execution`.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_cartesian<S: SpeculativeSampler + Clone>(
+    pub fn generate_embedded_mtp_distributed<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut ExpertParallelCache,
         input: runtime_input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        execution: &crate::CartesianExecution<'_>,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         let topology = execution.topology();
         if topology != self.topology {
             return Err(Exception::custom(
-                "embedded MTP model topology does not match Cartesian execution",
+                "embedded MTP model topology does not match distributed session",
             ));
         }
+        let stream = execution.stream();
         if topology.pipeline_parallel_size != 1 {
             return Err(Exception::custom(
                 "ExpertParallelModel embedded MTP cannot own a pipeline axis; use PipelineModel",
             ));
         }
         let expert_group = execution.expert_group().ok_or_else(|| {
-            Exception::custom("Cartesian embedded MTP requires an active EP subgroup")
+            Exception::custom("distributed embedded MTP requires an active EP subgroup")
         })?;
         let tensor = execution
-            .tensor_context(stream)
+            .tensor_context()
             .map_err(|error| Exception::custom(error.to_string()))?;
         let tensor_group = tensor.group();
         let sampling_rank = topology
@@ -3160,7 +3161,7 @@ impl ExpertParallelModel {
             }
         ) {
             return Err(Exception::custom(format!(
-                "embedded MTP runtime adapter is unavailable for Cartesian EP model type {} ({:?})",
+                "embedded MTP runtime adapter is unavailable for distributed EP model type {} ({:?})",
                 self.info.model_kind.model_type_name(),
                 self.mtp_capability()
             )));
@@ -3206,133 +3207,6 @@ impl ExpertParallelModel {
         result
     }
 
-    /// Generates with replicated Qwen MTP weights and EP target verification.
-    ///
-    /// Every rank must call this method with identical inputs and PRNG keys.
-    /// Sampling decisions are selected on `sampling_rank` and synchronized
-    /// across the EP group.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_input(
-        &mut self,
-        cache: &mut ExpertParallelCache,
-        input: runtime_input::ModelInput<'_>,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        sampling_rank: usize,
-        group: &Group,
-        stream: &Stream,
-    ) -> Result<(Vec<u32>, MtpStats), Exception> {
-        self.generate_embedded_mtp_input_with_sampler(
-            cache,
-            input,
-            config,
-            prng_key,
-            &mut DefaultSampler,
-            sampling_rank,
-            group,
-            stream,
-        )
-    }
-
-    /// Generates through embedded Qwen MTP with a caller-provided sampler.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
-        &mut self,
-        cache: &mut ExpertParallelCache,
-        input: runtime_input::ModelInput<'_>,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        sampler: &mut S,
-        sampling_rank: usize,
-        group: &Group,
-        stream: &Stream,
-    ) -> Result<(Vec<u32>, MtpStats), Exception> {
-        self.generate_embedded_mtp_input_with_sampler_callback(
-            cache,
-            input,
-            config,
-            prng_key,
-            sampler,
-            sampling_rank,
-            group,
-            stream,
-            |_| Ok(()),
-        )
-    }
-
-    /// Generates through embedded Qwen MTP and reports committed tokens on the
-    /// designated sampling rank.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_input_with_sampler_callback<S, F>(
-        &mut self,
-        cache: &mut ExpertParallelCache,
-        input: runtime_input::ModelInput<'_>,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        sampler: &mut S,
-        sampling_rank: usize,
-        group: &Group,
-        stream: &Stream,
-        mut on_token: F,
-    ) -> Result<(Vec<u32>, MtpStats), Exception>
-    where
-        S: SpeculativeSampler + Clone,
-        F: FnMut(u32) -> Result<(), Exception>,
-    {
-        self.validate_group(group)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        if sampling_rank >= group.size() {
-            return Err(Exception::custom(format!(
-                "sampling rank {sampling_rank} is outside EP size {}",
-                group.size()
-            )));
-        }
-        if !matches!(
-            self.mtp_capability(),
-            MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded
-            }
-        ) {
-            return Err(Exception::custom(format!(
-                "embedded MTP runtime adapter is unavailable for EP model type {} ({:?})",
-                self.info.model_kind.model_type_name(),
-                self.mtp_capability()
-            )));
-        }
-        let ExpertParallelCache::QwenHybrid(cache) = cache else {
-            return Err(Exception::custom(
-                "embedded Qwen MTP requires a Qwen hybrid EP cache",
-            ));
-        };
-        let mut synchronized_sampler =
-            DistributedEmbeddedMtpSampler::new(sampler.clone(), sampling_rank, group)
-                .map_err(|error| Exception::custom(error.to_string()))?;
-        let emit_callbacks = group.rank() == sampling_rank;
-        let mut target = ExpertParallelQwenMtpTarget {
-            model: self,
-            tensor_group: None,
-            group,
-        };
-        let result = crate::architectures::qwen::hybrid::mtp::generate_with_callback(
-            &mut target,
-            cache,
-            input,
-            config,
-            prng_key,
-            &mut synchronized_sampler,
-            stream,
-            |token| {
-                if emit_callbacks {
-                    on_token(token)
-                } else {
-                    Ok(())
-                }
-            },
-        );
-        *sampler = synchronized_sampler.into_inner();
-        result
-    }
-
     /// Samples on one rank and synchronizes only token ids and stop state.
     #[allow(clippy::too_many_arguments)]
     pub fn sample_and_synchronize<S: Sampler>(
@@ -3343,11 +3217,14 @@ impl ExpertParallelModel {
         prng_state: Option<&mut safemlx::random::RandomState>,
         finished: bool,
         sampling_rank: usize,
-        group: &Group,
-        stream: &Stream,
+        execution: &crate::MlxDistributedSession<'_>,
     ) -> Result<SynchronizedToken, Error> {
-        self.validate_group(group)?;
-        sample_and_synchronize(
+        if execution.topology() != self.topology {
+            return Err(Error::Parallel(
+                "expert sampling distributed-session topology mismatch".into(),
+            ));
+        }
+        execution.sample_and_synchronize_on_rank(
             Some(logits),
             logits.dim(0),
             sampler,
@@ -3355,22 +3232,7 @@ impl ExpertParallelModel {
             prng_state,
             finished,
             sampling_rank,
-            group,
-            stream,
         )
-    }
-
-    fn validate_group(&self, group: &Group) -> Result<(), Error> {
-        if group.rank() != self.topology.global_rank || group.size() != self.topology.world_size {
-            return Err(Error::Parallel(format!(
-                "expert-parallel topology expects group rank {}/{} but received {}/{}",
-                self.topology.global_rank,
-                self.topology.world_size,
-                group.rank(),
-                group.size()
-            )));
-        }
-        Ok(())
     }
 
     fn validate_expert_group(&self, group: &Group) -> Result<(), Error> {

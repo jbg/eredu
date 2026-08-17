@@ -73,6 +73,13 @@ and executable ownership coherent and avoids hidden cross-runtime transfers or
 per-operation dispatch costs. Transfers and collectives are optional explicit
 capabilities and therefore fail closed when absent.
 
+`DistributedBackend` is the optional extension for sessions which communicate
+across ranks. Its `DistributedSession` exposes opaque values, typed world/axis
+scopes, sum and gather collectives, variable-count all-to-all exchange,
+point-to-point transfer, portable scheduler-word consensus, and exact
+completion. Core contains no communicator, stream, native event, or tensor
+type. Capability discovery is operation-specific and defaults to false.
+
 ## MLX mapping
 
 `api::load_model_with_options` first calls the core `inspect_artifact` and
@@ -220,8 +227,12 @@ The current boundary leaves these components MLX-coupled:
 - architecture tensor execution, including multimodal and realtime model math;
 - MLX exact-completion objects, retained output arrays, and event-backend
   telemetry adapters;
-- concrete topology device assignment, communicator construction, collectives,
-  and tensor movement;
+- MLX device assignment, concrete communicator construction, collective tensor
+  math, and movement inside `MlxDistributedSession`; the portable session
+  capability, topology/rank descriptor, scopes, operation availability, and
+  exact-completion contract are core-owned. Tensor-parallel-only architecture
+  entry points which have not yet been folded into the architecture-erased
+  model session remain an MLX integration seam;
 - per-block MLX cache resources, native completion observation, physical
   transfer/disk worker execution, prompt-cache filesystem publication, safetensors payload
   mapping and materialization (container/header validation, the transition
@@ -314,11 +325,17 @@ deadline dispositions, work identities, and exact completion observations.
 all-gather of portable `u32` words. It contains no tensor, stream, device,
 group, or MLX error type.
 
-The production pipeline scheduler constructs `MlxConsensusTransport` for its
-world group. That adapter materializes the portable word frame as an MLX array,
-runs `all_gather`, waits for its exact completion, and returns rank-major words
-to core. Core decides whether work is globally incomplete, complete, failed but
-still executing on a peer, or failed and safe to release. Backend errors are
+The production pipeline scheduler receives one `MlxDistributedSession` from
+the selected `MlxBackend`. The session owns the world and topology-derived
+TP/PP/EP communicators and implements `ConsensusTransport` directly. It
+materializes portable word frames as MLX arrays, runs `all_gather`, waits for
+the exact completion, and returns rank-major words to core. The same selected
+session is the only public route for pipeline/expert execution, sampling,
+point-to-point transfer, and scheduler cancellation consensus; the former
+`CartesianExecution`, direct-world pipeline methods, and standalone
+`MlxConsensusTransport` were deleted. Core decides whether work is globally
+incomplete, complete, failed but still executing on a peer, or failed and safe
+to release. Backend errors are
 converted at the adapter boundary and consensus mismatches poison the canonical
 core scheduler before any new pipeline submission. Prepared branches are
 explicitly discarded during poisoning; submitted MLX resources remain retained
@@ -392,10 +409,11 @@ after that transaction reaches its exact safe boundary.
    sequencing outside core. Instantiate `SpeculativeRequestTable` with those
    opaque types instead of creating a backend-local request collection or
    action dispatcher.
-6. Add explicit transfer/collective support only when the backend implements
-   exact ownership and synchronization semantics. For distributed scheduling,
-   implement `ConsensusTransport` over a topology-wide, rank-ordered word
-   all-gather and run the core mismatch/failure tests.
+6. Implement `DistributedBackend` only when the backend can bind communication
+   to the complete selected session. Report `DistributedCapabilities`
+   fail-closed, implement typed world/axis collectives and transfers with exact
+   completion retention, and implement rank-ordered scheduler-word gathering.
+   Do not expose native communicators as an application-level dispatch path.
 7. Pair concrete weight storage with `ResidencyLedger`: reserve full batches
    before materialization, publish only complete copies, release every returned
    eviction descriptor, and resolve the exact generation attached to native
