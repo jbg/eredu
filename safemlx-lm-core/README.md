@@ -21,6 +21,14 @@ backend allocator observations. Deserialization cannot bypass plan invariants.
 Backends own only resource materialization, native transfer/completion objects,
 and destruction of the storage selected by ledger transitions.
 
+Core also owns the process-wide live-cache admission boundary.
+`CacheResidencyPool` registers independent cache managers, publishes their
+concrete occupancy, and issues exact RAII reservations for device, host,
+in-flight transfer, and live-disk resources. Concurrent admission is atomic and
+fails closed per resource axis. Backends retain the cache tensors and native
+completion objects; dropping a reservation or manager membership releases only
+that owner's accounting.
+
 The production Moshi/PersonaPlex realtime scheduler uses the core request state
 machine. Its MLX adapter supplies opaque work, session branches, submissions,
 and exact completions while core owns fairness and transactional publication.

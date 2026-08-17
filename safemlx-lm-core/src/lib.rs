@@ -11,6 +11,8 @@
 pub mod attention;
 /// High-level execution-backend contract.
 pub mod backend;
+/// Aggregate ownership and admission for backend-managed live caches.
+pub mod cache;
 /// Neutral checkpoint tensor descriptions and validation.
 pub mod checkpoint;
 /// Backend-neutral distributed scheduler consensus.

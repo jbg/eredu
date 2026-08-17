@@ -72,6 +72,9 @@ eviction decisions, exact transfer generations, and accounting likewise come
 directly from `safemlx-lm-core`. The MLX facade mirrors those transitions with
 concrete arrays and host buffers and owns native materialization, event/source
 retention, physical-capacity queries, and allocator sampling.
+Aggregate live-cache admission is also canonical core state: the MLX pager
+registers each cache session with `CacheResidencyPool` and holds core RAII
+reservations while device/host transfers or disk writes own resources.
 
 ## Automatic execution planning
 

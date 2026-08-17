@@ -48,4 +48,16 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::UnitResidencyReport>(),
         TypeId::of::<safemlx_lm::core::residency::UnitResidencyReport>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CachePoolLimits>(),
+        TypeId::of::<safemlx_lm::core::cache::CachePoolLimits>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CacheResidencyPool>(),
+        TypeId::of::<safemlx_lm::core::cache::CacheResidencyPool>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CachePoolReport>(),
+        TypeId::of::<safemlx_lm::core::cache::CachePoolReport>(),
+    );
 }

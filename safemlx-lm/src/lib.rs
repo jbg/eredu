@@ -49,9 +49,8 @@ pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
 pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheBlockId, CacheBlockLifecycle, CacheLayerResidencyReport,
-    CacheLayerResidencyStats, CachePoolLimits, CachePoolReport, CachePoolResource,
-    CacheRankIdentity, CacheRepresentation, CacheResidencyError, CacheResidencyManager,
-    CacheResidencyPolicy, CacheResidencyPool, CacheResidencyReport, CacheTier, LayerCachePolicy,
+    CacheLayerResidencyStats, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
+    CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, CacheTier, LayerCachePolicy,
     LiveCacheDiskPolicy, MutableStateResidency, PagedCacheOptions, PoolingStateComponent,
     PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
     PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass, StateTensorDimension,
@@ -81,6 +80,9 @@ pub use runtime::residency::dense_stream::{
     BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError,
 };
 pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
+pub use safemlx_lm_core::cache::{
+    CachePoolError, CachePoolLimits, CachePoolReport, CachePoolResource, CacheResidencyPool,
+};
 pub use safemlx_lm_core::residency::{
     AllocatorMemoryMetrics, CacheEvictionPolicy, EvictionMetrics, MemoryTier, OffloadConfig,
     OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry, OffloadUnitId, OffloadUnitSpec,

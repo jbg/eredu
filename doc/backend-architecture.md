@@ -32,6 +32,8 @@ Core owns concepts whose meaning does not depend on tensor representation:
 - weight-residency policy, atomic ownership/capacity transitions, protected
   windows, deterministic eviction, exact transfer generations, accounting, and
   serialized reports.
+- process-wide live-cache membership, multi-resource admission, exact
+  reservation ownership, occupancy reports, and high-water accounting.
 
 A backend owns executable models, tensor values, streams/queues, cache storage,
 sampling math, transfers, collectives, kernels, native errors, and the concrete
@@ -111,8 +113,8 @@ The current boundary leaves these components MLX-coupled:
   telemetry adapters;
 - concrete topology device assignment, communicator construction, collectives,
   and tensor movement;
-- cache-residency ownership and request-cache state machines, prompt-cache
-  materialization, and concrete cache tensors;
+- per-block cache promotion/demotion, mutable-tail and lease state, prompt-cache
+  catalog/materialization, and concrete cache tensors;
 - weight array/host-buffer materialization, native transfer events, retained
   source mappings, and physical-capacity queries (the corresponding ownership,
   admission, eviction, window, lease, and generation state is now in core);
@@ -132,6 +134,15 @@ generation state were also deleted from the MLX residency manager. They were
 not retained as forwarding wrappers or shadow state. `ResidencyLedger`,
 `ResidencyLedgerError`, `ResidencyBlocker`, and `UnitResidencyReport` in core
 are the sole definitions used by production.
+
+The aggregate cache pool is canonical core state as well. The former facade
+pool limits, resource axes, usage map, reservation map, manager membership,
+admission checks, and high-water accounting were deleted. The MLX pager now
+registers a manager through the core pool, publishes its concrete occupancy,
+and holds core reservation tokens across asynchronous host transfers and live
+disk operations. Pool errors cross the adapter as a transparent structured
+source. Per-block tensor state remains in the MLX adapter until its intertwined
+event and disk-worker transitions are separated as one complete state machine.
 
 The neutral scheduler in core now owns both production single-rank realtime and
 distributed pipeline request lifecycles. Queueing, fairness, deadlines,
@@ -184,7 +195,10 @@ facade.
    before materialization, publish only complete copies, release every returned
    eviction descriptor, and resolve the exact generation attached to native
    transfer completion.
-8. Run the core mock conformance tests plus backend-specific Llama load,
+8. Register every live cache with `CacheResidencyPool`, publish concrete
+   occupancy, and retain each admission token through the exact native
+   transfer or persistence transition that owns it.
+9. Run the core mock conformance tests plus backend-specific Llama load,
    prefill, multi-step decode, cancellation, checkpoint, and parity tests.
-9. Add backend selection at the facade/application boundary. Do not dispatch
+10. Add backend selection at the facade/application boundary. Do not dispatch
    individual tensor operations between MLX and the new runtime.

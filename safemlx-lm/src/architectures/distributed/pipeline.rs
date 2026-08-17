@@ -67,8 +67,11 @@ use crate::{
         },
     },
     backend::mlx::consensus::MlxConsensusTransport,
-    core::residency::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
+    core::{
+        cache::{CachePoolReport, CacheResidencyPool},
+        residency::{
+            MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
+        },
     },
     error::Error,
     nn::{
@@ -80,10 +83,10 @@ use crate::{
     },
     runtime::cache::residency::{
         load_prompt_cache_state_tensors, open_prompt_cache, validate_prompt_cache_model_identity,
-        CachePoolReport, CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy,
-        CacheResidencyPool, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateArray,
-        PromptCacheTopology, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheStateArray, PromptCacheTopology, StateTensorOwner,
+        StateTensorPolicy, StateTensorRole,
     },
     runtime::cache::{
         CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -1901,7 +1904,7 @@ impl PipelineInferenceScheduler {
                 pool
             }
             (None, None) => {
-                let pool = CacheResidencyPool::for_paged_options(&options)
+                let pool = crate::runtime::cache::residency::cache_pool_for_paged_options(&options)
                     .map_err(|error| Error::Parallel(error.to_string()))?;
                 self.cache_pool = Some(pool.clone());
                 pool
