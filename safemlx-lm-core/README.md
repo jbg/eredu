@@ -44,6 +44,15 @@ models primitive tensor operations or names a native runtime.
 `SpeculativeSampling` similarly exposes only complete opaque operations such as
 processing logits, sampling, proposal decisions, and committed-token updates;
 core never models softmax, indexing, or random tensor primitives.
+`PendingSpeculativeVerification` owns each submitted completion, verification
+output, cache checkpoint, canonical draft block, and optional optimistic branch
+until the exact safe boundary. `resolve_commit_and_publish` then performs
+resolution, backend cache commit, branch promotion/discard, telemetry updates,
+and output authorization as one transaction. `SpeculativeOutputRuntime` owns
+the canonical sampler, token sequence, semantic constraint, cancellation, and
+publication lifecycle. A backend supplies only a `SpeculativePublisher` sink
+for concrete callbacks or decoded events; it cannot publish before cache commit.
+`MtpStats`, `MtpSchedulerStats`, and `MtpBatchOutput` are canonical core types.
 
 Model loading starts here as well. `inspect_artifact` parses `config.json` or a
 portable `safemlx-gguf` checkpoint, validates SafeTensors/GGUF catalogs, and

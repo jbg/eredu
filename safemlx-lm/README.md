@@ -136,9 +136,14 @@ executor contract is also core-owned; the MLX implementations supply opaque
 model input, logits, assistant state, cache transactions, stream placement, and
 exact event completion. Core also owns proposal sequencing, stochastic
 accept/reject flow, replacement/bonus decisions, and bounded fair action
-selection through a high-level opaque sampling contract. MLX retains the
-actual logits transforms, probability/residual arithmetic, random arrays,
-cross-stream transfers, and tensor execution.
+selection through a high-level opaque sampling contract. Each in-flight
+verification, cache checkpoint, draft block, optimistic branch, and exact
+completion is one core-owned transaction. Core waits, commits the MLX cache,
+resolves branch promotion/discard and telemetry, and only then authorizes token
+and semantic-event publication. The MLX publisher is a thin concrete callback
+sink. MLX retains the actual logits transforms, probability/residual
+arithmetic, random arrays, cross-stream transfers, component timing probes, and
+tensor execution.
 
 ## Inputs and generation
 

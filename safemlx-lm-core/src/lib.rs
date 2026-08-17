@@ -53,8 +53,14 @@ pub use generation::{
     TokenTerminalSignals,
 };
 pub use speculative::{
-    propose_block, resolve_round, ProposalDecision, ResolvedSpeculativeRound, SamplingPlacement,
+    cancel_pending_verification, propose_block, resolve_commit_and_publish,
+    resolve_optimistic_branch, resolve_round, submit_verification_transaction, MtpBatchOutput,
+    MtpSchedulerStats, MtpStats, PendingSpeculativeVerification, ProposalDecision,
+    PublishedSpeculativeVerification, ResolvedSpeculativeRound, SamplingPlacement,
     SpeculativeAction, SpeculativeCandidate, SpeculativeCommit, SpeculativeConstraint,
-    SpeculativeDriverError, SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativePrefill,
-    SpeculativeProposal, SpeculativeRandomness, SpeculativeSampling, SpeculativeSchedule,
+    SpeculativeContinuation, SpeculativeDraftBlock, SpeculativeDriverError,
+    SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativeOptimisticBranch,
+    SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeProposal,
+    SpeculativePublicationStatus, SpeculativePublisher, SpeculativeRandomness, SpeculativeSampling,
+    SpeculativeSchedule,
 };

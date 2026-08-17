@@ -12,11 +12,18 @@ use safemlx::{error::Exception, random::RandomState, Array, Stream, TimedEvaluat
 #[cfg(test)]
 use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event};
 use safemlx_lm_core::{
-    propose_block, resolve_round, Completion, SamplingPlacement, SpeculativeAction,
-    SpeculativeCandidate, SpeculativeConstraint, SpeculativeDriverError,
-    SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativeProposal, SpeculativeSampling,
-    SpeculativeSchedule,
+    cancel_pending_verification, propose_block, resolve_commit_and_publish,
+    submit_verification_transaction, PendingSpeculativeVerification, SamplingPlacement,
+    SpeculativeAction, SpeculativeCandidate, SpeculativeConstraint, SpeculativeDraftBlock,
+    SpeculativeDriverError, SpeculativeExecutor, SpeculativeOptimisticBranch,
+    SpeculativeOutputRuntime, SpeculativePublicationStatus, SpeculativePublisher,
+    SpeculativeSampling, SpeculativeSchedule,
 };
+#[cfg(test)]
+use safemlx_lm_core::{
+    resolve_optimistic_branch, SpeculativeExecutionTopology, SpeculativeProposal,
+};
+pub use safemlx_lm_core::{MtpBatchOutput, MtpSchedulerStats, MtpStats};
 
 use crate::{
     api::{
@@ -33,9 +40,9 @@ use crate::{
         MlxModelInput,
     },
     core::generation::{
-        resolve_optimistic_reuse, FinishReason, GenerationCancellationToken, GenerationSequence,
-        MtpCancellationDisposition, MtpConfig, MtpRequestId, MtpRequestLifecycle, MtpRequestPhase,
-        MtpSchedulerOptions, OptimisticReuseDecision, SemanticEvent, TokenTerminalSignals,
+        FinishReason, GenerationCancellationToken, GenerationSequence, MtpCancellationDisposition,
+        MtpConfig, MtpRequestId, MtpRequestLifecycle, MtpRequestPhase, MtpSchedulerOptions,
+        SemanticEvent, TokenTerminalSignals,
     },
     error::Error,
     runtime::generation::sampler::SpeculativeSampler,
@@ -259,73 +266,6 @@ pub enum MtpCapability {
     },
 }
 
-/// Statistics collected from one speculative sequence.
-#[derive(Debug, Clone, Default)]
-pub struct MtpStats {
-    /// Relationship between the request's target and draft streams.
-    pub stream_topology: SpeculativeExecutionTopology,
-    /// Target tokens evaluated during prefill and verification.
-    pub target_tokens: usize,
-    /// Assistant tokens proposed.
-    pub draft_tokens: usize,
-    /// Assistant tokens accepted by target verification.
-    pub accepted_tokens: usize,
-    /// Number of target verification rounds.
-    pub rounds: usize,
-    /// Accepted proposal count for each round.
-    pub accept_lens: Vec<usize>,
-    /// Tokens emitted, including a terminal EOS token when one is produced.
-    pub emitted_tokens: usize,
-    /// Tokens drafted on an optimistic continuation while target verification was in flight.
-    pub optimistic_draft_tokens: usize,
-    /// Optimistic continuation blocks drafted.
-    pub optimistic_draft_blocks: usize,
-    /// Optimistically drafted tokens promoted after full acceptance.
-    pub reused_optimistic_tokens: usize,
-    /// Optimistic continuation blocks promoted after full acceptance.
-    pub reused_optimistic_blocks: usize,
-    /// First optimistic tokens consumed by matching target bonuses.
-    ///
-    /// These tokens are not proposals, so they do not count as reused or
-    /// contribute to `draft_tokens`.
-    pub consumed_optimistic_tokens: usize,
-    /// Optimistically drafted tokens discarded after rejection, EOS, or completion.
-    pub discarded_optimistic_tokens: usize,
-    /// Optimistic continuation blocks discarded after rejection, EOS, or completion.
-    pub discarded_optimistic_blocks: usize,
-    /// Target bonus tokens emitted while an optimistic branch existed.
-    pub optimistic_target_bonus_tokens: usize,
-    /// Non-terminal target bonuses matching the first optimistic token.
-    pub optimistic_bonus_matches: usize,
-    /// Non-terminal target bonuses differing from the first optimistic token.
-    pub optimistic_bonus_mismatches: usize,
-    /// Whether deterministic cost accounting disabled further optimistic branches.
-    pub adaptive_lookahead_disabled: bool,
-    /// Host wall time spent producing optional same-request branches.
-    pub optimistic_draft_time: Duration,
-    /// Host wall time from target submission until verification resolution began.
-    ///
-    /// This interval includes any deliberately overlapped scheduler work.
-    pub verification_in_flight_time: Duration,
-    /// Whether architecture component timings were collected for this request.
-    pub component_timings_collected: bool,
-    /// Device execution time spent encoding committed target context and
-    /// projecting it into assistant K/V state.
-    pub draft_context_time: Duration,
-    /// Device execution time spent executing assistant proposal blocks.
-    pub draft_assistant_time: Duration,
-    /// Device execution time spent projecting proposal states to vocabulary logits.
-    pub draft_head_time: Duration,
-    /// Device execution time spent executing target verification passes.
-    pub target_verification_time: Duration,
-    /// Scheduler operations performed for this request.
-    pub scheduler_turns: usize,
-    /// Times this request was drafted while another request had target work in flight.
-    pub cross_request_draft_opportunities: usize,
-    /// Wall-clock generation duration.
-    pub elapsed: Duration,
-}
-
 /// Component timings accumulated by an architecture-specific MTP backend.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MtpComponentTimings {
@@ -421,52 +361,9 @@ impl MtpComponentTimingEvaluations {
     }
 }
 
-/// Aggregate bounded-scheduler telemetry.
-#[derive(Debug, Clone, Default)]
-pub struct MtpSchedulerStats {
-    /// Relationship between the scheduler's target and draft streams.
-    pub stream_topology: SpeculativeExecutionTopology,
-    /// Total scheduler operations.
-    pub turns: usize,
-    /// Draft turns performed for a request while another request was being verified.
-    pub cross_request_draft_opportunities: usize,
-    /// Maximum simultaneously retained target verification transactions.
-    pub peak_in_flight_verifications: usize,
-    /// Maximum simultaneously retained optimistic draft branches.
-    pub peak_optimistic_branches: usize,
-}
-
-/// Completed independently progressing text batch.
-#[derive(Debug, Clone, Default)]
-pub struct MtpBatchOutput {
-    /// Generated token ids in original batch-lane order.
-    pub token_ids: Vec<Vec<u32>>,
-    /// Per-lane speculative statistics in the same order.
-    pub stats: Vec<MtpStats>,
-    /// Aggregate fair-scheduler telemetry.
-    pub scheduler: MtpSchedulerStats,
-}
-
-impl MtpStats {
-    /// Fraction of proposed tokens accepted by the target.
-    pub fn accept_rate(&self) -> f64 {
-        if self.draft_tokens == 0 {
-            0.0
-        } else {
-            self.accepted_tokens as f64 / self.draft_tokens as f64
-        }
-    }
-}
-
-struct DraftBlock<D> {
-    state: D,
-    proposals: Vec<SpeculativeProposal<Array>>,
-}
-
-struct OptimisticBranch<D> {
-    block: DraftBlock<D>,
-    assumed_prefix: Vec<u32>,
-}
+type DraftBlock<D> = SpeculativeDraftBlock<D, Array>;
+type OptimisticBranch<D> = SpeculativeOptimisticBranch<D, Array>;
+type InFlight<B> = PendingSpeculativeVerification<B, Array>;
 
 /// MLX-associated types required by the facade's sampling loop.
 ///
@@ -494,17 +391,6 @@ impl<'a, T> MlxSpeculativeRuntime<'a> for T where
             Error = Exception,
         > + 'a
 {
-}
-
-struct InFlight<B: SpeculativeExecutor> {
-    // Drop exact completion before the retained verification output so early
-    // scheduler destruction cannot release backend resources still in use.
-    completion: B::Completion,
-    verification: B::Verification,
-    checkpoint: B::CacheCheckpoint,
-    block: DraftBlock<B::DraftState>,
-    optimistic: Option<OptimisticBranch<B::DraftState>>,
-    submitted: Instant,
 }
 
 /// Forkable decoded-output state used while resolving a target transaction.
@@ -546,82 +432,43 @@ impl SpeculativeConstraint for MlxSemanticConstraint {
     }
 }
 
-struct CommittedOutputRuntime<'a, S> {
-    sampler: MlxSpeculativeSampling<S>,
-    sequence: GenerationSequence,
-    semantic: MlxSemanticConstraint,
+struct MlxOutputPublisher<'a> {
     on_token: Box<dyn FnMut(u32) -> Result<(), Exception> + 'a>,
     on_event: Option<Box<dyn FnMut(SemanticEvent) + 'a>>,
-    cancellation: GenerationCancellationToken,
 }
 
-impl<'a, S> CommittedOutputRuntime<'a, S> {
-    fn plain<F>(sampler: S, config: &MtpConfig, on_token: F) -> Self
-    where
-        F: FnMut(u32) -> Result<(), Exception> + 'a,
-    {
-        Self {
-            sampler: MlxSpeculativeSampling::new(sampler),
-            sequence: GenerationSequence::new(
-                config.max_tokens,
-                config.eos_token_ids.iter().copied(),
-            ),
-            semantic: MlxSemanticConstraint(None),
-            on_token: Box::new(on_token),
-            on_event: None,
-            cancellation: GenerationCancellationToken::new(),
-        }
-    }
+impl SpeculativePublisher<MlxSemanticConstraint> for MlxOutputPublisher<'_> {
+    type Error = Exception;
 
-    fn semantic_cancellable<F>(
-        sampler: S,
-        config: &MtpConfig,
-        semantic: Box<dyn MtpSemanticState>,
-        cancellation: GenerationCancellationToken,
-        on_event: F,
-    ) -> Self
-    where
-        F: FnMut(SemanticEvent) + 'a,
-    {
-        Self {
-            sampler: MlxSpeculativeSampling::new(sampler),
-            sequence: GenerationSequence::new(
-                config.max_tokens,
-                config.eos_token_ids.iter().copied(),
-            ),
-            semantic: MlxSemanticConstraint(Some(semantic)),
-            on_token: Box::new(|_| Ok(())),
-            on_event: Some(Box::new(on_event)),
-            cancellation,
-        }
-    }
-
-    fn publish(&mut self, tokens: &[u32]) -> Result<bool, Exception> {
+    fn publish_committed(
+        &mut self,
+        constraint: &mut MlxSemanticConstraint,
+        tokens: &[u32],
+        cancellation: &GenerationCancellationToken,
+        sequence_finished: bool,
+    ) -> Result<bool, Self::Error> {
         for &token in tokens {
             (self.on_token)(token)?;
         }
         let mut cancellation_won = false;
-        if let (Some(semantic), Some(on_event)) = (&mut self.semantic.0, &mut self.on_event) {
+        if let (Some(semantic), Some(on_event)) = (&mut constraint.0, &mut self.on_event) {
             for event in semantic.take_events() {
                 on_event(event);
-                if self.cancellation.is_cancelled() && !self.sequence.is_finished() {
+                if cancellation.is_cancelled() && !sequence_finished {
                     cancellation_won = true;
                     break;
                 }
             }
         }
-        cancellation_won |= self.cancellation.is_cancelled() && !self.sequence.is_finished();
-        if cancellation_won {
-            self.cancel()?;
-        }
+        cancellation_won |= cancellation.is_cancelled() && !sequence_finished;
         Ok(cancellation_won)
     }
 
-    fn cancel(&mut self) -> Result<(), Exception> {
-        if !self.sequence.cancel() {
-            return Ok(());
-        }
-        if let (Some(semantic), Some(on_event)) = (&mut self.semantic.0, &mut self.on_event) {
+    fn publish_cancelled(
+        &mut self,
+        constraint: &mut MlxSemanticConstraint,
+    ) -> Result<(), Self::Error> {
+        if let (Some(semantic), Some(on_event)) = (&mut constraint.0, &mut self.on_event) {
             semantic.cancel()?;
             for event in semantic.take_events() {
                 on_event(event);
@@ -631,12 +478,54 @@ impl<'a, S> CommittedOutputRuntime<'a, S> {
     }
 }
 
-enum OptimisticBonusTransition<D> {
-    NotPresent,
-    MatchedRetained(DraftBlock<D>),
-    MatchedConsumed,
-    Mismatched,
-    Terminal,
+type CommittedOutputRuntime<'a, S> = SpeculativeOutputRuntime<
+    MlxSpeculativeSampling<S>,
+    MlxSemanticConstraint,
+    MlxOutputPublisher<'a>,
+>;
+
+fn plain_runtime<'a, S, F>(
+    sampler: S,
+    config: &MtpConfig,
+    on_token: F,
+) -> CommittedOutputRuntime<'a, S>
+where
+    S: SpeculativeSampler + Clone,
+    F: FnMut(u32) -> Result<(), Exception> + 'a,
+{
+    SpeculativeOutputRuntime::new(
+        MlxSpeculativeSampling::new(sampler),
+        GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied()),
+        MlxSemanticConstraint(None),
+        MlxOutputPublisher {
+            on_token: Box::new(on_token),
+            on_event: None,
+        },
+        GenerationCancellationToken::new(),
+    )
+}
+
+fn semantic_runtime<'a, S, F>(
+    sampler: S,
+    config: &MtpConfig,
+    semantic: Box<dyn MtpSemanticState>,
+    cancellation: GenerationCancellationToken,
+    on_event: F,
+) -> CommittedOutputRuntime<'a, S>
+where
+    S: SpeculativeSampler + Clone,
+    F: FnMut(SemanticEvent) + 'a,
+{
+    SpeculativeOutputRuntime::new(
+        MlxSpeculativeSampling::new(sampler),
+        GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied()),
+        MlxSemanticConstraint(Some(semantic)),
+        MlxOutputPublisher {
+            on_token: Box::new(|_| Ok(())),
+            on_event: Some(Box::new(on_event)),
+        },
+        cancellation,
+    )
 }
 
 struct ScheduledRequest<'a, B: SpeculativeExecutor, S> {
@@ -735,7 +624,7 @@ where
     where
         F: FnMut(u32) -> Result<(), Exception> + 'a,
     {
-        let runtime = CommittedOutputRuntime::plain(sampler, &config, on_token);
+        let runtime = plain_runtime(sampler, &config, on_token);
         self.submit_runtime(cache, input, config, prng_key, runtime)
     }
 
@@ -783,13 +672,7 @@ where
     where
         F: FnMut(SemanticEvent) + 'a,
     {
-        let runtime = CommittedOutputRuntime::semantic_cancellable(
-            sampler,
-            &config,
-            semantic,
-            cancellation,
-            on_event,
-        );
+        let runtime = semantic_runtime(sampler, &config, semantic, cancellation, on_event);
         self.submit_runtime(cache, input, config, prng_key, runtime)
     }
 
@@ -804,7 +687,7 @@ where
         validate_config(self.backend, &config, prng_key.as_ref())?;
         let id = MtpRequestId::new(self.requests.len());
         let started = Instant::now();
-        if runtime.cancellation.is_cancelled() {
+        if runtime.cancellation().is_cancelled() {
             runtime.cancel()?;
             self.requests.push(ScheduledRequest {
                 id,
@@ -826,7 +709,7 @@ where
             });
             return Ok(id);
         }
-        if runtime.sequence.is_finished() {
+        if runtime.sequence().is_finished() {
             self.requests.push(ScheduledRequest {
                 id,
                 cache,
@@ -880,8 +763,9 @@ where
                 let prefill = self.backend.prefill(input, request.cache, self.streams)?;
                 request.stats.target_tokens = prefill.evaluated_tokens;
                 request.stats.scheduler_turns = 1;
-                let mut sampler = request.runtime.sampler.clone();
-                let mut semantic = request.runtime.semantic.fork()?;
+                let mut sampler = request.runtime.sampler().clone();
+                let mut semantic = request.runtime.constraint().fork()?;
+                let mut sequence = request.runtime.sequence().clone();
                 let mut target_prng = request.target_prng.clone();
                 let first_logits = sampler.process_logits(
                     &prefill.logits,
@@ -909,9 +793,7 @@ where
                 } else {
                     sampler.grammar_is_complete()?
                 };
-                let reason = request
-                    .runtime
-                    .sequence
+                let reason = sequence
                     .commit(
                         first,
                         TokenTerminalSignals {
@@ -924,10 +806,11 @@ where
                 if let Some(reason) = reason {
                     semantic.finish(reason)?;
                 }
-                request.runtime.sampler = sampler;
-                request.runtime.semantic = semantic;
+                request
+                    .runtime
+                    .install_committed_state(sampler, semantic, sequence);
                 request.target_prng = target_prng;
-                let cancelled = request.runtime.publish(&[first])?;
+                let cancelled = request.runtime.publish_committed(&[first])?;
                 request.stats.emitted_tokens = 1;
                 request.target_state = Some(prefill.state);
                 let next = if cancelled {
@@ -998,7 +881,7 @@ where
             .requests
             .iter()
             .filter(|request| {
-                request.runtime.cancellation.is_cancelled() && !request.lifecycle.is_terminal()
+                request.runtime.cancellation().is_cancelled() && !request.lifecycle.is_terminal()
             })
             .map(|request| request.id)
             .collect::<Vec<_>>();
@@ -1060,12 +943,13 @@ where
                 .into_iter()
                 .map(|request| {
                     let runtime = request.runtime;
-                    let finish_reason = runtime.sequence.finish_reason();
+                    let (sampler, sequence, _, _) = runtime.into_parts();
+                    let finish_reason = sequence.finish_reason();
                     MtpRequestOutput {
                         id: request.id,
-                        token_ids: runtime.sequence.into_tokens(),
+                        token_ids: sequence.into_tokens(),
                         stats: request.stats,
-                        sampler: runtime.sampler.into_inner(),
+                        sampler: sampler.into_inner(),
                         finish_reason,
                         #[cfg(test)]
                         cancelled: request.lifecycle.phase() == MtpRequestPhase::Cancelled,
@@ -1095,7 +979,7 @@ where
                 request
                     .in_flight
                     .as_ref()
-                    .is_some_and(|flight| flight.optimistic.is_some())
+                    .is_some_and(PendingSpeculativeVerification::has_optimistic_branch)
             })
             .count()
     }
@@ -1108,7 +992,7 @@ where
             request
                 .config
                 .max_tokens
-                .saturating_sub(request.runtime.sequence.tokens().len()),
+                .saturating_sub(request.runtime.sequence().tokens().len()),
         );
         if target_count == 0 {
             request.transition(MtpRequestPhase::Completed)?;
@@ -1121,7 +1005,7 @@ where
         } else {
             let last = *request
                 .runtime
-                .sequence
+                .sequence()
                 .tokens()
                 .last()
                 .expect("prefill emitted a token");
@@ -1152,15 +1036,16 @@ where
             target_count - block.proposals.len()
         };
         if additional > 0 {
-            let mut history =
-                Vec::with_capacity(request.runtime.sequence.tokens().len() + block.proposals.len());
-            history.extend_from_slice(request.runtime.sequence.tokens());
+            let mut history = Vec::with_capacity(
+                request.runtime.sequence().tokens().len() + block.proposals.len(),
+            );
+            history.extend_from_slice(request.runtime.sequence().tokens());
             history.extend(block.proposals.iter().map(|proposal| proposal.token));
             let previous = block.proposals.last().map_or_else(
                 || {
                     *request
                         .runtime
-                        .sequence
+                        .sequence()
                         .tokens()
                         .last()
                         .expect("prefill emitted a token")
@@ -1169,7 +1054,7 @@ where
             );
             let proposals = propose_block(
                 self.backend,
-                &request.runtime.sampler,
+                request.runtime.sampler(),
                 &mut block.state,
                 previous,
                 additional,
@@ -1200,35 +1085,17 @@ where
             .block
             .take()
             .expect("verification-ready request has a draft block");
-        if block.proposals.is_empty() {
-            return Err(Exception::custom(
-                "cannot submit an empty MTP verification block",
-            ));
-        }
-        let mut verify_ids = Vec::with_capacity(block.proposals.len() + 1);
-        verify_ids.push(
-            *request
-                .runtime
-                .sequence
-                .tokens()
-                .last()
-                .expect("prefill emitted a token"),
-        );
-        verify_ids.extend(block.proposals.iter().map(|proposal| proposal.token));
-        let checkpoint = B::checkpoint(request.cache);
-        let submission =
-            self.backend
-                .submit_verification(&verify_ids, request.cache, self.streams)?;
-        let submitted = Instant::now();
-        request.stats.target_tokens += verify_ids.len();
-        request.in_flight = Some(InFlight {
-            completion: submission.completion,
-            verification: submission.output,
-            checkpoint,
-            block,
-            optimistic: None,
-            submitted,
-        });
+        let last = *request
+            .runtime
+            .sequence()
+            .tokens()
+            .last()
+            .expect("prefill emitted a token");
+        let pending =
+            submit_verification_transaction(self.backend, request.cache, last, block, self.streams)
+                .map_err(speculative_driver_error)?;
+        request.stats.target_tokens += pending.submitted_tokens();
+        request.in_flight = Some(pending);
         request.transition(MtpRequestPhase::TargetVerificationInFlight)?;
         self.stats.peak_in_flight_verifications = self
             .stats
@@ -1242,23 +1109,23 @@ where
         let Some(flight) = request.in_flight.as_ref() else {
             return Ok(false);
         };
-        let assumed_len = request.runtime.sequence.tokens().len() + flight.block.proposals.len();
+        let block = flight.block();
+        let assumed_len = request.runtime.sequence().tokens().len() + block.proposals.len();
         let mut assumed_prefix = Vec::with_capacity(assumed_len);
-        assumed_prefix.extend_from_slice(request.runtime.sequence.tokens());
-        assumed_prefix.extend(flight.block.proposals.iter().map(|proposal| proposal.token));
+        assumed_prefix.extend_from_slice(request.runtime.sequence().tokens());
+        assumed_prefix.extend(block.proposals.iter().map(|proposal| proposal.token));
         Ok(self.backend.supports_exact_optimistic_promotion()
             && request
                 .runtime
-                .sampler
+                .sampler()
                 .supports_exact_optimistic_promotion()
             && !request.stats.adaptive_lookahead_disabled
-            && !flight.block.proposals.is_empty()
+            && !block.proposals.is_empty()
             && !request
                 .runtime
-                .sampler
+                .sampler()
                 .prefix_is_complete(&assumed_prefix)?
-            && !flight
-                .block
+            && !block
                 .proposals
                 .last()
                 .is_some_and(|proposal| {
@@ -1279,25 +1146,25 @@ where
             .in_flight
             .as_mut()
             .expect("optimistic request has an in-flight verification");
-        let assumed_len = request.runtime.sequence.tokens().len() + flight.block.proposals.len();
+        let block = flight.block();
+        let assumed_len = request.runtime.sequence().tokens().len() + block.proposals.len();
         let count = request
             .config
             .max_draft_tokens
             .min(backend_limit)
             .min(request.config.max_tokens.saturating_sub(assumed_len));
-        let mut state = flight.block.state.clone();
-        let last = flight
-            .block
+        let mut state = block.state.clone();
+        let last = block
             .proposals
             .last()
             .expect("optimistic block has an assumed token")
             .token;
         let mut history = Vec::with_capacity(assumed_len);
-        history.extend_from_slice(request.runtime.sequence.tokens());
-        history.extend(flight.block.proposals.iter().map(|proposal| proposal.token));
+        history.extend_from_slice(request.runtime.sequence().tokens());
+        history.extend(block.proposals.iter().map(|proposal| proposal.token));
         let proposals = propose_block(
             self.backend,
-            &request.runtime.sampler,
+            request.runtime.sampler(),
             &mut state,
             last,
             count,
@@ -1311,10 +1178,12 @@ where
         request.stats.optimistic_draft_tokens += proposals.len();
         request.stats.optimistic_draft_blocks += 1;
         request.stats.optimistic_draft_time += started.elapsed();
-        flight.optimistic = Some(OptimisticBranch {
-            block: DraftBlock { state, proposals },
-            assumed_prefix: history,
-        });
+        flight
+            .set_optimistic_branch(OptimisticBranch {
+                block: DraftBlock { state, proposals },
+                assumed_prefix: history,
+            })
+            .map_err(|error| Exception::custom(error.to_string()))?;
         request.transition(MtpRequestPhase::OptimisticDraftReady)?;
         self.stats.peak_optimistic_branches = self
             .stats
@@ -1327,212 +1196,59 @@ where
         self.record_turn(index);
         let request = &mut self.requests[index];
         request.transition(MtpRequestPhase::VerificationResolution)?;
-        let mut flight = request
+        let flight = request
             .in_flight
             .take()
             .expect("resolving request has an in-flight verification");
-        flight.completion.wait()?;
-        self.backend
-            .take_verification_telemetry(&mut flight.verification)?
-            .add_to(&mut request.stats);
-        request.stats.verification_in_flight_time += flight.submitted.elapsed();
-        let DraftBlock { state, proposals } = flight.block;
-
-        if request.lifecycle.cancellation_pending() || request.runtime.cancellation.is_cancelled() {
-            discard_optimistic(&mut request.stats, flight.optimistic.take());
-            let commit = self.backend.commit_verification(
-                flight.verification,
-                state,
+        if request.lifecycle.cancellation_pending() || request.runtime.cancellation().is_cancelled()
+        {
+            let (mut stats, telemetry) = cancel_pending_verification(
+                self.backend,
                 request.cache,
-                flight.checkpoint,
-                1,
+                flight,
+                &mut request.runtime,
+                request.stats.clone(),
                 self.streams,
-            )?;
-            request.stats.target_tokens += commit.replayed_tokens;
-            request.runtime.cancel()?;
+            )
+            .map_err(speculative_driver_error)?;
+            telemetry.add_to(&mut stats);
+            request.stats = stats;
             request.transition(MtpRequestPhase::Cancelled)?;
             request.stats.elapsed = request.started.elapsed();
             return Ok(());
         }
-
-        let mut tentative_stats = request.stats.clone();
-        let proposal_count = proposals.len();
-        let mut canonical_proposal_prefix = request.runtime.sequence.tokens().to_vec();
-        canonical_proposal_prefix.extend(proposals.iter().map(|proposal| proposal.token));
-        let resolved = resolve_round::<B, MlxSpeculativeSampling<S>, MlxSemanticConstraint>(
-            &flight.verification,
-            proposals,
-            &request.runtime.sampler,
-            &request.runtime.sequence,
-            &request.runtime.semantic,
+        let mut published = resolve_commit_and_publish(
+            self.backend,
+            request.cache,
+            flight,
+            &mut request.runtime,
             request.target_prng.as_ref(),
             request.config.temperature,
+            request.stats.clone(),
+            self.schedule.options(),
             self.streams,
         )
         .map_err(speculative_driver_error)?;
-        let mut bonus_transition = OptimisticBonusTransition::NotPresent;
-        if let Some(chosen) = resolved.bonus_token {
-            if let Some(branch) = flight.optimistic.take() {
-                bonus_transition = resolve_optimistic_bonus(
-                    branch,
-                    &canonical_proposal_prefix,
-                    chosen,
-                    resolved.finish_reason.is_some(),
-                    &mut tentative_stats,
-                )?;
+        published.telemetry.add_to(&mut published.stats);
+        request.target_state = Some(published.target_state);
+        request.target_prng = published.target_randomness;
+        request.stats = published.stats;
+        match published.status {
+            SpeculativePublicationStatus::Continue(continuation) => {
+                request.block = continuation.into_block();
+                request.transition(MtpRequestPhase::ReadyToDraft)?;
             }
-        }
-        let accepted = resolved.accepted_proposals;
-        let committed_tokens = resolved.committed_tokens;
-        let verified_inputs = resolved.verified_inputs;
-        let terminal = resolved.finish_reason;
-        tentative_stats.accepted_tokens += accepted;
-        tentative_stats.accept_lens.push(accepted);
-        tentative_stats.rounds += 1;
-        let commit = self.backend.commit_verification(
-            flight.verification,
-            state,
-            request.cache,
-            flight.checkpoint,
-            verified_inputs,
-            self.streams,
-        )?;
-        tentative_stats.target_tokens += commit.replayed_tokens;
-        request.target_state = Some(commit.state);
-        request.runtime.sampler = resolved.sampler;
-        request.runtime.semantic = resolved.constraint;
-        request.runtime.sequence = resolved.sequence;
-        request.target_prng = resolved.target_randomness;
-        tentative_stats.emitted_tokens += committed_tokens.len();
-        request.stats = tentative_stats;
-        let cancelled = request.runtime.publish(&committed_tokens)?;
-
-        if cancelled {
-            discard_optimistic(&mut request.stats, flight.optimistic.take());
-            request.transition(MtpRequestPhase::Cancelled)?;
-            request.stats.elapsed = request.started.elapsed();
-            return Ok(());
-        }
-
-        if terminal.is_some() {
-            discard_optimistic(&mut request.stats, flight.optimistic.take());
-            request.transition(MtpRequestPhase::Completed)?;
-            request.stats.elapsed = request.started.elapsed();
-        } else if accepted == proposal_count {
-            match bonus_transition {
-                OptimisticBonusTransition::MatchedRetained(block) => {
-                    request.stats.draft_tokens += block.proposals.len();
-                    request.stats.reused_optimistic_tokens += block.proposals.len();
-                    request.stats.reused_optimistic_blocks += 1;
-                    request.block = Some(block);
-                    // Refill the shortened block through the canonical draft
-                    // phase. This preserves ordinary verification boundaries
-                    // and target-RNG consumption without recomputing retained
-                    // tokens or distributions.
-                    request.transition(MtpRequestPhase::ReadyToDraft)?;
-                }
-                OptimisticBonusTransition::MatchedConsumed
-                | OptimisticBonusTransition::Mismatched
-                | OptimisticBonusTransition::NotPresent => {
-                    request.transition(MtpRequestPhase::ReadyToDraft)?;
-                }
-                OptimisticBonusTransition::Terminal => {
-                    return Err(Exception::custom(
-                        "terminal optimistic bonus did not complete its request",
-                    ));
-                }
+            SpeculativePublicationStatus::Completed => {
+                request.transition(MtpRequestPhase::Completed)?;
+                request.stats.elapsed = request.started.elapsed();
             }
-            update_adaptive_lookahead(&mut request.stats, self.schedule.options());
-        } else {
-            discard_optimistic(&mut request.stats, flight.optimistic.take());
-            update_adaptive_lookahead(&mut request.stats, self.schedule.options());
-            request.transition(MtpRequestPhase::ReadyToDraft)?;
+            SpeculativePublicationStatus::Cancelled => {
+                request.transition(MtpRequestPhase::Cancelled)?;
+                request.stats.elapsed = request.started.elapsed();
+            }
         }
         Ok(())
     }
-}
-
-fn resolve_optimistic_bonus<D>(
-    branch: OptimisticBranch<D>,
-    canonical_prefix: &[u32],
-    bonus: u32,
-    terminal: bool,
-    stats: &mut MtpStats,
-) -> Result<OptimisticBonusTransition<D>, Exception> {
-    let optimistic_tokens = branch
-        .block
-        .proposals
-        .iter()
-        .map(|proposal| proposal.token)
-        .collect::<Vec<_>>();
-    let decision = resolve_optimistic_reuse(
-        &branch.assumed_prefix,
-        canonical_prefix,
-        &optimistic_tokens,
-        bonus,
-        terminal,
-    )
-    .map_err(|error| Exception::custom(error.to_string()))?;
-    stats.optimistic_target_bonus_tokens += 1;
-    if decision == OptimisticReuseDecision::DiscardTerminal {
-        discard_optimistic(stats, Some(branch));
-        return Ok(OptimisticBonusTransition::Terminal);
-    }
-
-    let DraftBlock { state, proposals } = branch.block;
-    let drafted = proposals.len();
-    let mut proposals = proposals.into_iter();
-    let _matched_or_discarded = proposals
-        .next()
-        .expect("core rejected empty optimistic branch");
-    match decision {
-        OptimisticReuseDecision::DiscardMismatch => {
-            stats.optimistic_bonus_mismatches += 1;
-            stats.discarded_optimistic_tokens += drafted;
-            stats.discarded_optimistic_blocks += 1;
-            Ok(OptimisticBonusTransition::Mismatched)
-        }
-        OptimisticReuseDecision::MatchedConsumed => {
-            stats.optimistic_bonus_matches += 1;
-            stats.consumed_optimistic_tokens += 1;
-            Ok(OptimisticBonusTransition::MatchedConsumed)
-        }
-        OptimisticReuseDecision::MatchedRetained => {
-            stats.optimistic_bonus_matches += 1;
-            stats.consumed_optimistic_tokens += 1;
-            Ok(OptimisticBonusTransition::MatchedRetained(DraftBlock {
-                state,
-                proposals: proposals.collect(),
-            }))
-        }
-        OptimisticReuseDecision::DiscardTerminal => {
-            unreachable!("terminal decision returned before branch destruction")
-        }
-    }
-}
-
-fn discard_optimistic<D>(stats: &mut MtpStats, branch: Option<OptimisticBranch<D>>) {
-    if let Some(branch) = branch {
-        stats.discarded_optimistic_tokens += branch.block.proposals.len();
-        stats.discarded_optimistic_blocks += 1;
-    }
-}
-
-fn update_adaptive_lookahead(stats: &mut MtpStats, options: MtpSchedulerOptions) {
-    if !options.adaptive_lookahead
-        || stats.adaptive_lookahead_disabled
-        || stats.optimistic_draft_blocks < options.adaptive_lookahead_min_blocks
-    {
-        return;
-    }
-
-    // Retained proposals are branch work canonical execution did not need to
-    // recompute. Discarded proposals bought no reuse. The matched leading token
-    // is excluded from both because it is consumed as a target bonus rather
-    // than reused as a proposal. Adaptive disabling affects only future,
-    // optional draft work.
-    stats.adaptive_lookahead_disabled = stats.reused_optimistic_tokens == 0
-        || stats.reused_optimistic_tokens < stats.discarded_optimistic_tokens;
 }
 
 fn speculative_driver_error(error: SpeculativeDriverError<Exception>) -> Exception {
@@ -2822,9 +2538,9 @@ mod tests {
         let request = &scheduler.requests[id.index()];
 
         assert_eq!(events.borrow().len(), published_after_prefill);
-        assert_eq!(request.runtime.sequence.tokens(), &[1]);
-        assert_eq!(request.runtime.sampler.inner().committed, vec![1]);
-        assert_eq!(request.runtime.sampler.inner().process_calls, 1);
+        assert_eq!(request.runtime.sequence().tokens(), &[1]);
+        assert_eq!(request.runtime.sampler().inner().committed, vec![1]);
+        assert_eq!(request.runtime.sampler().inner().process_calls, 1);
     }
 
     #[test]
@@ -3425,7 +3141,7 @@ mod tests {
         }
 
         let request = &scheduler.requests[id.index()];
-        assert_eq!(request.runtime.sequence.tokens(), &[1, 2, 0, 0]);
+        assert_eq!(request.runtime.sequence().tokens(), &[1, 2, 0, 0]);
         assert_eq!(request.lifecycle.phase(), MtpRequestPhase::ReadyToDraft);
         let retained = request.block.as_ref().unwrap();
         assert_eq!(retained.proposals.len(), 1);
@@ -4134,7 +3850,7 @@ mod tests {
             assumed_prefix: vec![1, 2],
         };
         let mut stats = MtpStats::default();
-        let error = resolve_optimistic_bonus(branch, &[1, 0], 0, false, &mut stats)
+        let error = resolve_optimistic_branch(Some(branch), &[1, 0], Some(0), false, &mut stats)
             .err()
             .unwrap();
 
@@ -4474,7 +4190,7 @@ mod tests {
             discarded_optimistic_tokens: 2,
             ..MtpStats::default()
         };
-        update_adaptive_lookahead(&mut profitable, options);
+        profitable.update_adaptive_lookahead(options);
         assert!(!profitable.adaptive_lookahead_disabled);
 
         let mut unprofitable = MtpStats {
@@ -4483,25 +4199,22 @@ mod tests {
             discarded_optimistic_tokens: 2,
             ..MtpStats::default()
         };
-        update_adaptive_lookahead(&mut unprofitable, options);
+        unprofitable.update_adaptive_lookahead(options);
         assert!(unprofitable.adaptive_lookahead_disabled);
 
         let mut no_reuse = MtpStats {
             optimistic_draft_blocks: 4,
             ..MtpStats::default()
         };
-        update_adaptive_lookahead(&mut no_reuse, options);
+        no_reuse.update_adaptive_lookahead(options);
         assert!(no_reuse.adaptive_lookahead_disabled);
 
         let mut disabled_policy = unprofitable.clone();
         disabled_policy.adaptive_lookahead_disabled = false;
-        update_adaptive_lookahead(
-            &mut disabled_policy,
-            MtpSchedulerOptions {
-                adaptive_lookahead: false,
-                ..options
-            },
-        );
+        disabled_policy.update_adaptive_lookahead(MtpSchedulerOptions {
+            adaptive_lookahead: false,
+            ..options
+        });
         assert!(!disabled_policy.adaptive_lookahead_disabled);
     }
 }

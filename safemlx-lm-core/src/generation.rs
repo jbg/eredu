@@ -791,6 +791,9 @@ pub enum GenerationError {
     /// An optimistic branch contained no proposals.
     #[error("optimistic proposal branch is empty")]
     EmptyOptimisticBranch,
+    /// A second optimistic branch was installed for one target transaction.
+    #[error("speculative verification already retains an optimistic branch")]
+    OptimisticBranchAlreadyPresent,
     /// No assistant proposal may be generated per round.
     #[error("MTP max_draft_tokens must be positive")]
     ZeroDraftTokens,

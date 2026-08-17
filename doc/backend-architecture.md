@@ -28,7 +28,8 @@ Core owns concepts whose meaning does not depend on tensor representation:
 - generation configuration validation, committed-token sequencing, terminal
   precedence, cancellation, finish reasons, semantic output events, and
   speculative proposal generation, target acceptance/replacement, verification
-  commit plans, and fair speculative action selection;
+  commit plans, fair speculative action selection, exact request transactions,
+  optimistic continuation promotion/discard, and speculative telemetry;
 - queue fairness, request/work lifecycle, transactional branch commit/discard,
   exact-completion observation, cancellation, abandonment, and capacity;
 - backend/device descriptors and fail-closed capability discovery;
@@ -120,11 +121,24 @@ indexing, random tensors, or residual arithmetic. `propose_block` and
 `resolve_round` own proposal sequencing, stochastic accept/reject flow,
 replacement and bonus bookkeeping, grammar and terminal precedence, and the
 transactional state fork. `SpeculativeSchedule` owns bounded fair action
-selection across requests. `MlxSpeculativeSampling` maps those operations to
-MLX arrays, position-stable PRNG keys, target/draft streams, cross-device
-distribution transfer, probability ratios, and residual sampling. The facade
-scheduler retains callbacks and concrete resources but contains no duplicate
-sampling or action-selection algorithm.
+selection across requests. `PendingSpeculativeVerification` retains the exact
+completion, verification output, cache checkpoint, canonical draft block, and
+optional optimistic branch as one transaction. `resolve_commit_and_publish`
+waits for that exact completion, resolves portable sampling decisions, commits
+the backend cache, promotes or discards optimistic state, and only then exposes
+committed tokens. `SpeculativeOutputRuntime` is the sole canonical sampler,
+constraint, sequence, cancellation, and output-publication state. Its
+`SpeculativePublisher` adapter is a semantic sink rather than a scheduler: it
+cannot commit caches or choose which branch becomes canonical.
+
+`MlxSpeculativeSampling` maps sampling operations to MLX arrays,
+position-stable PRNG keys, target/draft streams, cross-device distribution
+transfer, probability ratios, and residual sampling. `MlxOutputPublisher`
+invokes concrete token callbacks and drains decoded semantic events after core
+authorizes publication. MLX component timings are returned as opaque executor
+telemetry and folded into the core-owned `MtpStats`. The facade contains no
+parallel in-flight transaction, optimistic promotion, cache-commit, callback
+ordering, or telemetry state machine.
 
 The public `api::load_model_with_options` route performs format, architecture,
 catalog, and policy planning in core before calling `Backend::prepare_model`.
@@ -201,7 +215,8 @@ The current boundary leaves these components MLX-coupled:
   observation, MLX allocator sampling, and Metal/CUDA kernels. Speculative
   proposal sequencing, stochastic acceptance flow, replacement/bonus
   bookkeeping, optimistic-prefix reuse, fair action selection, cache-retention
-  counts, token budgets, and terminal precedence are core-owned.
+  counts, cache-commit/publication ordering, request telemetry, token budgets,
+  and terminal precedence are core-owned.
 
 The former facade `runtime::residency::policy` module was deleted. It was not
 retained as a forwarding namespace. The earlier placeholder core
@@ -307,9 +322,14 @@ while its MLX implementations retain concrete arrays, streams, assistant state,
 cache transactions, and events. `SpeculativeSampling`, `propose_block`, and
 `resolve_round` make the sampling algorithm backend-neutral while keeping
 opaque distribution math in the adapter. `SpeculativeSchedule` selects the
-same bounded fair actions for any backend. The former facade acceptance loop,
-fair selector, probability helpers, `MtpBackend`, `MtpPrefill`, and `MtpCommit`
-definitions were deleted rather than retained as wrappers.
+same bounded fair actions for any backend. The core request coordinator owns
+retained verification resources, optimistic branch promotion/discard,
+cache-commit-before-publication ordering, cancellation at an exact safe
+boundary, and speculative request/scheduler telemetry. The former facade
+acceptance loop, fair selector, probability helpers, request transaction,
+optimistic transition, callback coordinator, telemetry definitions,
+`MtpBackend`, `MtpPrefill`, and `MtpCommit` definitions were deleted rather
+than retained as wrappers.
 
 Checkpoint sampling recommendations, request overrides, resolved sampler
 settings, MTP configuration, scheduler limits, request identity, and request
@@ -336,7 +356,9 @@ after that transaction reaches its exact safe boundary.
    verification, context, and completion types and materialize portable token
    ids only inside that adapter. Implement `SpeculativeSampling` with opaque
    logits, distributions, and random state so the core proposal and resolution
-   drivers can be reused unchanged.
+   drivers can be reused unchanged. Implement `SpeculativePublisher` as a thin
+   output sink; do not repeat transaction, promotion, cache-commit, or callback
+   sequencing outside core.
 6. Add explicit transfer/collective support only when the backend implements
    exact ownership and synchronization semantics. For distributed scheduling,
    implement `ConsensusTransport` over a topology-wide, rank-ordered word

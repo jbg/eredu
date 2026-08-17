@@ -3,11 +3,12 @@
 use crate::{
     backend::{Completion, Submission},
     generation::{
-        FinishReason, GenerationError, GenerationSequence, MtpRequestPhase, MtpSchedulerOptions,
-        SpeculativeRound, TokenTerminalSignals,
+        FinishReason, GenerationCancellationToken, GenerationError, GenerationSequence,
+        MtpRequestPhase, MtpSchedulerOptions, SpeculativeRound, TokenTerminalSignals,
     },
 };
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 /// Relationship between target and assistant execution placements.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -30,6 +31,116 @@ impl std::fmt::Display for SpeculativeExecutionTopology {
             Self::CrossDeviceSplit => "cross-device-split",
         })
     }
+}
+
+/// Statistics collected from one speculative sequence.
+#[derive(Debug, Clone, Default)]
+pub struct MtpStats {
+    /// Relationship between the request's target and draft execution placements.
+    pub stream_topology: SpeculativeExecutionTopology,
+    /// Target tokens evaluated during prefill and verification.
+    pub target_tokens: usize,
+    /// Assistant tokens proposed.
+    pub draft_tokens: usize,
+    /// Assistant tokens accepted by target verification.
+    pub accepted_tokens: usize,
+    /// Number of target verification rounds.
+    pub rounds: usize,
+    /// Accepted proposal count for each round.
+    pub accept_lens: Vec<usize>,
+    /// Tokens emitted, including a terminal EOS token when one is produced.
+    pub emitted_tokens: usize,
+    /// Tokens drafted on an optimistic continuation.
+    pub optimistic_draft_tokens: usize,
+    /// Optimistic continuation blocks drafted.
+    pub optimistic_draft_blocks: usize,
+    /// Optimistically drafted tokens promoted after full acceptance.
+    pub reused_optimistic_tokens: usize,
+    /// Optimistic continuation blocks promoted after full acceptance.
+    pub reused_optimistic_blocks: usize,
+    /// First optimistic tokens consumed by matching target bonuses.
+    pub consumed_optimistic_tokens: usize,
+    /// Optimistically drafted tokens discarded.
+    pub discarded_optimistic_tokens: usize,
+    /// Optimistic continuation blocks discarded.
+    pub discarded_optimistic_blocks: usize,
+    /// Target bonus tokens emitted while an optimistic branch existed.
+    pub optimistic_target_bonus_tokens: usize,
+    /// Non-terminal target bonuses matching the first optimistic token.
+    pub optimistic_bonus_matches: usize,
+    /// Non-terminal target bonuses differing from the first optimistic token.
+    pub optimistic_bonus_mismatches: usize,
+    /// Whether deterministic cost accounting disabled further optimistic branches.
+    pub adaptive_lookahead_disabled: bool,
+    /// Host wall time spent producing optional same-request branches.
+    pub optimistic_draft_time: Duration,
+    /// Host wall time retained target verification remained in flight.
+    pub verification_in_flight_time: Duration,
+    /// Whether architecture component timings were collected.
+    pub component_timings_collected: bool,
+    /// Device execution time spent encoding committed target context.
+    pub draft_context_time: Duration,
+    /// Device execution time spent executing assistant proposal blocks.
+    pub draft_assistant_time: Duration,
+    /// Device execution time spent projecting proposal states to logits.
+    pub draft_head_time: Duration,
+    /// Device execution time spent executing target verification passes.
+    pub target_verification_time: Duration,
+    /// Scheduler operations performed for this request.
+    pub scheduler_turns: usize,
+    /// Draft turns performed while another request had target work in flight.
+    pub cross_request_draft_opportunities: usize,
+    /// Wall-clock generation duration.
+    pub elapsed: Duration,
+}
+
+impl MtpStats {
+    /// Fraction of proposed tokens accepted by the target.
+    pub fn accept_rate(&self) -> f64 {
+        if self.draft_tokens == 0 {
+            0.0
+        } else {
+            self.accepted_tokens as f64 / self.draft_tokens as f64
+        }
+    }
+
+    /// Re-evaluates whether optional lookahead remains profitable.
+    pub fn update_adaptive_lookahead(&mut self, options: MtpSchedulerOptions) {
+        if !options.adaptive_lookahead
+            || self.adaptive_lookahead_disabled
+            || self.optimistic_draft_blocks < options.adaptive_lookahead_min_blocks
+        {
+            return;
+        }
+        self.adaptive_lookahead_disabled = self.reused_optimistic_tokens == 0
+            || self.reused_optimistic_tokens < self.discarded_optimistic_tokens;
+    }
+}
+
+/// Aggregate bounded-scheduler telemetry.
+#[derive(Debug, Clone, Default)]
+pub struct MtpSchedulerStats {
+    /// Relationship between scheduler target and draft placements.
+    pub stream_topology: SpeculativeExecutionTopology,
+    /// Total scheduler operations.
+    pub turns: usize,
+    /// Draft turns performed while another request was being verified.
+    pub cross_request_draft_opportunities: usize,
+    /// Maximum simultaneously retained target verification transactions.
+    pub peak_in_flight_verifications: usize,
+    /// Maximum simultaneously retained optimistic draft branches.
+    pub peak_optimistic_branches: usize,
+}
+
+/// Completed independently progressing text batch.
+#[derive(Debug, Clone, Default)]
+pub struct MtpBatchOutput {
+    /// Generated token ids in original batch-lane order.
+    pub token_ids: Vec<Vec<u32>>,
+    /// Per-lane speculative statistics in the same order.
+    pub stats: Vec<MtpStats>,
+    /// Aggregate fair-scheduler telemetry.
+    pub scheduler: MtpSchedulerStats,
 }
 
 /// Backend-owned first-token output and assistant seed state.
@@ -331,6 +442,95 @@ pub struct SpeculativeProposal<D> {
     pub distribution: D,
 }
 
+/// Backend-owned assistant state paired with a portable proposal sequence.
+pub struct SpeculativeDraftBlock<S, D> {
+    /// Assistant state after producing every proposal.
+    pub state: S,
+    /// Ordered proposed tokens and opaque distributions.
+    pub proposals: Vec<SpeculativeProposal<D>>,
+}
+
+/// Tentative continuation drafted against an assumed canonical prefix.
+pub struct SpeculativeOptimisticBranch<S, D> {
+    /// Backend-owned tentative draft block.
+    pub block: SpeculativeDraftBlock<S, D>,
+    /// Prefix against which the block was produced.
+    pub assumed_prefix: Vec<u32>,
+}
+
+/// Optimistic state retained after a committed target transaction.
+pub enum SpeculativeContinuation<S, D> {
+    /// No reusable proposal block remains.
+    None,
+    /// A matching branch may seed the next canonical round.
+    Promoted(SpeculativeDraftBlock<S, D>),
+}
+
+impl<S, D> SpeculativeContinuation<S, D> {
+    /// Returns the promoted block, when one exists.
+    pub fn into_block(self) -> Option<SpeculativeDraftBlock<S, D>> {
+        match self {
+            Self::None => None,
+            Self::Promoted(block) => Some(block),
+        }
+    }
+}
+
+/// Exact target verification resources retained through resolution.
+///
+/// Completion is declared first so it is dropped before the output and every
+/// resource reachable from it. Its destructor must preserve exact-completion
+/// safety when the scheduler itself is abandoned.
+pub struct PendingSpeculativeVerification<E, D>
+where
+    E: SpeculativeExecutor,
+{
+    completion: E::Completion,
+    verification: E::Verification,
+    checkpoint: E::CacheCheckpoint,
+    block: SpeculativeDraftBlock<E::DraftState, D>,
+    optimistic: Option<SpeculativeOptimisticBranch<E::DraftState, D>>,
+    submitted: Instant,
+    submitted_tokens: usize,
+}
+
+impl<E, D> PendingSpeculativeVerification<E, D>
+where
+    E: SpeculativeExecutor,
+{
+    /// Canonical block being verified.
+    pub const fn block(&self) -> &SpeculativeDraftBlock<E::DraftState, D> {
+        &self.block
+    }
+
+    /// Whether one optimistic continuation is retained.
+    pub const fn has_optimistic_branch(&self) -> bool {
+        self.optimistic.is_some()
+    }
+
+    /// Installs exactly one tentative optimistic branch.
+    pub fn set_optimistic_branch(
+        &mut self,
+        branch: SpeculativeOptimisticBranch<E::DraftState, D>,
+    ) -> Result<(), GenerationError> {
+        if self.optimistic.is_some() {
+            return Err(GenerationError::OptimisticBranchAlreadyPresent);
+        }
+        self.optimistic = Some(branch);
+        Ok(())
+    }
+
+    /// Number of target tokens submitted for verification.
+    pub const fn submitted_tokens(&self) -> usize {
+        self.submitted_tokens
+    }
+
+    /// Time elapsed since target submission.
+    pub fn elapsed(&self) -> Duration {
+        self.submitted.elapsed()
+    }
+}
+
 /// Transactional semantic state paired with committed token sequencing.
 pub trait SpeculativeConstraint: Sized {
     /// Structured backend error.
@@ -342,6 +542,137 @@ pub trait SpeculativeConstraint: Sized {
     fn push_token(&mut self, token: u32) -> Result<bool, Self::Error>;
     /// Stages terminal output.
     fn finish(&mut self, reason: FinishReason) -> Result<(), Self::Error>;
+}
+
+/// Backend adapter that publishes committed output and terminal cancellation.
+///
+/// The adapter may own callbacks and decoded semantic-event buffers, but core
+/// decides when publication is legal relative to exact cache commit.
+pub trait SpeculativePublisher<C> {
+    /// Structured backend error.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Publishes tokens and staged semantic output after cache commit.
+    ///
+    /// Returns `true` when cancellation was observed during publication.
+    fn publish_committed(
+        &mut self,
+        constraint: &mut C,
+        tokens: &[u32],
+        cancellation: &GenerationCancellationToken,
+        sequence_finished: bool,
+    ) -> Result<bool, Self::Error>;
+
+    /// Publishes the cancellation terminal state.
+    fn publish_cancelled(&mut self, constraint: &mut C) -> Result<(), Self::Error>;
+}
+
+/// Canonical speculative sampler, sequence, constraint, and output sink.
+pub struct SpeculativeOutputRuntime<S, C, P> {
+    sampler: S,
+    sequence: GenerationSequence,
+    constraint: C,
+    publisher: P,
+    cancellation: GenerationCancellationToken,
+}
+
+impl<S, C, P> SpeculativeOutputRuntime<S, C, P>
+where
+    S: SpeculativeSampling,
+    C: SpeculativeConstraint<Error = S::Error>,
+    P: SpeculativePublisher<C, Error = S::Error>,
+{
+    /// Creates one canonical output runtime.
+    pub fn new(
+        sampler: S,
+        sequence: GenerationSequence,
+        constraint: C,
+        publisher: P,
+        cancellation: GenerationCancellationToken,
+    ) -> Self {
+        Self {
+            sampler,
+            sequence,
+            constraint,
+            publisher,
+            cancellation,
+        }
+    }
+
+    /// Canonical sampling state.
+    pub const fn sampler(&self) -> &S {
+        &self.sampler
+    }
+
+    /// Mutable canonical sampling state.
+    pub const fn sampler_mut(&mut self) -> &mut S {
+        &mut self.sampler
+    }
+
+    /// Canonical committed sequence.
+    pub const fn sequence(&self) -> &GenerationSequence {
+        &self.sequence
+    }
+
+    /// Mutable canonical committed sequence.
+    pub const fn sequence_mut(&mut self) -> &mut GenerationSequence {
+        &mut self.sequence
+    }
+
+    /// Transactional semantic constraint.
+    pub const fn constraint(&self) -> &C {
+        &self.constraint
+    }
+
+    /// Mutable transactional semantic constraint.
+    pub const fn constraint_mut(&mut self) -> &mut C {
+        &mut self.constraint
+    }
+
+    /// Cooperative cancellation token.
+    pub const fn cancellation(&self) -> &GenerationCancellationToken {
+        &self.cancellation
+    }
+
+    /// Applies cancellation and publishes its terminal semantic state.
+    pub fn cancel(&mut self) -> Result<(), S::Error> {
+        if self.sequence.cancel() {
+            self.publisher.publish_cancelled(&mut self.constraint)?;
+        }
+        Ok(())
+    }
+
+    /// Installs logical state only after its matching backend boundary committed.
+    pub fn install_committed_state(
+        &mut self,
+        sampler: S,
+        constraint: C,
+        sequence: GenerationSequence,
+    ) {
+        self.sampler = sampler;
+        self.constraint = constraint;
+        self.sequence = sequence;
+    }
+
+    /// Publishes tokens only after their backend cache transaction committed.
+    pub fn publish_committed(&mut self, tokens: &[u32]) -> Result<bool, S::Error> {
+        let cancellation_won = self.publisher.publish_committed(
+            &mut self.constraint,
+            tokens,
+            &self.cancellation,
+            self.sequence.is_finished(),
+        )? || (self.cancellation.is_cancelled()
+            && !self.sequence.is_finished());
+        if cancellation_won {
+            self.cancel()?;
+        }
+        Ok(cancellation_won)
+    }
+
+    /// Consumes the runtime into its backend-owned parts.
+    pub fn into_parts(self) -> (S, GenerationSequence, C, P) {
+        (self.sampler, self.sequence, self.constraint, self.publisher)
+    }
 }
 
 /// Error returned by portable proposal and verification drivers.
@@ -560,6 +891,288 @@ where
     })
 }
 
+/// Submits one exact target verification and takes ownership of its resources.
+pub fn submit_verification_transaction<'a, E, D>(
+    executor: &mut E,
+    cache: &mut E::Cache,
+    last_committed_token: u32,
+    block: SpeculativeDraftBlock<E::DraftState, D>,
+    context: E::Context<'a>,
+) -> Result<PendingSpeculativeVerification<E, D>, SpeculativeDriverError<E::Error>>
+where
+    E: SpeculativeExecutor + 'a,
+{
+    if block.proposals.is_empty() {
+        return Err(SpeculativeDriverError::Generation(
+            GenerationError::EmptyProposalBlock,
+        ));
+    }
+    let mut input_tokens = Vec::with_capacity(block.proposals.len() + 1);
+    input_tokens.push(last_committed_token);
+    input_tokens.extend(block.proposals.iter().map(|proposal| proposal.token));
+    let checkpoint = E::checkpoint(cache);
+    let submission = executor.submit_verification(&input_tokens, cache, context)?;
+    Ok(PendingSpeculativeVerification {
+        completion: submission.completion,
+        verification: submission.output,
+        checkpoint,
+        block,
+        optimistic: None,
+        submitted: Instant::now(),
+        submitted_tokens: input_tokens.len(),
+    })
+}
+
+/// Request state selected after committed output publication.
+pub enum SpeculativePublicationStatus<S, D> {
+    /// Continue from canonical target state and an optional promoted block.
+    Continue(SpeculativeContinuation<S, D>),
+    /// Generation reached a normal terminal condition.
+    Completed,
+    /// Cancellation won at or after the exact commit boundary.
+    Cancelled,
+}
+
+/// Backend and portable state after exact commit and legal publication.
+pub struct PublishedSpeculativeVerification<TargetState, DraftState, Distribution, RandomState, T> {
+    /// Target state matching the committed backend cache.
+    pub target_state: TargetState,
+    /// Canonical target randomness after resolution.
+    pub target_randomness: Option<RandomState>,
+    /// Updated portable request telemetry.
+    pub stats: MtpStats,
+    /// Backend component telemetry observed at exact completion.
+    pub telemetry: T,
+    /// Request continuation selected after publication.
+    pub status: SpeculativePublicationStatus<DraftState, Distribution>,
+}
+
+/// Waits, resolves, commits, and only then publishes one verification.
+///
+/// Portable sampler, sequence, constraint, telemetry, and optimistic state are
+/// advanced transactionally. A backend cache-commit failure leaves the
+/// canonical output runtime unchanged and publishes nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_commit_and_publish<'a, E, S, C, P>(
+    executor: &mut E,
+    cache: &mut E::Cache,
+    pending: PendingSpeculativeVerification<E, S::Distribution>,
+    runtime: &mut SpeculativeOutputRuntime<S, C, P>,
+    target_randomness: Option<&S::RandomState>,
+    temperature: f32,
+    mut stats: MtpStats,
+    options: MtpSchedulerOptions,
+    context: E::Context<'a>,
+) -> Result<
+    PublishedSpeculativeVerification<
+        E::TargetState,
+        E::DraftState,
+        S::Distribution,
+        S::RandomState,
+        E::Telemetry,
+    >,
+    SpeculativeDriverError<E::Error>,
+>
+where
+    E: SpeculativeExecutor + 'a,
+    S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
+    C: SpeculativeConstraint<Error = E::Error>,
+    P: SpeculativePublisher<C, Error = E::Error>,
+{
+    let PendingSpeculativeVerification {
+        completion,
+        mut verification,
+        checkpoint,
+        block,
+        optimistic,
+        submitted,
+        submitted_tokens: _,
+    } = pending;
+    completion.wait()?;
+    let telemetry = executor.take_verification_telemetry(&mut verification)?;
+    stats.verification_in_flight_time += submitted.elapsed();
+    let mut canonical_proposal_prefix = runtime.sequence().tokens().to_vec();
+    canonical_proposal_prefix.extend(block.proposals.iter().map(|proposal| proposal.token));
+    let resolved = resolve_round::<E, S, C>(
+        &verification,
+        block.proposals,
+        runtime.sampler(),
+        runtime.sequence(),
+        runtime.constraint(),
+        target_randomness,
+        temperature,
+        context,
+    )?;
+    let accepted = resolved.accepted_proposals;
+    let committed_tokens = resolved.committed_tokens;
+    let terminal = resolved.finish_reason;
+    let mut continuation = resolve_optimistic_branch(
+        optimistic,
+        &canonical_proposal_prefix,
+        resolved.bonus_token,
+        terminal.is_some(),
+        &mut stats,
+    )
+    .map_err(SpeculativeDriverError::Generation)?;
+    stats.accepted_tokens += accepted;
+    stats.accept_lens.push(accepted);
+    stats.rounds += 1;
+    let commit = executor.commit_verification(
+        verification,
+        block.state,
+        cache,
+        checkpoint,
+        resolved.verified_inputs,
+        context,
+    )?;
+    stats.target_tokens += commit.replayed_tokens;
+    stats.emitted_tokens += committed_tokens.len();
+    let target_randomness = resolved.target_randomness;
+    runtime.install_committed_state(resolved.sampler, resolved.constraint, resolved.sequence);
+    let cancelled = runtime.publish_committed(&committed_tokens)?;
+    let status = if cancelled {
+        discard_continuation(&mut stats, continuation);
+        SpeculativePublicationStatus::Cancelled
+    } else if terminal.is_some() {
+        discard_continuation(&mut stats, continuation);
+        SpeculativePublicationStatus::Completed
+    } else {
+        stats.update_adaptive_lookahead(options);
+        SpeculativePublicationStatus::Continue(std::mem::replace(
+            &mut continuation,
+            SpeculativeContinuation::None,
+        ))
+    };
+    Ok(PublishedSpeculativeVerification {
+        target_state: commit.state,
+        target_randomness,
+        stats,
+        telemetry,
+        status,
+    })
+}
+
+/// Resolves an exact retained verification solely to reach a safe cancellation boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn cancel_pending_verification<'a, E, S, C, P>(
+    executor: &mut E,
+    cache: &mut E::Cache,
+    pending: PendingSpeculativeVerification<E, S::Distribution>,
+    runtime: &mut SpeculativeOutputRuntime<S, C, P>,
+    mut stats: MtpStats,
+    context: E::Context<'a>,
+) -> Result<(MtpStats, E::Telemetry), SpeculativeDriverError<E::Error>>
+where
+    E: SpeculativeExecutor + 'a,
+    S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
+    C: SpeculativeConstraint<Error = E::Error>,
+    P: SpeculativePublisher<C, Error = E::Error>,
+{
+    let PendingSpeculativeVerification {
+        completion,
+        mut verification,
+        checkpoint,
+        block,
+        optimistic,
+        submitted,
+        submitted_tokens: _,
+    } = pending;
+    completion.wait()?;
+    let telemetry = executor.take_verification_telemetry(&mut verification)?;
+    stats.verification_in_flight_time += submitted.elapsed();
+    discard_branch(&mut stats, optimistic);
+    let commit =
+        executor.commit_verification(verification, block.state, cache, checkpoint, 1, context)?;
+    stats.target_tokens += commit.replayed_tokens;
+    runtime.cancel()?;
+    Ok((stats, telemetry))
+}
+
+/// Resolves, promotes, or discards one optimistic branch and updates telemetry.
+pub fn resolve_optimistic_branch<S, D>(
+    branch: Option<SpeculativeOptimisticBranch<S, D>>,
+    canonical_prefix: &[u32],
+    bonus: Option<u32>,
+    terminal: bool,
+    stats: &mut MtpStats,
+) -> Result<SpeculativeContinuation<S, D>, GenerationError> {
+    let Some(branch) = branch else {
+        return Ok(SpeculativeContinuation::None);
+    };
+    let Some(bonus) = bonus else {
+        discard_branch(stats, Some(branch));
+        return Ok(SpeculativeContinuation::None);
+    };
+    let optimistic_tokens = branch
+        .block
+        .proposals
+        .iter()
+        .map(|proposal| proposal.token)
+        .collect::<Vec<_>>();
+    let decision = crate::generation::resolve_optimistic_reuse(
+        &branch.assumed_prefix,
+        canonical_prefix,
+        &optimistic_tokens,
+        bonus,
+        terminal,
+    )?;
+    stats.optimistic_target_bonus_tokens += 1;
+    if decision == crate::generation::OptimisticReuseDecision::DiscardTerminal {
+        discard_branch(stats, Some(branch));
+        return Ok(SpeculativeContinuation::None);
+    }
+    let drafted = branch.block.proposals.len();
+    let SpeculativeDraftBlock { state, proposals } = branch.block;
+    let mut proposals = proposals.into_iter();
+    let _matched_or_discarded = proposals
+        .next()
+        .expect("validated optimistic branch is non-empty");
+    Ok(match decision {
+        crate::generation::OptimisticReuseDecision::DiscardMismatch => {
+            stats.optimistic_bonus_mismatches += 1;
+            stats.discarded_optimistic_tokens += drafted;
+            stats.discarded_optimistic_blocks += 1;
+            SpeculativeContinuation::None
+        }
+        crate::generation::OptimisticReuseDecision::MatchedConsumed => {
+            stats.optimistic_bonus_matches += 1;
+            stats.consumed_optimistic_tokens += 1;
+            SpeculativeContinuation::None
+        }
+        crate::generation::OptimisticReuseDecision::MatchedRetained => {
+            stats.optimistic_bonus_matches += 1;
+            stats.consumed_optimistic_tokens += 1;
+            let proposals = proposals.collect::<Vec<_>>();
+            stats.draft_tokens += proposals.len();
+            stats.reused_optimistic_tokens += proposals.len();
+            stats.reused_optimistic_blocks += 1;
+            SpeculativeContinuation::Promoted(SpeculativeDraftBlock { state, proposals })
+        }
+        crate::generation::OptimisticReuseDecision::DiscardTerminal => {
+            unreachable!("terminal decision handled before branch destruction")
+        }
+    })
+}
+
+fn discard_branch<S, D>(stats: &mut MtpStats, branch: Option<SpeculativeOptimisticBranch<S, D>>) {
+    if let Some(branch) = branch {
+        stats.discarded_optimistic_tokens += branch.block.proposals.len();
+        stats.discarded_optimistic_blocks += 1;
+    }
+}
+
+fn discard_continuation<S, D>(stats: &mut MtpStats, continuation: SpeculativeContinuation<S, D>) {
+    if let SpeculativeContinuation::Promoted(block) = continuation {
+        stats.discarded_optimistic_tokens += block.proposals.len();
+        stats.discarded_optimistic_blocks += 1;
+        stats.draft_tokens = stats.draft_tokens.saturating_sub(block.proposals.len());
+        stats.reused_optimistic_tokens = stats
+            .reused_optimistic_tokens
+            .saturating_sub(block.proposals.len());
+        stats.reused_optimistic_blocks = stats.reused_optimistic_blocks.saturating_sub(1);
+    }
+}
+
 fn commit_terminal_token<S, C>(
     sequence: &mut GenerationSequence,
     sampler: &mut S,
@@ -734,10 +1347,14 @@ impl SpeculativeSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::Infallible;
+    use std::{cell::RefCell, convert::Infallible, rc::Rc};
 
-    #[derive(Debug, Clone, Copy)]
-    struct Done;
+    type TransactionTrace = Rc<RefCell<Vec<&'static str>>>;
+
+    #[derive(Debug, Clone, Default)]
+    struct Done {
+        trace: Option<TransactionTrace>,
+    }
 
     impl Completion for Done {
         type Error = Infallible;
@@ -747,11 +1364,17 @@ mod tests {
         }
 
         fn wait(&self) -> Result<(), Self::Error> {
+            if let Some(trace) = &self.trace {
+                trace.borrow_mut().push("wait");
+            }
             Ok(())
         }
     }
 
-    struct MockExecutor;
+    #[derive(Default)]
+    struct MockExecutor {
+        trace: Option<TransactionTrace>,
+    }
 
     struct MockVerification {
         tokens: Vec<u32>,
@@ -824,7 +1447,9 @@ mod tests {
                     tokens: input_tokens.to_vec(),
                     logits: vec![vec![0.0, 1.0], vec![1.0, 0.0], vec![0.0, 1.0]],
                 },
-                completion: Done,
+                completion: Done {
+                    trace: self.trace.clone(),
+                },
             })
         }
 
@@ -849,6 +1474,9 @@ mod tests {
             _: Self::Context<'a>,
         ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
             assert!(!output.tokens.is_empty());
+            if let Some(trace) = &self.trace {
+                trace.borrow_mut().push("commit");
+            }
             cache.truncate(checkpoint + verified_inputs);
             Ok(SpeculativeCommit {
                 state: draft_state.len(),
@@ -859,7 +1487,7 @@ mod tests {
 
     #[test]
     fn mock_executor_prefill_propose_verify_and_commit_without_a_tensor_runtime() {
-        let mut executor = MockExecutor;
+        let mut executor = MockExecutor::default();
         let mut cache = Vec::new();
         let prefill = executor.prefill(vec![4, 5], &mut cache, ()).unwrap();
         let mut draft = executor.begin_proposal(&prefill.state, 5, 2, ()).unwrap();
@@ -1034,9 +1662,60 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MockPublisher {
+        tokens: Vec<u32>,
+        cancelled: bool,
+        trace: Option<TransactionTrace>,
+    }
+
+    impl SpeculativePublisher<MockConstraint> for MockPublisher {
+        type Error = Infallible;
+
+        fn publish_committed(
+            &mut self,
+            _: &mut MockConstraint,
+            tokens: &[u32],
+            _: &GenerationCancellationToken,
+            _: bool,
+        ) -> Result<bool, Self::Error> {
+            if let Some(trace) = &self.trace {
+                trace.borrow_mut().push("publish");
+            }
+            self.tokens.extend_from_slice(tokens);
+            Ok(false)
+        }
+
+        fn publish_cancelled(&mut self, _: &mut MockConstraint) -> Result<(), Self::Error> {
+            if let Some(trace) = &self.trace {
+                trace.borrow_mut().push("cancel");
+            }
+            self.cancelled = true;
+            Ok(())
+        }
+    }
+
+    fn mock_output_runtime(
+        cancellation: GenerationCancellationToken,
+        trace: Option<TransactionTrace>,
+    ) -> SpeculativeOutputRuntime<MockSampling, MockConstraint, MockPublisher> {
+        let mut sequence = GenerationSequence::new(8, []);
+        sequence.commit(5, TokenTerminalSignals::default()).unwrap();
+        SpeculativeOutputRuntime::new(
+            MockSampling::default(),
+            sequence,
+            MockConstraint::default(),
+            MockPublisher {
+                trace,
+                ..MockPublisher::default()
+            },
+            cancellation,
+        )
+    }
+
     #[test]
     fn portable_driver_proposes_and_resolves_acceptance_and_replacement() {
-        let mut executor = MockExecutor;
+        let mut executor = MockExecutor::default();
         let sampler = MockSampling::default();
         let mut draft = executor.begin_proposal(&2, 5, 2, ()).unwrap();
         let proposals = propose_block(
@@ -1119,5 +1798,119 @@ mod tests {
                 cross_request: true,
             })
         );
+    }
+
+    #[test]
+    fn coordinator_commits_before_publication_and_discards_mismatched_lookahead() {
+        let trace = TransactionTrace::default();
+        let mut executor = MockExecutor {
+            trace: Some(trace.clone()),
+        };
+        let mut cache = vec![4, 5];
+        let block = SpeculativeDraftBlock {
+            state: vec![5, 1, 1],
+            proposals: vec![
+                SpeculativeProposal {
+                    token: 1,
+                    distribution: vec![0.0, 1.0],
+                },
+                SpeculativeProposal {
+                    token: 1,
+                    distribution: vec![0.0, 1.0],
+                },
+            ],
+        };
+        let mut pending =
+            submit_verification_transaction(&mut executor, &mut cache, 5, block, ()).unwrap();
+        pending
+            .set_optimistic_branch(SpeculativeOptimisticBranch {
+                block: SpeculativeDraftBlock {
+                    state: vec![5, 1, 1, 2],
+                    proposals: vec![SpeculativeProposal {
+                        token: 2,
+                        distribution: vec![0.0, 0.0, 1.0],
+                    }],
+                },
+                assumed_prefix: vec![5, 1, 1],
+            })
+            .unwrap();
+        let mut runtime =
+            mock_output_runtime(GenerationCancellationToken::new(), Some(trace.clone()));
+        let published = resolve_commit_and_publish(
+            &mut executor,
+            &mut cache,
+            pending,
+            &mut runtime,
+            Some(&0),
+            0.7,
+            MtpStats::default(),
+            MtpSchedulerOptions::default(),
+            (),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            published.status,
+            SpeculativePublicationStatus::Continue(SpeculativeContinuation::None)
+        ));
+        assert_eq!(published.stats.accepted_tokens, 1);
+        assert_eq!(published.stats.discarded_optimistic_tokens, 1);
+        assert_eq!(cache, [4, 5, 5, 1]);
+        let (_, sequence, constraint, publisher) = runtime.into_parts();
+        assert_eq!(sequence.tokens(), [5, 1, 0]);
+        assert_eq!(constraint.tokens, [1, 0]);
+        assert_eq!(publisher.tokens, [1, 0]);
+        assert!(!publisher.cancelled);
+        assert_eq!(*trace.borrow(), ["wait", "commit", "publish"]);
+    }
+
+    #[test]
+    fn coordinator_cancels_only_after_retained_verification_is_safe() {
+        let trace = TransactionTrace::default();
+        let mut executor = MockExecutor {
+            trace: Some(trace.clone()),
+        };
+        let mut cache = vec![4, 5];
+        let block = SpeculativeDraftBlock {
+            state: vec![5, 1],
+            proposals: vec![SpeculativeProposal {
+                token: 1,
+                distribution: vec![0.0, 1.0],
+            }],
+        };
+        let mut pending =
+            submit_verification_transaction(&mut executor, &mut cache, 5, block, ()).unwrap();
+        pending
+            .set_optimistic_branch(SpeculativeOptimisticBranch {
+                block: SpeculativeDraftBlock {
+                    state: vec![5, 1, 2],
+                    proposals: vec![SpeculativeProposal {
+                        token: 2,
+                        distribution: vec![0.0, 0.0, 1.0],
+                    }],
+                },
+                assumed_prefix: vec![5, 1],
+            })
+            .unwrap();
+        let cancellation = GenerationCancellationToken::new();
+        cancellation.cancel();
+        let mut runtime = mock_output_runtime(cancellation, Some(trace.clone()));
+        let (stats, ()) = cancel_pending_verification(
+            &mut executor,
+            &mut cache,
+            pending,
+            &mut runtime,
+            MtpStats::default(),
+            (),
+        )
+        .unwrap();
+
+        assert_eq!(stats.discarded_optimistic_tokens, 1);
+        assert_eq!(cache, [4, 5, 5]);
+        let (_, sequence, _, publisher) = runtime.into_parts();
+        assert_eq!(sequence.finish_reason(), Some(FinishReason::Cancelled));
+        assert!(publisher.tokens.is_empty());
+        assert!(publisher.cancelled);
+        assert_eq!(*trace.borrow(), ["wait", "commit", "cancel"]);
     }
 }
