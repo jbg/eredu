@@ -19,10 +19,7 @@ use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::core::residency::OffloadConfig;
 use safemlx_lm::{
     architectures::{
-        distributed::pipeline::{
-            load_pipeline_model_with_options, PipelineInferencePhase, PipelineInferenceScheduler,
-            PipelineMicrobatchInput, PipelineStep,
-        },
+        distributed::pipeline::{load_pipeline_model_with_options, PipelineStep},
         qwen::vl::model as qwen3_vl,
     },
     nn::generation::CausalLm,
@@ -31,8 +28,7 @@ use safemlx_lm::{
     runtime::media::PreparedModelInput,
     DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions, LayerwiseLoadOptions,
     MlxBackend, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions, ParallelTopology,
-    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, RequestId, RequestStatus,
-    SchedulerLimits, WeightResidency,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 
 const WORKER: &str = "SAFEMLX_QWEN3_VL_PIPELINE_WORKER";
@@ -43,7 +39,6 @@ const MOE: &str = "SAFEMLX_QWEN3_VL_PIPELINE_MOE";
 const STREAMED: &str = "SAFEMLX_QWEN3_VL_PIPELINE_STREAMED";
 const LAYERWISE_HOST: &str = "SAFEMLX_QWEN3_VL_PIPELINE_LAYERWISE_HOST";
 const EXPERT_CACHE: &str = "SAFEMLX_QWEN3_VL_PIPELINE_EXPERT_CACHE";
-const SCHEDULE_MISMATCH: &str = "SAFEMLX_QWEN3_VL_PIPELINE_SCHEDULE_MISMATCH";
 
 fn config(moe: bool) -> serde_json::Value {
     let model_type = if moe { "qwen3_vl_moe" } else { "qwen3_vl" };
@@ -523,42 +518,6 @@ fn qwen3_vl_pipeline_ring_worker() {
         );
         assert!(report.owned_bytes > 0);
     }
-    if std::env::var_os(SCHEDULE_MISMATCH).is_some() {
-        let request = RequestId::new(101);
-        let mut scheduler =
-            PipelineInferenceScheduler::new(&model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
-        scheduler.register_request(&model, request).unwrap();
-        let before = Array::from_slice(&[1u32], &[1, 1]);
-        let after = Array::from_slice(&[2u32], &[1, 1]);
-        let pixel_shape = if expected_rank == 0 { [4, 24] } else { [2, 48] };
-        let pixels = Array::from_slice(&[0.01f32; 96], &pixel_shape);
-        let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
-        let mut parts = [InputPart::text_token_ids(&before); 3];
-        let prepared = PreparedModelInput::from_model_input(multimodal_input(
-            &before, &pixels, &grid, &after, &mut parts,
-        ))
-        .unwrap();
-        let identity = prepared.identity();
-        let work = PipelineMicrobatchInput::new(
-            request,
-            PipelineInferencePhase::Prefill,
-            PipelineStep::new(1, 3).unwrap(),
-        );
-        let work = if model.stage_info().is_first {
-            work.with_prepared_input(prepared)
-        } else {
-            work.with_prepared_input_identity(identity)
-        };
-        scheduler.enqueue(work).unwrap();
-        let error = scheduler.run_queued(&mut model, &execution).unwrap_err();
-        assert!(error.to_string().contains("work descriptors differ"));
-        assert!(scheduler.report().poisoned);
-        assert_eq!(
-            scheduler.request_status(request),
-            Some(RequestStatus::Failed)
-        );
-        return;
-    }
     assert_eq!(
         model.stage_info().global_layer_range,
         topology.pipeline_parallel_rank..topology.pipeline_parallel_rank + 1
@@ -573,39 +532,22 @@ fn qwen3_vl_pipeline_ring_worker() {
     let mut parts = [InputPart::text_token_ids(&before); 3];
     let input = multimodal_input(&before, &pixels, &grid, &after, &mut parts);
     let prepared = PreparedModelInput::from_model_input(input).unwrap();
-    let identity = prepared.identity();
-    let request = RequestId::new(7);
-    let mut scheduler =
-        PipelineInferenceScheduler::new(&model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
-    scheduler
-        .register_request_with_options(
-            &model,
-            request,
-            safemlx_lm::CacheResidencyPolicy::Paged(paged.clone()),
-        )
+    let mut cache = model
+        .new_cache_with_options(safemlx_lm::CacheResidencyPolicy::Paged(paged.clone()))
         .unwrap();
-    let work = PipelineMicrobatchInput::new(
-        request,
-        PipelineInferencePhase::Prefill,
-        PipelineStep::new(1, 3).unwrap(),
-    );
-    let work = if model.stage_info().is_first {
-        work.with_prepared_input(prepared)
-    } else {
-        work.with_prepared_input_identity(identity)
-    };
-    scheduler.enqueue(work).unwrap();
-    let mut completed = Vec::new();
-    for _ in 0..64 {
-        completed.extend(scheduler.run_queued(&mut model, &execution).unwrap());
-        if !completed.is_empty() {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert_eq!(completed.len(), 1);
-    let logits = completed.pop().unwrap().into_logits().unwrap();
-    let mut cache = scheduler.release_request_cache(request).unwrap();
+    let logits = prepared
+        .with_model_input(|input| {
+            model.prefill_distributed(
+                model.stage_info().is_first.then_some(input),
+                PipelineStep::new(1, 3).unwrap(),
+                None,
+                &mut cache,
+                &execution,
+            )
+        })
+        .unwrap()
+        .into_logits()
+        .unwrap();
     assert_eq!(logits.is_some(), topology.pipeline_parallel_rank == 1);
     let synchronized = model
         .sample_and_synchronize(
@@ -837,8 +779,8 @@ fn ring_qwen3_vl_moe_gguf_triple_axis_streamed_nonexpert_cache() {
 
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_vl_moe_triple_axis_expert_cache_mismatch_consensus() {
-    run_mode(true, false, false, true, false, Some("tp-pp-ep"), true);
+fn ring_qwen3_vl_moe_triple_axis_expert_cache_session() {
+    run(true, false, false, true, false, Some("tp-pp-ep"));
 }
 
 struct Children(Vec<Child>);
@@ -859,27 +801,6 @@ fn run(
     expert_cache: bool,
     gguf: bool,
     axes: Option<&str>,
-) {
-    run_mode(
-        moe,
-        streamed,
-        layerwise_host,
-        expert_cache,
-        gguf,
-        axes,
-        false,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_mode(
-    moe: bool,
-    streamed: bool,
-    layerwise_host: bool,
-    expert_cache: bool,
-    gguf: bool,
-    axes: Option<&str>,
-    schedule_mismatch: bool,
 ) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
@@ -936,9 +857,6 @@ fn run_mode(
         }
         if expert_cache {
             command.env(EXPERT_CACHE, "1");
-        }
-        if schedule_mismatch {
-            command.env(SCHEDULE_MISMATCH, "1");
         }
         if let Some(axes) = axes {
             command.env(AXES, axes);

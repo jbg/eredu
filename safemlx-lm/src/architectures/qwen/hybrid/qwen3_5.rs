@@ -1363,25 +1363,6 @@ pub enum LayerCache {
 }
 
 impl LayerCache {
-    pub(crate) fn restore_checkpoint(
-        &mut self,
-        checkpoint: &Self,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        match (self, checkpoint) {
-            (Self::FullAttention(cache), Self::FullAttention(previous)) => {
-                cache.restore_checkpoint(previous, stream)
-            }
-            (Self::LinearAttention(cache), Self::LinearAttention(previous)) => {
-                cache.clone_from(previous);
-                Ok(())
-            }
-            _ => Err(Exception::custom(
-                "Qwen hybrid checkpoint changed layer policy",
-            )),
-        }
-    }
-
     pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
         match self {
             Self::FullAttention(cache) => cache.retained_arrays(),
@@ -4883,77 +4864,6 @@ impl Qwen35TextModel {
         profile_array(PerfComponent::FinalNorm, &h)?;
         Ok(h)
     }
-
-    pub(crate) fn forward_with_expert_executor<F>(
-        &mut self,
-        input: ModelInput<'_>,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let hidden = self.forward_hidden_with_expert_executor(input, execute, stream)?;
-        self.norm.forward(&hidden, stream)
-    }
-
-    pub(crate) fn forward_hidden_with_expert_executor<F>(
-        &mut self,
-        input: ModelInput<'_>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let ModelInput {
-            inputs,
-            inputs_embeds,
-            mask,
-            mut cache,
-        } = input;
-        let mut h = match inputs_embeds {
-            Some(inputs_embeds) => inputs_embeds.clone(),
-            None => self.embed_tokens.forward(inputs, stream)?,
-        };
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => {
-                let offset = cache.as_ref().map(|cache| cache.offset()).unwrap_or(0);
-                if h.dim(1) > 1 {
-                    match create_attention_mask(&h, &offset_cache(offset), Some(true), stream)? {
-                        Some(AttentionMask::Array(mask)) => Some(mask),
-                        Some(AttentionMask::Causal) => {
-                            return Err(Exception::custom("Only `Array` mask is supported"));
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                }
-            }
-        };
-        let cache = cache.as_mut().ok_or_else(|| {
-            Exception::custom("cached expert parallelism requires a Qwen hybrid cache")
-        })?;
-        for (index, (layer, layer_cache)) in self
-            .layers
-            .iter_mut()
-            .zip(cache.layers.iter_mut())
-            .enumerate()
-        {
-            h = layer.forward_sparse_experts(
-                BlockInput {
-                    x: &h,
-                    mask: mask.as_ref(),
-                    cache: Some(layer_cache),
-                },
-                stream,
-                |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
-            )?;
-        }
-        Ok(h)
-    }
 }
 
 /// Input for a Qwen3.5 MoE text forward pass.
@@ -5518,56 +5428,6 @@ impl Model {
             hidden_states
         };
         self.project_logits(&hidden_states, stream)
-    }
-
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        self.reject_multimodal_tokens(inputs, false, stream)?;
-        let hidden = self.model.forward_with_expert_executor(
-            ModelInput {
-                inputs,
-                inputs_embeds: None,
-                mask: None,
-                cache: Some(cache),
-            },
-            execute,
-            stream,
-        )?;
-        self.project_logits(&hidden, stream)
-    }
-
-    pub(crate) fn forward_cached_expert_parallel_mtp<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<QwenMtpStepOutput, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        self.reject_multimodal_tokens(inputs, false, stream)?;
-        let hidden = self.model.forward_hidden_with_expert_executor(
-            ModelInput {
-                inputs,
-                inputs_embeds: None,
-                mask: None,
-                cache: Some(cache),
-            },
-            execute,
-            stream,
-        )?;
-        let normalized = self.model.norm.forward(&hidden, stream)?;
-        let logits = self.project_logits(&normalized, stream)?;
-        Ok(QwenMtpStepOutput { logits, hidden })
     }
 
     /// Forward pass that reports activations to an observer.

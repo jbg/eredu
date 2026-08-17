@@ -249,9 +249,10 @@ The current boundary leaves these components MLX-coupled:
   exact-completion contract are core-owned. Replicated, tensor-, pipeline-, and
   expert-parallel loading, prefill, decode, cache ownership, and sampling
   synchronization all cross the architecture-erased model session. The
-  private pipeline scheduler and architecture executors still manipulate MLX
-  stage values internally, but they are backend implementation details rather
-  than alternate public model/session lifecycles;
+  architecture executors still manipulate MLX stage values internally, but
+  they are backend implementation details rather than alternate model/session
+  lifecycles. The former MLX pipeline request scheduler and partial-stage
+  execution, sampling, observer, and cache-inspection surfaces were deleted;
 - per-block MLX cache resources, native completion observation, physical
   transfer/disk worker execution, prompt-cache filesystem publication, safetensors payload
   mapping and materialization (container/header validation, the transition
@@ -344,8 +345,8 @@ deadline dispositions, work identities, and exact completion observations.
 all-gather of portable `u32` words. It contains no tensor, stream, device,
 group, or MLX error type.
 
-The production pipeline scheduler receives one `MlxDistributedSession` from
-the selected `MlxBackend`. The session owns the world and topology-derived
+Distributed scheduler adapters receive one `MlxDistributedSession` from the
+selected `MlxBackend`. The session owns the world and topology-derived
 TP/PP/EP communicators and implements `ConsensusTransport` directly. It
 materializes portable word frames as MLX arrays, runs `all_gather`, waits for
 the exact completion, and returns rank-major words to core. The same selected
@@ -356,11 +357,15 @@ point-to-point transfer, and scheduler cancellation consensus; the former
 incomplete, complete, failed but still executing on a peer, or failed and safe
 to release. Backend errors are
 converted at the adapter boundary and consensus mismatches poison the canonical
-core scheduler before any new pipeline submission. Prepared branches are
+core scheduler before any new model-session submission. Prepared branches are
 explicitly discarded during poisoning; submitted MLX resources remain retained
-until their exact completions resolve. Since further collectives are unsafe,
-`PipelineInferenceScheduler::poll_poisoned_completions` releases those resources
-using local exact-completion observation only and never publishes state.
+until their exact completions resolve.
+
+Cache policy changes, prompt-cache publication/restoration, and embedded MTP
+generation also operate on `MlxModelSession`. They match the opaque model kind
+to its backend-owned cache internally, so callers cannot extract a pipeline or
+expert cache and combine it with a different communicator. Architecture cache
+types and rank-local stage models remain private MLX implementation details.
 
 The former facade-only `FairScheduler`, `CompletedWork`, and `FailedWork` APIs
 were removed instead of retained as wrappers. `Scheduler`, `SchedulerProgress`,

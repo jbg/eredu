@@ -89,6 +89,9 @@ standalone communication-session constructors. `LoadedModel`, which combines
 tokenizer/chat conveniences with generation, is intentionally replicated-only;
 distributed applications use the same generic model loader and
 `MlxModelSession` directly.
+Cache policy selection, prompt-cache save/load, and embedded MTP generation
+likewise stay on that session; there is no parallel stage-cache or distributed
+request-scheduler API beside it.
 Weight-residency plans, atomic admission, ownership leases, protected windows,
 eviction decisions, exact transfer generations, and accounting likewise come
 directly from `safemlx-lm-core`. The MLX facade mirrors those transitions with

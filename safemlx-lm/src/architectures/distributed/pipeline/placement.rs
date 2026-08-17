@@ -187,11 +187,6 @@ impl ExecutionGroupPlacement {
     pub fn first_owner(&self) -> Option<usize> {
         self.owners.first().map(|owner| owner.pp_rank)
     }
-
-    /// Returns the terminal PP owner.
-    pub fn last_owner(&self) -> Option<usize> {
-        self.owners.last().map(|owner| owner.pp_rank)
-    }
 }
 
 /// Planner input for one architecture-authored group.
@@ -243,11 +238,9 @@ pub struct PlacementRoute {
 /// One validated authoritative placed execution-group DAG.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PlacedExecutionDag {
-    pipeline_stages: usize,
     groups: Vec<ExecutionGroupPlacement>,
     routes: Vec<PlacementRoute>,
     semantic: ExecutionGroupDag,
-    output: usize,
 }
 
 /// Runtime reason that two graph-ready groups cannot overlap.
@@ -394,23 +387,13 @@ impl PlacedExecutionDag {
             }
         }
         validate_segment_graph(&groups, &routes)?;
-        let output = groups
-            .iter()
-            .position(|group| group.id == output.as_ref())
-            .expect("validated output");
         Ok(Self {
-            pipeline_stages,
             groups,
             routes,
             semantic,
-            output,
         })
     }
 
-    /// Returns the planned PP size.
-    pub const fn pipeline_stages(&self) -> usize {
-        self.pipeline_stages
-    }
     /// Returns groups in architecture order.
     pub fn groups(&self) -> &[ExecutionGroupPlacement] {
         &self.groups
@@ -427,10 +410,6 @@ impl PlacedExecutionDag {
     pub(crate) const fn semantic(&self) -> &ExecutionGroupDag {
         &self.semantic
     }
-    /// Returns the authoritative output group.
-    pub fn output(&self) -> &ExecutionGroupPlacement {
-        &self.groups[self.output]
-    }
     /// Resolves a group by identity.
     pub fn group(&self, id: &str) -> Option<&ExecutionGroupPlacement> {
         self.groups.iter().find(|group| group.id == id)
@@ -442,17 +421,6 @@ impl PlacedExecutionDag {
     /// Returns dependency slots in declaration/schema order.
     pub fn dependency_indices(&self, group: usize) -> Option<&[usize]> {
         self.semantic.dependencies(group)
-    }
-    /// Returns the route for one producer/consumer boundary.
-    pub fn dependency_route(
-        &self,
-        producer: &str,
-        consumer: &str,
-    ) -> Option<(usize, &PlacementRoute)> {
-        self.routes
-            .iter()
-            .enumerate()
-            .find(|(_, route)| route.from_group == producer && route.to_group == consumer)
     }
     /// Determines whether two ready groups may submit rank-local compute in
     /// parallel. Transport remains ordered separately in stable group order.

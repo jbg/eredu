@@ -18,8 +18,7 @@ use safemlx::{
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
     architectures::distributed::pipeline::{
-        load_pipeline_model_with_options, PipelineInferencePhase, PipelineInferenceScheduler,
-        PipelineLayerCache, PipelineMicrobatchInput, PipelineStep,
+        load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
     },
     architectures::{
         deepseek_v3::model as deepseek_v3,
@@ -43,8 +42,7 @@ use safemlx_lm::{
     CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
     LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, ModelLoadOptions, MtpConfig,
     NonExpertWeightResidency, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology, RequestId, RequestStatus, SchedulerLimits,
-    WeightResidency,
+    PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -54,8 +52,6 @@ const FIXTURE_FAMILY: &str = "SAFEMLX_LM_PIPELINE_FIXTURE_FAMILY";
 const DENSE_STREAM: &str = "SAFEMLX_LM_PIPELINE_DENSE_STREAM";
 const LAYERWISE_HOST: &str = "SAFEMLX_LM_PIPELINE_LAYERWISE_HOST";
 const PROMPT_CACHE_ROOT: &str = "SAFEMLX_LM_PIPELINE_PROMPT_CACHE";
-const MICROBATCH: &str = "SAFEMLX_LM_PIPELINE_MICROBATCH";
-const SCHEDULE_MISMATCH: &str = "SAFEMLX_LM_PIPELINE_SCHEDULE_MISMATCH";
 const CARTESIAN_AXES: &str = "SAFEMLX_LM_PIPELINE_CARTESIAN_AXES";
 const EXPERT_CACHE: &str = "SAFEMLX_LM_PIPELINE_EXPERT_CACHE";
 const REQUANTIZE: &str = "SAFEMLX_LM_PIPELINE_REQUANTIZE";
@@ -341,6 +337,12 @@ fn pipeline_ring_worker() {
         .unwrap();
         let backend = MlxBackend::with_distributed_world(&stream, &group);
         let mut session = backend.create_session(&model).unwrap();
+        let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
+            .unwrap()
+            .with_full_attention(true);
+        session
+            .configure_cache(&model, CacheResidencyPolicy::Paged(paged))
+            .unwrap();
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
         let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let mut output = session
@@ -624,15 +626,6 @@ fn pipeline_ring_worker() {
         );
     }
 
-    if std::env::var_os(MICROBATCH).is_some() {
-        run_microbatch_worker(&mut model, expected_rank, &execution);
-        return;
-    }
-    if std::env::var_os(SCHEDULE_MISMATCH).is_some() {
-        run_schedule_mismatch_worker(&mut model, expected_rank, &execution);
-        return;
-    }
-
     let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
         .unwrap()
         .with_full_attention(true);
@@ -654,40 +647,19 @@ fn pipeline_ring_worker() {
     let prompt_length = prefix_ids.len() as i32;
     let mut logits = if family.is_multimodal() {
         let prepared = multimodal_prepared_input(family);
-        let identity = prepared.identity();
-        let request = RequestId::new(404);
-        let mut scheduler =
-            PipelineInferenceScheduler::new(&model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
-        scheduler
-            .register_request_with_options(
-                &model,
-                request,
-                CacheResidencyPolicy::Paged(paged.clone()),
-            )
-            .unwrap();
-        let work = PipelineMicrobatchInput::new(
-            request,
-            PipelineInferencePhase::Prefill,
-            PipelineStep::new(1, prompt_length).unwrap(),
-        );
-        scheduler
-            .enqueue(if model.stage_info().is_first {
-                work.with_prepared_input(prepared)
-            } else {
-                work.with_prepared_input_identity(identity)
+        prepared
+            .with_model_input(|input| {
+                model.prefill_distributed(
+                    model.stage_info().is_first.then_some(input),
+                    PipelineStep::new(1, prompt_length).unwrap(),
+                    None,
+                    &mut cache,
+                    &execution,
+                )
             })
-            .unwrap();
-        let mut completed = Vec::new();
-        for _ in 0..64 {
-            completed.extend(scheduler.run_queued(&mut model, &execution).unwrap());
-            if !completed.is_empty() {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert_eq!(completed.len(), 1);
-        cache = scheduler.release_request_cache(request).unwrap();
-        completed.pop().unwrap().into_logits().unwrap()
+            .unwrap()
+            .into_logits()
+            .unwrap()
     } else {
         let prompt = safemlx::Array::from_slice(&prefix_ids, &[1, prompt_length]);
         forward_pipeline_model(
@@ -1121,226 +1093,6 @@ fn assert_family_cache(
         }
         _ => {}
     }
-}
-
-fn run_microbatch_worker(
-    model: &mut safemlx_lm::architectures::distributed::pipeline::PipelineModel,
-    rank: usize,
-    execution: &MlxDistributedSession<'_>,
-) {
-    let first_request = RequestId::new(101);
-    let second_request = RequestId::new(202);
-    let first_prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let second_prompt = Array::from_slice(&[3u32, 4, 5], &[1, 3]);
-    let first_decode = Array::from_slice(&[6u32], &[1, 1]);
-    let second_decode = Array::from_slice(&[7u32], &[1, 1]);
-    let work = [
-        (
-            first_request,
-            PipelineInferencePhase::Prefill,
-            PipelineStep::new(1, 2).unwrap(),
-            &first_prompt,
-        ),
-        (
-            second_request,
-            PipelineInferencePhase::Prefill,
-            PipelineStep::new(1, 3).unwrap(),
-            &second_prompt,
-        ),
-        (
-            first_request,
-            PipelineInferencePhase::Decode,
-            PipelineStep::new(1, 1).unwrap(),
-            &first_decode,
-        ),
-        (
-            second_request,
-            PipelineInferencePhase::Decode,
-            PipelineStep::new(1, 1).unwrap(),
-            &second_decode,
-        ),
-    ];
-
-    let mut first_reference_cache = model.new_cache().unwrap();
-    let mut second_reference_cache = model.new_cache().unwrap();
-    let mut reference = Vec::with_capacity(work.len());
-    for (request, _, step, tokens) in &work {
-        let cache = if *request == first_request {
-            &mut first_reference_cache
-        } else {
-            &mut second_reference_cache
-        };
-        let logits = model
-            .forward_distributed(
-                (rank == 0).then_some(*tokens),
-                *step,
-                None,
-                cache,
-                execution,
-            )
-            .unwrap()
-            .into_logits()
-            .unwrap();
-        reference.push(logits.map(|logits| {
-            let logits = logits.evaluated().unwrap();
-            logits.as_slice::<f32>().to_vec()
-        }));
-    }
-
-    let mut scheduler =
-        PipelineInferenceScheduler::new(model, SchedulerLimits::new(2, 4).unwrap()).unwrap();
-    let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
-        .unwrap()
-        .with_full_attention(true);
-    scheduler
-        .register_request_with_options(
-            model,
-            first_request,
-            CacheResidencyPolicy::Paged(paged.clone()),
-        )
-        .unwrap();
-    scheduler
-        .register_request_with_options(model, second_request, CacheResidencyPolicy::Paged(paged))
-        .unwrap();
-    // Enqueue two transitions for each request. Round-robin draining must
-    // produce A0, B0, A1, B1 while retaining independent caches.
-    for (request, phase, step, tokens) in [work[0], work[2], work[1], work[3]] {
-        let input = PipelineMicrobatchInput::new(request, phase, step);
-        let input = if rank == 0 {
-            input.with_tokens(tokens.clone())
-        } else {
-            input
-        };
-        scheduler.enqueue(input).unwrap();
-    }
-    let mut output = Vec::new();
-    for _ in 0..16 {
-        output.extend(scheduler.run_queued(model, execution).unwrap());
-        if output.len() == work.len() {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert_eq!(output.len(), work.len());
-    assert_eq!(
-        output
-            .iter()
-            .map(|output| (output.work().request().value(), output.work().sequence()))
-            .collect::<Vec<_>>(),
-        vec![(101, 0), (202, 0), (101, 1), (202, 1)]
-    );
-    for (expected, actual) in reference.iter().zip(&output) {
-        match (expected, actual.logits()) {
-            (Some(expected), Some(actual)) => {
-                let actual = actual.evaluated().unwrap();
-                let actual = actual.as_slice::<f32>();
-                assert_eq!(expected.len(), actual.len());
-                assert!(expected
-                    .iter()
-                    .zip(actual)
-                    .all(|(left, right)| (left - right).abs() <= 1e-5));
-            }
-            (None, None) => {}
-            _ => panic!("microbatch scheduling changed final-stage output ownership"),
-        }
-    }
-    let report = scheduler.report();
-    assert_eq!(report.completed_work, 4);
-    assert_eq!(report.drain_cycles, 4);
-    assert_eq!(report.configured_submission_bound, 1);
-    assert_eq!(report.peak_in_flight_work, 2);
-    assert_eq!(report.peak_queued_work, 4);
-    assert_eq!(report.active_requests, 2);
-    assert!(!report.poisoned);
-
-    scheduler.finish_request(second_request).unwrap();
-    assert_eq!(
-        scheduler.request_status(second_request),
-        Some(RequestStatus::Finished)
-    );
-    let input = PipelineMicrobatchInput::new(
-        first_request,
-        PipelineInferencePhase::Decode,
-        PipelineStep::new(1, 1).unwrap(),
-    );
-    let input = if rank == 0 {
-        input.with_tokens(Array::from_slice(&[0u32], &[1, 1]))
-    } else {
-        input
-    };
-    scheduler.enqueue(input).unwrap();
-    scheduler
-        .cancel_request_distributed(first_request, execution)
-        .unwrap();
-    assert_eq!(
-        scheduler.request_status(first_request),
-        Some(RequestStatus::Cancelled)
-    );
-    let report = scheduler.report();
-    assert_eq!(report.active_requests, 0);
-    assert_eq!(report.queued_work, 0);
-    assert_eq!(report.discarded_work, 1);
-
-    let submitted_request = RequestId::new(303);
-    scheduler
-        .register_request(model, submitted_request)
-        .unwrap();
-    let input = PipelineMicrobatchInput::new(
-        submitted_request,
-        PipelineInferencePhase::Prefill,
-        PipelineStep::new(1, 1).unwrap(),
-    );
-    let input = if rank == 0 {
-        input.with_tokens(Array::from_slice(&[0u32], &[1, 1]))
-    } else {
-        input
-    };
-    scheduler.enqueue(input).unwrap();
-    assert!(scheduler.run_queued(model, execution).unwrap().is_empty());
-    scheduler
-        .cancel_request_distributed(submitted_request, execution)
-        .unwrap();
-    assert_eq!(scheduler.report().abandoned_in_flight_work, 1);
-    for _ in 0..16 {
-        assert!(scheduler.run_queued(model, execution).unwrap().is_empty());
-        if scheduler.report().current_in_flight_work == 0 {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    let report = scheduler.report();
-    assert_eq!(report.current_in_flight_work, 0);
-    assert_eq!(report.cancellation_after_submission, 1);
-    assert_eq!(report.abandoned_released_work, 1);
-}
-
-fn run_schedule_mismatch_worker(
-    model: &mut safemlx_lm::architectures::distributed::pipeline::PipelineModel,
-    rank: usize,
-    execution: &MlxDistributedSession<'_>,
-) {
-    let request = RequestId::new(if rank == 0 { 101 } else { 999 });
-    let mut scheduler =
-        PipelineInferenceScheduler::new(model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
-    scheduler.register_request(model, request).unwrap();
-    let input = PipelineMicrobatchInput::new(
-        request,
-        PipelineInferencePhase::Prefill,
-        PipelineStep::new(1, 2).unwrap(),
-    );
-    let input = if model.stage_info().is_first {
-        input.with_tokens(Array::from_slice(&[1u32, 2], &[1, 2]))
-    } else {
-        input
-    };
-    scheduler.enqueue(input).unwrap();
-    let error = scheduler.run_queued(model, execution).unwrap_err();
-    assert!(error.to_string().contains("work descriptors differ"));
-    assert!(scheduler.report().poisoned);
-    assert_eq!(
-        scheduler.request_status(request),
-        Some(RequestStatus::Failed)
-    );
 }
 
 struct ChildGuard {
@@ -3717,23 +3469,23 @@ fn ring_two_process_opaque_model_session() {
 /// schedule consensus, variable prompt shapes, decode parity, EOS, and cancel.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_pipeline_microbatch_scheduler() {
-    run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::Microbatch);
+fn ring_two_process_pipeline_opaque_session_repeated_decode() {
+    run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueSession);
 }
 
 /// Verifies the same scheduler and cache isolation over bounded local layers.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_dense_stream_pipeline_microbatch_scheduler() {
-    run_ring_pipeline_mode(true, FixtureFamily::Llama, WorkerMode::Microbatch);
+fn ring_two_process_dense_stream_opaque_session() {
+    run_ring_pipeline_mode(true, FixtureFamily::Llama, WorkerMode::OpaqueSession);
 }
 
 /// Verifies that divergent rank-local schedules fail before point-to-point
-/// traffic and poison every local request cache rather than risking reuse.
+/// Exercises paged cache selection through the opaque session lifecycle.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_pipeline_schedule_mismatch_fails_closed() {
-    run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::ScheduleMismatch);
+fn ring_two_process_pipeline_opaque_session_cache_policy() {
+    run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueSession);
 }
 
 /// Run with:
@@ -3874,12 +3626,12 @@ fn ring_four_process_deepseek_tensor_pipeline_expert_cache_without_ep() {
 /// compressed MLA state reusable.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_deepseek_expert_cache_mismatch_consensus() {
+fn ring_four_process_deepseek_expert_cache_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::DeepSeek,
         "pp-ep",
-        WorkerMode::ExpertCacheScheduleMismatch,
+        WorkerMode::ExpertCache,
     );
 }
 
@@ -3972,15 +3724,15 @@ fn ring_two_process_gpt_oss_pipeline_expert_cache() {
     run_ring_pipeline_mode(false, FixtureFamily::GptOss, WorkerMode::ExpertCache);
 }
 
-/// Verifies failure consensus remains deadlock-free with GPT-OSS cached experts.
+/// Verifies opaque-session execution with GPT-OSS cached experts.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_gpt_oss_pipeline_expert_cache_mismatch_consensus() {
+fn ring_four_process_gpt_oss_pipeline_expert_cache_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::GptOss,
         "pp-ep",
-        WorkerMode::ExpertCacheScheduleMismatch,
+        WorkerMode::ExpertCache,
     );
 }
 
@@ -4075,15 +3827,15 @@ fn ring_two_process_lfm2_moe_pipeline_expert_cache() {
     run_ring_pipeline_mode(false, FixtureFamily::Lfm2Moe, WorkerMode::ExpertCache);
 }
 
-/// Verifies failure consensus remains deadlock-free with LFM2 cached experts.
+/// Verifies opaque-session execution with LFM2 cached experts.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_lfm2_moe_pipeline_expert_cache_mismatch_consensus() {
+fn ring_four_process_lfm2_moe_pipeline_expert_cache_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Lfm2Moe,
         "pp-ep",
-        WorkerMode::ExpertCacheScheduleMismatch,
+        WorkerMode::ExpertCache,
     );
 }
 
@@ -4197,12 +3949,12 @@ fn ring_four_process_kimi_linear_tensor_pipeline_expert_cache_without_ep() {
 /// Kimi's recurrent or compressed-latent state reusable.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_kimi_linear_expert_cache_mismatch_consensus() {
+fn ring_four_process_kimi_linear_expert_cache_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::KimiLinear,
         "pp-ep",
-        WorkerMode::ExpertCacheScheduleMismatch,
+        WorkerMode::ExpertCache,
     );
 }
 
@@ -4283,16 +4035,15 @@ fn ring_two_process_nemotron_h_moe_pipeline_expert_cache() {
     run_ring_pipeline_mode(false, FixtureFamily::NemotronH, WorkerMode::ExpertCache);
 }
 
-/// Verifies cached-expert failure consensus remains deadlock-free for
-/// Nemotron-H stateful pipeline stages.
+/// Verifies cached-expert session execution for Nemotron-H stateful stages.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_nemotron_h_moe_pipeline_expert_cache_mismatch_consensus() {
+fn ring_four_process_nemotron_h_moe_pipeline_expert_cache_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::NemotronH,
         "pp-ep",
-        WorkerMode::ExpertCacheScheduleMismatch,
+        WorkerMode::ExpertCache,
     );
 }
 
@@ -4443,16 +4194,15 @@ fn ring_two_process_qwen35_moe_pipeline_expert_cache() {
     run_ring_pipeline_mode(false, FixtureFamily::Qwen35Moe, WorkerMode::ExpertCache);
 }
 
-/// Verifies failure consensus for cached Qwen hybrid experts without leaving a
-/// recurrent stage blocked in an EP collective.
+/// Verifies cached Qwen hybrid expert execution through one session.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_qwen35_moe_pipeline_expert_cache_mismatch_consensus() {
+fn ring_four_process_qwen35_moe_pipeline_expert_cache_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Qwen35Moe,
         "pp-ep",
-        WorkerMode::ExpertCacheScheduleMismatch,
+        WorkerMode::ExpertCache,
     );
 }
 
@@ -4555,16 +4305,15 @@ fn ring_qwen3_moe_gguf_pipeline_expert_cache() {
     );
 }
 
-/// Verifies global descriptor mismatch consensus remains deadlock-free while
-/// every stage also owns an independent expert cache.
+/// Verifies one session owns both pipeline communication and expert caches.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_pipeline_expert_cache_mismatch_consensus() {
+fn ring_qwen3_moe_pipeline_expert_cache_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Qwen3Moe,
         "pp-ep",
-        WorkerMode::ExpertCacheScheduleMismatch,
+        WorkerMode::ExpertCache,
     );
 }
 
@@ -4612,15 +4361,15 @@ fn ring_qwen3_moe_gguf_streamed_tensor_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3MoeGguf, "tp-pp-ep");
 }
 
-/// Verifies global descriptor mismatch consensus across every triple-axis rank.
+/// Verifies opaque model-session execution across every triple-axis rank.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_tensor_pipeline_expert_mismatch_consensus() {
+fn ring_qwen3_moe_tensor_pipeline_opaque_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Qwen3Moe,
         "tp-pp-ep",
-        WorkerMode::ScheduleMismatch,
+        WorkerMode::OpaqueSession,
     );
 }
 
@@ -4724,16 +4473,15 @@ fn ring_four_process_inkling_tensor_pipeline_expert_cache_without_ep() {
     );
 }
 
-/// Verifies descriptor mismatch consensus remains deadlock-free while every
-/// Inkling stage owns an independent expert cache.
+/// Verifies each Inkling stage's expert cache remains session-owned.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_four_process_inkling_expert_cache_mismatch_consensus() {
+fn ring_four_process_inkling_expert_cache_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Inkling,
         "pp-ep",
-        WorkerMode::ExpertCacheScheduleMismatch,
+        WorkerMode::ExpertCache,
     );
 }
 
@@ -4977,9 +4725,6 @@ enum WorkerMode {
     Standard,
     ExpertCache,
     ExpertCacheRequantize,
-    ExpertCacheScheduleMismatch,
-    Microbatch,
-    ScheduleMismatch,
     Requantize,
     OpaqueSession,
 }
@@ -5150,16 +4895,6 @@ fn run_ring_pipeline_processes(
             WorkerMode::ExpertCacheRequantize => {
                 command.env(EXPERT_CACHE, "1");
                 command.env(REQUANTIZE, "1");
-            }
-            WorkerMode::ExpertCacheScheduleMismatch => {
-                command.env(EXPERT_CACHE, "1");
-                command.env(SCHEDULE_MISMATCH, "1");
-            }
-            WorkerMode::Microbatch => {
-                command.env(MICROBATCH, "1");
-            }
-            WorkerMode::ScheduleMismatch => {
-                command.env(SCHEDULE_MISMATCH, "1");
             }
             WorkerMode::Requantize => {
                 command.env(REQUANTIZE, "1");

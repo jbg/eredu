@@ -1,12 +1,11 @@
 //! Executable pipeline parallelism for decoder-only language models.
 //!
-//! A [`crate::architectures::distributed::pipeline::PipelineModel`] owns one dependency-safe, balanced contiguous
-//! decoder-layer range and the boundary modules required by its explicit stage
-//! role. [`crate::architectures::distributed::pipeline::PipelineInferenceScheduler`]
-//! keeps independent request caches and
-//! drains bounded, round-robin microbatch queues so different requests can
-//! occupy different pipeline stages concurrently. Communication groups are
-//! borrowed for each operation and are never retained by model state.
+//! A [`crate::architectures::distributed::pipeline::PipelineModel`] owns one
+//! dependency-safe, balanced contiguous decoder-layer range and the boundary
+//! modules required by its explicit stage role. Request scheduling belongs to
+//! the backend-neutral core; this module only executes rank-local MLX stages.
+//! Communication groups are borrowed for each operation and are never retained
+//! by model state.
 //! Multimodal encoder, projection, merge, finalization, and decoder groups use
 //! one validated placement DAG with topology-planned payload routes.
 
@@ -24,9 +23,12 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
 };
 
+use crate::core::cache::{
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+};
 use safemlx::{
     distributed::{self, Group},
     error::Exception,
@@ -36,15 +38,6 @@ use safemlx::{
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
-};
-use safemlx_lm_core::scheduler::{
-    RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerLimits, SchedulerReport,
-    SemanticStateTransaction, TransitionOutput, WorkDescriptor, WorkId,
-};
-
-use crate::core::cache::{
-    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
-    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
 };
 
 use crate::{
@@ -72,11 +65,8 @@ use crate::{
     },
     core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
     core::generation::MtpConfig,
-    core::{
-        cache::{CachePoolReport, CacheResidencyPool},
-        residency::{
-            MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
-        },
+    core::residency::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
     error::Error,
     nn::{
@@ -107,10 +97,9 @@ use crate::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     runtime::distributed::parallel::{
-        ParallelBuildContext, ParallelExecutionContext, ShardingPolicy, SynchronizedToken,
+        ParallelBuildContext, ParallelExecutionContext, ShardingPolicy,
     },
     runtime::distributed::topology::{ParallelCoordinates, ParallelTopology},
-    runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
         ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
@@ -120,7 +109,7 @@ use crate::{
     },
     runtime::generation::{
         embedded_mtp::{DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget},
-        sampler::{Sampler, SpeculativeSampler},
+        sampler::SpeculativeSampler,
         speculative::{MtpCapability, MtpCheckpointKind, MtpStats},
     },
     runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
@@ -186,8 +175,6 @@ pub struct PipelineStageInfo {
     pub placement: Arc<PlacedExecutionDag>,
     /// Complete Cartesian topology and local TP/PP/EP coordinates.
     pub topology: ParallelTopology,
-    /// Rank in the distributed group.
-    pub global_rank: usize,
     /// Zero-based pipeline coordinate.
     pub pipeline_stage: usize,
     /// Number of pipeline stages.
@@ -228,8 +215,6 @@ pub struct PipelineStageInfo {
     pub successor_rank: Option<usize>,
     /// Architecture adapter used by the stage.
     pub model_kind: ModelKind,
-    /// Decoder hidden width.
-    pub hidden_size: i32,
     /// Flattened hidden width transferred between pipeline stages.
     pub activation_hidden_size: i32,
     /// Dtype used for transferred hidden activations.
@@ -311,65 +296,9 @@ impl PipelineStep {
         })
     }
 
-    /// Returns the validated batch dimension.
-    pub const fn batch_size(self) -> i32 {
-        self.batch_size
-    }
-
-    /// Returns the validated sequence dimension.
-    pub const fn sequence_length(self) -> i32 {
-        self.sequence_length
-    }
-
     fn activation_shape(self, hidden_size: i32) -> [i32; 3] {
         [self.batch_size, self.sequence_length, hidden_size]
     }
-}
-
-/// The cache transition performed by one scheduled microbatch.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum PipelineInferencePhase {
-    /// Add one prompt chunk to a request cache.
-    Prefill,
-    /// Add one autoregressive token to a request cache.
-    Decode,
-}
-
-impl PipelineInferencePhase {
-    const fn wire_tag(self) -> u32 {
-        match self {
-            Self::Prefill => 0,
-            Self::Decode => 1,
-        }
-    }
-}
-
-/// Rank-local input for one scheduled pipeline cache transition.
-///
-/// For token ingress, stage zero supplies token ids and later stages retain an
-/// empty token ingress. For typed multimodal ingress, every first-stage TP/EP
-/// coordinate owns a [`PreparedModelInput`], while later stages retain its
-/// payload-free [`PreparedModelInputIdentity`]. An architecture-specific
-/// additive mask, when supported, is supplied independently on every rank.
-#[derive(Debug, Clone)]
-pub struct PipelineMicrobatchInput {
-    request: RequestId,
-    phase: PipelineInferencePhase,
-    step: PipelineStep,
-    ingress: ScheduledPipelineIngress,
-    mask: Option<Array>,
-}
-
-#[derive(Debug, Clone)]
-enum ScheduledPipelineIngress {
-    Tokens(Option<Array>),
-    Prepared(PreparedPipelineIngress),
-}
-
-#[derive(Debug, Clone)]
-enum PreparedPipelineIngress {
-    Payload(PreparedModelInput),
-    Identity(PreparedModelInputIdentity),
 }
 
 const PLACED_PAYLOAD_WIRE_MAGIC: i32 = 0x534d_4c58;
@@ -613,181 +542,6 @@ fn recv_prepared_input(
     PreparedModelInput::from_identity_wire_arrays(&identity, arrays)
 }
 
-impl ScheduledPipelineIngress {
-    fn prepared_identity(&self) -> Option<PreparedModelInputIdentity> {
-        match self {
-            Self::Prepared(PreparedPipelineIngress::Payload(input)) => Some(input.identity()),
-            Self::Prepared(PreparedPipelineIngress::Identity(identity)) => Some(identity.clone()),
-            Self::Tokens(_) => None,
-        }
-    }
-
-    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
-        match self {
-            Self::Tokens(_) => output.push(0),
-            Self::Prepared(PreparedPipelineIngress::Payload(input)) => {
-                output.push(1);
-                input.identity().encode_descriptor(output)?;
-            }
-            Self::Prepared(PreparedPipelineIngress::Identity(identity)) => {
-                output.push(1);
-                identity.encode_descriptor(output)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl PipelineMicrobatchInput {
-    /// Creates a microbatch without rank-local token or mask tensors.
-    pub const fn new(
-        request: RequestId,
-        phase: PipelineInferencePhase,
-        step: PipelineStep,
-    ) -> Self {
-        Self {
-            request,
-            phase,
-            step,
-            ingress: ScheduledPipelineIngress::Tokens(None),
-            mask: None,
-        }
-    }
-
-    /// Supplies stage-zero token ids.
-    pub fn with_tokens(mut self, tokens: Array) -> Self {
-        self.ingress = ScheduledPipelineIngress::Tokens(Some(tokens));
-        self
-    }
-
-    /// Supplies an owned prepared input on a first-stage TP/EP coordinate.
-    ///
-    /// Build the matching identity with [`PreparedModelInput::identity`] before
-    /// moving the payload, then submit it with
-    /// [`Self::with_prepared_input_identity`] on every later stage.
-    pub fn with_prepared_input(mut self, input: PreparedModelInput) -> Self {
-        self.ingress = ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Payload(input));
-        self
-    }
-
-    /// Supplies only the matching prepared-input identity on a later stage.
-    pub fn with_prepared_input_identity(mut self, identity: PreparedModelInputIdentity) -> Self {
-        self.ingress =
-            ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Identity(identity));
-        self
-    }
-
-    /// Supplies an architecture-supported additive attention mask.
-    pub fn with_mask(mut self, mask: Array) -> Self {
-        self.mask = Some(mask);
-        self
-    }
-
-    /// Returns the target request.
-    pub const fn request(&self) -> RequestId {
-        self.request
-    }
-
-    /// Returns the cache transition phase.
-    pub const fn phase(&self) -> PipelineInferencePhase {
-        self.phase
-    }
-
-    /// Returns the validated batch and sequence geometry.
-    pub const fn step(&self) -> PipelineStep {
-        self.step
-    }
-
-    /// Returns stage-zero token ids when present on this rank.
-    pub const fn tokens(&self) -> Option<&Array> {
-        match &self.ingress {
-            ScheduledPipelineIngress::Tokens(tokens) => tokens.as_ref(),
-            ScheduledPipelineIngress::Prepared(_) => None,
-        }
-    }
-
-    /// Returns the collective identity for typed prepared ingress, when used.
-    pub fn prepared_input_identity(&self) -> Option<PreparedModelInputIdentity> {
-        self.ingress.prepared_identity()
-    }
-
-    /// Returns the rank-local additive mask when present.
-    pub const fn mask(&self) -> Option<&Array> {
-        self.mask.as_ref()
-    }
-}
-
-/// Result metadata and exact backend completion for one committed microbatch.
-#[derive(Debug)]
-#[must_use = "pipeline work completed; consume its result or retain its exact completion"]
-pub struct PipelineMicrobatchOutput {
-    work: WorkId,
-    phase: PipelineInferencePhase,
-    step: PipelineStep,
-    completion: PipelineStageCompletion,
-}
-
-impl PipelineMicrobatchOutput {
-    /// Returns the globally agreed work identity.
-    pub const fn work(&self) -> WorkId {
-        self.work
-    }
-
-    /// Returns the submitted cache transition phase.
-    pub const fn phase(&self) -> PipelineInferencePhase {
-        self.phase
-    }
-
-    /// Returns the completed batch and sequence geometry.
-    pub const fn step(&self) -> PipelineStep {
-        self.step
-    }
-
-    /// Returns vocabulary logits on the final rank and `None` elsewhere.
-    ///
-    /// The scheduler publishes this array only after its exact completion has
-    /// succeeded and its request-state branch has committed. The completion is
-    /// retained so callers can still order dependent work onto another stream.
-    pub const fn logits(&self) -> Option<&Array> {
-        self.completion.logits()
-    }
-
-    /// Orders later evaluation on `stream` after this microbatch.
-    pub fn wait_on(&self, stream: &Stream) -> Result<(), Error> {
-        self.completion.wait_on(stream)
-    }
-
-    /// Returns whether this microbatch's exact backend completion has finished.
-    pub fn is_complete(&self) -> Result<bool, Error> {
-        self.completion.is_complete()
-    }
-
-    /// Blocks for this microbatch's exact completion.
-    pub fn synchronize(&self) -> Result<(), Error> {
-        self.completion.synchronize()
-    }
-
-    /// Consumes the completion and returns final-rank logits when present.
-    pub fn into_logits(self) -> Result<Option<Array>, Error> {
-        self.completion.into_logits()
-    }
-}
-
-/// Submitted execution of one rank-local pipeline stage.
-///
-/// Pipeline transport and stage outputs are lazy MLX graphs. Construction of
-/// this value explicitly submits every endpoint and returns immediately with
-/// an exact backend event. The completion owns transport endpoints, cache
-/// updates, final logits, and embedded-MTP hidden state until MLX has retained
-/// them. It can order multiple compatible consumer streams without a host
-/// synchronization.
-///
-/// Dropping the value while work or consumer waits remain outstanding is safe.
-/// Asynchronous errors are observable through query or synchronization. The
-/// type is neither `Send` nor `Sync`, because its SafeMLX event is host-thread
-/// affine.
-#[derive(Debug)]
-#[must_use = "pipeline work has been submitted; retain, wait on, or synchronize its completion"]
 pub struct PipelineStageCompletion {
     inner: DistributedCompletion<Option<Array>>,
 }
@@ -806,11 +560,6 @@ impl PipelineStageCompletion {
         self.inner.value().as_ref()
     }
 
-    /// Orders later evaluation on a compatible stream after this stage.
-    pub fn wait_on(&self, stream: &Stream) -> Result<(), Error> {
-        self.inner.wait_on(stream)
-    }
-
     /// Returns whether the exact stage completion has finished.
     pub fn is_complete(&self) -> Result<bool, Error> {
         self.inner.is_complete()
@@ -821,34 +570,16 @@ impl PipelineStageCompletion {
         self.inner.synchronize()
     }
 
-    /// Waits for completion and returns final-rank logits when present.
-    pub fn into_logits(self) -> Result<Option<Array>, Error> {
-        self.inner.into_value()
-    }
-
     fn into_submitted_logits(self) -> Option<Array> {
         self.inner.value().clone()
     }
 }
 
-impl TransitionOutput for PipelineStageCompletion {
-    type Error = Error;
-
-    fn is_complete(&self) -> Result<bool, Error> {
-        self.inner.is_complete()
-    }
-
-    fn backend_name(&self) -> Option<String> {
-        self.inner.backend().ok().map(|backend| match backend {
-            safemlx::EventBackend::None => "none".into(),
-            safemlx::EventBackend::Cpu => "cpu".into(),
-            safemlx::EventBackend::Metal => "metal".into(),
-            safemlx::EventBackend::Cuda => "cuda".into(),
-        })
-    }
-
-    fn retained_resources(&self) -> usize {
-        self.inner.retained_resources()
+#[cfg(test)]
+impl PipelineStageCompletion {
+    pub fn into_logits(self) -> Result<Option<Array>, Error> {
+        self.synchronize()?;
+        Ok(self.logits().cloned())
     }
 }
 
@@ -977,24 +708,25 @@ impl PipelineStateSlot {
         }
     }
 
-    /// Returns the authoritative semantic tensor descriptor.
-    pub const fn policy(&self) -> &StateTensorPolicy {
-        &self.policy
-    }
-
     /// Returns the materialized recurrent or convolution tensor, if initialized.
     pub const fn value(&self) -> Option<&Array> {
         self.value.as_ref()
     }
 
-    /// Returns the number of input positions incorporated into this slot.
-    pub const fn offset(&self) -> i32 {
-        self.offset
-    }
-
     fn clear(&mut self) {
         self.value = None;
         self.offset = 0;
+    }
+}
+
+#[cfg(test)]
+impl PipelineStateSlot {
+    pub(crate) const fn policy(&self) -> &StateTensorPolicy {
+        &self.policy
+    }
+
+    pub(crate) const fn offset(&self) -> i32 {
+        self.offset
     }
 }
 
@@ -1080,29 +812,6 @@ impl PipelineCache {
         }
     }
 
-    /// Returns the architecture identity checked by stage execution.
-    pub const fn model_kind(&self) -> ModelKind {
-        self.model_kind
-    }
-
-    /// Returns the ordered local cache entries.
-    pub fn layers(&self) -> &[PipelineLayerCache] {
-        &self.layers
-    }
-
-    /// Returns the global decoder-layer ids represented locally.
-    pub fn global_layers(&self) -> Vec<usize> {
-        self.layers
-            .iter()
-            .map(|layer| match layer {
-                PipelineLayerCache::StateSlots { global_layer, .. }
-                | PipelineLayerCache::KeyValue { global_layer, .. }
-                | PipelineLayerCache::CompressedLatent { global_layer, .. }
-                | PipelineLayerCache::DeepSeekV4 { global_layer, .. } => *global_layer,
-            })
-            .collect()
-    }
-
     /// Clears retained state without changing local layer ownership.
     pub fn reset(&mut self) -> Result<(), Error> {
         let shared_manager_cleared = self.residency_manager.is_some();
@@ -1156,713 +865,24 @@ impl PipelineCache {
         self.mtp = PipelineMtpCache::None;
         Ok(())
     }
-
-    fn restore_transaction_checkpoint(
-        &mut self,
-        checkpoint: &Self,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        if self.model_kind != checkpoint.model_kind || self.layers.len() != checkpoint.layers.len()
-        {
-            return Err(Error::Parallel(
-                "pipeline transaction checkpoint changed cache layout".into(),
-            ));
-        }
-        for (current, previous) in self.layers.iter_mut().zip(&checkpoint.layers) {
-            match (current, previous) {
-                (
-                    PipelineLayerCache::StateSlots {
-                        global_layer,
-                        slots,
-                    },
-                    PipelineLayerCache::StateSlots {
-                        global_layer: previous_layer,
-                        slots: previous_slots,
-                    },
-                ) if global_layer == previous_layer => slots.clone_from(previous_slots),
-                (
-                    PipelineLayerCache::KeyValue {
-                        global_layer,
-                        cache,
-                        slots,
-                    },
-                    PipelineLayerCache::KeyValue {
-                        global_layer: previous_layer,
-                        cache: previous_cache,
-                        slots: previous_slots,
-                    },
-                ) if global_layer == previous_layer => {
-                    match (cache, previous_cache) {
-                        (
-                            PipelineKeyValueCache::Standard(cache),
-                            PipelineKeyValueCache::Standard(previous),
-                        ) => cache.clone_from(previous),
-                        (
-                            PipelineKeyValueCache::Paged(cache),
-                            PipelineKeyValueCache::Paged(previous),
-                        ) => cache.restore_checkpoint(previous, stream)?,
-                        _ => {
-                            return Err(Error::Parallel(
-                                "pipeline transaction checkpoint changed KV residency".into(),
-                            ));
-                        }
-                    }
-                    slots.clone_from(previous_slots);
-                }
-                (
-                    PipelineLayerCache::CompressedLatent {
-                        global_layer,
-                        cache,
-                        slots,
-                    },
-                    PipelineLayerCache::CompressedLatent {
-                        global_layer: previous_layer,
-                        cache: previous_cache,
-                        slots: previous_slots,
-                    },
-                ) if global_layer == previous_layer => {
-                    cache.restore_checkpoint(previous_cache, stream)?;
-                    slots.clone_from(previous_slots);
-                }
-                (
-                    PipelineLayerCache::DeepSeekV4 {
-                        global_layer,
-                        cache,
-                    },
-                    PipelineLayerCache::DeepSeekV4 {
-                        global_layer: previous_layer,
-                        cache: previous_cache,
-                    },
-                ) if global_layer == previous_layer => {
-                    cache.restore_checkpoint(previous_cache, stream)?
-                }
-                _ => {
-                    return Err(Error::Parallel(
-                        "pipeline transaction checkpoint changed layer identity".into(),
-                    ));
-                }
-            }
-        }
-        match (&mut self.mtp, &checkpoint.mtp) {
-            (PipelineMtpCache::None, PipelineMtpCache::None) => {}
-            (PipelineMtpCache::DeepSeek(current), PipelineMtpCache::DeepSeek(previous)) => {
-                if current.len() != previous.len() {
-                    return Err(Error::Parallel(
-                        "pipeline MTP checkpoint length changed".into(),
-                    ));
-                }
-                for (cache, checkpoint) in current.iter_mut().zip(previous) {
-                    cache.restore_checkpoint(checkpoint, stream)?;
-                }
-            }
-            (PipelineMtpCache::DeepSeekV4(current), PipelineMtpCache::DeepSeekV4(previous)) => {
-                if current.len() != previous.len() {
-                    return Err(Error::Parallel(
-                        "pipeline DeepSeek V4 MTP checkpoint length changed".into(),
-                    ));
-                }
-                for (cache, checkpoint) in current.iter_mut().zip(previous) {
-                    cache.restore_checkpoint(checkpoint, stream)?;
-                }
-            }
-            (PipelineMtpCache::Inkling(current), PipelineMtpCache::Inkling(previous)) => {
-                if current.len() != previous.len() {
-                    return Err(Error::Parallel(
-                        "pipeline MTP checkpoint length changed".into(),
-                    ));
-                }
-                for (cache, checkpoint) in current.iter_mut().zip(previous) {
-                    cache.restore_checkpoint(checkpoint, stream)?;
-                }
-            }
-            (PipelineMtpCache::NemotronH(current), PipelineMtpCache::NemotronH(previous)) => {
-                if current.len() != previous.len() {
-                    return Err(Error::Parallel(
-                        "pipeline MTP checkpoint length changed".into(),
-                    ));
-                }
-                for (cache, checkpoint) in current.iter_mut().zip(previous) {
-                    cache.restore_checkpoint(checkpoint, stream)?;
-                }
-            }
-            (PipelineMtpCache::QwenHybrid(current), PipelineMtpCache::QwenHybrid(previous)) => {
-                if current.len() != previous.len() {
-                    return Err(Error::Parallel(
-                        "pipeline MTP checkpoint length changed".into(),
-                    ));
-                }
-                for (cache, checkpoint) in current.iter_mut().zip(previous) {
-                    cache.restore_checkpoint(checkpoint, stream)?;
-                }
-            }
-            _ => {
-                return Err(Error::Parallel(
-                    "pipeline transaction checkpoint changed MTP layout".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
-#[derive(Debug, Clone)]
-struct PipelineRequestState {
-    cache: PipelineCache,
-    batch_size: Option<i32>,
-    last_phase: Option<PipelineInferencePhase>,
-}
-
-impl SemanticStateTransaction for PipelineRequestState {
-    type Branch = PipelineRequestBranch;
-    type Error = Error;
-
-    fn branch(&self) -> Result<Self::Branch, Error> {
-        // Array and sealed-cache backing is shared; only mutable cache tails
-        // and semantic metadata are structurally cloned for this branch.
-        Ok(PipelineRequestBranch {
-            state: self.clone(),
-            checkpoint: self.cache.clone(),
-            stream: None,
-        })
+#[cfg(test)]
+impl PipelineCache {
+    pub(crate) fn layers(&self) -> &[PipelineLayerCache] {
+        &self.layers
     }
 
-    fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Error> {
-        *self = branch.state;
-        Ok(())
-    }
-
-    fn discard_branch(mut branch: Self::Branch) -> Result<(), Error> {
-        if let Some(stream) = branch.stream.as_ref() {
-            branch
-                .state
-                .cache
-                .restore_transaction_checkpoint(&branch.checkpoint, stream)?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct PipelineRequestBranch {
-    state: PipelineRequestState,
-    checkpoint: PipelineCache,
-    stream: Option<Stream>,
-}
-
-#[derive(Debug, Clone)]
-struct ScheduledPipelineMicrobatch {
-    phase: PipelineInferencePhase,
-    step: PipelineStep,
-    ingress: ScheduledPipelineIngress,
-    mask: Option<Array>,
-}
-
-impl WorkDescriptor for ScheduledPipelineMicrobatch {
-    type Error = Error;
-
-    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
-        output.extend_from_slice(&[
-            self.phase.wire_tag(),
-            self.step.batch_size() as u32,
-            self.step.sequence_length() as u32,
-        ]);
-        self.ingress.encode_descriptor(output)?;
-        match &self.mask {
-            Some(mask) => {
-                output.extend_from_slice(&[1, mask.dtype() as u32, mask.ndim() as u32]);
-                output.extend(mask.shape().iter().map(|dimension| *dimension as u32));
-            }
-            None => output.push(0),
-        }
-        Ok(())
-    }
-
-    fn execution_slice_size(&self) -> usize {
-        self.step.sequence_length() as usize
-    }
-}
-
-/// Bounded, fair inference scheduler for one rank-local pipeline stage.
-///
-/// The scheduler owns an independent [`PipelineCache`] for each active request.
-/// Submitted work is drained in round-robin request order while preserving the
-/// exact transition order within each request. Because ranks are independent
-/// processes, every rank must register requests and submit matching work
-/// descriptors. [`Self::run_queued`] performs an exact collective descriptor
-/// comparison before point-to-point traffic begins, turning divergent schedules
-/// into an error instead of an unmatched send/receive deadlock.
-///
-/// Sampling remains outside this type: callers consume final-rank logits, call
-/// [`PipelineModel::sample_and_synchronize`], and either enqueue the selected
-/// decode token or call [`Self::finish_request`] after EOS. This keeps sampling
-/// policy separate from cache ownership and pipeline scheduling.
-#[derive(Debug)]
-pub struct PipelineInferenceScheduler {
-    topology: ParallelTopology,
-    model_kind: ModelKind,
-    global_layer_range: Range<usize>,
-    architecture_fingerprint: String,
-    cache_pool: Option<CacheResidencyPool>,
-    scheduler:
-        Scheduler<ScheduledPipelineMicrobatch, PipelineRequestState, PipelineStageCompletion>,
-}
-
-impl PipelineInferenceScheduler {
-    /// Binds a scheduler to one loaded pipeline stage.
-    pub fn new(model: &PipelineModel, limits: SchedulerLimits) -> Result<Self, Error> {
-        Ok(Self {
-            topology: model.topology,
-            model_kind: model.info.model_kind,
-            global_layer_range: model.info.global_layer_range.clone(),
-            architecture_fingerprint: model.prompt_cache_architecture_fingerprint()?,
-            cache_pool: None,
-            scheduler: Scheduler::new(limits)?,
-        })
-    }
-
-    /// Binds a scheduler to an explicit process-wide cache pool before any
-    /// request state is allocated.
-    pub fn new_with_cache_pool(
-        model: &PipelineModel,
-        limits: SchedulerLimits,
-        cache_pool: CacheResidencyPool,
-    ) -> Result<Self, Error> {
-        let mut scheduler = Self::new(model, limits)?;
-        scheduler.cache_pool = Some(cache_pool);
-        Ok(scheduler)
-    }
-
-    /// Registers a request with a fresh device-resident cache.
-    pub fn register_request(
-        &mut self,
-        model: &PipelineModel,
-        request: RequestId,
-    ) -> Result<(), Error> {
-        self.validate_model(model)?;
-        self.scheduler.validate_registration(request)?;
-        let cache = model.new_cache()?;
-        self.validate_cache(model, &cache)?;
-        Ok(self.scheduler.register(
-            request,
-            PipelineRequestState {
-                cache,
-                batch_size: None,
-                last_phase: None,
-            },
-        )?)
-    }
-
-    /// Registers a request with a fresh cache under an explicit residency policy.
-    pub fn register_request_with_options(
-        &mut self,
-        model: &PipelineModel,
-        request: RequestId,
-        policy: CacheResidencyPolicy,
-    ) -> Result<(), Error> {
-        self.validate_model(model)?;
-        self.scheduler.validate_registration(request)?;
-        let policy = self.bind_cache_policy(policy)?;
-        let cache = model.new_cache_with_options(policy)?;
-        self.validate_cache(model, &cache)?;
-        Ok(self.scheduler.register(
-            request,
-            PipelineRequestState {
-                cache,
-                batch_size: None,
-                last_phase: None,
-            },
-        )?)
-    }
-
-    /// Registers a request with a restored or caller-created stage-local cache.
-    pub fn register_request_with_cache(
-        &mut self,
-        model: &PipelineModel,
-        request: RequestId,
-        cache: PipelineCache,
-    ) -> Result<(), Error> {
-        self.validate_model(model)?;
-        self.scheduler.validate_registration(request)?;
-        self.validate_cache(model, &cache)?;
-        if let Some(manager) = cache.residency_manager.as_ref() {
-            self.bind_existing_cache_pool(manager.pool())?;
-        }
-        Ok(self.scheduler.register(
-            request,
-            PipelineRequestState {
-                cache,
-                batch_size: None,
-                last_phase: None,
-            },
-        )?)
-    }
-
-    /// Submits one rank-local microbatch and returns its ordered work identity.
-    ///
-    /// Requests may contain multiple prompt chunks. Once decode begins, later
-    /// prefill work is rejected. Decode work always has sequence length one and
-    /// every transition for a request must retain its original batch size.
-    pub fn enqueue(&mut self, input: PipelineMicrobatchInput) -> Result<WorkId, Error> {
-        self.enqueue_with_deadline(input, None)
-    }
-
-    /// Enqueues one microbatch with an optional absolute cancellation deadline.
-    pub fn enqueue_with_deadline(
-        &mut self,
-        input: PipelineMicrobatchInput,
-        deadline: Option<Instant>,
-    ) -> Result<WorkId, Error> {
-        let first_stage = self.topology.pipeline_parallel_rank == 0;
-        match &input.ingress {
-            ScheduledPipelineIngress::Tokens(Some(tokens)) if first_stage => {
-                if tokens.ndim() != 2
-                    || tokens.shape() != [input.step.batch_size(), input.step.sequence_length()]
-                {
-                    return Err(Error::Parallel(format!(
-                        "pipeline stage zero microbatch expected token ids shaped [{}, {}], got {:?}",
-                        input.step.batch_size(),
-                        input.step.sequence_length(),
-                        tokens.shape()
-                    )));
-                }
-            }
-            ScheduledPipelineIngress::Tokens(None) if first_stage => {
-                return Err(Error::Parallel(
-                    "pipeline stage zero microbatch requires token ids or prepared typed ingress"
-                        .into(),
-                ));
-            }
-            ScheduledPipelineIngress::Tokens(Some(_)) => {
-                return Err(Error::Parallel(format!(
-                    "pipeline stage {} microbatch must receive hidden activations rather than token ids",
-                    self.topology.pipeline_parallel_rank
-                )));
-            }
-            ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Payload(_))
-                if !first_stage =>
-            {
-                return Err(Error::Parallel(format!(
-                    "pipeline stage {} must retain only the prepared-input identity, not its payload",
-                    self.topology.pipeline_parallel_rank
-                )));
-            }
-            ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Identity(_))
-                if first_stage =>
-            {
-                return Err(Error::Parallel(
-                    "pipeline stage zero requires the owned prepared-input payload, not only its identity"
-                        .into(),
-                ));
-            }
-            ScheduledPipelineIngress::Prepared(_)
-                if input.phase != PipelineInferencePhase::Prefill =>
-            {
-                return Err(Error::Parallel(
-                    "prepared typed ingress is valid only for pipeline prefill work".into(),
-                ));
-            }
-            ScheduledPipelineIngress::Tokens(None) | ScheduledPipelineIngress::Prepared(_) => {}
-        }
-        if input.phase == PipelineInferencePhase::Decode && input.step.sequence_length() != 1 {
-            return Err(Error::Parallel(format!(
-                "pipeline decode microbatch sequence length must be one, got {}",
-                input.step.sequence_length()
-            )));
-        }
-
-        let request = self.scheduler.request_state(input.request).ok_or_else(|| {
-            Error::Parallel(format!(
-                "pipeline request {} is not active",
-                input.request.value()
-            ))
-        })?;
-        if request.last_phase == Some(PipelineInferencePhase::Decode)
-            && input.phase == PipelineInferencePhase::Prefill
-        {
-            return Err(Error::Parallel(format!(
-                "pipeline request {} cannot return to prefill after decode began",
-                input.request.value()
-            )));
-        }
-        if let Some(batch_size) = request.batch_size {
-            if batch_size != input.step.batch_size() {
-                return Err(Error::Parallel(format!(
-                    "pipeline request {} changed batch size from {batch_size} to {}",
-                    input.request.value(),
-                    input.step.batch_size()
-                )));
-            }
-        }
-        let phase = input.phase;
-        let batch_size = input.step.batch_size();
-        let request_id = input.request;
-        let work = self.scheduler.enqueue_with_deadline(
-            request_id,
-            ScheduledPipelineMicrobatch {
-                phase: input.phase,
-                step: input.step,
-                ingress: input.ingress,
-                mask: input.mask,
-            },
-            deadline,
-        )?;
-        let request = self.scheduler.request_state_mut(request_id)?;
-        request.batch_size.get_or_insert(batch_size);
-        request.last_phase = Some(phase);
-        Ok(work)
-    }
-
-    /// Advances one bounded scheduler turn in fair round-robin request order.
-    ///
-    /// A collective preflight compares every work descriptor exactly across
-    /// ranks before any point-to-point send or receive is issued. Stage zero can
-    /// then advance to a later request while downstream stages finish an earlier
-    /// request, filling the pipeline without mixing request caches.
-    pub fn run_queued(
-        &mut self,
-        model: &mut PipelineModel,
-        execution: &crate::MlxDistributedSession<'_>,
-    ) -> Result<Vec<PipelineMicrobatchOutput>, Error> {
-        self.validate_model(model)?;
-        if execution.topology() != self.topology {
-            return Err(Error::Parallel(format!(
-                "pipeline scheduler topology {:?} does not match distributed session topology {:?}",
-                self.topology,
-                execution.topology()
-            )));
-        }
-        let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
-        let progress = self.scheduler.run_distributed_turn(
-            protocol,
-            execution,
-            Instant::now(),
-            |_, work, request| {
-                request.stream = Some(execution.stream().clone());
-                let request = &mut request.state;
-                match &work.ingress {
-                    ScheduledPipelineIngress::Tokens(tokens) => model.forward_distributed(
-                        tokens.as_ref(),
-                        work.step,
-                        work.mask.as_ref(),
-                        &mut request.cache,
-                        execution,
-                    ),
-                    ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Payload(input)) => {
-                        input.with_model_input(|input| {
-                            model.prefill_distributed(
-                                Some(input),
-                                work.step,
-                                work.mask.as_ref(),
-                                &mut request.cache,
-                                execution,
-                            )
-                        })
-                    }
-                    ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Identity(_)) => {
-                        model.prefill_distributed(
-                            None,
-                            work.step,
-                            work.mask.as_ref(),
-                            &mut request.cache,
-                            execution,
-                        )
-                    }
-                }
-            },
-        )?;
-        if let Some((work, failure)) = progress.failed.first() {
-            return Err(Error::Parallel(format!(
-                "pipeline work {:?} failed asynchronously: {}",
-                work, failure
-            )));
-        }
-        Ok(progress
-            .committed
-            .into_iter()
-            .map(|(work, input, completion)| PipelineMicrobatchOutput {
-                work,
-                phase: input.phase,
-                step: input.step,
-                completion,
+    pub(crate) fn global_layers(&self) -> Vec<usize> {
+        self.layers
+            .iter()
+            .map(|layer| match layer {
+                PipelineLayerCache::StateSlots { global_layer, .. }
+                | PipelineLayerCache::KeyValue { global_layer, .. }
+                | PipelineLayerCache::CompressedLatent { global_layer, .. }
+                | PipelineLayerCache::DeepSeekV4 { global_layer, .. } => *global_layer,
             })
-            .collect())
-    }
-
-    /// Marks a request complete after EOS and releases its cache.
-    ///
-    /// Any speculative work still queued for the request is discarded.
-    pub fn finish_request(&mut self, request: RequestId) -> Result<(), Error> {
-        Ok(self.scheduler.finish(request)?)
-    }
-
-    /// Cancels local work before distributed execution begins.
-    ///
-    /// Once ranks are executing, use [`Self::cancel_request_distributed`] so
-    /// disposition reaches consensus through the selected session.
-    pub fn cancel_request(&mut self, request: RequestId) -> Result<(), Error> {
-        Ok(self.scheduler.cancel(request)?)
-    }
-
-    /// Reaches exact group consensus, then cancels or abandons this request.
-    pub fn cancel_request_distributed(
-        &mut self,
-        request: RequestId,
-        execution: &crate::MlxDistributedSession<'_>,
-    ) -> Result<(), Error> {
-        if execution.topology() != self.topology {
-            return Err(Error::Parallel(
-                "pipeline cancellation distributed-session topology mismatch".into(),
-            ));
-        }
-        let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
-        self.scheduler
-            .cancel_distributed(protocol, request, execution, Instant::now())
-            .map_err(Into::into)
-    }
-
-    /// Releases an idle active request and returns its cache to the caller.
-    ///
-    /// This is the handoff used before explicit prompt-cache persistence. Work
-    /// must be drained or cancelled first.
-    pub fn release_request_cache(&mut self, request: RequestId) -> Result<PipelineCache, Error> {
-        Ok(self.scheduler.release(request)?.cache)
-    }
-
-    /// Removes a terminal identity so a caller may explicitly reuse it.
-    pub fn forget_terminal_request(&mut self, request: RequestId) -> Result<RequestStatus, Error> {
-        Ok(self.scheduler.forget_terminal(request)?)
-    }
-
-    /// Returns the known request lifecycle state.
-    pub fn request_status(&self, request: RequestId) -> Option<RequestStatus> {
-        self.scheduler.request_status(request)
-    }
-
-    /// Returns the number of queued transitions for one active request.
-    pub fn queued_for_request(&self, request: RequestId) -> usize {
-        self.scheduler.queued_for_request(request)
-    }
-
-    /// Returns a current observability snapshot.
-    pub fn report(&self) -> SchedulerReport {
-        self.scheduler.report()
-    }
-
-    /// Returns configured bounds, backend identity, and physical-preemption support.
-    pub fn capabilities(&self) -> SchedulerCapabilities {
-        self.scheduler.capabilities()
-    }
-
-    /// Returns aggregate cache-pool occupancy for all attached request caches,
-    /// including caches released to callers while they retain pool membership.
-    pub fn cache_pool_report(&self) -> Result<Option<CachePoolReport>, Error> {
-        self.cache_pool
-            .as_ref()
-            .map(|pool| {
-                pool.report()
-                    .map_err(|error| Error::Parallel(error.to_string()))
-            })
-            .transpose()
-    }
-
-    /// Polls locally retained submissions after consensus poisoning.
-    ///
-    /// This performs no collective and never publishes request state. It
-    /// returns `true` once every MLX completion retained at the poison boundary
-    /// has reached an exact local terminal state and its resources were freed.
-    pub fn poll_poisoned_completions(&mut self) -> Result<bool, Error> {
-        if self.scheduler.poison_reason().is_none() {
-            return Err(Error::Parallel("pipeline scheduler is not poisoned".into()));
-        }
-        let progress = self.scheduler.poll_completions(Instant::now());
-        if let Some((work, error)) = progress.failed.first() {
-            return Err(Error::Parallel(format!(
-                "poisoned pipeline work {work:?} failed during local completion release: {error}"
-            )));
-        }
-        Ok(self.scheduler.report().current_in_flight_work == 0)
-    }
-
-    /// Returns the failure that invalidated this scheduler, if any.
-    pub fn poison_reason(&self) -> Option<&str> {
-        self.scheduler.poison_reason()
-    }
-
-    fn bind_cache_policy(
-        &mut self,
-        policy: CacheResidencyPolicy,
-    ) -> Result<CacheResidencyPolicy, Error> {
-        let CacheResidencyPolicy::Paged(options) = policy else {
-            return Ok(CacheResidencyPolicy::Device);
-        };
-        let requested_pool = options.pool().cloned();
-        let pool = match (&self.cache_pool, requested_pool) {
-            (Some(pool), Some(requested)) if pool != &requested => {
-                return Err(Error::Parallel(format!(
-                    "pipeline scheduler cache pool {} does not match requested pool {}",
-                    pool.id(),
-                    requested.id()
-                )));
-            }
-            (Some(pool), _) => pool.clone(),
-            (None, Some(pool)) => {
-                self.cache_pool = Some(pool.clone());
-                pool
-            }
-            (None, None) => {
-                let pool = crate::runtime::cache::residency::cache_pool_for_paged_options(&options)
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                self.cache_pool = Some(pool.clone());
-                pool
-            }
-        };
-        let options = options
-            .with_pool(pool)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(CacheResidencyPolicy::Paged(options))
-    }
-
-    fn bind_existing_cache_pool(&mut self, requested: &CacheResidencyPool) -> Result<(), Error> {
-        match &self.cache_pool {
-            Some(pool) if pool != requested => Err(Error::Parallel(format!(
-                "pipeline scheduler cache pool {} does not match restored cache pool {}",
-                pool.id(),
-                requested.id()
-            ))),
-            Some(_) => Ok(()),
-            None => {
-                self.cache_pool = Some(requested.clone());
-                Ok(())
-            }
-        }
-    }
-
-    fn validate_model(&self, model: &PipelineModel) -> Result<(), Error> {
-        if model.topology != self.topology
-            || model.info.model_kind != self.model_kind
-            || model.info.global_layer_range != self.global_layer_range
-            || model.prompt_cache_architecture_fingerprint()? != self.architecture_fingerprint
-        {
-            return Err(Error::Parallel(
-                "pipeline scheduler is bound to a different model stage".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, model: &PipelineModel, cache: &PipelineCache) -> Result<(), Error> {
-        if cache.model_kind() != self.model_kind
-            || cache.global_layers() != model.info.global_layer_range.clone().collect::<Vec<_>>()
-        {
-            return Err(Error::Parallel(format!(
-                "pipeline request cache {:?} layers {:?} do not match {:?} layers {:?}",
-                cache.model_kind(),
-                cache.global_layers(),
-                self.model_kind,
-                model.info.global_layer_range
-            )));
-        }
-        Ok(())
+            .collect()
     }
 }
 
@@ -2185,7 +1205,6 @@ trait PipelineStageAdapter {
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error>;
     /// Returns non-resident layer placement telemetry for host or disk-backed stages.
     fn parameter_residency_report(&self) -> Result<Option<ResidencyReport>, Error>;
-    fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error>;
     fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error>;
     fn placed_ingress_shared_residency_window(&self) -> bool;
 
@@ -2284,16 +1303,6 @@ trait PipelineStageAdapter {
         identity: &PromptCacheModelIdentity,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error>;
-
-    /// Executes this stage's local decoder range.
-    fn forward(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut [PipelineLayerCache],
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error>;
 
     #[allow(clippy::too_many_arguments)]
     fn prefill(
@@ -2546,26 +1555,6 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
             .transpose()
     }
 
-    fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error> {
-        if let Some(diagnostics) = self
-            .0
-            .dense_layers()
-            .map(PipelineLayerStorage::checkpoint_diagnostics)
-            .transpose()?
-        {
-            return Ok(Some(diagnostics));
-        }
-        self.0
-            .expert_cache()
-            .map(|cache| {
-                cache
-                    .report()
-                    .map(|report| report.residency.weight_store().clone())
-                    .map_err(Error::from)
-            })
-            .transpose()
-    }
-
     fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
         self.0
             .expert_cache()
@@ -2734,17 +1723,6 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         self.0.new_cache_layers(identity, paged)
     }
 
-    fn forward(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut [PipelineLayerCache],
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        self.0.forward(input, step, mask, cache, stream)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &mut self,
@@ -2787,7 +1765,6 @@ enum PipelineLayerController {
 }
 
 struct PipelineLayerStorage {
-    store: SharedWeightStore,
     residency: ResidencyManager,
     controller: PipelineLayerController,
     units: Vec<OffloadUnitId>,
@@ -2918,10 +1895,6 @@ impl PipelineLayerStorage {
                 Ok(controller.report(&self.residency)?.planned_layer_bytes())
             }
         }
-    }
-
-    fn checkpoint_diagnostics(&self) -> Result<WeightStoreDiagnostics, Error> {
-        Ok(self.store.diagnostics()?)
     }
 }
 
@@ -6354,12 +5327,6 @@ impl PipelineModel {
         &self.info
     }
 
-    /// Returns deterministic scheduling instrumentation for the latest typed
-    /// placed-ingress execution on this rank.
-    pub const fn placed_ingress_schedule_report(&self) -> &PlacedIngressScheduleReport {
-        &self.last_placed_ingress_schedule
-    }
-
     /// Returns stage-local disk-stream observations when enabled.
     pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
         self.stage.dense_stream_report()
@@ -6368,14 +5335,6 @@ impl PipelineModel {
     /// Returns stage-local non-resident parameter placement and transfer telemetry.
     pub fn parameter_residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
         self.stage.parameter_residency_report()
-    }
-
-    /// Returns physical checkpoint-read telemetry for a non-resident local stage.
-    pub fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error> {
-        Ok(self
-            .stage
-            .checkpoint_diagnostics()?
-            .or_else(|| self.info.checkpoint_diagnostics.clone()))
     }
 
     /// Returns stage-local independent expert-cache telemetry when enabled.
@@ -6676,81 +5635,8 @@ impl PipelineModel {
         root.join(format!("rank-{:05}", self.topology.global_rank))
     }
 
-    /// Returns the canonical cache-relevant architecture identity for this stage.
-    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
-        Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
-    }
-
-    /// Returns this stage's exact ordered prompt-cache layout.
-    pub fn prompt_cache_layer_layout(
-        &self,
-    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
-        Ok(self.prompt_cache_model_identity()?.layer_layout)
-    }
-
-    /// Returns each owned layer's processed-token delta from the persisted prefix.
-    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
-        Ok(self.prompt_cache_model_identity()?.layer_prefix_offsets)
-    }
-
     fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         Ok(self.cache_identity.clone())
-    }
-
-    /// Executes only this stage, without communication.
-    ///
-    /// This operation is useful for deterministic single-process composition
-    /// tests and custom schedulers. Distributed callers normally use
-    /// [`Self::forward_pipeline`].
-    pub fn forward_stage(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut PipelineCache,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        self.topology.validate_execution_stream(stream)?;
-        validate_stage_input(&self.info, &input, step, &self.auxiliary_shapes(step))?;
-        if cache.model_kind != self.info.model_kind {
-            return Err(Error::Parallel(format!(
-                "pipeline cache architecture {:?} does not match stage {:?}",
-                cache.model_kind, self.info.model_kind
-            )));
-        }
-        self.stage
-            .forward(input, step, mask, &mut cache.layers, stream)
-    }
-
-    /// Executes the local typed-ingress reference path without communication.
-    ///
-    /// This complements [`Self::forward_stage`] for deterministic composition
-    /// tests and custom schedulers. Distributed callers normally use
-    /// [`Self::prefill_pipeline`] or [`Self::prefill_distributed`].
-    pub fn prefill_stage(
-        &mut self,
-        input: crate::api::input::ModelInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut PipelineCache,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        if !self.info.is_first {
-            return Err(Error::Parallel(format!(
-                "pipeline stage {} cannot accept typed ingress",
-                self.info.pipeline_stage
-            )));
-        }
-        crate::api::input::validate(input)?;
-        self.topology.validate_execution_stream(stream)?;
-        if cache.model_kind != self.info.model_kind {
-            return Err(Error::Parallel(format!(
-                "pipeline cache architecture {:?} does not match stage {:?}",
-                cache.model_kind, self.info.model_kind
-            )));
-        }
-        self.stage
-            .prefill(input, step, mask, &mut cache.layers, None, None, stream)
     }
 
     /// Runs a microbatch through the selected distributed backend session.
@@ -7608,11 +6494,26 @@ impl PipelineModel {
             }
         }
     }
+}
 
-    /// Samples on the last stage and broadcasts only the selected token and
-    /// EOS/stop state via identically ordered all-sums.
+#[cfg(test)]
+impl PipelineModel {
+    pub const fn placed_ingress_schedule_report(&self) -> &PlacedIngressScheduleReport {
+        &self.last_placed_ingress_schedule
+    }
+
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+        Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
+    }
+
+    pub(crate) fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: Sampler>(
+    pub fn sample_and_synchronize<S: crate::runtime::generation::sampler::Sampler>(
         &self,
         logits: Option<&Array>,
         step: PipelineStep,
@@ -7621,17 +6522,7 @@ impl PipelineModel {
         prng_state: Option<&mut safemlx::random::RandomState>,
         finished: bool,
         execution: &crate::MlxDistributedSession<'_>,
-    ) -> Result<SynchronizedToken, Error> {
-        if execution.topology() != self.topology {
-            return Err(Error::Parallel(
-                "pipeline sampling distributed-session topology mismatch".into(),
-            ));
-        }
-        if !self.info.is_last && logits.is_some() {
-            return Err(Error::Parallel(
-                "only the last pipeline stage may supply logits".into(),
-            ));
-        }
+    ) -> Result<crate::runtime::distributed::parallel::SynchronizedToken, Error> {
         execution.sample_and_synchronize(
             logits,
             step.batch_size,
@@ -7640,6 +6531,56 @@ impl PipelineModel {
             prng_state,
             finished,
         )
+    }
+
+    pub(crate) fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error> {
+        Ok(self.info.checkpoint_diagnostics.clone())
+    }
+
+    pub(crate) fn forward_stage(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut PipelineCache,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.topology.validate_execution_stream(stream)?;
+        validate_stage_input(&self.info, &input, step, &self.auxiliary_shapes(step))?;
+        if cache.model_kind != self.info.model_kind {
+            return Err(Error::Parallel(format!(
+                "pipeline cache architecture {:?} does not match stage {:?}",
+                cache.model_kind, self.info.model_kind
+            )));
+        }
+        self.stage
+            .forward_with_execution(input, step, mask, &mut cache.layers, None, None, stream)
+    }
+
+    pub(crate) fn prefill_stage(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut PipelineCache,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if !self.info.is_first {
+            return Err(Error::Parallel(format!(
+                "pipeline stage {} cannot accept typed ingress",
+                self.info.pipeline_stage
+            )));
+        }
+        crate::api::input::validate(input)?;
+        self.topology.validate_execution_stream(stream)?;
+        if cache.model_kind != self.info.model_kind {
+            return Err(Error::Parallel(format!(
+                "pipeline cache architecture {:?} does not match stage {:?}",
+                cache.model_kind, self.info.model_kind
+            )));
+        }
+        self.stage
+            .prefill(input, step, mask, &mut cache.layers, None, None, stream)
     }
 }
 
@@ -8130,7 +7071,6 @@ fn base_info(
                 .expect("validated decoder topology has a placement"),
         ),
         topology,
-        global_rank: topology.global_rank,
         pipeline_stage: stage,
         pipeline_stages: topology.pipeline_parallel_size,
         is_first: stage == 0,
@@ -8155,7 +7095,6 @@ fn base_info(
             .pipeline_successor()
             .expect("validated topology has valid pipeline successor geometry"),
         model_kind,
-        hidden_size,
         activation_hidden_size: hidden_size,
         activation_dtype: Dtype::Float32,
         owned_tensors: Vec::new(),
@@ -8978,7 +7917,6 @@ where
         }
     };
     Ok(PipelineLayerStorage {
-        store,
         residency,
         controller,
         units,
@@ -24323,36 +23261,6 @@ fn validate_expert_bank_shape(
     }
 }
 
-/// Runs stage-local execution while retaining global observer layer names.
-pub fn forward_stage_with_observer(
-    model: &mut PipelineModel,
-    input: PipelineStageInput<'_>,
-    step: PipelineStep,
-    mask: Option<&Array>,
-    cache: &mut PipelineCache,
-    stream: &Stream,
-    observer: &mut impl ActivationObserver,
-) -> Result<PipelineStageOutput, Error> {
-    // Common boundary observations are stable; architecture layers already
-    // retain global identity in `stage_info` and the normal detailed adapters
-    // can be extended without changing orchestration.
-    let output = model.forward_stage(input, step, mask, cache, stream)?;
-    match &output {
-        PipelineStageOutput::Hidden(hidden) => observer.observe(
-            &format!(
-                "model.layers.{}.pipeline_stage_output",
-                model.info.global_layer_range.end - 1
-            ),
-            &hidden.hidden,
-        )?,
-        PipelineStageOutput::Logits(logits) => observer.observe("lm_head.logits", logits)?,
-        PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => {
-            observer.observe("lm_head.logits", logits)?
-        }
-    }
-    Ok(output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -24495,7 +23403,10 @@ mod tests {
             ("modality_merger", "modality_finalization"),
             ("modality_finalization", "text_decoder"),
         ] {
-            assert!(placement.dependency_route(producer, consumer).is_some());
+            assert!(placement
+                .routes()
+                .iter()
+                .any(|route| route.from_group == producer && route.to_group == consumer));
         }
         let vision = placement.group_index("vision_projector").unwrap();
         let audio = placement.group_index("audio_projector").unwrap();
@@ -26465,8 +25376,7 @@ mod tests {
                 loaded.info().assignment.local_global_expert_ids(),
                 &[topology.expert_parallel_rank]
             );
-            assert!(loaded.info().owned_expert_bytes > 0);
-            let identity = loaded.prompt_cache_layer_layout().unwrap();
+            let identity = loaded.prompt_cache_model_identity().unwrap().layer_layout;
             assert!(matches!(
                 identity.get(0),
                 Some(crate::LayerCachePolicy::KeyValue {
@@ -26841,7 +25751,7 @@ mod tests {
     ) -> Array {
         let step = PipelineStep::new(1, tokens.shape()[1]).unwrap();
         let hidden = Array::full::<f32>(
-            &[1, tokens.shape()[1], model.info.hidden_size],
+            &[1, tokens.shape()[1], model.info.activation_hidden_size],
             Array::from_f32(0.02),
             stream,
         )
@@ -29337,188 +28247,6 @@ mod tests {
             PipelineModel::from_adapter(first_topology, first_info, PipelineStage(first)).unwrap(),
             PipelineModel::from_adapter(last_topology, last_info, PipelineStage(last)).unwrap(),
         )
-    }
-
-    #[test]
-    fn pipeline_program_enforces_phase_lifecycle_and_cache_handoff() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let stream = context.stream();
-        let mut source = llama::ResidentModel::new(llama_args(false), stream).unwrap();
-        initialize_parameters(&mut source, stream);
-        let (first, _) = llama_pipeline_stages(&source, stream);
-        let mut scheduler =
-            PipelineInferenceScheduler::new(&first, SchedulerLimits::new(2, 4).unwrap()).unwrap();
-        let first_request = RequestId::new(11);
-        let second_request = RequestId::new(22);
-        scheduler.register_request(&first, first_request).unwrap();
-        scheduler.register_request(&first, second_request).unwrap();
-        assert!(scheduler
-            .register_request(&first, RequestId::new(33))
-            .unwrap_err()
-            .to_string()
-            .contains("active-request capacity"));
-
-        scheduler
-            .enqueue(
-                PipelineMicrobatchInput::new(
-                    first_request,
-                    PipelineInferencePhase::Prefill,
-                    PipelineStep::new(1, 2).unwrap(),
-                )
-                .with_tokens(Array::from_slice(&[1u32, 2], &[1, 2])),
-            )
-            .unwrap();
-        scheduler
-            .enqueue(
-                PipelineMicrobatchInput::new(
-                    first_request,
-                    PipelineInferencePhase::Decode,
-                    PipelineStep::new(1, 1).unwrap(),
-                )
-                .with_tokens(Array::from_slice(&[3u32], &[1, 1])),
-            )
-            .unwrap();
-        assert!(scheduler
-            .enqueue(
-                PipelineMicrobatchInput::new(
-                    first_request,
-                    PipelineInferencePhase::Prefill,
-                    PipelineStep::new(1, 1).unwrap(),
-                )
-                .with_tokens(Array::from_slice(&[4u32], &[1, 1])),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("cannot return to prefill"));
-        scheduler
-            .enqueue(
-                PipelineMicrobatchInput::new(
-                    second_request,
-                    PipelineInferencePhase::Prefill,
-                    PipelineStep::new(1, 3).unwrap(),
-                )
-                .with_tokens(Array::from_slice(&[4u32, 5, 6], &[1, 3])),
-            )
-            .unwrap();
-        scheduler
-            .enqueue(
-                PipelineMicrobatchInput::new(
-                    second_request,
-                    PipelineInferencePhase::Decode,
-                    PipelineStep::new(1, 1).unwrap(),
-                )
-                .with_tokens(Array::from_slice(&[7u32], &[1, 1])),
-            )
-            .unwrap();
-        assert!(scheduler
-            .enqueue(
-                PipelineMicrobatchInput::new(
-                    second_request,
-                    PipelineInferencePhase::Decode,
-                    PipelineStep::new(1, 1).unwrap(),
-                )
-                .with_tokens(Array::from_slice(&[0u32], &[1, 1])),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("queue capacity"));
-
-        scheduler.cancel_request(first_request).unwrap();
-        scheduler.finish_request(second_request).unwrap();
-        assert_eq!(
-            scheduler.request_status(first_request),
-            Some(RequestStatus::Cancelled)
-        );
-        assert_eq!(
-            scheduler.request_status(second_request),
-            Some(RequestStatus::Finished)
-        );
-        let report = scheduler.report();
-        assert_eq!(report.active_requests, 0);
-        assert_eq!(report.queued_work, 0);
-        assert_eq!(report.peak_queued_work, 4);
-        assert_eq!(report.submitted_work, 4);
-        assert_eq!(report.completed_work, 0);
-        assert_eq!(report.failed_work, 0);
-        assert_eq!(report.discarded_work, 4);
-        assert_eq!(report.finished_requests, 1);
-        assert_eq!(report.cancelled_requests, 1);
-        assert_eq!(report.drain_cycles, 0);
-        assert!(!report.poisoned);
-        assert_eq!(
-            scheduler.forget_terminal_request(second_request).unwrap(),
-            RequestStatus::Finished
-        );
-        scheduler.register_request(&first, second_request).unwrap();
-        let released = scheduler.release_request_cache(second_request).unwrap();
-        assert_eq!(released.global_layers(), vec![0]);
-        assert_eq!(scheduler.request_status(second_request), None);
-    }
-
-    #[test]
-    fn pipeline_scheduler_owns_one_pool_across_request_lifecycle() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let stream = context.stream();
-        let mut source = llama::ResidentModel::new(llama_args(false), stream).unwrap();
-        initialize_parameters(&mut source, stream);
-        let (first, _) = llama_pipeline_stages(&source, stream);
-        let pool = CacheResidencyPool::new(
-            crate::CachePoolLimits::new(2 << 20, 2 << 20, 1 << 20, 0).unwrap(),
-        );
-        let mut scheduler = PipelineInferenceScheduler::new_with_cache_pool(
-            &first,
-            SchedulerLimits::new(2, 2).unwrap(),
-            pool.clone(),
-        )
-        .unwrap();
-        let options = || {
-            PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
-                .unwrap()
-                .with_full_attention(true)
-        };
-        let first_request = RequestId::new(101);
-        let second_request = RequestId::new(202);
-        scheduler
-            .register_request_with_options(
-                &first,
-                first_request,
-                CacheResidencyPolicy::Paged(options()),
-            )
-            .unwrap();
-        scheduler
-            .register_request_with_options(
-                &first,
-                second_request,
-                CacheResidencyPolicy::Paged(options()),
-            )
-            .unwrap();
-        let report = scheduler.cache_pool_report().unwrap().unwrap();
-        assert_eq!(report.pool_id, pool.id());
-        assert_eq!(report.managers, 2);
-
-        scheduler.cancel_request(first_request).unwrap();
-        assert_eq!(scheduler.cache_pool_report().unwrap().unwrap().managers, 1);
-        let foreign_pool = CacheResidencyPool::new(
-            crate::CachePoolLimits::new(2 << 20, 2 << 20, 1 << 20, 0).unwrap(),
-        );
-        let foreign_options = options().with_pool(foreign_pool).unwrap();
-        let mismatch = scheduler
-            .register_request_with_options(
-                &first,
-                RequestId::new(303),
-                CacheResidencyPolicy::Paged(foreign_options),
-            )
-            .unwrap_err();
-        assert!(mismatch
-            .to_string()
-            .contains("does not match requested pool"));
-        scheduler.finish_request(second_request).unwrap();
-        let report = scheduler.cache_pool_report().unwrap().unwrap();
-        assert_eq!(report.managers, 0);
-        assert_eq!(report.current_device_bytes, 0);
-        assert_eq!(report.current_host_bytes, 0);
-        assert_eq!(report.current_transfer_in_flight_bytes, 0);
-        assert_eq!(report.current_disk_bytes, 0);
     }
 
     #[test]

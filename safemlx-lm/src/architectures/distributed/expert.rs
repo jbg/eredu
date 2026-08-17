@@ -39,13 +39,11 @@ use crate::{
         open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
         PagedCacheOptions,
     },
-    runtime::cache::{
-        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
-    },
+    runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::checkpoint::load::{transform_split_swiglu_experts, StrictLoadConfig},
     runtime::checkpoint::quantization::{should_quantize_on_load, WeightQuantization},
     runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore, WeightStore},
-    runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy, SynchronizedToken},
+    runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
     runtime::distributed::topology::{
         load_partition_from_store_on_streams, ParallelTopology, PlacementPlan, TensorPlacement,
     },
@@ -53,7 +51,7 @@ use crate::{
     runtime::generation::embedded_mtp::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
-    runtime::generation::sampler::{Sampler, SpeculativeSampler},
+    runtime::generation::sampler::SpeculativeSampler,
     runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpStats},
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -137,44 +135,15 @@ impl LocalExpertBank for gemma4::GemmaExperts {
     }
 }
 
-/// Physical residency of the routed experts owned by this EP rank.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum RoutedExpertResidency {
-    /// Every owned expert is materialized and pinned on the execution device.
-    FullyResident,
-    /// Owned experts are materialized on demand under explicit cache budgets.
-    SparseCache,
-}
-
 /// Immutable description of a rank-local expert-parallel model.
 #[derive(Debug, Clone)]
 pub struct ExpertParallelInfo {
     /// Complete Cartesian topology and local TP/PP/EP coordinates.
     pub topology: ParallelTopology,
-    /// Global rank.
-    pub global_rank: usize,
-    /// Rank in the EP group.
-    pub expert_parallel_rank: usize,
-    /// EP group size.
-    pub expert_parallel_size: usize,
     /// Loaded architecture.
     pub model_kind: ModelKind,
     /// Assignment metadata.
     pub assignment: ExpertAssignment,
-    /// Bytes in all locally materialized parameters.
-    pub local_parameter_bytes: usize,
-    /// Bytes in local routed-expert tensors.
-    pub routed_expert_bytes: usize,
-    /// Bytes in all cold, warm, or hot routed experts owned by this rank.
-    pub owned_expert_bytes: usize,
-    /// Physical residency policy for rank-owned routed experts.
-    pub routed_expert_residency: RoutedExpertResidency,
-    /// Bytes in replicated tensors.
-    pub replicated_parameter_bytes: usize,
-    /// Checkpoint shards opened by this rank.
-    pub opened_checkpoint_shards: Vec<PathBuf>,
-    /// Active route transport.
-    pub exchange_strategy: ExpertExchangeStrategy,
 }
 
 /// Architecture-checked replicated attention cache used by an EP model.
@@ -188,8 +157,6 @@ pub enum ExpertParallelCache {
     KimiLinear(kimi_linear::Cache),
     /// Dense-Qwen standard key/value cache.
     DenseQwen(Vec<Option<ConcatKeyValueCache>>),
-    /// Dense-Qwen bounded sliding-window key/value cache.
-    DenseQwenSliding(Vec<Option<SlidingKeyValueCache>>),
     /// Dense-Qwen globally budgeted paged key/value cache.
     DenseQwenPaged(Vec<Option<PagedKeyValueCache>>),
     /// GPT-OSS cache following its canonical per-layer attention schedule.
@@ -223,10 +190,6 @@ impl ExpertParallelCache {
                 .iter_mut()
                 .flatten()
                 .for_each(ConcatKeyValueCache::clear),
-            Self::DenseQwenSliding(cache) => cache
-                .iter_mut()
-                .flatten()
-                .for_each(SlidingKeyValueCache::clear),
             Self::DenseQwenPaged(caches) => {
                 if let Some(first) = caches.iter().flatten().next() {
                     first
@@ -248,8 +211,10 @@ impl ExpertParallelCache {
         }
         Ok(())
     }
+}
 
-    /// Returns the common replicated cache offset.
+#[cfg(test)]
+impl ExpertParallelCache {
     pub fn offset(&self) -> i32 {
         match self {
             Self::DeepSeek(cache) => cache.offset(),
@@ -258,15 +223,11 @@ impl ExpertParallelCache {
             Self::DenseQwen(cache) => cache
                 .first()
                 .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
-            Self::DenseQwenSliding(cache) => cache
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
+                .map_or(0, crate::runtime::cache::KeyValueCache::offset),
             Self::DenseQwenPaged(cache) => cache
                 .first()
                 .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
+                .map_or(0, crate::runtime::cache::KeyValueCache::offset),
             Self::GptOss(cache) => cache.offset(),
             Self::Inkling(cache) => cache.offset(),
             Self::Lfm2(cache) => cache.offset(),
@@ -276,13 +237,12 @@ impl ExpertParallelCache {
                 .kv
                 .first()
                 .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
-            Self::Gemma4(cache) => cache.offset(),
+                .map_or(0, crate::runtime::cache::KeyValueCache::offset),
+            Self::Gemma4(cache) => i32::try_from(cache.mtp_len()).unwrap_or(i32::MAX),
         }
     }
 }
 
-#[allow(dead_code)]
 enum ExpertArchitecture {
     DeepSeek(Box<deepseek_v3::Model>),
     DeepSeekLayerwise(Box<crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel>),
@@ -295,19 +255,13 @@ enum ExpertArchitecture {
     ),
     DenseQwen(Box<dense_qwen::Model>),
     DenseQwenLayerwise(Box<crate::architectures::qwen::dense::layerwise::LayerwiseDecoder>),
-    GptOss(Box<gpt_oss::Model>),
     GptOssLayerwise(Box<crate::architectures::gpt_oss::layerwise::GptOssLayerwiseModel>),
-    Inkling(Box<inkling::Model>),
     InklingLayerwise(Box<crate::architectures::inkling::layerwise::InklingLayerwiseModel>),
-    Lfm2(Box<lfm2::Model>),
     Lfm2Layerwise(Box<crate::architectures::lfm2::layerwise::Lfm2LayerwiseModel>),
-    NemotronH(Box<nemotron_h::Model>),
     NemotronHLayerwise(Box<crate::architectures::nemotron_h::layerwise::NemotronHLayerwiseModel>),
-    QwenHybrid(Box<qwen3_5::Model>),
     QwenHybridLayerwise(
         Box<crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel>,
     ),
-    Qwen3Vl(Box<qwen3_vl::Model>),
     Qwen3VlLayerwise(Box<crate::architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel>),
     Gemma4Layerwise(Box<crate::architectures::gemma4::layerwise::Gemma4LayerwiseModel>),
 }
@@ -403,9 +357,6 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
         stream: &Stream,
     ) -> Result<Array, Exception> {
         match &mut self.model.architecture {
-            ExpertArchitecture::QwenHybrid(model) => {
-                model.forward_mtp_head(hidden, tokens, cache, stream)
-            }
             ExpertArchitecture::QwenHybridLayerwise(model) => {
                 let expert_cache = self.model.expert_cache.as_ref().ok_or_else(|| {
                     Exception::custom("distributed Qwen MTP requires rank-owned expert residency")
@@ -457,7 +408,6 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
 
     fn mtp_layer_count(&self) -> usize {
         match &self.model.architecture {
-            ExpertArchitecture::QwenHybrid(model) => model.mtp_len(),
             ExpertArchitecture::QwenHybridLayerwise(model) => model.mtp_len(),
             _ => 0,
         }
@@ -679,6 +629,50 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
 }
 
 impl ExpertParallelModel {
+    #[cfg(test)]
+    pub fn new_qwen3_sliding_cache(
+        &self,
+        max_size: i32,
+        options: PagedCacheOptions,
+    ) -> Result<ExpertParallelCache, Error> {
+        let layer_count = match &self.architecture {
+            ExpertArchitecture::DenseQwen(model) => model.model.layers.len(),
+            ExpertArchitecture::DenseQwenLayerwise(model) => {
+                usize::try_from(model.args().num_hidden_layers)
+                    .map_err(|_| Error::Parallel("invalid dense-Qwen layer count".into()))?
+            }
+            _ => {
+                return Err(Error::Parallel(
+                    "sliding key/value caches are only available for Qwen3 expert parallelism"
+                        .into(),
+                ))
+            }
+        };
+        let manager = CacheResidencyManager::new(options)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let rank = Some(CacheRankIdentity {
+            pipeline_rank: None,
+            tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
+                .then_some(self.topology.tensor_parallel_rank),
+            expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+        });
+        Ok(ExpertParallelCache::DenseQwenPaged(
+            (0..layer_count)
+                .map(|layer| {
+                    PagedKeyValueCache::new_with_layout(
+                        manager.clone(),
+                        layer,
+                        Some(max_size),
+                        0,
+                        rank,
+                    )
+                    .map(Some)
+                    .map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
     /// Returns placement, assignment, and memory diagnostics.
     pub fn info(&self) -> &ExpertParallelInfo {
         &self.info
@@ -707,9 +701,6 @@ impl ExpertParallelModel {
                     checkpoint: MtpCheckpointKind::Embedded,
                 }
             }
-            ExpertArchitecture::QwenHybrid(model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
             ExpertArchitecture::QwenHybridLayerwise(model) if model.mtp_len() > 0 => {
                 MtpCapability::Ready {
                     checkpoint: MtpCheckpointKind::Embedded,
@@ -772,31 +763,21 @@ impl ExpertParallelModel {
             ExpertArchitecture::DenseQwenLayerwise(model) => {
                 ExpertParallelCache::DenseQwen(model.new_cache())
             }
-            ExpertArchitecture::GptOss(model) => ExpertParallelCache::GptOss(model.new_cache()),
             ExpertArchitecture::GptOssLayerwise(model) => {
                 ExpertParallelCache::GptOss(model.new_cache())
             }
-            ExpertArchitecture::Inkling(model) => ExpertParallelCache::Inkling(model.new_cache()),
             ExpertArchitecture::InklingLayerwise(model) => {
                 ExpertParallelCache::Inkling(model.new_cache())
             }
-            ExpertArchitecture::Lfm2(model) => ExpertParallelCache::Lfm2(model.new_cache()),
             ExpertArchitecture::Lfm2Layerwise(model) => {
                 ExpertParallelCache::Lfm2(model.new_cache())
-            }
-            ExpertArchitecture::NemotronH(model) => {
-                ExpertParallelCache::NemotronH(model.new_cache())
             }
             ExpertArchitecture::NemotronHLayerwise(model) => {
                 ExpertParallelCache::NemotronH(model.new_cache())
             }
-            ExpertArchitecture::QwenHybrid(model) => {
-                ExpertParallelCache::QwenHybrid(model.new_cache())
-            }
             ExpertArchitecture::QwenHybridLayerwise(model) => {
                 ExpertParallelCache::QwenHybrid(model.new_cache())
             }
-            ExpertArchitecture::Qwen3Vl(model) => ExpertParallelCache::Qwen3Vl(model.new_cache()),
             ExpertArchitecture::Qwen3VlLayerwise(model) => {
                 ExpertParallelCache::Qwen3Vl(model.new_cache())
             }
@@ -857,20 +838,6 @@ impl ExpertParallelModel {
                 ExpertArchitecture::KimiLinearLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::KimiLinear),
-                ExpertArchitecture::GptOss(model) => {
-                    let manager = CacheResidencyManager::new(options)
-                        .map_err(|error| Error::Parallel(error.to_string()))?;
-                    let rank = CacheRankIdentity {
-                        pipeline_rank: None,
-                        tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
-                            .then_some(self.topology.tensor_parallel_rank),
-                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
-                    };
-                    model
-                        .new_cache_with_manager(manager, Some(rank))
-                        .map(ExpertParallelCache::GptOss)
-                        .map_err(Into::into)
-                }
                 ExpertArchitecture::GptOssLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::GptOss),
@@ -906,66 +873,15 @@ impl ExpertParallelModel {
                     )?;
                     Ok(ExpertParallelCache::DenseQwenPaged(caches))
                 }
-                ExpertArchitecture::Inkling(model) => {
-                    let manager = CacheResidencyManager::new(options)
-                        .map_err(|error| Error::Parallel(error.to_string()))?;
-                    let rank = Some(CacheRankIdentity {
-                        pipeline_rank: None,
-                        tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
-                            .then_some(self.topology.tensor_parallel_rank),
-                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
-                    });
-                    model
-                        .new_paged_cache_with_manager(manager, rank)
-                        .map(ExpertParallelCache::Inkling)
-                        .map_err(Into::into)
-                }
                 ExpertArchitecture::InklingLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::Inkling),
-                ExpertArchitecture::NemotronH(model) => {
-                    let rank = Some(CacheRankIdentity {
-                        pipeline_rank: None,
-                        tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
-                            .then_some(self.topology.tensor_parallel_rank),
-                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
-                    });
-                    nemotron_h::Cache::new_with_options_and_rank(
-                        &model.args,
-                        CacheResidencyPolicy::Paged(options),
-                        rank,
-                    )
-                    .map(ExpertParallelCache::NemotronH)
-                    .map_err(Into::into)
-                }
                 ExpertArchitecture::NemotronHLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::NemotronH),
-                ExpertArchitecture::Lfm2(model) => {
-                    let rank = Some(CacheRankIdentity {
-                        pipeline_rank: None,
-                        tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
-                            .then_some(self.topology.tensor_parallel_rank),
-                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
-                    });
-                    lfm2::Cache::new_paged(&model.args, options, rank)
-                        .map(ExpertParallelCache::Lfm2)
-                        .map_err(Into::into)
-                }
                 ExpertArchitecture::Lfm2Layerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::Lfm2),
-                ExpertArchitecture::QwenHybrid(model) => {
-                    let rank = Some(CacheRankIdentity {
-                        pipeline_rank: None,
-                        tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
-                            .then_some(self.topology.tensor_parallel_rank),
-                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
-                    });
-                    qwen3_5::Cache::new_paged(&model.args, options, rank)
-                        .map(ExpertParallelCache::QwenHybrid)
-                        .map_err(Into::into)
-                }
                 ExpertArchitecture::QwenHybridLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::QwenHybrid),
@@ -1052,44 +968,41 @@ impl ExpertParallelModel {
                 rank,
             )
             .map_err(Into::into),
-            (
-                ExpertArchitecture::Lfm2(_) | ExpertArchitecture::Lfm2Layerwise(_),
-                ExpertParallelCache::Lfm2(cache),
-            ) => lfm2::Model::save_prompt_cache_with_rank(
-                cache,
-                directory,
-                descriptor,
-                prefix_token_ids,
-                options,
-                rank,
-                stream,
-            )
-            .map_err(Into::into),
-            (
-                ExpertArchitecture::Inkling(_) | ExpertArchitecture::InklingLayerwise(_),
-                ExpertParallelCache::Inkling(cache),
-            ) => inkling::Model::save_prompt_cache(
-                cache,
-                directory,
-                descriptor,
-                prefix_token_ids,
-                options,
-                stream,
-            )
-            .map_err(Into::into),
-            (
-                ExpertArchitecture::NemotronH(_) | ExpertArchitecture::NemotronHLayerwise(_),
-                ExpertParallelCache::NemotronH(cache),
-            ) => nemotron_h::Model::save_prompt_cache_with_rank(
-                cache,
-                directory,
-                descriptor,
-                prefix_token_ids,
-                options,
-                rank,
-                stream,
-            )
-            .map_err(Into::into),
+            (ExpertArchitecture::Lfm2Layerwise(_), ExpertParallelCache::Lfm2(cache)) => {
+                lfm2::Model::save_prompt_cache_with_rank(
+                    cache,
+                    directory,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    rank,
+                    stream,
+                )
+                .map_err(Into::into)
+            }
+            (ExpertArchitecture::InklingLayerwise(_), ExpertParallelCache::Inkling(cache)) => {
+                inkling::Model::save_prompt_cache(
+                    cache,
+                    directory,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+                .map_err(Into::into)
+            }
+            (ExpertArchitecture::NemotronHLayerwise(_), ExpertParallelCache::NemotronH(cache)) => {
+                nemotron_h::Model::save_prompt_cache_with_rank(
+                    cache,
+                    directory,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    rank,
+                    stream,
+                )
+                .map_err(Into::into)
+            }
             (ExpertArchitecture::Qwen3VlLayerwise(model), ExpertParallelCache::Qwen3Vl(cache)) => {
                 model.save_prompt_cache_with_validated_identity(
                     cache,
@@ -1161,18 +1074,6 @@ impl ExpertParallelModel {
                 .map(|(cache, manifest)| (ExpertParallelCache::KimiLinear(cache), manifest))
                 .map_err(Into::into);
             }
-            ExpertArchitecture::Lfm2(model) => {
-                return lfm2::Model::load_prompt_cache_with_identity(
-                    &model.args,
-                    directory,
-                    expected,
-                    prefix_token_ids,
-                    identity,
-                    stream,
-                )
-                .map(|(cache, manifest)| (ExpertParallelCache::Lfm2(cache), manifest))
-                .map_err(Into::into);
-            }
             ExpertArchitecture::Lfm2Layerwise(model) => {
                 return lfm2::Model::load_prompt_cache_with_identity(
                     model.args(),
@@ -1185,18 +1086,6 @@ impl ExpertParallelModel {
                 .map(|(cache, manifest)| (ExpertParallelCache::Lfm2(cache), manifest))
                 .map_err(Into::into);
             }
-            ExpertArchitecture::Inkling(model) => {
-                return inkling::Model::load_prompt_cache_with_identity(
-                    &model.args,
-                    directory,
-                    expected,
-                    prefix_token_ids,
-                    &identity,
-                    stream,
-                )
-                .map(|(cache, manifest)| (ExpertParallelCache::Inkling(cache), manifest))
-                .map_err(Into::into);
-            }
             ExpertArchitecture::InklingLayerwise(model) => {
                 return inkling::Model::load_prompt_cache_with_identity(
                     model.args(),
@@ -1207,19 +1096,6 @@ impl ExpertParallelModel {
                     stream,
                 )
                 .map(|(cache, manifest)| (ExpertParallelCache::Inkling(cache), manifest))
-                .map_err(Into::into);
-            }
-            ExpertArchitecture::NemotronH(model) => {
-                return nemotron_h::Model::load_paged_prompt_cache_with_identity(
-                    &model.args,
-                    directory,
-                    expected,
-                    prefix_token_ids,
-                    &identity,
-                    options,
-                    stream,
-                )
-                .map(|(cache, manifest)| (ExpertParallelCache::NemotronH(cache), manifest))
                 .map_err(Into::into);
             }
             ExpertArchitecture::NemotronHLayerwise(model) => {
@@ -1268,9 +1144,6 @@ impl ExpertParallelModel {
                 ExpertArchitecture::DeepSeek(model) => model
                     .new_cache_with_manager(manager, rank)
                     .map(ExpertParallelCache::DeepSeek)?,
-                ExpertArchitecture::GptOss(model) => model
-                    .new_cache_with_manager(manager, rank)
-                    .map(ExpertParallelCache::GptOss)?,
                 _ => return Err(Error::Parallel(
                     "expert-parallel prompt loading is unsupported for this cache representation"
                         .into(),
@@ -1283,41 +1156,7 @@ impl ExpertParallelModel {
         root.join(format!("rank-{:05}", self.topology.global_rank))
     }
 
-    /// Returns the canonical cache-relevant architecture identity for this rank.
-    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
-        match &self.architecture {
-            ExpertArchitecture::KimiLinear(model) => {
-                return Ok(
-                    crate::architectures::kimi_linear::model::prompt_cache_architecture_fingerprint(
-                        &model.args,
-                    ),
-                );
-            }
-            ExpertArchitecture::KimiLinearLayerwise(model) => {
-                return Ok(
-                    crate::architectures::kimi_linear::model::prompt_cache_architecture_fingerprint(
-                        model.args(),
-                    ),
-                );
-            }
-            _ => {}
-        }
-        Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
-    }
-
-    /// Returns this rank's exact ordered prompt-cache layout.
-    pub fn prompt_cache_layer_layout(
-        &self,
-    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
-        Ok(self.prompt_cache_model_identity()?.layer_layout)
-    }
-
-    /// Returns each owned layer's processed-token delta from the persisted prefix.
-    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
-        Ok(self.prompt_cache_model_identity()?.layer_prefix_offsets)
-    }
-
-    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         let layerwise_identity = match &self.architecture {
             ExpertArchitecture::KimiLinearLayerwise(model) => {
                 Some(model.prompt_cache_model_identity()?)
@@ -1363,42 +1202,12 @@ impl ExpertParallelModel {
                     kimi_linear::prompt_cache_architecture_fingerprint(&model.args),
                     model.args.layer_schedule.len(),
                 ),
-                ExpertArchitecture::GptOss(model) => (
-                    "gpt_oss".to_string(),
-                    model.args.model_type.clone(),
-                    crate::architectures::gpt_oss::model::prompt_cache_architecture_fingerprint(
-                        &model.args,
-                    ),
-                    usize::try_from(model.args.num_hidden_layers)
-                        .map_err(|_| Error::Parallel("invalid GPT-OSS layer count".into()))?,
-                ),
-                ExpertArchitecture::Inkling(model) => (
-                    "inkling".to_string(),
-                    model.args.model_type.clone(),
-                    inkling::prompt_cache_architecture_fingerprint(&model.args),
-                    usize::try_from(model.args.text_config.num_hidden_layers)
-                        .map_err(|_| Error::Parallel("invalid Inkling layer count".into()))?,
-                ),
-                ExpertArchitecture::Lfm2(model) => (
-                    "lfm2".to_string(),
-                    model.args.model_type.clone(),
-                    lfm2::prompt_cache_architecture_fingerprint(&model.args),
-                    usize::try_from(model.args.num_hidden_layers)
-                        .map_err(|_| Error::Parallel("invalid LFM2 layer count".into()))?,
-                ),
                 ExpertArchitecture::Lfm2Layerwise(model) => (
                     "lfm2".to_string(),
                     model.args().model_type.clone(),
                     lfm2::prompt_cache_architecture_fingerprint(model.args()),
                     usize::try_from(model.args().num_hidden_layers)
                         .map_err(|_| Error::Parallel("invalid LFM2 layer count".into()))?,
-                ),
-                ExpertArchitecture::NemotronH(model) => (
-                    "nemotron_h".to_string(),
-                    model.args.model_type.clone(),
-                    nemotron_h::prompt_cache_architecture_fingerprint(&model.args),
-                    usize::try_from(model.args.num_hidden_layers)
-                        .map_err(|_| Error::Parallel("invalid Nemotron-H layer count".into()))?,
                 ),
                 ExpertArchitecture::NemotronHLayerwise(model) => (
                     "nemotron_h".to_string(),
@@ -1422,24 +1231,8 @@ impl ExpertParallelModel {
             ExpertArchitecture::KimiLinear(model) => {
                 kimi_linear::prompt_cache_layer_layout(&model.args)?
             }
-            ExpertArchitecture::GptOss(model) => PromptCacheModelIdentity::key_value_layouts(
-                model.args.attention_schedule.iter().map(|policy| {
-                    policy.window().map(|window| {
-                        i32::try_from(window.get())
-                            .expect("validated GPT-OSS sliding window fits i32")
-                    })
-                }),
-                model.args.num_key_value_heads,
-                model.args.head_dim,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?,
-            ExpertArchitecture::Inkling(model) => inkling::prompt_cache_layer_layout(&model.args)?,
-            ExpertArchitecture::Lfm2(model) => lfm2::prompt_cache_layer_layout(&model.args)?,
             ExpertArchitecture::Lfm2Layerwise(model) => {
                 lfm2::prompt_cache_layer_layout(model.args())?
-            }
-            ExpertArchitecture::NemotronH(model) => {
-                nemotron_h::prompt_cache_layer_layout(&model.args)?
             }
             ExpertArchitecture::NemotronHLayerwise(model) => {
                 nemotron_h::prompt_cache_layer_layout(model.args())?
@@ -1471,86 +1264,6 @@ impl ExpertParallelModel {
         })
     }
 
-    /// Allocates a bounded Qwen3 sliding-window cache.
-    pub fn new_qwen3_sliding_cache(
-        &self,
-        max_size: i32,
-        options: PagedCacheOptions,
-    ) -> Result<ExpertParallelCache, Error> {
-        if max_size <= 0 {
-            return Err(Error::Parallel(
-                "Qwen3 sliding cache size must be positive".into(),
-            ));
-        }
-        match &self.architecture {
-            ExpertArchitecture::DenseQwen(model) => {
-                let manager = CacheResidencyManager::new(options)
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                let rank = Some(CacheRankIdentity {
-                    pipeline_rank: None,
-                    tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
-                        .then_some(self.topology.tensor_parallel_rank),
-                    expert_parallel_rank: Some(self.topology.expert_parallel_rank),
-                });
-                Ok(ExpertParallelCache::DenseQwenPaged(
-                    (0..model.model.layers.len())
-                        .map(|layer| {
-                            PagedKeyValueCache::new_with_layout(
-                                manager.clone(),
-                                layer,
-                                Some(max_size),
-                                0,
-                                rank,
-                            )
-                            .map(Some)
-                            .map_err(Error::from)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                ))
-            }
-            ExpertArchitecture::DenseQwenLayerwise(model) => {
-                let manager = CacheResidencyManager::new(options)
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                let rank = Some(CacheRankIdentity {
-                    pipeline_rank: None,
-                    tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
-                        .then_some(self.topology.tensor_parallel_rank),
-                    expert_parallel_rank: Some(self.topology.expert_parallel_rank),
-                });
-                let layer_count = usize::try_from(model.args().num_hidden_layers)
-                    .map_err(|_| Error::Parallel("invalid dense-Qwen layer count".into()))?;
-                Ok(ExpertParallelCache::DenseQwenPaged(
-                    (0..layer_count)
-                        .map(|layer| {
-                            PagedKeyValueCache::new_with_layout(
-                                manager.clone(),
-                                layer,
-                                Some(max_size),
-                                0,
-                                rank,
-                            )
-                            .map(Some)
-                            .map_err(Error::from)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                ))
-            }
-            _ => Err(Error::Parallel(
-                "sliding key/value caches are only available for Qwen3 expert parallelism".into(),
-            )),
-        }
-    }
-
-    /// Counters from the most recent complete model forward.
-    pub fn latest_routing_statistics(&self) -> &RoutingStatistics {
-        &self.latest_statistics
-    }
-
-    /// Counters accumulated across all forwards.
-    pub fn cumulative_routing_statistics(&self) -> &RoutingStatistics {
-        &self.cumulative_statistics
-    }
-
     /// Runs prefill or decode through the selected distributed backend session.
     pub fn forward(
         &mut self,
@@ -1578,36 +1291,6 @@ impl ExpertParallelModel {
             tensor_group,
             expert_group,
             None,
-            execution.stream(),
-        )
-    }
-
-    /// Runs expert-parallel inference while exposing global router decisions,
-    /// rank-local expert contributions, reduced routed outputs, and shared experts.
-    pub fn forward_with_observer(
-        &mut self,
-        tokens: &Array,
-        mask: Option<&Array>,
-        cache: &mut ExpertParallelCache,
-        execution: &crate::MlxDistributedSession<'_>,
-        observer: &mut impl ActivationObserver,
-    ) -> Result<Array, Error> {
-        if execution.topology() != self.topology {
-            return Err(Error::Parallel(
-                "observer distributed-session topology mismatch".into(),
-            ));
-        }
-        let tensor = execution.tensor_context()?;
-        let expert = execution.expert_group().ok_or_else(|| {
-            Error::Parallel("expert observation requires an active EP group".into())
-        })?;
-        self.forward_impl(
-            tokens,
-            mask,
-            cache,
-            tensor.group(),
-            expert,
-            Some(observer),
             execution.stream(),
         )
     }
@@ -1935,53 +1618,6 @@ impl ExpertParallelModel {
                 }
                 (
                     ExpertArchitecture::DenseQwenLayerwise(model),
-                    ExpertParallelCache::DenseQwenSliding(cache),
-                ) => {
-                    let args = model.args().clone();
-                    let mut execute =
-                        |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_qwen3(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        };
-                    match tensor_group {
-                        Some(tensor_group) => model.forward_tensor_expert_parallel_sliding(
-                            tokens,
-                            mask,
-                            cache,
-                            tensor_group,
-                            &mut execute,
-                            stream,
-                        )?,
-                        None => model.forward_with_sliding_expert_executor(
-                            tokens,
-                            mask,
-                            cache,
-                            &mut execute,
-                            stream,
-                        )?,
-                    }
-                }
-                (
-                    ExpertArchitecture::DenseQwenLayerwise(model),
                     ExpertParallelCache::DenseQwenPaged(cache),
                 ) => {
                     let args = model.args().clone();
@@ -2029,43 +1665,6 @@ impl ExpertParallelModel {
                 }
                 (
                     ExpertArchitecture::DenseQwen(model),
-                    ExpertParallelCache::DenseQwenSliding(cache),
-                ) => {
-                    let args = model.args.clone();
-                    model.forward_cached_expert_parallel(
-                        dense_qwen::ModelInput {
-                            inputs: tokens,
-                            mask,
-                            cache,
-                        },
-                        |layer, hidden, ids, weights, stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_qwen3(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        },
-                        stream,
-                    )?
-                }
-                (
-                    ExpertArchitecture::DenseQwen(model),
                     ExpertParallelCache::DenseQwenPaged(cache),
                 ) => {
                     let args = model.args.clone();
@@ -2085,37 +1684,6 @@ impl ExpertParallelModel {
                                 stream,
                                 |routes, stream| {
                                     execute_cached_qwen3(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        },
-                        stream,
-                    )?
-                }
-                (ExpertArchitecture::GptOss(model), ExpertParallelCache::GptOss(cache)) => {
-                    let args = model.args.clone();
-                    model.forward_cached_expert_parallel(
-                        tokens,
-                        cache,
-                        |layer, hidden, ids, weights, stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_gpt_oss(
                                         &args,
                                         layer,
                                         routes,
@@ -2177,37 +1745,6 @@ impl ExpertParallelModel {
                         )?,
                     }
                 }
-                (ExpertArchitecture::Inkling(model), ExpertParallelCache::Inkling(cache)) => {
-                    let args = model.args.clone();
-                    model.forward_cached_expert_parallel(
-                        tokens,
-                        cache,
-                        |layer, hidden, ids, weights, stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_inkling(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        },
-                        stream,
-                    )?
-                }
                 (
                     ExpertArchitecture::InklingLayerwise(model),
                     ExpertParallelCache::Inkling(cache),
@@ -2253,37 +1790,6 @@ impl ExpertParallelModel {
                         )?,
                     }
                 }
-                (ExpertArchitecture::Lfm2(model), ExpertParallelCache::Lfm2(cache)) => {
-                    let args = model.args.clone();
-                    model.forward_cached_expert_parallel(
-                        tokens,
-                        cache,
-                        |layer, hidden, ids, weights, stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_lfm2(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        },
-                        stream,
-                    )?
-                }
                 (ExpertArchitecture::Lfm2Layerwise(model), ExpertParallelCache::Lfm2(cache)) => {
                     let args = model.args().clone();
                     let mut execute =
@@ -2325,37 +1831,6 @@ impl ExpertParallelModel {
                             stream,
                         )?,
                     }
-                }
-                (ExpertArchitecture::NemotronH(model), ExpertParallelCache::NemotronH(cache)) => {
-                    let args = model.args.clone();
-                    model.forward_cached_expert_parallel(
-                        tokens,
-                        cache,
-                        |layer, hidden, ids, weights, stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_nemotron_h(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        },
-                        stream,
-                    )?
                 }
                 (
                     ExpertArchitecture::NemotronHLayerwise(model),
@@ -2401,37 +1876,6 @@ impl ExpertParallelModel {
                             stream,
                         )?,
                     }
-                }
-                (ExpertArchitecture::QwenHybrid(model), ExpertParallelCache::QwenHybrid(cache)) => {
-                    let args = model.args.clone();
-                    model.forward_cached_expert_parallel(
-                        tokens,
-                        cache,
-                        |layer, hidden, ids, weights, stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_qwen_hybrid(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        },
-                        stream,
-                    )?
                 }
                 (
                     ExpertArchitecture::QwenHybridLayerwise(model),
@@ -2480,38 +1924,6 @@ impl ExpertParallelModel {
                             stream,
                         )?,
                     }
-                }
-                (ExpertArchitecture::Qwen3Vl(model), ExpertParallelCache::Qwen3Vl(cache)) => {
-                    let args = model.args.text_config.clone();
-                    model.forward_cached_expert_parallel(
-                        tokens,
-                        cache,
-                        |layer, hidden, ids, weights, stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_qwen3_at(
-                                        &args,
-                                        layer,
-                                        "model.language_model.layers",
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        },
-                        stream,
-                    )?
                 }
                 (
                     ExpertArchitecture::Qwen3VlLayerwise(model),
@@ -2656,21 +2068,6 @@ impl ExpertParallelModel {
                         stream,
                     )?
                 }
-                (
-                    ExpertArchitecture::DenseQwen(model),
-                    ExpertParallelCache::DenseQwenSliding(cache),
-                ) => model.forward_expert_parallel(
-                    dense_qwen::ModelInput {
-                        inputs: tokens,
-                        mask,
-                        cache,
-                    },
-                    &self.info.assignment,
-                    group,
-                    &mut statistics,
-                    observer,
-                    stream,
-                )?,
                 (
                     ExpertArchitecture::DenseQwen(model),
                     ExpertParallelCache::DenseQwenPaged(cache),
@@ -3035,37 +2432,6 @@ impl ExpertParallelModel {
         let assignment = &self.info.assignment;
         let mut statistics = RoutingStatistics::default();
         let output = match &mut self.architecture {
-            ExpertArchitecture::QwenHybrid(model) => {
-                let args = model.args.clone();
-                model.forward_cached_expert_parallel_mtp(
-                    tokens,
-                    cache,
-                    |layer, hidden, ids, weights, stream| {
-                        let returned = dispatch_replicated_with(
-                            hidden,
-                            ids,
-                            weights,
-                            assignment,
-                            group,
-                            stream,
-                            |routes, stream| {
-                                execute_cached_qwen_hybrid(
-                                    &args,
-                                    layer,
-                                    routes,
-                                    pass,
-                                    expert_cache,
-                                    stream,
-                                )
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                        statistics.accumulate(&returned.statistics);
-                        Ok(returned.reduced_output)
-                    },
-                    stream,
-                )?
-            }
             ExpertArchitecture::QwenHybridLayerwise(model) => {
                 let args = model.args().clone();
                 model.forward_mtp_with_expert_executor(
@@ -3205,34 +2571,6 @@ impl ExpertParallelModel {
         );
         *sampler = synchronized.into_inner();
         result
-    }
-
-    /// Samples on one rank and synchronizes only token ids and stop state.
-    #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: Sampler>(
-        &self,
-        logits: &Array,
-        sampler: &mut S,
-        temperature: f32,
-        prng_state: Option<&mut safemlx::random::RandomState>,
-        finished: bool,
-        sampling_rank: usize,
-        execution: &crate::MlxDistributedSession<'_>,
-    ) -> Result<SynchronizedToken, Error> {
-        if execution.topology() != self.topology {
-            return Err(Error::Parallel(
-                "expert sampling distributed-session topology mismatch".into(),
-            ));
-        }
-        execution.sample_and_synchronize_on_rank(
-            Some(logits),
-            logits.dim(0),
-            sampler,
-            temperature,
-            prng_state,
-            finished,
-            sampling_rank,
-        )
     }
 
     fn validate_expert_group(&self, group: &Group) -> Result<(), Error> {
@@ -3520,6 +2858,68 @@ fn slice_required(
     let bytes = local.nbytes();
     *param = Param::new(local);
     Ok(bytes)
+}
+
+#[cfg(test)]
+impl ExpertParallelModel {
+    pub fn latest_routing_statistics(&self) -> &RoutingStatistics {
+        &self.latest_statistics
+    }
+
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+        Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
+    }
+
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+
+    pub fn forward_with_observer(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        cache: &mut ExpertParallelCache,
+        execution: &crate::MlxDistributedSession<'_>,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Array, Error> {
+        let tensor = execution.tensor_context()?;
+        let expert = execution.expert_group().ok_or_else(|| {
+            Error::Parallel("expert observation requires an active EP group".into())
+        })?;
+        self.forward_impl(
+            tokens,
+            mask,
+            cache,
+            tensor.group(),
+            expert,
+            Some(observer),
+            execution.stream(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_and_synchronize<S: crate::runtime::generation::sampler::Sampler>(
+        &self,
+        logits: &Array,
+        sampler: &mut S,
+        temperature: f32,
+        prng_state: Option<&mut safemlx::random::RandomState>,
+        finished: bool,
+        sampling_rank: usize,
+        execution: &crate::MlxDistributedSession<'_>,
+    ) -> Result<crate::runtime::distributed::parallel::SynchronizedToken, Error> {
+        execution.sample_and_synchronize_on_rank(
+            Some(logits),
+            logits.dim(0),
+            sampler,
+            temperature,
+            prng_state,
+            finished,
+            sampling_rank,
+        )
+    }
 }
 
 fn parameter_bytes(module: &impl ModuleParameters) -> usize {
@@ -4287,33 +3687,13 @@ fn load_kimi_linear_ep(
     } else {
         kimi_linear::load_model(model_dir, stream, weights_stream)?
     };
-    let routed_expert_bytes = model.partition_routed_experts(&assignment, stream)?;
-    let local_parameter_bytes = parameter_bytes(&model);
-    let mut opened_checkpoint_shards = std::fs::read_dir(model_dir)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "safetensors")
-        })
-        .collect::<Vec<_>>();
-    opened_checkpoint_shards.sort();
+    model.partition_routed_experts(&assignment, stream)?;
     Ok(ExpertParallelModel {
         topology,
         info: ExpertParallelInfo {
             topology,
-            global_rank: topology.global_rank,
-            expert_parallel_rank: topology.expert_parallel_rank,
-            expert_parallel_size: topology.expert_parallel_size,
             model_kind: ModelKind::KimiLinear,
             assignment,
-            local_parameter_bytes,
-            routed_expert_bytes,
-            owned_expert_bytes: routed_expert_bytes,
-            routed_expert_residency: RoutedExpertResidency::FullyResident,
-            replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
-            opened_checkpoint_shards,
-            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
         },
         architecture: ExpertArchitecture::KimiLinear(Box::new(model)),
         expert_cache: None,
@@ -4430,12 +3810,6 @@ fn load_gguf_ep(
             weights_stream,
         );
     }
-    let opened_checkpoint_shards = checkpoint
-        .catalog()
-        .shards()
-        .iter()
-        .map(|shard| shard.path().to_path_buf())
-        .collect::<Vec<_>>();
     match architecture {
         "kimi-linear" => {
             let loaded = kimi_linear::load_gguf_checkpoint(
@@ -4453,16 +3827,12 @@ fn load_gguf_ep(
             }
             let assignment =
                 resolve_model_assignment(assignment, model.args.num_experts as usize, topology)?;
-            let routed_expert_bytes = model.partition_routed_experts(&assignment, stream)?;
-            let local_parameter_bytes = parameter_bytes(&model);
+            model.partition_routed_experts(&assignment, stream)?;
             Ok(finish_resident_gguf_ep(
                 topology,
                 ModelKind::KimiLinear,
                 assignment,
                 ExpertArchitecture::KimiLinear(Box::new(model)),
-                local_parameter_bytes,
-                routed_expert_bytes,
-                opened_checkpoint_shards,
             ))
         }
         "deepseek2" => {
@@ -4484,22 +3854,16 @@ fn load_gguf_ep(
                 model.args.n_routed_experts as usize,
                 topology,
             )?;
-            let mut routed_expert_bytes = 0;
             for layer in &mut model.model.layers {
                 if let Some(moe) = layer.mlp.moe_mut() {
-                    routed_expert_bytes +=
-                        finalize_deepseek_expert_bank(&mut moe.experts, &assignment, stream)?;
+                    finalize_deepseek_expert_bank(&mut moe.experts, &assignment, stream)?;
                 }
             }
-            let local_parameter_bytes = parameter_bytes(&model);
             Ok(finish_resident_gguf_ep(
                 topology,
                 ModelKind::DeepSeekV3,
                 assignment,
                 ExpertArchitecture::DeepSeek(Box::new(model)),
-                local_parameter_bytes,
-                routed_expert_bytes,
-                opened_checkpoint_shards,
             ))
         }
         "qwen3moe" => {
@@ -4513,22 +3877,16 @@ fn load_gguf_ep(
             let mut model = loaded.model;
             let assignment =
                 resolve_model_assignment(assignment, model.args.num_experts as usize, topology)?;
-            let mut routed_expert_bytes = 0;
             for layer in &mut model.model.layers {
                 if let dense_qwen::FeedForward::Moe(moe) = &mut layer.mlp {
-                    routed_expert_bytes +=
-                        finalize_qwen3_expert_bank(&mut moe.experts, &assignment, stream)?;
+                    finalize_qwen3_expert_bank(&mut moe.experts, &assignment, stream)?;
                 }
             }
-            let local_parameter_bytes = parameter_bytes(&model);
             Ok(finish_resident_gguf_ep(
                 topology,
                 ModelKind::Qwen3,
                 assignment,
                 ExpertArchitecture::DenseQwen(Box::new(model)),
-                local_parameter_bytes,
-                routed_expert_bytes,
-                opened_checkpoint_shards,
             ))
         }
         other => Err(Error::Parallel(format!(
@@ -4595,8 +3953,6 @@ fn load_external_gguf_ep(
                     &args,
                     store.as_ref(),
                 )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::KimiLinear,
@@ -4605,7 +3961,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -4650,8 +4005,6 @@ fn load_external_gguf_ep(
                 &args,
                 store.as_ref(),
             )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::DeepSeekV4,
@@ -4660,7 +4013,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -4709,8 +4061,6 @@ fn load_external_gguf_ep(
                     &args,
                     store.as_ref(),
                 )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::DeepSeekV3,
@@ -4719,7 +4069,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -4764,8 +4113,6 @@ fn load_external_gguf_ep(
                     &args,
                     store.as_ref(),
                 )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::Qwen3,
@@ -4774,7 +4121,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -4833,8 +4179,6 @@ fn load_external_gguf_ep(
                     store.as_ref(),
                     "model.language_model.layers",
                 )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::Qwen3VlMoe,
@@ -4843,7 +4187,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -4895,8 +4238,6 @@ fn load_external_gguf_ep(
                 &args,
                 store.as_ref(),
             )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::Gemma4,
@@ -4905,7 +4246,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -4949,8 +4289,6 @@ fn load_external_gguf_ep(
                 &args,
                 store.as_ref(),
             )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::GptOss,
@@ -4959,7 +4297,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -5005,8 +4342,6 @@ fn load_external_gguf_ep(
                 &args,
                 store.as_ref(),
             )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::Inkling,
@@ -5015,7 +4350,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -5054,8 +4388,6 @@ fn load_external_gguf_ep(
                     &args,
                     store.as_ref(),
                 )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::Lfm2,
@@ -5064,7 +4396,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -5106,8 +4437,6 @@ fn load_external_gguf_ep(
                     &args,
                     store.as_ref(),
                 )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::NemotronH,
@@ -5116,7 +4445,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -5172,8 +4500,6 @@ fn load_external_gguf_ep(
                     &args,
                     store.as_ref(),
                 )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 kind,
@@ -5182,7 +4508,6 @@ fn load_external_gguf_ep(
                 store,
                 entries,
                 expert_residency,
-                replicated_parameter_bytes,
                 stream,
                 weights_stream,
             )
@@ -5198,44 +4523,19 @@ fn finish_resident_gguf_ep(
     model_kind: ModelKind,
     assignment: ExpertAssignment,
     architecture: ExpertArchitecture,
-    local_parameter_bytes: usize,
-    routed_expert_bytes: usize,
-    opened_checkpoint_shards: Vec<PathBuf>,
 ) -> ExpertParallelModel {
     ExpertParallelModel {
         topology,
         info: ExpertParallelInfo {
             topology,
-            global_rank: topology.global_rank,
-            expert_parallel_rank: topology.expert_parallel_rank,
-            expert_parallel_size: topology.expert_parallel_size,
             model_kind,
             assignment,
-            local_parameter_bytes,
-            routed_expert_bytes,
-            owned_expert_bytes: routed_expert_bytes,
-            routed_expert_residency: RoutedExpertResidency::FullyResident,
-            replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
-            opened_checkpoint_shards,
-            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
         },
         architecture,
         expert_cache: None,
         latest_statistics: Default::default(),
         cumulative_statistics: Default::default(),
     }
-}
-
-fn planned_replicated_bytes(
-    report: &crate::runtime::residency::manager::ResidencyReport,
-) -> Result<usize, Error> {
-    let bytes = report.units().iter().try_fold(0u64, |total, unit| {
-        total
-            .checked_add(unit.expected_bytes())
-            .ok_or_else(|| Error::Parallel("streamed replicated byte total overflowed".into()))
-    })?;
-    usize::try_from(bytes)
-        .map_err(|_| Error::Parallel("streamed replicated bytes exceed usize".into()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5247,15 +4547,13 @@ fn finish_external_ep(
     store: std::sync::Arc<dyn WeightStore + Send + Sync>,
     entries: Vec<ExpertCatalogEntry>,
     residency: ExternalExpertResidency,
-    replicated_parameter_bytes: usize,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
     architecture.bind_parallel_topology(topology);
-    let routed_expert_residency = residency.kind();
-    let (expert_cache, owned_expert_bytes) = match residency {
+    let expert_cache = match residency {
         ExternalExpertResidency::FullyResident(quantization) => rank_owned_resident_experts(
-            store.clone(),
+            store,
             entries,
             &assignment,
             quantization,
@@ -5263,7 +4561,7 @@ fn finish_external_ep(
             weights_stream,
         )?,
         ExternalExpertResidency::SparseCache(options, quantization) => rank_owned_expert_cache(
-            store.clone(),
+            store,
             entries,
             &assignment,
             options,
@@ -5272,17 +4570,12 @@ fn finish_external_ep(
             weights_stream,
         )?,
     };
-    let opened_checkpoint_shards = store.diagnostics()?.touched_shard_paths;
     Ok(finish_additional_cached_ep(
         topology,
         kind,
         assignment,
         architecture,
         expert_cache,
-        owned_expert_bytes,
-        replicated_parameter_bytes,
-        routed_expert_residency,
-        opened_checkpoint_shards,
     ))
 }
 
@@ -5293,13 +4586,6 @@ enum ExternalExpertResidency {
 }
 
 impl ExternalExpertResidency {
-    const fn kind(self) -> RoutedExpertResidency {
-        match self {
-            Self::FullyResident(_) => RoutedExpertResidency::FullyResident,
-            Self::SparseCache(_, _) => RoutedExpertResidency::SparseCache,
-        }
-    }
-
     const fn quantization(self) -> Option<WeightQuantization> {
         match self {
             Self::FullyResident(quantization) | Self::SparseCache(_, quantization) => quantization,
@@ -5345,7 +4631,6 @@ fn load_kimi_linear_external_ep(
     };
     let entries =
         crate::architectures::kimi_linear::layerwise::kimi_expert_catalog(&args, store.as_ref())?;
-    let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,
         ModelKind::KimiLinear,
@@ -5354,7 +4639,6 @@ fn load_kimi_linear_external_ep(
         store,
         entries,
         expert_residency,
-        replicated_parameter_bytes,
         stream,
         weights_stream,
     )
@@ -5401,7 +4685,6 @@ fn load_deepseek_external_ep(
         &args,
         store.as_ref(),
     )?;
-    let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,
         ModelKind::DeepSeekV3,
@@ -5410,7 +4693,6 @@ fn load_deepseek_external_ep(
         store,
         entries,
         expert_residency,
-        replicated_parameter_bytes,
         stream,
         weights_stream,
     )
@@ -5456,7 +4738,6 @@ fn load_deepseek_v4_external_ep(
     };
     let entries =
         crate::architectures::deepseek_v4::layerwise::expert_catalog(&args, store.as_ref())?;
-    let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,
         ModelKind::DeepSeekV4,
@@ -5465,7 +4746,6 @@ fn load_deepseek_v4_external_ep(
         store,
         entries,
         expert_residency,
-        replicated_parameter_bytes,
         stream,
         weights_stream,
     )
@@ -5513,7 +4793,6 @@ fn load_qwen3_external_ep(
     };
     let entries =
         crate::architectures::qwen::dense::layerwise::qwen3_expert_catalog(&args, store.as_ref())?;
-    let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,
         ModelKind::Qwen3,
@@ -5522,7 +4801,6 @@ fn load_qwen3_external_ep(
         store,
         entries,
         expert_residency,
-        replicated_parameter_bytes,
         stream,
         weights_stream,
     )
@@ -5621,7 +4899,6 @@ fn load_deepseek_ep(
     }
     let partition =
         load_partition_from_store_on_streams(&store, &plan, weights_stream, stream, &strict)?;
-    let opened_checkpoint_shards = partition.opened_shards().to_vec();
     let mut tensors = partition.into_tensors();
     let mut model = deepseek_v3::Model::new(target_args, stream)?;
     assign_module(&mut model, "", &mut tensors, quantize_on_load, stream)?;
@@ -5669,30 +4946,17 @@ fn load_deepseek_ep(
             unused,
         });
     }
-    let mut routed_expert_bytes = 0;
     for layer in &mut model.model.layers {
         if let Some(moe) = layer.mlp.moe_mut() {
-            routed_expert_bytes +=
-                finalize_deepseek_expert_bank(&mut moe.experts, &assignment, stream)?;
+            finalize_deepseek_expert_bank(&mut moe.experts, &assignment, stream)?;
         }
     }
-    let local_parameter_bytes = parameter_bytes(&model);
     Ok(ExpertParallelModel {
         topology,
         info: ExpertParallelInfo {
             topology,
-            global_rank: topology.global_rank,
-            expert_parallel_rank: topology.expert_parallel_rank,
-            expert_parallel_size: topology.expert_parallel_size,
             model_kind: ModelKind::DeepSeekV3,
             assignment,
-            local_parameter_bytes,
-            routed_expert_bytes,
-            owned_expert_bytes: routed_expert_bytes,
-            routed_expert_residency: RoutedExpertResidency::FullyResident,
-            replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
-            opened_checkpoint_shards,
-            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
         },
         architecture: ExpertArchitecture::DeepSeek(Box::new(model)),
         expert_cache: None,
@@ -5812,7 +5076,6 @@ fn load_qwen3_ep(
         stream,
         &StrictLoadConfig::default(),
     )?;
-    let opened_checkpoint_shards = partition.opened_shards().to_vec();
     let mut tensors = partition.into_tensors();
     if has_split {
         let mut localized = std::collections::HashMap::new();
@@ -5862,30 +5125,17 @@ fn load_qwen3_ep(
             unused,
         });
     }
-    let mut routed_expert_bytes = 0;
     for layer in &mut model.model.layers {
         if let dense_qwen::FeedForward::Moe(moe) = &mut layer.mlp {
-            routed_expert_bytes +=
-                finalize_qwen3_expert_bank(&mut moe.experts, &assignment, stream)?;
+            finalize_qwen3_expert_bank(&mut moe.experts, &assignment, stream)?;
         }
     }
-    let local_parameter_bytes = parameter_bytes(&model);
     Ok(ExpertParallelModel {
         topology,
         info: ExpertParallelInfo {
             topology,
-            global_rank: topology.global_rank,
-            expert_parallel_rank: topology.expert_parallel_rank,
-            expert_parallel_size: topology.expert_parallel_size,
             model_kind: ModelKind::Qwen3,
             assignment,
-            local_parameter_bytes,
-            routed_expert_bytes,
-            owned_expert_bytes: routed_expert_bytes,
-            routed_expert_residency: RoutedExpertResidency::FullyResident,
-            replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
-            opened_checkpoint_shards,
-            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
         },
         architecture: ExpertArchitecture::DenseQwen(Box::new(model)),
         expert_cache: None,
@@ -5930,7 +5180,7 @@ fn rank_owned_expert_cache(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(ExpertCache, usize), Error> {
+) -> Result<ExpertCache, Error> {
     let entries = entries
         .into_iter()
         .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
@@ -5952,9 +5202,7 @@ fn rank_owned_expert_cache(
             stream.clone(),
         )?,
     };
-    let owned_expert_bytes = usize::try_from(cache.report()?.owned_bytes)
-        .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
-    Ok((cache, owned_expert_bytes))
+    Ok(cache)
 }
 
 fn rank_owned_resident_experts(
@@ -5964,7 +5212,7 @@ fn rank_owned_resident_experts(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(ExpertCache, usize), Error> {
+) -> Result<ExpertCache, Error> {
     let entries = entries
         .into_iter()
         .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
@@ -5984,43 +5232,22 @@ fn rank_owned_resident_experts(
             stream.clone(),
         )?,
     };
-    let owned_expert_bytes = usize::try_from(resident.report()?.owned_bytes)
-        .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
-    Ok((resident, owned_expert_bytes))
+    Ok(resident)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish_additional_cached_ep(
     topology: ParallelTopology,
     kind: ModelKind,
     assignment: ExpertAssignment,
     architecture: ExpertArchitecture,
     expert_cache: ExpertCache,
-    owned_expert_bytes: usize,
-    replicated_parameter_bytes: usize,
-    routed_expert_residency: RoutedExpertResidency,
-    opened_checkpoint_shards: Vec<PathBuf>,
 ) -> ExpertParallelModel {
-    let routed_expert_bytes = match routed_expert_residency {
-        RoutedExpertResidency::FullyResident => owned_expert_bytes,
-        RoutedExpertResidency::SparseCache => 0,
-    };
     ExpertParallelModel {
         topology,
         info: ExpertParallelInfo {
             topology,
-            global_rank: topology.global_rank,
-            expert_parallel_rank: topology.expert_parallel_rank,
-            expert_parallel_size: topology.expert_parallel_size,
             model_kind: kind,
             assignment,
-            local_parameter_bytes: replicated_parameter_bytes.saturating_add(routed_expert_bytes),
-            routed_expert_bytes,
-            owned_expert_bytes,
-            routed_expert_residency,
-            replicated_parameter_bytes,
-            opened_checkpoint_shards,
-            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
         },
         architecture,
         expert_cache: Some(expert_cache),
@@ -6052,7 +5279,7 @@ fn load_additional_external_ep(
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
     let store = open_external_safetensors_store(model_dir, max_mapped_shards)?;
-    let (assignment, architecture, entries, replicated_parameter_bytes) = match kind {
+    let (assignment, architecture, entries) = match kind {
         ModelKind::Gemma4 => {
             let (args, _, _, _, _, _) = gemma4::get_gemma4_model_config(model_dir)?;
             let global_experts = args.num_experts.ok_or_else(|| {
@@ -6097,12 +5324,10 @@ fn load_additional_external_ep(
                 &args,
                 store.as_ref(),
             )?;
-            let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
                 ExpertArchitecture::Gemma4Layerwise(Box::new(model)),
                 entries,
-                replicated,
             )
         }
         ModelKind::GptOss => {
@@ -6131,12 +5356,10 @@ fn load_additional_external_ep(
                 &args,
                 store.as_ref(),
             )?;
-            let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
                 ExpertArchitecture::GptOssLayerwise(Box::new(model)),
                 entries,
-                replicated,
             )
         }
         ModelKind::Inkling => {
@@ -6177,12 +5400,10 @@ fn load_additional_external_ep(
                 &args,
                 store.as_ref(),
             )?;
-            let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
                 ExpertArchitecture::InklingLayerwise(Box::new(model)),
                 entries,
-                replicated,
             )
         }
         ModelKind::Lfm2 => {
@@ -6214,12 +5435,10 @@ fn load_additional_external_ep(
             };
             let entries =
                 crate::architectures::lfm2::layerwise::lfm2_expert_catalog(&args, store.as_ref())?;
-            let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
                 ExpertArchitecture::Lfm2Layerwise(Box::new(model)),
                 entries,
-                replicated,
             )
         }
         ModelKind::NemotronH => {
@@ -6259,12 +5478,10 @@ fn load_additional_external_ep(
                 &args,
                 store.as_ref(),
             )?;
-            let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
                 ExpertArchitecture::NemotronHLayerwise(Box::new(model)),
                 entries,
-                replicated,
             )
         }
         ModelKind::Qwen3Next | ModelKind::Qwen35 => {
@@ -6325,12 +5542,10 @@ fn load_additional_external_ep(
                     &args,
                     store.as_ref(),
                 )?;
-            let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
                 ExpertArchitecture::QwenHybridLayerwise(Box::new(model)),
                 entries,
-                replicated,
             )
         }
         ModelKind::Qwen3VlMoe => {
@@ -6369,12 +5584,10 @@ fn load_additional_external_ep(
                 store.as_ref(),
                 "model.language_model.layers",
             )?;
-            let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
                 ExpertArchitecture::Qwen3VlLayerwise(Box::new(model)),
                 entries,
-                replicated,
             )
         }
         _ => {
@@ -6392,7 +5605,6 @@ fn load_additional_external_ep(
         store,
         entries,
         expert_residency,
-        replicated_parameter_bytes,
         stream,
         weights_stream,
     )
@@ -6473,10 +5685,8 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
     )
     .unwrap();
     assert_eq!(model.info().model_kind, expected_kind);
-    assert_eq!(model.info().expert_parallel_rank, 1);
-    assert_eq!(model.info().expert_parallel_size, 2);
-    assert_eq!(model.info().routed_expert_bytes, 0);
-    assert!(model.info().owned_expert_bytes > 0);
+    assert_eq!(model.info().topology.expert_parallel_rank, 1);
+    assert_eq!(model.info().topology.expert_parallel_size, 2);
     assert_eq!(
         model.expert_cache_report().unwrap().unwrap().owned_experts,
         expected_owned_experts
@@ -6497,7 +5707,6 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
     )
     .unwrap();
     assert_eq!(resident_non_experts.info().model_kind, expected_kind);
-    assert_eq!(resident_non_experts.info().routed_expert_bytes, 0);
     assert_eq!(
         resident_non_experts
             .expert_cache_report()
@@ -6523,8 +5732,6 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
     )
     .unwrap();
     assert_eq!(streamed.info().model_kind, expected_kind);
-    assert_eq!(streamed.info().routed_expert_bytes, 0);
-    assert!(streamed.info().owned_expert_bytes > 0);
     assert_eq!(
         streamed
             .expert_cache_report()
@@ -6567,9 +5774,8 @@ pub(crate) fn assert_rank_owned_quantized_sparse_ep_load(
     )
     .unwrap();
     assert_eq!(model.info().model_kind, expected_kind);
-    assert_eq!(model.info().expert_parallel_rank, 1);
-    assert_eq!(model.info().expert_parallel_size, 2);
-    assert_eq!(model.info().routed_expert_bytes, 0);
+    assert_eq!(model.info().topology.expert_parallel_rank, 1);
+    assert_eq!(model.info().topology.expert_parallel_size, 2);
     let report = model.expert_cache_report().unwrap().unwrap();
     assert_eq!(report.owned_experts, expected_owned_experts);
     assert_eq!(report.weight_quantization, Some(quantization));
@@ -7000,9 +6206,6 @@ mod tests {
 
         assert_eq!(loaded.info.model_kind, ModelKind::KimiLinear);
         assert_eq!(loaded.info.assignment.local_global_expert_ids(), &[2, 3]);
-        assert_eq!(loaded.info.opened_checkpoint_shards, [fixture.path()]);
-        assert!(loaded.info.routed_expert_bytes > 0);
-        assert!(loaded.info.replicated_parameter_bytes > 0);
         let ExpertArchitecture::KimiLinear(model) = &loaded.architecture else {
             panic!("expected Kimi Linear");
         };
@@ -7045,14 +6248,10 @@ mod tests {
 
         assert_eq!(loaded.info.model_kind, ModelKind::KimiLinear);
         assert_eq!(loaded.info.assignment.local_global_expert_ids(), &[2, 3]);
-        assert_eq!(loaded.info.routed_expert_bytes, 0);
-        assert!(loaded.info.owned_expert_bytes > 0);
-        assert!(loaded.info.replicated_parameter_bytes > 0);
         let report = loaded.expert_cache_report().unwrap().unwrap();
         assert_eq!(report.owned_experts, 2);
         assert_eq!(report.host_resident_experts, 0);
         assert_eq!(report.device_resident_experts, 0);
-        assert_eq!(loaded.info.opened_checkpoint_shards, [fixture.path()]);
 
         let reads_before = report.residency.weight_store().physical_reads;
         let cache = loaded.expert_cache.as_ref().unwrap();
@@ -7094,8 +6293,6 @@ mod tests {
             loaded.architecture,
             ExpertArchitecture::KimiLinearLayerwise(_)
         ));
-        assert_eq!(loaded.info.routed_expert_bytes, 0);
-        assert!(loaded.info.owned_expert_bytes > 0);
         let experts = loaded.expert_cache_report().unwrap().unwrap();
         assert_eq!(experts.owned_experts, 2);
         assert_eq!(experts.device_resident_experts, 0);
@@ -7137,10 +6334,16 @@ mod tests {
                     &[2, 3]
                 }
             );
-            assert_eq!(loaded.prompt_cache_layer_layout().unwrap().len(), 2);
+            assert_eq!(
+                loaded
+                    .prompt_cache_model_identity()
+                    .unwrap()
+                    .layer_layout
+                    .len(),
+                2
+            );
             let dense = loaded.dense_stream_report().unwrap().unwrap();
             assert_eq!(dense.planned_layer_count(), 2);
-            assert!(loaded.info.owned_expert_bytes > 0);
         }
     }
 
@@ -7164,16 +6367,7 @@ mod tests {
                 loaded.architecture,
                 ExpertArchitecture::KimiLinearLayerwise(_)
             ));
-            assert_eq!(
-                loaded.info.routed_expert_residency,
-                RoutedExpertResidency::FullyResident
-            );
             assert_eq!(loaded.info.assignment.local_expert_count(), 2);
-            assert!(loaded.info.routed_expert_bytes > 0);
-            assert_eq!(
-                loaded.info.local_parameter_bytes,
-                loaded.info.replicated_parameter_bytes + loaded.info.routed_expert_bytes
-            );
             let experts = loaded.expert_cache_report().unwrap().unwrap();
             assert_eq!(experts.owned_experts, 2);
             assert_eq!(experts.device_resident_experts, 2);
@@ -7280,8 +6474,6 @@ mod tests {
         assert_eq!(report.owned_experts, 2);
         assert_eq!(report.host_resident_experts, 0);
         assert_eq!(report.device_resident_experts, 0);
-        assert_eq!(cached.info.routed_expert_bytes, 0);
-        assert!(cached.info.owned_expert_bytes > 0);
         assert_eq!(
             report
                 .residency
@@ -7311,7 +6503,6 @@ mod tests {
         assert_eq!(materialization.transformed_weights, 4);
         assert!(materialization.source_bytes_read > materialization.output_bytes);
         assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
-        assert!(quantized.info.owned_expert_bytes < cached.info.owned_expert_bytes);
     }
 
     #[test]

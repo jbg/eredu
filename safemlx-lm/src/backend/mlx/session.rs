@@ -6,7 +6,9 @@ use safemlx::{
     Array, Stream,
 };
 use safemlx_lm_core::{BackendSession, Completion, Submission};
+use std::path::Path;
 
+use crate::core::generation::MtpConfig;
 use crate::{
     api::{input, Model, ModelCache},
     architectures::distributed::{
@@ -16,8 +18,11 @@ use crate::{
     error::Error,
     nn::generation::CausalLm,
     runtime::execution::inspection::ActivationObserver,
-    runtime::generation::sampler::{DefaultSampler, Sampler},
+    runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
+    CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheOptions,
 };
+use safemlx_lm_core::MtpStats;
 
 use super::{MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, MlxModelKind};
 
@@ -273,6 +278,183 @@ impl<'a> MlxModelSession<'a> {
                 "MLX model and session state kinds do not match".into(),
             )),
         }
+    }
+
+    /// Replaces this session's cache with one allocated under `policy`.
+    ///
+    /// Cache representation remains an MLX backend detail for complete,
+    /// pipeline, and expert models alike.
+    pub fn configure_cache(
+        &mut self,
+        model: &MlxModel,
+        policy: CacheResidencyPolicy,
+    ) -> Result<(), Error> {
+        self.state = match &model.inner {
+            MlxModelKind::Complete(model) => {
+                MlxSessionState::Complete(model.new_cache_with_options(policy)?)
+            }
+            MlxModelKind::Pipeline(model) => {
+                MlxSessionState::Pipeline(model.new_cache_with_options(policy)?)
+            }
+            MlxModelKind::Expert(model) => {
+                MlxSessionState::Expert(model.new_cache_with_options(policy)?)
+            }
+        };
+        Ok(())
+    }
+
+    /// Atomically persists the completed prefix owned by this session.
+    pub fn save_prompt_cache(
+        &mut self,
+        backend: &MlxBackend<'a>,
+        model: &MlxModel,
+        root: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Error> {
+        match (&model.inner, &mut self.state) {
+            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => model
+                .save_prompt_cache(
+                    cache,
+                    root,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    backend.stream(),
+                )
+                .map_err(Into::into),
+            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => model
+                .save_prompt_cache(
+                    cache,
+                    root,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    backend.stream(),
+                ),
+            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => model
+                .save_prompt_cache(
+                    cache,
+                    root,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    backend.stream(),
+                ),
+            _ => Err(Error::Parallel(
+                "MLX model and session state kinds do not match".into(),
+            )),
+        }
+    }
+
+    /// Opens a compatible persisted prefix and replaces this session's cache.
+    pub fn load_prompt_cache(
+        &mut self,
+        backend: &MlxBackend<'a>,
+        model: &MlxModel,
+        root: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+    ) -> Result<PromptCacheManifest, Error> {
+        let (state, manifest) = match &model.inner {
+            MlxModelKind::Complete(model) => {
+                let (cache, manifest) = model.load_prompt_cache(
+                    root,
+                    expected,
+                    prefix_token_ids,
+                    options,
+                    backend.stream(),
+                )?;
+                (MlxSessionState::Complete(cache), manifest)
+            }
+            MlxModelKind::Pipeline(model) => {
+                let (cache, manifest) = model.load_prompt_cache(
+                    root,
+                    expected,
+                    prefix_token_ids,
+                    options,
+                    backend.stream(),
+                )?;
+                (MlxSessionState::Pipeline(cache), manifest)
+            }
+            MlxModelKind::Expert(model) => {
+                let (cache, manifest) = model.load_prompt_cache(
+                    root,
+                    expected,
+                    prefix_token_ids,
+                    options,
+                    backend.stream(),
+                )?;
+                (MlxSessionState::Expert(cache), manifest)
+            }
+        };
+        self.state = state;
+        Ok(manifest)
+    }
+
+    /// Runs embedded multi-token prediction through this session's opaque
+    /// model, cache, and optional distributed capability.
+    pub fn generate_embedded_mtp<S: SpeculativeSampler + Clone>(
+        &mut self,
+        backend: &MlxBackend<'a>,
+        model: &mut MlxModel,
+        input: MlxModelInput,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+    ) -> Result<(Vec<u32>, MtpStats), Error> {
+        let distributed = self.distributed.as_ref();
+        input.with_borrowed(|input| match (&mut model.inner, &mut self.state) {
+            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => {
+                match distributed {
+                    Some(execution) => model.generate_embedded_mtp_distributed(
+                        cache, input, config, prng_key, sampler, execution,
+                    ),
+                    None => model.generate_embedded_mtp_input_with_sampler(
+                        cache,
+                        input,
+                        config,
+                        prng_key,
+                        sampler,
+                        backend.stream(),
+                    ),
+                }
+                .map_err(Into::into)
+            }
+            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => model
+                .generate_embedded_mtp_distributed(
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    distributed.ok_or_else(|| {
+                        safemlx::error::Exception::custom(
+                            "pipeline embedded MTP requires session-owned communication",
+                        )
+                    })?,
+                )
+                .map_err(Into::into),
+            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => model
+                .generate_embedded_mtp_distributed(
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    distributed.ok_or_else(|| {
+                        safemlx::error::Exception::custom(
+                            "expert embedded MTP requires session-owned communication",
+                        )
+                    })?,
+                )
+                .map_err(Into::into),
+            _ => Err(Error::Parallel(
+                "MLX model and session state kinds do not match".into(),
+            )),
+        })
     }
 
     /// Returns communication when this is a distributed session.

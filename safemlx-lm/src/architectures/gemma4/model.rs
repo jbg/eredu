@@ -6342,14 +6342,6 @@ impl Cache {
         Ok(())
     }
 
-    pub(crate) fn offset(&self) -> i32 {
-        self.kv
-            .iter()
-            .flatten()
-            .next()
-            .map_or(0, KeyValueCache::offset)
-    }
-
     /// Returns the committed logical sequence length.
     pub(crate) fn mtp_len(&self) -> usize {
         self.token_ids.len()

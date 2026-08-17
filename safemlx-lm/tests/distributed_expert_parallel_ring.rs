@@ -24,7 +24,7 @@ use safemlx_lm::{
     architectures::distributed::expert::{
         load_expert_parallel_model_with_options,
         load_expert_parallel_model_with_options_and_assignment, profile_expert_parallel_timings,
-        ExpertAssignment, ExpertParallelCache, ExpertParallelModel, RoutedExpertResidency,
+        ExpertAssignment, ExpertParallelCache, ExpertParallelModel,
     },
     architectures::distributed::pipeline::load_pipeline_model_with_options,
     architectures::{
@@ -163,7 +163,6 @@ fn expert_parallel_model_ring_worker() {
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(artifact_dir.join("config.json")).unwrap()).unwrap();
     let hidden_size = config["hidden_size"].as_i64().unwrap() as i32;
-    let moe_intermediate_size = config["moe_intermediate_size"].as_i64().unwrap() as usize;
     let num_layers = config["num_hidden_layers"].as_i64().unwrap() as usize;
     let moe_layers = if let Some(value) = config.get("test_moe_layers") {
         value.as_u64().unwrap() as usize
@@ -289,35 +288,6 @@ fn expert_parallel_model_ring_worker() {
         _ => unreachable!(),
     };
     assert_eq!(info.assignment.local_global_expert_ids(), expected_experts);
-    assert_eq!(
-        info.routed_expert_residency,
-        if sparse_cached {
-            RoutedExpertResidency::SparseCache
-        } else {
-            RoutedExpertResidency::FullyResident
-        }
-    );
-    let dense_routed_bytes =
-        2 * routed_layer_count * 3 * moe_intermediate_size * hidden_size as usize * 4;
-    if sparse_cached {
-        assert_eq!(info.routed_expert_bytes, 0);
-        assert!(info.owned_expert_bytes > 0);
-    } else if tensor_expert {
-        assert!(info.routed_expert_bytes > 0);
-        assert!(info.routed_expert_bytes <= dense_routed_bytes);
-    } else if encoding == "dense" {
-        assert_eq!(info.routed_expert_bytes, dense_routed_bytes);
-    } else {
-        assert!(
-            info.routed_expert_bytes < dense_routed_bytes,
-            "{encoding} routed bank was not physically packed"
-        );
-    }
-    assert!(info.replicated_parameter_bytes > 0);
-    assert_eq!(
-        info.local_parameter_bytes,
-        info.replicated_parameter_bytes + info.routed_expert_bytes
-    );
     if matches!(
         residency.as_str(),
         "streamed-cache" | "tensor-expert-streamed"
@@ -338,40 +308,6 @@ fn expert_parallel_model_ring_worker() {
         assert_eq!(experts.prefill.device.misses, 0);
         assert_eq!(experts.decode.device.misses, 0);
         assert!(model.dense_stream_report().unwrap().is_none());
-    }
-    let opened = info
-        .opened_checkpoint_shards
-        .iter()
-        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    if checkpoint.extension().is_some_and(|value| value == "gguf") {
-        assert!(opened.contains(
-            &checkpoint
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        ));
-        assert!(opened.iter().any(|name| name.starts_with("mmproj-")));
-    } else if checkpoint.join("replicated.safetensors").exists() {
-        assert!(opened.contains(&"replicated.safetensors".to_string()));
-        for expert in 0..4 {
-            // Dense streaming catalogs every execution/expert unit up front,
-            // so shard metadata may be touched even though only rank-owned
-            // expert arrays can enter the cache. The mapped-reader bound still
-            // limits concurrent mappings.
-            let expected_open = matches!(
-                residency.as_str(),
-                "streamed-cache" | "tensor-expert-streamed" | "tensor-expert-resident"
-            ) || (!sparse_cached && expected_experts.contains(&expert));
-            assert_eq!(
-                opened.contains(&format!("expert-{expert}.safetensors")),
-                expected_open,
-                "rank {expected_rank} opened the wrong expert shards: {opened:?}"
-            );
-        }
-    } else {
-        assert_eq!(opened, vec!["model.safetensors"]);
     }
 
     let expected =

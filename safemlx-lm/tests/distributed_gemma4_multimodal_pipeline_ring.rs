@@ -18,10 +18,7 @@ use safemlx::{
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
     architectures::{
-        distributed::pipeline::{
-            load_pipeline_model_with_options, PipelineInferencePhase, PipelineInferenceScheduler,
-            PipelineMicrobatchInput, PipelineStep,
-        },
+        distributed::pipeline::{load_pipeline_model_with_options, PipelineStep},
         gemma4::model::{self as gemma4, Cache, Model},
     },
     core::residency::OffloadConfig,
@@ -32,7 +29,7 @@ use safemlx_lm::{
     },
     DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions, MlxBackend,
     ModelLoadOptions, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology, RequestId, SchedulerLimits, WeightResidency,
+    PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 
 const WORKER: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_WORKER";
@@ -739,39 +736,25 @@ fn gemma4_multimodal_pipeline_ring_worker() {
     let mut parts = [InputPart::text_token_ids(&text); 3];
     let input = typed_input(&text, &pixels, &positions, &audio, &audio_mask, &mut parts);
     let prepared = PreparedModelInput::from_model_input(input).unwrap();
-    let identity = prepared.identity();
-    let request = RequestId::new(44);
     let paged = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
         .unwrap()
         .with_full_attention(true);
-    let mut scheduler =
-        PipelineInferenceScheduler::new(&model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
-    scheduler
-        .register_request_with_options(
-            &model,
-            request,
-            safemlx_lm::CacheResidencyPolicy::Paged(paged.clone()),
-        )
+    let mut cache = model
+        .new_cache_with_options(safemlx_lm::CacheResidencyPolicy::Paged(paged.clone()))
         .unwrap();
     // Two text tokens, one pooled image token, and two audio tokens.
     let step = PipelineStep::new(1, 5).unwrap();
-    let work = PipelineMicrobatchInput::new(request, PipelineInferencePhase::Prefill, step);
-    scheduler
-        .enqueue(if model.stage_info().is_first {
-            work.with_prepared_input(prepared)
-        } else {
-            work.with_prepared_input_identity(identity)
+    let completion = prepared
+        .with_model_input(|input| {
+            model.prefill_distributed(
+                model.stage_info().is_first.then_some(input),
+                step,
+                None,
+                &mut cache,
+                &execution,
+            )
         })
         .unwrap();
-    let mut completed = Vec::new();
-    for _ in 0..64 {
-        completed.extend(scheduler.run_queued(&mut model, &execution).unwrap());
-        if !completed.is_empty() {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert_eq!(completed.len(), 1);
     let schedule = model.placed_ingress_schedule_report();
     let bounded =
         std::env::var_os(DENSE_STREAM).is_some() || std::env::var_os(LAYERWISE_HOST).is_some();
@@ -791,8 +774,7 @@ fn gemma4_multimodal_pipeline_ring_worker() {
             route.from_group != "vision_encoder" && route.from_group != "audio_encoder"
         }));
     }
-    let logits = completed.pop().unwrap().into_logits().unwrap();
-    let mut cache = scheduler.release_request_cache(request).unwrap();
+    let logits = completion.into_logits().unwrap();
     assert_eq!(logits.is_some(), topology.pipeline_parallel_rank == 1);
 
     let mut resident_cache = Cache::default();

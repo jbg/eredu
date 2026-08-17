@@ -388,27 +388,6 @@ impl LayerwiseDecoder {
         result
     }
 
-    pub(crate) fn forward_with_sliding_expert_executor<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Vec<Option<SlidingKeyValueCache>>,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
-        let result =
-            self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
-        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
-            unreachable!("dense-Qwen sliding cache wrapper changed variants")
-        };
-        *cache = owned;
-        result
-    }
-
     pub(crate) fn forward_with_paged_expert_executor<F>(
         &mut self,
         inputs: &Array,
@@ -502,34 +481,6 @@ impl LayerwiseDecoder {
         );
         let DenseQwenLayerwiseCache::Concat(owned) = owned else {
             unreachable!("dense-Qwen concat cache wrapper changed variants")
-        };
-        *cache = owned;
-        result
-    }
-
-    pub(crate) fn forward_tensor_expert_parallel_sliding<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Vec<Option<SlidingKeyValueCache>>,
-        tensor_group: &safemlx::distributed::Group,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
-        let result = self.forward_tensor_expert_parallel_cache(
-            inputs,
-            mask,
-            &mut owned,
-            tensor_group,
-            execute,
-            stream,
-        );
-        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
-            unreachable!("dense-Qwen sliding cache wrapper changed variants")
         };
         *cache = owned;
         result

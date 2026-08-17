@@ -1307,6 +1307,7 @@ impl Cache {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn offset(&self) -> i32 {
         self.layers.first().map_or(0, LayerCache::offset)
     }
@@ -1448,42 +1449,6 @@ impl GptOssModel {
         self.norm.forward(&hidden, stream)
     }
 
-    pub(crate) fn forward_with_expert_executor<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        if cache.layers.is_empty() {
-            *cache = self.new_cache();
-        }
-        self.validate_cache(cache)?;
-        let mut hidden = self.embed_tokens.forward(inputs, stream)?;
-        let length = hidden.dim(1);
-        for (index, ((layer, layer_cache), policy)) in self
-            .layers
-            .iter_mut()
-            .zip(cache.layers.iter_mut())
-            .zip(self.attention_schedule.iter())
-            .enumerate()
-        {
-            let offset = layer_cache.offset();
-            let mask = attention_mask(policy, length, offset, stream)?;
-            hidden = layer.forward_with_expert_executor(
-                &hidden,
-                mask.as_ref(),
-                layer_cache,
-                stream,
-                |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
-            )?;
-        }
-        self.norm.forward(&hidden, stream)
-    }
-
     fn validate_cache(&self, cache: &Cache) -> Result<(), Exception> {
         if cache.layers.len() != self.attention_schedule.len() {
             return Err(Exception::custom(format!(
@@ -1606,22 +1571,6 @@ impl Model {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward(inputs, cache, stream)?;
-        self.lm_head.forward(&hidden, stream)
-    }
-
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let hidden = self
-            .model
-            .forward_with_expert_executor(inputs, cache, execute, stream)?;
         self.lm_head.forward(&hidden, stream)
     }
 }

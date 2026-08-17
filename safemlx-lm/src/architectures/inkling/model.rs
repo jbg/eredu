@@ -671,16 +671,6 @@ pub struct LayerCache {
 }
 
 impl LayerCache {
-    pub(crate) fn restore_checkpoint(
-        &mut self,
-        checkpoint: &Self,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        self.kv.restore_checkpoint(&checkpoint.kv, stream)?;
-        self.convolutions.clone_from(&checkpoint.convolutions);
-        Ok(())
-    }
-
     fn new(policy: AttentionPolicy) -> Self {
         Self {
             kv: match policy.window() {
@@ -2755,37 +2745,6 @@ impl TextModel {
         }
         self.norm.forward(&hidden, stream)
     }
-
-    fn forward_with_expert_executor<F>(
-        &mut self,
-        tokens: &Array,
-        cache: &mut Cache,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut hidden = self.embed(tokens, stream)?;
-        for (index, (layer, layer_cache)) in self
-            .layers
-            .iter_mut()
-            .zip(cache.layers.iter_mut())
-            .enumerate()
-        {
-            hidden = if layer.moe.is_some() {
-                layer.forward_with_expert_executor(
-                    &hidden,
-                    Some(layer_cache),
-                    stream,
-                    |flat, ids, weights, stream| execute(index, flat, ids, weights, stream),
-                )?
-            } else {
-                layer.forward(&hidden, Some(layer_cache), stream)?
-            };
-        }
-        self.norm.forward(&hidden, stream)
-    }
 }
 
 /// Applies Inkling's authoritative post-decoder output policy around a caller-
@@ -3539,14 +3498,6 @@ impl Model {
         Ok((cache, manifest))
     }
 
-    pub(crate) fn new_paged_cache_with_manager(
-        &self,
-        manager: CacheResidencyManager,
-        rank: Option<CacheRankIdentity>,
-    ) -> Result<Cache, Exception> {
-        Cache::new_paged_with_manager(&self.args.text_config, manager, rank)
-    }
-
     pub(crate) fn forward_logits(
         &mut self,
         tokens: &Array,
@@ -3565,28 +3516,6 @@ impl Model {
             &hidden,
             &self.args.text_config,
             last_token_only,
-            stream,
-            |hidden, stream| self.lm_head.forward(hidden, stream),
-        )
-    }
-
-    pub(crate) fn forward_cached_expert_parallel<F>(
-        &mut self,
-        tokens: &Array,
-        cache: &mut Cache,
-        execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let hidden = self
-            .model
-            .forward_with_expert_executor(tokens, cache, execute, stream)?;
-        project_text_logits(
-            &hidden,
-            &self.args.text_config,
-            false,
             stream,
             |hidden, stream| self.lm_head.forward(hidden, stream),
         )
