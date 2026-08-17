@@ -3089,11 +3089,13 @@ mod tests {
                 &tokens,
             )];
             model
-                .prefill_input_with_cache(
+                .submit_prefill(
                     crate::runtime::media::input::ModelInput::new(&parts),
                     &mut cache,
                     gpu.stream(),
                 )
+                .unwrap()
+                .wait()
                 .unwrap()
                 .evaluated()
                 .unwrap();

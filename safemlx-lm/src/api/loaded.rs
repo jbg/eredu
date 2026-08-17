@@ -717,7 +717,7 @@ impl LoadedModel {
                         stream,
                         runtime.sampler,
                     );
-                    let mut source = ModelGenerateTokenSource { generator, stream };
+                    let mut source = GenerationTokenSource { generator, stream };
                     let (token_ids, finish_reason) = drive_committed_generation_cancellable(
                         &mut source,
                         &mut pipeline,
@@ -1918,53 +1918,63 @@ impl LoadedModel {
         )
     }
 
-    /// Computes logits for an initial typed input using a cache returned by [`LoadedModel::new_cache`].
-    pub fn prefill_input_with_cache(
+    /// Submits prompt prefill using a cache returned by [`LoadedModel::new_cache`].
+    pub fn submit_prefill(
         &mut self,
         input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
-        self.model.prefill_input_with_cache(input, cache, stream)
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
+        self.model.submit_prefill(input, cache, stream)
     }
 
-    /// Computes initial logits from an owned processor result.
+    /// Submits cached decode using an existing model cache.
+    pub fn submit_decode(
+        &mut self,
+        input: Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
+        self.model.submit_decode(input, cache, stream)
+    }
+
+    /// Submits prompt prefill from an owned processor result.
     #[cfg(feature = "media-processing")]
-    pub fn prefill_prepared_input_with_cache(
+    pub fn submit_prepared_prefill(
         &mut self,
         input: &PreparedModelInput,
         cache: &mut ModelCache,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
-        input.with_model_input(|input| self.prefill_input_with_cache(input, cache, stream))
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
+        input.with_model_input(|input| self.submit_prefill(input, cache, stream))
     }
 
-    /// Computes initial prompt logits while reporting detailed activations.
+    /// Submits prompt prefill while reporting detailed activations.
     ///
-    /// The returned logits have shape `[batch, vocab]` and match
-    /// [`LoadedModel::prefill_input_with_cache`] for the same model/cache.
-    pub fn prefill_input_with_observer(
+    /// The submitted output has shape `[batch, vocab]` and matches
+    /// [`LoadedModel::submit_prefill`] for the same model/cache.
+    pub fn submit_prefill_with_observer(
         &mut self,
         input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
         observer: &mut impl ActivationObserver,
-    ) -> Result<Array, Exception> {
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
         self.model
-            .prefill_input_with_observer(input, cache, stream, observer)
+            .submit_prefill_with_observer(input, cache, stream, observer)
     }
 
-    /// Computes initial logits from an owned processor result while observing activations.
+    /// Submits an owned processor result while observing activations.
     #[cfg(feature = "media-processing")]
-    pub fn prefill_prepared_input_with_observer(
+    pub fn submit_prepared_prefill_with_observer(
         &mut self,
         input: &PreparedModelInput,
         cache: &mut ModelCache,
         stream: &Stream,
         observer: &mut impl ActivationObserver,
-    ) -> Result<Array, Exception> {
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
         input.with_model_input(|input| {
-            self.prefill_input_with_observer(input, cache, stream, observer)
+            self.submit_prefill_with_observer(input, cache, stream, observer)
         })
     }
 
@@ -1972,11 +1982,11 @@ impl LoadedModel {
     pub fn generate_input_with_cache<'a>(
         &'a mut self,
         cache: &'a mut ModelCache,
-        input: input::ModelInput<'a>,
+        input: input::ModelInput<'_>,
         overrides: GenerationConfigOverrides,
         prng_key: Option<Array>,
         stream: &'a Stream,
-    ) -> Result<ModelGenerate<'a, crate::runtime::generation::sampler::GenerationSampler>, Error>
+    ) -> Result<MlxGeneration<'a, crate::runtime::generation::sampler::GenerationSampler>, Error>
     {
         let resolved = self.resolve_generation_config(overrides)?;
         let prng_key = match (prng_key, resolved.temperature) {
@@ -1999,11 +2009,11 @@ impl LoadedModel {
         &'a mut self,
         cache: &'a mut ModelCache,
         temp: f32,
-        input: input::ModelInput<'a>,
+        input: input::ModelInput<'_>,
         prng_key: Option<Array>,
         stream: &'a Stream,
         sampler: S,
-    ) -> ModelGenerate<'a, S>
+    ) -> MlxGeneration<'a, S>
     where
         S: Sampler,
     {

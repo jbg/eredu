@@ -148,33 +148,9 @@ impl LlamaCache {
 /// Llama/Mistral causal LM whose execution engine follows its residency policy.
 pub struct LlamaModel {
     execution: Box<LayerwiseModel<LlamaLayerwiseAdapter>>,
-    pending_backend_completions: Vec<crate::backend::mlx::MlxCompletion>,
 }
 
 impl LlamaModel {
-    pub(crate) fn retain_backend_completion(
-        &mut self,
-        completion: crate::backend::mlx::MlxCompletion,
-    ) -> Result<(), Error> {
-        use safemlx_lm_core::Completion;
-        self.pending_backend_completions.push(completion);
-        let mut pending = std::mem::take(&mut self.pending_backend_completions).into_iter();
-        let mut retained = Vec::with_capacity(pending.len());
-        while let Some(completion) = pending.next() {
-            match completion.is_complete() {
-                Ok(true) => {}
-                Ok(false) => retained.push(completion),
-                Err(error) => {
-                    retained.extend(pending);
-                    self.pending_backend_completions = retained;
-                    return Err(error);
-                }
-            }
-        }
-        self.pending_backend_completions = retained;
-        Ok(())
-    }
-
     /// Returns normalized model arguments regardless of execution engine.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
@@ -469,8 +445,7 @@ impl CausalLm<LlamaCache> for LlamaModel {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let tokens = input::text_token_ids(input, stream)?;
-        crate::backend::mlx::MlxLlamaExecutor::new(self, cache, stream)
-            .prefill_retained(tokens)
+        self.prefill(&tokens, cache, stream)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 
@@ -480,8 +455,7 @@ impl CausalLm<LlamaCache> for LlamaModel {
         cache: &mut LlamaCache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        crate::backend::mlx::MlxLlamaExecutor::new(self, cache, stream)
-            .decode_retained(input_tokens.clone())
+        self.decode(input_tokens, cache, stream)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 }
@@ -514,7 +488,6 @@ pub(crate) fn load_llama_safetensors_mlx(
             stream,
             weights_stream,
         )?),
-        pending_backend_completions: Vec::new(),
     })
 }
 
@@ -533,7 +506,6 @@ pub(crate) fn execute_transformed_llama_model(
             stream,
             weights_stream,
         )?),
-        pending_backend_completions: Vec::new(),
     })
 }
 
@@ -580,7 +552,6 @@ pub fn load_llama_tensor_parallel_model(
             stream,
             weights_stream,
         )?),
-        pending_backend_completions: Vec::new(),
     })
 }
 
@@ -615,7 +586,6 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     Ok((
         LlamaModel {
             execution: Box::new(execution),
-            pending_backend_completions: Vec::new(),
         },
         prepared.eos_token_ids,
     ))
@@ -655,7 +625,6 @@ pub(crate) fn load_llama_gguf_model(
                 stream,
                 weights_stream,
             )?),
-            pending_backend_completions: Vec::new(),
         },
         prepared.eos_token_ids,
     ))

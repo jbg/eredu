@@ -33,5 +33,5 @@ pub mod topology;
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use backend::{
     Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession, Completion,
-    DeviceDescriptor, PreparedModel, SessionExecutor, Submission,
+    DeviceDescriptor, PreparedModel, Submission,
 };

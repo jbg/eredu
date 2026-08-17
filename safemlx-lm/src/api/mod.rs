@@ -28,7 +28,6 @@ use crate::core::cache::{
 };
 
 pub(crate) use crate::nn as common;
-use crate::nn::generation::CausalLm;
 use crate::runtime::chat::constraints::ConstraintCompiler;
 use crate::runtime::chat::{
     prepare_format_profile, resolve_structural_tokens, SemanticRuntimePlan,
@@ -435,12 +434,13 @@ pub use capability::{
 };
 
 mod dispatch;
+pub use crate::backend::mlx::MlxGeneration;
 use dispatch::validate_gemma4_drafter;
-pub use dispatch::{Model, ModelCache, ModelGenerate};
+pub use dispatch::{Model, ModelCache};
 
 mod request;
 use request::{
-    prepare_chat_from_parts, with_prepared_chat_runtime, ModelGenerateTokenSource,
+    prepare_chat_from_parts, with_prepared_chat_runtime, GenerationTokenSource,
     PreparedChatSemanticState, PreparedChatTokenDecoder, ResolvedPreparedChatGenerationSettings,
 };
 pub use request::{
@@ -488,10 +488,11 @@ pub fn load_model_with_options(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     use safemlx_lm_core::Backend;
-    crate::backend::mlx::MlxBackend::new(stream, weights_stream)
+    crate::backend::mlx::MlxBackend::new(stream)
         .prepare_model(crate::backend::mlx::MlxModelConfig {
             model_path: model_dir.as_ref().to_path_buf(),
             options,
+            weights_stream,
         })
         .map(safemlx_lm_core::PreparedModel::into_inner)
 }

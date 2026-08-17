@@ -918,24 +918,23 @@ fn resident_reference_quantized(
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
     let prefill = model
-        .prefill_input_with_cache(
+        .submit_prefill(
             safemlx_lm::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
+        .unwrap()
+        .wait()
         .unwrap()
         .evaluated()
         .unwrap()
         .as_slice::<f32>()
         .to_vec();
     let token = Array::from_slice(&[0u32], &[1, 1]);
-    let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&token)];
     let decode = model
-        .prefill_input_with_cache(
-            safemlx_lm::runtime::media::input::ModelInput::new(&parts),
-            &mut cache,
-            stream,
-        )
+        .submit_decode(token, &mut cache, stream)
+        .unwrap()
+        .wait()
         .unwrap()
         .evaluated()
         .unwrap()
@@ -996,24 +995,23 @@ fn multimodal_resident_reference(
     let prepared = multimodal_prepared_input(family);
     let parts = prepared.input_parts();
     let prefill = model
-        .prefill_input_with_cache(
+        .submit_prefill(
             safemlx_lm::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
+        .unwrap()
+        .wait()
         .unwrap()
         .evaluated()
         .unwrap()
         .as_slice::<f32>()
         .to_vec();
     let token = Array::from_slice(&[0u32], &[1, 1]);
-    let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&token)];
     let decode = model
-        .prefill_input_with_cache(
-            safemlx_lm::runtime::media::input::ModelInput::new(&parts),
-            &mut cache,
-            stream,
-        )
+        .submit_decode(token, &mut cache, stream)
+        .unwrap()
+        .wait()
         .unwrap()
         .evaluated()
         .unwrap()

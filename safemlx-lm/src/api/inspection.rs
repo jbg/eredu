@@ -8690,11 +8690,13 @@ mod tests {
         let parts = [crate::api::input::InputPart::text_token_ids(&tokens)];
         let mut cache = loaded.new_cache();
         let logits = loaded
-            .prefill_input_with_cache(
+            .submit_prefill(
                 crate::api::input::ModelInput::new(&parts),
                 &mut cache,
                 execution.stream(),
             )
+            .unwrap()
+            .wait()
             .unwrap();
         assert_eq!(logits.shape(), &[1, 16]);
         assert!(

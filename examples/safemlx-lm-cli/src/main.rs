@@ -3197,7 +3197,9 @@ fn run_expert_cache_benchmark(
     let before_cold = expert_benchmark_snapshot(model)?;
     let mut cold_cache = model.new_cache();
     let started = Instant::now();
-    let logits = model.prefill_input_with_cache(input, &mut cold_cache, stream)?;
+    let logits = model
+        .submit_prefill(input, &mut cold_cache, stream)?
+        .wait()?;
     eval([&logits])?;
     stream.synchronize()?;
     let cold_elapsed = started.elapsed();
@@ -3213,7 +3215,9 @@ fn run_expert_cache_benchmark(
     let before_repeated = after_cold;
     let mut repeated_cache = model.new_cache();
     let started = Instant::now();
-    let logits = model.prefill_input_with_cache(input, &mut repeated_cache, stream)?;
+    let logits = model
+        .submit_prefill(input, &mut repeated_cache, stream)?
+        .wait()?;
     eval([&logits])?;
     stream.synchronize()?;
     let repeated_elapsed = started.elapsed();
@@ -3227,11 +3231,11 @@ fn run_expert_cache_benchmark(
     );
 
     let last = tokens.try_index_device((.., tokens.dim(1) - 1..), stream)?;
-    let decode_parts = [InputPart::text_token_ids(&last)];
-    let decode_input = ModelInput::new(&decode_parts);
     let before_decode = after_repeated;
     let started = Instant::now();
-    let logits = model.prefill_input_with_cache(decode_input, &mut repeated_cache, stream)?;
+    let logits = model
+        .submit_decode(last, &mut repeated_cache, stream)?
+        .wait()?;
     eval([&logits])?;
     stream.synchronize()?;
     let decode_elapsed = started.elapsed();

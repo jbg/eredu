@@ -440,15 +440,15 @@ pub(super) fn with_prepared_chat_runtime<S, R>(
     })
 }
 
-pub(super) struct ModelGenerateTokenSource<'a, S>
+pub(super) struct GenerationTokenSource<'a, S>
 where
     S: Sampler + Clone,
 {
-    pub(super) generator: ModelGenerate<'a, ConstrainedSampler<S>>,
+    pub(super) generator: MlxGeneration<'a, ConstrainedSampler<S>>,
     pub(super) stream: &'a Stream,
 }
 
-impl<S> CommittedTokenSource for ModelGenerateTokenSource<'_, S>
+impl<S> CommittedTokenSource for GenerationTokenSource<'_, S>
 where
     S: Sampler + Clone,
 {

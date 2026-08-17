@@ -53,14 +53,25 @@ struct Args {
     device_cache: bool,
 }
 
-fn input_for_tokens(
+fn prefill_tokens(
     tokens: &Array,
     cache: &mut ModelCache,
     model: &mut LoadedModel,
     stream: &safemlx::Stream,
-) -> Result<Array, safemlx::error::Exception> {
+) -> anyhow::Result<Array> {
     let parts = [InputPart::text_token_ids(tokens)];
-    model.prefill_input_with_cache(ModelInput::new(&parts), cache, stream)
+    Ok(model
+        .submit_prefill(ModelInput::new(&parts), cache, stream)?
+        .wait()?)
+}
+
+fn decode_tokens(
+    tokens: &Array,
+    cache: &mut ModelCache,
+    model: &mut LoadedModel,
+    stream: &safemlx::Stream,
+) -> anyhow::Result<Array> {
+    Ok(model.submit_decode(tokens.clone(), cache, stream)?.wait()?)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -79,8 +90,8 @@ fn main() -> anyhow::Result<()> {
 
     if args.device_cache {
         let mut cache = model.new_cache();
-        let _ = input_for_tokens(&prefix, &mut cache, &mut model, stream)?;
-        let logits = input_for_tokens(&suffix, &mut cache, &mut model, stream)?;
+        let _ = prefill_tokens(&prefix, &mut cache, &mut model, stream)?;
+        let logits = decode_tokens(&suffix, &mut cache, &mut model, stream)?;
         async_eval_with_event([&logits])?.synchronize()?;
         println!(
             "ordinary device cache suffix logits shape: {:?}",
@@ -108,8 +119,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut uninterrupted =
         model.new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))?;
-    let _ = input_for_tokens(&prefix, &mut uninterrupted, &mut model, stream)?;
-    let uninterrupted_logits = input_for_tokens(&suffix, &mut uninterrupted, &mut model, stream)?;
+    let _ = prefill_tokens(&prefix, &mut uninterrupted, &mut model, stream)?;
+    let uninterrupted_logits = decode_tokens(&suffix, &mut uninterrupted, &mut model, stream)?;
     async_eval_with_event([&uninterrupted_logits])?.synchronize()?;
     println!(
         "uninterrupted report: {:#?}",
@@ -117,7 +128,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     let mut persisted = model.new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))?;
-    let _ = input_for_tokens(&prefix, &mut persisted, &mut model, stream)?;
+    let _ = prefill_tokens(&prefix, &mut persisted, &mut model, stream)?;
     let model_type = model.model_type().to_owned();
     let model_family = if model_type.contains("deepseek") {
         "deepseek_v3"
@@ -163,7 +174,7 @@ fn main() -> anyhow::Result<()> {
         model.load_prompt_cache(&args.cache_dir, &descriptor, &prefix_ids, paged, stream)?;
     println!("cataloged blocks: {}", inspected.blocks.len());
     println!("load report: {:#?}", restored.residency_report()?);
-    let restored_logits = input_for_tokens(&suffix, &mut restored, &mut model, stream)?;
+    let restored_logits = decode_tokens(&suffix, &mut restored, &mut model, stream)?;
     async_eval_with_event([&restored_logits])?.synchronize()?;
     let equal = restored_logits
         .all_close(&uninterrupted_logits, 1e-4, 1e-4, None, stream)?

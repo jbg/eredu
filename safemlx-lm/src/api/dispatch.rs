@@ -834,92 +834,32 @@ impl Model {
         stream: &Stream,
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception> {
-        let result = match (self, cache) {
-            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-                if mask.is_some() {
-                    return Err(Exception::custom(
-                        "an explicit DeepSeek observer mask is unsupported; the adapter constructs the causal mask from cache state",
-                    ));
-                }
-                model.forward_with_observer(input_tokens, cache, stream, observer)
-            }
-            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
-                if mask.is_some() {
-                    return Err(Exception::custom(
-                        "an explicit Kimi Linear observer mask is unsupported; the adapter constructs the causal mask from cache state",
-                    ));
-                }
-                model.forward_with_observer(input_tokens, cache, stream, observer)
-            }
-            (Self::Llama(model), ModelCache::Llama(cache)) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, observer)
-            }
-            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, observer)
-            }
-            (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
-                model.forward_paged_with_observer(input_tokens, mask, cache, stream, observer)
-            }
-            (Self::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, observer)
-            }
-            (Self::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
-                model.forward_paged_with_observer(input_tokens, mask, cache, stream, observer)
-            }
-            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache))
-            | (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
-                if mask.is_some() {
-                    return Err(Exception::custom(
-                        "an explicit Qwen hybrid observer mask is unsupported; the adapter constructs the causal mask from cache state",
-                    ));
-                }
-                model.forward_with_observer(input_tokens, cache, stream, observer)
-            }
-            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
-                if mask.is_some() {
-                    return Err(Exception::custom(
-                        "an explicit Gemma observer mask is unsupported; the adapter constructs its per-layer masks from cache state",
-                    ));
-                }
-                model.forward_with_observer(input_tokens, cache, stream, observer)
-            }
-            (model, _) => {
-                return Err(Exception::custom(format!(
-                    "activation observation is unavailable for model type {} or the supplied cache does not match",
-                    model.model_type()
-                )))
-            }
-        };
-        result.map_err(|error| Exception::custom(error.to_string()))
+        crate::backend::mlx::MlxModelSession::forward_with_observer(
+            self,
+            input_tokens,
+            mask,
+            cache,
+            stream,
+            observer,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
     }
 
-    /// Computes initial prompt logits while reporting detailed activations.
-    pub fn prefill_input_with_observer(
+    /// Submits prompt prefill while reporting detailed activations.
+    pub fn submit_prefill_with_observer(
         &mut self,
         input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
         observer: &mut impl ActivationObserver,
-    ) -> Result<Array, Exception> {
-        if let (Self::Gemma4(model), ModelCache::Gemma4(cache)) = (&mut *self, &mut *cache) {
-            return model
-                .prefill_input_with_observer(input, cache, stream, observer)
-                .map_err(|error| Exception::custom(error.to_string()))?
-                .try_index_device((.., -1, ..), stream);
-        }
-        match (&mut *self, &mut *cache) {
-            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache))
-            | (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
-                return model
-                    .prefill_input_with_observer(input, cache, stream, observer)
-                    .map_err(|error| Exception::custom(error.to_string()))?
-                    .try_index_device((.., -1, ..), stream);
-            }
-            _ => {}
-        }
-        let tokens = input::text_token_ids(input, stream)?;
-        self.forward_with_observer(&tokens, None, cache, stream, observer)?
-            .try_index_device((.., -1, ..), stream)
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
+        crate::backend::mlx::MlxModelSession::submit_prefill_with_observer(
+            self,
+            input.into(),
+            cache,
+            stream,
+            observer,
+        )
     }
 
     /// Creates an empty cache value appropriate for this model.
@@ -1314,75 +1254,36 @@ impl Model {
         }
     }
 
-    /// Computes logits for an initial typed input using a cache returned by [`Model::new_cache`].
-    pub fn prefill_input_with_cache(
+    /// Submits prompt prefill through the selected MLX model session.
+    pub fn submit_prefill(
         &mut self,
         input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
-        match (self, cache) {
-            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::GptOss(model), ModelCache::GptOss(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Inkling(model), ModelCache::Inkling(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Llama(model), ModelCache::Llama(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Lfm2(model), ModelCache::Lfm2(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::DeepSeekV4(model), ModelCache::DeepSeekV4(cache)) => {
-                let tokens = input::text_token_ids(input, stream)?;
-                model
-                    .forward(&tokens, Some(cache), stream)?
-                    .try_index_device((.., -1, ..), stream)
-            }
-            (Self::DeepSeekV4Layerwise(model), ModelCache::DeepSeekV4(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            _ => Err(Exception::custom(
-                "model cache type does not match model kind",
-            )),
-        }
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
+        use safemlx_lm_core::BackendSession;
+        crate::backend::mlx::MlxModelSession::prefill(
+            &crate::backend::mlx::MlxBackend::new(stream),
+            self,
+            cache,
+            input.into(),
+        )
+    }
+
+    /// Submits cached decode through the selected MLX model session.
+    pub fn submit_decode(
+        &mut self,
+        input: Array,
+        cache: &mut ModelCache,
+        stream: &Stream,
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
+        use safemlx_lm_core::BackendSession;
+        crate::backend::mlx::MlxModelSession::decode(
+            &crate::backend::mlx::MlxBackend::new(stream),
+            self,
+            cache,
+            input,
+        )
     }
 
     /// Creates a token iterator from typed input using a cache returned by [`Model::new_cache`].
@@ -1390,10 +1291,10 @@ impl Model {
         &'a mut self,
         cache: &'a mut ModelCache,
         temp: f32,
-        input: input::ModelInput<'a>,
+        input: input::ModelInput<'_>,
         prng_key: Option<Array>,
         stream: &'a Stream,
-    ) -> ModelGenerate<'a> {
+    ) -> crate::backend::mlx::MlxGeneration<'a> {
         self.generate_input_with_cache_sampler(cache, temp, input, prng_key, stream, DefaultSampler)
     }
 
@@ -1402,109 +1303,17 @@ impl Model {
         &'a mut self,
         cache: &'a mut ModelCache,
         temp: f32,
-        input: input::ModelInput<'a>,
+        input: input::ModelInput<'_>,
         prng_key: Option<Array>,
         stream: &'a Stream,
         sampler: S,
-    ) -> ModelGenerate<'a, S>
+    ) -> crate::backend::mlx::MlxGeneration<'a, S>
     where
         S: Sampler,
     {
-        match (self, cache) {
-            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => ModelGenerate::Gemma4(
-                crate::architectures::gemma4::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::Lfm2(model), ModelCache::Lfm2(cache)) => ModelGenerate::Lfm2(
-                crate::architectures::lfm2::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::GptOss(model), ModelCache::GptOss(cache)) => ModelGenerate::GptOss(
-                crate::architectures::gpt_oss::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::Inkling(model), ModelCache::Inkling(cache)) => ModelGenerate::Inkling(
-                crate::architectures::inkling::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::Llama(model), ModelCache::Llama(cache)) => {
-                ModelGenerate::Llama(common::generation::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::DenseQwen(common::generation::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
-                ModelGenerate::DenseQwenPaged(common::generation::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::MuseGlimmer(common::generation::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
-                ModelGenerate::MuseGlimmerPaged(common::generation::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => ModelGenerate::Qwen3Vl(
-                crate::architectures::qwen::vl::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => ModelGenerate::Qwen3VlMoe(
-                crate::architectures::qwen::vl::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => ModelGenerate::NemotronH(
-                crate::architectures::nemotron_h::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::Qwen35(model), ModelCache::Qwen35(cache)) => ModelGenerate::Qwen35(
-                crate::architectures::qwen::hybrid::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => ModelGenerate::Qwen3Next(
-                crate::architectures::qwen::hybrid::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => ModelGenerate::DeepSeekV3(
-                crate::architectures::deepseek_v3::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::DeepSeekV4(model), ModelCache::DeepSeekV4(cache)) => ModelGenerate::DeepSeekV4(
-                crate::architectures::deepseek_v4::model::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            (Self::DeepSeekV4Layerwise(model), ModelCache::DeepSeekV4(cache)) => {
-                ModelGenerate::DeepSeekV4Layerwise(
-                    crate::architectures::deepseek_v4::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => ModelGenerate::KimiLinear(
-                crate::architectures::kimi_linear::layerwise::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ),
-            ),
-            _ => panic!("model cache type does not match model kind"),
-        }
+        crate::backend::mlx::MlxGeneration::with_sampler(
+            self, cache, temp, input, prng_key, stream, sampler,
+        )
     }
 }
 
@@ -1629,143 +1438,6 @@ impl ModelCache {
             Self::KimiLinear(cache) => cache.residency_report(),
             Self::NemotronH(cache) => cache.residency_report(),
             _ => Ok(None),
-        }
-    }
-}
-
-/// Token iterator for any supported model variant.
-pub enum ModelGenerate<'a, S = DefaultSampler>
-where
-    S: Sampler,
-{
-    /// DeepSeek-V3/R1 generation iterator.
-    DeepSeekV3(crate::architectures::deepseek_v3::layerwise::Generate<'a, S>),
-    /// DeepSeek-V4 generation iterator.
-    DeepSeekV4(crate::architectures::deepseek_v4::model::Generate<'a, S>),
-    /// Bounded-residency DeepSeek-V4 generation iterator.
-    DeepSeekV4Layerwise(crate::architectures::deepseek_v4::layerwise::Generate<'a, S>),
-    /// Gemma 4 generation iterator.
-    Gemma4(crate::architectures::gemma4::layerwise::Generate<'a, S>),
-    /// GPT-OSS generation iterator.
-    GptOss(crate::architectures::gpt_oss::layerwise::Generate<'a, S>),
-    /// Inkling generation iterator.
-    Inkling(crate::architectures::inkling::layerwise::Generate<'a, S>),
-    /// Kimi Linear generation iterator.
-    KimiLinear(crate::architectures::kimi_linear::layerwise::Generate<'a, S>),
-    /// Llama generation iterator.
-    Llama(
-        common::generation::Generate<
-            'a,
-            crate::architectures::llama::layerwise::LlamaModel,
-            crate::architectures::llama::layerwise::LlamaCache,
-            S,
-        >,
-    ),
-    /// Dense-Qwen generation iterator.
-    DenseQwen(
-        common::generation::Generate<
-            'a,
-            crate::architectures::qwen::dense::layerwise::LayerwiseDecoder,
-            Vec<Option<ConcatKeyValueCache>>,
-            S,
-        >,
-    ),
-    /// Dense-Qwen generation using a paged KV cache.
-    DenseQwenPaged(
-        common::generation::Generate<
-            'a,
-            crate::architectures::qwen::dense::layerwise::LayerwiseDecoder,
-            Vec<Option<PagedKeyValueCache>>,
-            S,
-        >,
-    ),
-    /// Muse-Glimmer generation iterator.
-    MuseGlimmer(
-        common::generation::Generate<
-            'a,
-            crate::architectures::muse_glimmer::layerwise::LayerwiseDecoder,
-            Vec<Option<ConcatKeyValueCache>>,
-            S,
-        >,
-    ),
-    /// Muse-Glimmer generation using a paged KV cache.
-    MuseGlimmerPaged(
-        common::generation::Generate<
-            'a,
-            crate::architectures::muse_glimmer::layerwise::LayerwiseDecoder,
-            Vec<Option<PagedKeyValueCache>>,
-            S,
-        >,
-    ),
-    /// Qwen3-VL generation iterator.
-    Qwen3Vl(crate::architectures::qwen::vl::layerwise::Generate<'a, S>),
-    /// Qwen3-VL-MoE generation iterator.
-    Qwen3VlMoe(crate::architectures::qwen::vl::layerwise::Generate<'a, S>),
-    /// Nemotron-H generation iterator.
-    NemotronH(crate::architectures::nemotron_h::layerwise::Generate<'a, S>),
-    /// LFM2 generation iterator.
-    Lfm2(crate::architectures::lfm2::layerwise::Generate<'a, S>),
-    /// Qwen3.5 MoE generation iterator.
-    Qwen35(crate::architectures::qwen::hybrid::layerwise::Generate<'a, S>),
-    /// Qwen3-Next generation iterator.
-    Qwen3Next(crate::architectures::qwen::hybrid::layerwise::Generate<'a, S>),
-}
-
-impl<S> ModelGenerate<'_, S>
-where
-    S: Sampler,
-{
-    /// Returns the architecture iterator's sampler at its committed prefix.
-    pub fn sampler_mut(&mut self) -> &mut S {
-        match self {
-            Self::DeepSeekV3(generate) => generate.sampler_mut(),
-            Self::DeepSeekV4(generate) => generate.sampler_mut(),
-            Self::DeepSeekV4Layerwise(generate) => generate.sampler_mut(),
-            Self::Gemma4(generate) => generate.sampler_mut(),
-            Self::GptOss(generate) => generate.sampler_mut(),
-            Self::Inkling(generate) => generate.sampler_mut(),
-            Self::KimiLinear(generate) => generate.sampler_mut(),
-            Self::Llama(generate) => generate.sampler_mut(),
-            Self::Lfm2(generate) => generate.sampler_mut(),
-            Self::NemotronH(generate) => generate.sampler_mut(),
-            Self::DenseQwenPaged(generate) => generate.sampler_mut(),
-            Self::DenseQwen(generate) => generate.sampler_mut(),
-            Self::MuseGlimmerPaged(generate) => generate.sampler_mut(),
-            Self::MuseGlimmer(generate) => generate.sampler_mut(),
-            Self::Qwen3Vl(generate) => generate.sampler_mut(),
-            Self::Qwen3VlMoe(generate) => generate.sampler_mut(),
-            Self::Qwen35(generate) => generate.sampler_mut(),
-            Self::Qwen3Next(generate) => generate.sampler_mut(),
-        }
-    }
-}
-
-impl<S> Iterator for ModelGenerate<'_, S>
-where
-    S: Sampler,
-{
-    type Item = Result<Array, Exception>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::DeepSeekV3(generate) => generate.next(),
-            Self::DeepSeekV4(generate) => generate.next(),
-            Self::DeepSeekV4Layerwise(generate) => generate.next(),
-            Self::Gemma4(generate) => generate.next(),
-            Self::GptOss(generate) => generate.next(),
-            Self::Inkling(generate) => generate.next(),
-            Self::KimiLinear(generate) => generate.next(),
-            Self::Llama(generate) => generate.next(),
-            Self::Lfm2(generate) => generate.next(),
-            Self::NemotronH(generate) => generate.next(),
-            Self::DenseQwenPaged(generate) => generate.next(),
-            Self::DenseQwen(generate) => generate.next(),
-            Self::MuseGlimmerPaged(generate) => generate.next(),
-            Self::MuseGlimmer(generate) => generate.next(),
-            Self::Qwen3Vl(generate) => generate.next(),
-            Self::Qwen3VlMoe(generate) => generate.next(),
-            Self::Qwen35(generate) => generate.next(),
-            Self::Qwen3Next(generate) => generate.next(),
         }
     }
 }

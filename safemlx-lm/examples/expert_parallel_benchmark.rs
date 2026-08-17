@@ -253,7 +253,9 @@ fn forward_complete(
     stream: &Stream,
 ) -> anyhow::Result<Array> {
     let parts = [InputPart::text_token_ids(tokens)];
-    Ok(model.prefill_input_with_cache(ModelInput::new(&parts), cache, stream)?)
+    Ok(model
+        .submit_prefill(ModelInput::new(&parts), cache, stream)?
+        .wait()?)
 }
 
 fn benchmark_complete_model(

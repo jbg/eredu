@@ -96,6 +96,17 @@ pub struct Submission<T, C> {
     pub completion: C,
 }
 
+impl<T, C> Submission<T, C>
+where
+    C: Completion,
+{
+    /// Waits for this exact submission and returns its output.
+    pub fn wait(self) -> Result<T, C::Error> {
+        self.completion.wait()?;
+        Ok(self.output)
+    }
+}
+
 /// Marker wrapper proving that a model was prepared by a backend.
 #[derive(Debug)]
 pub struct PreparedModel<M> {
@@ -165,7 +176,7 @@ pub trait BackendSession<B: Backend> {
     /// Submits prompt prefill against this session.
     fn prefill(
         backend: &B,
-        model: &mut PreparedModel<B::Model>,
+        model: &mut B::Model,
         session: &mut B::Session,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
@@ -173,39 +184,10 @@ pub trait BackendSession<B: Backend> {
     /// Submits one or more cached decode positions against this session.
     fn decode(
         backend: &B,
-        model: &mut PreparedModel<B::Model>,
+        model: &mut B::Model,
         session: &mut B::Session,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
-}
-
-/// Borrowing executor used by an established model/session owner.
-///
-/// Facades can use this contract without moving a public model into an opaque
-/// container. It has the same whole-session selection rule as [`Backend`].
-pub trait SessionExecutor {
-    /// Backend-owned prefill input.
-    type PrefillInput;
-    /// Backend-owned decode input.
-    type DecodeInput;
-    /// Backend-owned output.
-    type Output;
-    /// Exact completion type.
-    type Completion: Completion<Error = Self::Error>;
-    /// Structured backend error.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Submits prompt prefill.
-    fn prefill(
-        &mut self,
-        input: Self::PrefillInput,
-    ) -> Result<Submission<Self::Output, Self::Completion>, Self::Error>;
-
-    /// Submits cached decode.
-    fn decode(
-        &mut self,
-        input: Self::DecodeInput,
-    ) -> Result<Submission<Self::Output, Self::Completion>, Self::Error>;
 }
 
 #[cfg(test)]
@@ -254,25 +236,25 @@ mod tests {
         type Completion = Done;
         fn prefill(
             _: &Mock,
-            model: &mut PreparedModel<u32>,
+            model: &mut u32,
             session: &mut Vec<u32>,
             input: Vec<u32>,
         ) -> Result<Submission<u32, Done>, Infallible> {
             session.extend(input);
             Ok(Submission {
-                output: session.len() as u32 + *model.get(),
+                output: session.len() as u32 + *model,
                 completion: Done,
             })
         }
         fn decode(
             _: &Mock,
-            model: &mut PreparedModel<u32>,
+            model: &mut u32,
             session: &mut Vec<u32>,
             input: u32,
         ) -> Result<Submission<u32, Done>, Infallible> {
             session.push(input);
             Ok(Submission {
-                output: session.len() as u32 + *model.get(),
+                output: session.len() as u32 + *model,
                 completion: Done,
             })
         }
@@ -281,8 +263,9 @@ mod tests {
     #[test]
     fn mock_prefill_and_multiple_decode_steps() {
         let backend = Mock;
-        let mut model = backend.prepare_model(10).unwrap();
-        let mut session = backend.create_session(&model).unwrap();
+        let prepared = backend.prepare_model(10).unwrap();
+        let mut session = backend.create_session(&prepared).unwrap();
+        let mut model = prepared.into_inner();
         let prefill = MockSession::prefill(&backend, &mut model, &mut session, vec![1, 2]).unwrap();
         assert_eq!(prefill.output, 12);
         assert!(prefill.completion.is_complete().unwrap());

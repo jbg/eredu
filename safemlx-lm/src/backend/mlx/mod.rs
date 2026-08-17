@@ -6,43 +6,44 @@ pub(crate) mod cache;
 pub mod consensus;
 /// MLX allocator observations for neutral residency telemetry.
 pub mod residency;
+/// Architecture-erased model/session execution.
+mod session;
+
+pub use session::{MlxGeneration, MlxModelInput, MlxModelSession};
 
 use std::path::PathBuf;
 
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
 use safemlx_lm_core::backend::{
     Backend, BackendCapabilities, BackendDescriptor, Completion, DeviceDescriptor, PreparedModel,
-    SessionExecutor, Submission,
+    Submission,
 };
 
 use crate::{
     api::{Model, ModelCache, ModelLoadOptions},
-    architectures::llama::layerwise::{LlamaCache, LlamaModel},
     error::Error,
 };
 
 /// Request to prepare any facade-supported model on MLX.
 #[derive(Debug, Clone)]
-pub struct MlxModelConfig {
+pub struct MlxModelConfig<'a> {
     /// Checkpoint directory or GGUF file.
     pub model_path: PathBuf,
     /// Shared architecture-neutral load options.
     pub options: ModelLoadOptions,
+    /// Stream used for checkpoint materialization and transfers.
+    pub weights_stream: &'a Stream,
 }
 
 /// MLX backend selected for a complete model/session.
 pub struct MlxBackend<'a> {
     stream: &'a Stream,
-    weights_stream: &'a Stream,
 }
 
 impl<'a> MlxBackend<'a> {
-    /// Uses the established execution and weight-materialization streams.
-    pub const fn new(stream: &'a Stream, weights_stream: &'a Stream) -> Self {
-        Self {
-            stream,
-            weights_stream,
-        }
+    /// Uses the selected session execution stream.
+    pub const fn new(stream: &'a Stream) -> Self {
+        Self { stream }
     }
     /// Execution stream used by this backend instance.
     pub const fn stream(&self) -> &'a Stream {
@@ -50,8 +51,8 @@ impl<'a> MlxBackend<'a> {
     }
 }
 
-impl Backend for MlxBackend<'_> {
-    type ModelConfig = MlxModelConfig;
+impl<'a> Backend for MlxBackend<'a> {
+    type ModelConfig = MlxModelConfig<'a>;
     type Model = Model;
     type Session = ModelCache;
     type Error = Error;
@@ -93,7 +94,7 @@ impl Backend for MlxBackend<'_> {
             config.model_path,
             config.options,
             self.stream,
-            self.weights_stream,
+            config.weights_stream,
         )
         .map(PreparedModel::new)
     }
@@ -122,70 +123,29 @@ impl Completion for MlxCompletion {
     }
 }
 
-impl MlxCompletion {
-    /// Number of arrays held until exact completion.
-    pub fn retained_resources(&self) -> usize {
-        self.retained.len()
-    }
-}
-
-/// Whole-session MLX Llama prefill/decode implementation.
-pub struct MlxLlamaExecutor<'a> {
-    model: &'a mut LlamaModel,
-    cache: &'a mut LlamaCache,
-    stream: &'a Stream,
-}
-
-impl<'a> MlxLlamaExecutor<'a> {
-    /// Borrows one model and its matching cache for the session operation.
-    pub const fn new(
-        model: &'a mut LlamaModel,
-        cache: &'a mut LlamaCache,
-        stream: &'a Stream,
-    ) -> Self {
-        Self {
-            model,
-            cache,
-            stream,
+impl Drop for MlxCompletion {
+    fn drop(&mut self) {
+        match self.event.is_complete() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                let _ = self.event.synchronize();
+            }
         }
     }
+}
 
-    fn submission(output: Array) -> Result<Submission<Array, MlxCompletion>, Error> {
+impl MlxCompletion {
+    fn submission(output: Array) -> Result<Submission<Array, Self>, Error> {
         let retained = vec![output.clone()];
         let event = async_eval_with_event(retained.iter())?;
         Ok(Submission {
             output,
-            completion: MlxCompletion { event, retained },
+            completion: Self { event, retained },
         })
     }
 
-    pub(crate) fn prefill_retained(&mut self, input: Array) -> Result<Array, Error> {
-        let submission = self.prefill(input)?;
-        self.model
-            .retain_backend_completion(submission.completion)?;
-        Ok(submission.output)
-    }
-
-    pub(crate) fn decode_retained(&mut self, input: Array) -> Result<Array, Error> {
-        let submission = self.decode(input)?;
-        self.model
-            .retain_backend_completion(submission.completion)?;
-        Ok(submission.output)
-    }
-}
-
-impl SessionExecutor for MlxLlamaExecutor<'_> {
-    type PrefillInput = Array;
-    type DecodeInput = Array;
-    type Output = Array;
-    type Completion = MlxCompletion;
-    type Error = Error;
-
-    fn prefill(&mut self, input: Array) -> Result<Submission<Array, MlxCompletion>, Error> {
-        Self::submission(self.model.prefill(&input, self.cache, self.stream)?)
-    }
-
-    fn decode(&mut self, input: Array) -> Result<Submission<Array, MlxCompletion>, Error> {
-        Self::submission(self.model.decode(&input, self.cache, self.stream)?)
+    /// Number of arrays held until exact completion.
+    pub fn retained_resources(&self) -> usize {
+        self.retained.len()
     }
 }

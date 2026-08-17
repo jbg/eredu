@@ -50,9 +50,9 @@ not accept `Any`, raw pointers, or operation names as an execution escape hatch.
 
 `Backend::prepare_model` selects one backend and produces an opaque
 `PreparedModel`. `Backend::create_session` creates backend-owned persistent
-decode/cache state. `BackendSession` then submits prefill and decode operations.
-The borrowing `SessionExecutor` form supports existing public model owners
-without forcing them into a new container.
+decode/cache state. `BackendSession` then submits prefill and decode operations
+against that model and state. There is one session contract: the facade does
+not provide an architecture-specific or borrowing execution escape hatch.
 
 Every submission returns an opaque output and an exact `Completion`. Completion
 can be polled or waited without draining unrelated work. A scheduler-owned
@@ -68,21 +68,28 @@ capabilities and therefore fail closed when absent.
 
 ## MLX mapping
 
-`safemlx-lm::backend::mlx::MlxBackend` maps model preparation to the existing
-architecture-neutral `api::load_model_with_options` dispatcher and session
-creation to `ModelCache`.
-`MlxLlamaExecutor` maps prefill/decode to the existing `LlamaModel` operations.
-It submits the returned MLX array with `async_eval_with_event`; `MlxCompletion`
-owns that exact `Event` and retains the output array. Native exceptions are
-converted at the facade boundary and never appear in core trait signatures.
+`safemlx-lm::backend::mlx::MlxBackend` maps model preparation to the central
+`api::load_model_with_options` dispatcher and session creation to `ModelCache`.
+`MlxModelSession` is the sole architecture-erased prefill/decode
+implementation. It dispatches matching `Model` and `ModelCache` variants to
+their MLX architecture implementation, then wraps the output with
+`async_eval_with_event`. `MlxCompletion` owns that exact `Event`, retains the
+output array, and synchronizes on early drop so resources cannot be released
+before exact completion. Native exceptions are converted at the facade
+boundary and never appear in core trait signatures.
 
-The public `api::load_model_with_options` route now calls
-`Backend::prepare_model` before format and architecture dispatch. The existing
-generic Llama generation iterator calls `MlxLlamaExecutor` for prompt prefill
-and every cached decode step. Thus general loading and real inference cross the
-new boundary; the contract is not a disconnected future-backend interface.
-There is no public Llama-specific loading wrapper: architecture dispatch is
-owned exclusively by the central loader.
+`MlxModelInput` owns cloned MLX array handles for every typed input part and its
+metadata. Backend submission therefore owns text, image, audio, video, and
+embedding inputs without placing MLX arrays or modality-specific tensor layouts
+in core.
+
+The public `api::load_model_with_options` route calls `Backend::prepare_model`
+before format and architecture dispatch. `MlxGeneration` is one
+architecture-erased iterator over `Model` and `ModelCache`; every supported
+text and multimodal model submits prompt prefill and every cached decode through
+`MlxModelSession`. The former per-architecture `ModelGenerate` enum, Llama-only
+executor, and borrowing session trait were deleted. There is no public
+architecture-specific loading or execution wrapper.
 
 ## Tensor and cache ownership
 
@@ -123,7 +130,7 @@ are recorded into the neutral telemetry schema.
 
 The current boundary leaves these components MLX-coupled:
 
-- non-Llama tensor execution, including multimodal and realtime model math;
+- architecture tensor execution, including multimodal and realtime model math;
 - MLX exact-completion objects, retained output arrays, and event-backend
   telemetry adapters;
 - concrete topology device assignment, communicator construction, collectives,
@@ -248,7 +255,8 @@ facade.
 8. Register every live cache with `CacheResidencyPool`, publish concrete
    occupancy, and retain each admission token through the exact native
    transfer or persistence transition that owns it.
-9. Run the core mock conformance tests plus backend-specific Llama load,
-   prefill, multi-step decode, cancellation, checkpoint, and parity tests.
+9. Run the core mock conformance tests plus backend-specific model load,
+   architecture-erased prefill, multi-step decode, cancellation, checkpoint,
+   and parity tests.
 10. Add backend selection at the facade/application boundary. Do not dispatch
    individual tensor operations between MLX and the new runtime.

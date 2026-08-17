@@ -4652,7 +4652,9 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
         let parts = [super::input::InputPart::text_token_ids(&tokens)];
         let mut cache = loaded.new_cache();
         let logits = loaded
-            .prefill_input_with_cache(super::input::ModelInput::new(&parts), &mut cache, stream)
+            .submit_prefill(super::input::ModelInput::new(&parts), &mut cache, stream)
+            .unwrap()
+            .wait()
             .unwrap();
         tokens_by_policy.push(
             argmax_axis!(&logits, -1, stream = stream)
@@ -4833,11 +4835,15 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
             let input = super::input::ModelInput::new(&parts);
             let mut dense_cache = dense.new_cache();
             let dense_logits = dense
-                .prefill_input_with_cache(input, &mut dense_cache, stream)
+                .submit_prefill(input, &mut dense_cache, stream)
+                .unwrap()
+                .wait()
                 .unwrap();
             let mut quantized_cache = quantized.new_cache();
             let quantized_logits = quantized
-                .prefill_input_with_cache(input, &mut quantized_cache, stream)
+                .submit_prefill(input, &mut quantized_cache, stream)
+                .unwrap()
+                .wait()
                 .unwrap();
             assert_eq!(dense_logits.shape(), quantized_logits.shape());
             let dense_token = argmax_axis!(&dense_logits, -1, stream = stream)
@@ -4849,7 +4855,9 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
             assert_eq!(dense_token, quantized_token, "{family} {quantization:?}");
             let mut saved_cache = saved_quantized.new_cache();
             let saved_logits = saved_quantized
-                .prefill_input_with_cache(input, &mut saved_cache, stream)
+                .submit_prefill(input, &mut saved_cache, stream)
+                .unwrap()
+                .wait()
                 .unwrap();
             let saved_token = argmax_axis!(&saved_logits, -1, stream = stream)
                 .unwrap()
@@ -4858,6 +4866,47 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 quantized_token, saved_token,
                 "saved {family} {quantization:?}"
             );
+
+            let decode_input = Array::from_slice(&[dense_token], &[1, 1]);
+            let dense_decode = dense
+                .submit_decode(decode_input.clone(), &mut dense_cache, stream)
+                .unwrap()
+                .wait()
+                .unwrap();
+            let quantized_decode = quantized
+                .submit_decode(decode_input.clone(), &mut quantized_cache, stream)
+                .unwrap()
+                .wait()
+                .unwrap();
+            let saved_decode = saved_quantized
+                .submit_decode(decode_input, &mut saved_cache, stream)
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(dense_decode.shape(), quantized_decode.shape());
+            assert_eq!(quantized_decode.shape(), saved_decode.shape());
+            assert_eq!(
+                argmax_axis!(&dense_decode, -1, stream = stream)
+                    .unwrap()
+                    .item::<u32>(stream),
+                argmax_axis!(&quantized_decode, -1, stream = stream)
+                    .unwrap()
+                    .item::<u32>(stream),
+                "decode {family} {quantization:?}"
+            );
+            if family == "llama" && matches!(quantization, WeightQuantization::Affine(_)) {
+                let mut generation_cache = dense.new_cache();
+                let mut generation = dense.generate_input_with_cache(
+                    &mut generation_cache,
+                    0.0,
+                    input,
+                    None,
+                    stream,
+                );
+                generation.next().unwrap().unwrap().item::<u32>(stream);
+                generation.next().unwrap().unwrap().item::<u32>(stream);
+                generation.next().unwrap().unwrap().item::<u32>(stream);
+            }
             fs::remove_dir_all(saved_dir).unwrap();
         }
         fs::remove_dir_all(dir).unwrap();
@@ -4965,7 +5014,9 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     ];
     let mut cache = quantized.new_cache();
     let logits = quantized
-        .prefill_input_with_cache(super::input::ModelInput::new(&parts), &mut cache, stream)
+        .submit_prefill(super::input::ModelInput::new(&parts), &mut cache, stream)
+        .unwrap()
+        .wait()
         .unwrap();
     assert_eq!(logits.shape(), &[1, 32]);
 
@@ -5086,11 +5137,15 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
     let input = super::input::ModelInput::new(&parts);
     let mut dense_cache = dense.new_cache();
     let dense_logits = dense
-        .prefill_input_with_cache(input, &mut dense_cache, stream)
+        .submit_prefill(input, &mut dense_cache, stream)
+        .unwrap()
+        .wait()
         .unwrap();
     let mut quantized_cache = quantized.new_cache();
     let quantized_logits = quantized
-        .prefill_input_with_cache(input, &mut quantized_cache, stream)
+        .submit_prefill(input, &mut quantized_cache, stream)
+        .unwrap()
+        .wait()
         .unwrap();
     assert_eq!(dense_logits.shape(), quantized_logits.shape());
     assert_eq!(
