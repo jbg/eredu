@@ -84,4 +84,16 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::PromptCacheTopology>(),
         TypeId::of::<safemlx_lm::core::cache::PromptCacheTopology>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CacheBlockLifecycle>(),
+        TypeId::of::<safemlx_lm::core::cache::CacheBlockLifecycle>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::MutableCacheTail>(),
+        TypeId::of::<safemlx_lm::core::cache::MutableCacheTail>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CacheLifecycleError>(),
+        TypeId::of::<safemlx_lm::core::cache::CacheLifecycleError>(),
+    );
 }

@@ -1,14 +1,17 @@
-//! Backend-neutral aggregate ownership and admission for live model caches.
+//! Backend-neutral ownership and admission for live model caches.
 //!
 //! A cache backend owns concrete tensors, transfer objects, and persistent
-//! files. This module owns the process-wide accounting boundary shared by
-//! independently managed cache sessions. Reservations are RAII tokens: an
-//! admitted resource remains charged until its exact backend transition either
-//! publishes the bytes into a registered manager or drops the reservation.
+//! files. This module owns both each session's block/lease/tail lifecycle and
+//! the process-wide accounting boundary shared by independently managed cache
+//! sessions. Reservations are RAII tokens: an admitted resource remains charged
+//! until its exact backend transition either publishes the bytes into a
+//! registered manager or drops the reservation.
 
+mod lifecycle;
 mod policy;
 mod prompt;
 
+pub use lifecycle::{CacheBlockLifecycle, CacheLifecycleError, MutableCacheTail};
 pub use policy::{
     CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
     LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateResidencyClass,

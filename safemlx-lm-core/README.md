@@ -36,6 +36,12 @@ canonical definition in this crate. Constructors and deserialized policies use
 the same validation. A backend maps these contracts to its arrays and storage;
 it cannot redefine cache geometry or fixed-state ownership.
 
+`CacheBlockLifecycle` is the canonical live-block ownership catalog. It owns
+registration, exact lease counts, access clocks, protected-prefix state,
+deterministic LRU/LFU selection, transactional truncation replacement, and
+mutable-tail frontiers. Backend storage records contain none of that state;
+they retain only concrete resources and their native transfer phases.
+
 Reusable prompt-cache identity and catalogs are also canonical here. Core owns
 model and prefix identity, rank-local topology, the versioned manifest,
 architecture and token fingerprints, block/state descriptors, compatibility,

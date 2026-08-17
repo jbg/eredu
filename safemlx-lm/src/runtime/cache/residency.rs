@@ -32,12 +32,12 @@ use sha2::{Digest, Sha256};
 use crate::{
     core::cache::{
         prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, CacheBlockId,
-        CachePolicyError, CachePoolError, CachePoolLimits, CachePoolMembership,
-        CachePoolReservation, CachePoolResource, CachePoolUsage, CacheRankIdentity,
-        CacheRepresentation, CacheResidencyPool, CacheTier, PromptCacheBlock,
-        PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheStateTensor, StateTensorOwner, StateTensorRole,
-        PROMPT_CACHE_SCHEMA_VERSION,
+        CacheBlockLifecycle, CacheLifecycleError, CachePolicyError, CachePoolError,
+        CachePoolLimits, CachePoolMembership, CachePoolReservation, CachePoolResource,
+        CachePoolUsage, CacheRankIdentity, CacheRepresentation, CacheResidencyPool, CacheTier,
+        MutableCacheTail, PromptCacheBlock, PromptCacheDescriptor, PromptCacheError,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor,
+        StateTensorOwner, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
     },
     core::residency::CacheEvictionPolicy,
 };
@@ -978,11 +978,11 @@ impl DiskWriteCommit {
             Ok(DiskResult::Write(location)) if !stale => {
                 let mut transitioned_to_disk = false;
                 let mut bytes = 0;
+                debug_assert_eq!(state.lifecycle.lease_count(&self.key.id).ok(), Some(0));
                 if let Some(record) = state.blocks.get_mut(&self.key.id) {
                     if record.physical.pending_matches(&self.key) {
                         bytes = record.bytes;
                         if matches!(record.physical, CacheBlockPhysicalState::Host { .. }) {
-                            debug_assert_eq!(record.leases, 0);
                             record.physical = CacheBlockPhysicalState::Disk {
                                 location: location.clone(),
                                 read: DiskCacheReadState::Ready,
@@ -1562,10 +1562,6 @@ struct CacheBlockRecord {
     shapes: [Vec<i32>; 2],
     dtypes: [String; 2],
     imported: bool,
-    leases: usize,
-    access_count: u64,
-    last_access: u64,
-    protected_prefix: bool,
 }
 
 impl CacheBlockRecord {
@@ -1885,9 +1881,8 @@ struct CacheManagerState {
     pool_manager_id: u64,
     generation: u64,
     background_disk_error: Option<String>,
-    access_clock: u64,
+    lifecycle: CacheBlockLifecycle,
     blocks: BTreeMap<CacheBlockId, CacheBlockRecord>,
-    tails: HashMap<usize, (u64, i64)>,
     host_write_reservations: HashMap<DiskOperationKey, HostWriteReservation>,
     retiring_host_demotions: HashMap<u64, RetiringHostDemotion>,
     retiring_disk_reads: HashMap<DiskOperationKey, (usize, u64)>,
@@ -1984,9 +1979,8 @@ impl CacheResidencyManager {
                     pool_manager_id: session_id,
                     generation: 0,
                     background_disk_error: None,
-                    access_clock: 0,
+                    lifecycle: CacheBlockLifecycle::new(),
                     blocks: BTreeMap::new(),
-                    tails: HashMap::new(),
                     host_write_reservations: HashMap::new(),
                     retiring_host_demotions: HashMap::new(),
                     retiring_disk_reads: HashMap::new(),
@@ -2051,22 +2045,17 @@ impl CacheResidencyManager {
         end: i64,
     ) -> Result<(), CacheResidencyError> {
         let mut state = self.lock()?;
-        let previous = state.tails.insert(layer, (bytes, end));
-        let allocated = previous.is_none_or(|tail| tail.0 == 0) && bytes > 0;
+        let previous = state
+            .lifecycle
+            .set_tail(layer, MutableCacheTail { bytes, end });
+        let allocated = previous.is_none_or(|tail| tail.bytes == 0) && bytes > 0;
         if allocated {
             state.counters.report.tail_allocations += 1;
         }
         drop(state);
         if let Err(error) = self.rebalance(None, false) {
             let mut state = self.lock()?;
-            match previous {
-                Some(previous) => {
-                    state.tails.insert(layer, previous);
-                }
-                None => {
-                    state.tails.remove(&layer);
-                }
-            }
+            state.lifecycle.restore_tail(layer, previous);
             if allocated {
                 state.counters.report.tail_allocations =
                     state.counters.report.tail_allocations.saturating_sub(1);
@@ -2102,9 +2091,8 @@ impl CacheResidencyManager {
         };
         let mut state = self.lock()?;
         if state.blocks.contains_key(&id) {
-            return Err(CacheResidencyError::DuplicateBlock(id));
+            return Err(CacheLifecycleError::DuplicateBlock(id).into());
         }
-        state.access_clock += 1;
         let bytes = arrays.bytes();
         let record = CacheBlockRecord {
             id: id.clone(),
@@ -2113,16 +2101,17 @@ impl CacheResidencyManager {
             physical: CacheBlockPhysicalState::Device { arrays, disk: None },
             bytes,
             imported: false,
-            leases: 0,
-            access_count: 0,
-            last_access: state.access_clock,
-            protected_prefix,
         };
+        state
+            .lifecycle
+            .insert(id.clone(), protected_prefix)
+            .map_err(CacheResidencyError::from)?;
         state.blocks.insert(id.clone(), record);
         drop(state);
         if let Err(error) = self.rebalance(Some(&id), false) {
             let mut state = self.lock()?;
             if let Some(record) = state.blocks.remove(&id) {
+                state.lifecycle.remove(&id)?;
                 cancel_record_operation(&record, &mut state.counters.report);
                 remove_ephemeral_file(&record);
             }
@@ -2173,13 +2162,10 @@ impl CacheResidencyManager {
 
     pub(crate) fn remove_block(&self, id: &CacheBlockId) -> Result<(), CacheResidencyError> {
         let mut state = self.lock()?;
-        let record = state
-            .blocks
-            .get(id)
-            .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
-        if record.leases != 0 {
-            return Err(CacheResidencyError::BlockLeased(id.clone()));
+        if !state.blocks.contains_key(id) {
+            return Err(CacheLifecycleError::MissingBlock(id.clone()).into());
         }
+        state.lifecycle.remove(id)?;
         let tickets = advance_generation_locked(&mut state);
         let record = state
             .blocks
@@ -2197,13 +2183,14 @@ impl CacheResidencyManager {
         global_layer: usize,
         representation: CacheRepresentation,
         end: i64,
-        replacement: Option<(CacheBlockId, CacheBlockArrays)>,
+        replacement: Option<(CacheBlockLease, CacheBlockArrays)>,
         protected_prefix_tokens: i64,
     ) -> Result<(), CacheResidencyError> {
         if end < 0 {
             return Err(CacheResidencyError::InvalidTokenRange { start: 0, end });
         }
-        if let Some((old_id, arrays)) = &replacement {
+        if let Some((lease, arrays)) = &replacement {
+            let old_id = lease.id();
             if old_id.global_layer != global_layer
                 || old_id.representation != representation
                 || old_id.start >= end
@@ -2237,7 +2224,7 @@ impl CacheResidencyManager {
             .collect::<Vec<_>>();
         let crossing = affected.iter().find(|id| id.start < end);
         match (crossing, replacement.as_ref()) {
-            (Some(crossing), Some((old_id, _))) if crossing == old_id => {}
+            (Some(crossing), Some((lease, _))) if crossing == lease.id() => {}
             (None, None) => {}
             _ => {
                 return Err(CacheResidencyError::ArrayMismatch(
@@ -2250,13 +2237,10 @@ impl CacheResidencyManager {
             let record = state
                 .blocks
                 .get(id)
-                .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
-            let owned_replacement_lease =
-                replacement.as_ref().is_some_and(|(old_id, _)| old_id == id);
-            let expected_leases = usize::from(owned_replacement_lease);
-            if record.leases != expected_leases {
-                return Err(CacheResidencyError::BlockLeased(id.clone()));
-            }
+                .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?;
+            let owned_replacement_lease = replacement
+                .as_ref()
+                .is_some_and(|(lease, _)| lease.id() == id);
             if owned_replacement_lease && record.tier() != CacheTier::Device {
                 return Err(CacheResidencyError::Runtime(
                     "truncated cache replacement lease is not device resident".into(),
@@ -2264,19 +2248,37 @@ impl CacheResidencyManager {
             }
         }
 
-        let replacement_id = replacement.as_ref().map(|(old_id, _)| CacheBlockId {
+        let replacement_id = replacement.as_ref().map(|(lease, _)| CacheBlockId {
             session_id: self.session_id,
             global_layer,
             representation,
-            start: old_id.start,
+            start: lease.id().start,
             end,
-            rank: old_id.rank,
+            rank: lease.id().rank,
         });
         if let Some(id) = &replacement_id {
             if state.blocks.contains_key(id) && !affected.contains(id) {
-                return Err(CacheResidencyError::DuplicateBlock(id.clone()));
+                return Err(CacheLifecycleError::DuplicateBlock(id.clone()).into());
             }
         }
+
+        let removals = affected
+            .iter()
+            .map(|id| {
+                let owned_replacement_lease = replacement
+                    .as_ref()
+                    .is_some_and(|(lease, _)| lease.id() == id);
+                (id.clone(), usize::from(owned_replacement_lease))
+            })
+            .collect::<Vec<_>>();
+        state.lifecycle.replace(
+            &removals,
+            replacement_id
+                .clone()
+                .map(|id| (id, end <= protected_prefix_tokens)),
+            global_layer,
+            MutableCacheTail { bytes: 0, end },
+        )?;
 
         let tickets = advance_generation_locked(&mut state);
         let mut removed = Vec::with_capacity(affected.len());
@@ -2285,9 +2287,9 @@ impl CacheResidencyManager {
                 removed.push(record);
             }
         }
-        state.tails.insert(global_layer, (0, end));
-        if let Some((old_id, arrays)) = replacement {
-            state.access_clock += 1;
+        if let Some((mut lease, arrays)) = replacement {
+            let old_id = lease.id().clone();
+            lease.released = true;
             let id = replacement_id.expect("validated replacement id is available");
             debug_assert_eq!(id.start, old_id.start);
             let record = CacheBlockRecord {
@@ -2297,10 +2299,6 @@ impl CacheResidencyManager {
                 bytes: arrays.bytes(),
                 physical: CacheBlockPhysicalState::Device { arrays, disk: None },
                 imported: false,
-                leases: 0,
-                access_count: 0,
-                last_access: state.access_clock,
-                protected_prefix: end <= protected_prefix_tokens,
             };
             let previous = state.blocks.insert(id, record);
             debug_assert!(previous.is_none());
@@ -2350,7 +2348,7 @@ impl CacheResidencyManager {
             let physical = state
                 .blocks
                 .get(id)
-                .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
+                .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?
                 .physical
                 .clone();
 
@@ -2373,7 +2371,7 @@ impl CacheResidencyManager {
                                 let record = state
                                     .blocks
                                     .get(id)
-                                    .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+                                    .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?;
                                 let bytes = record.bytes;
                                 let reserved_host_bytes = host_cache_layout_capacity_upper_bound(
                                     &record.shapes,
@@ -2425,7 +2423,7 @@ impl CacheResidencyManager {
                                 let record = state
                                     .blocks
                                     .get_mut(id)
-                                    .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+                                    .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?;
                                 record.physical = CacheBlockPhysicalState::Disk {
                                     location: location.clone(),
                                     read: DiskCacheReadState::Reading {
@@ -2476,7 +2474,7 @@ impl CacheResidencyManager {
                             let record = state
                                 .blocks
                                 .get_mut(id)
-                                .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+                                .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?;
                             if shapes != record.shapes
                                 || dtypes != record.dtypes
                                 || bytes != record.bytes
@@ -2553,20 +2551,16 @@ impl CacheResidencyManager {
                     if state.generation != generation {
                         return Err(CacheResidencyError::DiskOperationCancelled { generation });
                     }
-                    state.access_clock += 1;
-                    let access_clock = state.access_clock;
+                    state.lifecycle.acquire(id)?;
                     let bytes = {
                         let record = state
                             .blocks
                             .get_mut(id)
-                            .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+                            .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?;
                         record.physical = CacheBlockPhysicalState::Device {
                             arrays: device_arrays.clone(),
                             disk: disk.clone(),
                         };
-                        record.leases += 1;
-                        record.access_count += 1;
-                        record.last_access = access_clock;
                         record.bytes
                     };
                     state.counters.report.demand_misses += 1;
@@ -2591,8 +2585,8 @@ impl CacheResidencyManager {
                     if let Err(error) = self.rebalance(Some(id), true) {
                         let mut state = self.lock()?;
                         if state.generation == generation {
+                            state.lifecycle.release(id)?;
                             if let Some(record) = state.blocks.get_mut(id) {
-                                record.leases = record.leases.saturating_sub(1);
                                 record.physical = CacheBlockPhysicalState::Host {
                                     block,
                                     persistence: match disk {
@@ -2615,23 +2609,13 @@ impl CacheResidencyManager {
                     });
                 }
                 CacheBlockPhysicalState::Device { arrays, .. } => {
-                    state.access_clock += 1;
-                    let access_clock = state.access_clock;
-                    let record = state
-                        .blocks
-                        .get_mut(id)
-                        .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
-                    record.leases += 1;
-                    record.access_count += 1;
-                    record.last_access = access_clock;
+                    state.lifecycle.acquire(id)?;
                     drop(state);
                     let completion = match async_eval_with_event(arrays.arrays()) {
                         Ok(completion) => completion,
                         Err(source) => {
                             if let Ok(mut state) = self.lock() {
-                                if let Some(record) = state.blocks.get_mut(id) {
-                                    record.leases = record.leases.saturating_sub(1);
-                                }
+                                let _ = state.lifecycle.release(id);
                                 update_report_totals(&mut state);
                             }
                             return Err(transfer_error(
@@ -2642,9 +2626,7 @@ impl CacheResidencyManager {
                     };
                     let mut state = self.lock()?;
                     if state.generation != generation {
-                        if let Some(record) = state.blocks.get_mut(id) {
-                            record.leases = record.leases.saturating_sub(1);
-                        }
+                        state.lifecycle.release(id)?;
                         return Err(CacheResidencyError::DiskOperationCancelled { generation });
                     }
                     state.counters.report.demand_hits += 1;
@@ -2656,9 +2638,7 @@ impl CacheResidencyManager {
                     drop(state);
                     if let Err(error) = self.rebalance(Some(id), true) {
                         if let Ok(mut state) = self.lock() {
-                            if let Some(record) = state.blocks.get_mut(id) {
-                                record.leases = record.leases.saturating_sub(1);
-                            }
+                            let _ = state.lifecycle.release(id);
                             update_report_totals(&mut state);
                         }
                         return Err(error);
@@ -2695,7 +2675,7 @@ impl CacheResidencyManager {
                     && id.representation == representation
                     && id.end <= visible_start
                     && id.end > prefix_tokens
-                    && record.leases == 0
+                    && state.lifecycle.lease_count(id).ok() == Some(0)
                     && !record.imported
             })
             .map(|(id, _)| id.clone())
@@ -2707,6 +2687,7 @@ impl CacheResidencyManager {
         };
         for id in ids {
             if let Some(record) = state.blocks.remove(&id) {
+                state.lifecycle.remove(&id)?;
                 remove_ephemeral_file(&record);
                 state.counters.report.discarded_sliding_blocks += 1;
             }
@@ -2720,20 +2701,12 @@ impl CacheResidencyManager {
     /// Clears every live block and advances the manager generation.
     pub fn clear(&self) -> Result<(), CacheResidencyError> {
         let mut state = self.lock()?;
-        if let Some(id) = state
-            .blocks
-            .values()
-            .find(|record| record.leases != 0)
-            .map(|record| record.id.clone())
-        {
-            return Err(CacheResidencyError::BlockLeased(id));
-        }
+        state.lifecycle.clear()?;
         let tickets = advance_generation_locked(&mut state);
         for record in state.blocks.values() {
             remove_ephemeral_file(record);
         }
         state.blocks.clear();
-        state.tails.clear();
         update_report_totals(&mut state);
         drop(state);
         self.retire_tickets(&tickets)?;
@@ -2827,10 +2800,12 @@ impl CacheResidencyManager {
     fn release_lease(&self, id: &CacheBlockId) {
         let mut background_failed = false;
         if let Ok(mut state) = self.inner.state.lock() {
-            if let Some(record) = state.blocks.get_mut(id) {
-                record.leases = record.leases.saturating_sub(1);
-            }
-            background_failed = state.background_disk_error.is_some();
+            let released = state.lifecycle.release(id);
+            debug_assert!(
+                released.is_ok(),
+                "cache lease release lost ownership: {released:?}"
+            );
+            background_failed = released.is_err() || state.background_disk_error.is_some();
         }
         if !background_failed {
             let _ = self.rebalance(None, false);
@@ -2845,7 +2820,9 @@ impl CacheResidencyManager {
         let Some(record) = state.blocks.get(id) else {
             return Ok(HostDemotionProgress::Retry);
         };
-        if record.tier() != CacheTier::Host || record.leases != 0 || record.pending_disk().is_some()
+        if record.tier() != CacheTier::Host
+            || state.lifecycle.is_leased(id)?
+            || record.pending_disk().is_some()
         {
             return Ok(HostDemotionProgress::Retry);
         }
@@ -3031,9 +3008,9 @@ impl CacheResidencyManager {
         let record = state
             .blocks
             .get(id)
-            .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
-        if record.leases != 0 {
-            return Err(CacheResidencyError::BlockLeased(id.clone()));
+            .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?;
+        if state.lifecycle.is_leased(id)? {
+            return Err(CacheLifecycleError::BlockLeased(id.clone()).into());
         }
         let arrays = match &record.physical {
             CacheBlockPhysicalState::Device { arrays, disk: None } => arrays.clone(),
@@ -3486,13 +3463,8 @@ impl CacheResidencyManager {
         let result = (|| {
             let records = {
                 let state = self.lock()?;
-                if let Some(id) = state
-                    .blocks
-                    .values()
-                    .find(|record| record.leases != 0)
-                    .map(|record| record.id.clone())
-                {
-                    return Err(CacheResidencyError::BlockLeased(id));
+                if let Some(id) = state.lifecycle.first_leased() {
+                    return Err(CacheLifecycleError::BlockLeased(id.clone()).into());
                 }
                 state.blocks.values().cloned().collect::<Vec<_>>()
             };
@@ -3730,7 +3702,7 @@ impl CacheBlockPrefetch {
         let next_bytes = state
             .blocks
             .get(id)
-            .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
+            .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?
             .bytes;
         Ok(pending_bytes.saturating_add(next_bytes) <= self.manager.options().device_budget_bytes)
     }
@@ -3901,13 +3873,12 @@ pub(crate) fn open_prompt_cache(
                 shapes: [block.first_shape.clone(), block.second_shape.clone()],
                 dtypes: [block.first_dtype.clone(), block.second_dtype.clone()],
                 imported: true,
-                leases: 0,
-                access_count: 0,
-                last_access: 0,
-                protected_prefix: block.end <= manifest.sink_tokens as i64,
             };
+            state
+                .lifecycle
+                .insert(id.clone(), block.end <= manifest.sink_tokens as i64)?;
             if state.blocks.insert(id.clone(), record).is_some() {
-                return Err(CacheResidencyError::DuplicateBlock(id));
+                return Err(CacheLifecycleError::DuplicateBlock(id).into());
             }
         }
         state.counters.report.prompt_cache_loads += 1;
@@ -4329,7 +4300,8 @@ fn update_report_totals(state: &mut CacheManagerState) {
     report.device_blocks = 0;
     report.host_blocks = 0;
     report.disk_blocks = 0;
-    report.current_device_bytes = state.tails.values().map(|tail| tail.0).sum();
+    let tails = state.lifecycle.tails().collect::<Vec<_>>();
+    report.current_device_bytes = tails.iter().map(|(_, tail)| tail.bytes).sum();
     report.mutable_tail_bytes = report.current_device_bytes;
     report.current_host_bytes = 0;
     report.current_disk_bytes = 0;
@@ -4345,12 +4317,12 @@ fn update_report_totals(state: &mut CacheManagerState) {
     report.per_layer_overflow = CacheLayerResidencyStats::default();
     let mut per_layer = BTreeMap::<usize, CacheLayerResidencyStats>::new();
     let mut layer_ends: HashMap<usize, i64> = HashMap::new();
-    for (layer, (bytes, end)) in &state.tails {
-        layer_ends.insert(*layer, *end);
-        let layer_report = per_layer.entry(*layer).or_default();
-        layer_report.current_device_bytes += *bytes;
-        layer_report.mutable_tail_bytes += *bytes;
-        layer_report.logical_cached_tokens = (*end).max(0) as u64;
+    for (layer, tail) in tails {
+        layer_ends.insert(layer, tail.end);
+        let layer_report = per_layer.entry(layer).or_default();
+        layer_report.current_device_bytes += tail.bytes;
+        layer_report.mutable_tail_bytes += tail.bytes;
+        layer_report.logical_cached_tokens = tail.end.max(0) as u64;
     }
     for record in state.blocks.values() {
         let layer_report = per_layer.entry(record.id.global_layer).or_default();
@@ -4428,7 +4400,11 @@ fn update_report_totals(state: &mut CacheManagerState) {
                 }
             }
         }
-        if record.protected_prefix {
+        if state
+            .lifecycle
+            .is_protected_prefix(&record.id)
+            .expect("storage block has lifecycle state")
+        {
             report.protected_prefix_blocks += 1;
             layer_report.protected_prefix_blocks += 1;
         }
@@ -4498,24 +4474,19 @@ fn update_report_totals(state: &mut CacheManagerState) {
                 .current_host_bytes += reserved_host_bytes;
         }
     }
-    let mut device_starts = HashMap::<usize, Vec<i64>>::new();
-    for record in state
+    let device_ids = state
         .blocks
         .values()
-        .filter(|record| record.tier() == CacheTier::Device && !record.protected_prefix)
-    {
-        device_starts
-            .entry(record.id.global_layer)
-            .or_default()
-            .push(record.id.start);
-    }
-    report.protected_recent_blocks = device_starts
-        .values()
-        .map(|starts| starts.len().min(state.recent_device_blocks) as u64)
-        .sum();
-    for (layer, starts) in &device_starts {
-        per_layer.entry(*layer).or_default().protected_recent_blocks =
-            starts.len().min(state.recent_device_blocks) as u64;
+        .filter(|record| record.tier() == CacheTier::Device)
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let recent = state
+        .lifecycle
+        .recent_protection_counts(device_ids, state.recent_device_blocks)
+        .expect("storage blocks have lifecycle state");
+    report.protected_recent_blocks = recent.values().sum();
+    for (layer, count) in recent {
+        per_layer.entry(layer).or_default().protected_recent_blocks = count;
     }
     report.logical_cached_tokens = layer_ends.values().copied().max().unwrap_or(0).max(0) as u64;
     // Historical counters keep the first observed layer identities stable.
@@ -4583,45 +4554,18 @@ fn eviction_candidate(
     recent_per_layer: usize,
     policy: CacheEvictionPolicy,
 ) -> Option<CacheBlockId> {
-    let mut recent = HashMap::<usize, Vec<i64>>::new();
-    if tier == CacheTier::Device && recent_per_layer > 0 {
-        for record in state
-            .blocks
-            .values()
-            .filter(|record| matches!(record.physical, CacheBlockPhysicalState::Device { .. }))
-        {
-            recent
-                .entry(record.id.global_layer)
-                .or_default()
-                .push(record.id.start);
-        }
-        for starts in recent.values_mut() {
-            starts.sort_unstable_by(|a, b| b.cmp(a));
-            starts.truncate(recent_per_layer);
-        }
-    }
-    state
+    let candidates = state
         .blocks
         .values()
         .filter(|record| {
             physical_state_is_tier_candidate(&record.physical, tier)
-                && record.leases == 0
                 && record.pending_disk().is_none()
-                && required != Some(&record.id)
-                && !record.protected_prefix
-                && !recent
-                    .get(&record.id.global_layer)
-                    .is_some_and(|starts| starts.contains(&record.id.start))
         })
-        .min_by_key(|record| match policy {
-            CacheEvictionPolicy::LeastRecentlyUsed => {
-                (record.last_access, record.access_count, record.id.clone())
-            }
-            CacheEvictionPolicy::LeastFrequentlyUsed => {
-                (record.access_count, record.last_access, record.id.clone())
-            }
-        })
-        .map(|record| record.id.clone())
+        .map(|record| record.id.clone());
+    state
+        .lifecycle
+        .eviction_candidate(candidates, required, recent_per_layer, policy)
+        .expect("storage blocks have lifecycle state")
 }
 
 fn physical_state_is_tier_candidate(physical: &CacheBlockPhysicalState, tier: CacheTier) -> bool {
@@ -5434,6 +5378,9 @@ pub enum CacheResidencyError {
     /// Backend-neutral aggregate cache ownership or admission failed.
     #[error(transparent)]
     Pool(#[from] CachePoolError),
+    /// Backend-neutral block, lease, access, or mutable-tail lifecycle failed.
+    #[error(transparent)]
+    Lifecycle(#[from] CacheLifecycleError),
     /// Backend-neutral prompt-cache identity or catalog validation failed.
     #[error(transparent)]
     PromptCache(#[from] PromptCacheError),
@@ -5451,21 +5398,12 @@ pub enum CacheResidencyError {
     /// Both arrays in a block did not describe the same token range.
     #[error("invalid cache block arrays: {0}")]
     ArrayMismatch(String),
-    /// A stable block identity was published more than once.
-    #[error("duplicate cache block {0:?}")]
-    DuplicateBlock(CacheBlockId),
-    /// A requested block was not cataloged.
-    #[error("missing cache block {0:?}")]
-    MissingBlock(CacheBlockId),
     /// A disk-backed block had no safe location.
     #[error("cache block has no disk location: {0:?}")]
     MissingDiskLocation(CacheBlockId),
     /// A host or device block had no evaluated arrays.
     #[error("cache block has no resident arrays: {0:?}")]
     MissingResidentArrays(CacheBlockId),
-    /// Active attention prevented mutation or eviction.
-    #[error("cache block is leased by active attention: {0:?}")]
-    BlockLeased(CacheBlockId),
     /// A finite tier budget could not admit required state.
     #[error("{tier:?} cache budget exceeded: requires {required} bytes, budget is {budget}")]
     BudgetExceeded {
@@ -5544,21 +5482,22 @@ mod tests {
         inspect_prompt_cache, live_block_paths, map_prompt_cache_shard, open_prompt_cache,
         publish_live_block_file, publish_prompt_cache_generation, safe_shard_path,
         verify_disk_payload, CacheBlockArrays, CacheBlockId, CacheBlockPhysicalState,
-        CacheBlockRecord, CacheLayerResidencyStats, CachePoolError, CachePoolLimits,
-        CachePoolResource, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
-        CacheResidencyManager, CacheResidencyPool, CacheTier, DiskCacheReadState, DiskLocation,
-        DiskOperationKey, DiskOperationKind, DiskResult, DiskTask, DiskWorker, DiskWriteCommit,
-        HostCacheBlock, HostCachePersistence, HostDemotionCompletion, HostDemotionTicket,
-        HostWriteReservation, PagedCacheOptions, PendingDiskOperation, StateTensorOwner,
-        StateTensorRole, TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
-        MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_GENERATIONS_DIRECTORY,
+        CacheBlockRecord, CacheLayerResidencyStats, CacheManagerState, CachePoolError,
+        CachePoolLimits, CachePoolResource, CacheRankIdentity, CacheRepresentation,
+        CacheResidencyError, CacheResidencyManager, CacheResidencyPool, CacheTier,
+        DiskCacheReadState, DiskLocation, DiskOperationKey, DiskOperationKind, DiskResult,
+        DiskTask, DiskWorker, DiskWriteCommit, HostCacheBlock, HostCachePersistence,
+        HostDemotionCompletion, HostDemotionTicket, HostWriteReservation, PagedCacheOptions,
+        PendingDiskOperation, StateTensorOwner, StateTensorRole, TemporaryFileGuard,
+        CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
+        PROMPT_CACHE_GENERATIONS_DIRECTORY,
     };
     use crate::core::cache::{
         prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, LayerCachePolicy,
-        MutableStateResidency, PromptCacheBlock, PromptCacheDescriptor, PromptCacheError,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor,
-        PromptCacheTopology, StateResidencyClass, StateTensorDimension, StateTensorDtype,
-        StateTensorPolicy, PROMPT_CACHE_SCHEMA_VERSION,
+        MutableCacheTail, MutableStateResidency, PromptCacheBlock, PromptCacheDescriptor,
+        PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass, StateTensorDimension,
+        StateTensorDtype, StateTensorPolicy, PROMPT_CACHE_SCHEMA_VERSION,
     };
     use crate::core::{AttentionPolicy, LayerSchedule};
     use safemlx::{
@@ -5611,6 +5550,23 @@ mod tests {
         HostCacheBlock::from_device_arrays(&test_device_block(), &super::cpu_stream()).unwrap()
     }
 
+    fn insert_test_record(
+        state: &mut CacheManagerState,
+        record: CacheBlockRecord,
+        protected_prefix: bool,
+        leases: usize,
+    ) {
+        let id = record.id.clone();
+        state
+            .lifecycle
+            .insert(id.clone(), protected_prefix)
+            .unwrap();
+        for _ in 0..leases {
+            state.lifecycle.acquire(&id).unwrap();
+        }
+        assert!(state.blocks.insert(id, record).is_none());
+    }
+
     fn manager_with_leased_block() -> CacheResidencyManager {
         let manager = CacheResidencyManager::new(
             PagedCacheOptions::new(1, 64, 64, 1)
@@ -5626,8 +5582,8 @@ mod tests {
             end: 1,
             rank: None,
         };
-        manager.lock().unwrap().blocks.insert(
-            id.clone(),
+        insert_test_record(
+            &mut manager.lock().unwrap(),
             CacheBlockRecord {
                 id,
                 physical: CacheBlockPhysicalState::Host {
@@ -5638,11 +5594,9 @@ mod tests {
                 shapes: [vec![1, 1, 1, 1], vec![1, 1, 1, 1]],
                 dtypes: ["Float32".into(), "Float32".into()],
                 imported: false,
-                leases: 1,
-                access_count: 0,
-                last_access: 0,
-                protected_prefix: false,
             },
+            false,
+            1,
         );
         manager
     }
@@ -6867,8 +6821,8 @@ mod tests {
         };
         let submission = worker.prepare(key.clone(), DiskTask::Panic).unwrap();
         let ticket = submission.ticket.clone();
-        manager.lock().unwrap().blocks.insert(
-            id.clone(),
+        insert_test_record(
+            &mut manager.lock().unwrap(),
             CacheBlockRecord {
                 id,
                 physical: CacheBlockPhysicalState::Host {
@@ -6881,11 +6835,9 @@ mod tests {
                 shapes: [vec![1], vec![1]],
                 dtypes: ["Float32".into(), "Float32".into()],
                 imported: false,
-                leases: 0,
-                access_count: 0,
-                last_access: 0,
-                protected_prefix: false,
             },
+            false,
+            0,
         );
         DiskWriteCommit {
             state: Arc::downgrade(&manager.inner.state),
@@ -6963,8 +6915,8 @@ mod tests {
                     ticket: ticket.clone(),
                 },
             );
-            state.blocks.insert(
-                id.clone(),
+            insert_test_record(
+                &mut state,
                 CacheBlockRecord {
                     id: id.clone(),
                     physical: CacheBlockPhysicalState::Host {
@@ -6977,11 +6929,9 @@ mod tests {
                     shapes: [vec![1], vec![1]],
                     dtypes: ["Float32".into(), "Float32".into()],
                     imported: false,
-                    leases: 0,
-                    access_count: 0,
-                    last_access: 0,
-                    protected_prefix: false,
                 },
+                false,
+                0,
             );
         }
 
@@ -7058,10 +7008,10 @@ mod tests {
                 ),
                 (recent.clone(), None),
             ] {
-                state.blocks.insert(
-                    id.clone(),
+                insert_test_record(
+                    &mut state,
                     CacheBlockRecord {
-                        id,
+                        id: id.clone(),
                         physical: CacheBlockPhysicalState::Device {
                             arrays: test_device_block(),
                             disk,
@@ -7070,11 +7020,9 @@ mod tests {
                         shapes: [vec![1], vec![1]],
                         dtypes: ["Float32".into(), "Float32".into()],
                         imported: false,
-                        leases: 0,
-                        access_count: 0,
-                        last_access: 0,
-                        protected_prefix: false,
                     },
+                    false,
+                    0,
                 );
             }
         }
@@ -7132,8 +7080,8 @@ mod tests {
                     end: global_layer as i64 + 1,
                     rank: None,
                 };
-                state.blocks.insert(
-                    id.clone(),
+                insert_test_record(
+                    &mut state,
                     CacheBlockRecord {
                         id,
                         physical,
@@ -7141,15 +7089,17 @@ mod tests {
                         shapes: [vec![1], vec![1]],
                         dtypes: ["Float32".into(), "Float32".into()],
                         imported: false,
-                        leases: 0,
-                        access_count: 0,
-                        last_access: 0,
-                        protected_prefix: global_layer % 5 == 0,
+                    },
+                    global_layer % 5 == 0,
+                    0,
+                );
+                state.lifecycle.set_tail(
+                    global_layer,
+                    MutableCacheTail {
+                        bytes: 2,
+                        end: global_layer as i64 + 1,
                     },
                 );
-                state
-                    .tails
-                    .insert(global_layer, (2, global_layer as i64 + 1));
             }
         }
 
@@ -7827,8 +7777,8 @@ mod tests {
             reserved_host_bytes: 8,
             completion,
         };
-        manager.lock().unwrap().blocks.insert(
-            id.clone(),
+        insert_test_record(
+            &mut manager.lock().unwrap(),
             CacheBlockRecord {
                 id: id.clone(),
                 physical: CacheBlockPhysicalState::Demoting {
@@ -7839,11 +7789,9 @@ mod tests {
                 shapes: [vec![1], vec![1]],
                 dtypes: ["Float32".into(), "Float32".into()],
                 imported: false,
-                leases: 0,
-                access_count: 0,
-                last_access: 0,
-                protected_prefix: false,
             },
+            false,
+            0,
         );
 
         let error = manager.finish_device_demotion(&ticket).unwrap_err();
@@ -7873,8 +7821,8 @@ mod tests {
             reserved_host_bytes: 8,
             completion: Arc::clone(&completion),
         };
-        manager.lock().unwrap().blocks.insert(
-            id.clone(),
+        insert_test_record(
+            &mut manager.lock().unwrap(),
             CacheBlockRecord {
                 id,
                 physical: CacheBlockPhysicalState::Demoting {
@@ -7885,11 +7833,9 @@ mod tests {
                 shapes: [vec![1], vec![1]],
                 dtypes: ["Float32".into(), "Float32".into()],
                 imported: false,
-                leases: 0,
-                access_count: 0,
-                last_access: 0,
-                protected_prefix: false,
             },
+            false,
+            0,
         );
 
         let clearing_manager = manager.clone();

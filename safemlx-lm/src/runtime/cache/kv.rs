@@ -922,7 +922,6 @@ impl PagedCompressedLatentCache {
             )
             .map_err(cache_residency_exception)?;
         let crossing = ids.into_iter().find(|id| id.start < len && id.end > len);
-        let mut crossing_lease = None;
         let replacement = if let Some(id) = crossing {
             let lease = self
                 .manager
@@ -944,9 +943,8 @@ impl PagedCompressedLatentCache {
             safemlx::transforms::async_eval_with_event([&latent, &rotary_key])?.synchronize()?;
             let latent = latent.deep_clone()?;
             let rotary_key = rotary_key.deep_clone()?;
-            crossing_lease = Some(lease);
             Some((
-                id,
+                lease,
                 CacheBlockArrays::CompressedLatentRotary { latent, rotary_key },
             ))
         } else {
@@ -961,7 +959,6 @@ impl PagedCompressedLatentCache {
                 0,
             )
             .map_err(cache_residency_exception)?;
-        drop(crossing_lease);
         self.tail_latent = None;
         self.tail_rotary = None;
         self.offset = len;
@@ -1585,7 +1582,6 @@ impl PagedKeyValueCache {
             )
             .map_err(cache_residency_exception)?;
         let crossing = ids.into_iter().find(|id| id.start < len && id.end > len);
-        let mut crossing_lease = None;
         let replacement = if let Some(id) = crossing {
             let lease = self
                 .manager
@@ -1607,8 +1603,7 @@ impl PagedKeyValueCache {
             safemlx::transforms::async_eval_with_event([&keys, &values])?.synchronize()?;
             let keys = keys.deep_clone()?;
             let values = values.deep_clone()?;
-            crossing_lease = Some(lease);
-            Some((id, CacheBlockArrays::KeyValue { keys, values }))
+            Some((lease, CacheBlockArrays::KeyValue { keys, values }))
         } else {
             None
         };
@@ -1621,7 +1616,6 @@ impl PagedKeyValueCache {
                 self.prefix_tokens as i64,
             )
             .map_err(cache_residency_exception)?;
-        drop(crossing_lease);
         self.tail_keys = None;
         self.tail_values = None;
         self.offset = len;
@@ -3685,7 +3679,7 @@ mod tests {
         let error = cache
             .truncate(1, stream)
             .expect_err("a leased middle suffix block must reject truncation");
-        assert!(error.what().contains("leased by active attention"));
+        assert!(error.what().contains("has lease count 1, expected 0"));
         assert_eq!(cache.offset(), 7);
         assert_eq!(cache.tail_start, 6);
         assert_eq!(cache.tail_len(), 1);
