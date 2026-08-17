@@ -121,7 +121,12 @@ indexing, random tensors, or residual arithmetic. `propose_block` and
 `resolve_round` own proposal sequencing, stochastic accept/reject flow,
 replacement and bonus bookkeeping, grammar and terminal precedence, and the
 transactional state fork. `SpeculativeSchedule` owns bounded fair action
-selection across requests. `PendingSpeculativeVerification` retains the exact
+selection across requests. `SpeculativeRequestTable` owns the production
+request collection, stable insertion identities, per-request resource slots,
+cancellation scan, action application, fairness/peak accounting, prefill,
+terminal finalization, and output ordering. Its generic request records hold
+opaque backend caches, target/draft state, random state, and publishers; no
+MLX type appears in the table contract. `PendingSpeculativeVerification` retains the exact
 completion, verification output, cache checkpoint, canonical draft block, and
 optional optimistic branch as one transaction. `resolve_commit_and_publish`
 waits for that exact completion, resolves portable sampling decisions, commits
@@ -137,8 +142,8 @@ transfer, probability ratios, and residual sampling. `MlxOutputPublisher`
 invokes concrete token callbacks and drains decoded semantic events after core
 authorizes publication. MLX component timings are returned as opaque executor
 telemetry and folded into the core-owned `MtpStats`. The facade contains no
-parallel in-flight transaction, optimistic promotion, cache-commit, callback
-ordering, or telemetry state machine.
+parallel request table, action dispatcher, in-flight transaction, optimistic
+promotion, cache-commit, callback ordering, or telemetry state machine.
 
 The public `api::load_model_with_options` route performs format, architecture,
 catalog, and policy planning in core before calling `Backend::prepare_model`.
@@ -323,13 +328,15 @@ cache transactions, and events. `SpeculativeSampling`, `propose_block`, and
 `resolve_round` make the sampling algorithm backend-neutral while keeping
 opaque distribution math in the adapter. `SpeculativeSchedule` selects the
 same bounded fair actions for any backend. The core request coordinator owns
-retained verification resources, optimistic branch promotion/discard,
+the request table, opaque per-request resources, action application, retained
+verification resources, optimistic branch promotion/discard,
 cache-commit-before-publication ordering, cancellation at an exact safe
-boundary, and speculative request/scheduler telemetry. The former facade
-acceptance loop, fair selector, probability helpers, request transaction,
-optimistic transition, callback coordinator, telemetry definitions,
-`MtpBackend`, `MtpPrefill`, and `MtpCommit` definitions were deleted rather
-than retained as wrappers.
+boundary, stable output ordering, and speculative request/scheduler telemetry.
+The former facade `ScheduledRequest`, request vector, acceptance loop, fair
+selector, action methods, probability helpers, request transaction, optimistic
+transition, callback coordinator, telemetry definitions, `MtpBackend`,
+`MtpPrefill`, and `MtpCommit` definitions were deleted rather than retained as
+wrappers.
 
 Checkpoint sampling recommendations, request overrides, resolved sampler
 settings, MTP configuration, scheduler limits, request identity, and request
@@ -358,7 +365,9 @@ after that transaction reaches its exact safe boundary.
    logits, distributions, and random state so the core proposal and resolution
    drivers can be reused unchanged. Implement `SpeculativePublisher` as a thin
    output sink; do not repeat transaction, promotion, cache-commit, or callback
-   sequencing outside core.
+   sequencing outside core. Instantiate `SpeculativeRequestTable` with those
+   opaque types instead of creating a backend-local request collection or
+   action dispatcher.
 6. Add explicit transfer/collective support only when the backend implements
    exact ownership and synchronization semantics. For distributed scheduling,
    implement `ConsensusTransport` over a topology-wide, rank-ordered word

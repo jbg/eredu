@@ -53,6 +53,11 @@ the canonical sampler, token sequence, semantic constraint, cancellation, and
 publication lifecycle. A backend supplies only a `SpeculativePublisher` sink
 for concrete callbacks or decoded events; it cannot publish before cache commit.
 `MtpStats`, `MtpSchedulerStats`, and `MtpBatchOutput` are canonical core types.
+`SpeculativeRequestTable` is the production request coordinator. It owns the
+stable request collection, lifecycle-bound resource slots, cancellation scan,
+fair action application, aggregate accounting, and ordered finalization while
+holding backend caches, states, randomness, completions, and publishers only as
+opaque associated types. Backends do not implement another request table.
 
 Model loading starts here as well. `inspect_artifact` parses `config.json` or a
 portable `safemlx-gguf` checkpoint, validates SafeTensors/GGUF catalogs, and

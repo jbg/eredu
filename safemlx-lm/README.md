@@ -141,7 +141,11 @@ verification, cache checkpoint, draft block, optimistic branch, and exact
 completion is one core-owned transaction. Core waits, commits the MLX cache,
 resolves branch promotion/discard and telemetry, and only then authorizes token
 and semantic-event publication. The MLX publisher is a thin concrete callback
-sink. MLX retains the actual logits transforms, probability/residual
+sink. The generic core `SpeculativeRequestTable` also owns the production
+request collection, cancellation scan, fair action application, resource-slot
+invariants, aggregate accounting, and ordered finalization. The facade supplies
+only the MLX executor, streams, caches, randomness representation, sampler, and
+publisher types used to instantiate it. MLX retains the actual logits transforms, probability/residual
 arithmetic, random arrays, cross-stream transfers, component timing probes, and
 tensor execution.
 

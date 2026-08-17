@@ -54,13 +54,13 @@ pub use generation::{
 };
 pub use speculative::{
     cancel_pending_verification, propose_block, resolve_commit_and_publish,
-    resolve_optimistic_branch, resolve_round, submit_verification_transaction, MtpBatchOutput,
-    MtpSchedulerStats, MtpStats, PendingSpeculativeVerification, ProposalDecision,
-    PublishedSpeculativeVerification, ResolvedSpeculativeRound, SamplingPlacement,
-    SpeculativeAction, SpeculativeCandidate, SpeculativeCommit, SpeculativeConstraint,
-    SpeculativeContinuation, SpeculativeDraftBlock, SpeculativeDriverError,
-    SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativeOptimisticBranch,
-    SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeProposal,
-    SpeculativePublicationStatus, SpeculativePublisher, SpeculativeRandomness, SpeculativeSampling,
-    SpeculativeSchedule,
+    resolve_optimistic_branch, resolve_round, submit_verification_transaction,
+    CompletedSpeculativeRequest, CompletedSpeculativeSchedule, MtpBatchOutput, MtpSchedulerStats,
+    MtpStats, PendingSpeculativeVerification, ProposalDecision, PublishedSpeculativeVerification,
+    ResolvedSpeculativeRound, SamplingPlacement, SpeculativeAction, SpeculativeCandidate,
+    SpeculativeCommit, SpeculativeConstraint, SpeculativeContinuation, SpeculativeDraftBlock,
+    SpeculativeDriverError, SpeculativeExecutionTopology, SpeculativeExecutor,
+    SpeculativeOptimisticBranch, SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeProposal,
+    SpeculativePublicationStatus, SpeculativePublisher, SpeculativeRandomness, SpeculativeRequest,
+    SpeculativeRequestTable, SpeculativeSampling, SpeculativeSchedule, SpeculativeTelemetry,
 };

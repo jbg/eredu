@@ -794,9 +794,29 @@ pub enum GenerationError {
     /// A second optimistic branch was installed for one target transaction.
     #[error("speculative verification already retains an optimistic branch")]
     OptimisticBranchAlreadyPresent,
+    /// A speculative request identifier does not belong to this table.
+    #[error("unknown MTP request id {index}")]
+    UnknownMtpRequest {
+        /// Requested stable insertion index.
+        index: usize,
+    },
+    /// A promoted proposal block no longer fits the canonical request budget.
+    #[error("promoted MTP block has {proposed} proposals but canonical capacity is {capacity}")]
+    ProposalCapacityExceeded {
+        /// Proposals retained by the promoted block.
+        proposed: usize,
+        /// Current canonical proposal capacity.
+        capacity: usize,
+    },
+    /// A speculative request table was consumed before reaching terminal state.
+    #[error("cannot finish an MTP scheduler with active requests")]
+    ActiveSpeculativeRequests,
     /// No assistant proposal may be generated per round.
     #[error("MTP max_draft_tokens must be positive")]
     ZeroDraftTokens,
+    /// The selected backend cannot submit an assistant proposal.
+    #[error("MTP backend does not permit any draft tokens")]
+    NoBackendDraftCapacity,
     /// Temperature is NaN, infinite, or negative.
     #[error("temperature must be finite and non-negative, got {0}")]
     InvalidTemperature(f32),
