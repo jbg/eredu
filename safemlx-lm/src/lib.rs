@@ -76,13 +76,15 @@ pub use runtime::residency::dense_stream::{
 };
 pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
 pub use safemlx_lm_core::cache::{
-    CacheBlockId, CacheBlockLifecycle, CacheLifecycleError, CachePolicyError, CachePoolError,
-    CachePoolLimits, CachePoolReport, CachePoolResource, CacheRankIdentity, CacheRepresentation,
-    CacheResidencyPool, CacheTier, LayerCachePolicy, MutableCacheTail, MutableStateResidency,
-    PoolingStateComponent, PromptCacheBlock, PromptCacheDescriptor, PromptCacheError,
-    PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor,
-    PromptCacheTopology, StateResidencyClass, StateTensorDimension, StateTensorDtype,
-    StateTensorOwner, StateTensorPolicy, StateTensorPresence, StateTensorRole,
+    CacheBlockId, CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation,
+    CacheHostPromotion, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
+    CacheLifecycleError, CachePolicyError, CachePoolError, CachePoolLimits, CachePoolReport,
+    CachePoolResource, CacheRankIdentity, CacheRepresentation, CacheResidencyPool,
+    CacheStorageError, CacheStoragePhase, CacheTier, LayerCachePolicy, MutableCacheTail,
+    MutableStateResidency, PoolingStateComponent, PromptCacheBlock, PromptCacheDescriptor,
+    PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass, StateTensorDimension,
+    StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorPresence, StateTensorRole,
     PROMPT_CACHE_SCHEMA_VERSION,
 };
 pub use safemlx_lm_core::residency::{

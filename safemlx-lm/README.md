@@ -79,11 +79,16 @@ Stable cache block identities, logical tiers, layer geometry, and
 fixed-state policies are also canonical core contracts. Core additionally owns
 block registration, exact leases, access ordering, protected prefixes,
 deterministic eviction choice, transactional truncation, and mutable tails.
+The generic core `CacheBlockStorage` state machine also owns legal device,
+host, writing, backed, disk, and reading transitions. Its opaque resource slots
+hold MLX arrays, host buffers, disk locations, and native completion tickets;
+the adapter cannot define a parallel phase enum.
+
 The same is true of prompt-cache model/prefix identity, topology, versioned
 manifests, fingerprinting, compatibility, and catalog validation. MLX cache
-code imports them directly and supplies only tensor storage, transfers, exact
-events,
-safetensors payload verification, and filesystem publication.
+code imports them directly and supplies only resource implementations, transfer
+workers, exact native completion observation, safetensors payload verification,
+and filesystem publication.
 
 ## Automatic execution planning
 

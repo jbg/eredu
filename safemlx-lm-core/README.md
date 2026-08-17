@@ -39,8 +39,12 @@ it cannot redefine cache geometry or fixed-state ownership.
 `CacheBlockLifecycle` is the canonical live-block ownership catalog. It owns
 registration, exact lease counts, access clocks, protected-prefix state,
 deterministic LRU/LFU selection, transactional truncation replacement, and
-mutable-tail frontiers. Backend storage records contain none of that state;
-they retain only concrete resources and their native transfer phases.
+mutable-tail frontiers. `CacheBlockStorage` separately owns the legal physical
+phase protocol for a block: device demotion, host promotion and rollback,
+backing writes, backing reads, and direct release of backed resources. Device,
+host, backing, and completion values are opaque type parameters. Exact operation
+keys are core types and are bound to one block and generation. A backend owns
+the values but cannot construct contradictory resource/phase combinations.
 
 Reusable prompt-cache identity and catalogs are also canonical here. Core owns
 model and prefix identity, rank-local topology, the versioned manifest,

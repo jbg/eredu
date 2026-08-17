@@ -10,6 +10,7 @@
 mod lifecycle;
 mod policy;
 mod prompt;
+mod storage;
 
 pub use lifecycle::{CacheBlockLifecycle, CacheLifecycleError, MutableCacheTail};
 pub use policy::{
@@ -23,6 +24,10 @@ pub use prompt::{
     validate_prompt_cache_model_identity, PromptCacheBlock, PromptCacheDescriptor,
     PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     PromptCacheStateTensor, PromptCacheTopology, PROMPT_CACHE_SCHEMA_VERSION,
+};
+pub use storage::{
+    CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion, CacheIoOperation,
+    CacheIoOperationKey, CacheIoOperationKind, CacheStorageError, CacheStoragePhase,
 };
 
 use serde::{Deserialize, Serialize};

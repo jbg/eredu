@@ -96,4 +96,16 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::CacheLifecycleError>(),
         TypeId::of::<safemlx_lm::core::cache::CacheLifecycleError>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CacheStoragePhase>(),
+        TypeId::of::<safemlx_lm::core::cache::CacheStoragePhase>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CacheIoOperationKey>(),
+        TypeId::of::<safemlx_lm::core::cache::CacheIoOperationKey>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CacheStorageError>(),
+        TypeId::of::<safemlx_lm::core::cache::CacheStorageError>(),
+    );
 }
