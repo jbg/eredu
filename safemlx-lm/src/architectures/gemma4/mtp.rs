@@ -367,8 +367,18 @@ impl<T: Gemma4MtpTarget> SpeculativeExecutor for Gemma4MtpBackend<'_, T> {
         Ok(Submission { output, completion })
     }
 
-    fn verification_logits(output: &Self::Verification) -> &Array {
-        &output.output.logits
+    fn verification_logits<'a>(
+        output: &Self::Verification,
+        index: usize,
+        streams: MtpExecutionStreams<'a>,
+    ) -> Result<Array, Exception>
+    where
+        Self: 'a,
+    {
+        output
+            .output
+            .logits
+            .try_index_device((.., index as i32, ..), streams.target())
     }
 
     fn commit_verification(

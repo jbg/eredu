@@ -824,6 +824,9 @@ pub enum GenerationError {
     /// Adaptive lookahead needs a non-zero observation window.
     #[error("MTP adaptive_lookahead_min_blocks must be positive")]
     ZeroAdaptiveLookaheadWindow,
+    /// Active requests expose no legal scheduler action.
+    #[error("MTP scheduler reached a non-terminal state with no eligible operation")]
+    StalledSpeculativeSchedule,
     /// The requested speculative lifecycle edge is invalid.
     #[error("invalid MTP request phase transition from {from:?} to {to:?}")]
     InvalidMtpPhaseTransition {

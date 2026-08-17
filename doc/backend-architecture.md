@@ -27,7 +27,8 @@ Core owns concepts whose meaning does not depend on tensor representation:
 - validated attention schedules;
 - generation configuration validation, committed-token sequencing, terminal
   precedence, cancellation, finish reasons, semantic output events, and
-  speculative proposal/verification commit plans;
+  speculative proposal generation, target acceptance/replacement, verification
+  commit plans, and fair speculative action selection;
 - queue fairness, request/work lifecycle, transactional branch commit/discard,
   exact-completion observation, cancellation, abandonment, and capacity;
 - backend/device descriptors and fail-closed capability discovery;
@@ -112,6 +113,19 @@ the adapter, and returns a `Submission` whose exact event remains owned by the
 scheduler until resolution. Dropping an unresolved MLX completion synchronizes
 it, including cancellation and failure paths.
 
+The corresponding `SpeculativeSampling` contract is deliberately high-level.
+Core asks a backend to process opaque logits, sample an opaque distribution,
+decide one proposal, and commit an accepted token; it never asks for softmax,
+indexing, random tensors, or residual arithmetic. `propose_block` and
+`resolve_round` own proposal sequencing, stochastic accept/reject flow,
+replacement and bonus bookkeeping, grammar and terminal precedence, and the
+transactional state fork. `SpeculativeSchedule` owns bounded fair action
+selection across requests. `MlxSpeculativeSampling` maps those operations to
+MLX arrays, position-stable PRNG keys, target/draft streams, cross-device
+distribution transfer, probability ratios, and residual sampling. The facade
+scheduler retains callbacks and concrete resources but contains no duplicate
+sampling or action-selection algorithm.
+
 The public `api::load_model_with_options` route performs format, architecture,
 catalog, and policy planning in core before calling `Backend::prepare_model`.
 `MlxGeneration` is one
@@ -181,13 +195,13 @@ The current boundary leaves these components MLX-coupled:
 - architecture-specific checkpoint binding/weight recipes, mapped payload
   stores, GGUF decoding, and MLX array materialization (artifact detection,
   model-family resolution, neutral catalogs, and route planning are core-owned);
-- logits filtering and sampling, architecture tensor execution inside the
-  portable speculative-executor operations, assistant and MTP model math,
-  concrete cache mutation, activation
+- logits filtering, probability and residual math, random tensor generation,
+  architecture tensor execution inside the portable speculative-executor
+  operations, assistant and MTP model math, concrete cache mutation, activation
   observation, MLX allocator sampling, and Metal/CUDA kernels. Speculative
-  acceptance state, replacement/bonus bookkeeping, optimistic-prefix reuse,
-  cache-retention counts, token budgets, and terminal precedence are
-  core-owned.
+  proposal sequencing, stochastic acceptance flow, replacement/bonus
+  bookkeeping, optimistic-prefix reuse, fair action selection, cache-retention
+  counts, token budgets, and terminal precedence are core-owned.
 
 The former facade `runtime::residency::policy` module was deleted. It was not
 retained as a forwarding namespace. The earlier placeholder core
@@ -290,8 +304,12 @@ prefix/reuse decision before promoting or discarding MLX-owned draft state.
 The encompassing model-execution lifecycle is also backend-neutral:
 `SpeculativeExecutor` owns the prefill/propose/submit/observe/commit boundary,
 while its MLX implementations retain concrete arrays, streams, assistant state,
-cache transactions, and events. The former facade `MtpBackend`, `MtpPrefill`,
-and `MtpCommit` definitions were deleted rather than retained as wrappers.
+cache transactions, and events. `SpeculativeSampling`, `propose_block`, and
+`resolve_round` make the sampling algorithm backend-neutral while keeping
+opaque distribution math in the adapter. `SpeculativeSchedule` selects the
+same bounded fair actions for any backend. The former facade acceptance loop,
+fair selector, probability helpers, `MtpBackend`, `MtpPrefill`, and `MtpCommit`
+definitions were deleted rather than retained as wrappers.
 
 Checkpoint sampling recommendations, request overrides, resolved sampler
 settings, MTP configuration, scheduler limits, request identity, and request
@@ -316,7 +334,9 @@ after that transaction reaches its exact safe boundary.
    Implement `SpeculativeExecutor` as well when the backend supports assistant
    or embedded-head decoding; choose backend-owned input, cache, checkpoint,
    verification, context, and completion types and materialize portable token
-   ids only inside that adapter.
+   ids only inside that adapter. Implement `SpeculativeSampling` with opaque
+   logits, distributions, and random state so the core proposal and resolution
+   drivers can be reused unchanged.
 6. Add explicit transfer/collective support only when the backend implements
    exact ownership and synchronization semantics. For distributed scheduling,
    implement `ConsensusTransport` over a topology-wide, rank-ordered word

@@ -26,9 +26,13 @@ token order, token budgets, cancellation, and stop/grammar/EOS precedence.
 `SpeculativeRound` owns acceptance, replacement/bonus tails, transactional
 publication, and the exact verified-input retention count used by a backend
 cache commit. Optimistic-prefix reuse and checkpoint/request sampler
-configuration validation are pure core decisions. A backend owns logits,
-random sampling, executable assistant heads, tensor caches, and exact native
-completion; it cannot maintain a second logical token or terminal state.
+configuration validation are pure core decisions. `SpeculativeSchedule` owns
+bounded fair action selection, while `propose_block` and `resolve_round` own
+proposal sequencing, stochastic accept/reject flow, replacement/bonus
+bookkeeping, and transactional sampler/constraint state. A backend owns logits,
+distribution and random-state representations, executable assistant heads,
+tensor caches, and exact native completion; it cannot maintain a second logical
+token or terminal state.
 `MtpRequestLifecycle` rejects illegal phase edges and defers cancellation while
 a backend verification transaction remains retained.
 `SpeculativeExecutor` defines the production whole-session boundary for
@@ -37,6 +41,9 @@ observation, and transactional cache commit. Inputs, logits, target/draft
 state, checkpoints, verification outputs, execution contexts, telemetry, and
 completion objects are backend-owned associated types. The contract never
 models primitive tensor operations or names a native runtime.
+`SpeculativeSampling` similarly exposes only complete opaque operations such as
+processing logits, sampling, proposal decisions, and committed-token updates;
+core never models softmax, indexing, or random tensor primitives.
 
 Model loading starts here as well. `inspect_artifact` parses `config.json` or a
 portable `safemlx-gguf` checkpoint, validates SafeTensors/GGUF catalogs, and

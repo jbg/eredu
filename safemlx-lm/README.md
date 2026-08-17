@@ -134,7 +134,11 @@ Speculative generation uses the same core-owned committed-token and terminal
 lifecycle as ordinary generation. Its prefill/proposal/verification/commit
 executor contract is also core-owned; the MLX implementations supply opaque
 model input, logits, assistant state, cache transactions, stream placement, and
-exact event completion. Sampling math and tensor execution remain in MLX.
+exact event completion. Core also owns proposal sequencing, stochastic
+accept/reject flow, replacement/bonus decisions, and bounded fair action
+selection through a high-level opaque sampling contract. MLX retains the
+actual logits transforms, probability/residual arithmetic, random arrays,
+cross-stream transfers, and tensor execution.
 
 ## Inputs and generation
 

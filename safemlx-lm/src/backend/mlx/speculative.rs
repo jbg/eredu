@@ -1,7 +1,18 @@
 //! MLX execution primitives for speculative model sessions.
 
-use safemlx::{error::Exception, transforms::async_eval_with_event, Array, Event, Stream};
-use safemlx_lm_core::{Completion, SpeculativeExecutionTopology};
+use safemlx::{
+    error::Exception,
+    ops::{indexing::TryIndexOp, maximum, softmax_axis},
+    random::{self, RandomState},
+    transforms::{async_eval_with_event, eval},
+    Array, Event, Stream,
+};
+use safemlx_lm_core::{
+    Completion, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
+    SpeculativeRandomness, SpeculativeSampling,
+};
+
+use crate::runtime::generation::sampler::SpeculativeSampler;
 
 /// Target and assistant streams assigned to one speculative session.
 #[derive(Debug, Clone, Copy)]
@@ -142,4 +153,281 @@ impl Drop for MlxSpeculativeCompletion {
             }
         }
     }
+}
+
+/// MLX implementation of opaque speculative sampling operations.
+#[derive(Clone)]
+pub(crate) struct MlxSpeculativeSampling<S> {
+    inner: S,
+}
+
+impl<S> MlxSpeculativeSampling<S> {
+    /// Wraps one facade sampling policy for backend-owned execution.
+    pub(crate) const fn new(inner: S) -> Self {
+        Self { inner }
+    }
+
+    /// Returns the public sampling policy after generation completes.
+    pub(crate) fn into_inner(self) -> S {
+        self.inner
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn inner(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S> SpeculativeSampling for MlxSpeculativeSampling<S>
+where
+    S: SpeculativeSampler + Clone,
+{
+    type Logits = Array;
+    type Distribution = Array;
+    type Seed = Array;
+    type RandomState = RandomState;
+    type DraftRandomness = Array;
+    type Context<'a>
+        = MtpExecutionStreams<'a>
+    where
+        Self: 'a;
+    type Error = Exception;
+
+    fn supports_exact_optimistic_promotion(&self) -> bool {
+        self.inner.supports_exact_optimistic_promotion()
+    }
+
+    fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
+        self.inner.grammar_is_complete()
+    }
+
+    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {
+        self.inner.prefix_is_complete(history)
+    }
+
+    fn initialize_randomness<'a>(
+        seed: Option<Self::Seed>,
+        temperature: f32,
+        context: Self::Context<'a>,
+    ) -> Result<SpeculativeRandomness<Self::RandomState, Self::DraftRandomness>, Self::Error>
+    where
+        Self: 'a,
+    {
+        if temperature == 0.0 {
+            return Ok(SpeculativeRandomness {
+                target: None,
+                draft: None,
+            });
+        }
+        let mut root =
+            RandomState::from_key(seed.ok_or_else(|| {
+                Exception::custom("random operations require an explicit PRNG key")
+            })?);
+        let target_key = root.next_key(context.target())?;
+        let draft_key = root.next_key(context.target())?;
+        let draft_key = if context.is_split() {
+            if context.crosses_devices() {
+                async_eval_with_event([&draft_key])?.synchronize()?;
+                let copied = draft_key.copy(context.draft())?;
+                async_eval_with_event([&copied])?.synchronize()?;
+                copied
+            } else {
+                let _completion = context.wait_for_target_outputs([&draft_key])?;
+                draft_key
+            }
+        } else {
+            draft_key
+        };
+        Ok(SpeculativeRandomness {
+            target: Some(RandomState::from_key(target_key)),
+            draft: Some(draft_key),
+        })
+    }
+
+    fn draft_randomness_at<'a>(
+        root: &Self::DraftRandomness,
+        position: usize,
+        context: Self::Context<'a>,
+    ) -> Result<Self::RandomState, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(RandomState::from_key(random::split_key_at(
+            root,
+            position,
+            context.draft(),
+        )?))
+    }
+
+    fn process_logits<'a>(
+        &mut self,
+        logits: &Self::Logits,
+        temperature: f32,
+        history: &[u32],
+        placement: SamplingPlacement,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Distribution, Self::Error>
+    where
+        Self: 'a,
+    {
+        self.inner.process_logits(
+            logits,
+            temperature,
+            history,
+            sampling_stream(placement, context),
+        )
+    }
+
+    fn sample<'a>(
+        &self,
+        distribution: &Self::Distribution,
+        temperature: f32,
+        randomness: Option<&mut Self::RandomState>,
+        placement: SamplingPlacement,
+        context: Self::Context<'a>,
+    ) -> Result<u32, Self::Error>
+    where
+        Self: 'a,
+    {
+        let stream = sampling_stream(placement, context);
+        let token = self
+            .inner
+            .sample_processed(distribution, temperature, randomness, stream)?;
+        eval([&token])?;
+        Ok(token.item::<u32>(stream))
+    }
+
+    fn decide_proposal<'a>(
+        &self,
+        target: &Self::Distribution,
+        draft: &Self::Distribution,
+        proposed: u32,
+        temperature: f32,
+        randomness: Option<&mut Self::RandomState>,
+        context: Self::Context<'a>,
+    ) -> Result<ProposalDecision, Self::Error>
+    where
+        Self: 'a,
+    {
+        let stream = context.target();
+        if temperature == 0.0 {
+            let chosen = self
+                .inner
+                .sample_processed(target, 0.0, None, stream)?
+                .item::<u32>(stream);
+            return Ok(if chosen == proposed {
+                ProposalDecision::Accept
+            } else {
+                ProposalDecision::Reject(chosen)
+            });
+        }
+
+        let target_probabilities = probabilities(target, stream)?;
+        let draft_probabilities = probabilities(draft, stream)?;
+        let target_probability = probability_at(&target_probabilities, proposed, stream)?;
+        let draft_probability = probability_at(&draft_probabilities, proposed, stream)?;
+        let acceptance = if draft_probability <= 0.0 {
+            1.0
+        } else {
+            (target_probability / draft_probability).min(1.0)
+        };
+        let mut randomness = randomness;
+        if uniform(randomness.as_deref_mut(), stream)? <= acceptance {
+            return Ok(ProposalDecision::Accept);
+        }
+        let residual = maximum(
+            target_probabilities.subtract(&draft_probabilities, stream)?,
+            Array::from_f32(0.0),
+            stream,
+        )?;
+        let mass = residual.sum(None, stream)?.item::<f32>(stream);
+        let logits = if mass <= f32::EPSILON {
+            target.clone()
+        } else {
+            residual.log(stream)?
+        };
+        let replacement = self
+            .inner
+            .sample_processed(&logits, temperature, randomness, stream)?
+            .item::<u32>(stream);
+        Ok(ProposalDecision::Reject(replacement))
+    }
+
+    fn commit_token<'a>(
+        &mut self,
+        distribution: &Self::Distribution,
+        token: u32,
+        placement: SamplingPlacement,
+        context: Self::Context<'a>,
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'a,
+    {
+        self.inner
+            .commit_token(distribution, token, sampling_stream(placement, context))
+    }
+
+    fn prepare_verification<'a>(
+        &self,
+        distributions: &mut [&mut Self::Distribution],
+        temperature: f32,
+        context: Self::Context<'a>,
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'a,
+    {
+        if temperature == 0.0 || !context.is_split() {
+            return Ok(());
+        }
+        if context.crosses_devices() {
+            async_eval_with_event(distributions.iter().map(|distribution| &**distribution))?
+                .synchronize()?;
+            for distribution in distributions {
+                **distribution = distribution.copy(context.target())?;
+            }
+        } else {
+            let _completion = context
+                .wait_for_draft_outputs(distributions.iter().map(|distribution| &**distribution))?;
+        }
+        Ok(())
+    }
+}
+
+fn sampling_stream<'a>(
+    placement: SamplingPlacement,
+    context: MtpExecutionStreams<'a>,
+) -> &'a Stream {
+    match placement {
+        SamplingPlacement::Target => context.target(),
+        SamplingPlacement::Draft => context.draft(),
+    }
+}
+
+fn probabilities(logits: &Array, stream: &Stream) -> Result<Array, Exception> {
+    softmax_axis(&logits.as_type::<f32>(stream)?, -1, true, stream)
+}
+
+fn probability_at(probabilities: &Array, token: u32, stream: &Stream) -> Result<f32, Exception> {
+    if token as i32 >= probabilities.dim(-1) {
+        return Err(Exception::custom(format!(
+            "sampled token {token} exceeds vocabulary size {}",
+            probabilities.dim(-1)
+        )));
+    }
+    let value = match probabilities.ndim() {
+        2 => probabilities.try_index_device((0, token as i32), stream)?,
+        3 => probabilities.try_index_device((0, 0, token as i32), stream)?,
+        ndim => {
+            return Err(Exception::custom(format!(
+                "speculative distribution must be rank 2 or 3, got rank {ndim}"
+            )))
+        }
+    };
+    Ok(value.item::<f32>(stream))
+}
+
+fn uniform(state: Option<&mut RandomState>, stream: &Stream) -> Result<f32, Exception> {
+    let state = state.ok_or_else(|| Exception::custom("stochastic MTP requires a PRNG key"))?;
+    let key = state.next_key(stream)?;
+    Ok(random::uniform::<_, f32>(0.0, 1.0, &[1], &key, stream)?.item::<f32>(stream))
 }

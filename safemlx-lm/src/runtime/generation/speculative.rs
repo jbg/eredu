@@ -8,14 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use safemlx::{
-    error::Exception,
-    ops::{indexing::TryIndexOp, maximum, softmax_axis},
-    random::{self, RandomState},
-    transforms::{async_eval_with_event, eval},
-    Array, Stream, TimedEvaluation,
+use safemlx::{error::Exception, random::RandomState, Array, Stream, TimedEvaluation};
+#[cfg(test)]
+use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event};
+use safemlx_lm_core::{
+    propose_block, resolve_round, Completion, SamplingPlacement, SpeculativeAction,
+    SpeculativeCandidate, SpeculativeConstraint, SpeculativeDriverError,
+    SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativeProposal, SpeculativeSampling,
+    SpeculativeSchedule,
 };
-use safemlx_lm_core::{Completion, SpeculativeExecutionTopology, SpeculativeExecutor};
 
 use crate::{
     api::{
@@ -28,14 +29,13 @@ use crate::{
     },
     architectures::muse_glimmer::assistant::{self as muse_dflash, MuseGlimmerDFlash},
     backend::mlx::{
-        speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+        speculative::{MlxSpeculativeCompletion, MlxSpeculativeSampling, MtpExecutionStreams},
         MlxModelInput,
     },
     core::generation::{
         resolve_optimistic_reuse, FinishReason, GenerationCancellationToken, GenerationSequence,
         MtpCancellationDisposition, MtpConfig, MtpRequestId, MtpRequestLifecycle, MtpRequestPhase,
-        MtpSchedulerOptions, OptimisticReuseDecision, SemanticEvent, SpeculativeRound,
-        TokenTerminalSignals,
+        MtpSchedulerOptions, OptimisticReuseDecision, SemanticEvent, TokenTerminalSignals,
     },
     error::Error,
     runtime::generation::sampler::SpeculativeSampler,
@@ -458,14 +458,9 @@ impl MtpStats {
     }
 }
 
-struct DraftProposal {
-    token: u32,
-    distribution: Array,
-}
-
 struct DraftBlock<D> {
     state: D,
-    proposals: Vec<DraftProposal>,
+    proposals: Vec<SpeculativeProposal<Array>>,
 }
 
 struct OptimisticBranch<D> {
@@ -501,19 +496,6 @@ impl<'a, T> MlxSpeculativeRuntime<'a> for T where
 {
 }
 
-#[derive(Clone)]
-struct PositionedDraftRng {
-    root: Array,
-}
-
-impl PositionedDraftRng {
-    fn state_at(&self, position: usize, stream: &Stream) -> Result<RandomState, Exception> {
-        Ok(RandomState::from_key(random::split_key_at(
-            &self.root, position, stream,
-        )?))
-    }
-}
-
 struct InFlight<B: SpeculativeExecutor> {
     // Drop exact completion before the retained verification output so early
     // scheduler destruction cannot release backend resources still in use.
@@ -537,10 +519,37 @@ pub(crate) trait MtpSemanticState {
     fn take_events(&mut self) -> Vec<SemanticEvent>;
 }
 
+struct MlxSemanticConstraint(Option<Box<dyn MtpSemanticState>>);
+
+impl SpeculativeConstraint for MlxSemanticConstraint {
+    type Error = Exception;
+
+    fn fork(&self) -> Result<Self, Self::Error> {
+        Ok(Self(
+            self.0.as_ref().map(|state| state.fork_box()).transpose()?,
+        ))
+    }
+
+    fn push_token(&mut self, token: u32) -> Result<bool, Self::Error> {
+        self.0
+            .as_mut()
+            .map(|state| state.push_token(token))
+            .transpose()
+            .map(|matched| matched.unwrap_or(false))
+    }
+
+    fn finish(&mut self, reason: FinishReason) -> Result<(), Self::Error> {
+        if let Some(state) = &mut self.0 {
+            state.finish(reason)?;
+        }
+        Ok(())
+    }
+}
+
 struct CommittedOutputRuntime<'a, S> {
-    sampler: S,
+    sampler: MlxSpeculativeSampling<S>,
     sequence: GenerationSequence,
-    semantic: Option<Box<dyn MtpSemanticState>>,
+    semantic: MlxSemanticConstraint,
     on_token: Box<dyn FnMut(u32) -> Result<(), Exception> + 'a>,
     on_event: Option<Box<dyn FnMut(SemanticEvent) + 'a>>,
     cancellation: GenerationCancellationToken,
@@ -552,12 +561,12 @@ impl<'a, S> CommittedOutputRuntime<'a, S> {
         F: FnMut(u32) -> Result<(), Exception> + 'a,
     {
         Self {
-            sampler,
+            sampler: MlxSpeculativeSampling::new(sampler),
             sequence: GenerationSequence::new(
                 config.max_tokens,
                 config.eos_token_ids.iter().copied(),
             ),
-            semantic: None,
+            semantic: MlxSemanticConstraint(None),
             on_token: Box::new(on_token),
             on_event: None,
             cancellation: GenerationCancellationToken::new(),
@@ -575,12 +584,12 @@ impl<'a, S> CommittedOutputRuntime<'a, S> {
         F: FnMut(SemanticEvent) + 'a,
     {
         Self {
-            sampler,
+            sampler: MlxSpeculativeSampling::new(sampler),
             sequence: GenerationSequence::new(
                 config.max_tokens,
                 config.eos_token_ids.iter().copied(),
             ),
-            semantic: Some(semantic),
+            semantic: MlxSemanticConstraint(Some(semantic)),
             on_token: Box::new(|_| Ok(())),
             on_event: Some(Box::new(on_event)),
             cancellation,
@@ -592,7 +601,7 @@ impl<'a, S> CommittedOutputRuntime<'a, S> {
             (self.on_token)(token)?;
         }
         let mut cancellation_won = false;
-        if let (Some(semantic), Some(on_event)) = (&mut self.semantic, &mut self.on_event) {
+        if let (Some(semantic), Some(on_event)) = (&mut self.semantic.0, &mut self.on_event) {
             for event in semantic.take_events() {
                 on_event(event);
                 if self.cancellation.is_cancelled() && !self.sequence.is_finished() {
@@ -612,7 +621,7 @@ impl<'a, S> CommittedOutputRuntime<'a, S> {
         if !self.sequence.cancel() {
             return Ok(());
         }
-        if let (Some(semantic), Some(on_event)) = (&mut self.semantic, &mut self.on_event) {
+        if let (Some(semantic), Some(on_event)) = (&mut self.semantic.0, &mut self.on_event) {
             semantic.cancel()?;
             for event in semantic.take_events() {
                 on_event(event);
@@ -636,7 +645,7 @@ struct ScheduledRequest<'a, B: SpeculativeExecutor, S> {
     config: MtpConfig,
     runtime: CommittedOutputRuntime<'a, S>,
     target_prng: Option<RandomState>,
-    draft_rng: Option<PositionedDraftRng>,
+    draft_rng: Option<Array>,
     stats: MtpStats,
     started: Instant,
     target_state: Option<B::TargetState>,
@@ -678,17 +687,16 @@ pub(crate) struct MtpScheduleOutput<S> {
 pub(crate) struct MtpScheduler<'a, B: SpeculativeExecutor, S> {
     backend: &'a mut B,
     streams: MtpExecutionStreams<'a>,
-    options: MtpSchedulerOptions,
+    schedule: SpeculativeSchedule,
     component_timing: bool,
     requests: Vec<ScheduledRequest<'a, B, S>>,
-    cursor: usize,
     stats: MtpSchedulerStats,
 }
 
 impl<'a, B, S> MtpScheduler<'a, B, S>
 where
     B: MlxSpeculativeRuntime<'a>,
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler + Clone + 'a,
 {
     /// Creates a scheduler over shared model parameters and explicit streams.
     pub fn new(
@@ -696,18 +704,16 @@ where
         streams: MtpExecutionStreams<'a>,
         options: MtpSchedulerOptions,
     ) -> Result<Self, Exception> {
-        let options = options
-            .validate()
+        let schedule = SpeculativeSchedule::new(options)
             .map_err(|error| Exception::custom(error.to_string()))?;
         let component_timing = component_timing_enabled() && backend.supports_telemetry();
         backend.set_telemetry_enabled(component_timing);
         Ok(Self {
             backend,
             streams,
-            options,
+            schedule,
             component_timing,
             requests: Vec::new(),
-            cursor: 0,
             stats: MtpSchedulerStats {
                 stream_topology: streams.topology(),
                 ..MtpSchedulerStats::default()
@@ -844,15 +850,18 @@ where
 
         validate_input(input)?;
         let input = MlxModelInput::from(input);
-        let (target_prng, draft_rng) =
-            split_random_states(prng_key, config.temperature, self.streams)?;
+        let randomness = <MlxSpeculativeSampling<S> as SpeculativeSampling>::initialize_randomness(
+            prng_key,
+            config.temperature,
+            self.streams,
+        )?;
         self.requests.push(ScheduledRequest {
             id,
             cache,
             config,
             runtime,
-            target_prng,
-            draft_rng,
+            target_prng: randomness.target,
+            draft_rng: randomness.draft,
             stats: MtpStats {
                 stream_topology: self.streams.topology(),
                 component_timings_collected: self.component_timing,
@@ -872,33 +881,29 @@ where
                 request.stats.target_tokens = prefill.evaluated_tokens;
                 request.stats.scheduler_turns = 1;
                 let mut sampler = request.runtime.sampler.clone();
-                let mut semantic = request
-                    .runtime
-                    .semantic
-                    .as_ref()
-                    .map(|state| state.fork_box())
-                    .transpose()?;
+                let mut semantic = request.runtime.semantic.fork()?;
                 let mut target_prng = request.target_prng.clone();
                 let first_logits = sampler.process_logits(
                     &prefill.logits,
                     request.config.temperature,
                     &[],
-                    self.streams.target(),
+                    SamplingPlacement::Target,
+                    self.streams,
                 )?;
-                let first = sampler.sample_processed(
+                let first = sampler.sample(
                     &first_logits,
                     request.config.temperature,
                     target_prng.as_mut(),
-                    self.streams.target(),
+                    SamplingPlacement::Target,
+                    self.streams,
                 )?;
-                eval([&first])?;
-                let first = first.item::<u32>(self.streams.target());
-                sampler.commit_token(&first_logits, first, self.streams.target())?;
-                let stop_matched = semantic
-                    .as_mut()
-                    .map(|state| state.push_token(first))
-                    .transpose()?
-                    .unwrap_or(false);
+                sampler.commit_token(
+                    &first_logits,
+                    first,
+                    SamplingPlacement::Target,
+                    self.streams,
+                )?;
+                let stop_matched = semantic.push_token(first)?;
                 let grammar_complete = if stop_matched {
                     false
                 } else {
@@ -916,8 +921,8 @@ where
                     )
                     .map_err(|error| Exception::custom(error.to_string()))?
                     .finish_reason;
-                if let (Some(state), Some(reason)) = (&mut semantic, reason) {
-                    state.finish(reason)?;
+                if let Some(reason) = reason {
+                    semantic.finish(reason)?;
                 }
                 request.runtime.sampler = sampler;
                 request.runtime.semantic = semantic;
@@ -1004,62 +1009,36 @@ where
             return Ok(false);
         }
 
-        let in_flight = self.in_flight_count();
-        if in_flight < self.options.max_in_flight_verifications {
-            if let Some(index) = self.select(|request| {
-                request.lifecycle.phase() == MtpRequestPhase::ReadyToSubmitVerification
-            }) {
-                self.submit_verification(index)?;
-                return Ok(true);
-            }
-        }
-
-        if in_flight > 0 {
-            if self.optimistic_count() < self.options.max_optimistic_branches
-                && self.options.lookahead_blocks > 0
+        let mut candidates = Vec::with_capacity(self.requests.len());
+        for index in 0..self.requests.len() {
+            let phase = self.requests[index].lifecycle.phase();
+            let optimistic_eligible = phase == MtpRequestPhase::TargetVerificationInFlight
                 && self.streams.is_split()
-            {
-                if let Some(index) = self.select(|request| {
-                    request.lifecycle.phase() == MtpRequestPhase::TargetVerificationInFlight
-                        && request
-                            .in_flight
-                            .as_ref()
-                            .is_some_and(|flight| flight.optimistic.is_none())
-                }) {
-                    if self.can_optimistically_draft(index)? {
-                        self.draft_optimistic(index)?;
-                        return Ok(true);
-                    }
-                }
-            }
-
-            if let Some(index) =
-                self.select(|request| request.lifecycle.phase() == MtpRequestPhase::ReadyToDraft)
-            {
-                self.draft_committed(index, true)?;
-                return Ok(true);
-            }
-
-            if let Some(index) = self.select(|request| {
-                matches!(
-                    request.lifecycle.phase(),
-                    MtpRequestPhase::TargetVerificationInFlight
-                        | MtpRequestPhase::OptimisticDraftReady
-                )
-            }) {
-                self.resolve_verification(index)?;
-                return Ok(true);
-            }
-        } else if let Some(index) =
-            self.select(|request| request.lifecycle.phase() == MtpRequestPhase::ReadyToDraft)
-        {
-            self.draft_committed(index, false)?;
-            return Ok(true);
+                && self.can_optimistically_draft(index)?;
+            candidates.push(SpeculativeCandidate {
+                phase,
+                optimistic_eligible,
+            });
         }
-
-        Err(Exception::custom(
-            "MTP scheduler reached a non-terminal state with no eligible operation",
-        ))
+        let action = self
+            .schedule
+            .next_action(&candidates)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        match action {
+            Some(SpeculativeAction::SubmitVerification(index)) => {
+                self.submit_verification(index)?
+            }
+            Some(SpeculativeAction::DraftCommitted {
+                index,
+                cross_request,
+            }) => self.draft_committed(index, cross_request)?,
+            Some(SpeculativeAction::DraftOptimistic(index)) => self.draft_optimistic(index)?,
+            Some(SpeculativeAction::ResolveVerification(index)) => {
+                self.resolve_verification(index)?
+            }
+            None => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// Drives all submitted requests to completion.
@@ -1086,7 +1065,7 @@ where
                         id: request.id,
                         token_ids: runtime.sequence.into_tokens(),
                         stats: request.stats,
-                        sampler: runtime.sampler,
+                        sampler: runtime.sampler.into_inner(),
                         finish_reason,
                         #[cfg(test)]
                         cancelled: request.lifecycle.phase() == MtpRequestPhase::Cancelled,
@@ -1095,18 +1074,6 @@ where
                 .collect(),
             scheduler: self.stats,
         })
-    }
-
-    fn select(&mut self, predicate: impl Fn(&ScheduledRequest<'a, B, S>) -> bool) -> Option<usize> {
-        let len = self.requests.len();
-        for offset in 0..len {
-            let index = (self.cursor + offset) % len;
-            if predicate(&self.requests[index]) {
-                self.cursor = (index + 1) % len;
-                return Some(index);
-            }
-        }
-        None
     }
 
     fn record_turn(&mut self, index: usize) {
@@ -1200,17 +1167,19 @@ where
                 },
                 |proposal| proposal.token,
             );
-            let proposals = draft_block(
+            let proposals = propose_block(
                 self.backend,
+                &request.runtime.sampler,
                 &mut block.state,
                 previous,
                 additional,
                 &history,
-                &request.config,
-                &request.runtime.sampler,
+                request.config.temperature,
+                &request.config.eos_token_ids,
                 request.draft_rng.as_ref(),
                 self.streams,
-            )?;
+            )
+            .map_err(speculative_driver_error)?;
             request.stats.draft_tokens += proposals.len();
             block.proposals.extend(proposals);
         }
@@ -1326,17 +1295,19 @@ where
         let mut history = Vec::with_capacity(assumed_len);
         history.extend_from_slice(request.runtime.sequence.tokens());
         history.extend(flight.block.proposals.iter().map(|proposal| proposal.token));
-        let proposals = draft_block(
+        let proposals = propose_block(
             self.backend,
+            &request.runtime.sampler,
             &mut state,
             last,
             count,
             &history,
-            &request.config,
-            &request.runtime.sampler,
+            request.config.temperature,
+            &request.config.eos_token_ids,
             request.draft_rng.as_ref(),
             self.streams,
-        )?;
+        )
+        .map_err(speculative_driver_error)?;
         request.stats.optimistic_draft_tokens += proposals.len();
         request.stats.optimistic_draft_blocks += 1;
         request.stats.optimistic_draft_time += started.elapsed();
@@ -1365,10 +1336,7 @@ where
             .take_verification_telemetry(&mut flight.verification)?
             .add_to(&mut request.stats);
         request.stats.verification_in_flight_time += flight.submitted.elapsed();
-        let DraftBlock {
-            state,
-            mut proposals,
-        } = flight.block;
+        let DraftBlock { state, proposals } = flight.block;
 
         if request.lifecycle.cancellation_pending() || request.runtime.cancellation.is_cancelled() {
             discard_optimistic(&mut request.stats, flight.optimistic.take());
@@ -1387,146 +1355,37 @@ where
             return Ok(());
         }
 
-        if request.config.temperature != 0.0 && self.streams.is_split() {
-            if self.streams.crosses_devices() {
-                async_eval_with_event(proposals.iter().map(|proposal| &proposal.distribution))?
-                    .synchronize()?;
-                for proposal in &mut proposals {
-                    proposal.distribution = proposal.distribution.copy(self.streams.target())?;
-                }
-            } else {
-                let _completion = self.streams.wait_for_draft_outputs(
-                    proposals.iter().map(|proposal| &proposal.distribution),
-                )?;
-            }
-        }
-        let target_raw = B::verification_logits(&flight.verification);
-        let mut sampler = request.runtime.sampler.clone();
-        let mut target_prng = request.target_prng.clone();
-        let mut semantic = request
-            .runtime
-            .semantic
-            .as_ref()
-            .map(|state| state.fork_box())
-            .transpose()?;
         let mut tentative_stats = request.stats.clone();
-        let mut history = request.runtime.sequence.tokens().to_vec();
-        let mut sequence = request.runtime.sequence.clone();
-        let mut round = SpeculativeRound::new(proposals.len())
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        let mut terminal = None;
-        for (index, proposal) in proposals.iter().enumerate() {
-            let token = proposal.token;
-            let raw = target_raw.try_index_device((.., index as i32, ..), self.streams.target())?;
-            let target = sampler.process_logits(
-                &raw,
-                request.config.temperature,
-                &history,
-                self.streams.target(),
-            )?;
-            let accepted_proposal = if request.config.temperature == 0.0 {
-                let chosen = sampler
-                    .sample_processed(&target, 0.0, None, self.streams.target())?
-                    .item::<u32>(self.streams.target());
-                if chosen == token {
-                    true
-                } else {
-                    sampler.commit_token(&target, chosen, self.streams.target())?;
-                    terminal =
-                        commit_terminal_token(&mut sequence, &mut sampler, &mut semantic, chosen)?;
-                    round
-                        .reject_with(chosen, terminal.is_some())
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                    break;
-                }
-            } else {
-                let p = probabilities(&target, self.streams.target())?;
-                let q = probabilities(&proposal.distribution, self.streams.target())?;
-                let p_token = probability_at(&p, token, self.streams.target())?;
-                let q_token = probability_at(&q, token, self.streams.target())?;
-                let acceptance = if q_token <= 0.0 {
-                    1.0
-                } else {
-                    (p_token / q_token).min(1.0)
-                };
-                if uniform(target_prng.as_mut(), self.streams.target())? <= acceptance {
-                    true
-                } else {
-                    let chosen = sample_residual(
-                        &p,
-                        &q,
-                        &target,
-                        &mut sampler,
-                        request.config.temperature,
-                        target_prng.as_mut(),
-                        self.streams.target(),
-                    )?;
-                    sampler.commit_token(&target, chosen, self.streams.target())?;
-                    terminal =
-                        commit_terminal_token(&mut sequence, &mut sampler, &mut semantic, chosen)?;
-                    round
-                        .reject_with(chosen, terminal.is_some())
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                    break;
-                }
-            };
-
-            if accepted_proposal {
-                sampler.commit_token(&target, token, self.streams.target())?;
-                history.push(token);
-                terminal =
-                    commit_terminal_token(&mut sequence, &mut sampler, &mut semantic, token)?;
-                round
-                    .accept(token, terminal.is_some())
-                    .map_err(|error| Exception::custom(error.to_string()))?;
-                if terminal.is_some() {
-                    break;
-                }
-            }
-        }
-
+        let proposal_count = proposals.len();
+        let mut canonical_proposal_prefix = request.runtime.sequence.tokens().to_vec();
+        canonical_proposal_prefix.extend(proposals.iter().map(|proposal| proposal.token));
+        let resolved = resolve_round::<B, MlxSpeculativeSampling<S>, MlxSemanticConstraint>(
+            &flight.verification,
+            proposals,
+            &request.runtime.sampler,
+            &request.runtime.sequence,
+            &request.runtime.semantic,
+            request.target_prng.as_ref(),
+            request.config.temperature,
+            self.streams,
+        )
+        .map_err(speculative_driver_error)?;
         let mut bonus_transition = OptimisticBonusTransition::NotPresent;
-        if round.is_full_acceptance() && !sequence.is_finished() {
-            let accepted = proposals.len();
-            let raw =
-                target_raw.try_index_device((.., accepted as i32, ..), self.streams.target())?;
-            let target = sampler.process_logits(
-                &raw,
-                request.config.temperature,
-                &history,
-                self.streams.target(),
-            )?;
-            let chosen = sampler
-                .sample_processed(
-                    &target,
-                    request.config.temperature,
-                    target_prng.as_mut(),
-                    self.streams.target(),
-                )?
-                .item::<u32>(self.streams.target());
-            sampler.commit_token(&target, chosen, self.streams.target())?;
-            terminal = commit_terminal_token(&mut sequence, &mut sampler, &mut semantic, chosen)?;
-            round
-                .bonus(chosen, terminal.is_some())
-                .map_err(|error| Exception::custom(error.to_string()))?;
-
+        if let Some(chosen) = resolved.bonus_token {
             if let Some(branch) = flight.optimistic.take() {
                 bonus_transition = resolve_optimistic_bonus(
                     branch,
-                    &history,
+                    &canonical_proposal_prefix,
                     chosen,
-                    terminal.is_some(),
+                    resolved.finish_reason.is_some(),
                     &mut tentative_stats,
                 )?;
             }
         }
-
-        let plan = round
-            .commit_plan()
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        let accepted = plan.accepted_proposals;
-        let committed_tokens = plan.committed_tokens.to_vec();
-        let verified_inputs = plan.verified_inputs;
+        let accepted = resolved.accepted_proposals;
+        let committed_tokens = resolved.committed_tokens;
+        let verified_inputs = resolved.verified_inputs;
+        let terminal = resolved.finish_reason;
         tentative_stats.accepted_tokens += accepted;
         tentative_stats.accept_lens.push(accepted);
         tentative_stats.rounds += 1;
@@ -1540,10 +1399,10 @@ where
         )?;
         tentative_stats.target_tokens += commit.replayed_tokens;
         request.target_state = Some(commit.state);
-        request.runtime.sampler = sampler;
-        request.runtime.semantic = semantic;
-        request.runtime.sequence = sequence;
-        request.target_prng = target_prng;
+        request.runtime.sampler = resolved.sampler;
+        request.runtime.semantic = resolved.constraint;
+        request.runtime.sequence = resolved.sequence;
+        request.target_prng = resolved.target_randomness;
         tentative_stats.emitted_tokens += committed_tokens.len();
         request.stats = tentative_stats;
         let cancelled = request.runtime.publish(&committed_tokens)?;
@@ -1559,7 +1418,7 @@ where
             discard_optimistic(&mut request.stats, flight.optimistic.take());
             request.transition(MtpRequestPhase::Completed)?;
             request.stats.elapsed = request.started.elapsed();
-        } else if accepted == proposals.len() {
+        } else if accepted == proposal_count {
             match bonus_transition {
                 OptimisticBonusTransition::MatchedRetained(block) => {
                     request.stats.draft_tokens += block.proposals.len();
@@ -1583,46 +1442,14 @@ where
                     ));
                 }
             }
-            update_adaptive_lookahead(&mut request.stats, self.options);
+            update_adaptive_lookahead(&mut request.stats, self.schedule.options());
         } else {
             discard_optimistic(&mut request.stats, flight.optimistic.take());
-            update_adaptive_lookahead(&mut request.stats, self.options);
+            update_adaptive_lookahead(&mut request.stats, self.schedule.options());
             request.transition(MtpRequestPhase::ReadyToDraft)?;
         }
         Ok(())
     }
-}
-
-fn commit_terminal_token<S: SpeculativeSampler>(
-    sequence: &mut GenerationSequence,
-    sampler: &mut S,
-    semantic: &mut Option<Box<dyn MtpSemanticState>>,
-    token: u32,
-) -> Result<Option<FinishReason>, Exception> {
-    let stop_matched = semantic
-        .as_mut()
-        .map(|state| state.push_token(token))
-        .transpose()?
-        .unwrap_or(false);
-    let grammar_complete = if stop_matched {
-        false
-    } else {
-        sampler.grammar_is_complete()?
-    };
-    let reason = sequence
-        .commit(
-            token,
-            TokenTerminalSignals {
-                stop_sequence: stop_matched,
-                grammar_complete,
-            },
-        )
-        .map_err(|error| Exception::custom(error.to_string()))?
-        .finish_reason;
-    if let (Some(state), Some(reason)) = (semantic, reason) {
-        state.finish(reason)?;
-    }
-    Ok(reason)
 }
 
 fn resolve_optimistic_bonus<D>(
@@ -1708,59 +1535,8 @@ fn update_adaptive_lookahead(stats: &mut MtpStats, options: MtpSchedulerOptions)
         || stats.reused_optimistic_tokens < stats.discarded_optimistic_tokens;
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draft_block<'a, B, S>(
-    backend: &mut B,
-    state: &mut B::DraftState,
-    first_previous: u32,
-    count: usize,
-    base_history: &[u32],
-    config: &MtpConfig,
-    sampler: &S,
-    draft_rng: Option<&PositionedDraftRng>,
-    streams: MtpExecutionStreams<'a>,
-) -> Result<Vec<DraftProposal>, Exception>
-where
-    B: SpeculativeExecutor<
-            Logits = Array,
-            Error = Exception,
-            Context<'a> = MtpExecutionStreams<'a>,
-        > + 'a,
-    S: SpeculativeSampler + Clone,
-{
-    let stream = streams.draft();
-    let mut branch_sampler = sampler.clone();
-    let mut history = Vec::with_capacity(base_history.len() + count);
-    history.extend_from_slice(base_history);
-    let mut proposals = Vec::with_capacity(count);
-    for offset in 0..count {
-        let previous = proposals
-            .last()
-            .map_or(first_previous, |proposal: &DraftProposal| proposal.token);
-        let raw = backend.proposal_logits(state, previous, streams)?;
-        let processed =
-            branch_sampler.process_logits(&raw, config.temperature, &history, stream)?;
-        let mut position_state = draft_rng
-            .map(|rng| rng.state_at(base_history.len() + offset, stream))
-            .transpose()?;
-        let token = branch_sampler.sample_processed(
-            &processed,
-            config.temperature,
-            position_state.as_mut(),
-            stream,
-        )?;
-        eval([&token])?;
-        let token = token.item::<u32>(stream);
-        proposals.push(DraftProposal {
-            token,
-            distribution: processed,
-        });
-        history.push(token);
-        if config.eos_token_ids.contains(&token) || branch_sampler.prefix_is_complete(&history)? {
-            break;
-        }
-    }
-    Ok(proposals)
+fn speculative_driver_error(error: SpeculativeDriverError<Exception>) -> Exception {
+    Exception::custom(error.to_string())
 }
 
 fn validate_config<B: SpeculativeExecutor>(
@@ -1784,36 +1560,6 @@ fn validate_config<B: SpeculativeExecutor>(
     Ok(())
 }
 
-fn split_random_states(
-    prng_key: Option<Array>,
-    temperature: f32,
-    streams: MtpExecutionStreams<'_>,
-) -> Result<(Option<RandomState>, Option<PositionedDraftRng>), Exception> {
-    if temperature == 0.0 {
-        return Ok((None, None));
-    }
-    let mut root = RandomState::from_key(prng_key.expect("validated stochastic PRNG key"));
-    let target_key = root.next_key(streams.target())?;
-    let draft_key = root.next_key(streams.target())?;
-    let draft_key = if streams.is_split() {
-        if streams.crosses_devices() {
-            async_eval_with_event([&draft_key])?.synchronize()?;
-            let copied = draft_key.copy(streams.draft())?;
-            async_eval_with_event([&copied])?.synchronize()?;
-            copied
-        } else {
-            let _completion = streams.wait_for_target_outputs([&draft_key])?;
-            draft_key
-        }
-    } else {
-        draft_key
-    };
-    Ok((
-        Some(RandomState::from_key(target_key)),
-        Some(PositionedDraftRng { root: draft_key }),
-    ))
-}
-
 #[cfg(test)]
 fn generate<'runtime, B, S>(
     backend: &'runtime mut B,
@@ -1826,7 +1572,7 @@ fn generate<'runtime, B, S>(
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler + Clone + 'runtime,
 {
     generate_with_streams(
         backend,
@@ -1851,7 +1597,7 @@ fn generate_with_streams<'runtime, B, S>(
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler + Clone + 'runtime,
 {
     generate_with_streams_and_callback(
         backend,
@@ -1879,7 +1625,7 @@ pub(crate) fn generate_with_callback<'runtime, B, S, F>(
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler + Clone + 'runtime,
     F: FnMut(u32) -> Result<(), Exception> + 'runtime,
 {
     generate_with_streams_and_callback(
@@ -1908,7 +1654,7 @@ pub(crate) fn generate_with_streams_and_callback<'runtime, B, S, F>(
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler + Clone + 'runtime,
     F: FnMut(u32) -> Result<(), Exception> + 'runtime,
 {
     generate_with_streams_and_callback_and_options(
@@ -1940,7 +1686,7 @@ pub(crate) fn generate_with_streams_and_callback_and_options<'runtime, B, S, F>(
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler + Clone + 'runtime,
     F: FnMut(u32) -> Result<(), Exception> + 'runtime,
 {
     let final_sampler;
@@ -1984,7 +1730,7 @@ pub(crate) fn generate_with_semantics_and_options<'runtime, B, S, F>(
 ) -> Result<(Vec<u32>, MtpStats, FinishReason), Exception>
 where
     B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone,
+    S: SpeculativeSampler + Clone + 'runtime,
     F: FnMut(SemanticEvent) + 'runtime,
 {
     let final_sampler;
@@ -2048,60 +1794,6 @@ fn validate_input(input: ModelInput<'_>) -> Result<(), Exception> {
         }
     }
     Ok(())
-}
-
-fn probabilities(logits: &Array, stream: &Stream) -> Result<Array, Exception> {
-    softmax_axis(&logits.as_type::<f32>(stream)?, -1, true, stream)
-}
-
-fn probability_at(probabilities: &Array, token: u32, stream: &Stream) -> Result<f32, Exception> {
-    if token as i32 >= probabilities.dim(-1) {
-        return Err(Exception::custom(format!(
-            "sampled token {token} exceeds vocabulary size {}",
-            probabilities.dim(-1)
-        )));
-    }
-    let value = match probabilities.ndim() {
-        2 => probabilities.try_index_device((0, token as i32), stream)?,
-        3 => probabilities.try_index_device((0, 0, token as i32), stream)?,
-        ndim => {
-            return Err(Exception::custom(format!(
-                "speculative distribution must be rank 2 or 3, got rank {ndim}"
-            )))
-        }
-    };
-    Ok(value.item::<f32>(stream))
-}
-
-fn uniform(state: Option<&mut RandomState>, stream: &Stream) -> Result<f32, Exception> {
-    let state = state.ok_or_else(|| Exception::custom("stochastic MTP requires a PRNG key"))?;
-    let key = state.next_key(stream)?;
-    Ok(random::uniform::<_, f32>(0.0, 1.0, &[1], &key, stream)?.item::<f32>(stream))
-}
-
-fn sample_residual<S: SpeculativeSampler>(
-    target_probabilities: &Array,
-    draft_probabilities: &Array,
-    target_logits: &Array,
-    sampler: &mut S,
-    temperature: f32,
-    prng_state: Option<&mut RandomState>,
-    stream: &Stream,
-) -> Result<u32, Exception> {
-    let residual = maximum(
-        target_probabilities.subtract(draft_probabilities, stream)?,
-        Array::from_f32(0.0),
-        stream,
-    )?;
-    let mass = residual.sum(None, stream)?.item::<f32>(stream);
-    let logits = if mass <= f32::EPSILON {
-        target_logits.clone()
-    } else {
-        residual.log(stream)?
-    };
-    Ok(sampler
-        .sample_processed(&logits, temperature, prng_state, stream)?
-        .item::<u32>(stream))
 }
 
 #[cfg(test)]
@@ -2399,8 +2091,15 @@ mod tests {
             Ok(Submission { output, completion })
         }
 
-        fn verification_logits(output: &Self::Verification) -> &Array {
-            output
+        fn verification_logits<'a>(
+            output: &Self::Verification,
+            index: usize,
+            streams: MtpExecutionStreams<'a>,
+        ) -> Result<Array, Exception>
+        where
+            Self: 'a,
+        {
+            output.try_index_device((.., index as i32, ..), streams.target())
         }
 
         fn commit_verification(
@@ -2491,8 +2190,15 @@ mod tests {
             self.inner.submit_verification(input_tokens, cache, streams)
         }
 
-        fn verification_logits(output: &Self::Verification) -> &Array {
-            output
+        fn verification_logits<'a>(
+            output: &Self::Verification,
+            index: usize,
+            streams: MtpExecutionStreams<'a>,
+        ) -> Result<Array, Exception>
+        where
+            Self: 'a,
+        {
+            output.try_index_device((.., index as i32, ..), streams.target())
         }
 
         fn commit_verification(
@@ -3117,8 +2823,8 @@ mod tests {
 
         assert_eq!(events.borrow().len(), published_after_prefill);
         assert_eq!(request.runtime.sequence.tokens(), &[1]);
-        assert_eq!(request.runtime.sampler.committed, vec![1]);
-        assert_eq!(request.runtime.sampler.process_calls, 1);
+        assert_eq!(request.runtime.sampler.inner().committed, vec![1]);
+        assert_eq!(request.runtime.sampler.inner().process_calls, 1);
     }
 
     #[test]
@@ -4420,7 +4126,7 @@ mod tests {
                     step: 1,
                     storage: Arc::new(()),
                 },
-                proposals: vec![DraftProposal {
+                proposals: vec![SpeculativeProposal {
                     token: 0,
                     distribution: Array::from_slice(&[1.0f32, 0.0, 0.0], &[1, 1, 3]),
                 }],
