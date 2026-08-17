@@ -24,16 +24,16 @@ use safemlx_lm::{
         discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
         AllocatorTelemetry, AutomaticPlanRequest, BackendKind, DevicePlan, DraftPlacementPlan,
         DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
-        ExpertCacheTelemetry, GenerationCancellationToken, GenerationConfigOverrides,
-        HardwareMemorySemantics, HardwareProfile, LoadedModel, ModelInspectionOptions,
-        ModelLoadOptions, ModelResourceProfile, Observed, PlanExplanation, PlanExplanationEntry,
-        PlanExplanationLevel, PreparedChatEmbeddedMtpGenerationRequest,
+        ExpertCacheTelemetry, HardwareMemorySemantics, HardwareProfile, LoadedModel,
+        ModelInspectionOptions, ModelLoadOptions, ModelResourceProfile, Observed, PlanExplanation,
+        PlanExplanationEntry, PlanExplanationLevel, PreparedChatEmbeddedMtpGenerationRequest,
         PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
         ResidencyTelemetry, TextDecoder, TimingTelemetry, WeightTransformationPlan,
     },
     backend::mlx::speculative::MtpExecutionStreams,
     core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
+    core::speculative::MtpStats,
     error::Error as LmError,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
@@ -45,15 +45,14 @@ use safemlx_lm::{
     runtime::generation::sampler::{
         DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
     },
-    runtime::generation::speculative::{
-        LoadedDrafter, MtpComponentTimingGuard, MtpConfig, MtpSchedulerOptions, MtpStats,
-    },
-    runtime::generation::streaming::{FinishReason, SemanticEvent},
+    runtime::generation::speculative::{LoadedDrafter, MtpComponentTimingGuard},
     runtime::media::input::{InputPart, ModelInput},
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     runtime::residency::expert_cache::{
         ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
     },
+    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, MtpConfig,
+    MtpSchedulerOptions, SemanticEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -3871,6 +3870,7 @@ mod tests {
 
     use clap::{CommandFactory, FromArgMatches, Parser};
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
+    use safemlx_lm::core::speculative::SpeculativeExecutionTopology;
 
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
@@ -4727,7 +4727,7 @@ mod tests {
             MtpExecutionStreams::new(target.stream(), draft.stream())
                 .unwrap()
                 .topology(),
-            safemlx_lm::runtime::generation::speculative::MtpStreamTopology::SameDeviceSplit
+            SpeculativeExecutionTopology::SameDeviceSplit
         );
     }
 
@@ -4740,7 +4740,7 @@ mod tests {
             MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
                 .unwrap()
                 .topology(),
-            safemlx_lm::runtime::generation::speculative::MtpStreamTopology::SameDeviceSplit
+            SpeculativeExecutionTopology::SameDeviceSplit
         );
 
         let (target, draft) =
@@ -4749,7 +4749,7 @@ mod tests {
             MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
                 .unwrap()
                 .topology(),
-            safemlx_lm::runtime::generation::speculative::MtpStreamTopology::CrossDeviceSplit
+            SpeculativeExecutionTopology::CrossDeviceSplit
         );
 
         let (target, draft) =
@@ -4758,7 +4758,7 @@ mod tests {
             MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
                 .unwrap()
                 .topology(),
-            safemlx_lm::runtime::generation::speculative::MtpStreamTopology::CrossDeviceSplit
+            SpeculativeExecutionTopology::CrossDeviceSplit
         );
     }
 

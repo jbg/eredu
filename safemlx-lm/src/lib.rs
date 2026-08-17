@@ -79,28 +79,29 @@ pub use runtime::execution::layerwise::{
     LayerwiseModel, LayerwiseModelMetadata, NonExpertWeightResidency, ParallelModelInfo,
     SharedWeightStore, WeightResidency,
 };
-pub use runtime::residency::dense_stream::{
-    BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError,
-};
+pub use runtime::residency::dense_stream::{DenseDiskStreamLoadOptions, DenseStreamError};
 pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
 pub use safemlx_lm_core::cache::{
     CacheBlockId, CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation,
-    CacheHostPromotion, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
-    CacheLifecycleError, CachePolicyError, CachePoolError, CachePoolLimits, CachePoolReport,
-    CachePoolResource, CacheRankIdentity, CacheRepresentation, CacheResidencyPool,
-    CacheStorageError, CacheStoragePhase, CacheTier, LayerCachePolicy, MutableCacheTail,
-    MutableStateResidency, PoolingStateComponent, PromptCacheBlock, PromptCacheDescriptor,
-    PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass, StateTensorDimension,
-    StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorPresence, StateTensorRole,
-    PROMPT_CACHE_SCHEMA_VERSION,
+    CacheHostPromotion, CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
+    CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
+    CacheIoPreparation, CacheIoStartDisposition, CacheLifecycleError, CachePolicyError,
+    CachePoolError, CachePoolLimits, CachePoolReport, CachePoolResource, CacheRankIdentity,
+    CacheRepresentation, CacheResidencyPool, CacheStorageError, CacheStoragePhase, CacheTier,
+    LayerCachePolicy, MutableCacheTail, MutableStateResidency, PoolingStateComponent,
+    PromptCacheBlock, PromptCacheDescriptor, PromptCacheError, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology,
+    StateResidencyClass, StateTensorDimension, StateTensorDtype, StateTensorOwner,
+    StateTensorPolicy, StateTensorPresence, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
 };
 pub use safemlx_lm_core::residency::{
-    AllocatorMemoryMetrics, CacheEvictionPolicy, EvictionMetrics, MemoryTier, OffloadConfig,
-    OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry, OffloadUnitId, OffloadUnitSpec,
-    PrefetchMetrics, PrefetchOutcome, ProcessMetrics, ResidencyBlocker, ResidencyLedger,
-    ResidencyLedgerError, ResidencyPolicy, TierByteTotals, TierUnitTotals, TransferDirection,
-    TransferMetrics, UnitResidencyReport, OFFLOAD_PLAN_SCHEMA_VERSION,
+    AllocatorMemoryMetrics, BackgroundPrefetchReport, CacheEvictionPolicy, EvictionMetrics,
+    MemoryTier, OffloadConfig, OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry,
+    OffloadUnitId, OffloadUnitSpec, PrefetchAdmission, PrefetchCompletion,
+    PrefetchDemandObservation, PrefetchDemandResolution, PrefetchExecutionState, PrefetchMetrics,
+    PrefetchOutcome, PrefetchStateError, PrefetchWork, ProcessMetrics, ResidencyBlocker,
+    ResidencyLedger, ResidencyLedgerError, ResidencyPolicy, TierByteTotals, TierUnitTotals,
+    TransferDirection, TransferMetrics, UnitResidencyReport, OFFLOAD_PLAN_SCHEMA_VERSION,
 };
 pub use safemlx_lm_core::scheduler::{
     CancellationCause, RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,

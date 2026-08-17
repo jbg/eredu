@@ -20,6 +20,11 @@ copies whose concrete storage a backend must release. `OffloadTelemetry` and
 backend allocator observations. Deserialization cannot bypass plan invariants.
 Backends own only resource materialization, native transfer/completion objects,
 and destruction of the storage selected by ledger transitions.
+`PrefetchExecutionState` is the reusable bounded execution coordinator for
+residency materialization. It owns FIFO admission, coalescing, cancellation
+generations, exact work tickets, rollback, failure retention and retry,
+demand handoff, and worker telemetry. A backend supplies only its concrete
+worker, storage operation, I/O, and completion observation.
 
 Generation orchestration is portable too. `GenerationSequence` owns committed
 token order, token budgets, cancellation, and stop/grammar/EOS precedence.
@@ -90,6 +95,10 @@ backing writes, backing reads, and direct release of backed resources. Device,
 host, backing, and completion values are opaque type parameters. Exact operation
 keys are core types and are bound to one block and generation. A backend owns
 the values but cannot construct contradictory resource/phase combinations.
+`CacheIoExecutionState` complements that per-block protocol with exact-key
+join ownership, bounded worker admission, queued/in-flight cancellation, and
+completion publication disposition. Backends retain only opaque task payloads,
+physical scheduling, files, buffers, and completion primitives.
 
 Reusable prompt-cache identity and catalogs are also canonical here. Core owns
 model and prefix identity, rank-local topology, the versioned manifest,

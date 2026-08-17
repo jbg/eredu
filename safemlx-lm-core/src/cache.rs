@@ -7,6 +7,7 @@
 //! until its exact backend transition either publishes the bytes into a
 //! registered manager or drops the reservation.
 
+mod executor;
 mod lifecycle;
 mod policy;
 mod prompt;
@@ -670,3 +671,7 @@ mod tests {
         ));
     }
 }
+pub use executor::{
+    CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
+    CacheIoExecutionStateError, CacheIoPreparation, CacheIoStartDisposition,
+};

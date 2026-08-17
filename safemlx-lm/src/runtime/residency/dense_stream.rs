@@ -6,15 +6,17 @@
 //! next layer may continue transferring independently.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{mpsc, Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use crate::{
-    core::residency::{CacheEvictionPolicy, MemoryTier, OffloadUnitId},
+    core::residency::{
+        BackgroundPrefetchReport, CacheEvictionPolicy, MemoryTier, OffloadUnitId,
+        PrefetchAdmission, PrefetchDemandResolution, PrefetchExecutionState,
+    },
     runtime::residency::manager::{ResidencyManager, ResidentUnitLease},
 };
 
@@ -104,55 +106,10 @@ impl Default for DenseDiskStreamLoadOptions {
     }
 }
 
-/// Immutable background-prefetch observations.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
-pub struct BackgroundPrefetchReport {
-    /// Requests accepted for background execution.
-    pub submitted: u64,
-    /// Duplicate queued or active requests folded into existing work.
-    pub coalesced: u64,
-    /// Requests begun by the worker.
-    pub started: u64,
-    /// Requests completed successfully.
-    pub completed: u64,
-    /// Stale requests skipped before publication.
-    pub cancelled: u64,
-    /// Requests that returned an error.
-    pub failed: u64,
-    /// Configured bounded queue capacity.
-    pub queue_capacity: usize,
-    /// Largest observed number of queued requests.
-    pub peak_queue_occupancy: usize,
-    /// Submissions that waited for bounded queue capacity.
-    pub backpressure_count: u64,
-    /// Time spent waiting for bounded queue capacity.
-    pub backpressure_duration: Duration,
-    /// Demand acquisitions that waited for queued or active work.
-    pub demand_waits: u64,
-    /// Time spent waiting for demanded background work.
-    pub demand_wait_duration: Duration,
-    /// Prefetches found resident before demand.
-    pub ready_before_demand: u64,
-    /// Prefetches still active when demanded.
-    pub in_flight_at_demand: u64,
-    /// Completed prefetched copies evicted before their first demand.
-    pub evicted_before_use: u64,
-}
-
 #[derive(Debug)]
 enum WorkerMessage {
-    Prefetch { generation: u64, id: OffloadUnitId },
+    WorkAvailable,
     Shutdown,
-}
-
-#[derive(Default)]
-struct SharedState {
-    generation: u64,
-    queued: BTreeSet<OffloadUnitId>,
-    in_flight: BTreeSet<OffloadUnitId>,
-    completed: BTreeSet<OffloadUnitId>,
-    failures: BTreeMap<OffloadUnitId, String>,
-    report: BackgroundPrefetchReport,
 }
 
 type HostPrefetchOperation =
@@ -161,8 +118,8 @@ type HostPrefetchOperation =
 /// One bounded, deterministically joined disk-to-host worker.
 pub(crate) struct BackgroundLayerPrefetch {
     manager: ResidencyManager,
-    sender: mpsc::SyncSender<WorkerMessage>,
-    shared: Arc<(Mutex<SharedState>, Condvar)>,
+    sender: mpsc::Sender<WorkerMessage>,
+    shared: Arc<(Mutex<PrefetchExecutionState<String>>, Condvar)>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -189,14 +146,11 @@ impl BackgroundLayerPrefetch {
         if capacity == 0 {
             return Err(DenseStreamError::ZeroQueueCapacity);
         }
-        let (sender, receiver) = mpsc::sync_channel(capacity);
-        let shared = Arc::new((Mutex::new(SharedState::default()), Condvar::new()));
-        shared
-            .0
-            .lock()
-            .map_err(|_| DenseStreamError::StatePoisoned)?
-            .report
-            .queue_capacity = capacity;
+        let (sender, receiver) = mpsc::channel();
+        let shared = Arc::new((
+            Mutex::new(PrefetchExecutionState::new(capacity)?),
+            Condvar::new(),
+        ));
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("safemlx-dense-layer-prefetch".into())
@@ -210,70 +164,42 @@ impl BackgroundLayerPrefetch {
     }
 
     pub(crate) fn submit(&self, id: &OffloadUnitId) -> Result<(), DenseStreamError> {
-        let resident = self.manager.is_resident(id, MemoryTier::Host)?;
-        let generation = {
+        let started = Instant::now();
+        let mut backpressured = false;
+        loop {
+            let resident = self.manager.is_resident(id, MemoryTier::Host)?;
             let mut state = self
                 .shared
                 .0
                 .lock()
                 .map_err(|_| DenseStreamError::StatePoisoned)?;
-            if state.queued.contains(id) || state.in_flight.contains(id) {
-                state.report.coalesced = state.report.coalesced.saturating_add(1);
-                return Ok(());
-            }
-            if state.completed.contains(id) && !resident {
-                state.completed.remove(id);
-                state.report.evicted_before_use = state.report.evicted_before_use.saturating_add(1);
-            }
-            if resident {
-                state.completed.insert(id.clone());
-                state.report.coalesced = state.report.coalesced.saturating_add(1);
-                return Ok(());
-            }
-            state.queued.insert(id.clone());
-            state.report.submitted = state.report.submitted.saturating_add(1);
-            state.report.peak_queue_occupancy = state
-                .report
-                .peak_queue_occupancy
-                .max(state.queued.len().min(state.report.queue_capacity));
-            state.generation
-        };
-        let message = WorkerMessage::Prefetch {
-            generation,
-            id: id.clone(),
-        };
-        match self.sender.try_send(message) {
-            Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(message)) => {
-                let started = Instant::now();
-                let disconnected = self.sender.send(message).is_err();
-                let mut state = self
-                    .shared
-                    .0
-                    .lock()
-                    .map_err(|_| DenseStreamError::StatePoisoned)?;
-                state.report.backpressure_count = state.report.backpressure_count.saturating_add(1);
-                state.report.backpressure_duration = state
-                    .report
-                    .backpressure_duration
-                    .saturating_add(started.elapsed());
-                if disconnected {
-                    rollback_submission(&mut state, id);
-                    self.shared.1.notify_all();
-                    Err(DenseStreamError::WorkerDisconnected)
-                } else {
-                    Ok(())
+            match state.admit(id.clone(), resident) {
+                PrefetchAdmission::Coalesced => {
+                    if backpressured {
+                        state.record_backpressure(started.elapsed());
+                    }
+                    return Ok(());
                 }
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                let mut state = self
-                    .shared
-                    .0
-                    .lock()
-                    .map_err(|_| DenseStreamError::StatePoisoned)?;
-                rollback_submission(&mut state, id);
-                self.shared.1.notify_all();
-                Err(DenseStreamError::WorkerDisconnected)
+                PrefetchAdmission::AtCapacity => {
+                    backpressured = true;
+                    drop(
+                        self.shared
+                            .1
+                            .wait(state)
+                            .map_err(|_| DenseStreamError::StatePoisoned)?,
+                    );
+                }
+                PrefetchAdmission::Admitted(work) => {
+                    if backpressured {
+                        state.record_backpressure(started.elapsed());
+                    }
+                    if self.sender.send(WorkerMessage::WorkAvailable).is_ok() {
+                        return Ok(());
+                    }
+                    state.rollback_admission(&work)?;
+                    self.shared.1.notify_all();
+                    return Err(DenseStreamError::WorkerDisconnected);
+                }
             }
         }
     }
@@ -283,38 +209,25 @@ impl BackgroundLayerPrefetch {
         id: &OffloadUnitId,
     ) -> Result<ResidentUnitLease, DenseStreamError> {
         let started = Instant::now();
-        let mut waited = false;
         let mut state = self
             .shared
             .0
             .lock()
             .map_err(|_| DenseStreamError::StatePoisoned)?;
-        if state.in_flight.contains(id) {
-            state.report.in_flight_at_demand = state.report.in_flight_at_demand.saturating_add(1);
-        }
-        while state.queued.contains(id) || state.in_flight.contains(id) {
-            waited = true;
+        let waited = state.observe_demand(id).is_pending();
+        while state.is_pending(id) {
             state = self
                 .shared
                 .1
                 .wait(state)
                 .map_err(|_| DenseStreamError::StatePoisoned)?;
         }
-        if let Some(message) = state.failures.remove(id) {
+        let resolution = state.resolve_demand(id, waited.then(|| started.elapsed()))?;
+        if let PrefetchDemandResolution::Failed(message) = resolution {
             return Err(DenseStreamError::PrefetchFailed {
                 id: id.clone(),
                 message,
             });
-        }
-        if state.completed.remove(id) {
-            state.report.ready_before_demand = state.report.ready_before_demand.saturating_add(1);
-        }
-        if waited {
-            state.report.demand_waits = state.report.demand_waits.saturating_add(1);
-            state.report.demand_wait_duration = state
-                .report
-                .demand_wait_duration
-                .saturating_add(started.elapsed());
         }
         drop(state);
         Ok(self.manager.acquire(id, MemoryTier::Host)?)
@@ -326,24 +239,16 @@ impl BackgroundLayerPrefetch {
             .0
             .lock()
             .map_err(|_| DenseStreamError::StatePoisoned)?;
-        state.generation = state.generation.wrapping_add(1);
-        let cancelled = state.queued.len() as u64;
-        state.report.cancelled = state.report.cancelled.saturating_add(cancelled);
+        state.cancel_all()?;
         self.shared.1.notify_all();
-        while !state.queued.is_empty() || !state.in_flight.is_empty() {
+        while !state.is_idle() {
             state = self
                 .shared
                 .1
                 .wait(state)
                 .map_err(|_| DenseStreamError::StatePoisoned)?;
         }
-        let failure = state
-            .failures
-            .iter()
-            .next()
-            .map(|(id, message)| (id.clone(), message.clone()));
-        state.completed.clear();
-        state.failures.clear();
+        let failure = state.finish_cancellation()?;
         self.shared.1.notify_all();
         match failure {
             Some((id, message)) => Err(DenseStreamError::PrefetchFailed { id, message }),
@@ -357,7 +262,7 @@ impl BackgroundLayerPrefetch {
             .0
             .lock()
             .map_err(|_| DenseStreamError::StatePoisoned)?
-            .report)
+            .report())
     }
 
     #[cfg(test)]
@@ -367,7 +272,7 @@ impl BackgroundLayerPrefetch {
             .0
             .lock()
             .map_err(|_| DenseStreamError::StatePoisoned)?;
-        while !state.queued.is_empty() || !state.in_flight.is_empty() {
+        while !state.is_idle() {
             state = self
                 .shared
                 .1
@@ -375,12 +280,6 @@ impl BackgroundLayerPrefetch {
                 .map_err(|_| DenseStreamError::StatePoisoned)?;
         }
         Ok(())
-    }
-}
-
-fn rollback_submission(state: &mut SharedState, id: &OffloadUnitId) {
-    if state.queued.remove(id) {
-        state.report.submitted = state.report.submitted.saturating_sub(1);
     }
 }
 
@@ -397,26 +296,24 @@ impl Drop for BackgroundLayerPrefetch {
 fn worker_loop(
     operation: HostPrefetchOperation,
     receiver: mpsc::Receiver<WorkerMessage>,
-    shared: Arc<(Mutex<SharedState>, Condvar)>,
+    shared: Arc<(Mutex<PrefetchExecutionState<String>>, Condvar)>,
 ) {
     while let Ok(message) = receiver.recv() {
-        let WorkerMessage::Prefetch { generation, id } = message else {
+        let WorkerMessage::WorkAvailable = message else {
             break;
         };
-        {
+        let work = {
             let Ok(mut state) = shared.0.lock() else {
                 break;
             };
-            state.queued.remove(&id);
-            if generation != state.generation {
-                shared.1.notify_all();
-                continue;
-            }
-            state.in_flight.insert(id.clone());
-            state.report.started = state.report.started.saturating_add(1);
+            let work = state.begin_next();
             shared.1.notify_all();
-        }
-        let result = catch_unwind(AssertUnwindSafe(|| operation(&id)))
+            work
+        };
+        let Some(work) = work else {
+            continue;
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| operation(work.id())))
             .map_err(|payload| {
                 payload
                     .downcast_ref::<&str>()
@@ -428,21 +325,9 @@ fn worker_loop(
         let Ok(mut state) = shared.0.lock() else {
             break;
         };
-        state.in_flight.remove(&id);
-        if generation != state.generation {
-            state.report.cancelled = state.report.cancelled.saturating_add(1);
-        } else {
-            match result {
-                Ok(_) => {
-                    state.completed.insert(id);
-                    state.report.completed = state.report.completed.saturating_add(1);
-                }
-                Err(error) => {
-                    state.failures.insert(id, error);
-                    state.report.failed = state.report.failed.saturating_add(1);
-                }
-            }
-        }
+        state
+            .complete(work, result)
+            .expect("worker completion matches core-owned admitted work");
         shared.1.notify_all();
     }
 }
@@ -479,6 +364,9 @@ pub enum DenseStreamError {
     /// A residency transition failed.
     #[error(transparent)]
     Residency(#[from] crate::runtime::residency::manager::ResidencyError),
+    /// Backend-neutral prefetch lifecycle misuse.
+    #[error(transparent)]
+    PrefetchState(#[from] crate::core::residency::PrefetchStateError),
     /// Worker creation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -688,9 +576,9 @@ mod tests {
         let lease = prefetch.acquire(&id).unwrap();
         assert_eq!(lease.host_buffer("weight").unwrap().shape().unwrap(), [2]);
         let report = prefetch.report().unwrap();
-        assert_eq!(report.submitted, 1);
-        assert!(report.coalesced >= 1);
-        assert_eq!(report.completed, 1);
+        assert_eq!(report.submitted(), 1);
+        assert!(report.coalesced() >= 1);
+        assert_eq!(report.completed(), 1);
     }
 
     #[test]
@@ -727,13 +615,13 @@ mod tests {
         let lease = prefetch.acquire(&ids[2]).unwrap();
         assert_eq!(lease.host_buffer("weight").unwrap().shape().unwrap(), [2]);
         let report = prefetch.report().unwrap();
-        assert_eq!(report.queue_capacity, 1);
-        assert_eq!(report.peak_queue_occupancy, 1);
-        assert_eq!(report.submitted, 3);
-        assert_eq!(report.started, 3);
-        assert_eq!(report.completed, 3);
-        assert_eq!(report.failed, 0);
-        assert!(report.backpressure_count >= 1);
+        assert_eq!(report.queue_capacity(), 1);
+        assert_eq!(report.peak_queue_occupancy(), 1);
+        assert_eq!(report.submitted(), 3);
+        assert_eq!(report.started(), 3);
+        assert_eq!(report.completed(), 3);
+        assert_eq!(report.failed(), 0);
+        assert!(report.backpressure_count() >= 1);
     }
 
     #[test]
@@ -757,7 +645,7 @@ mod tests {
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
         thread::spawn(move || cancelled_tx.send(cancelling.cancel()).unwrap());
         let mut state = shared.0.lock().unwrap();
-        while state.generation == 0 {
+        while state.generation() == 0 {
             state = shared.1.wait(state).unwrap();
         }
         drop(state);
@@ -765,10 +653,10 @@ mod tests {
         cancelled_rx.recv().unwrap().unwrap();
 
         let report = prefetch.report().unwrap();
-        assert_eq!(report.started, 1);
-        assert_eq!(report.completed, 0);
-        assert_eq!(report.cancelled, 2);
-        assert_eq!(report.failed, 0);
+        assert_eq!(report.started(), 1);
+        assert_eq!(report.completed(), 0);
+        assert_eq!(report.cancelled(), 2);
+        assert_eq!(report.failed(), 0);
     }
 
     #[test]
@@ -785,7 +673,7 @@ mod tests {
         let report = manager.report().unwrap();
         assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 0);
         assert!(!report.units()[0].host_resident());
-        assert_eq!(prefetch.report().unwrap().failed, 1);
+        assert_eq!(prefetch.report().unwrap().failed(), 1);
 
         let (_directory, manager, ids) = i32_manager(1, 8);
         let operation: HostPrefetchOperation = Arc::new(|_| -> Result<(), String> {
@@ -799,7 +687,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("controlled worker panic"));
-        assert_eq!(prefetch.report().unwrap().failed, 1);
+        assert_eq!(prefetch.report().unwrap().failed(), 1);
         assert!(!manager.is_resident(&ids[0], MemoryTier::Host).unwrap());
     }
 
@@ -815,7 +703,7 @@ mod tests {
 
         prefetch.submit(&ids[0]).unwrap();
         prefetch.wait_idle().unwrap();
-        assert_eq!(prefetch.report().unwrap().evicted_before_use, 1);
+        assert_eq!(prefetch.report().unwrap().evicted_before_use(), 1);
     }
 
     #[test]
@@ -828,7 +716,7 @@ mod tests {
             disconnected.submit(&ids[0]),
             Err(DenseStreamError::WorkerDisconnected)
         ));
-        assert_eq!(disconnected.report().unwrap().submitted, 0);
+        assert_eq!(disconnected.report().unwrap().submitted(), 0);
         disconnected.cancel().unwrap();
 
         let (_directory, manager, ids) = i32_manager(1, 8);
@@ -848,7 +736,7 @@ mod tests {
             finished_tx.send(()).unwrap();
         });
         let mut state = shared.0.lock().unwrap();
-        while state.generation == 0 {
+        while state.generation() == 0 {
             state = shared.1.wait(state).unwrap();
         }
         drop(state);

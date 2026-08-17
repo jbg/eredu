@@ -11,11 +11,13 @@ use std::{
 
 use safemlx::{transforms::async_eval, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    api::{GenerationConfigOverrides, LoadedModel},
+    api::LoadedModel,
     runtime::{
         chat::ChatTemplateRequest,
+        generation::sampler::GenerationSampler,
         media::input::{InputPart, ModelInput},
     },
+    GenerationConfigOverrides,
 };
 
 /// Receives one UTF-8 text fragment. The bytes are valid only during the call.
@@ -137,7 +139,7 @@ fn generate(
         input,
         prng_key,
         stream,
-        settings.sampler(),
+        GenerationSampler::from_resolved(settings),
     );
 
     let mut current = generator

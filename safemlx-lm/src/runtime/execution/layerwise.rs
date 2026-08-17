@@ -20,6 +20,7 @@ use crate::core::cache::{
 };
 
 use crate::{
+    core::residency::BackgroundPrefetchReport,
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
         ResidencyLedgerError, ResidencyPolicy, TransferDirection,
@@ -39,8 +40,7 @@ use crate::{
     runtime::checkpoint::store::{MemoryWeightStore, SafetensorsWeightStore, WeightStore},
     runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
     runtime::residency::dense_stream::{
-        BackgroundLayerPrefetch, BackgroundPrefetchReport, DenseDiskStreamLoadOptions,
-        DENSE_TRANSFER_WINDOW,
+        BackgroundLayerPrefetch, DenseDiskStreamLoadOptions, DENSE_TRANSFER_WINDOW,
     },
     runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyError, ResidencyManager,
@@ -6371,7 +6371,7 @@ mod tests {
             );
         }
         let report = streamed.dense_stream_report().unwrap().unwrap();
-        assert!(report.background().submitted >= 3);
+        assert!(report.background().submitted() >= 3);
         assert!(report.host_layers().current_layer_count() <= 1);
         assert!(report.device_layers().current_layer_count() <= DENSE_TRANSFER_WINDOW);
         assert_eq!(report.host_layers().peak_layer_count(), 1);

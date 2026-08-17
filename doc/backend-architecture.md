@@ -36,7 +36,9 @@ Core owns concepts whose meaning does not depend on tensor representation:
 - parallel axes, coordinates, membership, and portable placement descriptions;
 - weight-residency policy, atomic ownership/capacity transitions, protected
   windows, deterministic eviction, exact transfer generations, accounting, and
-  serialized reports.
+  serialized reports; and bounded prefetch FIFO admission, duplicate
+  coalescing, cancellation generations, exact operation disposition, failure
+  recovery, demand handoff, and worker telemetry.
 - process-wide live-cache membership, multi-resource admission, exact
   reservation ownership, occupancy reports, and high-water accounting;
 - stable cache block/rank identity, logical tier vocabulary,
@@ -191,6 +193,26 @@ transfer sources remain in the adapter; their stable generations are allocated
 and resolved by core. Allocator samples obtained by `backend::mlx::residency`
 are recorded into the neutral telemetry schema.
 
+Dense disk-to-host prefetching uses `PrefetchExecutionState` as its only
+logical coordinator. Core owns the bounded FIFO and decides admission,
+coalescing, ordering, cancellation, rollback, exact completion publication,
+retry supersession, and demand-visible failure delivery. The MLX adapter owns
+one worker thread and sends it only work-available or shutdown notifications;
+the channel is not a second queue or capacity authority. For each item selected
+by core, the worker invokes `ResidencyManager` to map SafeTensors payloads and
+construct host storage, then returns the structured outcome to the same exact
+core work ticket. A different backend can reuse every transition and supply a
+different materializer, I/O queue, and completion mechanism.
+
+Paged-cache backing I/O uses the separate core `CacheIoExecutionState`.
+Exact read/write keys are prepared once, duplicate callers join that owner,
+bounded admission is decided before the adapter channel is notified, and core
+tracks queued versus executing cancellation through exact completion. The MLX
+adapter retains task payloads, completion condition variables, filesystem
+operations, SafeTensors serialization, mapped buffers, and cleanup. Its
+channel transports already-admitted opaque tasks but no longer decides queue
+capacity, coalescing, cancellation phase, or result publication.
+
 ## Coupling still present
 
 The current boundary leaves these components MLX-coupled:
@@ -200,8 +222,8 @@ The current boundary leaves these components MLX-coupled:
   telemetry adapters;
 - concrete topology device assignment, communicator construction, collectives,
   and tensor movement;
-- per-block MLX cache resources, native completion observation, transfer/disk
-  worker scheduling, prompt-cache filesystem publication, safetensors payload
+- per-block MLX cache resources, native completion observation, physical
+  transfer/disk worker execution, prompt-cache filesystem publication, safetensors payload
   mapping and materialization (container/header validation, the transition
   protocol, block registration, exact leases, access ordering, protected
   prefixes, victim selection, mutable tails, prompt identity, topology,
@@ -209,8 +231,10 @@ The current boundary leaves these components MLX-coupled:
   vocabulary, layer geometry, fixed-state policy, and pure validation are
   already core-owned);
 - weight array/host-buffer materialization, native transfer events, retained
-  source mappings, and physical-capacity queries (the corresponding ownership,
-  admission, eviction, window, lease, and generation state is now in core);
+  source mappings, physical-capacity queries, and concrete disk-to-host worker
+  execution (the corresponding ownership, bounded FIFO admission, coalescing,
+  cancellation, failure recovery, eviction, window, lease, and generation
+  state is now in core);
 - architecture-specific checkpoint binding/weight recipes, mapped payload
   stores, GGUF decoding, and MLX array materialization (artifact detection,
   model-family resolution, neutral catalogs, and route planning are core-owned);

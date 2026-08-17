@@ -97,6 +97,14 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::core::residency::UnitResidencyReport>(),
     );
     assert_eq!(
+        TypeId::of::<safemlx_lm::BackgroundPrefetchReport>(),
+        TypeId::of::<safemlx_lm::core::residency::BackgroundPrefetchReport>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CacheIoExecutionState>(),
+        TypeId::of::<safemlx_lm::core::cache::CacheIoExecutionState>(),
+    );
+    assert_eq!(
         TypeId::of::<safemlx_lm::CachePoolLimits>(),
         TypeId::of::<safemlx_lm::core::cache::CachePoolLimits>(),
     );

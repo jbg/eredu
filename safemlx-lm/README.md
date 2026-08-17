@@ -81,6 +81,11 @@ eviction decisions, exact transfer generations, and accounting likewise come
 directly from `safemlx-lm-core`. The MLX facade mirrors those transitions with
 concrete arrays and host buffers and owns native materialization, event/source
 retention, physical-capacity queries, and allocator sampling.
+Bounded disk-to-host prefetch ordering, admission, duplicate coalescing,
+cancellation fencing, rollback, failure recovery, demand handoff, and telemetry
+also come from core. The MLX worker channel only wakes the concrete
+SafeTensors-to-host materializer; it does not own another request queue or
+lifecycle table.
 Aggregate live-cache admission is also canonical core state: the MLX pager
 registers each cache session with `CacheResidencyPool` and holds core RAII
 reservations while device/host transfers or disk writes own resources.
@@ -92,6 +97,10 @@ The generic core `CacheBlockStorage` state machine also owns legal device,
 host, writing, backed, disk, and reading transitions. Its opaque resource slots
 hold MLX arrays, host buffers, disk locations, and native completion tickets;
 the adapter cannot define a parallel phase enum.
+Core `CacheIoExecutionState` also owns exact-key joining, bounded disk-worker
+admission, queued/in-flight cancellation, and completion disposition. The MLX
+cache adapter retains only task payloads, condition variables, physical worker
+execution, SafeTensors I/O, mappings, and cleanup.
 
 The same is true of prompt-cache model/prefix identity, topology, versioned
 manifests, fingerprinting, compatibility, and catalog validation. MLX cache

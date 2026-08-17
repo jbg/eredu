@@ -13,6 +13,13 @@ use std::{
     time::Duration,
 };
 
+mod prefetch;
+
+pub use prefetch::{
+    BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,
+    PrefetchDemandResolution, PrefetchExecutionState, PrefetchStateError, PrefetchWork,
+};
+
 /// Current serialized residency-plan schema.
 pub const OFFLOAD_PLAN_SCHEMA_VERSION: u32 = 1;
 

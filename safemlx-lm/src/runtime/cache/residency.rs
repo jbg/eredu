@@ -11,9 +11,8 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, SyncSender, TrySendError},
-        Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -32,14 +31,16 @@ use sha2::{Digest, Sha256};
 use crate::{
     core::cache::{
         prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, CacheBlockId,
-        CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheIoOperation,
-        CacheIoOperationKey, CacheIoOperationKind, CacheLifecycleError, CachePolicyError,
-        CachePoolError, CachePoolLimits, CachePoolMembership, CachePoolReservation,
-        CachePoolResource, CachePoolUsage, CacheRankIdentity, CacheRepresentation,
-        CacheResidencyPool, CacheStorageError, CacheStoragePhase, CacheTier, MutableCacheTail,
-        PromptCacheBlock, PromptCacheDescriptor, PromptCacheError, PromptCacheManifest,
-        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor, StateTensorOwner,
-        StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
+        CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheIoAdmission,
+        CacheIoCompletionDisposition, CacheIoExecutionState, CacheIoExecutionStateError,
+        CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind, CacheIoPreparation,
+        CacheIoStartDisposition, CacheLifecycleError, CachePolicyError, CachePoolError,
+        CachePoolLimits, CachePoolMembership, CachePoolReservation, CachePoolResource,
+        CachePoolUsage, CacheRankIdentity, CacheRepresentation, CacheResidencyPool,
+        CacheStorageError, CacheStoragePhase, CacheTier, MutableCacheTail, PromptCacheBlock,
+        PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheStateTensor, StateTensorOwner, StateTensorRole,
+        PROMPT_CACHE_SCHEMA_VERSION,
     },
     core::residency::CacheEvictionPolicy,
 };
@@ -1040,10 +1041,10 @@ impl DiskTicket {
     }
 
     fn cancel(&self) -> bool {
-        let Ok(_space) = self.shared.space.lock() else {
+        let Ok(mut execution) = self.shared.execution.lock() else {
             return false;
         };
-        let cancelled = self.completion.cancel();
+        let cancelled = execution.cancel(&self.key) && self.completion.cancel();
         self.shared.space_available.notify_all();
         cancelled
     }
@@ -1055,7 +1056,7 @@ impl DiskTicket {
 
 struct DiskSubmission {
     ticket: DiskTicket,
-    sender: SyncSender<DiskRequest>,
+    sender: mpsc::Sender<DiskRequest>,
     shared: Arc<DiskWorkerShared>,
     unsent: Option<DiskRequest>,
     joined: bool,
@@ -1072,9 +1073,9 @@ struct DiskSubmissionOutcome {
 impl DiskSubmission {
     fn enqueue(mut self) -> Result<DiskSubmissionOutcome, CacheResidencyError> {
         let mut backpressure = false;
-        if let Some(mut request) = self.unsent.take() {
-            let mut space = match self.shared.space.lock() {
-                Ok(space) => space,
+        if let Some(request) = self.unsent.take() {
+            let mut execution = match self.shared.execution.lock() {
+                Ok(execution) => execution,
                 Err(_) => {
                     drop(request);
                     self.ticket.completion.release_task_resources();
@@ -1082,25 +1083,23 @@ impl DiskSubmission {
                 }
             };
             loop {
-                if self.ticket.completion.is_ready() {
-                    drop(request);
-                    self.ticket.completion.release_task_resources();
-                    break;
-                }
-                match self.sender.try_send(request) {
-                    Ok(()) => {
-                        let occupancy = self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1;
-                        update_atomic_max(
-                            &self.shared.peak_occupancy,
-                            occupancy.min(self.shared.capacity),
-                        );
+                match execution.admit(&self.ticket.key)? {
+                    CacheIoAdmission::Admitted => {
+                        if self.sender.send(request).is_err() {
+                            execution.rollback_admission(&self.ticket.key)?;
+                            self.ticket
+                                .completion
+                                .finish(Err(CacheResidencyError::Runtime(
+                                    "live cache disk worker stopped".into(),
+                                )));
+                            self.ticket.completion.release_task_resources();
+                        }
                         break;
                     }
-                    Err(TrySendError::Full(returned)) => {
-                        request = returned;
+                    CacheIoAdmission::AtCapacity => {
                         backpressure = true;
-                        space = match self.shared.space_available.wait(space) {
-                            Ok(space) => space,
+                        execution = match self.shared.space_available.wait(execution) {
+                            Ok(execution) => execution,
                             Err(_) => {
                                 drop(request);
                                 self.ticket.completion.release_task_resources();
@@ -1108,22 +1107,24 @@ impl DiskSubmission {
                             }
                         };
                     }
-                    Err(TrySendError::Disconnected(_)) => {
-                        self.ticket
-                            .completion
-                            .finish(Err(CacheResidencyError::Runtime(
-                                "live cache disk worker stopped".into(),
-                            )));
+                    CacheIoAdmission::Cancelled => {
+                        drop(request);
                         self.ticket.completion.release_task_resources();
                         break;
                     }
                 }
             }
+            drop(execution);
         }
         Ok(DiskSubmissionOutcome {
             joined: self.joined,
             backpressure,
-            peak_occupancy: self.shared.peak_occupancy.load(Ordering::Acquire),
+            peak_occupancy: self
+                .shared
+                .execution
+                .lock()
+                .map_err(|_| CacheResidencyError::ManagerPoisoned)?
+                .peak_queued(),
         })
     }
 }
@@ -1143,23 +1144,17 @@ impl Drop for DiskSubmission {
 #[derive(Debug)]
 struct DiskWorkerShared {
     in_flight: Mutex<HashMap<CacheIoOperationKey, Arc<DiskCompletion>>>,
-    space: Mutex<()>,
+    execution: Mutex<CacheIoExecutionState>,
     space_available: Condvar,
-    queued: AtomicUsize,
-    peak_occupancy: AtomicUsize,
-    capacity: usize,
 }
 
 impl DiskWorkerShared {
-    fn new(capacity: usize) -> Self {
-        Self {
+    fn new(capacity: usize) -> Result<Self, CacheIoExecutionStateError> {
+        Ok(Self {
             in_flight: Mutex::new(HashMap::new()),
-            space: Mutex::new(()),
+            execution: Mutex::new(CacheIoExecutionState::new(capacity)?),
             space_available: Condvar::new(),
-            queued: AtomicUsize::new(0),
-            peak_occupancy: AtomicUsize::new(0),
-            capacity,
-        }
+        })
     }
 }
 
@@ -1168,27 +1163,35 @@ fn retire_disk_completion(
     key: &CacheIoOperationKey,
     completion: &Arc<DiskCompletion>,
 ) {
-    if let Ok(mut in_flight) = shared.in_flight.lock() {
-        if in_flight
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, completion))
-        {
-            in_flight.remove(key);
+    let retired = if let Ok(mut execution) = shared.execution.lock() {
+        execution.retire(key).unwrap_or(false)
+    } else {
+        false
+    };
+    if retired {
+        shared.space_available.notify_all();
+        if let Ok(mut in_flight) = shared.in_flight.lock() {
+            if in_flight
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, completion))
+            {
+                in_flight.remove(key);
+            }
         }
     }
 }
 
 #[derive(Debug)]
 struct DiskWorker {
-    sender: SyncSender<DiskRequest>,
+    sender: mpsc::Sender<DiskRequest>,
     handle: Mutex<Option<JoinHandle<()>>>,
     shared: Arc<DiskWorkerShared>,
 }
 
 impl DiskWorker {
     fn new(capacity: usize) -> Result<Self, CacheResidencyError> {
-        let (sender, receiver) = mpsc::sync_channel::<DiskRequest>(capacity);
-        let shared = Arc::new(DiskWorkerShared::new(capacity));
+        let (sender, receiver) = mpsc::channel::<DiskRequest>();
+        let shared = Arc::new(DiskWorkerShared::new(capacity)?);
         let worker_shared = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("safemlx-cache-disk".into())
@@ -1200,15 +1203,29 @@ impl DiskWorker {
                             task,
                             completion,
                         } => {
-                            if let Ok(_space) = worker_shared.space.lock() {
-                                worker_shared.queued.fetch_sub(1, Ordering::AcqRel);
-                                worker_shared.space_available.notify_all();
-                            }
-                            if completion.is_ready() {
-                                drop(task);
-                                completion.release_task_resources();
-                                retire_disk_completion(&worker_shared, &key, &completion);
-                                continue;
+                            let start = worker_shared
+                                .execution
+                                .lock()
+                                .map_err(|_| CacheResidencyError::ManagerPoisoned)
+                                .and_then(|mut execution| {
+                                    execution.begin(&key).map_err(Into::into)
+                                });
+                            worker_shared.space_available.notify_all();
+                            match start {
+                                Ok(CacheIoStartDisposition::Execute) => {}
+                                Ok(CacheIoStartDisposition::Discard) => {
+                                    drop(task);
+                                    completion.release_task_resources();
+                                    retire_disk_completion(&worker_shared, &key, &completion);
+                                    continue;
+                                }
+                                Err(error) => {
+                                    drop(task);
+                                    completion.finish(Err(error));
+                                    completion.release_task_resources();
+                                    retire_disk_completion(&worker_shared, &key, &completion);
+                                    continue;
+                                }
                             }
                             let mut write_commit = None;
                             let result = catch_unwind(AssertUnwindSafe(|| match *task {
@@ -1260,7 +1277,16 @@ impl DiskWorker {
                             // point. Release their reservation before waking
                             // logical completion waiters.
                             drop(write_commit);
-                            if completion.is_ready() {
+                            let disposition = worker_shared
+                                .execution
+                                .lock()
+                                .map_err(|_| CacheResidencyError::ManagerPoisoned)
+                                .and_then(|mut execution| {
+                                    execution.complete(&key).map_err(Into::into)
+                                });
+                            if !matches!(disposition, Ok(CacheIoCompletionDisposition::Publish))
+                                || completion.is_ready()
+                            {
                                 if let Ok(DiskResult::Write(location)) = result {
                                     if !location.persistent {
                                         let _ = fs::remove_file(location.path);
@@ -1304,10 +1330,19 @@ impl DiskWorker {
     ) -> Result<DiskSubmission, CacheResidencyError> {
         let mut in_flight = self
             .shared
+            .execution
+            .lock()
+            .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
+        let preparation = in_flight.prepare(key.clone());
+        let mut completions = self
+            .shared
             .in_flight
             .lock()
             .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
-        if let Some(completion) = in_flight.get(&key) {
+        if preparation == CacheIoPreparation::Joined {
+            let completion = completions
+                .get(&key)
+                .expect("core joined key has an adapter completion");
             if let DiskTask::Write {
                 commit: Some(commit),
                 ..
@@ -1329,7 +1364,8 @@ impl DiskWorker {
             });
         }
         let completion = Arc::new(DiskCompletion::default());
-        in_flight.insert(key.clone(), Arc::clone(&completion));
+        completions.insert(key.clone(), Arc::clone(&completion));
+        drop(completions);
         drop(in_flight);
         let request = DiskRequest::Operation {
             key: key.clone(),
@@ -1406,16 +1442,6 @@ impl DiskWorker {
 
     fn retire(&self, ticket: &DiskTicket) {
         retire_disk_completion(&self.shared, &ticket.key, &ticket.completion);
-    }
-}
-
-fn update_atomic_max(target: &AtomicUsize, value: usize) {
-    let mut current = target.load(Ordering::Acquire);
-    while value > current {
-        match target.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
     }
 }
 
@@ -5254,6 +5280,9 @@ pub enum CacheResidencyError {
     /// Backend-neutral physical storage transition failed.
     #[error(transparent)]
     Storage(#[from] CacheStorageError),
+    /// Backend-neutral cache I/O admission or completion lifecycle failed.
+    #[error(transparent)]
+    IoExecution(#[from] CacheIoExecutionStateError),
     /// Backend-neutral prompt-cache identity or catalog validation failed.
     #[error(transparent)]
     PromptCache(#[from] PromptCacheError),

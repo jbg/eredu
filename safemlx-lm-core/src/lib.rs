@@ -52,6 +52,10 @@ pub use generation::{
     SemanticEvent, SpeculativeCommitPlan, SpeculativeRound, SpeculativeTail, TokenCommit,
     TokenTerminalSignals,
 };
+pub use residency::{
+    BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,
+    PrefetchDemandResolution, PrefetchExecutionState, PrefetchStateError, PrefetchWork,
+};
 pub use speculative::{
     cancel_pending_verification, propose_block, resolve_commit_and_publish,
     resolve_optimistic_branch, resolve_round, submit_verification_transaction,
