@@ -88,7 +88,7 @@ fn run_prepared_chat_mtp_batch<'a, B, S>(
     options: MtpSchedulerOptions,
 ) -> Result<PreparedChatMtpBatchOutput, Exception>
 where
-    B: crate::runtime::generation::speculative::MtpBackend,
+    B: crate::runtime::generation::speculative::MlxSpeculativeRuntime<'a>,
     S: SpeculativeSampler + Clone + 'a,
 {
     let mut scheduler = MtpScheduler::new(backend, streams, options)?;
@@ -159,7 +159,7 @@ fn model_mtp_cache(cache: &mut ModelCache) -> Option<&mut ModelCache> {
 
 struct ExternalMtpBatch<'a, B, S>
 where
-    B: crate::runtime::generation::speculative::MtpBackend,
+    B: crate::runtime::generation::speculative::MlxSpeculativeRuntime<'a>,
 {
     lanes: &'a mut [ModelCache],
     cache_for_lane: fn(&mut ModelCache) -> Option<&mut B::Cache>,
@@ -176,7 +176,7 @@ fn run_external_mtp_batch<'a, B, S>(
     batch: ExternalMtpBatch<'a, B, S>,
 ) -> Result<MtpBatchOutput, Exception>
 where
-    B: crate::runtime::generation::speculative::MtpBackend,
+    B: crate::runtime::generation::speculative::MlxSpeculativeRuntime<'a>,
     S: SpeculativeSampler + Clone + 'a,
 {
     let ExternalMtpBatch {
@@ -263,7 +263,7 @@ fn nemotron_mtp_cache(cache: &mut ModelCache) -> Option<&mut nemotron_h::Cache> 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_embedded_mtp_batch<'a, B, C, S>(
+fn run_embedded_mtp_batch<'a, B, C: 'a, S>(
     backend: &'a mut B,
     lanes: &'a mut [ModelCache],
     cache_for_lane: fn(&mut ModelCache) -> Option<&mut C>,
@@ -274,7 +274,8 @@ fn run_embedded_mtp_batch<'a, B, C, S>(
     stream: &'a Stream,
 ) -> Result<MtpBatchOutput, Exception>
 where
-    B: crate::runtime::generation::speculative::MtpBackend<Cache = C>,
+    B: crate::runtime::generation::speculative::MlxSpeculativeRuntime<'a>
+        + safemlx_lm_core::SpeculativeExecutor<Cache = C>,
     S: SpeculativeSampler + Clone + 'a,
 {
     let streams = MtpExecutionStreams::single(stream);

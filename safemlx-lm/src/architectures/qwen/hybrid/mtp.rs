@@ -1,19 +1,22 @@
 //! Qwen3-Next and Qwen3.5/3.6 adapters for embedded MTP layers.
 
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
+use safemlx_lm_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
 
 use crate::{
     api::{
         input::{self, ModelInput},
         qwen3_5::{Cache, LayerCache, Model, QwenMtpStepOutput},
     },
+    backend::mlx::{
+        speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+        MlxModelInput,
+    },
     core::generation::{
         FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
     },
     runtime::generation::sampler::SpeculativeSampler,
-    runtime::generation::speculative::{
-        self as mtp, MtpBackend, MtpCommit, MtpExecutionStreams, MtpPrefill, MtpSemanticState,
-    },
+    runtime::generation::speculative::{self as mtp, MtpComponentTimings, MtpSemanticState},
 };
 
 pub(crate) trait QwenMtpTarget {
@@ -171,48 +174,64 @@ impl<'a, T: QwenMtpTarget> QwenMtpBackend<'a, T> {
     }
 }
 
-impl<T: QwenMtpTarget> MtpBackend for QwenMtpBackend<'_, T> {
+impl<T: QwenMtpTarget> SpeculativeExecutor for QwenMtpBackend<'_, T> {
+    type Input = MlxModelInput;
     type Cache = Cache;
     type TargetState = QwenTargetState;
     type DraftState = QwenDraftState;
     type CacheCheckpoint = Cache;
     type Verification = QwenVerification;
+    type Logits = Array;
+    type Context<'a>
+        = MtpExecutionStreams<'a>
+    where
+        Self: 'a;
+    type Completion = MlxSpeculativeCompletion;
+    type Telemetry = MtpComponentTimings;
+    type Error = Exception;
 
-    fn max_draft_tokens(&self) -> usize {
+    fn max_proposals(&self) -> usize {
         usize::from(self.target.mtp_layer_count() > 0)
     }
 
-    fn prefill(
+    fn prefill<'context>(
         &mut self,
-        input: ModelInput<'_>,
+        input: MlxModelInput,
         cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<MtpPrefill<Self::TargetState>, Exception> {
-        let tokens = input::text_token_ids(input, stream)?;
-        let output = self.target.prefill_mtp_target(input, cache, stream)?;
-        let sequence = output.logits.dim(-2);
-        if sequence == 0 {
-            return Err(Exception::custom(
-                "Qwen MTP input must contain at least one token",
-            ));
-        }
-        self.prefill_draft_cache(&output, &tokens, cache, stream)?;
-        let logits = output
-            .logits
-            .try_index_device((.., sequence - 1, ..), stream)?;
-        let state = Self::state_at(&output, sequence - 1, &cache.mtp_layers, stream)?;
-        Ok(MtpPrefill {
-            logits,
-            state,
-            evaluated_tokens: sequence as usize,
+        streams: MtpExecutionStreams<'context>,
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
+    where
+        Self: 'context,
+    {
+        let stream = streams.target();
+        input.with_borrowed(|input| {
+            let tokens = input::text_token_ids(input, stream)?;
+            let output = self.target.prefill_mtp_target(input, cache, stream)?;
+            let sequence = output.logits.dim(-2);
+            if sequence == 0 {
+                return Err(Exception::custom(
+                    "Qwen MTP input must contain at least one token",
+                ));
+            }
+            self.prefill_draft_cache(&output, &tokens, cache, stream)?;
+            let logits = output
+                .logits
+                .try_index_device((.., sequence - 1, ..), stream)?;
+            let state = Self::state_at(&output, sequence - 1, &cache.mtp_layers, stream)?;
+            Ok(SpeculativePrefill {
+                logits,
+                state,
+                evaluated_tokens: sequence as usize,
+            })
         })
     }
 
-    fn begin_draft(
+    fn begin_proposal(
         &mut self,
         state: &Self::TargetState,
         _last_token: u32,
-        _stream: &Stream,
+        _proposal_capacity: usize,
+        _streams: MtpExecutionStreams<'_>,
     ) -> Result<Self::DraftState, Exception> {
         Ok(QwenDraftState {
             hidden: state.hidden.clone(),
@@ -220,12 +239,13 @@ impl<T: QwenMtpTarget> MtpBackend for QwenMtpBackend<'_, T> {
         })
     }
 
-    fn draft_logits(
+    fn proposal_logits(
         &mut self,
         state: &mut Self::DraftState,
         last_token: u32,
-        stream: &Stream,
+        streams: MtpExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
+        let stream = streams.draft();
         let token = Array::from_slice(&[last_token], &[1, 1]);
         self.target
             .forward_mtp_drafter(&state.hidden, &token, &mut state.mtp_cache, stream)
@@ -235,16 +255,24 @@ impl<T: QwenMtpTarget> MtpBackend for QwenMtpBackend<'_, T> {
         cache.clone()
     }
 
-    fn verify(
+    fn submit_verification(
         &mut self,
-        input_tokens: &Array,
+        input_tokens: &[u32],
         cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<Self::Verification, Exception> {
-        Ok(QwenVerification {
-            output: self.target.verify_mtp_target(input_tokens, cache, stream)?,
-            inputs: input_tokens.clone(),
-        })
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
+        let mut inputs = Array::from_slice(input_tokens, &[1, input_tokens.len() as i32]);
+        if streams.crosses_devices() {
+            inputs = inputs.copy(streams.target())?;
+        }
+        let output = QwenVerification {
+            output: self
+                .target
+                .verify_mtp_target(&inputs, cache, streams.target())?,
+            inputs,
+        };
+        let completion = MlxSpeculativeCompletion::submit([&output.output.logits])?;
+        Ok(Submission { output, completion })
     }
 
     fn verification_logits(output: &Self::Verification) -> &Array {
@@ -258,8 +286,9 @@ impl<T: QwenMtpTarget> MtpBackend for QwenMtpBackend<'_, T> {
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
-        stream: &Stream,
-    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
+        let stream = streams.target();
         let input_len = output.inputs.dim(1) as usize;
         if verified_inputs == 0 || verified_inputs > input_len {
             return Err(Exception::custom(format!(
@@ -303,7 +332,7 @@ impl<T: QwenMtpTarget> MtpBackend for QwenMtpBackend<'_, T> {
             &cache.mtp_layers,
             stream,
         )?;
-        Ok(MtpCommit {
+        Ok(SpeculativeCommit {
             state,
             replayed_tokens,
         })

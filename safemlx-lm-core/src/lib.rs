@@ -29,6 +29,8 @@ pub mod model;
 pub mod residency;
 /// Transactional fair work scheduler.
 pub mod scheduler;
+/// High-level speculative execution backend contract.
+pub mod speculative;
 /// Parallel topology and placement planning.
 pub mod topology;
 
@@ -49,4 +51,7 @@ pub use generation::{
     MtpRequestPhase, MtpSchedulerOptions, OptimisticReuseDecision, ResolvedGenerationConfig,
     SemanticEvent, SpeculativeCommitPlan, SpeculativeRound, SpeculativeTail, TokenCommit,
     TokenTerminalSignals,
+};
+pub use speculative::{
+    SpeculativeCommit, SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativePrefill,
 };

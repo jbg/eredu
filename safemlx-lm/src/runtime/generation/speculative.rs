@@ -1,4 +1,4 @@
-//! Architecture-independent multi-token prediction and speculative decoding.
+//! MLX speculative sampling and scheduling over the portable executor contract.
 
 use std::{
     cell::Cell,
@@ -12,9 +12,10 @@ use safemlx::{
     error::Exception,
     ops::{indexing::TryIndexOp, maximum, softmax_axis},
     random::{self, RandomState},
-    transforms::{async_eval, async_eval_with_event, eval},
-    Array, Event, Stream, TimedEvaluation,
+    transforms::{async_eval_with_event, eval},
+    Array, Stream, TimedEvaluation,
 };
+use safemlx_lm_core::{Completion, SpeculativeExecutionTopology, SpeculativeExecutor};
 
 use crate::{
     api::{
@@ -26,6 +27,10 @@ use crate::{
         ModelCache, ModelLoadOptions,
     },
     architectures::muse_glimmer::assistant::{self as muse_dflash, MuseGlimmerDFlash},
+    backend::mlx::{
+        speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+        MlxModelInput,
+    },
     core::generation::{
         resolve_optimistic_reuse, FinishReason, GenerationCancellationToken, GenerationSequence,
         MtpCancellationDisposition, MtpConfig, MtpRequestId, MtpRequestLifecycle, MtpRequestPhase,
@@ -54,132 +59,6 @@ pub enum DrafterKind {
     Gemma4Assistant,
     /// Muse-Glimmer anchor-plus-15-mask DFlash assistant.
     MuseGlimmerDFlash,
-}
-
-/// Target and draft streams used by one MTP generation sequence.
-///
-/// A single-stream execution preserves the original behavior. Supplying
-/// distinct streams places target prefill/verification and accepted-token
-/// sampling on `target`, while proposal generation runs on `draft`. Submitted
-/// target verification remains unresolved while eligible draft work runs;
-/// same-device dependencies use backend-ordered completion events, while
-/// cross-device copies retain host synchronization at transfer boundaries.
-#[derive(Debug, Clone, Copy)]
-pub struct MtpExecutionStreams<'a> {
-    target: &'a Stream,
-    draft: &'a Stream,
-    topology: MtpStreamTopology,
-}
-
-/// Relationship between the target and draft execution streams.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub enum MtpStreamTopology {
-    /// Target and draft operations are ordered on one stream.
-    #[default]
-    Single,
-    /// Distinct streams share one device and can overlap without array copies.
-    SameDeviceSplit,
-    /// Distinct streams use different devices and require physical transfers.
-    CrossDeviceSplit,
-}
-
-impl std::fmt::Display for MtpStreamTopology {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Single => "single",
-            Self::SameDeviceSplit => "same-device-split",
-            Self::CrossDeviceSplit => "cross-device-split",
-        })
-    }
-}
-
-impl<'a> MtpExecutionStreams<'a> {
-    /// Creates an execution assignment and classifies its device topology.
-    pub fn new(target: &'a Stream, draft: &'a Stream) -> Result<Self, Exception> {
-        let topology = if target == draft {
-            MtpStreamTopology::Single
-        } else if target.get_device()? == draft.get_device()? {
-            MtpStreamTopology::SameDeviceSplit
-        } else {
-            MtpStreamTopology::CrossDeviceSplit
-        };
-        Ok(Self {
-            target,
-            draft,
-            topology,
-        })
-    }
-
-    /// Creates an assignment in which all MTP work uses one stream.
-    pub const fn single(stream: &'a Stream) -> Self {
-        Self {
-            target: stream,
-            draft: stream,
-            topology: MtpStreamTopology::Single,
-        }
-    }
-
-    /// Returns the stream used for target prefill and verification.
-    pub const fn target(self) -> &'a Stream {
-        self.target
-    }
-
-    /// Returns the stream used for proposal generation.
-    pub const fn draft(self) -> &'a Stream {
-        self.draft
-    }
-
-    /// Returns the relationship between the target and draft streams.
-    pub const fn topology(self) -> MtpStreamTopology {
-        self.topology
-    }
-
-    /// Returns whether target and draft work use different streams.
-    pub const fn is_split(self) -> bool {
-        !matches!(self.topology, MtpStreamTopology::Single)
-    }
-
-    /// Returns whether arrays must be physically transferred between devices.
-    pub const fn crosses_devices(self) -> bool {
-        matches!(self.topology, MtpStreamTopology::CrossDeviceSplit)
-    }
-
-    /// Submits target outputs and orders subsequent draft work after them.
-    ///
-    /// This is only valid for distinct streams on the same device. The
-    /// returned event may be dropped after this call: MLX retains it for the
-    /// queued consumer wait.
-    pub(crate) fn wait_for_target_outputs<'b>(
-        self,
-        outputs: impl IntoIterator<Item = &'b Array>,
-    ) -> Result<Event, Exception> {
-        self.wait_for_same_device_outputs(outputs, self.draft, "target-to-draft")
-    }
-
-    /// Submits draft outputs and orders subsequent target work after them.
-    pub(crate) fn wait_for_draft_outputs<'b>(
-        self,
-        outputs: impl IntoIterator<Item = &'b Array>,
-    ) -> Result<Event, Exception> {
-        self.wait_for_same_device_outputs(outputs, self.target, "draft-to-target")
-    }
-
-    fn wait_for_same_device_outputs<'b>(
-        self,
-        outputs: impl IntoIterator<Item = &'b Array>,
-        consumer: &Stream,
-        direction: &str,
-    ) -> Result<Event, Exception> {
-        if self.topology != MtpStreamTopology::SameDeviceSplit {
-            return Err(Exception::custom(format!(
-                "MTP {direction} event handoff requires distinct streams on one device, got {}",
-                self.topology
-            )));
-        }
-        let completion = async_eval_with_event(outputs)?;
-        completion.wait_on(consumer)?;
-        Ok(completion)
-    }
 }
 
 /// Per-lane target caches for independently progressing MTP text batches.
@@ -384,7 +263,7 @@ pub enum MtpCapability {
 #[derive(Debug, Clone, Default)]
 pub struct MtpStats {
     /// Relationship between the request's target and draft streams.
-    pub stream_topology: MtpStreamTopology,
+    pub stream_topology: SpeculativeExecutionTopology,
     /// Target tokens evaluated during prefill and verification.
     pub target_tokens: usize,
     /// Assistant tokens proposed.
@@ -546,7 +425,7 @@ impl MtpComponentTimingEvaluations {
 #[derive(Debug, Clone, Default)]
 pub struct MtpSchedulerStats {
     /// Relationship between the scheduler's target and draft streams.
-    pub stream_topology: MtpStreamTopology,
+    pub stream_topology: SpeculativeExecutionTopology,
     /// Total scheduler operations.
     pub turns: usize,
     /// Draft turns performed for a request while another request was being verified.
@@ -579,182 +458,6 @@ impl MtpStats {
     }
 }
 
-/// Target output after prefill.
-pub struct MtpPrefill<S> {
-    /// Logits predicting the first generated token.
-    pub logits: Array,
-    /// Architecture-owned state needed to begin drafting.
-    pub state: S,
-    /// Number of target input tokens evaluated.
-    pub evaluated_tokens: usize,
-}
-
-/// Result of committing one target verification transaction.
-pub struct MtpCommit<S> {
-    /// Draft context matching the committed target cache.
-    pub state: S,
-    /// Target tokens replayed to restore an exact cache after rejection.
-    pub replayed_tokens: usize,
-}
-
-/// One architecture-independent MTP backend.
-///
-/// Implementations may combine separate target and assistant models or operate
-/// on a single checkpoint containing embedded MTP layers.
-pub trait MtpBackend {
-    /// Complete target cache type.
-    type Cache;
-    /// Target state consumed when starting a draft round.
-    type TargetState;
-    /// Mutable state used while producing one proposal block.
-    type DraftState: Clone;
-    /// Architecture-specific cache transaction marker.
-    type CacheCheckpoint;
-    /// Architecture-specific target verification result.
-    type Verification;
-
-    /// Maximum proposals supported by this backend in one round.
-    fn max_draft_tokens(&self) -> usize {
-        usize::MAX
-    }
-
-    /// Enables asynchronous device-timeline component timing for diagnostic runs.
-    fn set_component_timing(&mut self, _enabled: bool) {}
-
-    /// Returns whether this backend exposes synchronized component timings.
-    fn supports_component_timing(&self) -> bool {
-        false
-    }
-
-    /// Resolves and drains draft-component timings recorded since the previous call.
-    fn take_component_timings(&mut self) -> Result<MtpComponentTimings, Exception> {
-        Ok(MtpComponentTimings::default())
-    }
-
-    /// Resolves component timing carried by one target verification result.
-    fn take_verification_component_timings(
-        &mut self,
-        _output: &mut Self::Verification,
-    ) -> Result<MtpComponentTimings, Exception> {
-        Ok(MtpComponentTimings::default())
-    }
-
-    /// Returns whether a cloned draft state is an exact, discardable frontier
-    /// that can be promoted after consuming a matching target bonus.
-    ///
-    /// Returning `true` guarantees that cloning and advancing `DraftState`
-    /// cannot mutate canonical backend state, and that after drafting
-    /// `[bonus, retained...]`, removing the matching `bonus` token leaves the
-    /// state paired with `retained` at the exact autoregressive frontier.
-    /// External Gemma assistants support this. Embedded Qwen paths deliberately
-    /// return `false`: their target-owned MTP cache is advanced during commit.
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        false
-    }
-
-    /// Prefills a typed input and returns first-token logits plus draft context.
-    fn prefill(
-        &mut self,
-        input: ModelInput<'_>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<MtpPrefill<Self::TargetState>, Exception>;
-
-    /// Starts one draft round from committed target state.
-    fn begin_draft(
-        &mut self,
-        state: &Self::TargetState,
-        last_token: u32,
-        stream: &Stream,
-    ) -> Result<Self::DraftState, Exception>;
-
-    /// Starts one draft round with explicit target and draft streams.
-    ///
-    /// Existing backends may rely on the default draft-stream-only behavior.
-    /// Backends that must transfer committed target state should override this
-    /// method.
-    fn begin_draft_with_streams(
-        &mut self,
-        state: &Self::TargetState,
-        last_token: u32,
-        streams: MtpExecutionStreams<'_>,
-    ) -> Result<Self::DraftState, Exception> {
-        self.begin_draft(state, last_token, streams.draft())
-    }
-
-    /// Starts one draft round sized for at most `proposal_capacity` proposals.
-    ///
-    /// Backends whose round setup is independent of proposal count may rely on
-    /// this default. Block-based assistants can override it to avoid computing
-    /// proposal positions that the scheduler will never consume.
-    fn begin_draft_with_capacity(
-        &mut self,
-        state: &Self::TargetState,
-        last_token: u32,
-        proposal_capacity: usize,
-        streams: MtpExecutionStreams<'_>,
-    ) -> Result<Self::DraftState, Exception> {
-        let _ = proposal_capacity;
-        self.begin_draft_with_streams(state, last_token, streams)
-    }
-
-    /// Returns raw next-token logits and advances private draft state.
-    fn draft_logits(
-        &mut self,
-        state: &mut Self::DraftState,
-        last_token: u32,
-        stream: &Stream,
-    ) -> Result<Array, Exception>;
-
-    /// Captures cache state before speculative verification.
-    fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint;
-
-    /// Evaluates `[last_committed_token, proposed_tokens...]` in one target pass.
-    fn verify(
-        &mut self,
-        input_tokens: &Array,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<Self::Verification, Exception>;
-
-    /// Returns verification logits shaped `[1, input_length, vocabulary]`.
-    fn verification_logits(output: &Self::Verification) -> &Array;
-
-    /// Retains exactly `verified_inputs` tokens after the checkpoint and
-    /// returns draft context matching the retained prefix.
-    fn commit_verification(
-        &mut self,
-        output: Self::Verification,
-        draft_state: Self::DraftState,
-        cache: &mut Self::Cache,
-        checkpoint: Self::CacheCheckpoint,
-        verified_inputs: usize,
-        stream: &Stream,
-    ) -> Result<MtpCommit<Self::TargetState>, Exception>;
-
-    /// Commits verification with explicit target and draft streams.
-    ///
-    /// The default preserves the original target-stream commit behavior.
-    fn commit_verification_with_streams(
-        &mut self,
-        output: Self::Verification,
-        draft_state: Self::DraftState,
-        cache: &mut Self::Cache,
-        checkpoint: Self::CacheCheckpoint,
-        verified_inputs: usize,
-        streams: MtpExecutionStreams<'_>,
-    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
-        self.commit_verification(
-            output,
-            draft_state,
-            cache,
-            checkpoint,
-            verified_inputs,
-            streams.target(),
-        )
-    }
-}
-
 struct DraftProposal {
     token: u32,
     distribution: Array,
@@ -770,6 +473,34 @@ struct OptimisticBranch<D> {
     assumed_prefix: Vec<u32>,
 }
 
+/// MLX-associated types required by the facade's sampling loop.
+///
+/// Model execution is expressed by the portable core contract; only logits
+/// sampling and stream placement remain MLX-specific in this module.
+pub(crate) trait MlxSpeculativeRuntime<'a>:
+    SpeculativeExecutor<
+        Input = MlxModelInput,
+        Logits = Array,
+        Context<'a> = MtpExecutionStreams<'a>,
+        Completion = MlxSpeculativeCompletion,
+        Telemetry = MtpComponentTimings,
+        Error = Exception,
+    > + 'a
+{
+}
+
+impl<'a, T> MlxSpeculativeRuntime<'a> for T where
+    T: SpeculativeExecutor<
+            Input = MlxModelInput,
+            Logits = Array,
+            Context<'a> = MtpExecutionStreams<'a>,
+            Completion = MlxSpeculativeCompletion,
+            Telemetry = MtpComponentTimings,
+            Error = Exception,
+        > + 'a
+{
+}
+
 #[derive(Clone)]
 struct PositionedDraftRng {
     root: Array,
@@ -783,7 +514,10 @@ impl PositionedDraftRng {
     }
 }
 
-struct InFlight<B: MtpBackend> {
+struct InFlight<B: SpeculativeExecutor> {
+    // Drop exact completion before the retained verification output so early
+    // scheduler destruction cannot release backend resources still in use.
+    completion: B::Completion,
     verification: B::Verification,
     checkpoint: B::CacheCheckpoint,
     block: DraftBlock<B::DraftState>,
@@ -896,7 +630,7 @@ enum OptimisticBonusTransition<D> {
     Terminal,
 }
 
-struct ScheduledRequest<'a, B: MtpBackend, S> {
+struct ScheduledRequest<'a, B: SpeculativeExecutor, S> {
     id: MtpRequestId,
     cache: &'a mut B::Cache,
     config: MtpConfig,
@@ -911,7 +645,7 @@ struct ScheduledRequest<'a, B: MtpBackend, S> {
     lifecycle: MtpRequestLifecycle,
 }
 
-impl<B: MtpBackend, S> ScheduledRequest<'_, B, S> {
+impl<B: SpeculativeExecutor, S> ScheduledRequest<'_, B, S> {
     fn transition(&mut self, next: MtpRequestPhase) -> Result<(), Exception> {
         self.lifecycle
             .transition(next)
@@ -919,28 +653,19 @@ impl<B: MtpBackend, S> ScheduledRequest<'_, B, S> {
     }
 }
 
-/// One completed scheduled request.
-pub struct MtpRequestOutput<S> {
-    /// Stable request identifier.
-    pub id: MtpRequestId,
-    /// Generated tokens in request order.
-    pub token_ids: Vec<u32>,
-    /// Per-request statistics.
-    pub stats: MtpStats,
-    /// Final canonical sampler state.
-    pub sampler: S,
-    /// Terminal condition, including [`FinishReason::Cancelled`] for cancellation.
-    pub finish_reason: Option<FinishReason>,
-    /// Whether the request was cancelled.
-    pub cancelled: bool,
+pub(crate) struct MtpRequestOutput<S> {
+    pub(crate) id: MtpRequestId,
+    pub(crate) token_ids: Vec<u32>,
+    pub(crate) stats: MtpStats,
+    pub(crate) sampler: S,
+    pub(crate) finish_reason: Option<FinishReason>,
+    #[cfg(test)]
+    pub(crate) cancelled: bool,
 }
 
-/// Completed scheduler output.
-pub struct MtpScheduleOutput<S> {
-    /// Requests in submission order.
-    pub requests: Vec<MtpRequestOutput<S>>,
-    /// Aggregate scheduler telemetry.
-    pub scheduler: MtpSchedulerStats,
+pub(crate) struct MtpScheduleOutput<S> {
+    pub(crate) requests: Vec<MtpRequestOutput<S>>,
+    pub(crate) scheduler: MtpSchedulerStats,
 }
 
 /// Single-threaded fair MTP request scheduler.
@@ -950,7 +675,7 @@ pub struct MtpScheduleOutput<S> {
 /// draft work, and synchronizes only when a verification result is resolved.
 /// Model parameters are shared through the backend; every request owns its
 /// cache, target state, sampler, PRNG substreams, output, and statistics.
-pub struct MtpScheduler<'a, B: MtpBackend, S> {
+pub(crate) struct MtpScheduler<'a, B: SpeculativeExecutor, S> {
     backend: &'a mut B,
     streams: MtpExecutionStreams<'a>,
     options: MtpSchedulerOptions,
@@ -962,7 +687,7 @@ pub struct MtpScheduler<'a, B: MtpBackend, S> {
 
 impl<'a, B, S> MtpScheduler<'a, B, S>
 where
-    B: MtpBackend,
+    B: MlxSpeculativeRuntime<'a>,
     S: SpeculativeSampler + Clone,
 {
     /// Creates a scheduler over shared model parameters and explicit streams.
@@ -974,8 +699,8 @@ where
         let options = options
             .validate()
             .map_err(|error| Exception::custom(error.to_string()))?;
-        let component_timing = component_timing_enabled() && backend.supports_component_timing();
-        backend.set_component_timing(component_timing);
+        let component_timing = component_timing_enabled() && backend.supports_telemetry();
+        backend.set_telemetry_enabled(component_timing);
         Ok(Self {
             backend,
             streams,
@@ -1118,6 +843,7 @@ where
         }
 
         validate_input(input)?;
+        let input = MlxModelInput::from(input);
         let (target_prng, draft_rng) =
             split_random_states(prng_key, config.temperature, self.streams)?;
         self.requests.push(ScheduledRequest {
@@ -1142,9 +868,7 @@ where
         let prefill_result = {
             let request = &mut self.requests[id.index()];
             (|| {
-                let prefill = self
-                    .backend
-                    .prefill(input, request.cache, self.streams.target())?;
+                let prefill = self.backend.prefill(input, request.cache, self.streams)?;
                 request.stats.target_tokens = prefill.evaluated_tokens;
                 request.stats.scheduler_turns = 1;
                 let mut sampler = request.runtime.sampler.clone();
@@ -1223,6 +947,7 @@ where
     }
 
     /// Returns the current phase for a submitted request.
+    #[cfg(test)]
     pub fn phase(&self, id: MtpRequestId) -> Option<MtpRequestPhase> {
         self.requests
             .get(id.index())
@@ -1363,6 +1088,7 @@ where
                         stats: request.stats,
                         sampler: runtime.sampler,
                         finish_reason,
+                        #[cfg(test)]
                         cancelled: request.lifecycle.phase() == MtpRequestPhase::Cancelled,
                     }
                 })
@@ -1409,7 +1135,7 @@ where
 
     fn draft_committed(&mut self, index: usize, cross_request: bool) -> Result<(), Exception> {
         self.record_turn(index);
-        let backend_limit = self.backend.max_draft_tokens();
+        let backend_limit = self.backend.max_proposals();
         let request = &mut self.requests[index];
         let target_count = request.config.max_draft_tokens.min(backend_limit).min(
             request
@@ -1436,12 +1162,9 @@ where
                 .target_state
                 .as_ref()
                 .expect("ready request has target state");
-            let state = self.backend.begin_draft_with_capacity(
-                target_state,
-                last,
-                target_count,
-                self.streams,
-            )?;
+            let state =
+                self.backend
+                    .begin_proposal(target_state, last, target_count, self.streams)?;
             DraftBlock {
                 state,
                 proposals: Vec::new(),
@@ -1486,14 +1209,12 @@ where
                 &request.config,
                 &request.runtime.sampler,
                 request.draft_rng.as_ref(),
-                self.streams.draft(),
+                self.streams,
             )?;
             request.stats.draft_tokens += proposals.len();
             block.proposals.extend(proposals);
         }
-        self.backend
-            .take_component_timings()?
-            .add_to(&mut request.stats);
+        self.backend.take_telemetry()?.add_to(&mut request.stats);
         if cross_request && additional > 0 {
             request.stats.cross_request_draft_opportunities += 1;
             self.stats.cross_request_draft_opportunities += 1;
@@ -1525,21 +1246,15 @@ where
                 .expect("prefill emitted a token"),
         );
         verify_ids.extend(block.proposals.iter().map(|proposal| proposal.token));
-        let verify_input = Array::from_slice(&verify_ids, &[1, verify_ids.len() as i32]);
-        let verify_input = if self.streams.crosses_devices() {
-            verify_input.copy(self.streams.target())?
-        } else {
-            verify_input
-        };
         let checkpoint = B::checkpoint(request.cache);
-        let verification =
+        let submission =
             self.backend
-                .verify(&verify_input, request.cache, self.streams.target())?;
-        async_eval([B::verification_logits(&verification)])?;
+                .submit_verification(&verify_ids, request.cache, self.streams)?;
         let submitted = Instant::now();
         request.stats.target_tokens += verify_ids.len();
         request.in_flight = Some(InFlight {
-            verification,
+            completion: submission.completion,
+            verification: submission.output,
             checkpoint,
             block,
             optimistic: None,
@@ -1588,7 +1303,7 @@ where
     fn draft_optimistic(&mut self, index: usize) -> Result<(), Exception> {
         self.record_turn(index);
         let started = Instant::now();
-        let backend_limit = self.backend.max_draft_tokens();
+        let backend_limit = self.backend.max_proposals();
         let request = &mut self.requests[index];
         request.transition(MtpRequestPhase::OptimisticDraftInProgress)?;
         let flight = request
@@ -1620,7 +1335,7 @@ where
             &request.config,
             &request.runtime.sampler,
             request.draft_rng.as_ref(),
-            self.streams.draft(),
+            self.streams,
         )?;
         request.stats.optimistic_draft_tokens += proposals.len();
         request.stats.optimistic_draft_blocks += 1;
@@ -1645,8 +1360,9 @@ where
             .in_flight
             .take()
             .expect("resolving request has an in-flight verification");
+        flight.completion.wait()?;
         self.backend
-            .take_verification_component_timings(&mut flight.verification)?
+            .take_verification_telemetry(&mut flight.verification)?
             .add_to(&mut request.stats);
         request.stats.verification_in_flight_time += flight.submitted.elapsed();
         let DraftBlock {
@@ -1656,7 +1372,7 @@ where
 
         if request.lifecycle.cancellation_pending() || request.runtime.cancellation.is_cancelled() {
             discard_optimistic(&mut request.stats, flight.optimistic.take());
-            let commit = self.backend.commit_verification_with_streams(
+            let commit = self.backend.commit_verification(
                 flight.verification,
                 state,
                 request.cache,
@@ -1814,7 +1530,7 @@ where
         tentative_stats.accepted_tokens += accepted;
         tentative_stats.accept_lens.push(accepted);
         tentative_stats.rounds += 1;
-        let commit = self.backend.commit_verification_with_streams(
+        let commit = self.backend.commit_verification(
             flight.verification,
             state,
             request.cache,
@@ -1993,7 +1709,7 @@ fn update_adaptive_lookahead(stats: &mut MtpStats, options: MtpSchedulerOptions)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draft_block<B, S>(
+fn draft_block<'a, B, S>(
     backend: &mut B,
     state: &mut B::DraftState,
     first_previous: u32,
@@ -2002,12 +1718,17 @@ fn draft_block<B, S>(
     config: &MtpConfig,
     sampler: &S,
     draft_rng: Option<&PositionedDraftRng>,
-    stream: &Stream,
+    streams: MtpExecutionStreams<'a>,
 ) -> Result<Vec<DraftProposal>, Exception>
 where
-    B: MtpBackend,
+    B: SpeculativeExecutor<
+            Logits = Array,
+            Error = Exception,
+            Context<'a> = MtpExecutionStreams<'a>,
+        > + 'a,
     S: SpeculativeSampler + Clone,
 {
+    let stream = streams.draft();
     let mut branch_sampler = sampler.clone();
     let mut history = Vec::with_capacity(base_history.len() + count);
     history.extend_from_slice(base_history);
@@ -2016,7 +1737,7 @@ where
         let previous = proposals
             .last()
             .map_or(first_previous, |proposal: &DraftProposal| proposal.token);
-        let raw = backend.draft_logits(state, previous, stream)?;
+        let raw = backend.proposal_logits(state, previous, streams)?;
         let processed =
             branch_sampler.process_logits(&raw, config.temperature, &history, stream)?;
         let mut position_state = draft_rng
@@ -2042,7 +1763,7 @@ where
     Ok(proposals)
 }
 
-fn validate_config<B: MtpBackend>(
+fn validate_config<B: SpeculativeExecutor>(
     backend: &B,
     config: &MtpConfig,
     prng_key: Option<&Array>,
@@ -2050,7 +1771,7 @@ fn validate_config<B: MtpBackend>(
     config
         .validate()
         .map_err(|error| Exception::custom(error.to_string()))?;
-    if backend.max_draft_tokens() == 0 {
+    if backend.max_proposals() == 0 {
         return Err(Exception::custom(
             "MTP backend does not permit any draft tokens",
         ));
@@ -2093,18 +1814,18 @@ fn split_random_states(
     ))
 }
 
-/// Runs one scheduled speculative request.
-pub fn generate<B, S>(
-    backend: &mut B,
-    cache: &mut B::Cache,
+#[cfg(test)]
+fn generate<'runtime, B, S>(
+    backend: &'runtime mut B,
+    cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    stream: &Stream,
+    stream: &'runtime Stream,
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
-    B: MtpBackend,
+    B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone,
 {
     generate_with_streams(
@@ -2118,18 +1839,18 @@ where
     )
 }
 
-/// Runs one scheduled speculative request with explicit target/draft streams.
-pub fn generate_with_streams<B, S>(
-    backend: &mut B,
-    cache: &mut B::Cache,
+#[cfg(test)]
+fn generate_with_streams<'runtime, B, S>(
+    backend: &'runtime mut B,
+    cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    streams: MtpExecutionStreams<'_>,
+    streams: MtpExecutionStreams<'runtime>,
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
-    B: MtpBackend,
+    B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone,
 {
     generate_with_streams_and_callback(
@@ -2146,20 +1867,20 @@ where
 
 /// Runs one scheduled request and reports committed tokens.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_with_callback<B, S, F>(
-    backend: &mut B,
-    cache: &mut B::Cache,
+pub(crate) fn generate_with_callback<'runtime, B, S, F>(
+    backend: &'runtime mut B,
+    cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    stream: &Stream,
+    stream: &'runtime Stream,
     on_token: F,
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
-    B: MtpBackend,
+    B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone,
-    F: FnMut(u32) -> Result<(), Exception>,
+    F: FnMut(u32) -> Result<(), Exception> + 'runtime,
 {
     generate_with_streams_and_callback(
         backend,
@@ -2175,20 +1896,20 @@ where
 
 /// Runs one scheduled request with explicit streams and a commit callback.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_with_streams_and_callback<B, S, F>(
-    backend: &mut B,
-    cache: &mut B::Cache,
+pub(crate) fn generate_with_streams_and_callback<'runtime, B, S, F>(
+    backend: &'runtime mut B,
+    cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    streams: MtpExecutionStreams<'_>,
+    streams: MtpExecutionStreams<'runtime>,
     on_token: F,
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
-    B: MtpBackend,
+    B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone,
-    F: FnMut(u32) -> Result<(), Exception>,
+    F: FnMut(u32) -> Result<(), Exception> + 'runtime,
 {
     generate_with_streams_and_callback_and_options(
         backend,
@@ -2206,21 +1927,21 @@ where
 /// Runs one scheduled request with explicit streams, scheduler options, and a
 /// commit callback.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_with_streams_and_callback_and_options<B, S, F>(
-    backend: &mut B,
-    cache: &mut B::Cache,
+pub(crate) fn generate_with_streams_and_callback_and_options<'runtime, B, S, F>(
+    backend: &'runtime mut B,
+    cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    streams: MtpExecutionStreams<'_>,
+    streams: MtpExecutionStreams<'runtime>,
     options: MtpSchedulerOptions,
     on_token: F,
 ) -> Result<(Vec<u32>, MtpStats), Exception>
 where
-    B: MtpBackend,
+    B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone,
-    F: FnMut(u32) -> Result<(), Exception>,
+    F: FnMut(u32) -> Result<(), Exception> + 'runtime,
 {
     let final_sampler;
     let token_ids;
@@ -2248,23 +1969,23 @@ where
 
 /// Runs one request with transactional semantic output.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_semantics_and_options<B, S, F>(
-    backend: &mut B,
-    cache: &mut B::Cache,
+pub(crate) fn generate_with_semantics_and_options<'runtime, B, S, F>(
+    backend: &'runtime mut B,
+    cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
     semantic: Box<dyn MtpSemanticState>,
     cancellation: GenerationCancellationToken,
-    streams: MtpExecutionStreams<'_>,
+    streams: MtpExecutionStreams<'runtime>,
     options: MtpSchedulerOptions,
     on_event: F,
 ) -> Result<(Vec<u32>, MtpStats, FinishReason), Exception>
 where
-    B: MtpBackend,
+    B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone,
-    F: FnMut(SemanticEvent),
+    F: FnMut(SemanticEvent) + 'runtime,
 {
     let final_sampler;
     let token_ids;
@@ -2388,6 +2109,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc, sync::Arc};
 
     use safemlx::{Device, DeviceType, ExecutionContext};
+    use safemlx_lm_core::{SpeculativeCommit, SpeculativePrefill, Submission};
 
     use super::*;
     use crate::{
@@ -2552,14 +2274,20 @@ mod tests {
         }
     }
 
-    impl MtpBackend for ScriptedBackend {
+    impl SpeculativeExecutor for ScriptedBackend {
+        type Input = MlxModelInput;
         type Cache = usize;
         type TargetState = ();
         type DraftState = ScriptedDraftState;
         type CacheCheckpoint = usize;
         type Verification = Array;
+        type Logits = Array;
+        type Context<'a> = MtpExecutionStreams<'a>;
+        type Completion = MlxSpeculativeCompletion;
+        type Telemetry = MtpComponentTimings;
+        type Error = Exception;
 
-        fn max_draft_tokens(&self) -> usize {
+        fn max_proposals(&self) -> usize {
             2
         }
 
@@ -2567,42 +2295,36 @@ mod tests {
             true
         }
 
-        fn prefill(
+        fn prefill<'context>(
             &mut self,
-            _input: ModelInput<'_>,
+            _input: MlxModelInput,
             cache: &mut Self::Cache,
-            stream: &Stream,
-        ) -> Result<MtpPrefill<Self::TargetState>, Exception> {
+            streams: MtpExecutionStreams<'context>,
+        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
+        where
+            Self: 'context,
+        {
+            let stream = streams.target();
             self.record("prefill", stream)?;
             *cache = 1;
             let mut first = [0.0f32; 3];
             first[self.first_token as usize] = 10.0;
-            Ok(MtpPrefill {
+            Ok(SpeculativePrefill {
                 logits: Array::from_slice(&first, &[1, 3]),
                 state: (),
                 evaluated_tokens: 1,
             })
         }
 
-        fn begin_draft(
+        fn begin_proposal(
             &mut self,
-            _state: &Self::TargetState,
-            _last_token: u32,
-            stream: &Stream,
-        ) -> Result<Self::DraftState, Exception> {
-            self.record("begin_draft", stream)?;
-            Ok(ScriptedDraftState {
-                step: 0,
-                storage: Arc::new(()),
-            })
-        }
-
-        fn begin_draft_with_streams(
-            &mut self,
-            _state: &Self::TargetState,
-            _last_token: u32,
+            state: &Self::TargetState,
+            last_token: u32,
+            proposal_capacity: usize,
             streams: MtpExecutionStreams<'_>,
         ) -> Result<Self::DraftState, Exception> {
+            self.draft_capacities.push(proposal_capacity);
+            let _ = (state, last_token);
             self.record("begin_target", streams.target())?;
             self.record("begin_draft", streams.draft())?;
             Ok(ScriptedDraftState {
@@ -2611,23 +2333,13 @@ mod tests {
             })
         }
 
-        fn begin_draft_with_capacity(
-            &mut self,
-            state: &Self::TargetState,
-            last_token: u32,
-            proposal_capacity: usize,
-            streams: MtpExecutionStreams<'_>,
-        ) -> Result<Self::DraftState, Exception> {
-            self.draft_capacities.push(proposal_capacity);
-            self.begin_draft_with_streams(state, last_token, streams)
-        }
-
-        fn draft_logits(
+        fn proposal_logits(
             &mut self,
             state: &mut Self::DraftState,
             _last_token: u32,
-            stream: &Stream,
+            streams: MtpExecutionStreams<'_>,
         ) -> Result<Array, Exception> {
+            let stream = streams.draft();
             self.record("draft", stream)?;
             self.draft_storage
                 .push(Arc::as_ptr(&state.storage) as usize);
@@ -2644,13 +2356,14 @@ mod tests {
             *cache
         }
 
-        fn verify(
+        fn submit_verification(
             &mut self,
-            input_tokens: &Array,
+            input_tokens: &[u32],
             cache: &mut Self::Cache,
-            stream: &Stream,
-        ) -> Result<Self::Verification, Exception> {
-            let input_len = input_tokens.dim(1) as usize;
+            streams: MtpExecutionStreams<'_>,
+        ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
+            let input_len = input_tokens.len();
+            let stream = streams.target();
             self.record(
                 match input_len {
                     2 => "verify_input_2",
@@ -2675,13 +2388,15 @@ mod tests {
             };
             let mut bonus = [0.0f32; 3];
             bonus[self.bonus_token as usize] = 10.0;
-            Ok(Array::from_slice(
+            let output = Array::from_slice(
                 &[
                     first[0], first[1], first[2], second[0], second[1], second[2], bonus[0],
                     bonus[1], bonus[2],
                 ],
                 &[1, 3, 3],
-            ))
+            );
+            let completion = MlxSpeculativeCompletion::submit([&output])?;
+            Ok(Submission { output, completion })
         }
 
         fn verification_logits(output: &Self::Verification) -> &Array {
@@ -2695,35 +2410,15 @@ mod tests {
             cache: &mut Self::Cache,
             checkpoint: Self::CacheCheckpoint,
             verified_inputs: usize,
-            stream: &Stream,
-        ) -> Result<MtpCommit<Self::TargetState>, Exception> {
-            if verified_inputs != output.dim(1) as usize {
-                self.record("cache_truncate", stream)?;
-            }
-            self.record("commit_target", stream)?;
-            *cache = checkpoint + verified_inputs;
-            Ok(MtpCommit {
-                state: (),
-                replayed_tokens: 0,
-            })
-        }
-
-        fn commit_verification_with_streams(
-            &mut self,
-            output: Self::Verification,
-            _draft_state: Self::DraftState,
-            cache: &mut Self::Cache,
-            checkpoint: Self::CacheCheckpoint,
-            verified_inputs: usize,
             streams: MtpExecutionStreams<'_>,
-        ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+        ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
             if verified_inputs != output.dim(1) as usize {
                 self.record("cache_truncate", streams.target())?;
             }
             self.record("commit_target", streams.target())?;
             self.record("commit_draft", streams.draft())?;
             *cache = checkpoint + verified_inputs;
-            Ok(MtpCommit {
+            Ok(SpeculativeCommit {
                 state: (),
                 replayed_tokens: 0,
             })
@@ -2734,55 +2429,66 @@ mod tests {
         inner: ScriptedBackend,
     }
 
-    impl MtpBackend for CommitFailBackend {
+    impl SpeculativeExecutor for CommitFailBackend {
+        type Input = MlxModelInput;
         type Cache = usize;
         type TargetState = ();
         type DraftState = ScriptedDraftState;
         type CacheCheckpoint = usize;
         type Verification = Array;
+        type Logits = Array;
+        type Context<'a> = MtpExecutionStreams<'a>;
+        type Completion = MlxSpeculativeCompletion;
+        type Telemetry = MtpComponentTimings;
+        type Error = Exception;
 
-        fn max_draft_tokens(&self) -> usize {
-            self.inner.max_draft_tokens()
+        fn max_proposals(&self) -> usize {
+            self.inner.max_proposals()
         }
 
-        fn prefill(
+        fn prefill<'context>(
             &mut self,
-            input: ModelInput<'_>,
+            input: MlxModelInput,
             cache: &mut Self::Cache,
-            stream: &Stream,
-        ) -> Result<MtpPrefill<Self::TargetState>, Exception> {
-            self.inner.prefill(input, cache, stream)
+            streams: MtpExecutionStreams<'context>,
+        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
+        where
+            Self: 'context,
+        {
+            self.inner.prefill(input, cache, streams)
         }
 
-        fn begin_draft(
+        fn begin_proposal(
             &mut self,
             state: &Self::TargetState,
             last_token: u32,
-            stream: &Stream,
+            proposal_capacity: usize,
+            streams: MtpExecutionStreams<'_>,
         ) -> Result<Self::DraftState, Exception> {
-            self.inner.begin_draft(state, last_token, stream)
+            self.inner
+                .begin_proposal(state, last_token, proposal_capacity, streams)
         }
 
-        fn draft_logits(
+        fn proposal_logits(
             &mut self,
             state: &mut Self::DraftState,
             last_token: u32,
-            stream: &Stream,
+            streams: MtpExecutionStreams<'_>,
         ) -> Result<Array, Exception> {
-            self.inner.draft_logits(state, last_token, stream)
+            self.inner.proposal_logits(state, last_token, streams)
         }
 
         fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
             *cache
         }
 
-        fn verify(
+        fn submit_verification(
             &mut self,
-            input_tokens: &Array,
+            input_tokens: &[u32],
             cache: &mut Self::Cache,
-            stream: &Stream,
-        ) -> Result<Self::Verification, Exception> {
-            self.inner.verify(input_tokens, cache, stream)
+            streams: MtpExecutionStreams<'_>,
+        ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
+            self.inner.submit_verification(input_tokens, cache, streams)
         }
 
         fn verification_logits(output: &Self::Verification) -> &Array {
@@ -2796,8 +2502,8 @@ mod tests {
             _cache: &mut Self::Cache,
             _checkpoint: Self::CacheCheckpoint,
             _verified_inputs: usize,
-            _stream: &Stream,
-        ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+            _streams: MtpExecutionStreams<'_>,
+        ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
             Err(Exception::custom("injected commit failure"))
         }
     }
@@ -3652,19 +3358,19 @@ mod tests {
 
         assert_eq!(
             MtpExecutionStreams::single(target.stream()).topology(),
-            MtpStreamTopology::Single
+            SpeculativeExecutionTopology::Single
         );
         assert_eq!(
             MtpExecutionStreams::new(target.stream(), second_stream.stream())
                 .unwrap()
                 .topology(),
-            MtpStreamTopology::SameDeviceSplit
+            SpeculativeExecutionTopology::SameDeviceSplit
         );
         assert_eq!(
             MtpExecutionStreams::new(target.stream(), second_device.stream())
                 .unwrap()
                 .topology(),
-            MtpStreamTopology::CrossDeviceSplit
+            SpeculativeExecutionTopology::CrossDeviceSplit
         );
     }
 
@@ -3673,7 +3379,10 @@ mod tests {
         let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let streams = MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap();
-        assert_eq!(streams.topology(), MtpStreamTopology::SameDeviceSplit);
+        assert_eq!(
+            streams.topology(),
+            SpeculativeExecutionTopology::SameDeviceSplit
+        );
 
         let lhs = Array::ones::<f32>(&[1024, 1024], target.stream()).unwrap();
         let rhs = Array::ones::<f32>(&[1024, 1024], target.stream()).unwrap();
@@ -3717,13 +3426,19 @@ mod tests {
         let same_device = MtpExecutionStreams::new(target.stream(), second_gpu.stream()).unwrap();
         let cross_device = MtpExecutionStreams::new(target.stream(), cpu.stream()).unwrap();
 
-        assert_eq!(single.topology(), MtpStreamTopology::Single);
+        assert_eq!(single.topology(), SpeculativeExecutionTopology::Single);
         assert!(!single.is_split());
         assert!(!single.crosses_devices());
-        assert_eq!(same_device.topology(), MtpStreamTopology::SameDeviceSplit);
+        assert_eq!(
+            same_device.topology(),
+            SpeculativeExecutionTopology::SameDeviceSplit
+        );
         assert!(same_device.is_split());
         assert!(!same_device.crosses_devices());
-        assert_eq!(cross_device.topology(), MtpStreamTopology::CrossDeviceSplit);
+        assert_eq!(
+            cross_device.topology(),
+            SpeculativeExecutionTopology::CrossDeviceSplit
+        );
         assert!(cross_device.is_split());
         assert!(cross_device.crosses_devices());
     }
@@ -3777,9 +3492,12 @@ mod tests {
 
         assert_eq!(
             output.scheduler.stream_topology,
-            MtpStreamTopology::SameDeviceSplit
+            SpeculativeExecutionTopology::SameDeviceSplit
         );
-        assert_eq!(stats.stream_topology, MtpStreamTopology::SameDeviceSplit);
+        assert_eq!(
+            stats.stream_topology,
+            SpeculativeExecutionTopology::SameDeviceSplit
+        );
         assert!(stats.optimistic_draft_blocks > 0);
         assert!(stats.optimistic_target_bonus_tokens > 0);
         assert_eq!(
@@ -3814,7 +3532,10 @@ mod tests {
         let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let streams = MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap();
-        assert_eq!(streams.topology(), MtpStreamTopology::SameDeviceSplit);
+        assert_eq!(
+            streams.topology(),
+            SpeculativeExecutionTopology::SameDeviceSplit
+        );
         assert_ne!(
             target.stream().get_index().unwrap(),
             draft.stream().get_index().unwrap()
@@ -3882,7 +3603,7 @@ mod tests {
 
         assert_eq!(
             request.stats.stream_topology,
-            MtpStreamTopology::SameDeviceSplit
+            SpeculativeExecutionTopology::SameDeviceSplit
         );
         assert_eq!(request.token_ids, canonical.token_ids);
         assert_eq!(request.token_ids.len(), 8);

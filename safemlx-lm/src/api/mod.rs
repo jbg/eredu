@@ -57,6 +57,7 @@ use crate::runtime::media::PreparedModelInput;
 #[cfg(feature = "media-processing")]
 use crate::runtime::media::{load_processor, ChatMediaBinding, ModelProcessor, ProcessorInput};
 use crate::{
+    backend::mlx::speculative::MtpExecutionStreams,
     core::cache::{CacheResidencyPool, LayerCachePolicy},
     error::Error,
     runtime::attention::LayerSchedule,
@@ -64,7 +65,7 @@ use crate::{
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::generation::speculative::{
         DrafterKind, LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind,
-        MtpExecutionStreams, MtpScheduler, MtpSchedulerStats, MtpSemanticState, MtpStats,
+        MtpScheduler, MtpSchedulerStats, MtpSemanticState, MtpStats,
     },
 };
 

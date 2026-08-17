@@ -7,6 +7,8 @@ pub mod consensus;
 mod loading;
 /// MLX allocator observations for neutral residency telemetry.
 pub mod residency;
+/// MLX stream assignment and exact completion for speculative sessions.
+pub mod speculative;
 /// Exact MLX loader binding against portable checkpoint catalogs.
 pub(crate) mod structural;
 pub(crate) use loading::{

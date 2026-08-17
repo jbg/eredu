@@ -9,20 +9,25 @@ use safemlx::{
     transforms::{async_eval, async_eval_timed, async_eval_with_event},
     Array, Stream,
 };
+use safemlx_lm_core::{
+    SpeculativeCommit, SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativePrefill,
+    Submission,
+};
 
 use crate::{
-    api::{input::ModelInput, ModelCache},
+    api::ModelCache,
     architectures::muse_glimmer::{
         assistant::{DFlashContextCache, MuseGlimmerDFlash},
         layerwise::{DFlashTargetOutput, LayerwiseDecoder, MuseGlimmerLayerwiseCache},
         scale_logits,
     },
+    backend::mlx::{
+        speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+        MlxModelInput,
+    },
     runtime::{
         cache::KeyValueCache,
-        generation::speculative::{
-            MtpBackend, MtpCommit, MtpComponentTimingEvaluations, MtpComponentTimings,
-            MtpExecutionStreams, MtpPrefill, MtpStreamTopology,
-        },
+        generation::speculative::{MtpComponentTimingEvaluations, MtpComponentTimings},
     },
 };
 
@@ -172,7 +177,7 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
         if !streams.is_split() {
             return Ok(state.clone());
         }
-        if streams.topology() == MtpStreamTopology::SameDeviceSplit {
+        if streams.topology() == SpeculativeExecutionTopology::SameDeviceSplit {
             if let Some(pending) = state.pending_context.as_ref() {
                 let _ = streams.wait_for_target_outputs([pending])?;
             }
@@ -200,7 +205,7 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
         proposal_capacity: usize,
         streams: MtpExecutionStreams<'_>,
     ) -> Result<MuseDraftState, Exception> {
-        let maximum = self.max_draft_tokens();
+        let maximum = self.max_proposals();
         if proposal_capacity == 0 || proposal_capacity > maximum {
             return Err(Exception::custom(format!(
                 "Muse-Glimmer DFlash proposal capacity must be between 1 and {maximum}"
@@ -211,7 +216,7 @@ impl<'a> MuseGlimmerMtpBackend<'a> {
             let (embedding, head) = self
                 .target
                 .dflash_weight_snapshot(streams.draft(), streams.crosses_devices())?;
-            if streams.topology() == MtpStreamTopology::SameDeviceSplit {
+            if streams.topology() == SpeculativeExecutionTopology::SameDeviceSplit {
                 let embedding_parameters = embedding.parameters().flatten();
                 let head_parameters = head.parameters().flatten();
                 let _ = streams.wait_for_target_outputs(
@@ -300,31 +305,40 @@ fn dflash_block_token_ids(anchor: u32, mask_token: u32, proposal_capacity: usize
     ids
 }
 
-impl MtpBackend for MuseGlimmerMtpBackend<'_> {
+impl SpeculativeExecutor for MuseGlimmerMtpBackend<'_> {
+    type Input = MlxModelInput;
     type Cache = ModelCache;
     type TargetState = MuseTargetState;
     type DraftState = MuseDraftState;
     type CacheCheckpoint = usize;
     type Verification = MuseVerification;
+    type Logits = Array;
+    type Context<'a>
+        = MtpExecutionStreams<'a>
+    where
+        Self: 'a;
+    type Completion = MlxSpeculativeCompletion;
+    type Telemetry = MtpComponentTimings;
+    type Error = Exception;
 
-    fn max_draft_tokens(&self) -> usize {
+    fn max_proposals(&self) -> usize {
         self.assistant.config.block_size.saturating_sub(1).min(15)
     }
 
-    fn set_component_timing(&mut self, enabled: bool) {
+    fn set_telemetry_enabled(&mut self, enabled: bool) {
         self.component_timing = enabled;
         self.component_timings = MtpComponentTimingEvaluations::default();
     }
 
-    fn supports_component_timing(&self) -> bool {
+    fn supports_telemetry(&self) -> bool {
         true
     }
 
-    fn take_component_timings(&mut self) -> Result<MtpComponentTimings, Exception> {
+    fn take_telemetry(&mut self) -> Result<MtpComponentTimings, Exception> {
         self.component_timings.resolve()
     }
 
-    fn take_verification_component_timings(
+    fn take_verification_telemetry(
         &mut self,
         output: &mut Self::Verification,
     ) -> Result<MtpComponentTimings, Exception> {
@@ -334,62 +348,45 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         })
     }
 
-    fn prefill(
+    fn prefill<'context>(
         &mut self,
-        input: ModelInput<'_>,
+        input: MlxModelInput,
         cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<MtpPrefill<Self::TargetState>, Exception> {
-        let target_layers = self.assistant.config.target_layer_ids.clone();
-        let output = Self::with_cache(cache, |cache| {
-            self.target
-                .prefill_dflash(input, cache, &target_layers, stream)
-        })?;
-        let sequence = output.logits.dim(1);
-        if sequence == 0 {
-            return Err(Exception::custom("Muse-Glimmer DFlash input is empty"));
-        }
-        let logits = output
-            .logits
-            .try_index_device((.., sequence - 1, ..), stream)?;
-        let cache_len = Self::cache_len(cache);
-        let state = Self::initial_target_state(
-            output.states,
-            cache_len,
-            self.assistant.config.sliding_window,
-            stream,
-        )?;
-        Ok(MtpPrefill {
-            logits,
-            state,
-            evaluated_tokens: sequence as usize,
+        streams: MtpExecutionStreams<'context>,
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
+    where
+        Self: 'context,
+    {
+        let stream = streams.target();
+        input.with_borrowed(|input| {
+            let target_layers = self.assistant.config.target_layer_ids.clone();
+            let output = Self::with_cache(cache, |cache| {
+                self.target
+                    .prefill_dflash(input, cache, &target_layers, stream)
+            })?;
+            let sequence = output.logits.dim(1);
+            if sequence == 0 {
+                return Err(Exception::custom("Muse-Glimmer DFlash input is empty"));
+            }
+            let logits = output
+                .logits
+                .try_index_device((.., sequence - 1, ..), stream)?;
+            let cache_len = Self::cache_len(cache);
+            let state = Self::initial_target_state(
+                output.states,
+                cache_len,
+                self.assistant.config.sliding_window,
+                stream,
+            )?;
+            Ok(SpeculativePrefill {
+                logits,
+                state,
+                evaluated_tokens: sequence as usize,
+            })
         })
     }
 
-    fn begin_draft(
-        &mut self,
-        state: &Self::TargetState,
-        last_token: u32,
-        stream: &Stream,
-    ) -> Result<Self::DraftState, Exception> {
-        self.begin_dflash_block(
-            state,
-            last_token,
-            self.max_draft_tokens(),
-            MtpExecutionStreams::single(stream),
-        )
-    }
-
-    fn begin_draft_with_streams(
-        &mut self,
-        state: &Self::TargetState,
-        last_token: u32,
-        streams: MtpExecutionStreams<'_>,
-    ) -> Result<Self::DraftState, Exception> {
-        self.begin_dflash_block(state, last_token, self.max_draft_tokens(), streams)
-    }
-
-    fn begin_draft_with_capacity(
+    fn begin_proposal(
         &mut self,
         state: &Self::TargetState,
         last_token: u32,
@@ -399,12 +396,13 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         self.begin_dflash_block(state, last_token, proposal_capacity, streams)
     }
 
-    fn draft_logits(
+    fn proposal_logits(
         &mut self,
         state: &mut Self::DraftState,
         _last_token: u32,
-        stream: &Stream,
+        streams: MtpExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
+        let stream = streams.draft();
         if state.cursor >= state.proposal_capacity {
             return Err(Exception::custom(
                 "Muse-Glimmer DFlash proposal block is exhausted",
@@ -420,24 +418,30 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         Self::cache_len(cache)
     }
 
-    fn verify(
+    fn submit_verification(
         &mut self,
-        input_tokens: &Array,
+        input_tokens: &[u32],
         cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<Self::Verification, Exception> {
-        let input_len = input_tokens.dim(1) as usize;
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
+        let mut inputs = Array::from_slice(input_tokens, &[1, input_tokens.len() as i32]);
+        if streams.crosses_devices() {
+            inputs = inputs.copy(streams.target())?;
+        }
+        let input_len = input_tokens.len();
         let target_layers = self.assistant.config.target_layer_ids.clone();
         let output = Self::with_cache(cache, |cache| {
             self.target.verify_dflash(
-                input_tokens,
+                &inputs,
                 cache,
                 &target_layers,
                 self.component_timing,
-                stream,
+                streams.target(),
             )
         })?;
-        Ok(MuseVerification { output, input_len })
+        let output = MuseVerification { output, input_len };
+        let completion = MlxSpeculativeCompletion::submit([&output.output.logits])?;
+        Ok(Submission { output, completion })
     }
 
     fn verification_logits(output: &Self::Verification) -> &Array {
@@ -451,8 +455,9 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
-        stream: &Stream,
-    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
+        let stream = streams.target();
         if draft_state.cache_len != checkpoint
             || usize::try_from(draft_state.draft_cache.end()).ok() != Some(checkpoint)
         {
@@ -490,29 +495,10 @@ impl MtpBackend for MuseGlimmerMtpBackend<'_> {
             draft_cache: Some(draft_state.draft_cache),
             cache_len: retained,
         };
-        Ok(MtpCommit {
+        Ok(SpeculativeCommit {
             state,
             replayed_tokens: 0,
         })
-    }
-
-    fn commit_verification_with_streams(
-        &mut self,
-        output: Self::Verification,
-        draft_state: Self::DraftState,
-        cache: &mut Self::Cache,
-        checkpoint: Self::CacheCheckpoint,
-        verified_inputs: usize,
-        streams: MtpExecutionStreams<'_>,
-    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
-        self.commit_verification(
-            output,
-            draft_state,
-            cache,
-            checkpoint,
-            verified_inputs,
-            streams.target(),
-        )
     }
 }
 

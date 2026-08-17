@@ -31,6 +31,12 @@ random sampling, executable assistant heads, tensor caches, and exact native
 completion; it cannot maintain a second logical token or terminal state.
 `MtpRequestLifecycle` rejects illegal phase edges and defers cancellation while
 a backend verification transaction remains retained.
+`SpeculativeExecutor` defines the production whole-session boundary for
+prefill, assistant proposals, target verification submission, exact completion
+observation, and transactional cache commit. Inputs, logits, target/draft
+state, checkpoints, verification outputs, execution contexts, telemetry, and
+completion objects are backend-owned associated types. The contract never
+models primitive tensor operations or names a native runtime.
 
 Model loading starts here as well. `inspect_artifact` parses `config.json` or a
 portable `safemlx-gguf` checkpoint, validates SafeTensors/GGUF catalogs, and

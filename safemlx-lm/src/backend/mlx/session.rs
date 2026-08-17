@@ -80,7 +80,7 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
 }
 
 impl MlxModelInput {
-    fn with_borrowed<T>(&self, execute: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
+    pub(crate) fn with_borrowed<T>(&self, execute: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
         let parts = self
             .parts
             .iter()

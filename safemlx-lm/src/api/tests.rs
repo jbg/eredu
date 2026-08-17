@@ -10,6 +10,7 @@ use crate::{
     core::generation::{
         FinishReason, GenerationCancellationToken, MtpSchedulerOptions, SemanticEvent,
     },
+    core::SpeculativeExecutionTopology,
     error::Error,
     runtime::chat::constraints::ConstraintCompiler,
     runtime::chat::{
@@ -21,7 +22,6 @@ use crate::{
     },
     runtime::execution::inspection::ActivationRecorder,
     runtime::generation::sampler::{ConstrainedSampler, DefaultSampler, GenerationSampler},
-    runtime::generation::speculative::MtpStreamTopology,
 };
 use safemlx::{
     argmax_axis,
@@ -782,7 +782,10 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     fs::remove_dir_all(directory).unwrap();
 
     assert!(output.requests.is_empty());
-    assert_eq!(output.scheduler.stream_topology, MtpStreamTopology::Single);
+    assert_eq!(
+        output.scheduler.stream_topology,
+        SpeculativeExecutionTopology::Single
+    );
     assert_eq!(output.scheduler.turns, 0);
 
     let mut wrong_cache = super::ModelCache::KeyValue(Vec::new());

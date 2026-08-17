@@ -100,6 +100,18 @@ metadata. Backend submission therefore owns text, image, audio, video, and
 embedding inputs without placing MLX arrays or modality-specific tensor layouts
 in core.
 
+Speculative model execution uses the core `SpeculativeExecutor` contract. Its
+input, target and assistant state, cache checkpoint, verification output,
+logits, execution context, completion, telemetry, and error are opaque
+associated types. The contract submits high-level prefill, proposal,
+verification, and exact commit operations; it does not expose tensor
+primitives. MLX implementations use `MlxModelInput`, `MtpExecutionStreams`,
+architecture-owned cache/state values, and `MlxSpeculativeCompletion`.
+Verification accepts portable token ids, materializes the MLX token array in
+the adapter, and returns a `Submission` whose exact event remains owned by the
+scheduler until resolution. Dropping an unresolved MLX completion synchronizes
+it, including cancellation and failure paths.
+
 The public `api::load_model_with_options` route performs format, architecture,
 catalog, and policy planning in core before calling `Backend::prepare_model`.
 `MlxGeneration` is one
@@ -169,8 +181,9 @@ The current boundary leaves these components MLX-coupled:
 - architecture-specific checkpoint binding/weight recipes, mapped payload
   stores, GGUF decoding, and MLX array materialization (artifact detection,
   model-family resolution, neutral catalogs, and route planning are core-owned);
-- logits filtering and sampling, proposal/verification tensor execution,
-  assistant and MTP model execution, concrete cache mutation, activation
+- logits filtering and sampling, architecture tensor execution inside the
+  portable speculative-executor operations, assistant and MTP model math,
+  concrete cache mutation, activation
   observation, MLX allocator sampling, and Metal/CUDA kernels. Speculative
   acceptance state, replacement/bonus bookkeeping, optimistic-prefix reuse,
   cache-retention counts, token budgets, and terminal precedence are
@@ -274,6 +287,11 @@ samples target and draft distributions, mutates cache tensors, and owns exact
 completion. The scheduler publishes staged semantic events and tokens only
 after that cache transaction commits. Optimistic lookahead uses the pure core
 prefix/reuse decision before promoting or discarding MLX-owned draft state.
+The encompassing model-execution lifecycle is also backend-neutral:
+`SpeculativeExecutor` owns the prefill/propose/submit/observe/commit boundary,
+while its MLX implementations retain concrete arrays, streams, assistant state,
+cache transactions, and events. The former facade `MtpBackend`, `MtpPrefill`,
+and `MtpCommit` definitions were deleted rather than retained as wrappers.
 
 Checkpoint sampling recommendations, request overrides, resolved sampler
 settings, MTP configuration, scheduler limits, request identity, and request
@@ -295,6 +313,10 @@ after that transaction reaches its exact safe boundary.
 4. Implement whole-model preparation and whole-session creation.
 5. Implement prefill, decode, and exact completion; retain submitted resources
    until completion even after cancellation.
+   Implement `SpeculativeExecutor` as well when the backend supports assistant
+   or embedded-head decoding; choose backend-owned input, cache, checkpoint,
+   verification, context, and completion types and materialize portable token
+   ids only inside that adapter.
 6. Add explicit transfer/collective support only when the backend implements
    exact ownership and synchronization semantics. For distributed scheduling,
    implement `ConsensusTransport` over a topology-wide, rank-ordered word

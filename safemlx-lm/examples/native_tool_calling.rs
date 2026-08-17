@@ -12,11 +12,10 @@ use safemlx_lm::{
         PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
         PreparedChatMtpGenerationRequest,
     },
+    backend::mlx::speculative::MtpExecutionStreams,
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
     runtime::generation::sampler::DefaultSampler,
-    runtime::generation::speculative::{
-        LoadedDrafter, MtpCapability, MtpCheckpointKind, MtpExecutionStreams,
-    },
+    runtime::generation::speculative::{LoadedDrafter, MtpCapability, MtpCheckpointKind},
     MtpSchedulerOptions, SemanticEvent,
 };
 use serde_json::json;

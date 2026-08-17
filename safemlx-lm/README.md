@@ -131,8 +131,10 @@ against current available memory and header-only loader admission. Use
 bounds, and `execution_plan_load_options` to apply a returned plan to model
 loading. Device creation remains owned by the embedding application.
 Speculative generation uses the same core-owned committed-token and terminal
-lifecycle as ordinary generation; the MLX adapter owns proposal logits,
-sampling, assistant execution, cache tensors, and exact completion.
+lifecycle as ordinary generation. Its prefill/proposal/verification/commit
+executor contract is also core-owned; the MLX implementations supply opaque
+model input, logits, assistant state, cache transactions, stream placement, and
+exact event completion. Sampling math and tensor execution remain in MLX.
 
 ## Inputs and generation
 

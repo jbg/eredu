@@ -9,17 +9,20 @@ use safemlx::{
     quantization::MaybeQuantized,
     Array, Stream,
 };
+use safemlx_lm_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
 
 use crate::{
     api::input::ModelInput,
+    backend::mlx::{
+        speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+        MlxModelInput,
+    },
     core::generation::{
         FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
     },
     runtime::generation::{
         sampler::SpeculativeSampler,
-        speculative::{
-            self, MtpBackend, MtpCommit, MtpExecutionStreams, MtpPrefill, MtpSemanticState,
-        },
+        speculative::{self, MtpComponentTimings, MtpSemanticState},
     },
 };
 
@@ -375,68 +378,60 @@ impl<'a, T: EmbeddedMtpTarget> EmbeddedMtpBackend<'a, T> {
     }
 }
 
-impl<T: EmbeddedMtpTarget> MtpBackend for EmbeddedMtpBackend<'_, T> {
+impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpBackend<'_, T> {
+    type Input = MlxModelInput;
     type Cache = T::Cache;
     type TargetState = EmbeddedTargetState<T::DraftCache>;
     type DraftState = EmbeddedDraftState<T::DraftCache>;
     type CacheCheckpoint = T::Cache;
     type Verification = EmbeddedVerification;
+    type Logits = Array;
+    type Context<'a>
+        = MtpExecutionStreams<'a>
+    where
+        Self: 'a;
+    type Completion = MlxSpeculativeCompletion;
+    type Telemetry = MtpComponentTimings;
+    type Error = Exception;
 
-    fn max_draft_tokens(&self) -> usize {
+    fn max_proposals(&self) -> usize {
         self.target.max_draft_tokens()
     }
 
-    fn prefill(
+    fn prefill<'context>(
         &mut self,
-        input: ModelInput<'_>,
+        input: MlxModelInput,
         cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<MtpPrefill<Self::TargetState>, Exception> {
-        let output = self.target.prefill_target(input, cache, stream)?;
-        let sequence = output.logits.dim(-2);
-        if sequence == 0 {
-            return Err(Exception::custom(
-                "embedded MTP input must contain at least one token",
-            ));
-        }
-        let tokens = output.tokens.clone();
-        self.target
-            .prefill_draft_cache(&output, &tokens, cache, stream)?;
-        let logits = output
-            .logits
-            .try_index_device((.., sequence - 1, ..), stream)?;
-        let state = Self::state_at(&output, sequence - 1, T::draft_cache(cache), stream)?;
-        Ok(MtpPrefill {
-            logits,
-            state,
-            evaluated_tokens: sequence as usize,
+        streams: MtpExecutionStreams<'context>,
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
+    where
+        Self: 'context,
+    {
+        let stream = streams.target();
+        input.with_borrowed(|input| {
+            let output = self.target.prefill_target(input, cache, stream)?;
+            let sequence = output.logits.dim(-2);
+            if sequence == 0 {
+                return Err(Exception::custom(
+                    "embedded MTP input must contain at least one token",
+                ));
+            }
+            let tokens = output.tokens.clone();
+            self.target
+                .prefill_draft_cache(&output, &tokens, cache, stream)?;
+            let logits = output
+                .logits
+                .try_index_device((.., sequence - 1, ..), stream)?;
+            let state = Self::state_at(&output, sequence - 1, T::draft_cache(cache), stream)?;
+            Ok(SpeculativePrefill {
+                logits,
+                state,
+                evaluated_tokens: sequence as usize,
+            })
         })
     }
 
-    fn begin_draft(
-        &mut self,
-        state: &Self::TargetState,
-        last_token: u32,
-        stream: &Stream,
-    ) -> Result<Self::DraftState, Exception> {
-        let mut draft_cache = state.draft_cache.clone();
-        let fused_logits = self.target.fused_draft_logits(
-            &state.hidden,
-            last_token,
-            self.target.max_draft_tokens(),
-            &mut draft_cache,
-            stream,
-        )?;
-        Ok(EmbeddedDraftState {
-            hidden: state.hidden.clone(),
-            draft_cache,
-            depth: 0,
-            fused_logits,
-            fused_cursor: 0,
-        })
-    }
-
-    fn begin_draft_with_capacity(
+    fn begin_proposal(
         &mut self,
         state: &Self::TargetState,
         last_token: u32,
@@ -460,12 +455,13 @@ impl<T: EmbeddedMtpTarget> MtpBackend for EmbeddedMtpBackend<'_, T> {
         })
     }
 
-    fn draft_logits(
+    fn proposal_logits(
         &mut self,
         state: &mut Self::DraftState,
         last_token: u32,
-        stream: &Stream,
+        streams: MtpExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
+        let stream = streams.draft();
         if let Some(logits) = &state.fused_logits {
             if state.fused_cursor >= logits.dim(1) as usize {
                 return Err(Exception::custom("fused MTP proposal block is exhausted"));
@@ -493,16 +489,24 @@ impl<T: EmbeddedMtpTarget> MtpBackend for EmbeddedMtpBackend<'_, T> {
         cache.clone()
     }
 
-    fn verify(
+    fn submit_verification(
         &mut self,
-        input_tokens: &Array,
+        input_tokens: &[u32],
         cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<Self::Verification, Exception> {
-        Ok(EmbeddedVerification {
-            output: self.target.verify_target(input_tokens, cache, stream)?,
-            inputs: input_tokens.clone(),
-        })
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
+        let mut inputs = Array::from_slice(input_tokens, &[1, input_tokens.len() as i32]);
+        if streams.crosses_devices() {
+            inputs = inputs.copy(streams.target())?;
+        }
+        let output = EmbeddedVerification {
+            output: self
+                .target
+                .verify_target(&inputs, cache, streams.target())?,
+            inputs,
+        };
+        let completion = MlxSpeculativeCompletion::submit([&output.output.logits])?;
+        Ok(Submission { output, completion })
     }
 
     fn verification_logits(output: &Self::Verification) -> &Array {
@@ -516,8 +520,9 @@ impl<T: EmbeddedMtpTarget> MtpBackend for EmbeddedMtpBackend<'_, T> {
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
-        stream: &Stream,
-    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
+        let stream = streams.target();
         let input_len = output.inputs.dim(1) as usize;
         if verified_inputs == 0 || verified_inputs > input_len {
             return Err(Exception::custom(format!(
@@ -559,7 +564,7 @@ impl<T: EmbeddedMtpTarget> MtpBackend for EmbeddedMtpBackend<'_, T> {
             T::draft_cache(cache),
             stream,
         )?;
-        Ok(MtpCommit {
+        Ok(SpeculativeCommit {
             state,
             replayed_tokens,
         })

@@ -5,6 +5,10 @@ use std::{collections::HashMap, sync::Arc};
 use safemlx::{
     error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
 };
+use safemlx_lm_core::{
+    SpeculativeCommit, SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativePrefill,
+    Submission,
+};
 
 use crate::{
     api::{
@@ -13,15 +17,16 @@ use crate::{
         input::ModelInput as RuntimeInput,
     },
     architectures::gemma4::layerwise::Gemma4LayerwiseModel,
+    backend::mlx::{
+        speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+        MlxModelInput,
+    },
     core::generation::{
         FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
     },
     runtime::attention::AttentionPolicy,
     runtime::generation::sampler::SpeculativeSampler,
-    runtime::generation::speculative::{
-        self as mtp, MtpBackend, MtpCommit, MtpExecutionStreams, MtpPrefill, MtpSemanticState,
-        MtpStreamTopology,
-    },
+    runtime::generation::speculative::{self as mtp, MtpComponentTimings, MtpSemanticState},
 };
 
 #[derive(Clone)]
@@ -240,14 +245,23 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
     }
 }
 
-impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
+impl<T: Gemma4MtpTarget> SpeculativeExecutor for Gemma4MtpBackend<'_, T> {
+    type Input = MlxModelInput;
     type Cache = Cache;
     type TargetState = Gemma4TargetState;
     type DraftState = Gemma4AssistantDraftState;
     type CacheCheckpoint = Cache;
     type Verification = Gemma4Verification;
+    type Logits = Array;
+    type Context<'a>
+        = MtpExecutionStreams<'a>
+    where
+        Self: 'a;
+    type Completion = MlxSpeculativeCompletion;
+    type Telemetry = MtpComponentTimings;
+    type Error = Exception;
 
-    fn max_draft_tokens(&self) -> usize {
+    fn max_proposals(&self) -> usize {
         self.assistant.block_size().saturating_sub(1)
     }
 
@@ -255,43 +269,41 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
         true
     }
 
-    fn prefill(
+    fn prefill<'context>(
         &mut self,
-        input: RuntimeInput<'_>,
+        input: MlxModelInput,
         cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<MtpPrefill<Self::TargetState>, Exception> {
-        let output = self.target.prefill_mtp_target(input, cache, stream)?;
-        let sequence = output.logits.dim(-2);
-        if sequence == 0 {
-            return Err(Exception::custom(
-                "MTP input must contain at least one token",
-            ));
-        }
-        let logits = output
-            .logits
-            .try_index_device((.., sequence - 1, ..), stream)?;
-        let state = Self::state_at(&output, sequence - 1, cache.mtp_len(), stream)?;
-        Ok(MtpPrefill {
-            logits,
-            state,
-            evaluated_tokens: sequence as usize,
+        streams: MtpExecutionStreams<'context>,
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
+    where
+        Self: 'context,
+    {
+        let stream = streams.target();
+        input.with_borrowed(|input| {
+            let output = self.target.prefill_mtp_target(input, cache, stream)?;
+            let sequence = output.logits.dim(-2);
+            if sequence == 0 {
+                return Err(Exception::custom(
+                    "MTP input must contain at least one token",
+                ));
+            }
+            let logits = output
+                .logits
+                .try_index_device((.., sequence - 1, ..), stream)?;
+            let state = Self::state_at(&output, sequence - 1, cache.mtp_len(), stream)?;
+            Ok(SpeculativePrefill {
+                logits,
+                state,
+                evaluated_tokens: sequence as usize,
+            })
         })
     }
 
-    fn begin_draft(
-        &mut self,
-        state: &Self::TargetState,
-        last_token: u32,
-        stream: &Stream,
-    ) -> Result<Self::DraftState, Exception> {
-        self.begin_draft_with_streams(state, last_token, MtpExecutionStreams::single(stream))
-    }
-
-    fn begin_draft_with_streams(
+    fn begin_proposal(
         &mut self,
         state: &Self::TargetState,
         _last_token: u32,
+        _proposal_capacity: usize,
         streams: MtpExecutionStreams<'_>,
     ) -> Result<Self::DraftState, Exception> {
         let state = Self::state_on_draft_stream(state, streams)?;
@@ -299,7 +311,7 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
             let embedding = self
                 .target
                 .mtp_embedding_snapshot(streams.draft(), streams.crosses_devices())?;
-            if streams.topology() == MtpStreamTopology::SameDeviceSplit {
+            if streams.topology() == SpeculativeExecutionTopology::SameDeviceSplit {
                 let _completion =
                     streams.wait_for_target_outputs(embedding.materialization_arrays())?;
             }
@@ -312,12 +324,13 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
             .begin_round(state.shared_kv, offset, &state.hidden))
     }
 
-    fn draft_logits(
+    fn proposal_logits(
         &mut self,
         state: &mut Self::DraftState,
         last_token: u32,
-        stream: &Stream,
+        streams: MtpExecutionStreams<'_>,
     ) -> Result<Array, Exception> {
+        let stream = streams.draft();
         let embedding = self
             .draft_embedding
             .as_mut()
@@ -334,16 +347,24 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
         cache.clone()
     }
 
-    fn verify(
+    fn submit_verification(
         &mut self,
-        input_tokens: &Array,
+        input_tokens: &[u32],
         cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<Self::Verification, Exception> {
-        Ok(Gemma4Verification {
-            output: self.target.verify_mtp_target(input_tokens, cache, stream)?,
-            inputs: input_tokens.clone(),
-        })
+        streams: MtpExecutionStreams<'_>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
+        let mut inputs = Array::from_slice(input_tokens, &[1, input_tokens.len() as i32]);
+        if streams.crosses_devices() {
+            inputs = inputs.copy(streams.target())?;
+        }
+        let output = Gemma4Verification {
+            output: self
+                .target
+                .verify_mtp_target(&inputs, cache, streams.target())?,
+            inputs,
+        };
+        let completion = MlxSpeculativeCompletion::submit([&output.output.logits])?;
+        Ok(Submission { output, completion })
     }
 
     fn verification_logits(output: &Self::Verification) -> &Array {
@@ -353,31 +374,12 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
     fn commit_verification(
         &mut self,
         output: Self::Verification,
-        draft_state: Self::DraftState,
-        cache: &mut Self::Cache,
-        checkpoint: Self::CacheCheckpoint,
-        verified_inputs: usize,
-        stream: &Stream,
-    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
-        self.commit_verification_with_streams(
-            output,
-            draft_state,
-            cache,
-            checkpoint,
-            verified_inputs,
-            MtpExecutionStreams::single(stream),
-        )
-    }
-
-    fn commit_verification_with_streams(
-        &mut self,
-        output: Self::Verification,
         _draft_state: Self::DraftState,
         cache: &mut Self::Cache,
         checkpoint: Self::CacheCheckpoint,
         verified_inputs: usize,
         streams: MtpExecutionStreams<'_>,
-    ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
         let stream = streams.target();
         let input_len = output.inputs.dim(1) as usize;
         if verified_inputs > input_len {
@@ -392,7 +394,7 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
                 cache.mtp_len(),
                 stream,
             )?;
-            return Ok(MtpCommit {
+            return Ok(SpeculativeCommit {
                 state,
                 replayed_tokens: 0,
             });
@@ -419,7 +421,7 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
             cache.mtp_len(),
             stream,
         )?;
-        Ok(MtpCommit {
+        Ok(SpeculativeCommit {
             state,
             replayed_tokens: 0,
         })
