@@ -5,7 +5,7 @@ use safemlx::{
     random::RandomState,
     Array, Stream,
 };
-use safemlx_lm_core::{BackendSession, Completion, Submission};
+use safemlx_lm_core::{BackendSession, Completion, ModelRuntime, Submission};
 use std::path::Path;
 
 use crate::core::generation::MtpConfig;
@@ -266,6 +266,28 @@ impl<'a> MlxModelSession<'a> {
             MlxSessionKind::Pipeline(model, _) => model.expert_cache_report(),
             MlxSessionKind::Expert(model, _) => model.expert_cache_report(),
         }
+    }
+
+    pub(crate) fn complete_model(&self) -> &Model {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model,
+            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
+                unreachable!("replicated facade contains a distributed MLX session")
+            }
+        }
+    }
+
+    pub(crate) fn complete_parts_mut(&mut self) -> (&mut Model, &mut ModelCache) {
+        match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => (model, cache),
+            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
+                unreachable!("replicated facade contains a distributed MLX session")
+            }
+        }
+    }
+
+    pub(crate) fn new_complete_cache(&self) -> ModelCache {
+        self.complete_model().new_cache()
     }
 
     #[cfg(test)]
@@ -1124,35 +1146,23 @@ pub struct MlxGeneration<'a, S = DefaultSampler>
 where
     S: Sampler,
 {
-    model: &'a mut Model,
-    cache: &'a mut ModelCache,
-    backend: MlxBackend<'a>,
+    runtime: &'a mut ModelRuntime<MlxBackend<'static>>,
     temperature: f32,
     prng_state: Option<RandomState>,
     sampler: S,
     state: GenerationState,
-    completions: Vec<MlxCompletion>,
+    completions: Vec<MlxSessionCompletion>,
 }
 
 impl<'a> MlxGeneration<'a, DefaultSampler> {
     /// Creates an architecture-erased generation session with the default sampler.
     pub fn new(
-        model: &'a mut Model,
-        cache: &'a mut ModelCache,
+        runtime: &'a mut ModelRuntime<MlxBackend<'static>>,
         temperature: f32,
         input: input::ModelInput<'_>,
         prng_key: Option<Array>,
-        stream: &'a Stream,
     ) -> Self {
-        Self::with_sampler(
-            model,
-            cache,
-            temperature,
-            input,
-            prng_key,
-            stream,
-            DefaultSampler,
-        )
+        Self::with_sampler(runtime, temperature, input, prng_key, DefaultSampler)
     }
 }
 
@@ -1162,18 +1172,14 @@ where
 {
     /// Creates an architecture-erased generation session with a caller sampler.
     pub fn with_sampler(
-        model: &'a mut Model,
-        cache: &'a mut ModelCache,
+        runtime: &'a mut ModelRuntime<MlxBackend<'static>>,
         temperature: f32,
         input: input::ModelInput<'_>,
         prng_key: Option<Array>,
-        stream: &'a Stream,
         sampler: S,
     ) -> Self {
         Self {
-            model,
-            cache,
-            backend: MlxBackend::new(stream),
+            runtime,
             temperature,
             prng_state: prng_key.map(RandomState::from_key),
             sampler,
@@ -1187,7 +1193,7 @@ where
         &mut self.sampler
     }
 
-    fn retain_completion(&mut self, completion: MlxCompletion) -> Result<(), Error> {
+    fn retain_completion(&mut self, completion: MlxSessionCompletion) -> Result<(), Error> {
         let mut retained = Vec::with_capacity(self.completions.len() + 1);
         for pending in self.completions.drain(..) {
             if !pending.is_complete()? {
@@ -1207,38 +1213,37 @@ where
     type Item = Result<Array, safemlx::error::Exception>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let stream = self.runtime.backend().stream().clone();
         let submission = match &self.state {
-            GenerationState::Prefill(input) => submit_prefill_with_cache(
-                self.model,
-                self.cache,
-                input.clone(),
-                self.backend.stream(),
-            ),
+            GenerationState::Prefill(input) => self.runtime.prefill(input.clone()),
             GenerationState::Decode(token) => {
-                let input = match token.try_index_device((.., NewAxis), self.backend.stream()) {
+                let input = match token.try_index_device((.., NewAxis), &stream) {
                     Ok(input) => input,
                     Err(error) => return Some(Err(error)),
                 };
-                submit_decode_with_cache(self.model, self.cache, input, self.backend.stream())
+                self.runtime.decode(input)
             }
         };
         let submission = match submission {
             Ok(submission) => submission,
             Err(error) => return Some(Err(safemlx::error::Exception::custom(error.to_string()))),
         };
-        let logits = submission.output;
+        let Some(logits) = submission.output.into_logits() else {
+            return Some(Err(safemlx::error::Exception::custom(
+                "token generation requires logits on the local session rank",
+            )));
+        };
         if let Err(error) = self.retain_completion(submission.completion) {
             return Some(Err(safemlx::error::Exception::custom(error.to_string())));
         }
-        let token = match self.sampler.sample(
-            &logits,
-            self.temperature,
-            self.prng_state.as_mut(),
-            self.backend.stream(),
-        ) {
-            Ok(token) => token,
-            Err(error) => return Some(Err(error)),
-        };
+        let token =
+            match self
+                .sampler
+                .sample(&logits, self.temperature, self.prng_state.as_mut(), &stream)
+            {
+                Ok(token) => token,
+                Err(error) => return Some(Err(error)),
+            };
         self.state = GenerationState::Decode(token.clone());
         Some(Ok(token))
     }

@@ -43,17 +43,17 @@ pub(crate) struct MlxDistributedConfig<'a> {
 pub struct MlxDistributedSession<'a> {
     topology: ParallelTopology,
     communicators: ParallelCommunicators<'a>,
-    stream: &'a Stream,
+    stream: Stream,
 }
 
 impl<'a> MlxDistributedSession<'a> {
-    pub(crate) fn new(config: MlxDistributedConfig<'a>, stream: &'a Stream) -> Result<Self, Error> {
+    pub(crate) fn new(config: MlxDistributedConfig<'a>, stream: &Stream) -> Result<Self, Error> {
         config.topology.validate_execution_stream(stream)?;
         let communicators = ParallelCommunicators::new(config.topology, config.world)?;
         Ok(Self {
             topology: config.topology,
             communicators,
-            stream,
+            stream: stream.clone(),
         })
     }
 
@@ -64,7 +64,7 @@ impl<'a> MlxDistributedSession<'a> {
 
     /// Returns the execution stream selected for this session.
     pub const fn stream(&self) -> &Stream {
-        self.stream
+        &self.stream
     }
 
     pub(crate) const fn world(&self) -> &Group {
@@ -74,9 +74,9 @@ impl<'a> MlxDistributedSession<'a> {
     pub(crate) fn tensor_context(&self) -> Result<ParallelExecutionContext<'_>, Error> {
         match self.communicators.tensor_group() {
             Some(group) => {
-                ParallelExecutionContext::tensor_parallel(self.topology(), group, self.stream)
+                ParallelExecutionContext::tensor_parallel(self.topology(), group, &self.stream)
             }
-            None => Ok(ParallelExecutionContext::replicated(self.stream)),
+            None => Ok(ParallelExecutionContext::replicated(&self.stream)),
         }
     }
 
@@ -214,7 +214,7 @@ impl<'a> MlxDistributedSession<'a> {
             finished,
             sampling_rank,
             self.world(),
-            self.stream,
+            &self.stream,
         )
     }
 
@@ -225,14 +225,14 @@ impl<'a> MlxDistributedSession<'a> {
         local_cancelled: bool,
     ) -> Result<(bool, bool), Error> {
         let failed = if local_failed {
-            ones::<i32>(&[], self.stream)?
+            ones::<i32>(&[], &self.stream)?
         } else {
-            zeros::<i32>(&[], self.stream)?
+            zeros::<i32>(&[], &self.stream)?
         };
         let cancelled = if local_cancelled {
-            ones::<i32>(&[], self.stream)?
+            ones::<i32>(&[], &self.stream)?
         } else {
-            zeros::<i32>(&[], self.stream)?
+            zeros::<i32>(&[], &self.stream)?
         };
         let failed = DistributedSession::all_reduce_sum(self, CollectiveScope::World, &failed)?;
         let cancelled =
@@ -240,8 +240,8 @@ impl<'a> MlxDistributedSession<'a> {
         let failed = failed.wait()?;
         let cancelled = cancelled.wait()?;
         Ok((
-            failed.try_item::<i32>(self.stream)? != 0,
-            cancelled.try_item::<i32>(self.stream)? != 0,
+            failed.try_item::<i32>(&self.stream)? != 0,
+            cancelled.try_item::<i32>(&self.stream)? != 0,
         ))
     }
 
@@ -330,7 +330,7 @@ impl DistributedSession for MlxDistributedSession<'_> {
         scope: CollectiveScope,
         input: &Array,
     ) -> Result<Submission<Array, Self::Completion>, Error> {
-        let output = distributed::all_sum(input, self.group(scope)?, self.stream)?;
+        let output = distributed::all_sum(input, self.group(scope)?, &self.stream)?;
         let completion = DistributedCompletion::submit(output.clone(), [&output])?;
         Ok(Submission { output, completion })
     }
@@ -340,7 +340,7 @@ impl DistributedSession for MlxDistributedSession<'_> {
         scope: CollectiveScope,
         input: &Array,
     ) -> Result<Submission<Array, Self::Completion>, Error> {
-        let output = distributed::all_gather(input, self.group(scope)?, self.stream)?;
+        let output = distributed::all_gather(input, self.group(scope)?, &self.stream)?;
         let completion = DistributedCompletion::submit(output.clone(), [&output])?;
         Ok(Submission { output, completion })
     }
@@ -357,7 +357,7 @@ impl DistributedSession for MlxDistributedSession<'_> {
             send_counts,
             receive_counts,
             self.group(scope)?,
-            self.stream,
+            &self.stream,
         )?;
         let completion = DistributedCompletion::submit(output.clone(), [&output])?;
         Ok(Submission { output, completion })
@@ -369,7 +369,7 @@ impl DistributedSession for MlxDistributedSession<'_> {
         peer: usize,
         input: &Array,
     ) -> Result<Submission<Array, Self::Completion>, Error> {
-        let output = distributed::send(input, peer, self.group(scope)?, self.stream)?;
+        let output = distributed::send(input, peer, self.group(scope)?, &self.stream)?;
         let completion = DistributedCompletion::submit(output.clone(), [&output])?;
         Ok(Submission { output, completion })
     }
@@ -386,7 +386,7 @@ impl DistributedSession for MlxDistributedSession<'_> {
             Self::value_dtype(value)?,
             peer,
             self.group(scope)?,
-            self.stream,
+            &self.stream,
         )?;
         let completion = DistributedCompletion::submit(output.clone(), [&output])?;
         Ok(Submission { output, completion })

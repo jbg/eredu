@@ -108,12 +108,17 @@ fn observer_forward_reports_attention_and_residual_hooks() {
         safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let mut model = LoadedModel::load(model_dir, ctx.stream(), weights_ctx.stream()).unwrap();
     let input = model.encode_to_array("hello", true, ctx.stream()).unwrap();
-    let mut cache = model.new_cache();
     let mut recorder = ActivationRecorder::new();
-
+    let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+        &input,
+    )];
     model
-        .model
-        .forward_with_observer(&input, None, &mut cache, ctx.stream(), &mut recorder)
+        .submit_prefill_with_observer(
+            crate::runtime::media::input::ModelInput::new(&parts),
+            &mut recorder,
+        )
+        .unwrap()
+        .wait()
         .unwrap();
 
     let names = recorder
@@ -762,8 +767,15 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         panic!("expected canonical Qwen3.5 model");
     };
     let tokenizer_fingerprint = super::tokenizer_vocabulary_fingerprint(&tokenizer);
+    let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
+        crate::backend::mlx::MlxBackend::new(stream),
+        safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(
+            super::Model::Qwen35(qwen),
+        )),
+    )
+    .unwrap();
     let mut model = LoadedModel {
-        model: super::Model::Qwen35(qwen),
+        runtime,
         #[cfg(feature = "media-processing")]
         processor: None,
         tokenizer,
@@ -775,9 +787,11 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         constraint_compiler: compiler,
     };
 
+    let mut empty_cache = model.new_mtp_cache(0);
     let output = model
         .generate_prepared_chat_embedded_mtp_batch::<DefaultSampler>(
             PreparedChatEmbeddedMtpBatchRequest {
+                cache: &mut empty_cache,
                 lanes: Vec::new(),
                 stream,
                 scheduler: MtpSchedulerOptions::default(),
@@ -793,12 +807,13 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     );
     assert_eq!(output.scheduler.turns, 0);
 
-    let mut wrong_cache = super::ModelCache::KeyValue(Vec::new());
+    let wrong_cache = super::ModelCache::KeyValue(Vec::new());
+    let mut wrong_cache = crate::runtime::generation::speculative::MtpCache::new(vec![wrong_cache]);
     let error = model
         .generate_prepared_chat_embedded_mtp_batch(PreparedChatEmbeddedMtpBatchRequest {
+            cache: &mut wrong_cache,
             lanes: vec![PreparedChatMtpBatchLane {
                 input: PreparedChatInput::rendered_prompt(&prepared),
-                cache: &mut wrong_cache,
                 sampling_policy: DefaultSampler,
                 settings: PreparedChatGenerationSettings::default(),
                 max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
@@ -4918,14 +4933,15 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 "decode {family} {quantization:?}"
             );
             if family == "llama" && matches!(quantization, WeightQuantization::Affine(_)) {
-                let mut generation_cache = dense.new_cache();
-                let mut generation = dense.generate_input_with_cache(
-                    &mut generation_cache,
-                    0.0,
-                    input,
-                    None,
-                    stream,
-                );
+                let mut runtime = safemlx_lm_core::ModelRuntime::from_prepared(
+                    crate::backend::mlx::MlxBackend::new(stream),
+                    safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(
+                        dense,
+                    )),
+                )
+                .unwrap();
+                let mut generation =
+                    crate::backend::mlx::MlxGeneration::new(&mut runtime, 0.0, input, None);
                 generation.next().unwrap().unwrap().item::<u32>(stream);
                 generation.next().unwrap().unwrap().item::<u32>(stream);
                 generation.next().unwrap().unwrap().item::<u32>(stream);

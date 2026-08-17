@@ -1273,36 +1273,6 @@ impl Model {
     ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
         crate::backend::mlx::submit_decode_with_cache(self, cache, input, stream)
     }
-
-    /// Creates a token iterator from typed input using a cache returned by [`Model::new_cache`].
-    pub fn generate_input_with_cache<'a>(
-        &'a mut self,
-        cache: &'a mut ModelCache,
-        temp: f32,
-        input: input::ModelInput<'_>,
-        prng_key: Option<Array>,
-        stream: &'a Stream,
-    ) -> crate::backend::mlx::MlxGeneration<'a> {
-        self.generate_input_with_cache_sampler(cache, temp, input, prng_key, stream, DefaultSampler)
-    }
-
-    /// Creates a token iterator from typed input with a caller-provided sampler.
-    pub fn generate_input_with_cache_sampler<'a, S>(
-        &'a mut self,
-        cache: &'a mut ModelCache,
-        temp: f32,
-        input: input::ModelInput<'_>,
-        prng_key: Option<Array>,
-        stream: &'a Stream,
-        sampler: S,
-    ) -> crate::backend::mlx::MlxGeneration<'a, S>
-    where
-        S: Sampler,
-    {
-        crate::backend::mlx::MlxGeneration::with_sampler(
-            self, cache, temp, input, prng_key, stream, sampler,
-        )
-    }
 }
 
 /// Cache value matching a [`Model`] variant.

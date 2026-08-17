@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    api::{LoadedModel, ModelCache},
+    api::LoadedModel,
     runtime::media::input::{InputPart, ModelInput},
     AttentionPolicy, CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology,
@@ -53,25 +53,13 @@ struct Args {
     device_cache: bool,
 }
 
-fn prefill_tokens(
-    tokens: &Array,
-    cache: &mut ModelCache,
-    model: &mut LoadedModel,
-    stream: &safemlx::Stream,
-) -> anyhow::Result<Array> {
+fn prefill_tokens(tokens: &Array, model: &mut LoadedModel) -> anyhow::Result<Array> {
     let parts = [InputPart::text_token_ids(tokens)];
-    Ok(model
-        .submit_prefill(ModelInput::new(&parts), cache, stream)?
-        .wait()?)
+    Ok(model.submit_prefill(ModelInput::new(&parts))?.wait()?)
 }
 
-fn decode_tokens(
-    tokens: &Array,
-    cache: &mut ModelCache,
-    model: &mut LoadedModel,
-    stream: &safemlx::Stream,
-) -> anyhow::Result<Array> {
-    Ok(model.submit_decode(tokens.clone(), cache, stream)?.wait()?)
+fn decode_tokens(tokens: &Array, model: &mut LoadedModel) -> anyhow::Result<Array> {
+    Ok(model.submit_decode(tokens.clone())?.wait()?)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -89,9 +77,8 @@ fn main() -> anyhow::Result<()> {
     let suffix = Array::from_slice(&[args.suffix_token], &[1, 1]);
 
     if args.device_cache {
-        let mut cache = model.new_cache();
-        let _ = prefill_tokens(&prefix, &mut cache, &mut model, stream)?;
-        let logits = decode_tokens(&suffix, &mut cache, &mut model, stream)?;
+        let _ = prefill_tokens(&prefix, &mut model)?;
+        let logits = decode_tokens(&suffix, &mut model)?;
         async_eval_with_event([&logits])?.synchronize()?;
         println!(
             "ordinary device cache suffix logits shape: {:?}",
@@ -117,18 +104,17 @@ fn main() -> anyhow::Result<()> {
         paged = paged.with_live_disk(directory, args.live_disk_bytes, 2)?;
     }
 
-    let mut uninterrupted =
-        model.new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))?;
-    let _ = prefill_tokens(&prefix, &mut uninterrupted, &mut model, stream)?;
-    let uninterrupted_logits = decode_tokens(&suffix, &mut uninterrupted, &mut model, stream)?;
+    model.configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
+    let _ = prefill_tokens(&prefix, &mut model)?;
+    let uninterrupted_logits = decode_tokens(&suffix, &mut model)?;
     async_eval_with_event([&uninterrupted_logits])?.synchronize()?;
     println!(
         "uninterrupted report: {:#?}",
-        uninterrupted.residency_report()?
+        model.cache_residency_report()?
     );
 
-    let mut persisted = model.new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))?;
-    let _ = prefill_tokens(&prefix, &mut persisted, &mut model, stream)?;
+    model.configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
+    let _ = prefill_tokens(&prefix, &mut model)?;
     let model_type = model.model_type().to_owned();
     let model_family = if model_type.contains("deepseek") {
         "deepseek_v3"
@@ -156,7 +142,6 @@ fn main() -> anyhow::Result<()> {
         topology: PromptCacheTopology::default(),
     };
     let manifest = model.save_prompt_cache(
-        &mut persisted,
         &args.cache_dir,
         descriptor.clone(),
         &prefix_ids,
@@ -164,23 +149,20 @@ fn main() -> anyhow::Result<()> {
             application_namespace: Some("paged-prompt-cache-example".into()),
             replace_existing: args.replace,
         },
-        stream,
     )?;
     println!("saved blocks: {}", manifest.blocks.len());
-    println!("save report: {:#?}", persisted.residency_report()?);
-    drop(persisted);
+    println!("save report: {:#?}", model.cache_residency_report()?);
 
-    let (mut restored, inspected) =
-        model.load_prompt_cache(&args.cache_dir, &descriptor, &prefix_ids, paged, stream)?;
+    let inspected = model.load_prompt_cache(&args.cache_dir, &descriptor, &prefix_ids, paged)?;
     println!("cataloged blocks: {}", inspected.blocks.len());
-    println!("load report: {:#?}", restored.residency_report()?);
-    let restored_logits = decode_tokens(&suffix, &mut restored, &mut model, stream)?;
+    println!("load report: {:#?}", model.cache_residency_report()?);
+    let restored_logits = decode_tokens(&suffix, &mut model)?;
     async_eval_with_event([&restored_logits])?.synchronize()?;
     let equal = restored_logits
         .all_close(&uninterrupted_logits, 1e-4, 1e-4, None, stream)?
         .item::<bool>(stream);
     println!("restored suffix logits match uninterrupted execution: {equal}");
-    println!("continued report: {:#?}", restored.residency_report()?);
+    println!("continued report: {:#?}", model.cache_residency_report()?);
     anyhow::ensure!(
         equal,
         "restored suffix logits differ from uninterrupted execution"

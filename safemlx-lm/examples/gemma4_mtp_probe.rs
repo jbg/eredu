@@ -105,22 +105,19 @@ fn run_greedy(
     let mut loaded = LoadedModel::load(target_dir, stream, weights_stream)?;
     let prompt_tokens = loaded.encode_to_array(prompt, false, stream)?;
     let eos = loaded.eos_token_ids().to_vec();
-    let mut cache = loaded.new_cache();
     let mut ids = Vec::new();
     let start = Instant::now();
     {
         let input_parts = [InputPart::text_token_ids(&prompt_tokens)];
         let input = ModelInput::new(&input_parts);
         let generator = loaded
-            .generate_input_with_cache(
-                &mut cache,
+            .generate_input(
                 input,
                 GenerationConfigOverrides {
                     temperature: Some(0.0),
                     ..Default::default()
                 },
                 None,
-                stream,
             )?
             .take(max_tokens);
         for token in generator {
@@ -154,7 +151,6 @@ fn run_mtp(
     let mut target = LoadedModel::load(target_dir, stream, weights_stream)?;
     let mut assistant = LoadedDrafter::load(assistant_dir, stream, weights_stream)?;
     let prompt_tokens = target.encode_to_array(prompt, false, stream)?;
-    let mut cache = target.new_cache();
     let parts = [InputPart::text_token_ids(&prompt_tokens)];
     let input = ModelInput::new(&parts);
     let config = MtpConfig {
@@ -164,7 +160,7 @@ fn run_mtp(
         eos_token_ids: target.eos_token_ids().to_vec(),
     };
     let (mut generated, stats) =
-        target.generate_mtp_input(&mut assistant, &mut cache, input, &config, None, stream)?;
+        target.generate_mtp_input(&mut assistant, input, &config, None, stream)?;
     if generated
         .last()
         .is_some_and(|token| config.eos_token_ids.contains(token))

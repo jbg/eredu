@@ -160,16 +160,14 @@ fn run_case(
     let prompt_tokens = Array::from(prompt_ids.as_slice()).try_index_device(NewAxis, stream)?;
     let input_parts = [InputPart::text_token_ids(&prompt_tokens)];
     let input = ModelInput::new(&input_parts);
-    let mut cache = model.new_cache();
-    let mut generator = model.generate_input_with_cache(
-        &mut cache,
+    model.reset_session()?;
+    let mut generator = model.generate_input(
         input,
         GenerationConfigOverrides {
             temperature: Some(0.0),
             ..Default::default()
         },
         None,
-        stream,
     )?;
     let mut ids = Vec::with_capacity(decode_tokens);
 

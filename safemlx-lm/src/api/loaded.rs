@@ -5,11 +5,11 @@ use super::*;
 /// A model directory or GGUF file loaded together with its tokenizer and chat template.
 ///
 /// This is the most convenient entry point for text generation: it owns the
-/// architecture-specific [`Model`], tokenizer, optional chat template, model id
+/// selected backend runtime, tokenizer, optional chat template, model id
 /// used by the template renderer, and EOS token ids collected from checkpoint
 /// and sidecar metadata.
 pub struct LoadedModel {
-    pub(super) model: Model,
+    pub(super) runtime: safemlx_lm_core::ModelRuntime<crate::backend::mlx::MlxBackend<'static>>,
     #[cfg(feature = "media-processing")]
     pub(super) processor: Option<ModelProcessor>,
     pub(super) tokenizer: ChatTokenizer,
@@ -318,6 +318,14 @@ where
 }
 
 impl LoadedModel {
+    pub(crate) fn model(&self) -> &Model {
+        self.runtime.session().complete_model()
+    }
+
+    fn model_and_cache(&mut self) -> (&mut Model, &mut ModelCache) {
+        self.runtime.session_mut().complete_parts_mut()
+    }
+
     fn resolve_prepared_chat_generation_settings(
         &self,
         settings: PreparedChatGenerationSettings,
@@ -348,7 +356,7 @@ impl LoadedModel {
     /// and the token-id vocabulary mapping when the drafter carries tokenizer
     /// metadata.
     pub fn validate_drafter_compatibility(&self, drafter: &LoadedDrafter) -> Result<(), Error> {
-        match (&self.model, drafter.kind()) {
+        match (self.model(), drafter.kind()) {
             (Model::Gemma4(target), DrafterKind::Gemma4Assistant) => {
                 validate_gemma4_drafter(target.args(), drafter.gemma4())?
             }
@@ -408,16 +416,24 @@ impl LoadedModel {
     fn prepare_chat_mtp_batch_lanes<'a, S>(
         &self,
         lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
+        cache: &'a mut MtpCache,
         stream: &Stream,
     ) -> Result<Vec<PreparedChatMtpLaneRuntime<'a, S>>, Error>
     where
         S: SpeculativeSampler + Clone,
     {
+        if cache.len() != lanes.len() {
+            return Err(Error::PreparedChatGeneration(format!(
+                "MTP cache has {} lanes but the request has {} lanes",
+                cache.len(),
+                lanes.len()
+            )));
+        }
         let mut prepared_lanes = Vec::with_capacity(lanes.len());
-        for (lane_index, lane) in lanes.into_iter().enumerate() {
+        for (lane_index, (lane, cache)) in lanes.into_iter().zip(cache.lanes.iter_mut()).enumerate()
+        {
             let PreparedChatMtpBatchLane {
                 input,
-                cache,
                 sampling_policy,
                 settings,
                 max_draft_tokens,
@@ -505,14 +521,15 @@ impl LoadedModel {
     {
         let PreparedChatMtpBatchRequest {
             drafter,
+            cache,
             lanes,
             streams,
             scheduler,
         } = request;
         self.validate_drafter_compatibility(drafter)?;
-        let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, streams.target())?;
+        let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, cache, streams.target())?;
 
-        match &mut self.model {
+        match self.model_and_cache().0 {
             Model::Gemma4(target) => {
                 let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
@@ -568,13 +585,14 @@ impl LoadedModel {
         S: SpeculativeSampler + Clone,
     {
         let PreparedChatEmbeddedMtpBatchRequest {
+            cache,
             lanes,
             stream,
             scheduler,
         } = request;
-        let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, stream)?;
+        let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, cache, stream)?;
         let streams = MtpExecutionStreams::single(stream);
-        match &mut self.model {
+        match self.model_and_cache().0 {
             Model::DeepSeekV3(target) => {
                 let mut backend =
                     crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
@@ -663,6 +681,8 @@ impl LoadedModel {
     /// is checked before model work, after each synchronous event callback, and
     /// before requesting another token. It emits only `Finished(Cancelled)` as
     /// finalization and does not close incomplete protocol structures.
+    /// Call [`LoadedModel::reset_session`] before an unrelated request; without
+    /// a reset this request deliberately continues the session-owned prefix.
     pub fn generate_prepared_chat<S, F>(
         &mut self,
         request: PreparedChatGenerationRequest<'_, S, F>,
@@ -673,11 +693,9 @@ impl LoadedModel {
     {
         let PreparedChatGenerationRequest {
             input,
-            cache,
             sampling_policy,
             settings,
             caller_stop_sequences,
-            stream,
             cancellation,
             mut on_event,
         } = request;
@@ -691,6 +709,7 @@ impl LoadedModel {
             });
         }
         let prepared_chat = input.prepared_chat();
+        let stream = self.runtime.backend().stream().clone();
         let use_checkpoint_sampler = Sampler::uses_checkpoint_defaults(&sampling_policy);
         let settings = self.resolve_prepared_chat_generation_settings(settings)?;
 
@@ -709,17 +728,18 @@ impl LoadedModel {
                 let raw_decoder =
                     RawTokenDecoder::with_structural_tokens(decoder, runtime.structural_tokens);
                 let mut pipeline = CommittedTokenPipeline::new(raw_decoder, runtime.parser);
-                let model_input = self.prepare_chat_model_input(input, stream)?;
+                let model_input = self.prepare_chat_model_input(input, &stream)?;
                 model_input.with_model_input(|model_input| {
-                    let generator = self.generate_input_with_cache_sampler(
-                        cache,
+                    let generator = self.generate_input_with_sampler(
                         settings.temperature,
                         model_input,
                         settings.prng_key,
-                        stream,
                         runtime.sampler,
                     );
-                    let mut source = GenerationTokenSource { generator, stream };
+                    let mut source = GenerationTokenSource {
+                        generator,
+                        stream: &stream,
+                    };
                     let (token_ids, finish_reason) = drive_committed_generation_cancellable(
                         &mut source,
                         &mut pipeline,
@@ -755,7 +775,6 @@ impl LoadedModel {
         let PreparedChatMtpGenerationRequest {
             input,
             drafter,
-            cache,
             sampling_policy,
             settings,
             options,
@@ -801,8 +820,8 @@ impl LoadedModel {
                 let mut sampler = runtime.sampler;
                 let model_input = self.prepare_chat_model_input(input, streams.target())?;
                 model_input.with_model_input(|model_input| {
-                    let (token_ids, stats, finish_reason) = self
-                        .model
+                    let (model, cache) = self.model_and_cache();
+                    let (token_ids, stats, finish_reason) = model
                         .generate_mtp_input_with_semantics_and_options(
                             drafter,
                             cache,
@@ -840,7 +859,6 @@ impl LoadedModel {
     {
         let PreparedChatEmbeddedMtpGenerationRequest {
             input,
-            cache,
             sampling_policy,
             settings,
             options,
@@ -885,8 +903,8 @@ impl LoadedModel {
                 let mut sampler = runtime.sampler;
                 let model_input = self.prepare_chat_model_input(input, stream)?;
                 model_input.with_model_input(|model_input| {
-                    let (token_ids, stats, finish_reason) = self
-                        .model
+                    let (model, cache) = self.model_and_cache();
+                    let (token_ids, stats, finish_reason) = model
                         .generate_embedded_mtp_input_with_semantics_and_options(
                             cache,
                             model_input,
@@ -912,19 +930,22 @@ impl LoadedModel {
 
     /// Reports whether and how this target can perform MTP generation.
     pub fn mtp_capability(&self) -> MtpCapability {
-        self.model.mtp_capability()
+        self.model().mtp_capability()
     }
 
     /// Creates independent target caches for an MTP text batch.
     pub fn new_mtp_cache(&self, batch_size: usize) -> MtpCache {
-        MtpCache::new((0..batch_size).map(|_| self.new_cache()).collect())
+        MtpCache::new(
+            (0..batch_size)
+                .map(|_| self.runtime.session().new_complete_cache())
+                .collect(),
+        )
     }
 
     /// Generates through the architecture-independent MTP path.
     pub fn generate_mtp_input(
         &mut self,
         drafter: &mut LoadedDrafter,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -932,7 +953,6 @@ impl LoadedModel {
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         self.generate_mtp_input_with_sampler(
             drafter,
-            cache,
             input,
             config,
             prng_key,
@@ -945,7 +965,6 @@ impl LoadedModel {
     pub fn generate_mtp_input_with_streams(
         &mut self,
         drafter: &mut LoadedDrafter,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -953,7 +972,6 @@ impl LoadedModel {
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         self.generate_mtp_input_with_sampler_and_streams(
             drafter,
-            cache,
             input,
             config,
             prng_key,
@@ -967,7 +985,6 @@ impl LoadedModel {
     pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
         drafter: &mut LoadedDrafter,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -976,7 +993,6 @@ impl LoadedModel {
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         self.generate_mtp_input_with_sampler_and_streams(
             drafter,
-            cache,
             input,
             config,
             prng_key,
@@ -991,7 +1007,6 @@ impl LoadedModel {
     pub fn generate_mtp_input_with_sampler_and_streams<S: SpeculativeSampler + Clone>(
         &mut self,
         drafter: &mut LoadedDrafter,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1002,17 +1017,17 @@ impl LoadedModel {
         if config.eos_token_ids.is_empty() {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        self.model
-            .generate_mtp_input_with_sampler_callback_and_streams(
-                drafter,
-                cache,
-                input,
-                &config,
-                prng_key,
-                sampler,
-                streams,
-                |_| Ok(()),
-            )
+        let (model, cache) = self.model_and_cache();
+        model.generate_mtp_input_with_sampler_callback_and_streams(
+            drafter,
+            cache,
+            input,
+            &config,
+            prng_key,
+            sampler,
+            streams,
+            |_| Ok(()),
+        )
     }
 
     /// Generates through MTP with separate streams and reports committed
@@ -1021,7 +1036,6 @@ impl LoadedModel {
     pub fn generate_mtp_input_with_sampler_callback_and_streams<S, F>(
         &mut self,
         drafter: &mut LoadedDrafter,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1035,7 +1049,6 @@ impl LoadedModel {
     {
         self.generate_mtp_input_with_sampler_callback_and_streams_and_options(
             drafter,
-            cache,
             input,
             config,
             prng_key,
@@ -1054,7 +1067,6 @@ impl LoadedModel {
     pub fn generate_mtp_input_with_sampler_callback_and_streams_and_options<S, F>(
         &mut self,
         drafter: &mut LoadedDrafter,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1073,18 +1085,18 @@ impl LoadedModel {
         if config.eos_token_ids.is_empty() {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        self.model
-            .generate_mtp_input_with_sampler_callback_and_streams_and_options(
-                drafter,
-                cache,
-                input,
-                &config,
-                prng_key,
-                sampler,
-                streams,
-                scheduler_options,
-                on_token,
-            )
+        let (model, cache) = self.model_and_cache();
+        model.generate_mtp_input_with_sampler_callback_and_streams_and_options(
+            drafter,
+            cache,
+            input,
+            &config,
+            prng_key,
+            sampler,
+            streams,
+            scheduler_options,
+            on_token,
+        )
     }
 
     /// Generates through MTP and reports each committed token as it becomes available.
@@ -1092,7 +1104,6 @@ impl LoadedModel {
     pub fn generate_mtp_input_with_sampler_callback<S, F>(
         &mut self,
         drafter: &mut LoadedDrafter,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1106,7 +1117,6 @@ impl LoadedModel {
     {
         self.generate_mtp_input_with_sampler_callback_and_streams(
             drafter,
-            cache,
             input,
             config,
             prng_key,
@@ -1119,14 +1129,12 @@ impl LoadedModel {
     /// Generates through MTP weights embedded in the target checkpoint.
     pub fn generate_embedded_mtp_input(
         &mut self,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
         stream: &Stream,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         self.generate_embedded_mtp_input_with_sampler(
-            cache,
             input,
             config,
             prng_key,
@@ -1139,7 +1147,6 @@ impl LoadedModel {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1150,7 +1157,8 @@ impl LoadedModel {
         if config.eos_token_ids.is_empty() {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        self.model.generate_embedded_mtp_input_with_sampler(
+        let (model, cache) = self.model_and_cache();
+        model.generate_embedded_mtp_input_with_sampler(
             cache, input, &config, prng_key, sampler, stream,
         )
     }
@@ -1159,7 +1167,6 @@ impl LoadedModel {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_embedded_mtp_input_with_sampler_callback<S, F>(
         &mut self,
-        cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1175,10 +1182,10 @@ impl LoadedModel {
         if config.eos_token_ids.is_empty() {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        self.model
-            .generate_embedded_mtp_input_with_sampler_callback(
-                cache, input, &config, prng_key, sampler, stream, on_token,
-            )
+        let (model, cache) = self.model_and_cache();
+        model.generate_embedded_mtp_input_with_sampler_callback(
+            cache, input, &config, prng_key, sampler, stream, on_token,
+        )
     }
 
     /// Generates an independently accepting and stopping batch of text prompts.
@@ -1275,7 +1282,7 @@ impl LoadedModel {
         if config.eos_token_ids.is_empty() {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        match &mut self.model {
+        match self.model_and_cache().0 {
             Model::Gemma4(target) => {
                 let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
@@ -1381,7 +1388,7 @@ impl LoadedModel {
         if config.eos_token_ids.is_empty() {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
-        match &mut self.model {
+        match self.model_and_cache().0 {
             Model::DeepSeekV3(target) => {
                 let mut backend =
                     crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
@@ -1464,21 +1471,21 @@ impl LoadedModel {
     pub fn residency_report(
         &self,
     ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
-        self.model.residency_report()
+        self.runtime.session().residency_report()
     }
 
     /// Returns experimental dense-stream telemetry when enabled.
     pub fn dense_stream_report(
         &self,
     ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
-        self.model.dense_stream_report()
+        self.runtime.session().dense_stream_report()
     }
 
     /// Returns sparse routed-expert cache telemetry when enabled.
     pub fn expert_cache_report(
         &self,
     ) -> Result<Option<crate::runtime::residency::expert_cache::ExpertCacheReport>, Error> {
-        self.model.expert_cache_report()
+        self.runtime.session().expert_cache_report()
     }
 
     /// Loads a supported model directory or GGUF file with its tokenizer.
@@ -1555,8 +1562,12 @@ impl LoadedModel {
             let chat_template = chat_template.or(load_chat_template(sidecar_dir)?);
             let constraint_compiler =
                 ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
+            let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
+                crate::backend::mlx::MlxBackend::new(stream),
+                safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(model)),
+            )?;
             return Ok(Self {
-                model,
+                runtime,
                 #[cfg(feature = "media-processing")]
                 processor,
                 tokenizer,
@@ -1585,12 +1596,14 @@ impl LoadedModel {
                 "PersonaPlex is a realtime speech-to-speech token model; use architectures::moshi::personaplex instead of LoadedModel".into(),
             ));
         }
-        let model = load_model_with_options(model_dir, options, stream, weights_stream)?
-            .into_inner()
-            .into_complete()?;
+        let model = load_model_with_options(model_dir, options, stream, weights_stream)?;
+        let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
+            crate::backend::mlx::MlxBackend::new(stream),
+            model,
+        )?;
 
         Ok(Self {
-            model,
+            runtime,
             #[cfg(feature = "media-processing")]
             processor,
             tokenizer,
@@ -1605,7 +1618,7 @@ impl LoadedModel {
 
     /// Returns the effective runtime model type.
     pub fn model_type(&self) -> &str {
-        self.model.model_type()
+        self.runtime.session().model_type()
     }
 
     /// Returns sampling values declared by `generation_config.json`, if present.
@@ -1628,7 +1641,7 @@ impl LoadedModel {
     pub fn native_quantization_stats(
         &self,
     ) -> Option<&safemlx::native_quantization::NativeQuantizationStats> {
-        self.model.native_quantization_stats()
+        self.model().native_quantization_stats()
     }
 
     /// Returns the model id passed to chat-template rendering.
@@ -1871,102 +1884,106 @@ impl LoadedModel {
         self.eos_token_ids.contains(&id)
     }
 
-    /// Creates an empty cache value appropriate for the loaded model.
-    pub fn new_cache(&self) -> ModelCache {
-        self.model.new_cache()
+    /// Clears the backend-owned cache for a new independent sequence.
+    pub fn reset_session(&mut self) -> Result<(), Error> {
+        self.runtime.session_mut().reset()
     }
 
-    /// Creates cache state under an explicit cache-residency policy.
-    pub fn new_cache_with_options(
-        &self,
-        policy: CacheResidencyPolicy,
-    ) -> Result<ModelCache, Exception> {
-        self.model.new_cache_with_options(policy)
+    /// Replaces backend-owned cache state under an explicit residency policy.
+    pub fn configure_cache(&mut self, policy: CacheResidencyPolicy) -> Result<(), Error> {
+        self.runtime.session_mut().configure_cache(policy)
     }
 
-    /// Creates a paged cache attached to an aggregate process-wide pool.
-    pub fn new_cache_in_pool(
-        &self,
+    /// Returns residency telemetry for the backend-owned session cache.
+    pub fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Error> {
+        self.runtime.session().cache_residency_report()
+    }
+
+    /// Configures a paged cache attached to an aggregate process-wide pool.
+    pub fn configure_cache_in_pool(
+        &mut self,
         options: PagedCacheOptions,
         pool: CacheResidencyPool,
-    ) -> Result<ModelCache, Exception> {
+    ) -> Result<(), Error> {
         let options = options
             .with_pool(pool)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        self.model
-            .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+            .map_err(|error| Error::Exception(Exception::custom(error.to_string())))?;
+        self.configure_cache(CacheResidencyPolicy::Paged(options))
     }
 
     /// Returns the canonical cache-relevant architecture identity for this loaded model.
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
-        self.model.prompt_cache_architecture_fingerprint()
+        self.model().prompt_cache_architecture_fingerprint()
     }
 
     /// Returns the exact ordered prompt-cache state and attention layout.
     pub fn prompt_cache_layer_layout(&self) -> Result<LayerSchedule<LayerCachePolicy>, Exception> {
-        self.model.prompt_cache_layer_layout()
+        self.model().prompt_cache_layer_layout()
     }
 
     /// Returns each owned layer's processed-token delta from the persisted prefix.
     pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Exception> {
-        self.model.prompt_cache_layer_prefix_offsets()
+        self.model().prompt_cache_layer_prefix_offsets()
     }
 
     /// Opens a compatible reusable prefix for this loaded model.
     ///
-    /// Block-paged families retain mmap-lazy attention shards. Resident hybrid
-    /// and multimodal families materialize their validated fixed state on
-    /// `stream` before returning.
+    /// The compatible prefix replaces the cache owned by this model session.
     pub fn load_prompt_cache(
-        &self,
+        &mut self,
         directory: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
-        stream: &Stream,
-    ) -> Result<(ModelCache, PromptCacheManifest), Exception> {
-        self.model
-            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+    ) -> Result<PromptCacheManifest, Error> {
+        let (backend, session) = self.runtime.parts_mut();
+        session.load_prompt_cache(backend, directory, expected, prefix_token_ids, options)
     }
 
     /// Atomically saves a completed immutable prefix with model-owned state validation.
     pub fn save_prompt_cache(
-        &self,
-        cache: &mut ModelCache,
+        &mut self,
         destination: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-        stream: &Stream,
-    ) -> Result<PromptCacheManifest, Exception> {
-        self.model.save_prompt_cache(
-            cache,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-            stream,
-        )
+    ) -> Result<PromptCacheManifest, Error> {
+        let (backend, session) = self.runtime.parts_mut();
+        session.save_prompt_cache(backend, destination, descriptor, prefix_token_ids, options)
     }
 
-    /// Submits prompt prefill using a cache returned by [`LoadedModel::new_cache`].
+    /// Submits prompt prefill against this model session's cache.
     pub fn submit_prefill(
         &mut self,
         input: input::ModelInput<'_>,
-        cache: &mut ModelCache,
-        stream: &Stream,
-    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        self.model.submit_prefill(input, cache, stream)
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxSessionCompletion>, Error>
+    {
+        let submission = self
+            .runtime
+            .prefill(crate::backend::mlx::MlxModelInput::from(input))?;
+        let output = submission.output.into_logits().ok_or_else(|| {
+            Error::Parallel("replicated loaded model produced no local logits".into())
+        })?;
+        Ok(safemlx_lm_core::Submission {
+            output,
+            completion: submission.completion,
+        })
     }
 
     /// Submits cached decode using an existing model cache.
     pub fn submit_decode(
         &mut self,
         input: Array,
-        cache: &mut ModelCache,
-        stream: &Stream,
-    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        self.model.submit_decode(input, cache, stream)
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxSessionCompletion>, Error>
+    {
+        let submission = self.runtime.decode(input)?;
+        let output = submission.output.into_logits().ok_or_else(|| {
+            Error::Parallel("replicated loaded model produced no local logits".into())
+        })?;
+        Ok(safemlx_lm_core::Submission {
+            output,
+            completion: submission.completion,
+        })
     }
 
     /// Submits prompt prefill from an owned processor result.
@@ -1974,10 +1991,9 @@ impl LoadedModel {
     pub fn submit_prepared_prefill(
         &mut self,
         input: &PreparedModelInput,
-        cache: &mut ModelCache,
-        stream: &Stream,
-    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        input.with_model_input(|input| self.submit_prefill(input, cache, stream))
+    ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxSessionCompletion>, Error>
+    {
+        input.with_model_input(|input| self.submit_prefill(input))
     }
 
     /// Submits prompt prefill while reporting detailed activations.
@@ -1987,12 +2003,17 @@ impl LoadedModel {
     pub fn submit_prefill_with_observer(
         &mut self,
         input: input::ModelInput<'_>,
-        cache: &mut ModelCache,
-        stream: &Stream,
         observer: &mut impl ActivationObserver,
     ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        self.model
-            .submit_prefill_with_observer(input, cache, stream, observer)
+        let stream = self.runtime.backend().stream().clone();
+        let (model, cache) = self.model_and_cache();
+        crate::backend::mlx::MlxModelSession::submit_prefill_with_observer(
+            model,
+            input.into(),
+            cache,
+            &stream,
+            observer,
+        )
     }
 
     /// Submits an owned processor result while observing activations.
@@ -2000,23 +2021,17 @@ impl LoadedModel {
     pub fn submit_prepared_prefill_with_observer(
         &mut self,
         input: &PreparedModelInput,
-        cache: &mut ModelCache,
-        stream: &Stream,
         observer: &mut impl ActivationObserver,
     ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        input.with_model_input(|input| {
-            self.submit_prefill_with_observer(input, cache, stream, observer)
-        })
+        input.with_model_input(|input| self.submit_prefill_with_observer(input, observer))
     }
 
     /// Creates a token iterator using checkpoint generation defaults plus typed overrides.
-    pub fn generate_input_with_cache<'a>(
+    pub fn generate_input<'a>(
         &'a mut self,
-        cache: &'a mut ModelCache,
         input: input::ModelInput<'_>,
         overrides: GenerationConfigOverrides,
         prng_key: Option<Array>,
-        stream: &'a Stream,
     ) -> Result<MlxGeneration<'a, crate::runtime::generation::sampler::GenerationSampler>, Error>
     {
         let resolved = self.resolve_generation_config(overrides)?;
@@ -2025,30 +2040,26 @@ impl LoadedModel {
             (None, 0.0) => None,
             (None, _) => Some(safemlx::random::key(0)?),
         };
-        Ok(self.model.generate_input_with_cache_sampler(
-            cache,
+        Ok(MlxGeneration::with_sampler(
+            &mut self.runtime,
             resolved.temperature,
             input,
             prng_key,
-            stream,
             crate::runtime::generation::sampler::GenerationSampler::from_resolved(resolved),
         ))
     }
 
     /// Creates a token iterator from typed input with a caller-provided sampler.
-    pub fn generate_input_with_cache_sampler<'a, S>(
+    pub fn generate_input_with_sampler<'a, S>(
         &'a mut self,
-        cache: &'a mut ModelCache,
         temp: f32,
         input: input::ModelInput<'_>,
         prng_key: Option<Array>,
-        stream: &'a Stream,
         sampler: S,
     ) -> MlxGeneration<'a, S>
     where
         S: Sampler,
     {
-        self.model
-            .generate_input_with_cache_sampler(cache, temp, input, prng_key, stream, sampler)
+        MlxGeneration::with_sampler(&mut self.runtime, temp, input, prng_key, sampler)
     }
 }

@@ -2395,7 +2395,6 @@ fn main() -> Result<()> {
     }
 
     let eos_token_ids = model.eos_token_ids().to_vec();
-    let mut cache = model.new_cache();
     let configured_sampler = GenerationSampler::new()
         .top_k(top_k)
         .top_p(top_p)
@@ -2482,7 +2481,6 @@ fn main() -> Result<()> {
             let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
                 drafter,
-                cache: &mut cache,
                 sampling_policy: sampler,
                 settings,
                 options: PreparedChatMtpGenerationOptions {
@@ -2524,7 +2522,6 @@ fn main() -> Result<()> {
             let output = model.generate_prepared_chat_embedded_mtp(
                 PreparedChatEmbeddedMtpGenerationRequest {
                     input: PreparedChatInput::rendered_prompt(prepared),
-                    cache: &mut cache,
                     sampling_policy: sampler,
                     settings,
                     options: PreparedChatMtpGenerationOptions {
@@ -2566,11 +2563,9 @@ fn main() -> Result<()> {
             let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
-                cache: &mut cache,
                 sampling_policy: sampler,
                 settings,
                 caller_stop_sequences: &args.stop_sequences,
-                stream,
                 cancellation,
                 on_event: |event| {
                     if time_to_first_token.is_none()
@@ -2613,7 +2608,6 @@ fn main() -> Result<()> {
         let (tokens, stats) = model
             .generate_mtp_input_with_sampler_callback_and_streams_and_options(
                 drafter,
-                &mut cache,
                 input,
                 &config,
                 prng_key,
@@ -2649,7 +2643,6 @@ fn main() -> Result<()> {
             eos_token_ids: eos_token_ids.clone(),
         };
         let (tokens, stats) = model.generate_embedded_mtp_input_with_sampler_callback(
-            &mut cache,
             input,
             &config,
             prng_key,
@@ -2672,14 +2665,8 @@ fn main() -> Result<()> {
     } else {
         let parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&parts);
-        let mut generator = model.generate_input_with_cache_sampler(
-            &mut cache,
-            temperature,
-            input,
-            prng_key,
-            stream,
-            sampler,
-        );
+        let mut generator =
+            model.generate_input_with_sampler(temperature, input, prng_key, sampler);
 
         let mut current = generator.next().transpose()?;
         for index in 0..max_tokens {
@@ -3194,11 +3181,9 @@ fn run_expert_cache_benchmark(
     let input = ModelInput::new(&parts);
 
     let before_cold = expert_benchmark_snapshot(model)?;
-    let mut cold_cache = model.new_cache();
+    model.reset_session()?;
     let started = Instant::now();
-    let logits = model
-        .submit_prefill(input, &mut cold_cache, stream)?
-        .wait()?;
+    let logits = model.submit_prefill(input)?.wait()?;
     eval([&logits])?;
     stream.synchronize()?;
     let cold_elapsed = started.elapsed();
@@ -3212,11 +3197,9 @@ fn run_expert_cache_benchmark(
     );
 
     let before_repeated = after_cold;
-    let mut repeated_cache = model.new_cache();
+    model.reset_session()?;
     let started = Instant::now();
-    let logits = model
-        .submit_prefill(input, &mut repeated_cache, stream)?
-        .wait()?;
+    let logits = model.submit_prefill(input)?.wait()?;
     eval([&logits])?;
     stream.synchronize()?;
     let repeated_elapsed = started.elapsed();
@@ -3232,9 +3215,7 @@ fn run_expert_cache_benchmark(
     let last = tokens.try_index_device((.., tokens.dim(1) - 1..), stream)?;
     let before_decode = after_repeated;
     let started = Instant::now();
-    let logits = model
-        .submit_decode(last, &mut repeated_cache, stream)?
-        .wait()?;
+    let logits = model.submit_decode(last)?.wait()?;
     eval([&logits])?;
     stream.synchronize()?;
     let decode_elapsed = started.elapsed();

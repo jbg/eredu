@@ -64,6 +64,14 @@ model, nor can one mutable executable be driven through two sessions.
 There is one backend session contract: the backend-selected path does not
 provide an architecture-specific or borrowing execution escape hatch.
 
+`ModelRuntime<B>` is the canonical client owner of the selected backend and
+that session. Its `prefill` and `decode` methods are the production submission
+path for both the core mock backend and MLX. Generic downstream coordinators
+can be written once over `B: Backend`; associated input, output, and completion
+types keep backend values opaque without runtime type erasure. A runtime may
+expose its session for explicit optional capabilities, but it never exposes or
+separates the executable from its cache.
+
 Every submission returns an opaque output and an exact `Completion`. Completion
 can be polled or waited without draining unrelated work. A scheduler-owned
 transition retains its branch, output, completion, arrays, and leases until
@@ -177,10 +185,15 @@ communication-session constructor.
 Every backend-contract prefill and decode goes through `MlxModelSession`, whose
 model, cache, and communicator cannot be extracted or replaced. The former
 complete-cache accessors, per-architecture `ModelGenerate` enum, Llama-only
-executor, and borrowing backend-session trait were deleted. The tokenizer/chat
-facade still contains MLX-native batch and iterator implementations over its
-private replicated model/cache state; generalizing that convenience layer is a
-separate boundary from the backend execution contract.
+executor, raw facade cache pairing, and borrowing backend-session trait were
+deleted. `LoadedModel` owns a `ModelRuntime<MlxBackend>` rather than a raw model.
+Ordinary generation, prepared-chat generation, speculative single-request
+generation, cache-policy selection, and prompt-cache persistence all use the
+session-owned cache and selected stream. Opaque multi-lane `MtpCache` remains
+an MLX adapter resource because each speculative lane needs independent tensor
+state. Starting an unrelated sequence is an explicit `reset_session`
+transition; loading a prompt cache deliberately replaces the same session
+state so the next prefill/decode continues that prefix.
 
 ## Tensor and cache ownership
 
@@ -280,6 +293,11 @@ The current boundary leaves these components MLX-coupled:
   bookkeeping, optimistic-prefix reuse, fair action selection, cache-retention
   counts, cache-commit/publication ordering, request telemetry, token budgets,
   and terminal precedence are core-owned.
+- tokenizer/chat-template rendering, constrained decoding, multimodal
+  preprocessing, and the concrete `LoadedModel` constructor still live in the
+  MLX facade. Their execution state now crosses `ModelRuntime`, but a future
+  backend needs a backend-generic prepared-input and sampled-token facade before
+  applications can switch backend types without generic plumbing.
 
 The former facade `runtime::residency::policy` module was deleted. It was not
 retained as a forwarding namespace. The earlier placeholder core

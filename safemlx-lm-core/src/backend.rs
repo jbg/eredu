@@ -297,6 +297,80 @@ pub trait BackendSession<B: Backend> {
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
 }
 
+/// A prepared model, its selected backend, and its backend-owned session.
+///
+/// This is the canonical client-side execution owner. Keeping the backend and
+/// session together makes backend selection a whole-model decision and makes
+/// it impossible to submit a session through a different backend instance.
+/// Backend-owned executable, cache, tensor, and completion types remain
+/// associated types and never enter the portable API.
+pub struct ModelRuntime<B: Backend> {
+    backend: B,
+    session: B::Session,
+}
+
+impl<B: Backend> ModelRuntime<B> {
+    /// Prepares `config` and creates its sole execution session.
+    pub fn prepare(backend: B, config: B::ModelConfig) -> Result<Self, B::Error> {
+        let model = backend.prepare_model(config)?;
+        Self::from_prepared(backend, model)
+    }
+
+    /// Creates the sole execution session for an already prepared model.
+    pub fn from_prepared(backend: B, model: PreparedModel<B::Model>) -> Result<Self, B::Error> {
+        let session = backend.create_session(model)?;
+        Ok(Self { backend, session })
+    }
+
+    /// Returns the selected backend.
+    pub const fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Returns the backend-owned session for optional backend capabilities.
+    pub const fn session(&self) -> &B::Session {
+        &self.session
+    }
+
+    /// Returns the backend-owned session for optional backend capabilities.
+    pub fn session_mut(&mut self) -> &mut B::Session {
+        &mut self.session
+    }
+
+    /// Borrows the selected backend and its mutable session together.
+    pub fn parts_mut(&mut self) -> (&B, &mut B::Session) {
+        (&self.backend, &mut self.session)
+    }
+
+    /// Submits prompt prefill through the selected backend and session.
+    pub fn prefill(
+        &mut self,
+        input: <B::Session as BackendSession<B>>::PrefillInput,
+    ) -> Result<
+        Submission<
+            <B::Session as BackendSession<B>>::Output,
+            <B::Session as BackendSession<B>>::Completion,
+        >,
+        B::Error,
+    > {
+        self.session.prefill(&self.backend, input)
+    }
+
+    /// Submits cached decode through the selected backend and session.
+    pub fn decode(
+        &mut self,
+        input: <B::Session as BackendSession<B>>::DecodeInput,
+    ) -> Result<
+        Submission<
+            <B::Session as BackendSession<B>>::Output,
+            <B::Session as BackendSession<B>>::Completion,
+        >,
+        B::Error,
+    > {
+        self.session.decode(&self.backend, input)
+    }
+}
+
 /// Optional high-level transfer and collective capability of a selected session.
 ///
 /// This contract deliberately operates on an opaque backend value. It models
@@ -442,14 +516,12 @@ mod tests {
 
     #[test]
     fn mock_prefill_and_multiple_decode_steps() {
-        let backend = Mock;
-        let prepared = backend.prepare_model(10).unwrap();
-        let mut session = backend.create_session(prepared).unwrap();
-        let prefill = session.prefill(&backend, vec![1, 2]).unwrap();
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let prefill = runtime.prefill(vec![1, 2]).unwrap();
         assert_eq!(prefill.output, 12);
         assert!(prefill.completion.is_complete().unwrap());
-        assert_eq!(session.decode(&backend, 3).unwrap().output, 13);
-        assert_eq!(session.decode(&backend, 4).unwrap().output, 14);
+        assert_eq!(runtime.decode(3).unwrap().output, 13);
+        assert_eq!(runtime.decode(4).unwrap().output, 14);
     }
 
     #[derive(Debug, Clone, Copy)]

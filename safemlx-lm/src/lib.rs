@@ -33,7 +33,7 @@ pub use safemlx_lm_core::generation::{
 };
 pub use safemlx_lm_core::{
     Backend, BackendSession, CollectiveScope, DistributedBackend, DistributedCapabilities,
-    DistributedSession, DistributedSessionDescriptor, ValueDescriptor,
+    DistributedSession, DistributedSessionDescriptor, ModelRuntime, ValueDescriptor,
 };
 #[cfg(test)]
 mod test_utils;

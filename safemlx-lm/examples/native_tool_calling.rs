@@ -85,12 +85,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // GPU execution context instead creates a same-GPU split stream.
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut drafter = LoadedDrafter::load(&drafter_path, draft.stream(), draft.stream())?;
-        let mut cache = model.new_cache();
         model
             .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),
                 drafter: &mut drafter,
-                cache: &mut cache,
                 sampling_policy: DefaultSampler,
                 settings,
                 options: PreparedChatMtpGenerationOptions {
@@ -109,11 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             checkpoint: MtpCheckpointKind::Embedded
         }
     ) {
-        let mut cache = model.new_cache();
         model
             .generate_prepared_chat_embedded_mtp(PreparedChatEmbeddedMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),
-                cache: &mut cache,
                 sampling_policy: DefaultSampler,
                 settings,
                 options: PreparedChatMtpGenerationOptions {
@@ -127,15 +123,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?
             .finish_reason
     } else {
-        let mut cache = model.new_cache();
         model
             .generate_prepared_chat(PreparedChatGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),
-                cache: &mut cache,
                 sampling_policy: DefaultSampler,
                 settings,
                 caller_stop_sequences: &[],
-                stream: target.stream(),
                 cancellation: safemlx_lm::GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?

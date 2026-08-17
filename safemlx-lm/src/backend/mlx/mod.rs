@@ -52,7 +52,7 @@ pub(crate) enum MlxModelKind {
 }
 
 impl MlxModel {
-    pub(super) const fn complete(model: Model) -> Self {
+    pub(crate) const fn complete(model: Model) -> Self {
         Self {
             inner: MlxModelKind::Complete(model),
         }
@@ -70,6 +70,7 @@ impl MlxModel {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_complete(self) -> Result<Model, Error> {
         match self.inner {
             MlxModelKind::Complete(model) => Ok(model),
@@ -142,32 +143,31 @@ pub struct MlxModelConfig<'a> {
 
 /// MLX backend selected for a complete model/session.
 pub struct MlxBackend<'a> {
-    stream: &'a Stream,
+    stream: Stream,
     world: Option<&'a safemlx::distributed::Group>,
 }
 
-impl<'a> MlxBackend<'a> {
+impl MlxBackend<'static> {
     /// Uses the selected session execution stream.
-    pub const fn new(stream: &'a Stream) -> Self {
+    pub fn new(stream: &Stream) -> Self {
         Self {
-            stream,
+            stream: stream.clone(),
             world: None,
         }
     }
+}
 
+impl<'a> MlxBackend<'a> {
     /// Selects MLX distributed communication for sessions created by this backend.
-    pub const fn with_distributed_world(
-        stream: &'a Stream,
-        world: &'a safemlx::distributed::Group,
-    ) -> Self {
+    pub fn with_distributed_world(stream: &Stream, world: &'a safemlx::distributed::Group) -> Self {
         Self {
-            stream,
+            stream: stream.clone(),
             world: Some(world),
         }
     }
     /// Execution stream used by this backend instance.
-    pub const fn stream(&self) -> &'a Stream {
-        self.stream
+    pub const fn stream(&self) -> &Stream {
+        &self.stream
     }
 
     #[cfg(test)]
@@ -176,7 +176,7 @@ impl<'a> MlxBackend<'a> {
         topology: crate::ParallelTopology,
         world: &'a safemlx::distributed::Group,
     ) -> Result<MlxDistributedSession<'a>, Error> {
-        MlxDistributedSession::new(MlxDistributedConfig { topology, world }, self.stream)
+        MlxDistributedSession::new(MlxDistributedConfig { topology, world }, &self.stream)
     }
 }
 
@@ -222,7 +222,7 @@ impl<'a> Backend for MlxBackend<'a> {
         loading::materialize_model_plan(
             config.plan,
             config.options,
-            self.stream,
+            &self.stream,
             config.weights_stream,
         )
         .map(PreparedModel::new)
@@ -242,7 +242,7 @@ impl<'a> Backend for MlxBackend<'a> {
                 })?;
                 Some(MlxDistributedSession::new(
                     MlxDistributedConfig { topology, world },
-                    self.stream,
+                    &self.stream,
                 )?)
             }
             None => None,

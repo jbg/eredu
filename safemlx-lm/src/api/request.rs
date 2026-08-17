@@ -103,22 +103,18 @@ impl<'a> PreparedChatInput<'a> {
 
 /// Cohesive request for ordinary structured generation from a [`PreparedChat`].
 ///
-/// The cache and stream remain caller-owned and may be selected using the
-/// existing cache-residency and execution APIs. `sampling_policy` is wrapped in
-/// the prepared chat's constraint plan before any model execution.
+/// Cache and execution-stream ownership belong to the selected backend
+/// session. `sampling_policy` is wrapped in the prepared chat's constraint
+/// plan before any model execution.
 pub struct PreparedChatGenerationRequest<'a, S, F> {
     /// Explicit prompt source and embedded format/runtime plan.
     pub input: PreparedChatInput<'a>,
-    /// Architecture-matched cache used for prompt prefill and decoding.
-    pub cache: &'a mut ModelCache,
     /// Caller-selected base sampling policy.
     pub sampling_policy: S,
     /// Temperature, token limit, and optional random state.
     pub settings: PreparedChatGenerationSettings,
     /// Additional decoded text sequences that terminate generation.
     pub caller_stop_sequences: &'a [String],
-    /// MLX execution stream used for prompt encoding transfer and model work.
-    pub stream: &'a Stream,
     /// One-shot cooperative-cancellation token for this request.
     pub cancellation: GenerationCancellationToken,
     /// Called synchronously as each semantic event becomes available.
@@ -158,8 +154,6 @@ pub struct PreparedChatMtpGenerationRequest<'a, S, F> {
     pub input: PreparedChatInput<'a>,
     /// Separate target-compatible draft model.
     pub drafter: &'a mut LoadedDrafter,
-    /// Architecture-matched target cache.
-    pub cache: &'a mut ModelCache,
     /// Caller-selected base sampling policy.
     pub sampling_policy: S,
     /// Temperature, token limit, and optional random state.
@@ -180,8 +174,6 @@ pub struct PreparedChatMtpGenerationRequest<'a, S, F> {
 pub struct PreparedChatEmbeddedMtpGenerationRequest<'a, S, F> {
     /// Explicit prompt source and embedded format/runtime plan.
     pub input: PreparedChatInput<'a>,
-    /// Architecture-matched target and embedded-MTP cache.
-    pub cache: &'a mut ModelCache,
     /// Caller-selected base sampling policy.
     pub sampling_policy: S,
     /// Temperature, token limit, and optional random state.
@@ -218,8 +210,6 @@ pub struct PreparedChatMtpGenerationOutput {
 pub struct PreparedChatMtpBatchLane<'a, S> {
     /// Explicit prompt source and embedded format/runtime plan.
     pub input: PreparedChatInput<'a>,
-    /// Architecture-matched target cache used only by this lane.
-    pub cache: &'a mut ModelCache,
     /// Caller-selected base sampling policy used only by this lane.
     pub sampling_policy: S,
     /// Temperature, token limit, and independent random root.
@@ -238,6 +228,8 @@ pub struct PreparedChatMtpBatchLane<'a, S> {
 pub struct PreparedChatMtpBatchRequest<'a, S> {
     /// Separate target-compatible draft model shared read/write by the scheduler.
     pub drafter: &'a mut LoadedDrafter,
+    /// Opaque independent target-cache lanes owned by the MLX backend.
+    pub cache: &'a mut MtpCache,
     /// Independently executable prepared-chat lanes.
     pub lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
     /// Target and draft execution streams shared by scheduler submissions.
@@ -248,6 +240,8 @@ pub struct PreparedChatMtpBatchRequest<'a, S> {
 
 /// Cohesive fair-scheduler request for embedded-head prepared-chat MTP lanes.
 pub struct PreparedChatEmbeddedMtpBatchRequest<'a, S> {
+    /// Opaque independent target-cache lanes owned by the MLX backend.
+    pub cache: &'a mut MtpCache,
     /// Independently executable prepared-chat lanes.
     pub lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
     /// MLX stream shared by target and embedded-head scheduler submissions.

@@ -28,7 +28,6 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
     let path = std::env::var(environment)
         .unwrap_or_else(|_| panic!("{environment} must name a local checkpoint"));
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-    let stream = execution.stream();
     let mut model = LoadedModel::load(&path, execution.stream(), execution.stream())
         .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
     let prepared = model
@@ -79,12 +78,10 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
         "{environment} profile {profile_identity} did not configure a stop sequence"
     );
 
-    let mut cache = model.new_cache();
     let mut events = Vec::new();
     let output = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
             input: PreparedChatInput::rendered_prompt(&prepared),
-            cache: &mut cache,
             sampling_policy: DefaultSampler,
             settings: PreparedChatGenerationSettings {
                 overrides: safemlx_lm::GenerationConfigOverrides {
@@ -95,7 +92,6 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
                 prng_key: None,
             },
             caller_stop_sequences: &[],
-            stream,
             cancellation: safemlx_lm::GenerationCancellationToken::new(),
             on_event: |event| events.push(event),
         })

@@ -46,7 +46,6 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| prompt.to_owned());
     let tokens = model.encode_to_array(&rendered, false, stream)?;
     let eos_token_ids = model.eos_token_ids().to_vec();
-    let mut cache = model.new_cache();
     let mut output_ids = Vec::new();
     let prng_key = if temperature == 0.0 {
         None
@@ -57,15 +56,13 @@ fn main() -> anyhow::Result<()> {
     {
         let input_parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&input_parts);
-        let mut generator = model.generate_input_with_cache(
-            &mut cache,
+        let mut generator = model.generate_input(
             input,
             GenerationConfigOverrides {
                 temperature: Some(temperature),
                 ..Default::default()
             },
             prng_key,
-            stream,
         )?;
         for _ in 0..max_tokens {
             let Some(token) = generator.next() else {

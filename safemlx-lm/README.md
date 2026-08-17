@@ -179,10 +179,14 @@ tensor execution.
 
 ## Inputs and generation
 
-`LoadedModel` owns the model, tokenizer, optional processor, and chat-template
-metadata. Applications can prepare raw token input, ordered multimodal input,
-or a structured chat request. Prepared-chat generation emits protocol-neutral
-semantic events for reasoning, visible text, and tool calls.
+`LoadedModel` owns a selected MLX `ModelRuntime`, tokenizer, optional processor,
+and chat-template metadata. The runtime owns the executable, cache, and stream
+as one session; applications do not construct or pair raw caches with models.
+Applications can prepare raw token input, ordered multimodal input, or a
+structured chat request. Prepared-chat generation emits protocol-neutral
+semantic events for reasoning, visible text, and tool calls. Call
+`reset_session` before starting an unrelated sequence, or deliberately retain
+or restore the session cache when continuing a prefix.
 
 Raw generation remains available for completion workloads. It deliberately
 bypasses chat-template and native-tool guarantees.

@@ -9,6 +9,12 @@ types at its facade root and supplies the default MLX backend. Backend authors
 can depend on this crate to implement whole-model preparation and session-level
 prefill/decode without implementing a primitive tensor algebra.
 
+`ModelRuntime<B>` is the canonical downstream owner of a selected backend and
+its sole model session. It prepares or accepts a `PreparedModel`, binds the
+backend and session once, and submits prefill/decode without exposing an
+executable or cache. The same generic client code is exercised by the core mock
+backend and the production MLX adapter.
+
 Core owns the production weight-residency policy and ownership state machine,
 not a parallel summary schema. `OffloadPlan` validates stable unit identities,
 tier assignments, budgets, prefetch depth, and eviction policy.

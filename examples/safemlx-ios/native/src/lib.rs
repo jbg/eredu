@@ -129,16 +129,13 @@ fn generate(
         .transpose()
         .map_err(|error| error.to_string())?;
     let eos = model.eos_token_ids().to_vec();
-    let mut cache = model.new_cache();
     let mut decoder = model.text_decoder(true);
     let parts = [InputPart::text_token_ids(&tokens)];
     let input = ModelInput::new(&parts);
-    let mut generator = model.generate_input_with_cache_sampler(
-        &mut cache,
+    let mut generator = model.generate_input_with_sampler(
         settings.temperature,
         input,
         prng_key,
-        stream,
         GenerationSampler::from_resolved(settings),
     );
 

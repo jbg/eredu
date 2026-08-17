@@ -8,7 +8,7 @@ use safemlx::{
     ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    api::{LoadedModel, ModelCache},
+    api::LoadedModel,
     error::Error,
     runtime::media::input::{InputPart, ModelInput},
     GenerationConfigOverrides,
@@ -67,9 +67,8 @@ fn main() -> anyhow::Result<()> {
     let ids = model.encode(&rendered, false)?;
     let tokens = safemlx::Array::from(ids.as_slice()).try_index_device(NewAxis, stream)?;
     let eos = model.eos_token_ids().to_vec();
-    let mut cache = model.new_cache();
-    print_first_token_distribution(&mut model, &mut cache, &tokens, stream)?;
-    cache = model.new_cache();
+    print_first_token_distribution(&mut model, &tokens, stream)?;
+    model.reset_session()?;
     let mut output_ids = Vec::new();
     let prng_key = if temp == 0.0 {
         None
@@ -80,15 +79,13 @@ fn main() -> anyhow::Result<()> {
     {
         let input_parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&input_parts);
-        let mut generator = model.generate_input_with_cache(
-            &mut cache,
+        let mut generator = model.generate_input(
             input,
             GenerationConfigOverrides {
                 temperature: Some(temp),
                 ..Default::default()
             },
             prng_key,
-            stream,
         )?;
         for _ in 0..120 {
             let token = match generator.next() {
@@ -121,21 +118,18 @@ fn gemma4_message(prompt: &str, model_type: &str) -> serde_json::Value {
 
 fn print_first_token_distribution(
     model: &mut LoadedModel,
-    cache: &mut ModelCache,
     tokens: &safemlx::Array,
     stream: &Stream,
 ) -> anyhow::Result<()> {
     let input_parts = [InputPart::text_token_ids(tokens)];
     let input = ModelInput::new(&input_parts);
-    let mut generator = model.generate_input_with_cache(
-        cache,
+    let mut generator = model.generate_input(
         input,
         GenerationConfigOverrides {
             temperature: Some(0.0),
             ..Default::default()
         },
         None,
-        stream,
     )?;
     let Some(first) = generator.next() else {
         return Ok(());

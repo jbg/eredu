@@ -2629,7 +2629,7 @@ fn estimate_architecture_state(
 impl super::LoadedModel {
     /// Returns architecture-independent capabilities derived from validated loaded state.
     pub fn capabilities(&self) -> Result<ModelCapabilities, CapabilityError> {
-        self.model
+        self.model()
             .capabilities_and_estimate()
             .map(|(capabilities, _)| capabilities)
     }
@@ -2719,7 +2719,7 @@ impl super::LoadedModel {
                     )?;
                 }
                 (modality, InputPayload::Tensor(tensor)) => {
-                    let (positions, workspace_bytes) = self.model.prepared_media_accounting(
+                    let (positions, workspace_bytes) = self.model().prepared_media_accounting(
                         modality,
                         tensor,
                         part.metadata,
@@ -2767,14 +2767,14 @@ impl super::LoadedModel {
         max_output_tokens: u64,
         batch_size: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError> {
-        let (_, estimate) = self.model.capabilities_and_estimate()?;
+        let (_, estimate) = self.model().capabilities_and_estimate()?;
         estimate_architecture_state(&estimate, input, max_output_tokens, batch_size)
     }
 
     /// Reports logical checkpoint/residency accounting and MLX allocator observations.
     pub fn static_memory(&self) -> Result<StaticMemoryReport, CapabilityError> {
         let residency = self
-            .model
+            .model()
             .residency_report()
             .map_err(|error| CapabilityError::Observation(error.to_string()))?;
         let (logical, host, device, disk, mappings) = if let Some(report) = residency {
