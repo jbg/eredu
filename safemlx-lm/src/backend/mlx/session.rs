@@ -9,13 +9,70 @@ use safemlx_lm_core::{BackendSession, Completion, Submission};
 
 use crate::{
     api::{input, Model, ModelCache},
+    architectures::distributed::{
+        expert::ExpertParallelCache,
+        pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
+    },
     error::Error,
     nn::generation::CausalLm,
     runtime::execution::inspection::ActivationObserver,
     runtime::generation::sampler::{DefaultSampler, Sampler},
 };
 
-use super::{MlxBackend, MlxCompletion, MlxDistributedSession};
+use super::{MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, MlxModelKind};
+
+/// Backend-owned output of one MLX model-session submission.
+///
+/// Pipeline ranks that do not own the output projection complete with no local
+/// logits. The final rank and every non-pipeline session complete with logits.
+#[derive(Debug, Clone)]
+pub struct MlxModelOutput {
+    logits: Option<Array>,
+}
+
+impl MlxModelOutput {
+    const fn new(logits: Option<Array>) -> Self {
+        Self { logits }
+    }
+
+    /// Borrows local logits when this rank owns them.
+    pub const fn logits(&self) -> Option<&Array> {
+        self.logits.as_ref()
+    }
+
+    /// Consumes the output and returns local logits when present.
+    pub fn into_logits(self) -> Option<Array> {
+        self.logits
+    }
+}
+
+/// Opaque exact completion for any MLX model-session submission.
+pub struct MlxSessionCompletion {
+    inner: MlxSessionCompletionKind,
+}
+
+enum MlxSessionCompletionKind {
+    Model(MlxCompletion),
+    Pipeline(PipelineStageCompletion),
+}
+
+impl Completion for MlxSessionCompletion {
+    type Error = Error;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        match &self.inner {
+            MlxSessionCompletionKind::Model(completion) => completion.is_complete(),
+            MlxSessionCompletionKind::Pipeline(completion) => completion.is_complete(),
+        }
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        match &self.inner {
+            MlxSessionCompletionKind::Model(completion) => completion.wait(),
+            MlxSessionCompletionKind::Pipeline(completion) => completion.synchronize(),
+        }
+    }
+}
 
 /// MLX-owned prefill input.
 ///
@@ -109,46 +166,113 @@ impl MlxModelInput {
 /// session so callers cannot accidentally execute a sharded model with an
 /// unrelated communicator.
 pub struct MlxModelSession<'a> {
-    cache: ModelCache,
+    state: MlxSessionState,
     distributed: Option<MlxDistributedSession<'a>>,
 }
 
+enum MlxSessionState {
+    Complete(ModelCache),
+    Pipeline(PipelineCache),
+    Expert(ExpertParallelCache),
+}
+
 impl<'a> MlxModelSession<'a> {
-    pub(crate) const fn new(cache: ModelCache) -> Self {
-        Self {
-            cache,
-            distributed: None,
-        }
-    }
-
-    pub(crate) fn new_distributed(
-        cache: ModelCache,
-        distributed: MlxDistributedSession<'a>,
+    pub(crate) fn from_model(
+        model: &MlxModel,
+        distributed: Option<MlxDistributedSession<'a>>,
     ) -> Result<Self, Error> {
-        if distributed.topology().is_replicated() {
-            return Err(Error::Parallel(
-                "distributed model sessions require a non-replicated topology".into(),
-            ));
+        let state = match &model.inner {
+            MlxModelKind::Complete(model) => MlxSessionState::Complete(model.new_cache()),
+            MlxModelKind::Pipeline(model) => MlxSessionState::Pipeline(model.new_cache()?),
+            MlxModelKind::Expert(model) => MlxSessionState::Expert(model.new_cache()),
+        };
+        match (model.topology(), distributed.as_ref()) {
+            (None, None) => {}
+            (Some(expected), Some(session)) if session.topology() == expected => {}
+            (Some(_), None) => {
+                return Err(Error::Parallel(
+                    "distributed MLX model has no session-owned communication".into(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(Error::Parallel(
+                    "replicated MLX model cannot own distributed communication".into(),
+                ))
+            }
+            (Some(expected), Some(session)) => {
+                return Err(Error::Parallel(format!(
+                    "model topology {expected:?} does not match session topology {:?}",
+                    session.topology()
+                )))
+            }
         }
-        Ok(Self {
-            cache,
-            distributed: Some(distributed),
-        })
+        Ok(Self { state, distributed })
     }
 
-    /// Returns this session's cache state.
-    pub const fn cache(&self) -> &ModelCache {
-        &self.cache
+    /// Returns complete-model cache state for explicit prompt-cache operations.
+    pub fn complete_cache(&self) -> Result<&ModelCache, Error> {
+        match &self.state {
+            MlxSessionState::Complete(cache) => Ok(cache),
+            MlxSessionState::Pipeline(_) | MlxSessionState::Expert(_) => Err(Error::Parallel(
+                "distributed stage caches are owned opaquely by MlxModelSession".into(),
+            )),
+        }
     }
 
-    /// Returns this session's mutable cache state.
-    pub fn cache_mut(&mut self) -> &mut ModelCache {
-        &mut self.cache
+    /// Returns mutable complete-model cache state for explicit prompt-cache operations.
+    pub fn complete_cache_mut(&mut self) -> Result<&mut ModelCache, Error> {
+        match &mut self.state {
+            MlxSessionState::Complete(cache) => Ok(cache),
+            MlxSessionState::Pipeline(_) | MlxSessionState::Expert(_) => Err(Error::Parallel(
+                "distributed stage caches are owned opaquely by MlxModelSession".into(),
+            )),
+        }
     }
 
-    /// Replaces cache state after an explicitly validated restore.
-    pub fn replace_cache(&mut self, cache: ModelCache) -> ModelCache {
-        std::mem::replace(&mut self.cache, cache)
+    /// Replaces complete-model cache state after an explicitly validated restore.
+    pub fn replace_complete_cache(&mut self, cache: ModelCache) -> Result<ModelCache, Error> {
+        match &mut self.state {
+            MlxSessionState::Complete(current) => Ok(std::mem::replace(current, cache)),
+            MlxSessionState::Pipeline(_) | MlxSessionState::Expert(_) => Err(Error::Parallel(
+                "distributed stage caches are owned opaquely by MlxModelSession".into(),
+            )),
+        }
+    }
+
+    /// Clears all backend-owned cache state while preserving session topology.
+    pub fn reset(&mut self, model: &MlxModel) -> Result<(), Error> {
+        match (&model.inner, &mut self.state) {
+            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => {
+                *cache = model.new_cache();
+                Ok(())
+            }
+            (MlxModelKind::Pipeline(_), MlxSessionState::Pipeline(cache)) => cache.reset(),
+            (MlxModelKind::Expert(_), MlxSessionState::Expert(cache)) => cache.reset(),
+            _ => Err(Error::Parallel(
+                "MLX model and session state kinds do not match".into(),
+            )),
+        }
+    }
+
+    /// Returns aggregate cache-residency telemetry for this session.
+    pub fn cache_residency_report(
+        &self,
+        model: &MlxModel,
+    ) -> Result<Option<crate::CacheResidencyReport>, Error> {
+        match (&model.inner, &self.state) {
+            (MlxModelKind::Complete(_), MlxSessionState::Complete(cache)) => cache
+                .residency_report()
+                .map_err(|error| Error::Parallel(error.to_string())),
+            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => {
+                model.cache_residency_report(cache)
+            }
+            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => {
+                model.cache_residency_report(cache)
+            }
+            _ => Err(Error::Parallel(
+                "MLX model and session state kinds do not match".into(),
+            )),
+        }
     }
 
     /// Returns communication when this is a distributed session.
@@ -295,50 +419,149 @@ impl<'a> MlxModelSession<'a> {
 impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
     type PrefillInput = MlxModelInput;
     type DecodeInput = Array;
-    type Output = Array;
-    type Completion = MlxCompletion;
+    type Output = MlxModelOutput;
+    type Completion = MlxSessionCompletion;
 
     fn prefill(
         &mut self,
         backend: &MlxBackend<'a>,
-        model: &mut Model,
+        model: &mut MlxModel,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        let output = match &self.distributed {
-            Some(distributed) => input.with_borrowed(|input| {
-                prefill_model_tensor_parallel(
-                    model,
-                    &mut self.cache,
-                    input,
-                    distributed,
-                    backend.stream(),
-                )
-            })?,
-            None => input.with_borrowed(|input| {
-                prefill_model(model, &mut self.cache, input, backend.stream())
-            })?,
-        };
-        MlxCompletion::submission(output)
+        match (&mut model.inner, &mut self.state) {
+            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => {
+                let output = match &self.distributed {
+                    Some(distributed) => input.with_borrowed(|input| {
+                        prefill_model_tensor_parallel(
+                            model,
+                            cache,
+                            input,
+                            distributed,
+                            backend.stream(),
+                        )
+                    })?,
+                    None => input.with_borrowed(|input| {
+                        prefill_model(model, cache, input, backend.stream())
+                    })?,
+                };
+                model_submission(output)
+            }
+            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => {
+                let distributed = self.distributed.as_ref().ok_or_else(|| {
+                    Error::Parallel("pipeline model session has no communication".into())
+                })?;
+                let completion = input.with_borrowed(|borrowed| {
+                    let tokens = input::text_token_ids(borrowed, backend.stream())?;
+                    let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
+                    let multimodal = borrowed
+                        .parts
+                        .iter()
+                        .any(|part| part.modality != input::Modality::Text);
+                    if multimodal {
+                        model.prefill_distributed(
+                            model.stage_info().is_first.then_some(borrowed),
+                            step,
+                            None,
+                            cache,
+                            distributed,
+                        )
+                    } else {
+                        model.forward_distributed(
+                            model.stage_info().is_first.then_some(&tokens),
+                            step,
+                            None,
+                            cache,
+                            distributed,
+                        )
+                    }
+                })?;
+                pipeline_submission(completion)
+            }
+            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => {
+                let distributed = self.distributed.as_ref().ok_or_else(|| {
+                    Error::Parallel("expert model session has no communication".into())
+                })?;
+                let output = input.with_borrowed(|borrowed| {
+                    let tokens = input::text_token_ids(borrowed, backend.stream())?;
+                    model.forward(&tokens, None, cache, distributed)
+                })?;
+                model_submission(output)
+            }
+            _ => Err(Error::Parallel(
+                "MLX model and session state kinds do not match".into(),
+            )),
+        }
     }
 
     fn decode(
         &mut self,
         backend: &MlxBackend<'a>,
-        model: &mut Model,
+        model: &mut MlxModel,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        let output = match &self.distributed {
-            Some(distributed) => decode_model_tensor_parallel(
-                model,
-                &mut self.cache,
-                &input,
-                distributed,
-                backend.stream(),
-            )?,
-            None => decode_model(model, &mut self.cache, &input, backend.stream())?,
-        };
-        MlxCompletion::submission(output)
+        match (&mut model.inner, &mut self.state) {
+            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => {
+                let output = match &self.distributed {
+                    Some(distributed) => decode_model_tensor_parallel(
+                        model,
+                        cache,
+                        &input,
+                        distributed,
+                        backend.stream(),
+                    )?,
+                    None => decode_model(model, cache, &input, backend.stream())?,
+                };
+                model_submission(output)
+            }
+            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => {
+                let distributed = self.distributed.as_ref().ok_or_else(|| {
+                    Error::Parallel("pipeline model session has no communication".into())
+                })?;
+                let step = PipelineStep::new(input.dim(0), input.dim(1))?;
+                let completion = model.forward_distributed(
+                    model.stage_info().is_first.then_some(&input),
+                    step,
+                    None,
+                    cache,
+                    distributed,
+                )?;
+                pipeline_submission(completion)
+            }
+            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => {
+                let distributed = self.distributed.as_ref().ok_or_else(|| {
+                    Error::Parallel("expert model session has no communication".into())
+                })?;
+                model_submission(model.forward(&input, None, cache, distributed)?)
+            }
+            _ => Err(Error::Parallel(
+                "MLX model and session state kinds do not match".into(),
+            )),
+        }
     }
+}
+
+fn model_submission(
+    output: Array,
+) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
+    let submission = MlxCompletion::submission(output)?;
+    Ok(Submission {
+        output: MlxModelOutput::new(Some(submission.output)),
+        completion: MlxSessionCompletion {
+            inner: MlxSessionCompletionKind::Model(submission.completion),
+        },
+    })
+}
+
+fn pipeline_submission(
+    completion: PipelineStageCompletion,
+) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
+    let output = MlxModelOutput::new(completion.logits().cloned());
+    Ok(Submission {
+        output,
+        completion: MlxSessionCompletion {
+            inner: MlxSessionCompletionKind::Pipeline(completion),
+        },
+    })
 }
 
 fn prefill_pair<M, C>(

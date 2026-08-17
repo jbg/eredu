@@ -67,23 +67,28 @@ SafeTensors/GGUF header catalogs, and load-route validation happen without
 MLX. The selected MLX backend then consumes that plan to map payloads and
 construct executable arrays/modules; it never calls back into the public
 facade loader.
-Complete-model tensor-parallel text and multimodal prefill/decode execution
+Replicated, tensor-, pipeline-, and expert-parallel prefill/decode execution
 crosses the single stateful `MlxModelSession` implementation of the core
-session contract. The session owns cache state and its optional distributed
-capability. Direct submissions return their exact completion; callers either
-retain it or use `Submission::wait`. Raw generation retains in-flight
-completions internally.
+session contract. `load_model_with_options` always returns a
+`PreparedModel<MlxModel>`; the preparation marker is required when creating a
+session, while its opaque MLX model selects complete-model, rank-local
+pipeline, or rank-local expert materialization inside the adapter. The session
+owns the matching cache state and its optional distributed capability. Direct
+submissions return their exact completion; callers either retain it or use
+`Submission::wait`. Raw generation retains in-flight completions internally.
 Realtime Moshi/PersonaPlex requests use the backend-neutral core scheduler;
 only their tensor execution and exact MLX completion adapter remain here.
 Distributed pipeline schedule, cancellation, and completion agreement use the
 same core scheduler through the MLX collective and completion adapters; the
 facade does not maintain a second lifecycle implementation.
-`MlxBackend::create_distributed_model_session` binds a pure tensor-parallel
-model, cache, topology, and `MlxDistributedSession` as one lifecycle. Pipeline
-and expert executors operate on partial rank-local models and currently use
-`create_communication_session`; that object owns the world and derived
-TP/PP/EP communicators after construction and is their route for transfers,
-collectives, sampling, scheduler consensus, and exact completion.
+`MlxBackend::with_distributed_world` selects the world before
+`Backend::create_session` binds the opaque model, topology-derived TP/PP/EP
+communicators, and the correct cache form into one lifecycle. There are no
+public architecture-specific distributed loaders, rank-local model types, or
+standalone communication-session constructors. `LoadedModel`, which combines
+tokenizer/chat conveniences with generation, is intentionally replicated-only;
+distributed applications use the same generic model loader and
+`MlxModelSession` directly.
 Weight-residency plans, atomic admission, ownership leases, protected windows,
 eviction decisions, exact transfer generations, and accounting likewise come
 directly from `safemlx-lm-core`. The MLX facade mirrors those transitions with

@@ -3267,47 +3267,8 @@ fn validate_expert_topology(topology: ParallelTopology) -> Result<(), Error> {
     Ok(())
 }
 
-/// Loads an executable expert-parallel MoE model.
-///
-/// SafeTensors uses the architecture's resident or sparse-cache adapter.
-/// Registered GGUF architectures support resident partitioning and
-/// rank-filtered sparse expert caching.
-pub fn load_expert_parallel_model(
-    model_dir: impl AsRef<Path>,
-    topology: ParallelTopology,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<ExpertParallelModel, Error> {
-    load_expert_parallel_model_with_options(
-        model_dir,
-        ModelLoadOptions::with_parallel(topology),
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads an executable EP or TP+EP model with a caller-supplied assignment.
-///
-/// The assignment must describe the checkpoint's complete routed-expert set
-/// and match this process's EP rank and group size.
-pub fn load_expert_parallel_model_with_assignment(
-    model_dir: impl AsRef<Path>,
-    topology: ParallelTopology,
-    assignment: ExpertAssignment,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<ExpertParallelModel, Error> {
-    load_expert_parallel_model_with_options_and_assignment(
-        model_dir,
-        ModelLoadOptions::with_parallel(topology),
-        assignment,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads an executable EP or TP+EP model with explicit load options.
-pub fn load_expert_parallel_model_with_options(
+/// Materializes an executable EP or TP+EP model for the MLX backend.
+pub(crate) fn load_expert_parallel_model_with_options(
     model_dir: impl AsRef<Path>,
     options: ModelLoadOptions,
     stream: &Stream,
@@ -3316,9 +3277,8 @@ pub fn load_expert_parallel_model_with_options(
     load_expert_parallel_model_impl(model_dir, options, None, stream, weights_stream)
 }
 
-/// Loads an executable EP or TP+EP model with explicit model options and expert
-/// assignment.
-pub fn load_expert_parallel_model_with_options_and_assignment(
+#[cfg(test)]
+pub(crate) fn load_expert_parallel_model_with_options_and_assignment(
     model_dir: impl AsRef<Path>,
     options: ModelLoadOptions,
     assignment: ExpertAssignment,
@@ -7248,8 +7208,22 @@ mod tests {
         let source = dense_qwen::Model::new(args, stream).unwrap();
         save_zero_checkpoint(&source, fixture.path(), stream);
 
+        let expected_topology = rank_one_topology();
+        let generic = crate::api::load_model_with_options(
+            fixture.path(),
+            ModelLoadOptions::with_parallel(expected_topology),
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+        assert_eq!(generic.topology(), Some(expected_topology));
+        assert!(matches!(
+            generic.inner,
+            crate::backend::mlx::MlxModelKind::Expert(_)
+        ));
+
         let options = ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
-            .with_parallel_topology(rank_one_topology());
+            .with_parallel_topology(expected_topology);
         let assignment = ExpertAssignment::round_robin(4, 2, 1).unwrap();
         let loaded = load_expert_parallel_model_with_options_and_assignment(
             fixture.path(),

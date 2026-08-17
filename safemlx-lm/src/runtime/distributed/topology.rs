@@ -1757,14 +1757,14 @@ mod tests {
     }
 
     #[test]
-    fn model_load_options_accept_complete_models_and_reject_partial_models() {
+    fn replicated_facades_reject_distributed_session_topologies() {
         let default = crate::api::ModelLoadOptions::default();
         assert_eq!(default.quantization, None);
         assert_eq!(default.parallel, None);
-        crate::api::ensure_executable_load_options(default).unwrap();
+        crate::api::ensure_replicated_load_options(default).unwrap();
 
         let singleton = crate::api::ModelLoadOptions::with_parallel(topology(1, 0, 1, 1, 1));
-        crate::api::ensure_executable_load_options(singleton).unwrap();
+        crate::api::ensure_replicated_load_options(singleton).unwrap();
         let combined = crate::api::ModelLoadOptions::with_quantization(
             crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4,
         )
@@ -1776,14 +1776,15 @@ mod tests {
         assert!(combined.parallel.unwrap().is_replicated());
 
         let tensor_parallel = crate::api::ModelLoadOptions::with_parallel(topology(2, 0, 2, 1, 1));
-        crate::api::ensure_executable_load_options(tensor_parallel).unwrap();
+        assert!(crate::api::ensure_replicated_load_options(tensor_parallel).is_err());
 
         let pipeline_partitioned =
             crate::api::ModelLoadOptions::with_parallel(topology(2, 0, 1, 2, 1));
-        assert!(matches!(
-            crate::api::ensure_executable_load_options(pipeline_partitioned),
-            Err(Error::Parallel(_))
-        ));
+        assert!(crate::api::ensure_replicated_load_options(pipeline_partitioned).is_err());
+
+        let expert_partitioned =
+            crate::api::ModelLoadOptions::with_parallel(topology(2, 0, 1, 1, 2));
+        assert!(crate::api::ensure_replicated_load_options(expert_partitioned).is_err());
     }
 
     #[test]

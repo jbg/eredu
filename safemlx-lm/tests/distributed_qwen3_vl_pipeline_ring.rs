@@ -478,7 +478,7 @@ fn qwen3_vl_pipeline_ring_worker() {
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     let execution = MlxBackend::new(&stream)
-        .create_communication_session(topology, &group)
+        .communication_for_topology(topology, &group)
         .unwrap();
     let streamed = std::env::var_os(STREAMED).is_some();
     let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();
@@ -913,7 +913,11 @@ fn run_mode(
     for rank in 0..world {
         let mut command = Command::new(&executable);
         command
-            .args(["--exact", "qwen3_vl_pipeline_ring_worker", "--nocapture"])
+            .args([
+                "--exact",
+                "distributed_qwen3_vl_pipeline_ring::qwen3_vl_pipeline_ring_worker",
+                "--nocapture",
+            ])
             .env(WORKER, rank.to_string())
             .env(CHECKPOINT, &checkpoint_path)
             .env(CACHE_ROOT, cache.path())

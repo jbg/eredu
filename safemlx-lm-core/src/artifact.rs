@@ -490,9 +490,6 @@ pub fn validate_preparation_policy(
     format: ArtifactFormat,
     policy: PreparationPolicy,
 ) -> Result<MaterializationRoute, ArtifactError> {
-    if policy.distributed {
-        return Err(ArtifactError::DistributedModelRequiresDistributedLoader);
-    }
     if kind == ModelKind::PersonaPlex {
         return Err(ArtifactError::RealtimeModelRequiresRealtimeLoader);
     }
@@ -881,9 +878,6 @@ pub enum ArtifactError {
     /// Requested residency mode is unavailable for the artifact.
     #[error("unsupported model residency policy: {0}")]
     UnsupportedResidencyPolicy(String),
-    /// A whole model cannot represent the requested distributed topology.
-    #[error("non-replicated model preparation requires a distributed model loader")]
-    DistributedModelRequiresDistributedLoader,
     /// PersonaPlex uses a distinct realtime model/session contract.
     #[error("PersonaPlex must be prepared through the realtime model loader")]
     RealtimeModelRequiresRealtimeLoader,
@@ -935,6 +929,21 @@ mod tests {
             plan.into_parts().0,
             ModelArtifact::SafeTensors { .. }
         ));
+    }
+
+    #[test]
+    fn distributed_policy_uses_the_same_neutral_preparation_plan() {
+        let root = tempfile::tempdir().unwrap();
+        write_safetensors_fixture(root.path(), "llama");
+        let policy = PreparationPolicy {
+            distributed: true,
+            ..PreparationPolicy::default()
+        };
+
+        let plan = plan_model_preparation(inspect_artifact(root.path()).unwrap(), policy).unwrap();
+
+        assert_eq!(plan.policy(), policy);
+        assert_eq!(plan.route(), MaterializationRoute::Resident);
     }
 
     #[test]

@@ -4385,6 +4385,9 @@ mod tests {
                 gpu.stream(),
                 cpu.stream(),
             )
+            .unwrap()
+            .into_inner()
+            .into_complete()
             .unwrap();
             let crate::api::Model::Inkling(mut quantized) = loaded else {
                 panic!("high-level dispatch did not return an Inkling model")

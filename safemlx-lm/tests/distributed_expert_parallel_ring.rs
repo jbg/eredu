@@ -37,6 +37,7 @@ use safemlx_lm::{
         nemotron_h::model as nemotron_h,
         qwen::{dense as dense_qwen, hybrid::qwen3_5, vl::model as qwen3_vl},
     },
+    load_model_with_options,
     runtime::cache::{ConcatKeyValueCache, SlidingKeyValueCache},
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
@@ -46,9 +47,10 @@ use safemlx_lm::{
     runtime::residency::{
         dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions,
     },
-    CacheResidencyPolicy, DeviceAssignment, MlxBackend, MlxDistributedSession, MtpConfig,
-    NonExpertWeightResidency, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology, WeightResidency,
+    Backend as _, BackendSession as _, CacheResidencyPolicy, DeviceAssignment, MlxBackend,
+    MlxDistributedSession, MtpConfig, NonExpertWeightResidency, PagedCacheOptions,
+    ParallelTopology, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+    WeightResidency,
 };
 
 const WORKER_RANK: &str = "SAFEMLX_LM_EXPERT_MODEL_RING_WORKER";
@@ -214,6 +216,44 @@ fn expert_parallel_model_ring_worker() {
             )
         };
     }
+    if assignment_kind == "opaque-session" {
+        let mut model =
+            load_model_with_options(&checkpoint, options, stream, weights_stream).unwrap();
+        let backend = MlxBackend::with_distributed_world(stream, &group);
+        let mut session = backend.create_session(&model).unwrap();
+        let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
+        let parts = [runtime_input::InputPart::text_token_ids(&prompt)];
+        let mut output = session
+            .prefill(
+                &backend,
+                &mut model,
+                runtime_input::ModelInput::new(&parts).into(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        for _ in 0..2 {
+            let logits = output.logits().expect("every EP rank owns output logits");
+            let token = session
+                .sample_and_synchronize(
+                    Some(logits),
+                    logits.dim(0),
+                    &mut DefaultSampler,
+                    0.0,
+                    None,
+                    false,
+                )
+                .unwrap()
+                .token;
+            output = session
+                .decode(&backend, &mut model, token)
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+        assert!(output.logits().is_some());
+        return;
+    }
     let assignment = match assignment_kind.as_str() {
         "balanced" => None,
         "round-robin" => {
@@ -342,7 +382,7 @@ fn expert_parallel_model_ring_worker() {
             .collect::<HashMap<_, _>>();
     let _profiling = profile_expert_parallel_timings();
     let execution = MlxBackend::new(&stream)
-        .create_communication_session(topology, &group)
+        .communication_for_topology(topology, &group)
         .unwrap();
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let persist_prompt = artifact_dir.join(PROMPT_CACHE_MARKER).exists();
@@ -1846,7 +1886,7 @@ fn run_ring_fixture_with_world_size(
             Command::new(&executable)
                 .args([
                     "--exact",
-                    "expert_parallel_model_ring_worker",
+                    "distributed_expert_parallel_ring::expert_parallel_model_ring_worker",
                     "--nocapture",
                 ])
                 .env(WORKER_RANK, rank.to_string())
@@ -2016,6 +2056,29 @@ fn ring_two_process_model_parity() {
             "expected.safetensors",
         );
     }
+}
+
+/// Proves the public generic loader and architecture-erased model session own
+/// expert loading, prefill, repeated decode, cache state, and collectives.
+#[test]
+#[ignore = "spawns local Ring workers and opens loopback sockets"]
+fn ring_two_process_opaque_model_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let fixture = tempfile::tempdir().unwrap();
+    let qwen = fixture.path().join("qwen3-moe");
+    let packed = fixture.path().join("qwen3-moe-packed");
+    std::fs::create_dir_all(&qwen).unwrap();
+    std::fs::create_dir_all(&packed).unwrap();
+    write_qwen_fixture(&qwen, &packed);
+    run_ring_fixture(
+        "opaque Qwen3 session",
+        "Qwen3",
+        "dense",
+        "opaque-session",
+        "resident",
+        &qwen,
+        "expected.safetensors",
+    );
 }
 
 /// Verifies the combined policy end-to-end: replicated decoder units stream

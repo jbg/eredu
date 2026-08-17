@@ -20,7 +20,9 @@ mod session;
 pub(crate) use distributed::MlxDistributedConfig;
 pub use distributed::MlxDistributedSession;
 pub(crate) use session::{submit_decode_with_cache, submit_prefill_with_cache};
-pub use session::{MlxGeneration, MlxModelInput, MlxModelSession};
+pub use session::{
+    MlxGeneration, MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion,
+};
 
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
 use safemlx_lm_core::backend::{
@@ -30,8 +32,102 @@ use safemlx_lm_core::backend::{
 
 use crate::{
     api::{Model, ModelLoadOptions},
+    architectures::distributed::{expert::ExpertParallelModel, pipeline::PipelineModel},
     error::Error,
 };
+
+/// Opaque MLX executable selected for one complete model session.
+///
+/// Replicated, tensor-, pipeline-, and expert-parallel materializations share
+/// this type. Architecture-specific rank-local executables are deliberately
+/// not exposed through the public loading API.
+pub struct MlxModel {
+    pub(crate) inner: MlxModelKind,
+}
+
+pub(crate) enum MlxModelKind {
+    Complete(Model),
+    Pipeline(PipelineModel),
+    Expert(ExpertParallelModel),
+}
+
+impl MlxModel {
+    pub(super) const fn complete(model: Model) -> Self {
+        Self {
+            inner: MlxModelKind::Complete(model),
+        }
+    }
+
+    pub(super) const fn pipeline(model: PipelineModel) -> Self {
+        Self {
+            inner: MlxModelKind::Pipeline(model),
+        }
+    }
+
+    pub(super) const fn expert(model: ExpertParallelModel) -> Self {
+        Self {
+            inner: MlxModelKind::Expert(model),
+        }
+    }
+
+    pub(crate) fn into_complete(self) -> Result<Model, Error> {
+        match self.inner {
+            MlxModelKind::Complete(model) => Ok(model),
+            MlxModelKind::Pipeline(_) | MlxModelKind::Expert(_) => Err(Error::Parallel(
+                "the tokenizer/generation facade requires a replicated model; execute distributed models through MlxModelSession"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Returns the selected model's normalized architecture name.
+    pub fn model_type(&self) -> &str {
+        match &self.inner {
+            MlxModelKind::Complete(model) => model.model_type(),
+            MlxModelKind::Pipeline(model) => model.stage_info().model_kind.model_type_name(),
+            MlxModelKind::Expert(model) => model.info().model_kind.model_type_name(),
+        }
+    }
+
+    /// Returns the rank-local topology for a distributed executable.
+    pub fn topology(&self) -> Option<crate::ParallelTopology> {
+        match &self.inner {
+            MlxModelKind::Complete(model) => model.parallel_info().map(|info| info.topology()),
+            MlxModelKind::Pipeline(model) => Some(model.stage_info().topology),
+            MlxModelKind::Expert(model) => Some(model.info().topology),
+        }
+        .filter(|topology| !topology.is_replicated())
+    }
+
+    /// Returns bounded parameter-residency telemetry when available.
+    pub fn residency_report(
+        &self,
+    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
+        match &self.inner {
+            MlxModelKind::Complete(model) => model.residency_report(),
+            MlxModelKind::Pipeline(model) => model.parameter_residency_report(),
+            MlxModelKind::Expert(_) => Ok(None),
+        }
+    }
+
+    /// Returns dense checkpoint-streaming telemetry when enabled.
+    pub fn dense_stream_report(&self) -> Result<Option<crate::DenseDiskStreamReport>, Error> {
+        match &self.inner {
+            MlxModelKind::Complete(model) => model.dense_stream_report(),
+            MlxModelKind::Pipeline(model) => model.dense_stream_report(),
+            MlxModelKind::Expert(model) => model.dense_stream_report(),
+        }
+    }
+
+    /// Returns sparse routed-expert cache telemetry when enabled.
+    pub fn expert_cache_report(&self) -> Result<Option<crate::ExpertCacheReport>, Error> {
+        match &self.inner {
+            MlxModelKind::Complete(model) => model.expert_cache_report(),
+            MlxModelKind::Pipeline(model) => model.expert_cache_report(),
+            MlxModelKind::Expert(model) => model.expert_cache_report(),
+        }
+    }
+}
 
 /// Request to prepare any facade-supported model on MLX.
 #[derive(Debug, Clone)]
@@ -47,64 +143,46 @@ pub struct MlxModelConfig<'a> {
 /// MLX backend selected for a complete model/session.
 pub struct MlxBackend<'a> {
     stream: &'a Stream,
+    world: Option<&'a safemlx::distributed::Group>,
 }
 
 impl<'a> MlxBackend<'a> {
     /// Uses the selected session execution stream.
     pub const fn new(stream: &'a Stream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            world: None,
+        }
+    }
+
+    /// Selects MLX distributed communication for sessions created by this backend.
+    pub const fn with_distributed_world(
+        stream: &'a Stream,
+        world: &'a safemlx::distributed::Group,
+    ) -> Self {
+        Self {
+            stream,
+            world: Some(world),
+        }
     }
     /// Execution stream used by this backend instance.
     pub const fn stream(&self) -> &'a Stream {
         self.stream
     }
 
-    /// Creates communication for pipeline/expert executors which do not yet
-    /// use the architecture-erased complete-model session.
-    pub fn create_communication_session(
+    #[cfg(test)]
+    pub(crate) fn communication_for_topology(
         &self,
         topology: crate::ParallelTopology,
         world: &'a safemlx::distributed::Group,
     ) -> Result<MlxDistributedSession<'a>, Error> {
         MlxDistributedSession::new(MlxDistributedConfig { topology, world }, self.stream)
     }
-
-    /// Creates a model session with topology-scoped MLX communication.
-    pub fn create_distributed_model_session(
-        &self,
-        model: &Model,
-        topology: crate::ParallelTopology,
-        world: &'a safemlx::distributed::Group,
-    ) -> Result<MlxModelSession<'a>, Error> {
-        self.create_distributed_model_session_with_cache(model.new_cache(), topology, world)
-    }
-
-    /// Creates a distributed model session from caller-selected cache policy.
-    pub fn create_distributed_model_session_with_cache(
-        &self,
-        cache: crate::api::ModelCache,
-        topology: crate::ParallelTopology,
-        world: &'a safemlx::distributed::Group,
-    ) -> Result<MlxModelSession<'a>, Error> {
-        if topology.tensor_parallel_size <= 1
-            || topology.pipeline_parallel_size != 1
-            || topology.expert_parallel_size != 1
-        {
-            return Err(Error::Parallel(
-                "architecture-erased distributed model sessions currently require a pure tensor-parallel topology"
-                    .into(),
-            ));
-        }
-        MlxModelSession::new_distributed(
-            cache,
-            MlxDistributedSession::new(MlxDistributedConfig { topology, world }, self.stream)?,
-        )
-    }
 }
 
 impl<'a> Backend for MlxBackend<'a> {
     type ModelConfig = MlxModelConfig<'a>;
-    type Model = Model;
+    type Model = MlxModel;
     type Session = MlxModelSession<'a>;
     type Error = Error;
 
@@ -154,7 +232,22 @@ impl<'a> Backend for MlxBackend<'a> {
         &self,
         model: &PreparedModel<Self::Model>,
     ) -> Result<Self::Session, Self::Error> {
-        Ok(MlxModelSession::new(model.get().new_cache()))
+        let distributed = match model.get().topology() {
+            Some(topology) => {
+                let world = self.world.ok_or_else(|| {
+                    Error::Parallel(
+                        "distributed model session creation requires MlxBackend::with_distributed_world"
+                            .into(),
+                    )
+                })?;
+                Some(MlxDistributedSession::new(
+                    MlxDistributedConfig { topology, world },
+                    self.stream,
+                )?)
+            }
+            None => None,
+        };
+        MlxModelSession::from_model(model.get(), distributed)
     }
 }
 

@@ -3477,6 +3477,9 @@ mod tests {
                 gpu.stream(),
                 cpu.stream(),
             )
+            .unwrap()
+            .into_inner()
+            .into_complete()
             .unwrap();
             let crate::api::Model::NemotronH(mut quantized) = loaded else {
                 panic!("high-level dispatch did not return a Nemotron-H model")

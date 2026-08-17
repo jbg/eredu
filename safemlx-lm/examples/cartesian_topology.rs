@@ -2,9 +2,9 @@
 
 use safemlx::{
     distributed::{self, Backend},
-    DeviceType, Stream,
+    DeviceType,
 };
-use safemlx_lm::{DeviceAssignment, MlxBackend, ParallelTopology};
+use safemlx_lm::{DeviceAssignment, ParallelTopology};
 
 fn parse(index: usize, name: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(std::env::args()
@@ -31,9 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ep,
         DeviceAssignment::new(DeviceType::Gpu, local_index),
     )?;
-    let stream = Stream::new_with_device(&topology.device.device()?);
     let report = topology.preflight((pp > 1).then_some(layers), (ep > 1).then_some(experts))?;
-    let _execution = MlxBackend::new(&stream).create_communication_session(topology, &world)?;
     eprintln!(
         "global={}/{} coordinates={:?} layers={:?} experts={:?} embedding={} head={} TP={:?} PP={:?} EP={:?}",
         topology.global_rank,

@@ -10,6 +10,19 @@ license.workspace = true
 rust-version.workspace = true
 description = "SafeMLX language-model facade and MLX execution backend"
 readme = "README.md"
+autotests = false
+
+[[test]]
+name = "automatic_planner_api"
+path = "tests/automatic_planner_api.rs"
+
+[[test]]
+name = "core_types"
+path = "tests/core_types.rs"
+
+[[test]]
+name = "native_tool_checkpoints"
+path = "tests/native_tool_checkpoints.rs"
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]

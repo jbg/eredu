@@ -15,9 +15,8 @@ pub struct ModelLoadOptions {
     pub quantization: Option<WeightQuantization>,
     /// Optional validated runtime topology and process-local device assignment.
     ///
-    /// Singleton topologies preserve normal model loading. Non-replicated
-    /// topologies must be loaded through the explicit pipeline/expert APIs or
-    /// through the selected architecture's generalized tensor-parallel loader.
+    /// Singleton topologies preserve replicated model loading. Non-replicated
+    /// topologies select a rank-local executable behind [`crate::MlxModel`].
     pub parallel: Option<ParallelTopology>,
     /// Parameter placement and execution policy for cataloged checkpoint stores.
     pub weight_residency: WeightResidency,
@@ -99,7 +98,6 @@ impl ModelLoadOptions {
         gguf_architecture: Option<safemlx_lm_core::GgufArchitecture>,
         format: safemlx_lm_core::ArtifactFormat,
     ) -> Result<safemlx_lm_core::MaterializationRoute, Error> {
-        ensure_executable_load_options(self)?;
         Ok(safemlx_lm_core::validate_preparation_policy(
             kind,
             gguf_architecture,
@@ -109,44 +107,17 @@ impl ModelLoadOptions {
     }
 }
 
-pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Result<(), Error> {
-    if let Some(topology) = options
+pub(crate) fn ensure_replicated_load_options(options: ModelLoadOptions) -> Result<(), Error> {
+    if options
         .parallel
-        .filter(|topology| !topology.is_replicated())
+        .is_some_and(|topology| !topology.is_replicated())
     {
-        if topology.tensor_parallel_size > 1
-            && topology.pipeline_parallel_size == 1
-            && topology.expert_parallel_size == 1
-        {
-            Ok(())
-        } else {
-            Err(Error::Parallel(
-                if topology.pipeline_parallel_size > 1
-                    && topology.tensor_parallel_size == 1
-                    && topology.expert_parallel_size == 1
-                {
-                    "non-replicated pure pipeline loading cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options"
-                    .into()
-                } else if topology.expert_parallel_size > 1
-                    && topology.tensor_parallel_size == 1
-                    && topology.pipeline_parallel_size == 1
-                {
-                    "non-replicated pure expert-parallel loading cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options"
-                    .into()
-                } else {
-                    if topology.pipeline_parallel_size > 1 {
-                        "Cartesian pipeline topology cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options and PipelineModel::forward_distributed"
-                        .into()
-                    } else {
-                        "Cartesian TP+EP topology cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options and ExpertParallelModel::forward_distributed"
-                        .into()
-                    }
-                },
-            ))
-        }
-    } else {
-        Ok(())
+        return Err(Error::Parallel(
+            "this facade owns replicated runtime state; use load_model_with_options and create an MlxModelSession for distributed execution"
+                .into(),
+        ));
     }
+    Ok(())
 }
 
 /// Canonical resolution of a validated model config.

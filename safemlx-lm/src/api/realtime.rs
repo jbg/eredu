@@ -23,7 +23,7 @@ use serde::Deserialize;
 use std::{path::Path, time::Instant};
 
 use crate::{
-    api::{ensure_executable_load_options, moshi, personaplex, ModelLoadOptions},
+    api::{ensure_replicated_load_options, moshi, personaplex, ModelLoadOptions},
     architectures::moshi::layerwise::MoshiLayerwiseModel,
     error::Error,
     runtime::checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
@@ -285,7 +285,7 @@ pub fn load_model_with_options(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedRealtimeModel, Error> {
-    ensure_executable_load_options(options)?;
+    ensure_replicated_load_options(options)?;
     let model_dir = model_dir.as_ref();
     let kind = realtime_model_kind(model_dir)?;
     if options.weight_residency.expert_cache().is_some() {

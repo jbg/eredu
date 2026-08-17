@@ -4,8 +4,8 @@
 pub mod deepseek_v3;
 /// DeepSeek-V4 compressed sparse-attention and mHC architecture.
 pub mod deepseek_v4;
-/// Architecture-dispatched distributed model adapters.
-pub mod distributed;
+/// MLX-internal rank-local distributed model adapters.
+pub(crate) mod distributed;
 /// Gemma 4 text and multimodal implementations.
 pub mod gemma4;
 /// GPT-OSS implementations and output format.

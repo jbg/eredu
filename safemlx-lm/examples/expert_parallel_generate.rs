@@ -6,10 +6,11 @@ use safemlx::{
 };
 use safemlx_lm::{
     api::ModelLoadOptions,
-    architectures::distributed::expert::load_expert_parallel_model_with_options,
-    runtime::generation::sampler::DefaultSampler,
-    runtime::residency::expert_cache::ExpertCacheLoadOptions, DeviceAssignment, MlxBackend,
-    ParallelTopology, WeightResidency,
+    core::{Backend as _, BackendSession as _},
+    load_model_with_options,
+    runtime::residency::expert_cache::ExpertCacheLoadOptions,
+    runtime::{generation::sampler::DefaultSampler, media::input},
+    DeviceAssignment, MlxBackend, ParallelTopology, WeightResidency,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,30 +31,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let execution = MlxBackend::new(&stream).create_communication_session(topology, &group)?;
     let options = ModelLoadOptions::with_parallel(topology).with_weight_residency(
         WeightResidency::with_expert_cache(
             safemlx_lm::NonExpertWeightResidency::LayerwiseHost(Default::default()),
             ExpertCacheLoadOptions::default(),
         ),
     );
-    let mut model =
-        load_expert_parallel_model_with_options(&model_dir, options, &stream, &weights_stream)?;
+    let mut model = load_model_with_options(&model_dir, options, &stream, &weights_stream)?;
     if group.rank() == 0 {
-        eprintln!(
-            "EP={} assignment={:?} local experts by rank 0={:?}",
-            model.info().expert_parallel_size,
-            model.info().assignment.policy(),
-            model.info().assignment.local_global_expert_ids(),
-        );
+        eprintln!("loaded {} with EP={}", model.model_type(), group.size());
     }
 
-    let mut cache = model.new_cache();
+    let backend = MlxBackend::with_distributed_world(&stream, &group);
+    let mut session = backend.create_session(&model)?;
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-    let mut logits = model.forward(&prompt, None, &mut cache, &execution)?;
+    let parts = [input::InputPart::text_token_ids(&prompt)];
+    let mut logits = session
+        .prefill(&backend, &mut model, input::ModelInput::new(&parts).into())?
+        .wait()?
+        .into_logits()
+        .ok_or("expert-parallel session returned no logits")?;
     let mut sampler = DefaultSampler;
     for _ in 0..8 {
-        let synchronized = execution.sample_and_synchronize(
+        let synchronized = session.sample_and_synchronize(
             Some(&logits),
             logits.dim(0),
             &mut sampler,
@@ -63,15 +63,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         if group.rank() == 0 {
             eprintln!(
-                "sampled token {:?}; routing {:?}",
+                "sampled token {:?}",
                 synchronized.token.evaluated()?.as_slice::<u32>(),
-                model.latest_routing_statistics(),
             );
         }
         if synchronized.finished {
             break;
         }
-        logits = model.forward(&synchronized.token, None, &mut cache, &execution)?;
+        logits = session
+            .decode(&backend, &mut model, synchronized.token)?
+            .wait()?
+            .into_logits()
+            .ok_or("expert-parallel session returned no logits")?;
     }
     Ok(())
 }

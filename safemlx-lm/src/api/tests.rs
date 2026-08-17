@@ -753,7 +753,12 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     let qwen = super::qwen3_5::Model::new(args, None, None, None, stream).unwrap();
     let directory = temp_model_dir(&config.to_string());
     save_zero_checkpoint(&qwen, &directory, stream);
-    let super::Model::Qwen35(qwen) = super::load_model(&directory, stream, stream).unwrap() else {
+    let super::Model::Qwen35(qwen) = super::load_model(&directory, stream, stream)
+        .unwrap()
+        .into_inner()
+        .into_complete()
+        .unwrap()
+    else {
         panic!("expected canonical Qwen3.5 model");
     };
     let tokenizer_fingerprint = super::tokenizer_vocabulary_fingerprint(&tokenizer);
@@ -4636,7 +4641,11 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
     for residency in policies {
         let options =
             ModelLoadOptions::with_quantization(quantization).with_weight_residency(residency);
-        let mut loaded = load_model_with_options(&path, options, stream, weights_stream).unwrap();
+        let mut loaded = load_model_with_options(&path, options, stream, weights_stream)
+            .unwrap()
+            .into_inner()
+            .into_complete()
+            .unwrap();
         let super::Model::Llama(model) = &loaded else {
             panic!("expected Llama GGUF model");
         };
@@ -4804,6 +4813,9 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
         ] {
             let mut dense =
                 load_model_with_options(&dir, ModelLoadOptions::default(), stream, weights_stream)
+                    .unwrap()
+                    .into_inner()
+                    .into_complete()
                     .unwrap();
             let mut quantized = load_model_with_options(
                 &dir,
@@ -4811,7 +4823,10 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 stream,
                 weights_stream,
             )
-            .unwrap_or_else(|error| panic!("{family} {quantization:?}: {error}"));
+            .unwrap_or_else(|error| panic!("{family} {quantization:?}: {error}"))
+            .into_inner()
+            .into_complete()
+            .unwrap();
             let suffix = if quantization == WeightQuantization::MxFp4 {
                 "mxfp4"
             } else {
@@ -4834,6 +4849,9 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 stream,
                 weights_stream,
             )
+            .unwrap()
+            .into_inner()
+            .into_complete()
             .unwrap();
             let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
             let parts = [super::input::InputPart::text_token_ids(&tokens)];
@@ -4947,6 +4965,9 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
         stream,
         weights_stream,
     )
+    .unwrap()
+    .into_inner()
+    .into_complete()
     .unwrap();
     let super::Model::GptOss(model) = model else {
         panic!("expected GPT-OSS model")
@@ -4998,6 +5019,9 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
         stream,
         weights_stream,
     )
+    .unwrap()
+    .into_inner()
+    .into_complete()
     .unwrap();
     let super::Model::Qwen3Vl(model) = &quantized else {
         panic!("expected Qwen3-VL model");
@@ -5043,6 +5067,9 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
         stream,
         weights_stream,
     )
+    .unwrap()
+    .into_inner()
+    .into_complete()
     .unwrap();
     let super::Model::Qwen3Vl(saved_model) = &saved_quantized else {
         panic!("expected saved Qwen3-VL model");
@@ -5118,13 +5145,20 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
     );
 
     let mut dense =
-        load_model_with_options(&dir, ModelLoadOptions::default(), stream, weights_stream).unwrap();
+        load_model_with_options(&dir, ModelLoadOptions::default(), stream, weights_stream)
+            .unwrap()
+            .into_inner()
+            .into_complete()
+            .unwrap();
     let mut quantized = load_model_with_options(
         &dir,
         ModelLoadOptions::with_quantization(WeightQuantization::MxFp4),
         stream,
         weights_stream,
     )
+    .unwrap()
+    .into_inner()
+    .into_complete()
     .unwrap();
     let super::Model::Qwen35(quantized_model) = &quantized else {
         panic!("expected Qwen3.5-MoE model");

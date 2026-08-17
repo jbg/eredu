@@ -13,10 +13,9 @@
 mod placement;
 
 pub use placement::{
-    ActiveParallelSubgroup, CheckpointBinding, ExecutionGroupKind, ExecutionGroupPlacement,
-    ExecutionGroupPlacementRequest, PayloadField, PayloadSchema, PlacedExecutionDag,
-    PlacedGroupConcurrencyPolicy, PlacedGroupSerialReason, PlacedUnitRange, PlacementRoute,
-    ResidencyBinding, StaticTensorOwnership,
+    ActiveParallelSubgroup, ExecutionGroupKind, ExecutionGroupPlacementRequest, PayloadField,
+    PayloadSchema, PlacedExecutionDag, PlacedGroupConcurrencyPolicy, PlacedGroupSerialReason,
+    PlacementRoute, ResidencyBinding,
 };
 
 use std::{
@@ -8991,22 +8990,7 @@ where
     })
 }
 
-/// Loads a pipeline stage using default non-quantizing options.
-pub fn load_pipeline_model(
-    model_dir: impl AsRef<Path>,
-    topology: ParallelTopology,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<PipelineModel, Error> {
-    load_pipeline_model_with_options(
-        model_dir,
-        ModelLoadOptions::with_parallel(topology),
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads an executable rank-local Cartesian pipeline stage.
+/// Materializes an executable rank-local Cartesian pipeline stage for the MLX backend.
 ///
 /// Llama/Mistral, DeepSeek-V3/R1/V4, Inkling, Kimi Linear, Qwen, Qwen3-VL, GPT-OSS,
 /// LFM2, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 text TP+PP stages, plus
@@ -9024,7 +9008,7 @@ pub fn load_pipeline_model(
 /// Load-time conversion from a dense checkpoint always constructs the same
 /// stage-local bounded packed overlay before parameter residency is selected;
 /// fully resident stages never fall back to eager complete-matrix conversion.
-pub fn load_pipeline_model_with_options(
+pub(crate) fn load_pipeline_model_with_options(
     model_dir: impl AsRef<Path>,
     options: ModelLoadOptions,
     stream: &Stream,
@@ -28699,6 +28683,31 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn generic_loader_materializes_an_opaque_pipeline_model() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let mut source = llama::ResidentModel::new(llama_args(true), stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let directory = tempfile::tempdir().unwrap();
+        write_llama_fixture(directory.path(), &source, false);
+        let expected_topology = topology(2, 0, 2);
+
+        let loaded = crate::api::load_model_with_options(
+            directory.path(),
+            ModelLoadOptions::with_parallel(expected_topology),
+            stream,
+            stream,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.topology(), Some(expected_topology));
+        assert!(matches!(
+            loaded.inner,
+            crate::backend::mlx::MlxModelKind::Pipeline(_)
+        ));
     }
 
     fn llama_gguf_fixture(model: &llama::ResidentModel) -> SyntheticGguf {

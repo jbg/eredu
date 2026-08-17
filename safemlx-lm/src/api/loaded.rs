@@ -1507,7 +1507,7 @@ impl LoadedModel {
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref();
-        ensure_executable_load_options(options)?;
+        ensure_replicated_load_options(options)?;
         if is_gguf_file(model_dir) {
             let sidecar_dir = gguf_sidecar_dir(model_dir);
             let checkpoint_generation_config = read_checkpoint_generation_config(sidecar_dir)?;
@@ -1585,7 +1585,9 @@ impl LoadedModel {
                 "PersonaPlex is a realtime speech-to-speech token model; use architectures::moshi::personaplex instead of LoadedModel".into(),
             ));
         }
-        let model = load_model_with_options(model_dir, options, stream, weights_stream)?;
+        let model = load_model_with_options(model_dir, options, stream, weights_stream)?
+            .into_inner()
+            .into_complete()?;
 
         Ok(Self {
             model,

@@ -5,13 +5,14 @@ use std::{path::PathBuf, time::Instant};
 use clap::Parser;
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    api::Model,
     architectures::llama::model as llama,
     core::residency::{MemoryTier, OffloadConfig, TransferDirection},
+    core::{Backend as _, BackendSession as _},
     load_model_with_options,
     runtime::execution::layerwise::LayerwiseLoadOptions,
+    runtime::media::input,
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    ModelLoadOptions, WeightResidency,
+    MlxBackend, ModelLoadOptions, WeightResidency,
 };
 
 #[derive(Debug, Parser)]
@@ -97,21 +98,19 @@ fn main() -> anyhow::Result<()> {
         };
         WeightResidency::layerwise_host(layerwise)
     };
-    let loaded = load_model_with_options(
+    let mut model = load_model_with_options(
         &args.model_dir,
         ModelLoadOptions::default().with_weight_residency(weight_residency),
         stream,
         weights.stream(),
     )?;
-    let mut model = match loaded {
-        Model::Llama(model) => model,
-        model => anyhow::bail!(
-            "the Llama residency benchmark requires a Llama-compatible checkpoint, got {}",
-            model.model_type()
-        ),
-    };
-    let metadata = model.metadata().clone();
-    let mut cache = model.new_cache();
+    anyhow::ensure!(
+        model.model_type() == "llama",
+        "the Llama residency benchmark requires a Llama-compatible checkpoint, got {}",
+        model.model_type()
+    );
+    let backend = MlxBackend::new(stream);
+    let mut session = backend.create_session(&model)?;
 
     if let Some(report) = model.dense_stream_report()? {
         let offload = report.residency().offload();
@@ -134,15 +133,30 @@ fn main() -> anyhow::Result<()> {
 
     stream.synchronize()?;
     let prompt_array = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
+    let prompt_parts = [input::InputPart::text_token_ids(&prompt_array)];
     let prefill_started = Instant::now();
-    let _ = model.prefill(&prompt_array, &mut cache, stream)?;
+    let _ = session
+        .prefill(
+            &backend,
+            &mut model,
+            input::ModelInput::new(&prompt_parts).into(),
+        )?
+        .wait()?;
     stream.synchronize()?;
     let prefill = prefill_started.elapsed();
     let time_to_first_token = prefill;
 
-    cache.clear()?;
+    session.reset(&model)?;
     let repeated_prefill_started = Instant::now();
-    let mut logits = model.prefill(&prompt_array, &mut cache, stream)?;
+    let mut logits = session
+        .prefill(
+            &backend,
+            &mut model,
+            input::ModelInput::new(&prompt_parts).into(),
+        )?
+        .wait()?
+        .into_logits()
+        .expect("replicated model session returns logits");
     stream.synchronize()?;
     let repeated_prefill = repeated_prefill_started.elapsed();
 
@@ -151,7 +165,11 @@ fn main() -> anyhow::Result<()> {
         let token = llama::sample(&logits, 0.0, None, stream)?;
         stream.synchronize()?;
         let token = token.reshape(&[1, 1], stream)?;
-        logits = model.decode(&token, &mut cache, stream)?;
+        logits = session
+            .decode(&backend, &mut model, token)?
+            .wait()?
+            .into_logits()
+            .expect("replicated model session returns logits");
         stream.synchronize()?;
     }
     let decode = decode_started.elapsed();
@@ -165,20 +183,10 @@ fn main() -> anyhow::Result<()> {
         .filter(|unit| unit.id().as_str().starts_with("llama.layer.") && unit.device_resident())
         .count();
 
-    println!("model type: {}", metadata.model_type());
-    println!("quantization: {:?}", metadata.quantization());
-    println!(
-        "static device-weight bytes: {}",
-        metadata.static_device_bytes()
-    );
-    println!(
-        "decoder-layer parameter bytes: {}",
-        metadata.layer_parameter_bytes()
-    );
+    println!("model type: {}", model.model_type());
     println!(
         "configured/observed device-layer window: {}/{}",
-        metadata.device_layer_capacity(),
-        observed_window
+        args.device_layer_window, observed_window
     );
     println!(
         "current logical host/device parameter bytes: {}/{}",

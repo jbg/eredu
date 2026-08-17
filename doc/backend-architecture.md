@@ -56,9 +56,10 @@ not accept `Any`, raw pointers, or operation names as an execution escape hatch.
 ## Model, session, and completion lifecycle
 
 `Backend::prepare_model` selects one backend and produces an opaque
-`PreparedModel`. `Backend::create_session` creates a backend-owned object which
-implements `BackendSession` directly. That object owns persistent decode/cache
-state and submits prefill and decode operations against the prepared model.
+`PreparedModel`. Its backend model is then passed to `Backend::create_session`,
+which creates a backend-owned object implementing `BackendSession` directly.
+That object owns persistent decode/cache state and submits prefill and decode
+operations against the same model.
 There is one session contract: the facade does not provide an
 architecture-specific or borrowing execution escape hatch.
 
@@ -100,15 +101,17 @@ metadata are not reopened: `GgufCheckpoint::from_portable` wraps the core-owned
 checkpoint for payload conversion. Combined model/tokenizer loading uses the
 same core plan; tokenizer and chat sidecars remain facade concerns.
 
-`MlxBackend` maps session creation to `MlxModelSession`, which owns its
-`ModelCache` and, for pure tensor-parallel execution, its
-`MlxDistributedSession`. `MlxModelSession` is the sole architecture-erased
-prefill/decode implementation. It dispatches matching `Model` and `ModelCache`
-variants to their replicated or tensor-parallel MLX implementation, then wraps the output with
-`async_eval_with_event`. `MlxCompletion` owns that exact `Event`, retains the
-output array, and synchronizes on early drop so resources cannot be released
-before exact completion. Native exceptions are converted at the facade
-boundary and never appear in core trait signatures.
+`MlxBackend` maps session creation to `MlxModelSession`. The opaque `MlxModel`
+contains exactly one private MLX executable form: complete, pipeline stage, or
+expert partition. `MlxModelSession` allocates and owns the matching
+`ModelCache`, `PipelineCache`, or `ExpertParallelCache` plus the optional
+`MlxDistributedSession`. It is the sole architecture-erased prefill/decode
+implementation for replicated, TP, PP, EP, and Cartesian combinations.
+Complete and expert submissions are wrapped by `async_eval_with_event`;
+pipeline submissions preserve the stage completion that retains transfers and
+stage outputs. Both implement the same core exact-completion contract and
+synchronize on early drop where required. Native exceptions are converted at
+the facade boundary and never appear in core trait signatures.
 
 `MlxModelInput` owns cloned MLX array handles for every typed input part and its
 metadata. Backend submission therefore owns text, image, audio, video, and
@@ -160,11 +163,15 @@ promotion, cache-commit, callback ordering, or telemetry state machine.
 
 The public `api::load_model_with_options` route performs format, architecture,
 catalog, and policy planning in core before calling `Backend::prepare_model`.
-`ModelLoadOptions::with_parallel` selects pure tensor-parallel materialization
-through this same entry point. Architecture-specific tensor-parallel loaders
-are internal materializers, not public alternatives. The selected topology is
-then bound to cache state and communicators by
-`MlxBackend::create_distributed_model_session`.
+It returns the resulting `PreparedModel<MlxModel>` rather than discarding the
+core preparation marker; `Backend::create_session` requires that marker.
+`ModelLoadOptions::with_parallel` selects TP, PP, EP, or a supported Cartesian
+materialization through this same entry point. Architecture-specific
+distributed loaders and rank-local model types are private materializers, not
+public alternatives. `MlxBackend::with_distributed_world` supplies the world;
+`Backend::create_session` derives the topology-scoped communication and binds
+it to the selected model and cache state. There is no standalone public
+communication-session constructor.
 `MlxGeneration` is one
 architecture-erased iterator over `Model` and `ModelCache`; every supported
 text and multimodal model submits prompt prefill and every cached decode through
@@ -239,11 +246,12 @@ The current boundary leaves these components MLX-coupled:
 - MLX device assignment, concrete communicator construction, collective tensor
   math, and movement inside `MlxDistributedSession`; the portable session
   capability, topology/rank descriptor, scopes, operation availability, and
-  exact-completion contract are core-owned. Complete-model tensor-parallel
-  loading, prefill, decode, cache ownership, and sampling synchronization now
-  cross the architecture-erased model session. Pipeline/expert executors still
-  operate on partial rank-local models and use an explicit MLX communication
-  session until those model forms are unified;
+  exact-completion contract are core-owned. Replicated, tensor-, pipeline-, and
+  expert-parallel loading, prefill, decode, cache ownership, and sampling
+  synchronization all cross the architecture-erased model session. The
+  private pipeline scheduler and architecture executors still manipulate MLX
+  stage values internally, but they are backend implementation details rather
+  than alternate public model/session lifecycles;
 - per-block MLX cache resources, native completion observation, physical
   transfer/disk worker execution, prompt-cache filesystem publication, safetensors payload
   mapping and materialization (container/header validation, the transition

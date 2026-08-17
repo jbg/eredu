@@ -698,7 +698,7 @@ fn gemma4_multimodal_pipeline_ring_worker() {
     )
     .unwrap();
     let execution = MlxBackend::new(&stream)
-        .create_communication_session(topology, &group)
+        .communication_for_topology(topology, &group)
         .unwrap();
     assert_eq!(
         model.stage_info().global_layer_range,
@@ -945,7 +945,7 @@ fn run_ring_axes(tp: bool, dense: bool, host: bool, gguf: bool, axes: Option<&st
         command
             .args([
                 "--exact",
-                "gemma4_multimodal_pipeline_ring_worker",
+                "distributed_gemma4_multimodal_pipeline_ring::gemma4_multimodal_pipeline_ring_worker",
                 "--nocapture",
             ])
             .env(WORKER, rank.to_string())

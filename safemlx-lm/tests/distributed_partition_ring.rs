@@ -162,7 +162,11 @@ fn ring_two_process_partition_load() {
     for rank in 0..2 {
         children.children.push(
             Command::new(&executable)
-                .args(["--exact", "partition_ring_worker", "--nocapture"])
+                .args([
+                    "--exact",
+                    "distributed_partition_ring::partition_ring_worker",
+                    "--nocapture",
+                ])
                 .env(WORKER_RANK, rank.to_string())
                 .env(CHECKPOINT_DIR, checkpoint.path())
                 .env("MLX_RANK", rank.to_string())

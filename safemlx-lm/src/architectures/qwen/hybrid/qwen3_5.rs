@@ -8960,7 +8960,11 @@ mod tests {
         )
         .unwrap();
 
-        let model = crate::api::load_model(&dir, stream, weights_ctx.stream()).unwrap();
+        let model = crate::api::load_model(&dir, stream, weights_ctx.stream())
+            .unwrap()
+            .into_inner()
+            .into_complete()
+            .unwrap();
         let AnyModel::Qwen35(mut model) = model else {
             panic!("qwen3_5 must dispatch to the Qwen3.5 loader");
         };
@@ -9009,6 +9013,9 @@ mod tests {
             stream,
             weights_ctx.stream(),
         )
+        .unwrap()
+        .into_inner()
+        .into_complete()
         .unwrap();
         let AnyModel::Qwen35(mut quantized) = quantized else {
             panic!("qwen3_5 must dispatch to the Qwen3.5 affine loader");

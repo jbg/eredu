@@ -5,7 +5,7 @@ use safemlx::{
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    core::BackendSession,
+    core::{Backend as _, BackendSession},
     load_model_with_options,
     runtime::{generation::sampler::DefaultSampler, media::input},
     DeviceAssignment, MlxBackend, ModelLoadOptions, ParallelTopology,
@@ -35,13 +35,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &stream,
         &weights_stream,
     )?;
-    let backend = MlxBackend::new(&stream);
-    let mut session = backend.create_distributed_model_session(&model, topology, &group)?;
+    let backend = MlxBackend::with_distributed_world(&stream, &group);
+    let mut session = backend.create_session(&model)?;
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let parts = [input::InputPart::text_token_ids(&prompt)];
     let mut logits = session
         .prefill(&backend, &mut model, input::ModelInput::new(&parts).into())?
-        .wait()?;
+        .wait()?
+        .into_logits()
+        .ok_or("tensor-parallel session returned no logits")?;
     let mut sampler = DefaultSampler;
     for _ in 0..8 {
         let synchronized = session.sample_and_synchronize(
@@ -63,7 +65,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         logits = session
             .decode(&backend, &mut model, synchronized.token)?
-            .wait()?;
+            .wait()?
+            .into_logits()
+            .ok_or("tensor-parallel session returned no logits")?;
     }
     Ok(())
 }

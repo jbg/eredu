@@ -534,7 +534,11 @@ fn ring_two_process_all_to_all_v_and_dispatch_sharded() {
     for rank in 0..2 {
         children.0.push(
             Command::new(&executable)
-                .args(["--exact", "expert_exchange_ring_worker", "--nocapture"])
+                .args([
+                    "--exact",
+                    "distributed_expert_exchange_ring::expert_exchange_ring_worker",
+                    "--nocapture",
+                ])
                 .env(WORKER_RANK, rank.to_string())
                 .env("MLX_RANK", rank.to_string())
                 .env("MLX_HOSTFILE", &hostfile)

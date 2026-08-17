@@ -27,7 +27,7 @@ use safemlx_lm_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparati
 use crate::{api::gguf_sidecar_dir, runtime::media::ModelProcessor};
 use crate::{
     api::{Model, ModelLoadOptions},
-    backend::mlx::structural,
+    backend::mlx::{structural, MlxModel},
     error::Error,
     runtime::checkpoint::quantization::WeightQuantization,
 };
@@ -514,13 +514,34 @@ pub(super) fn materialize_model_plan(
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Model, Error> {
+) -> Result<MlxModel, Error> {
     validate_plan_options(&plan, options)?;
     let (artifact, _policy, _route) = plan.into_parts();
-    if options
+    if let Some(topology) = options
         .parallel
-        .is_some_and(|topology| !topology.is_replicated())
+        .filter(|topology| !topology.is_replicated())
     {
+        let path = match &artifact {
+            ModelArtifact::Gguf { path, .. } | ModelArtifact::SafeTensors { path, .. } => path,
+        };
+        if topology.pipeline_parallel_size > 1 {
+            return crate::architectures::distributed::pipeline::load_pipeline_model_with_options(
+                path,
+                options,
+                stream,
+                weights_stream,
+            )
+            .map(MlxModel::pipeline);
+        }
+        if topology.expert_parallel_size > 1 {
+            return crate::architectures::distributed::expert::load_expert_parallel_model_with_options(
+                path,
+                options,
+                stream,
+                weights_stream,
+            )
+            .map(MlxModel::expert);
+        }
         if let ModelArtifact::SafeTensors {
             path,
             configuration,
@@ -533,18 +554,21 @@ pub(super) fn materialize_model_plan(
                 options,
                 stream,
                 weights_stream,
-            );
+            )
+            .map(MlxModel::complete);
         }
     }
     match artifact {
         artifact @ ModelArtifact::Gguf { .. } => {
-            Ok(materialize_gguf_artifact(artifact, options, stream, weights_stream)?.model)
+            materialize_gguf_artifact(artifact, options, stream, weights_stream)
+                .map(|materialized| MlxModel::complete(materialized.model))
         }
         ModelArtifact::SafeTensors {
             path,
             configuration,
             ..
-        } => materialize_safetensors(configuration.kind, &path, options, stream, weights_stream),
+        } => materialize_safetensors(configuration.kind, &path, options, stream, weights_stream)
+            .map(MlxModel::complete),
     }
 }
 

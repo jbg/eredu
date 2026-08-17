@@ -37,6 +37,32 @@ pub use safemlx_lm_core::{
 };
 #[cfg(test)]
 mod test_utils;
+#[cfg(test)]
+extern crate self as safemlx_lm;
+#[cfg(test)]
+#[path = "../tests/distributed_cartesian_ring.rs"]
+mod distributed_cartesian_ring;
+#[cfg(test)]
+#[path = "../tests/distributed_expert_exchange_ring.rs"]
+mod distributed_expert_exchange_ring;
+#[cfg(test)]
+#[path = "../tests/distributed_expert_parallel_ring.rs"]
+mod distributed_expert_parallel_ring;
+#[cfg(test)]
+#[path = "../tests/distributed_gemma4_multimodal_pipeline_ring.rs"]
+mod distributed_gemma4_multimodal_pipeline_ring;
+#[cfg(test)]
+#[path = "../tests/distributed_partition_ring.rs"]
+mod distributed_partition_ring;
+#[cfg(test)]
+#[path = "../tests/distributed_pipeline_ring.rs"]
+mod distributed_pipeline_ring;
+#[cfg(test)]
+#[path = "../tests/distributed_qwen3_vl_pipeline_ring.rs"]
+mod distributed_qwen3_vl_pipeline_ring;
+#[cfg(test)]
+#[path = "../tests/distributed_tensor_parallel_ring.rs"]
+mod distributed_tensor_parallel_ring;
 
 pub use api::realtime::{
     load_model as load_realtime_model, load_model_with_options as load_realtime_model_with_options,
@@ -58,7 +84,10 @@ pub use api::{
     TimingTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
-pub use backend::mlx::{MlxBackend, MlxDistributedSession, MlxModelInput, MlxModelSession};
+pub use backend::mlx::{
+    MlxBackend, MlxDistributedSession, MlxModel, MlxModelInput, MlxModelOutput, MlxModelSession,
+    MlxSessionCompletion,
+};
 pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyError,

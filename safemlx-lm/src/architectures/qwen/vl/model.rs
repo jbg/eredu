@@ -2167,20 +2167,22 @@ mod tests {
             )
             .unwrap()
         };
-        let mut first = crate::architectures::distributed::pipeline::load_pipeline_model(
-            &model_path,
-            topology(0),
-            stream,
-            stream,
-        )
-        .unwrap();
-        let mut second = crate::architectures::distributed::pipeline::load_pipeline_model(
-            &model_path,
-            topology(1),
-            stream,
-            stream,
-        )
-        .unwrap();
+        let mut first =
+            crate::architectures::distributed::pipeline::load_pipeline_model_with_options(
+                &model_path,
+                crate::ModelLoadOptions::with_parallel(topology(0)),
+                stream,
+                stream,
+            )
+            .unwrap();
+        let mut second =
+            crate::architectures::distributed::pipeline::load_pipeline_model_with_options(
+                &model_path,
+                crate::ModelLoadOptions::with_parallel(topology(1)),
+                stream,
+                stream,
+            )
+            .unwrap();
         let mut first_cache = first.new_cache().unwrap();
         let mut second_cache = second.new_cache().unwrap();
         let before = Array::from_slice(&[1u32], &[1, 1]);

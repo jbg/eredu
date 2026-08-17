@@ -31,7 +31,8 @@ use safemlx_lm::{
         nemotron_h::model as nemotron_model,
         qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen_hybrid},
     },
-    core::residency::OffloadConfig,
+    core::{residency::OffloadConfig, Backend as _, BackendSession as _},
+    load_model_with_options,
     runtime::generation::sampler::DefaultSampler,
     runtime::generation::speculative::{MtpCapability, MtpCheckpointKind},
     runtime::{
@@ -58,6 +59,7 @@ const SCHEDULE_MISMATCH: &str = "SAFEMLX_LM_PIPELINE_SCHEDULE_MISMATCH";
 const CARTESIAN_AXES: &str = "SAFEMLX_LM_PIPELINE_CARTESIAN_AXES";
 const EXPERT_CACHE: &str = "SAFEMLX_LM_PIPELINE_EXPERT_CACHE";
 const REQUANTIZE: &str = "SAFEMLX_LM_PIPELINE_REQUANTIZE";
+const OPAQUE_SESSION: &str = "SAFEMLX_LM_PIPELINE_OPAQUE_SESSION";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FixtureFamily {
@@ -329,8 +331,44 @@ fn pipeline_ring_worker() {
     assert_eq!(topology.global_rank, expected_rank);
     let pipeline_rank = topology.pipeline_parallel_rank;
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    if std::env::var_os(OPAQUE_SESSION).is_some() {
+        let mut model = load_model_with_options(
+            &checkpoint,
+            ModelLoadOptions::with_parallel(topology),
+            &stream,
+            &stream,
+        )
+        .unwrap();
+        let backend = MlxBackend::with_distributed_world(&stream, &group);
+        let mut session = backend.create_session(&model).unwrap();
+        let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let mut output = session
+            .prefill(
+                &backend,
+                &mut model,
+                safemlx_lm::runtime::media::input::ModelInput::new(&parts).into(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(output.logits().is_some(), pipeline_rank == 1);
+            let token = session
+                .sample_and_synchronize(output.logits(), 1, &mut DefaultSampler, 0.0, None, false)
+                .unwrap()
+                .token;
+            output = session
+                .decode(&backend, &mut model, token)
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+        assert_eq!(output.logits().is_some(), pipeline_rank == 1);
+        return;
+    }
     let execution = MlxBackend::new(&stream)
-        .create_communication_session(topology, &group)
+        .communication_for_topology(topology, &group)
         .unwrap();
     let reference = (pipeline_rank == 1
         && (family.needs_resident_reference()
@@ -860,8 +898,11 @@ fn resident_reference_quantized(
     let options = quantization
         .map(ModelLoadOptions::with_quantization)
         .unwrap_or_default();
-    let mut model =
-        safemlx_lm::api::load_model_with_options(checkpoint, options, stream, stream).unwrap();
+    let mut model = safemlx_lm::api::load_model_with_options(checkpoint, options, stream, stream)
+        .unwrap()
+        .into_inner()
+        .into_complete()
+        .unwrap();
     let mut cache = model.new_cache();
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
@@ -938,7 +979,11 @@ fn multimodal_resident_reference(
     checkpoint: &Path,
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
-    let mut model = safemlx_lm::api::load_model(checkpoint, stream, stream).unwrap();
+    let mut model = safemlx_lm::api::load_model(checkpoint, stream, stream)
+        .unwrap()
+        .into_inner()
+        .into_complete()
+        .unwrap();
     let mut cache = model.new_cache();
     let prepared = multimodal_prepared_input(family);
     let parts = prepared.input_parts();
@@ -3660,6 +3705,14 @@ fn ring_two_process_pipeline() {
     run_ring_pipeline(false, FixtureFamily::Llama);
 }
 
+/// Proves the public generic loader and architecture-erased model session own
+/// pipeline loading, prefill, repeated decode, cache state, and communication.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_opaque_model_session() {
+    run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueSession);
+}
+
 /// Verifies fair multi-request scheduling, independent request caches, exact
 /// schedule consensus, variable prompt shapes, decode parity, EOS, and cancel.
 #[test]
@@ -4928,6 +4981,7 @@ enum WorkerMode {
     Microbatch,
     ScheduleMismatch,
     Requantize,
+    OpaqueSession,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -5062,7 +5116,11 @@ fn run_ring_pipeline_processes(
     for rank in 0..world_size {
         let mut command = Command::new(&executable);
         command
-            .args(["--exact", "pipeline_ring_worker", "--nocapture"])
+            .args([
+                "--exact",
+                "distributed_pipeline_ring::pipeline_ring_worker",
+                "--nocapture",
+            ])
             .env(WORKER_RANK, rank.to_string())
             .env(CHECKPOINT_DIR, &checkpoint_path)
             .env(FIXTURE_FAMILY, family.name())
@@ -5105,6 +5163,9 @@ fn run_ring_pipeline_processes(
             }
             WorkerMode::Requantize => {
                 command.env(REQUANTIZE, "1");
+            }
+            WorkerMode::OpaqueSession => {
+                command.env(OPAQUE_SESSION, "1");
             }
         }
         children.children.push(command.spawn().unwrap());

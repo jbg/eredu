@@ -257,7 +257,7 @@ pub(crate) fn gguf_eos_token_ids(
 }
 
 mod config;
-pub(crate) use config::ensure_executable_load_options;
+pub(crate) use config::ensure_replicated_load_options;
 #[cfg(test)]
 pub(crate) use config::{resolve_model_config, ResolvedModelConfig};
 pub use config::{ModelKind, ModelLoadOptions};
@@ -319,7 +319,7 @@ pub fn load_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Model, Error> {
+) -> Result<safemlx_lm_core::PreparedModel<crate::backend::mlx::MlxModel>, Error> {
     load_model_with_options(
         model_dir,
         ModelLoadOptions::default(),
@@ -334,17 +334,17 @@ pub fn load_model_with_options(
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Model, Error> {
+) -> Result<safemlx_lm_core::PreparedModel<crate::backend::mlx::MlxModel>, Error> {
     use safemlx_lm_core::Backend;
     let inspection = safemlx_lm_core::inspect_artifact(model_dir.as_ref())?;
     let plan = safemlx_lm_core::plan_model_preparation(inspection, options.preparation_policy()?)?;
-    crate::backend::mlx::MlxBackend::new(stream)
-        .prepare_model(crate::backend::mlx::MlxModelConfig {
+    crate::backend::mlx::MlxBackend::new(stream).prepare_model(
+        crate::backend::mlx::MlxModelConfig {
             plan,
             options,
             weights_stream,
-        })
-        .map(safemlx_lm_core::PreparedModel::into_inner)
+        },
+    )
 }
 
 mod tokenizer;

@@ -222,6 +222,20 @@ impl<M> PreparedModel<M> {
     }
 }
 
+impl<M> std::ops::Deref for PreparedModel<M> {
+    type Target = M;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+impl<M> std::ops::DerefMut for PreparedModel<M> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.get_mut()
+    }
+}
+
 /// One backend selected for an entire prepared model and all its sessions.
 pub trait Backend: Sized {
     /// Portable model preparation request.

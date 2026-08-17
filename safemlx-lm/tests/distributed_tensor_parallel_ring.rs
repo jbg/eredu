@@ -303,7 +303,7 @@ impl FixtureFamily {
     }
 }
 
-struct GeneralizedTensorModel(safemlx_lm::api::Model);
+struct GeneralizedTensorModel(safemlx_lm::core::PreparedModel<safemlx_lm::MlxModel>);
 
 impl GeneralizedTensorModel {
     fn load(
@@ -323,22 +323,24 @@ impl GeneralizedTensorModel {
     }
 
     fn parallel_info(&self) -> &ParallelModelInfo {
-        self.0.parallel_info().unwrap()
+        self.complete().parallel_info().unwrap()
     }
 
     fn prompt_cache_architecture_fingerprint(&self) -> String {
-        self.0.prompt_cache_architecture_fingerprint().unwrap()
+        self.complete()
+            .prompt_cache_architecture_fingerprint()
+            .unwrap()
     }
 
     fn prompt_cache_layer_layout(&self) -> safemlx_lm::LayerSchedule<LayerCachePolicy> {
-        self.0.prompt_cache_layer_layout().unwrap()
+        self.complete().prompt_cache_layer_layout().unwrap()
     }
 
     fn new_paged_cache(&self, options: PagedCacheOptions) -> safemlx_lm::api::ModelCache {
-        if let safemlx_lm::api::Model::DenseQwen(model) = &self.0 {
+        if let safemlx_lm::api::Model::DenseQwen(model) = self.complete() {
             return safemlx_lm::api::ModelCache::KeyValue(model.new_cache());
         }
-        self.0
+        self.complete()
             .new_cache_with_options(CacheResidencyPolicy::Paged(options))
             .unwrap()
     }
@@ -346,7 +348,7 @@ impl GeneralizedTensorModel {
     fn checkpoint_diagnostics(
         &self,
     ) -> safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
-        match &self.0 {
+        match self.complete() {
             safemlx_lm::api::Model::Llama(model) => model.checkpoint_store().diagnostics().unwrap(),
             safemlx_lm::api::Model::DeepSeekV3(model) => {
                 model.checkpoint_store().diagnostics().unwrap()
@@ -378,7 +380,7 @@ impl GeneralizedTensorModel {
         descriptor: PromptCacheDescriptor,
         stream: &Stream,
     ) -> PromptCacheManifest {
-        self.0
+        self.complete()
             .save_prompt_cache(
                 cache,
                 root,
@@ -397,9 +399,16 @@ impl GeneralizedTensorModel {
         options: PagedCacheOptions,
         stream: &Stream,
     ) -> (safemlx_lm::api::ModelCache, PromptCacheManifest) {
-        self.0
+        self.complete()
             .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
             .unwrap()
+    }
+
+    fn complete(&self) -> &safemlx_lm::api::Model {
+        match &self.0.inner {
+            safemlx_lm::backend::mlx::MlxModelKind::Complete(model) => model,
+            _ => panic!("tensor-parallel fixture did not load a complete model"),
+        }
     }
 }
 
@@ -857,10 +866,9 @@ fn tensor_ring_worker() {
         .unwrap()
         .with_full_attention(true);
     let cache = model.new_paged_cache(paged.clone());
-    let backend = MlxBackend::new(&stream);
-    let mut session = backend
-        .create_distributed_model_session_with_cache(cache, topology, &group)
-        .unwrap();
+    let backend = MlxBackend::with_distributed_world(&stream, &group);
+    let mut session = safemlx_lm::core::Backend::create_session(&backend, &model.0).unwrap();
+    let _ = session.replace_complete_cache(cache).unwrap();
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
     let logits = session
@@ -871,6 +879,8 @@ fn tensor_ring_worker() {
         )
         .unwrap()
         .wait()
+        .unwrap()
+        .into_logits()
         .unwrap();
     assert_eq!(logits.shape(), &[1, vocab_size as i32]);
 
@@ -936,12 +946,10 @@ fn tensor_ring_worker() {
         } else {
             (2, 1, 1)
         };
-        session.cache().assert_nemotron_local_cache_geometry(
-            local_heads,
-            local_groups,
-            local_kv,
-            2,
-        );
+        session
+            .complete_cache()
+            .unwrap()
+            .assert_nemotron_local_cache_geometry(local_heads, local_groups, local_kv, 2);
         if family == FixtureFamily::NemotronGguf {
             let diagnostics = model.checkpoint_diagnostics();
             assert!(diagnostics.physical_reads > 0);
@@ -971,12 +979,17 @@ fn tensor_ring_worker() {
             .try_index_device((.., -1, ..), &stream)
             .unwrap();
         assert_arrays_close(&logits, &reference_logits, 5e-5);
-        session.cache().assert_qwen3_moe_local_cache_geometry(2);
+        session
+            .complete_cache()
+            .unwrap()
+            .assert_qwen3_moe_local_cache_geometry(2);
         let token = Array::from_slice(&[3u32], &[1, 1]);
         let distributed_decode = session
             .decode(&backend, &mut model.0, token.clone())
             .unwrap()
             .wait()
+            .unwrap()
+            .into_logits()
             .unwrap();
         let reference_decode = reference
             .forward(
@@ -992,7 +1005,10 @@ fn tensor_ring_worker() {
             .try_index_device((.., -1, ..), &stream)
             .unwrap();
         assert_arrays_close(&distributed_decode, &reference_decode, 5e-5);
-        session.cache().assert_qwen3_moe_local_cache_geometry(3);
+        session
+            .complete_cache()
+            .unwrap()
+            .assert_qwen3_moe_local_cache_geometry(3);
         return;
     }
 
@@ -1017,7 +1033,8 @@ fn tensor_ring_worker() {
             .unwrap();
         assert_arrays_close(&logits, &reference_logits, 2e-4);
         session
-            .cache()
+            .complete_cache()
+            .unwrap()
             .assert_gpt_oss_local_cache_geometry(if expected_rank == 0 { 2 } else { 1 }, 2);
     }
 
@@ -1046,12 +1063,15 @@ fn tensor_ring_worker() {
             5e-5
         };
         assert_arrays_close(&logits, &reference_logits, tolerance);
-        session.cache().assert_lfm2_local_cache_geometry(
-            family.lfm2_local_kv_heads(expected_rank),
-            family.lfm2_local_convolution_channels(),
-            family.lfm2_head_dim(),
-            2,
-        );
+        session
+            .complete_cache()
+            .unwrap()
+            .assert_lfm2_local_cache_geometry(
+                family.lfm2_local_kv_heads(expected_rank),
+                family.lfm2_local_convolution_channels(),
+                family.lfm2_head_dim(),
+                2,
+            );
         if matches!(family, FixtureFamily::Lfm2Gguf | FixtureFamily::Lfm2Q8Gguf) {
             let diagnostics = model.checkpoint_diagnostics();
             assert!(diagnostics.physical_reads > 0);
@@ -1090,7 +1110,8 @@ fn tensor_ring_worker() {
             .unwrap();
         assert_arrays_close(&logits, &reference_logits, 8e-5);
         session
-            .cache()
+            .complete_cache()
+            .unwrap()
             .assert_kimi_local_cache_geometry(if expected_rank == 0 { 2 } else { 1 }, 2);
         if family == FixtureFamily::KimiLinearGguf {
             let diagnostics = model.checkpoint_diagnostics();
@@ -1165,11 +1186,10 @@ fn tensor_ring_worker() {
         } else {
             1
         };
-        session.cache().assert_qwen2_local_cache_geometry(
-            local_kv_heads,
-            2,
-            family.qwen2_head_dim(),
-        );
+        session
+            .complete_cache()
+            .unwrap()
+            .assert_qwen2_local_cache_geometry(local_kv_heads, 2, family.qwen2_head_dim());
 
         let diagnostics = model.checkpoint_diagnostics();
         assert!(diagnostics.physical_reads > 0);
@@ -1200,6 +1220,8 @@ fn tensor_ring_worker() {
             .decode(&backend, &mut model.0, token.clone())
             .unwrap()
             .wait()
+            .unwrap()
+            .into_logits()
             .unwrap();
         let reference_decode = reference
             .forward(
@@ -1215,12 +1237,11 @@ fn tensor_ring_worker() {
             .try_index_device((.., -1, ..), &stream)
             .unwrap();
         assert_arrays_close(&distributed_decode, &reference_decode, tolerance);
-        session.cache().assert_qwen2_local_cache_geometry(
-            local_kv_heads,
-            3,
-            family.qwen2_head_dim(),
-        );
-        assert_eq!(session.cache().offset(), 3);
+        session
+            .complete_cache()
+            .unwrap()
+            .assert_qwen2_local_cache_geometry(local_kv_heads, 3, family.qwen2_head_dim());
+        assert_eq!(session.complete_cache().unwrap().offset(), 3);
         return;
     }
 
@@ -1246,7 +1267,7 @@ fn tensor_ring_worker() {
         },
     };
     let saved = model.save_prompt_cache(
-        session.cache_mut(),
+        session.complete_cache_mut().unwrap(),
         &prompt_cache_root,
         descriptor.clone(),
         &stream,
@@ -1257,18 +1278,22 @@ fn tensor_ring_worker() {
         .decode(&backend, &mut model.0, token.clone())
         .unwrap()
         .wait()
+        .unwrap()
+        .into_logits()
         .unwrap();
     let uninterrupted = uninterrupted.evaluated().unwrap();
     let uninterrupted_values = uninterrupted.as_slice::<f32>().to_vec();
     drop(uninterrupted);
     let (cache, manifest) =
         model.load_prompt_cache(&prompt_cache_root, &descriptor, paged, &stream);
-    let _ = session.replace_cache(cache);
+    let _ = session.replace_complete_cache(cache).unwrap();
     assert_eq!(manifest.topology, descriptor.topology);
     let restored = session
         .decode(&backend, &mut model.0, token)
         .unwrap()
         .wait()
+        .unwrap()
+        .into_logits()
         .unwrap();
     let restored = restored.evaluated().unwrap();
     assert_eq!(uninterrupted_values, restored.as_slice::<f32>());
@@ -1286,9 +1311,11 @@ fn tensor_ring_worker() {
         .decode(&backend, &mut model.0, synchronized.token)
         .unwrap()
         .wait()
+        .unwrap()
+        .into_logits()
         .unwrap();
     assert_eq!(logits.shape(), &[1, vocab_size as i32]);
-    assert_eq!(session.cache().offset(), 4);
+    assert_eq!(session.complete_cache().unwrap().offset(), 4);
 }
 
 fn write_f32_shard(path: &Path, tensors: &[(&str, Vec<usize>, f32)]) {
@@ -3546,7 +3573,11 @@ fn run_ring_tensor_parallel(family: FixtureFamily, parameter_residency: TensorPa
         drop(reservation.take());
         children.0.push(
             Command::new(&executable)
-                .args(["--exact", "tensor_ring_worker", "--nocapture"])
+                .args([
+                    "--exact",
+                    "distributed_tensor_parallel_ring::tensor_ring_worker",
+                    "--nocapture",
+                ])
                 .env(WORKER_RANK, rank.to_string())
                 .env(CHECKPOINT_DIR, &checkpoint_path)
                 .env(FIXTURE_FAMILY, family.name())
