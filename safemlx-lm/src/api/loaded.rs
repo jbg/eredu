@@ -2051,9 +2051,4 @@ impl LoadedModel {
         self.model
             .generate_input_with_cache_sampler(cache, temp, input, prng_key, stream, sampler)
     }
-
-    /// Returns a mutable reference to the underlying architecture-specific model.
-    pub fn model_mut(&mut self) -> &mut Model {
-        &mut self.model
-    }
 }

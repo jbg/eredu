@@ -230,9 +230,9 @@ impl<'a> Backend for MlxBackend<'a> {
 
     fn create_session(
         &self,
-        model: &PreparedModel<Self::Model>,
+        model: PreparedModel<Self::Model>,
     ) -> Result<Self::Session, Self::Error> {
-        let distributed = match model.get().topology() {
+        let distributed = match model.topology() {
             Some(topology) => {
                 let world = self.world.ok_or_else(|| {
                     Error::Parallel(
@@ -247,7 +247,7 @@ impl<'a> Backend for MlxBackend<'a> {
             }
             None => None,
         };
-        MlxModelSession::from_model(model.get(), distributed)
+        MlxModelSession::from_model(model.into_inner(), distributed)
     }
 }
 

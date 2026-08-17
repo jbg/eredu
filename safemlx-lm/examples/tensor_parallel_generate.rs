@@ -29,18 +29,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let mut model = load_model_with_options(
+    let model = load_model_with_options(
         &model_dir,
         ModelLoadOptions::with_parallel(topology),
         &stream,
         &weights_stream,
     )?;
     let backend = MlxBackend::with_distributed_world(&stream, &group);
-    let mut session = backend.create_session(&model)?;
+    let mut session = backend.create_session(model)?;
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let parts = [input::InputPart::text_token_ids(&prompt)];
     let mut logits = session
-        .prefill(&backend, &mut model, input::ModelInput::new(&parts).into())?
+        .prefill(&backend, input::ModelInput::new(&parts).into())?
         .wait()?
         .into_logits()
         .ok_or("tensor-parallel session returned no logits")?;
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         logits = session
-            .decode(&backend, &mut model, synchronized.token)?
+            .decode(&backend, synchronized.token)?
             .wait()?
             .into_logits()
             .ok_or("tensor-parallel session returned no logits")?;

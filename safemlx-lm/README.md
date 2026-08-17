@@ -71,9 +71,11 @@ Replicated, tensor-, pipeline-, and expert-parallel prefill/decode execution
 crosses the single stateful `MlxModelSession` implementation of the core
 session contract. `load_model_with_options` always returns a
 `PreparedModel<MlxModel>`; the preparation marker is required when creating a
-session, while its opaque MLX model selects complete-model, rank-local
-pipeline, or rank-local expert materialization inside the adapter. The session
-owns the matching cache state and its optional distributed capability. Direct
+session and is consumed by that operation, while its opaque MLX model selects
+complete-model, rank-local pipeline, or rank-local expert materialization
+inside the adapter. The session
+owns that model, the matching cache state, and its optional distributed
+capability. Direct
 submissions return their exact completion; callers either retain it or use
 `Submission::wait`. Raw generation retains in-flight completions internally.
 Realtime Moshi/PersonaPlex requests use the backend-neutral core scheduler;
@@ -82,7 +84,7 @@ Distributed pipeline schedule, cancellation, and completion agreement use the
 same core scheduler through the MLX collective and completion adapters; the
 facade does not maintain a second lifecycle implementation.
 `MlxBackend::with_distributed_world` selects the world before
-`Backend::create_session` binds the opaque model, topology-derived TP/PP/EP
+`Backend::create_session` consumes and binds the opaque model, topology-derived TP/PP/EP
 communicators, and the correct cache form into one lifecycle. There are no
 public architecture-specific distributed loaders, rank-local model types, or
 standalone communication-session constructors. `LoadedModel`, which combines
@@ -91,7 +93,8 @@ distributed applications use the same generic model loader and
 `MlxModelSession` directly.
 Cache policy selection, prompt-cache save/load, and embedded MTP generation
 likewise stay on that session; there is no parallel stage-cache or distributed
-request-scheduler API beside it.
+request-scheduler API beside it, and no complete-model cache extraction or
+replacement API.
 Weight-residency plans, atomic admission, ownership leases, protected windows,
 eviction decisions, exact transfer generations, and accounting likewise come
 directly from `safemlx-lm-core`. The MLX facade mirrors those transitions with

@@ -256,17 +256,22 @@ pub trait Backend: Sized {
         &self,
         config: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error>;
-    /// Creates backend-owned session/cache state for a prepared model.
+    /// Consumes a prepared model into one backend-owned execution session.
+    ///
+    /// The executable and its mutable cache state have one owner after this
+    /// call. This prevents callers from pairing session state with a different
+    /// model or submitting the same mutable executable through two sessions.
     fn create_session(
         &self,
-        model: &PreparedModel<Self::Model>,
+        model: PreparedModel<Self::Model>,
     ) -> Result<Self::Session, Self::Error>;
 }
 
 /// Prefill/decode interface for an already selected backend session.
 ///
-/// The contract intentionally models language-model submissions rather than
-/// primitive tensor operations. Input, output, cache and completion stay opaque.
+/// The session owns its prepared executable and cache. The contract
+/// intentionally models language-model submissions rather than primitive
+/// tensor operations. Input, output, cache and completion stay opaque.
 pub trait BackendSession<B: Backend> {
     /// Backend-owned prefill input.
     type PrefillInput;
@@ -281,7 +286,6 @@ pub trait BackendSession<B: Backend> {
     fn prefill(
         &mut self,
         backend: &B,
-        model: &mut B::Model,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
 
@@ -289,7 +293,6 @@ pub trait BackendSession<B: Backend> {
     fn decode(
         &mut self,
         backend: &B,
-        model: &mut B::Model,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
 }
@@ -399,14 +402,16 @@ mod tests {
         fn prepare_model(&self, config: u32) -> Result<PreparedModel<u32>, Self::Error> {
             Ok(PreparedModel::new(config))
         }
-        fn create_session(&self, _: &PreparedModel<u32>) -> Result<MockSession, Self::Error> {
+        fn create_session(&self, model: PreparedModel<u32>) -> Result<MockSession, Self::Error> {
             Ok(MockSession {
+                model: model.into_inner(),
                 tokens: vec![],
                 distributed: None,
             })
         }
     }
     struct MockSession {
+        model: u32,
         tokens: Vec<u32>,
         distributed: Option<MockDistributed>,
     }
@@ -418,24 +423,18 @@ mod tests {
         fn prefill(
             &mut self,
             _: &Mock,
-            model: &mut u32,
             input: Vec<u32>,
         ) -> Result<Submission<u32, Done>, Infallible> {
             self.tokens.extend(input);
             Ok(Submission {
-                output: self.tokens.len() as u32 + *model,
+                output: self.tokens.len() as u32 + self.model,
                 completion: Done,
             })
         }
-        fn decode(
-            &mut self,
-            _: &Mock,
-            model: &mut u32,
-            input: u32,
-        ) -> Result<Submission<u32, Done>, Infallible> {
+        fn decode(&mut self, _: &Mock, input: u32) -> Result<Submission<u32, Done>, Infallible> {
             self.tokens.push(input);
             Ok(Submission {
-                output: self.tokens.len() as u32 + *model,
+                output: self.tokens.len() as u32 + self.model,
                 completion: Done,
             })
         }
@@ -445,13 +444,12 @@ mod tests {
     fn mock_prefill_and_multiple_decode_steps() {
         let backend = Mock;
         let prepared = backend.prepare_model(10).unwrap();
-        let mut session = backend.create_session(&prepared).unwrap();
-        let mut model = prepared.into_inner();
-        let prefill = session.prefill(&backend, &mut model, vec![1, 2]).unwrap();
+        let mut session = backend.create_session(prepared).unwrap();
+        let prefill = session.prefill(&backend, vec![1, 2]).unwrap();
         assert_eq!(prefill.output, 12);
         assert!(prefill.completion.is_complete().unwrap());
-        assert_eq!(session.decode(&backend, &mut model, 3).unwrap().output, 13);
-        assert_eq!(session.decode(&backend, &mut model, 4).unwrap().output, 14);
+        assert_eq!(session.decode(&backend, 3).unwrap().output, 13);
+        assert_eq!(session.decode(&backend, 4).unwrap().output, 14);
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -591,6 +589,7 @@ mod tests {
         assert_eq!(session.all_gather_words(&[7]).unwrap(), vec![7, 7]);
 
         let model_session = MockSession {
+            model: 0,
             tokens: Vec::new(),
             distributed: Some(session),
         };

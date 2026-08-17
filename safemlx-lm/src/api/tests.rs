@@ -112,7 +112,7 @@ fn observer_forward_reports_attention_and_residual_hooks() {
     let mut recorder = ActivationRecorder::new();
 
     model
-        .model_mut()
+        .model
         .forward_with_observer(&input, None, &mut cache, ctx.stream(), &mut recorder)
         .unwrap();
 

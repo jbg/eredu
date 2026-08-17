@@ -216,18 +216,13 @@ fn expert_parallel_model_ring_worker() {
         };
     }
     if assignment_kind == "opaque-session" {
-        let mut model =
-            load_model_with_options(&checkpoint, options, stream, weights_stream).unwrap();
+        let model = load_model_with_options(&checkpoint, options, stream, weights_stream).unwrap();
         let backend = MlxBackend::with_distributed_world(stream, &group);
-        let mut session = backend.create_session(&model).unwrap();
+        let mut session = backend.create_session(model).unwrap();
         let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
         let parts = [runtime_input::InputPart::text_token_ids(&prompt)];
         let mut output = session
-            .prefill(
-                &backend,
-                &mut model,
-                runtime_input::ModelInput::new(&parts).into(),
-            )
+            .prefill(&backend, runtime_input::ModelInput::new(&parts).into())
             .unwrap()
             .wait()
             .unwrap();
@@ -244,11 +239,7 @@ fn expert_parallel_model_ring_worker() {
                 )
                 .unwrap()
                 .token;
-            output = session
-                .decode(&backend, &mut model, token)
-                .unwrap()
-                .wait()
-                .unwrap();
+            output = session.decode(&backend, token).unwrap().wait().unwrap();
         }
         assert!(output.logits().is_some());
         return;

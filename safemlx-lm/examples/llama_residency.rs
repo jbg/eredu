@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         };
         WeightResidency::layerwise_host(layerwise)
     };
-    let mut model = load_model_with_options(
+    let model = load_model_with_options(
         &args.model_dir,
         ModelLoadOptions::default().with_weight_residency(weight_residency),
         stream,
@@ -110,9 +110,9 @@ fn main() -> anyhow::Result<()> {
         model.model_type()
     );
     let backend = MlxBackend::new(stream);
-    let mut session = backend.create_session(&model)?;
+    let mut session = backend.create_session(model)?;
 
-    if let Some(report) = model.dense_stream_report()? {
+    if let Some(report) = session.dense_stream_report()? {
         let offload = report.residency().offload();
         println!("experimental dense disk streaming enabled");
         println!(
@@ -136,24 +136,16 @@ fn main() -> anyhow::Result<()> {
     let prompt_parts = [input::InputPart::text_token_ids(&prompt_array)];
     let prefill_started = Instant::now();
     let _ = session
-        .prefill(
-            &backend,
-            &mut model,
-            input::ModelInput::new(&prompt_parts).into(),
-        )?
+        .prefill(&backend, input::ModelInput::new(&prompt_parts).into())?
         .wait()?;
     stream.synchronize()?;
     let prefill = prefill_started.elapsed();
     let time_to_first_token = prefill;
 
-    session.reset(&model)?;
+    session.reset()?;
     let repeated_prefill_started = Instant::now();
     let mut logits = session
-        .prefill(
-            &backend,
-            &mut model,
-            input::ModelInput::new(&prompt_parts).into(),
-        )?
+        .prefill(&backend, input::ModelInput::new(&prompt_parts).into())?
         .wait()?
         .into_logits()
         .expect("replicated model session returns logits");
@@ -166,14 +158,14 @@ fn main() -> anyhow::Result<()> {
         stream.synchronize()?;
         let token = token.reshape(&[1, 1], stream)?;
         logits = session
-            .decode(&backend, &mut model, token)?
+            .decode(&backend, token)?
             .wait()?
             .into_logits()
             .expect("replicated model session returns logits");
         stream.synchronize()?;
     }
     let decode = decode_started.elapsed();
-    let report = model
+    let report = session
         .residency_report()?
         .expect("layerwise residency was selected");
     let offload = report.offload();
@@ -183,7 +175,7 @@ fn main() -> anyhow::Result<()> {
         .filter(|unit| unit.id().as_str().starts_with("llama.layer.") && unit.device_resident())
         .count();
 
-    println!("model type: {}", model.model_type());
+    println!("model type: {}", session.model_type());
     println!(
         "configured/observed device-layer window: {}/{}",
         args.device_layer_window, observed_window
@@ -226,7 +218,7 @@ fn main() -> anyhow::Result<()> {
     println!("time to first token: {time_to_first_token:?}");
     println!("Backend allocator memory: {:?}", offload.allocator_memory());
     println!("weight-store diagnostics: {:?}", report.weight_store());
-    if let Some(dense) = model.dense_stream_report()? {
+    if let Some(dense) = session.dense_stream_report()? {
         println!("background host-prefetch: {:?}", dense.background());
         println!(
             "streamed host layers current/peak: {}/{} ({} peak bytes)",

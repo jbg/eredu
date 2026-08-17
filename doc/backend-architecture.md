@@ -56,12 +56,13 @@ not accept `Any`, raw pointers, or operation names as an execution escape hatch.
 ## Model, session, and completion lifecycle
 
 `Backend::prepare_model` selects one backend and produces an opaque
-`PreparedModel`. Its backend model is then passed to `Backend::create_session`,
-which creates a backend-owned object implementing `BackendSession` directly.
-That object owns persistent decode/cache state and submits prefill and decode
-operations against the same model.
-There is one session contract: the facade does not provide an
-architecture-specific or borrowing execution escape hatch.
+`PreparedModel`. `Backend::create_session` consumes that value and creates a
+backend-owned object implementing `BackendSession` directly. That object owns
+the executable, persistent decode/cache state, and optional communication as
+one unit. Prefill and decode therefore cannot be submitted with a different
+model, nor can one mutable executable be driven through two sessions.
+There is one backend session contract: the backend-selected path does not
+provide an architecture-specific or borrowing execution escape hatch.
 
 Every submission returns an opaque output and an exact `Completion`. Completion
 can be polled or waited without draining unrelated work. A scheduler-owned
@@ -164,7 +165,8 @@ promotion, cache-commit, callback ordering, or telemetry state machine.
 The public `api::load_model_with_options` route performs format, architecture,
 catalog, and policy planning in core before calling `Backend::prepare_model`.
 It returns the resulting `PreparedModel<MlxModel>` rather than discarding the
-core preparation marker; `Backend::create_session` requires that marker.
+core preparation marker; `Backend::create_session` consumes that marker and
+the opaque model it proves was prepared by MLX.
 `ModelLoadOptions::with_parallel` selects TP, PP, EP, or a supported Cartesian
 materialization through this same entry point. Architecture-specific
 distributed loaders and rank-local model types are private materializers, not
@@ -172,12 +174,13 @@ public alternatives. `MlxBackend::with_distributed_world` supplies the world;
 `Backend::create_session` derives the topology-scoped communication and binds
 it to the selected model and cache state. There is no standalone public
 communication-session constructor.
-`MlxGeneration` is one
-architecture-erased iterator over `Model` and `ModelCache`; every supported
-text and multimodal model submits prompt prefill and every cached decode through
-`MlxModelSession`. The former per-architecture `ModelGenerate` enum, Llama-only
-executor, and borrowing session trait were deleted. There is no public
-architecture-specific loading or execution wrapper.
+Every backend-contract prefill and decode goes through `MlxModelSession`, whose
+model, cache, and communicator cannot be extracted or replaced. The former
+complete-cache accessors, per-architecture `ModelGenerate` enum, Llama-only
+executor, and borrowing backend-session trait were deleted. The tokenizer/chat
+facade still contains MLX-native batch and iterator implementations over its
+private replicated model/cache state; generalizing that convenience layer is a
+separate boundary from the backend execution contract.
 
 ## Tensor and cache ownership
 
@@ -363,9 +366,10 @@ until their exact completions resolve.
 
 Cache policy changes, prompt-cache publication/restoration, and embedded MTP
 generation also operate on `MlxModelSession`. They match the opaque model kind
-to its backend-owned cache internally, so callers cannot extract a pipeline or
-expert cache and combine it with a different communicator. Architecture cache
-types and rank-local stage models remain private MLX implementation details.
+to its backend-owned cache internally, so callers cannot extract any complete,
+pipeline, or expert cache, replace it with a foreign cache, or combine a model
+with a different communicator. Architecture cache types and rank-local stage
+models remain private MLX implementation details.
 
 The former facade-only `FairScheduler`, `CompletedWork`, and `FailedWork` APIs
 were removed instead of retained as wrappers. `Scheduler`, `SchedulerProgress`,

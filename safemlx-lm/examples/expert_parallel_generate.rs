@@ -37,17 +37,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ExpertCacheLoadOptions::default(),
         ),
     );
-    let mut model = load_model_with_options(&model_dir, options, &stream, &weights_stream)?;
+    let model = load_model_with_options(&model_dir, options, &stream, &weights_stream)?;
     if group.rank() == 0 {
         eprintln!("loaded {} with EP={}", model.model_type(), group.size());
     }
 
     let backend = MlxBackend::with_distributed_world(&stream, &group);
-    let mut session = backend.create_session(&model)?;
+    let mut session = backend.create_session(model)?;
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let parts = [input::InputPart::text_token_ids(&prompt)];
     let mut logits = session
-        .prefill(&backend, &mut model, input::ModelInput::new(&parts).into())?
+        .prefill(&backend, input::ModelInput::new(&parts).into())?
         .wait()?
         .into_logits()
         .ok_or("expert-parallel session returned no logits")?;
@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         logits = session
-            .decode(&backend, &mut model, synchronized.token)?
+            .decode(&backend, synchronized.token)?
             .wait()?
             .into_logits()
             .ok_or("expert-parallel session returned no logits")?;

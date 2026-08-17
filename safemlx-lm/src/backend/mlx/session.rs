@@ -171,27 +171,29 @@ impl MlxModelInput {
 /// session so callers cannot accidentally execute a sharded model with an
 /// unrelated communicator.
 pub struct MlxModelSession<'a> {
-    state: MlxSessionState,
+    inner: MlxSessionKind,
     distributed: Option<MlxDistributedSession<'a>>,
 }
 
-enum MlxSessionState {
-    Complete(ModelCache),
-    Pipeline(PipelineCache),
-    Expert(ExpertParallelCache),
+enum MlxSessionKind {
+    Complete(Model, ModelCache),
+    Pipeline(
+        crate::architectures::distributed::pipeline::PipelineModel,
+        PipelineCache,
+    ),
+    Expert(
+        crate::architectures::distributed::expert::ExpertParallelModel,
+        ExpertParallelCache,
+    ),
 }
 
 impl<'a> MlxModelSession<'a> {
     pub(crate) fn from_model(
-        model: &MlxModel,
+        model: MlxModel,
         distributed: Option<MlxDistributedSession<'a>>,
     ) -> Result<Self, Error> {
-        let state = match &model.inner {
-            MlxModelKind::Complete(model) => MlxSessionState::Complete(model.new_cache()),
-            MlxModelKind::Pipeline(model) => MlxSessionState::Pipeline(model.new_cache()?),
-            MlxModelKind::Expert(model) => MlxSessionState::Expert(model.new_cache()),
-        };
-        match (model.topology(), distributed.as_ref()) {
+        let topology = model.topology();
+        match (topology, distributed.as_ref()) {
             (None, None) => {}
             (Some(expected), Some(session)) if session.topology() == expected => {}
             (Some(_), None) => {
@@ -211,72 +213,101 @@ impl<'a> MlxModelSession<'a> {
                 )))
             }
         }
-        Ok(Self { state, distributed })
+        let inner = match model.inner {
+            MlxModelKind::Complete(model) => {
+                let cache = model.new_cache();
+                MlxSessionKind::Complete(model, cache)
+            }
+            MlxModelKind::Pipeline(model) => {
+                let cache = model.new_cache()?;
+                MlxSessionKind::Pipeline(model, cache)
+            }
+            MlxModelKind::Expert(model) => {
+                let cache = model.new_cache();
+                MlxSessionKind::Expert(model, cache)
+            }
+        };
+        Ok(Self { inner, distributed })
     }
 
-    /// Returns complete-model cache state for explicit prompt-cache operations.
-    pub fn complete_cache(&self) -> Result<&ModelCache, Error> {
-        match &self.state {
-            MlxSessionState::Complete(cache) => Ok(cache),
-            MlxSessionState::Pipeline(_) | MlxSessionState::Expert(_) => Err(Error::Parallel(
-                "distributed stage caches are owned opaquely by MlxModelSession".into(),
-            )),
+    /// Returns the normalized architecture name of the session-owned model.
+    pub fn model_type(&self) -> &str {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model.model_type(),
+            MlxSessionKind::Pipeline(model, _) => model.stage_info().model_kind.model_type_name(),
+            MlxSessionKind::Expert(model, _) => model.info().model_kind.model_type_name(),
         }
     }
 
-    /// Returns mutable complete-model cache state for explicit prompt-cache operations.
-    pub fn complete_cache_mut(&mut self) -> Result<&mut ModelCache, Error> {
-        match &mut self.state {
-            MlxSessionState::Complete(cache) => Ok(cache),
-            MlxSessionState::Pipeline(_) | MlxSessionState::Expert(_) => Err(Error::Parallel(
-                "distributed stage caches are owned opaquely by MlxModelSession".into(),
-            )),
+    /// Returns bounded parameter-residency telemetry when available.
+    pub fn residency_report(
+        &self,
+    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model.residency_report(),
+            MlxSessionKind::Pipeline(model, _) => model.parameter_residency_report(),
+            MlxSessionKind::Expert(_, _) => Ok(None),
         }
     }
 
-    /// Replaces complete-model cache state after an explicitly validated restore.
-    pub fn replace_complete_cache(&mut self, cache: ModelCache) -> Result<ModelCache, Error> {
-        match &mut self.state {
-            MlxSessionState::Complete(current) => Ok(std::mem::replace(current, cache)),
-            MlxSessionState::Pipeline(_) | MlxSessionState::Expert(_) => Err(Error::Parallel(
-                "distributed stage caches are owned opaquely by MlxModelSession".into(),
-            )),
+    /// Returns dense checkpoint-streaming telemetry when enabled.
+    pub fn dense_stream_report(&self) -> Result<Option<crate::DenseDiskStreamReport>, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model.dense_stream_report(),
+            MlxSessionKind::Pipeline(model, _) => model.dense_stream_report(),
+            MlxSessionKind::Expert(model, _) => model.dense_stream_report(),
+        }
+    }
+
+    /// Returns sparse routed-expert cache telemetry when enabled.
+    pub fn expert_cache_report(&self) -> Result<Option<crate::ExpertCacheReport>, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model.expert_cache_report(),
+            MlxSessionKind::Pipeline(model, _) => model.expert_cache_report(),
+            MlxSessionKind::Expert(model, _) => model.expert_cache_report(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_complete_model(&self) -> &Model {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model,
+            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
+                panic!("test expected a replicated MLX model session")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_complete_cache(&self) -> &ModelCache {
+        match &self.inner {
+            MlxSessionKind::Complete(_, cache) => cache,
+            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
+                panic!("test expected a replicated MLX model-session cache")
+            }
         }
     }
 
     /// Clears all backend-owned cache state while preserving session topology.
-    pub fn reset(&mut self, model: &MlxModel) -> Result<(), Error> {
-        match (&model.inner, &mut self.state) {
-            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => {
+    pub fn reset(&mut self) -> Result<(), Error> {
+        match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => {
                 *cache = model.new_cache();
                 Ok(())
             }
-            (MlxModelKind::Pipeline(_), MlxSessionState::Pipeline(cache)) => cache.reset(),
-            (MlxModelKind::Expert(_), MlxSessionState::Expert(cache)) => cache.reset(),
-            _ => Err(Error::Parallel(
-                "MLX model and session state kinds do not match".into(),
-            )),
+            MlxSessionKind::Pipeline(_, cache) => cache.reset(),
+            MlxSessionKind::Expert(_, cache) => cache.reset(),
         }
     }
 
     /// Returns aggregate cache-residency telemetry for this session.
-    pub fn cache_residency_report(
-        &self,
-        model: &MlxModel,
-    ) -> Result<Option<crate::CacheResidencyReport>, Error> {
-        match (&model.inner, &self.state) {
-            (MlxModelKind::Complete(_), MlxSessionState::Complete(cache)) => cache
+    pub fn cache_residency_report(&self) -> Result<Option<crate::CacheResidencyReport>, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(_, cache) => cache
                 .residency_report()
                 .map_err(|error| Error::Parallel(error.to_string())),
-            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => {
-                model.cache_residency_report(cache)
-            }
-            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => {
-                model.cache_residency_report(cache)
-            }
-            _ => Err(Error::Parallel(
-                "MLX model and session state kinds do not match".into(),
-            )),
+            MlxSessionKind::Pipeline(model, cache) => model.cache_residency_report(cache),
+            MlxSessionKind::Expert(model, cache) => model.cache_residency_report(cache),
         }
     }
 
@@ -284,22 +315,18 @@ impl<'a> MlxModelSession<'a> {
     ///
     /// Cache representation remains an MLX backend detail for complete,
     /// pipeline, and expert models alike.
-    pub fn configure_cache(
-        &mut self,
-        model: &MlxModel,
-        policy: CacheResidencyPolicy,
-    ) -> Result<(), Error> {
-        self.state = match &model.inner {
-            MlxModelKind::Complete(model) => {
-                MlxSessionState::Complete(model.new_cache_with_options(policy)?)
+    pub fn configure_cache(&mut self, policy: CacheResidencyPolicy) -> Result<(), Error> {
+        match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => {
+                *cache = model.new_cache_with_options(policy)?;
             }
-            MlxModelKind::Pipeline(model) => {
-                MlxSessionState::Pipeline(model.new_cache_with_options(policy)?)
+            MlxSessionKind::Pipeline(model, cache) => {
+                *cache = model.new_cache_with_options(policy)?;
             }
-            MlxModelKind::Expert(model) => {
-                MlxSessionState::Expert(model.new_cache_with_options(policy)?)
+            MlxSessionKind::Expert(model, cache) => {
+                *cache = model.new_cache_with_options(policy)?;
             }
-        };
+        }
         Ok(())
     }
 
@@ -307,14 +334,13 @@ impl<'a> MlxModelSession<'a> {
     pub fn save_prompt_cache(
         &mut self,
         backend: &MlxBackend<'a>,
-        model: &MlxModel,
         root: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
-        match (&model.inner, &mut self.state) {
-            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => model
+        match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => model
                 .save_prompt_cache(
                     cache,
                     root,
@@ -324,27 +350,22 @@ impl<'a> MlxModelSession<'a> {
                     backend.stream(),
                 )
                 .map_err(Into::into),
-            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => model
-                .save_prompt_cache(
-                    cache,
-                    root,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    backend.stream(),
-                ),
-            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => model
-                .save_prompt_cache(
-                    cache,
-                    root,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    backend.stream(),
-                ),
-            _ => Err(Error::Parallel(
-                "MLX model and session state kinds do not match".into(),
-            )),
+            MlxSessionKind::Pipeline(model, cache) => model.save_prompt_cache(
+                cache,
+                root,
+                descriptor,
+                prefix_token_ids,
+                options,
+                backend.stream(),
+            ),
+            MlxSessionKind::Expert(model, cache) => model.save_prompt_cache(
+                cache,
+                root,
+                descriptor,
+                prefix_token_ids,
+                options,
+                backend.stream(),
+            ),
         }
     }
 
@@ -352,45 +373,46 @@ impl<'a> MlxModelSession<'a> {
     pub fn load_prompt_cache(
         &mut self,
         backend: &MlxBackend<'a>,
-        model: &MlxModel,
         root: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
-        let (state, manifest) = match &model.inner {
-            MlxModelKind::Complete(model) => {
-                let (cache, manifest) = model.load_prompt_cache(
+        let manifest = match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => {
+                let (loaded_cache, manifest) = model.load_prompt_cache(
                     root,
                     expected,
                     prefix_token_ids,
                     options,
                     backend.stream(),
                 )?;
-                (MlxSessionState::Complete(cache), manifest)
+                *cache = loaded_cache;
+                manifest
             }
-            MlxModelKind::Pipeline(model) => {
-                let (cache, manifest) = model.load_prompt_cache(
+            MlxSessionKind::Pipeline(model, cache) => {
+                let (loaded_cache, manifest) = model.load_prompt_cache(
                     root,
                     expected,
                     prefix_token_ids,
                     options,
                     backend.stream(),
                 )?;
-                (MlxSessionState::Pipeline(cache), manifest)
+                *cache = loaded_cache;
+                manifest
             }
-            MlxModelKind::Expert(model) => {
-                let (cache, manifest) = model.load_prompt_cache(
+            MlxSessionKind::Expert(model, cache) => {
+                let (loaded_cache, manifest) = model.load_prompt_cache(
                     root,
                     expected,
                     prefix_token_ids,
                     options,
                     backend.stream(),
                 )?;
-                (MlxSessionState::Expert(cache), manifest)
+                *cache = loaded_cache;
+                manifest
             }
         };
-        self.state = state;
         Ok(manifest)
     }
 
@@ -399,31 +421,28 @@ impl<'a> MlxModelSession<'a> {
     pub fn generate_embedded_mtp<S: SpeculativeSampler + Clone>(
         &mut self,
         backend: &MlxBackend<'a>,
-        model: &mut MlxModel,
         input: MlxModelInput,
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
     ) -> Result<(Vec<u32>, MtpStats), Error> {
         let distributed = self.distributed.as_ref();
-        input.with_borrowed(|input| match (&mut model.inner, &mut self.state) {
-            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => {
-                match distributed {
-                    Some(execution) => model.generate_embedded_mtp_distributed(
-                        cache, input, config, prng_key, sampler, execution,
-                    ),
-                    None => model.generate_embedded_mtp_input_with_sampler(
-                        cache,
-                        input,
-                        config,
-                        prng_key,
-                        sampler,
-                        backend.stream(),
-                    ),
-                }
-                .map_err(Into::into)
+        input.with_borrowed(|input| match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => match distributed {
+                Some(execution) => model.generate_embedded_mtp_distributed(
+                    cache, input, config, prng_key, sampler, execution,
+                ),
+                None => model.generate_embedded_mtp_input_with_sampler(
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    backend.stream(),
+                ),
             }
-            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => model
+            .map_err(Into::into),
+            MlxSessionKind::Pipeline(model, cache) => model
                 .generate_embedded_mtp_distributed(
                     cache,
                     input,
@@ -437,7 +456,7 @@ impl<'a> MlxModelSession<'a> {
                     })?,
                 )
                 .map_err(Into::into),
-            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => model
+            MlxSessionKind::Expert(model, cache) => model
                 .generate_embedded_mtp_distributed(
                     cache,
                     input,
@@ -451,9 +470,6 @@ impl<'a> MlxModelSession<'a> {
                     })?,
                 )
                 .map_err(Into::into),
-            _ => Err(Error::Parallel(
-                "MLX model and session state kinds do not match".into(),
-            )),
         })
     }
 
@@ -607,11 +623,10 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
     fn prefill(
         &mut self,
         backend: &MlxBackend<'a>,
-        model: &mut MlxModel,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        match (&mut model.inner, &mut self.state) {
-            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => {
+        match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => {
                 let output = match &self.distributed {
                     Some(distributed) => input.with_borrowed(|input| {
                         prefill_model_tensor_parallel(
@@ -628,7 +643,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 };
                 model_submission(output)
             }
-            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => {
+            MlxSessionKind::Pipeline(model, cache) => {
                 let distributed = self.distributed.as_ref().ok_or_else(|| {
                     Error::Parallel("pipeline model session has no communication".into())
                 })?;
@@ -659,7 +674,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 })?;
                 pipeline_submission(completion)
             }
-            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => {
+            MlxSessionKind::Expert(model, cache) => {
                 let distributed = self.distributed.as_ref().ok_or_else(|| {
                     Error::Parallel("expert model session has no communication".into())
                 })?;
@@ -669,20 +684,16 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 })?;
                 model_submission(output)
             }
-            _ => Err(Error::Parallel(
-                "MLX model and session state kinds do not match".into(),
-            )),
         }
     }
 
     fn decode(
         &mut self,
         backend: &MlxBackend<'a>,
-        model: &mut MlxModel,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        match (&mut model.inner, &mut self.state) {
-            (MlxModelKind::Complete(model), MlxSessionState::Complete(cache)) => {
+        match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => {
                 let output = match &self.distributed {
                     Some(distributed) => decode_model_tensor_parallel(
                         model,
@@ -695,7 +706,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 };
                 model_submission(output)
             }
-            (MlxModelKind::Pipeline(model), MlxSessionState::Pipeline(cache)) => {
+            MlxSessionKind::Pipeline(model, cache) => {
                 let distributed = self.distributed.as_ref().ok_or_else(|| {
                     Error::Parallel("pipeline model session has no communication".into())
                 })?;
@@ -709,15 +720,12 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 )?;
                 pipeline_submission(completion)
             }
-            (MlxModelKind::Expert(model), MlxSessionState::Expert(cache)) => {
+            MlxSessionKind::Expert(model, cache) => {
                 let distributed = self.distributed.as_ref().ok_or_else(|| {
                     Error::Parallel("expert model session has no communication".into())
                 })?;
                 model_submission(model.forward(&input, None, cache, distributed)?)
             }
-            _ => Err(Error::Parallel(
-                "MLX model and session state kinds do not match".into(),
-            )),
         }
     }
 }

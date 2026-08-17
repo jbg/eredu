@@ -30,8 +30,8 @@ use safemlx_lm::{
     runtime::generation::sampler::DefaultSampler,
     CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, LayerCachePolicy,
     LayerWeightResidency, LayerwiseLoadOptions, MlxBackend, ModelLoadOptions, PagedCacheOptions,
-    ParallelModelInfo, ParallelTopology, PromptCacheDescriptor, PromptCacheManifest,
-    PromptCacheOptions, PromptCacheTopology, WeightResidency,
+    ParallelModelInfo, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
+    PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -336,72 +336,10 @@ impl GeneralizedTensorModel {
         self.complete().prompt_cache_layer_layout().unwrap()
     }
 
-    fn new_paged_cache(&self, options: PagedCacheOptions) -> safemlx_lm::api::ModelCache {
-        if let safemlx_lm::api::Model::DenseQwen(model) = self.complete() {
-            return safemlx_lm::api::ModelCache::KeyValue(model.new_cache());
-        }
-        self.complete()
-            .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-            .unwrap()
-    }
-
     fn checkpoint_diagnostics(
         &self,
     ) -> safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
-        match self.complete() {
-            safemlx_lm::api::Model::Llama(model) => model.checkpoint_store().diagnostics().unwrap(),
-            safemlx_lm::api::Model::DeepSeekV3(model) => {
-                model.checkpoint_store().diagnostics().unwrap()
-            }
-            safemlx_lm::api::Model::DenseQwen(model) => {
-                model.checkpoint_store().diagnostics().unwrap()
-            }
-            safemlx_lm::api::Model::Lfm2(model) => model.checkpoint_store().diagnostics().unwrap(),
-            safemlx_lm::api::Model::GptOss(model) => {
-                model.checkpoint_store().diagnostics().unwrap()
-            }
-            safemlx_lm::api::Model::KimiLinear(model) => {
-                model.checkpoint_store().diagnostics().unwrap()
-            }
-            safemlx_lm::api::Model::NemotronH(model) => {
-                model.checkpoint_store().diagnostics().unwrap()
-            }
-            model => panic!(
-                "checkpoint diagnostics unavailable for {}",
-                model.model_type()
-            ),
-        }
-    }
-
-    fn save_prompt_cache(
-        &self,
-        cache: &mut safemlx_lm::api::ModelCache,
-        root: &Path,
-        descriptor: PromptCacheDescriptor,
-        stream: &Stream,
-    ) -> PromptCacheManifest {
-        self.complete()
-            .save_prompt_cache(
-                cache,
-                root,
-                descriptor,
-                &[1, 2],
-                &PromptCacheOptions::default(),
-                stream,
-            )
-            .unwrap()
-    }
-
-    fn load_prompt_cache(
-        &self,
-        root: &Path,
-        descriptor: &PromptCacheDescriptor,
-        options: PagedCacheOptions,
-        stream: &Stream,
-    ) -> (safemlx_lm::api::ModelCache, PromptCacheManifest) {
-        self.complete()
-            .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
-            .unwrap()
+        checkpoint_diagnostics(self.complete())
     }
 
     fn complete(&self) -> &safemlx_lm::api::Model {
@@ -409,6 +347,28 @@ impl GeneralizedTensorModel {
             safemlx_lm::backend::mlx::MlxModelKind::Complete(model) => model,
             _ => panic!("tensor-parallel fixture did not load a complete model"),
         }
+    }
+}
+
+fn checkpoint_diagnostics(
+    model: &safemlx_lm::api::Model,
+) -> safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
+    match model {
+        safemlx_lm::api::Model::Llama(model) => model.checkpoint_store().diagnostics().unwrap(),
+        safemlx_lm::api::Model::DeepSeekV3(model) => {
+            model.checkpoint_store().diagnostics().unwrap()
+        }
+        safemlx_lm::api::Model::DenseQwen(model) => model.checkpoint_store().diagnostics().unwrap(),
+        safemlx_lm::api::Model::Lfm2(model) => model.checkpoint_store().diagnostics().unwrap(),
+        safemlx_lm::api::Model::GptOss(model) => model.checkpoint_store().diagnostics().unwrap(),
+        safemlx_lm::api::Model::KimiLinear(model) => {
+            model.checkpoint_store().diagnostics().unwrap()
+        }
+        safemlx_lm::api::Model::NemotronH(model) => model.checkpoint_store().diagnostics().unwrap(),
+        model => panic!(
+            "checkpoint diagnostics unavailable for {}",
+            model.model_type()
+        ),
     }
 }
 
@@ -681,7 +641,7 @@ fn tensor_ring_worker() {
             .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
-    let mut model =
+    let model =
         GeneralizedTensorModel::load(&checkpoint, family, parameter_residency, topology, &stream);
     let info = model.parallel_info();
     assert_eq!(info.topology(), topology);
@@ -865,16 +825,21 @@ fn tensor_ring_worker() {
     let paged = PagedCacheOptions::new(cache_block_size, 64 * 1024, 64 * 1024, 1)
         .unwrap()
         .with_full_attention(true);
-    let cache = model.new_paged_cache(paged.clone());
+    let architecture_fingerprint = model.prompt_cache_architecture_fingerprint();
+    let prompt_cache_layer_layout = model.prompt_cache_layer_layout();
+    let cache_policy = if family.is_qwen2() || family == FixtureFamily::Qwen3MoeSafetensors {
+        CacheResidencyPolicy::Device
+    } else {
+        CacheResidencyPolicy::Paged(paged.clone())
+    };
     let backend = MlxBackend::with_distributed_world(&stream, &group);
-    let mut session = safemlx_lm::core::Backend::create_session(&backend, &model.0).unwrap();
-    let _ = session.replace_complete_cache(cache).unwrap();
+    let mut session = safemlx_lm::core::Backend::create_session(&backend, model.0).unwrap();
+    session.configure_cache(cache_policy).unwrap();
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
     let logits = session
         .prefill(
             &backend,
-            &mut model.0,
             safemlx_lm::runtime::media::input::ModelInput::new(&parts).into(),
         )
         .unwrap()
@@ -910,7 +875,7 @@ fn tensor_ring_worker() {
             .unwrap();
         assert_arrays_close(&logits, &reference_logits, 8e-5);
         if family == FixtureFamily::DeepSeekGguf {
-            let diagnostics = model.checkpoint_diagnostics();
+            let diagnostics = checkpoint_diagnostics(session.test_complete_model());
             assert!(diagnostics.physical_reads > 0);
             assert!(
                 diagnostics.physical_read_bytes < family.deepseek_payload_bytes(),
@@ -947,11 +912,10 @@ fn tensor_ring_worker() {
             (2, 1, 1)
         };
         session
-            .complete_cache()
-            .unwrap()
+            .test_complete_cache()
             .assert_nemotron_local_cache_geometry(local_heads, local_groups, local_kv, 2);
         if family == FixtureFamily::NemotronGguf {
-            let diagnostics = model.checkpoint_diagnostics();
+            let diagnostics = checkpoint_diagnostics(session.test_complete_model());
             assert!(diagnostics.physical_reads > 0);
             assert!(
                 diagnostics.physical_read_bytes < family.nemotron_payload_bytes(),
@@ -980,12 +944,11 @@ fn tensor_ring_worker() {
             .unwrap();
         assert_arrays_close(&logits, &reference_logits, 5e-5);
         session
-            .complete_cache()
-            .unwrap()
+            .test_complete_cache()
             .assert_qwen3_moe_local_cache_geometry(2);
         let token = Array::from_slice(&[3u32], &[1, 1]);
         let distributed_decode = session
-            .decode(&backend, &mut model.0, token.clone())
+            .decode(&backend, token.clone())
             .unwrap()
             .wait()
             .unwrap()
@@ -1006,8 +969,7 @@ fn tensor_ring_worker() {
             .unwrap();
         assert_arrays_close(&distributed_decode, &reference_decode, 5e-5);
         session
-            .complete_cache()
-            .unwrap()
+            .test_complete_cache()
             .assert_qwen3_moe_local_cache_geometry(3);
         return;
     }
@@ -1033,8 +995,7 @@ fn tensor_ring_worker() {
             .unwrap();
         assert_arrays_close(&logits, &reference_logits, 2e-4);
         session
-            .complete_cache()
-            .unwrap()
+            .test_complete_cache()
             .assert_gpt_oss_local_cache_geometry(if expected_rank == 0 { 2 } else { 1 }, 2);
     }
 
@@ -1064,8 +1025,7 @@ fn tensor_ring_worker() {
         };
         assert_arrays_close(&logits, &reference_logits, tolerance);
         session
-            .complete_cache()
-            .unwrap()
+            .test_complete_cache()
             .assert_lfm2_local_cache_geometry(
                 family.lfm2_local_kv_heads(expected_rank),
                 family.lfm2_local_convolution_channels(),
@@ -1073,7 +1033,7 @@ fn tensor_ring_worker() {
                 2,
             );
         if matches!(family, FixtureFamily::Lfm2Gguf | FixtureFamily::Lfm2Q8Gguf) {
-            let diagnostics = model.checkpoint_diagnostics();
+            let diagnostics = checkpoint_diagnostics(session.test_complete_model());
             assert!(diagnostics.physical_reads > 0);
             assert!(
                 diagnostics.physical_read_bytes < family.lfm2_payload_bytes(),
@@ -1110,11 +1070,10 @@ fn tensor_ring_worker() {
             .unwrap();
         assert_arrays_close(&logits, &reference_logits, 8e-5);
         session
-            .complete_cache()
-            .unwrap()
+            .test_complete_cache()
             .assert_kimi_local_cache_geometry(if expected_rank == 0 { 2 } else { 1 }, 2);
         if family == FixtureFamily::KimiLinearGguf {
-            let diagnostics = model.checkpoint_diagnostics();
+            let diagnostics = checkpoint_diagnostics(session.test_complete_model());
             assert!(diagnostics.physical_reads > 0);
             assert!(
                 diagnostics.physical_read_bytes < family.kimi_linear_payload_bytes(),
@@ -1187,11 +1146,10 @@ fn tensor_ring_worker() {
             1
         };
         session
-            .complete_cache()
-            .unwrap()
+            .test_complete_cache()
             .assert_qwen2_local_cache_geometry(local_kv_heads, 2, family.qwen2_head_dim());
 
-        let diagnostics = model.checkpoint_diagnostics();
+        let diagnostics = checkpoint_diagnostics(session.test_complete_model());
         assert!(diagnostics.physical_reads > 0);
         assert!(
             diagnostics.physical_read_bytes < family.qwen2_payload_bytes(),
@@ -1217,7 +1175,7 @@ fn tensor_ring_worker() {
 
         let token = Array::from_slice(&[3u32], &[1, 1]);
         let distributed_decode = session
-            .decode(&backend, &mut model.0, token.clone())
+            .decode(&backend, token.clone())
             .unwrap()
             .wait()
             .unwrap()
@@ -1238,10 +1196,9 @@ fn tensor_ring_worker() {
             .unwrap();
         assert_arrays_close(&distributed_decode, &reference_decode, tolerance);
         session
-            .complete_cache()
-            .unwrap()
+            .test_complete_cache()
             .assert_qwen2_local_cache_geometry(local_kv_heads, 3, family.qwen2_head_dim());
-        assert_eq!(session.complete_cache().unwrap().offset(), 3);
+        assert_eq!(session.test_complete_cache().offset(), 3);
         return;
     }
 
@@ -1251,13 +1208,13 @@ fn tensor_ring_worker() {
         effective_model_type: family.model_type().into(),
         checkpoint_fingerprint: "tensor-ring-fixture".into(),
         prefix_content_fingerprint: "tokens:1,2".into(),
-        architecture_fingerprint: model.prompt_cache_architecture_fingerprint(),
+        architecture_fingerprint,
         layer_count,
         global_layer_start: 0,
         global_layer_end: layer_count,
         batch_size: 1,
         layer_prefix_offsets: vec![0; layer_count],
-        layer_layout: model.prompt_cache_layer_layout(),
+        layer_layout: prompt_cache_layer_layout,
         sink_tokens: 0,
         topology: PromptCacheTopology {
             pipeline: None,
@@ -1266,16 +1223,19 @@ fn tensor_ring_worker() {
             expert_parallel_cache_replicated: true,
         },
     };
-    let saved = model.save_prompt_cache(
-        session.complete_cache_mut().unwrap(),
-        &prompt_cache_root,
-        descriptor.clone(),
-        &stream,
-    );
+    let saved = session
+        .save_prompt_cache(
+            &backend,
+            &prompt_cache_root,
+            descriptor.clone(),
+            &[1, 2],
+            &PromptCacheOptions::default(),
+        )
+        .unwrap();
     assert_eq!(saved.topology, descriptor.topology);
     let token = safemlx::Array::from_slice(&[0u32], &[1, 1]);
     let uninterrupted = session
-        .decode(&backend, &mut model.0, token.clone())
+        .decode(&backend, token.clone())
         .unwrap()
         .wait()
         .unwrap()
@@ -1284,12 +1244,12 @@ fn tensor_ring_worker() {
     let uninterrupted = uninterrupted.evaluated().unwrap();
     let uninterrupted_values = uninterrupted.as_slice::<f32>().to_vec();
     drop(uninterrupted);
-    let (cache, manifest) =
-        model.load_prompt_cache(&prompt_cache_root, &descriptor, paged, &stream);
-    let _ = session.replace_complete_cache(cache).unwrap();
+    let manifest = session
+        .load_prompt_cache(&backend, &prompt_cache_root, &descriptor, &[1, 2], paged)
+        .unwrap();
     assert_eq!(manifest.topology, descriptor.topology);
     let restored = session
-        .decode(&backend, &mut model.0, token)
+        .decode(&backend, token)
         .unwrap()
         .wait()
         .unwrap()
@@ -1308,14 +1268,14 @@ fn tensor_ring_worker() {
     assert!(sampled.as_slice::<u32>()[0] < vocab_size as u32);
     drop(sampled);
     let logits = session
-        .decode(&backend, &mut model.0, synchronized.token)
+        .decode(&backend, synchronized.token)
         .unwrap()
         .wait()
         .unwrap()
         .into_logits()
         .unwrap();
     assert_eq!(logits.shape(), &[1, vocab_size as i32]);
-    assert_eq!(session.complete_cache().unwrap().offset(), 4);
+    assert_eq!(session.test_complete_cache().offset(), 4);
 }
 
 fn write_f32_shard(path: &Path, tensors: &[(&str, Vec<usize>, f32)]) {

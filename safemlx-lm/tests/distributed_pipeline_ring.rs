@@ -328,7 +328,7 @@ fn pipeline_ring_worker() {
     let pipeline_rank = topology.pipeline_parallel_rank;
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     if std::env::var_os(OPAQUE_SESSION).is_some() {
-        let mut model = load_model_with_options(
+        let model = load_model_with_options(
             &checkpoint,
             ModelLoadOptions::with_parallel(topology),
             &stream,
@@ -336,19 +336,18 @@ fn pipeline_ring_worker() {
         )
         .unwrap();
         let backend = MlxBackend::with_distributed_world(&stream, &group);
-        let mut session = backend.create_session(&model).unwrap();
+        let mut session = backend.create_session(model).unwrap();
         let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
             .unwrap()
             .with_full_attention(true);
         session
-            .configure_cache(&model, CacheResidencyPolicy::Paged(paged))
+            .configure_cache(CacheResidencyPolicy::Paged(paged))
             .unwrap();
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
         let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let mut output = session
             .prefill(
                 &backend,
-                &mut model,
                 safemlx_lm::runtime::media::input::ModelInput::new(&parts).into(),
             )
             .unwrap()
@@ -360,11 +359,7 @@ fn pipeline_ring_worker() {
                 .sample_and_synchronize(output.logits(), 1, &mut DefaultSampler, 0.0, None, false)
                 .unwrap()
                 .token;
-            output = session
-                .decode(&backend, &mut model, token)
-                .unwrap()
-                .wait()
-                .unwrap();
+            output = session.decode(&backend, token).unwrap().wait().unwrap();
         }
         assert_eq!(output.logits().is_some(), pipeline_rank == 1);
         return;
