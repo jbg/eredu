@@ -2512,11 +2512,10 @@ mod tests {
         ParallelCallLayout, StructuralObjectEncoding, ToolNameConstraint, DECLARATIVE_DIALECT,
     };
     use crate::{
+        core::generation::{FinishReason, SemanticEvent},
         runtime::chat::constraints::ConstraintCompiler,
         runtime::chat::{ParallelToolCallPolicy, ToolChoice},
-        runtime::generation::streaming::{
-            FinishReason, ProtocolParser, SemanticEvent, SemanticEventSink,
-        },
+        runtime::generation::streaming::{ProtocolParser, SemanticEventSink},
     };
 
     const FUNCTION_INPUT_JSON: JsonFunctionEnvelope = JsonFunctionEnvelope {

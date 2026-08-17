@@ -41,14 +41,14 @@ use safemlx_lm::{
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
     runtime::generation::sampler::DefaultSampler,
-    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig},
+    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind},
     runtime::media::input as runtime_input,
     runtime::residency::{
         dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions,
     },
-    CacheResidencyPolicy, CartesianExecution, DeviceAssignment, NonExpertWeightResidency,
-    PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
-    PromptCacheTopology, WeightResidency,
+    CacheResidencyPolicy, CartesianExecution, DeviceAssignment, MtpConfig,
+    NonExpertWeightResidency, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
+    PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 
 const WORKER_RANK: &str = "SAFEMLX_LM_EXPERT_MODEL_RING_WORKER";

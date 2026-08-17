@@ -23,6 +23,8 @@ use safemlx::{
 };
 use safemlx_lm_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
 
+#[cfg(feature = "media-processing")]
+use crate::{api::gguf_sidecar_dir, runtime::media::ModelProcessor};
 use crate::{
     api::{Model, ModelLoadOptions},
     backend::mlx::structural,

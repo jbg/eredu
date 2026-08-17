@@ -8980,7 +8980,7 @@ mod tests {
         .unwrap();
         assert_eq!(logits.shape(), &[1, 32]);
 
-        let mtp_config = crate::runtime::generation::speculative::MtpConfig {
+        let mtp_config = crate::core::generation::MtpConfig {
             max_tokens: 3,
             max_draft_tokens: 1,
             temperature: 0.0,

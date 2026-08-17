@@ -129,8 +129,10 @@ hardware profile, or schema is ignored. Historical plans are also rechecked
 against current available memory and header-only loader admission. Use
 `AutomaticPlanner::new` with an `AutomaticPlannerPolicy` for explicit policy
 bounds, and `execution_plan_load_options` to apply a returned plan to model
-loading. Device creation and speculative-generation orchestration remain owned
-by the embedding application.
+loading. Device creation remains owned by the embedding application.
+Speculative generation uses the same core-owned committed-token and terminal
+lifecycle as ordinary generation; the MLX adapter owns proposal logits,
+sampling, assistant execution, cache tensors, and exact completion.
 
 ## Inputs and generation
 

@@ -2,9 +2,10 @@ use std::{path::PathBuf, time::Instant};
 
 use safemlx::{transforms::eval, ExecutionContext, Stream};
 use safemlx_lm::{
-    api::{GenerationConfigOverrides, LoadedModel},
-    runtime::generation::speculative::{LoadedDrafter, MtpConfig},
+    api::LoadedModel,
+    runtime::generation::speculative::LoadedDrafter,
     runtime::media::input::{InputPart, ModelInput},
+    GenerationConfigOverrides, MtpConfig,
 };
 
 fn main() -> anyhow::Result<()> {

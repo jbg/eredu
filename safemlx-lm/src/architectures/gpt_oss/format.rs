@@ -567,10 +567,10 @@ mod tests {
 
     use super::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT, STRUCTURAL_TOKENS};
     use crate::{
+        core::generation::{FinishReason, SemanticEvent},
         runtime::chat::constraints::ConstraintCompiler,
         runtime::chat::dialect::DialectParameters,
         runtime::chat::{ParallelToolCallPolicy, ToolChoice},
-        runtime::generation::streaming::{FinishReason, SemanticEvent},
     };
 
     const REASONING_CALL_FIXTURE: &str =

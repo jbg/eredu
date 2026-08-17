@@ -949,10 +949,10 @@ mod tests {
 
     use super::{LFM2_DIALECT, LFM2_PARAMETERS, STRUCTURAL_TOKENS, TOOL_CALL_END, TOOL_CALL_START};
     use crate::{
+        core::generation::{FinishReason, SemanticEvent},
         runtime::chat::constraints::ConstraintCompiler,
         runtime::chat::dialect::DialectParameters,
         runtime::chat::{ParallelToolCallPolicy, ToolChoice},
-        runtime::generation::streaming::{FinishReason, SemanticEvent},
     };
 
     const AUTHORITATIVE_CALL: &str =

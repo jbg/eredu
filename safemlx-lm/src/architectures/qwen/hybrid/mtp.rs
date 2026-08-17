@@ -7,12 +7,13 @@ use crate::{
         input::{self, ModelInput},
         qwen3_5::{Cache, LayerCache, Model, QwenMtpStepOutput},
     },
+    core::generation::{
+        FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
+    },
     runtime::generation::sampler::SpeculativeSampler,
     runtime::generation::speculative::{
-        self as mtp, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
-        MtpSchedulerOptions, MtpSemanticState,
+        self as mtp, MtpBackend, MtpCommit, MtpExecutionStreams, MtpPrefill, MtpSemanticState,
     },
-    runtime::generation::streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
 };
 
 pub(crate) trait QwenMtpTarget {

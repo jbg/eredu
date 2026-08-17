@@ -12,13 +12,14 @@ use safemlx::{
 
 use crate::{
     api::input::ModelInput,
+    core::generation::{
+        FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
+    },
     runtime::generation::{
         sampler::SpeculativeSampler,
         speculative::{
-            self, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
-            MtpSchedulerOptions, MtpSemanticState,
+            self, MtpBackend, MtpCommit, MtpExecutionStreams, MtpPrefill, MtpSemanticState,
         },
-        streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
     },
 };
 

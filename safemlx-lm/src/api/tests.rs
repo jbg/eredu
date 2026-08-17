@@ -7,6 +7,9 @@ use super::{
     PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
 };
 use crate::{
+    core::generation::{
+        FinishReason, GenerationCancellationToken, MtpSchedulerOptions, SemanticEvent,
+    },
     error::Error,
     runtime::chat::constraints::ConstraintCompiler,
     runtime::chat::{
@@ -18,8 +21,7 @@ use crate::{
     },
     runtime::execution::inspection::ActivationRecorder,
     runtime::generation::sampler::{ConstrainedSampler, DefaultSampler, GenerationSampler},
-    runtime::generation::speculative::{MtpSchedulerOptions, MtpStreamTopology},
-    runtime::generation::streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
+    runtime::generation::speculative::MtpStreamTopology,
 };
 use safemlx::{
     argmax_axis,

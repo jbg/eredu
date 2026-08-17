@@ -21,6 +21,17 @@ backend allocator observations. Deserialization cannot bypass plan invariants.
 Backends own only resource materialization, native transfer/completion objects,
 and destruction of the storage selected by ledger transitions.
 
+Generation orchestration is portable too. `GenerationSequence` owns committed
+token order, token budgets, cancellation, and stop/grammar/EOS precedence.
+`SpeculativeRound` owns acceptance, replacement/bonus tails, transactional
+publication, and the exact verified-input retention count used by a backend
+cache commit. Optimistic-prefix reuse and checkpoint/request sampler
+configuration validation are pure core decisions. A backend owns logits,
+random sampling, executable assistant heads, tensor caches, and exact native
+completion; it cannot maintain a second logical token or terminal state.
+`MtpRequestLifecycle` rejects illegal phase edges and defers cancellation while
+a backend verification transaction remains retained.
+
 Model loading starts here as well. `inspect_artifact` parses `config.json` or a
 portable `safemlx-gguf` checkpoint, validates SafeTensors/GGUF catalogs, and
 resolves the canonical `ModelKind` without a tensor runtime.

@@ -8,9 +8,10 @@ use safemlx::{
     ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    api::{GenerationConfigOverrides, LoadedModel, ModelCache},
+    api::{LoadedModel, ModelCache},
     error::Error,
     runtime::media::input::{InputPart, ModelInput},
+    GenerationConfigOverrides,
 };
 use serde_json::Value;
 

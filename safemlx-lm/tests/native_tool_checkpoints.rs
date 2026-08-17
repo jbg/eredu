@@ -11,7 +11,7 @@ use safemlx_lm::{
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
     runtime::generation::sampler::DefaultSampler,
-    runtime::generation::streaming::{FinishReason, SemanticEvent},
+    FinishReason, SemanticEvent,
 };
 use serde_json::json;
 
@@ -87,7 +87,7 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
             cache: &mut cache,
             sampling_policy: DefaultSampler,
             settings: PreparedChatGenerationSettings {
-                overrides: safemlx_lm::api::GenerationConfigOverrides {
+                overrides: safemlx_lm::GenerationConfigOverrides {
                     temperature: Some(0.0),
                     max_new_tokens: Some(256),
                     ..Default::default()
@@ -96,7 +96,7 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
             },
             caller_stop_sequences: &[],
             stream,
-            cancellation: safemlx_lm::api::GenerationCancellationToken::new(),
+            cancellation: safemlx_lm::GenerationCancellationToken::new(),
             on_event: |event| events.push(event),
         })
         .unwrap_or_else(|error| {

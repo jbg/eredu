@@ -335,7 +335,8 @@ impl LoadedModel {
             temperature: resolved.temperature,
             max_tokens,
             prng_key,
-            checkpoint_sampler: resolved.sampler(),
+            checkpoint_sampler:
+                crate::runtime::generation::sampler::GenerationSampler::from_resolved(resolved),
         })
     }
 
@@ -1614,7 +1615,10 @@ impl LoadedModel {
         &self,
         overrides: GenerationConfigOverrides,
     ) -> Result<ResolvedGenerationConfig, Error> {
-        resolve_generation_config(self.checkpoint_generation_config.as_ref(), overrides)
+        Ok(resolve_generation_config(
+            self.checkpoint_generation_config.as_ref(),
+            overrides,
+        )?)
     }
 
     /// Returns checkpoint-native quantization storage statistics when available.
@@ -2024,7 +2028,7 @@ impl LoadedModel {
             input,
             prng_key,
             stream,
-            resolved.sampler(),
+            crate::runtime::generation::sampler::GenerationSampler::from_resolved(resolved),
         ))
     }
 

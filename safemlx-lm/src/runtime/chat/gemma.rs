@@ -426,9 +426,12 @@ mod tests {
     use std::convert::Infallible;
 
     use super::*;
-    use crate::runtime::generation::streaming::{
-        CommittedTokenPipeline, FinishReason, RawTokenDecoder, SemanticEvent, SemanticEventSink,
-        TokenDecoderBackend, ToolRuntimeParser,
+    use crate::{
+        core::generation::{FinishReason, SemanticEvent},
+        runtime::generation::streaming::{
+            CommittedTokenPipeline, RawTokenDecoder, SemanticEventSink, TokenDecoderBackend,
+            ToolRuntimeParser,
+        },
     };
 
     #[test]

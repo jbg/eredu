@@ -5,10 +5,13 @@ use safemlx::{
     transforms::eval,
     Array, ExecutionContext, Stream,
 };
-use safemlx_lm::api::{GenerationConfigOverrides, LoadedModel, ModelLoadOptions};
 use safemlx_lm::architectures::qwen::hybrid::qwen3_5;
 use safemlx_lm::runtime::checkpoint::quantization::AffineQuantization;
 use safemlx_lm::runtime::media::input::{InputPart, ModelInput};
+use safemlx_lm::{
+    api::{LoadedModel, ModelLoadOptions},
+    GenerationConfigOverrides,
+};
 
 const DEFAULT_DECODE_TOKENS: usize = 128;
 const CASES: &[(&str, usize)] = &[

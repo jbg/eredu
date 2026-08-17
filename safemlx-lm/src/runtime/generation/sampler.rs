@@ -1037,6 +1037,14 @@ impl GenerationSampler {
         Self::default()
     }
 
+    /// Materializes backend-neutral sampling filters for MLX logits.
+    pub fn from_resolved(config: crate::core::generation::ResolvedGenerationConfig) -> Self {
+        Self::new()
+            .top_k(config.top_k)
+            .top_p(config.top_p)
+            .min_p(config.min_p)
+    }
+
     /// Creates a sampler with an initial accepted-token history.
     ///
     /// The history is used by repetition, frequency, and presence penalties.
@@ -1347,6 +1355,7 @@ mod tests {
         GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
     };
     use crate::{
+        core::generation::{FinishReason, SemanticEvent},
         runtime::chat::constraints::ConstraintCompiler,
         runtime::chat::dialect::{
             DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
@@ -1354,7 +1363,6 @@ mod tests {
             DECLARATIVE_DIALECT,
         },
         runtime::chat::{ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
-        runtime::generation::streaming::{FinishReason, SemanticEvent},
     };
 
     const SYNTHETIC_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {

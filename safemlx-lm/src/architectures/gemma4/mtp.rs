@@ -13,13 +13,15 @@ use crate::{
         input::ModelInput as RuntimeInput,
     },
     architectures::gemma4::layerwise::Gemma4LayerwiseModel,
+    core::generation::{
+        FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
+    },
     runtime::attention::AttentionPolicy,
     runtime::generation::sampler::SpeculativeSampler,
     runtime::generation::speculative::{
-        self as mtp, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
-        MtpSchedulerOptions, MtpSemanticState, MtpStreamTopology,
+        self as mtp, MtpBackend, MtpCommit, MtpExecutionStreams, MtpPrefill, MtpSemanticState,
+        MtpStreamTopology,
     },
-    runtime::generation::streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
 };
 
 #[derive(Clone)]

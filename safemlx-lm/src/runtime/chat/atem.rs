@@ -539,7 +539,10 @@ fn repeated_rule(item: &str, separator: &str, minimum: usize, maximum: Option<us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::generation::streaming::{FinishReason, SemanticEvent, ToolRuntimeParser};
+    use crate::{
+        core::generation::{FinishReason, SemanticEvent},
+        runtime::generation::streaming::ToolRuntimeParser,
+    };
 
     #[test]
     fn eom_is_a_channel_boundary_and_atem_arguments_are_typed() {

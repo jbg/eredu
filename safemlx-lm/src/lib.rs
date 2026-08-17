@@ -26,6 +26,11 @@ pub use safemlx_lm_core::artifact::{
     MaterializationRoute, ModelArtifact, ModelConfiguration, ModelKind, ModelPreparationPlan,
     PreparationPolicy, QuantizationRequest, ResidencyRequest,
 };
+pub use safemlx_lm_core::generation::{
+    CheckpointGenerationConfig, FinishReason, GenerationCancellationToken,
+    GenerationConfigOverrides, MtpConfig, MtpRequestId, MtpRequestPhase, MtpSchedulerOptions,
+    ResolvedGenerationConfig, SemanticEvent,
+};
 #[cfg(test)]
 mod test_utils;
 
@@ -39,16 +44,14 @@ pub use api::{
     discover_hardware, execution_plan_load_options, inspect_model, load_model,
     load_model_with_options, plan_automatic_execution, AllocatorTelemetry, ArtifactKind,
     ArtifactModality, ArtifactTensorEncoding, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlannerPolicy, BackendKind, CheckpointGenerationConfig, DevicePlan,
-    DraftPlacementPlan, DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport,
-    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, GenerationConfigOverrides,
-    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
-    InspectionIssue, InspectionIssueCode, InspectionReadiness, InspectionRequirement,
-    InspectionSeverity, ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions,
-    ModelResourceProfile, ObservationKind, Observed, ParallelismPlan, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
-    ResolvedGenerationConfig, TimingTelemetry, TransferTelemetry, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    AutomaticPlannerPolicy, BackendKind, DevicePlan, DraftPlacementPlan, DraftingPlan,
+    DurationSeconds, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
+    ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
+    HardwareProfile, InspectionIssue, InspectionIssueCode, InspectionReadiness,
+    InspectionRequirement, InspectionSeverity, ModelInspectionOptions, ModelInspectionReport,
+    ModelLoadOptions, ModelResourceProfile, ObservationKind, Observed, ParallelismPlan,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
+    TimingTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
 pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};

@@ -6,87 +6,13 @@
 
 #![allow(dead_code)]
 
+use crate::core::generation::{
+    FinishReason, GenerationCancellationToken, GenerationSequence, SemanticEvent,
+    TokenTerminalSignals,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-
-/// A cheap, thread-safe cooperative-cancellation token for prepared-chat generation.
-///
-/// Tokens are one-shot: once any clone calls [`Self::cancel`], every clone
-/// remains cancelled. Generation observes cancellation at committed output
-/// boundaries rather than interrupting an active model/cache transaction.
-#[derive(Debug, Clone, Default)]
-pub struct GenerationCancellationToken {
-    cancelled: Arc<AtomicBool>,
-}
-
-impl GenerationCancellationToken {
-    /// Creates a token in the active (not cancelled) state.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Requests cooperative cancellation for the associated generation.
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-
-    /// Returns whether cancellation has been requested through any clone.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-}
-
-/// Why a semantic response stream finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FinishReason {
-    /// A checkpoint EOS token was generated.
-    Eos,
-    /// A profile or caller stop sequence matched.
-    StopSequence,
-    /// A generation grammar reached its accepting state.
-    GrammarComplete,
-    /// The caller's generation token limit was reached.
-    MaxTokens,
-    /// The caller cooperatively cancelled generation.
-    Cancelled,
-}
-
-/// A protocol-neutral incremental response event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SemanticEvent {
-    /// An incremental reasoning-text fragment.
-    ReasoningDelta(String),
-    /// An incremental visible-text fragment.
-    TextDelta(String),
-    /// The beginning of one canonical tool call.
-    ToolCallStart {
-        /// Zero-based tool-call position in the assistant turn.
-        index: usize,
-        /// Stable tool-call identifier.
-        id: String,
-        /// Tool name selected by the model.
-        name: String,
-    },
-    /// An incremental JSON argument fragment for a tool call.
-    ToolArgumentsDelta {
-        /// Zero-based tool-call position in the assistant turn.
-        index: usize,
-        /// A fragment of the tool call's JSON arguments.
-        json_fragment: String,
-    },
-    /// The current tool call ended.
-    ToolCallEnd,
-    /// The semantic response stream ended.
-    Finished {
-        /// The condition that ended the stream.
-        reason: FinishReason,
-    },
-}
 
 /// Canonical parser-owned representation of a tool call being assembled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1071,25 +997,26 @@ where
     D::Error: fmt::Display,
     T: CommittedTokenSource,
 {
-    let max_tokens = max_tokens.get();
-    let mut token_ids = Vec::with_capacity(max_tokens);
-    for index in 0..max_tokens {
-        if cancellation.is_cancelled() {
+    let mut sequence = GenerationSequence::new(max_tokens.get(), eos_token_ids.iter().copied());
+    while !sequence.is_finished() {
+        if sequence.observe_cancellation(cancellation) {
             pipeline.cancel(emit);
-            return Ok((token_ids, FinishReason::Cancelled));
+            return Ok((sequence.into_tokens(), FinishReason::Cancelled));
         }
 
         let token_id = source
             .next_token()
             .map_err(|error| format!("model generation failed: {error}"))?
             .ok_or_else(|| "architecture generation ended without a terminal token".to_owned())?;
-        token_ids.push(token_id);
-
         let (stop_matched, cancelled_during_delivery) =
             pipeline.push_cancellable(token_id, cancellation, emit)?;
         if cancelled_during_delivery && !stop_matched {
+            sequence
+                .commit(token_id, TokenTerminalSignals::default())
+                .map_err(|error| error.to_string())?;
+            sequence.cancel();
             pipeline.cancel(emit);
-            return Ok((token_ids, FinishReason::Cancelled));
+            return Ok((sequence.into_tokens(), FinishReason::Cancelled));
         }
         let grammar_complete = if stop_matched {
             false
@@ -1098,19 +1025,20 @@ where
                 .grammar_is_complete()
                 .map_err(|error| format!("grammar completion check failed: {error}"))?
         };
-        let reason = stop_matched
-            .then_some(FinishReason::StopSequence)
-            .or_else(|| grammar_complete.then_some(FinishReason::GrammarComplete))
-            .or_else(|| {
-                eos_token_ids
-                    .contains(&token_id)
-                    .then_some(FinishReason::Eos)
-            })
-            .or_else(|| (index + 1 == max_tokens).then_some(FinishReason::MaxTokens));
+        let reason = sequence
+            .commit(
+                token_id,
+                TokenTerminalSignals {
+                    stop_sequence: stop_matched,
+                    grammar_complete,
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .finish_reason;
 
         if let Some(reason) = reason {
             pipeline.finish(reason, emit)?;
-            return Ok((token_ids, reason));
+            return Ok((sequence.into_tokens(), reason));
         }
     }
 

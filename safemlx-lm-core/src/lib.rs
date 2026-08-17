@@ -42,3 +42,11 @@ pub use backend::{
     Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession, Completion,
     DeviceDescriptor, PreparedModel, Submission,
 };
+pub use generation::{
+    resolve_generation_config, resolve_optimistic_reuse, CheckpointGenerationConfig, FinishReason,
+    GenerationCancellationToken, GenerationConfigOverrides, GenerationError, GenerationPhase,
+    GenerationSequence, MtpCancellationDisposition, MtpConfig, MtpRequestId, MtpRequestLifecycle,
+    MtpRequestPhase, MtpSchedulerOptions, OptimisticReuseDecision, ResolvedGenerationConfig,
+    SemanticEvent, SpeculativeCommitPlan, SpeculativeRound, SpeculativeTail, TokenCommit,
+    TokenTerminalSignals,
+};

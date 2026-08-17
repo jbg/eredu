@@ -111,7 +111,7 @@ pub(super) fn is_gguf_file(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
 }
 
-pub(super) fn gguf_sidecar_dir(path: &Path) -> &Path {
+pub(crate) fn gguf_sidecar_dir(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new("."))
 }
 

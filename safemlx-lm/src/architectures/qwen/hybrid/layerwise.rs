@@ -5056,7 +5056,7 @@ mod tests {
 
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
         let parts = [runtime_input::InputPart::text_token_ids(&prompt)];
-        let mtp_config = crate::runtime::generation::speculative::MtpConfig {
+        let mtp_config = crate::core::generation::MtpConfig {
             max_tokens: 3,
             max_draft_tokens: 1,
             temperature: 0.0,

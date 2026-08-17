@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use safemlx::{Device, DeviceType, ExecutionContext};
-use safemlx_lm::api::{GenerationConfigOverrides, LoadedModel};
 use safemlx_lm::runtime::media::input::{InputPart, ModelInput};
+use safemlx_lm::{api::LoadedModel, GenerationConfigOverrides};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

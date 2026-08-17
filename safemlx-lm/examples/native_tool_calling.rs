@@ -15,9 +15,9 @@ use safemlx_lm::{
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
     runtime::generation::sampler::DefaultSampler,
     runtime::generation::speculative::{
-        LoadedDrafter, MtpCapability, MtpCheckpointKind, MtpExecutionStreams, MtpSchedulerOptions,
+        LoadedDrafter, MtpCapability, MtpCheckpointKind, MtpExecutionStreams,
     },
-    runtime::generation::streaming::SemanticEvent,
+    MtpSchedulerOptions, SemanticEvent,
 };
 use serde_json::json;
 
@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let settings = PreparedChatGenerationSettings {
-        overrides: safemlx_lm::api::GenerationConfigOverrides {
+        overrides: safemlx_lm::GenerationConfigOverrides {
             max_new_tokens: Some(256),
             ..Default::default()
         },
@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 caller_stop_sequences: &[],
                 streams: MtpExecutionStreams::new(target.stream(), draft.stream())?,
-                cancellation: safemlx_lm::api::GenerationCancellationToken::new(),
+                cancellation: safemlx_lm::GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
             .finish_reason
@@ -123,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 caller_stop_sequences: &[],
                 stream: target.stream(),
-                cancellation: safemlx_lm::api::GenerationCancellationToken::new(),
+                cancellation: safemlx_lm::GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
             .finish_reason
@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 settings,
                 caller_stop_sequences: &[],
                 stream: target.stream(),
-                cancellation: safemlx_lm::api::GenerationCancellationToken::new(),
+                cancellation: safemlx_lm::GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
             .finish_reason

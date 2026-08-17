@@ -73,6 +73,7 @@ use crate::{
     },
     backend::mlx::consensus::MlxConsensusTransport,
     core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
+    core::generation::MtpConfig,
     core::{
         cache::{CachePoolReport, CacheResidencyPool},
         residency::{
@@ -123,7 +124,7 @@ use crate::{
     runtime::generation::{
         embedded_mtp::{DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget},
         sampler::{Sampler, SpeculativeSampler},
-        speculative::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
+        speculative::{MtpCapability, MtpCheckpointKind, MtpStats},
     },
     runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
     runtime::residency::dense_stream::DENSE_TRANSFER_WINDOW,

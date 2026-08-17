@@ -33,6 +33,7 @@ use crate::{
     },
     architectures::distributed::pipeline::{assign_module, load_deepseek_experts},
     core::cache::CacheRankIdentity,
+    core::generation::MtpConfig,
     error::Error,
     runtime::cache::residency::{
         open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
@@ -55,7 +56,7 @@ use crate::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
     runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
-    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
+    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpStats},
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertPass, ExpertRouteBatch,

@@ -25,7 +25,9 @@ Core owns concepts whose meaning does not depend on tensor representation:
 - artifact/model identity, SafeTensors/GGUF header inspection, model-family
   resolution, neutral tensor catalogs, and materialization-route selection;
 - validated attention schedules;
-- generation phases, cancellation, finish reasons, and semantic output events;
+- generation configuration validation, committed-token sequencing, terminal
+  precedence, cancellation, finish reasons, semantic output events, and
+  speculative proposal/verification commit plans;
 - queue fairness, request/work lifecycle, transactional branch commit/discard,
   exact-completion observation, cancellation, abandonment, and capacity;
 - backend/device descriptors and fail-closed capability discovery;
@@ -167,8 +169,12 @@ The current boundary leaves these components MLX-coupled:
 - architecture-specific checkpoint binding/weight recipes, mapped payload
   stores, GGUF decoding, and MLX array materialization (artifact detection,
   model-family resolution, neutral catalogs, and route planning are core-owned);
-- sampling, speculative decoding, activation observation, MLX allocator
-  sampling, and Metal/CUDA kernels.
+- logits filtering and sampling, proposal/verification tensor execution,
+  assistant and MTP model execution, concrete cache mutation, activation
+  observation, MLX allocator sampling, and Metal/CUDA kernels. Speculative
+  acceptance state, replacement/bonus bookkeeping, optimistic-prefix reuse,
+  cache-retention counts, token budgets, and terminal precedence are
+  core-owned.
 
 The former facade `runtime::residency::policy` module was deleted. It was not
 retained as a forwarding namespace. The earlier placeholder core
@@ -253,6 +259,30 @@ The former facade-only `FairScheduler`, `CompletedWork`, and `FailedWork` APIs
 were removed instead of retained as wrappers. `Scheduler`, `SchedulerProgress`,
 and `SchedulerError` are the only lifecycle types and are reexported by the
 facade.
+
+Ordinary and speculative text generation share one core-owned
+`GenerationSequence`. It is the sole committed token history and applies stop
+sequence, grammar, EOS, token-budget, and cancellation precedence. The MLX
+streaming adapter decodes and publishes each committed token but no longer owns
+a parallel token vector or finish-reason state.
+
+For speculative decoding, `SpeculativeRound` records proposal acceptance, a
+replacement or bonus tail, and whether the round terminated. Its commit plan
+determines both the tokens that become visible and the exact number of target
+verification inputs retained in the MLX cache. MLX still computes logits,
+samples target and draft distributions, mutates cache tensors, and owns exact
+completion. The scheduler publishes staged semantic events and tokens only
+after that cache transaction commits. Optimistic lookahead uses the pure core
+prefix/reuse decision before promoting or discarding MLX-owned draft state.
+
+Checkpoint sampling recommendations, request overrides, resolved sampler
+settings, MTP configuration, scheduler limits, request identity, and request
+phases likewise have one canonical definition in core. The MLX adapter maps a
+validated resolved configuration to its concrete `GenerationSampler`; it does
+not repeat validation. `MtpRequestLifecycle` validates every prefill, draft,
+submission, resolution, completion, and cancellation edge; cancellation stays
+pending while an MLX verification retains resources and becomes terminal only
+after that transaction reaches its exact safe boundary.
 
 ## Adding IREE or native Slang later
 

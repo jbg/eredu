@@ -41,6 +41,26 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::core::scheduler::SchedulerError>(),
     );
     assert_eq!(
+        TypeId::of::<safemlx_lm::FinishReason>(),
+        TypeId::of::<safemlx_lm::core::generation::FinishReason>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::SemanticEvent>(),
+        TypeId::of::<safemlx_lm::core::generation::SemanticEvent>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::GenerationConfigOverrides>(),
+        TypeId::of::<safemlx_lm::core::generation::GenerationConfigOverrides>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::MtpConfig>(),
+        TypeId::of::<safemlx_lm::core::generation::MtpConfig>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::MtpSchedulerOptions>(),
+        TypeId::of::<safemlx_lm::core::generation::MtpSchedulerOptions>(),
+    );
+    assert_eq!(
         TypeId::of::<safemlx_lm::OffloadConfig>(),
         TypeId::of::<safemlx_lm::core::residency::OffloadConfig>(),
     );
