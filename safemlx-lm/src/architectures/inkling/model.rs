@@ -41,15 +41,17 @@ use crate::{
         input,
     },
     architectures::qwen::dense::{gguf_i32_catalog, gguf_string},
+    core::cache::{
+        CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
+        StateTensorOwner, StateTensorPolicy, StateTensorRole,
+    },
     error::Error,
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::residency::{
         derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-        save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
-        CacheResidencyReport, LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension, StateTensorDtype,
-        StateTensorOwner, StateTensorPolicy, StateTensorRole,
+        save_prompt_cache_snapshot, CacheBlockArrays, CacheResidencyManager, CacheResidencyReport,
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
     },
     runtime::cache::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -381,7 +383,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
     geometry: &[ParallelLayerGeometry],
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
     let text = &args.text_config;
-    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+    let cache_error = |error: crate::core::cache::CachePolicyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let history = text.sconv_kernel_size.checked_sub(1).ok_or_else(|| {
@@ -5069,9 +5071,9 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_records_four_convolutions_and_attention_order() {
-        use crate::runtime::{
-            attention::AttentionPolicy,
-            cache::residency::{LayerCachePolicy, StateTensorRole},
+        use crate::{
+            core::cache::{LayerCachePolicy, StateTensorRole},
+            runtime::attention::AttentionPolicy,
         };
 
         let args = super::args_from_gguf_catalog(&tiny_gguf_metadata()).unwrap();

@@ -30,6 +30,10 @@ use crate::{
         DeepSeekQuantizationConfig, LayerPolicy as DeepSeekLayerPolicy, ModelArgs as DeepSeekArgs,
         MultiHeadLatentAttention,
     },
+    core::cache::{
+        CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
+        StateTensorOwner, StateTensorPolicy, StateTensorRole,
+    },
     error::Error,
     nn::{
         convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
@@ -48,12 +52,11 @@ use crate::{
         cache::{
             residency::{
                 derive_prompt_cache_architecture_fingerprint, load_prompt_cache_state_tensors,
-                open_prompt_cache, save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity,
+                open_prompt_cache, save_prompt_cache_snapshot, CacheBlockArrays,
                 CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-                LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+                PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
                 PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
-                PromptCacheStateArray, StateTensorDimension, StateTensorDtype, StateTensorOwner,
-                StateTensorPolicy, StateTensorRole,
+                PromptCacheStateArray,
             },
             CompressedLatentCache,
         },
@@ -705,7 +708,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
         .short_conv_kernel_size
         .checked_sub(1)
         .ok_or_else(|| Error::UnsupportedArchitecture("invalid Kimi KDA kernel width".into()))?;
-    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+    let cache_error = |error: crate::core::cache::CachePolicyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
@@ -3603,7 +3606,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_records_kda_fixed_state_and_mla_in_order() {
-        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+        use crate::core::cache::{LayerCachePolicy, StateTensorRole};
 
         let args = model_args_from_config_value(&config()).unwrap();
         let layout = super::prompt_cache_layer_layout(&args).unwrap();

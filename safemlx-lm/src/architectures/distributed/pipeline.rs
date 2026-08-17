@@ -67,6 +67,7 @@ use crate::{
         },
     },
     backend::mlx::consensus::MlxConsensusTransport,
+    core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
     core::{
         cache::{CachePoolReport, CacheResidencyPool},
         residency::{
@@ -83,10 +84,9 @@ use crate::{
     },
     runtime::cache::residency::{
         load_prompt_cache_state_tensors, open_prompt_cache, validate_prompt_cache_model_identity,
-        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheStateArray, PromptCacheTopology, StateTensorOwner,
-        StateTensorPolicy, StateTensorRole,
+        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheStateArray, PromptCacheTopology,
     },
     runtime::cache::{
         CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -24900,12 +24900,12 @@ mod tests {
             crate::LayerSchedule::new(
                 1,
                 vec![crate::LayerCachePolicy::FixedState {
-                    tensors: vec![crate::runtime::cache::residency::StateTensorPolicy {
-                        role: crate::runtime::cache::residency::StateTensorRole::Recurrent,
-                        shape: vec![crate::runtime::cache::residency::StateTensorDimension::Scalar],
-                        dtype: crate::runtime::cache::residency::StateTensorDtype::Float32,
+                    tensors: vec![crate::core::cache::StateTensorPolicy {
+                        role: crate::core::cache::StateTensorRole::Recurrent,
+                        shape: vec![crate::core::cache::StateTensorDimension::Scalar],
+                        dtype: crate::core::cache::StateTensorDtype::Float32,
                         residency: crate::MutableStateResidency::LayerScopedOffloadable,
-                        presence: crate::runtime::cache::residency::StateTensorPresence::Required,
+                        presence: crate::core::cache::StateTensorPresence::Required,
                     }],
                 }],
             )
@@ -24923,7 +24923,7 @@ mod tests {
         assert_eq!(slots.len(), 1);
         assert_eq!(
             slots[0].policy().role,
-            crate::runtime::cache::residency::StateTensorRole::Recurrent
+            crate::core::cache::StateTensorRole::Recurrent
         );
         assert!(slots[0].value().is_none());
         assert_eq!(slots[0].offset(), 0);
@@ -24933,8 +24933,8 @@ mod tests {
     fn semantic_state_slots_reset_and_reject_inconsistent_offsets() {
         let policy = StateTensorPolicy::new(
             StateTensorRole::Recurrent,
-            vec![crate::runtime::cache::residency::StateTensorDimension::Scalar],
-            crate::runtime::cache::residency::StateTensorDtype::Float32,
+            vec![crate::core::cache::StateTensorDimension::Scalar],
+            crate::core::cache::StateTensorDtype::Float32,
             crate::MutableStateResidency::LayerScopedOffloadable,
         )
         .unwrap();
@@ -24976,7 +24976,7 @@ mod tests {
 
     #[test]
     fn recurrent_pipeline_layouts_use_only_semantic_cache_variants() {
-        use crate::runtime::cache::residency::{StateTensorDimension, StateTensorDtype};
+        use crate::core::cache::{StateTensorDimension, StateTensorDtype};
 
         let tensor = |role| {
             let residency = match role {

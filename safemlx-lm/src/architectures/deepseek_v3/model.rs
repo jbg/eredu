@@ -42,6 +42,7 @@ use crate::{
     },
 };
 use crate::{
+    core::cache::CacheRankIdentity,
     error::Error,
     nn::tensor::{
         create_causal_mask,
@@ -50,9 +51,9 @@ use crate::{
     runtime::attention::LayerSchedule,
     runtime::cache::residency::{
         derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
-        validate_prompt_cache_model_identity, CacheBlockArrays, CacheRankIdentity,
-        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        validate_prompt_cache_model_identity, CacheBlockArrays, CacheResidencyManager,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     },
     runtime::cache::{
         BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock,

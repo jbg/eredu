@@ -2186,7 +2186,7 @@ mod tests {
 
     #[test]
     fn tensor_parallel_plan_preserves_attention_and_packed_moe_geometry() {
-        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorDimension};
+        use crate::core::cache::{LayerCachePolicy, StateTensorDimension};
 
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         for (rank, query_width, kv_width, dense_width, expert_width, local_kv_heads) in

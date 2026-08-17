@@ -51,13 +51,13 @@ use crate::runtime::media::PreparedModelInput;
 #[cfg(feature = "media-processing")]
 use crate::runtime::media::{load_processor, ChatMediaBinding, ModelProcessor, ProcessorInput};
 use crate::{
-    core::cache::CacheResidencyPool,
+    core::cache::{CacheResidencyPool, LayerCachePolicy},
     error::Error,
     runtime::attention::LayerSchedule,
     runtime::cache::residency::{
         validate_prompt_cache_model_identity, CacheResidencyPolicy, CacheResidencyReport,
-        LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-        PromptCacheModelIdentity, PromptCacheOptions,
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions,
     },
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::generation::speculative::{

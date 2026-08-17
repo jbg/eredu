@@ -54,6 +54,10 @@ use crate::{
         },
         input,
     },
+    core::cache::{
+        LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorOwner,
+        StateTensorPolicy, StateTensorRole,
+    },
     error::Error,
     nn::tensor::{
         create_causal_mask,
@@ -63,10 +67,9 @@ use crate::{
     runtime::cache::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, LayerCachePolicy, PromptCacheDescriptor,
+            save_prompt_cache_snapshot, CacheBlockArrays, PromptCacheDescriptor,
             PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-            PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension,
-            StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+            PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache,
     },
@@ -1068,7 +1071,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
     args: &ModelArgs,
     geometry: &[ParallelLayerGeometry],
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
-    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+    let cache_error = |error: crate::core::cache::CachePolicyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let layers = args.num_hidden_layers as usize;
@@ -6299,7 +6302,7 @@ pub struct Cache {
     pub(crate) token_ids: Vec<u32>,
     prefix_embeddings: Option<Array>,
     prefix_len: usize,
-    pub(crate) rank: Option<crate::runtime::cache::residency::CacheRankIdentity>,
+    pub(crate) rank: Option<crate::core::cache::CacheRankIdentity>,
 }
 
 impl Cache {
@@ -7096,7 +7099,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_records_optional_multimodal_prefix_embeddings() {
-        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+        use crate::core::cache::{LayerCachePolicy, StateTensorRole};
 
         let args = model_args(false);
         let layout = super::prompt_cache_layer_layout(&args).unwrap();
@@ -7107,13 +7110,13 @@ mod tests {
         assert_eq!(tensors[0].role, StateTensorRole::PrefixEmbedding);
         assert_eq!(
             tensors[0].presence,
-            crate::runtime::cache::residency::StateTensorPresence::Optional
+            crate::core::cache::StateTensorPresence::Optional
         );
     }
 
     #[test]
     fn prompt_cache_layout_uses_planner_authored_local_kv_geometry() {
-        use crate::runtime::cache::residency::LayerCachePolicy;
+        use crate::core::cache::LayerCachePolicy;
 
         let args = model_args(false);
         let geometry = (0..args.num_hidden_layers as usize)

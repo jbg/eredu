@@ -2918,7 +2918,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
 
     pub(crate) fn prompt_cache_rank_identity(
         &self,
-    ) -> Option<crate::runtime::cache::residency::CacheRankIdentity> {
+    ) -> Option<crate::core::cache::CacheRankIdentity> {
         self.parallel_topology
             .map(PromptCacheTopology::for_parallel_topology)
             .and_then(|topology| topology.cache_rank_identity())

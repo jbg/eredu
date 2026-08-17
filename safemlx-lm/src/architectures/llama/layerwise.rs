@@ -24,6 +24,7 @@ use crate::{
         input,
         llama::{self as resident, AttentionInput, ModelArgs, TransformerBlock},
     },
+    core::cache::LayerCachePolicy,
     error::Error,
     nn::{
         parallel::{
@@ -35,8 +36,8 @@ use crate::{
     },
     runtime::cache::residency::{
         open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheTopology,
     },
     runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     runtime::checkpoint::binding::{build_module_bindings, populate_module_from_lease},

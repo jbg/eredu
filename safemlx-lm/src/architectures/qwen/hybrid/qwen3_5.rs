@@ -46,7 +46,10 @@ use crate::{
         },
         input as runtime_input,
     },
-    core::cache::CacheResidencyPool,
+    core::cache::{
+        CacheRankIdentity, CacheResidencyPool, LayerCachePolicy, StateTensorDimension,
+        StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+    },
     error::Error,
     nn::tensor::{
         create_attention_mask,
@@ -57,12 +60,10 @@ use crate::{
     runtime::cache::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
-            CacheResidencyPolicy, CacheResidencyReport, LayerCachePolicy, PagedCacheOptions,
-            PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-            PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
-            StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-            StateTensorRole,
+            save_prompt_cache_snapshot, CacheBlockArrays, CacheResidencyManager,
+            CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
@@ -805,7 +806,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
     args: &ModelArgs,
     geometry: &[ParallelLayerGeometry],
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
-    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+    let cache_error = |error: crate::core::cache::CachePolicyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
@@ -7699,7 +7700,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_records_hybrid_state_in_exact_order() {
-        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+        use crate::core::cache::{LayerCachePolicy, StateTensorRole};
 
         let args = tiny_args(vec![LINEAR, FULL, LINEAR]);
         let layout = super::prompt_cache_layer_layout(&args).unwrap();
@@ -7722,9 +7723,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_uses_rank_local_hybrid_geometry() {
-        use crate::runtime::cache::residency::{
-            LayerCachePolicy, StateTensorDimension, StateTensorRole,
-        };
+        use crate::core::cache::{LayerCachePolicy, StateTensorDimension, StateTensorRole};
 
         let args = tiny_args(vec![LINEAR, FULL]);
         let geometry = [

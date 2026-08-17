@@ -33,7 +33,10 @@ Core owns concepts whose meaning does not depend on tensor representation:
   windows, deterministic eviction, exact transfer generations, accounting, and
   serialized reports.
 - process-wide live-cache membership, multi-resource admission, exact
-  reservation ownership, occupancy reports, and high-water accounting.
+  reservation ownership, occupancy reports, and high-water accounting;
+- stable cache block/rank identity, logical tier vocabulary,
+  per-layer attention-state geometry, fixed-state roles, symbolic shapes, dtype
+  families, and pure state-residency validation.
 
 A backend owns executable models, tensor values, streams/queues, cache storage,
 sampling math, transfers, collectives, kernels, native errors, and the concrete
@@ -82,7 +85,10 @@ owned exclusively by the central loader.
 
 MLX arrays, streams, devices, events, executable layer modules, and concrete KV
 cache tensors remain wholly in `safemlx-lm`. Core sees only associated opaque
-types. Neutral checkpoint descriptors describe names, shapes, dtypes, and byte
+types. The MLX pager consumes core `CacheBlockId` and `LayerCachePolicy`
+contracts directly; it owns only the arrays, leases, transfer completions, and
+physical storage that realize them. Neutral checkpoint descriptors describe
+names, shapes, dtypes, and byte
 locations; MLX weight stores remain responsible for validating source formats
 and materializing arrays. `OffloadPlan` is the only weight-residency plan:
 budgets, tier assignments, eviction policy, transfer accounting, prefetch and
@@ -113,8 +119,10 @@ The current boundary leaves these components MLX-coupled:
   telemetry adapters;
 - concrete topology device assignment, communicator construction, collectives,
   and tensor movement;
-- per-block cache promotion/demotion, mutable-tail and lease state, prompt-cache
-  catalog/materialization, and concrete cache tensors;
+- per-block cache promotion/demotion ownership, mutable-tail and lease state,
+  prompt-cache manifest/catalog publication and materialization, and concrete
+  cache tensors (block identity, tier vocabulary, layer geometry,
+  fixed-state policy, and pure validation are already core-owned);
 - weight array/host-buffer materialization, native transfer events, retained
   source mappings, and physical-capacity queries (the corresponding ownership,
   admission, eviction, window, lease, and generation state is now in core);
@@ -143,6 +151,13 @@ and holds core reservation tokens across asynchronous host transfers and live
 disk operations. Pool errors cross the adapter as a transparent structured
 source. Per-block tensor state remains in the MLX adapter until its intertwined
 event and disk-worker transitions are separated as one complete state machine.
+
+The former facade definitions of cache block identity, logical tiers, layer
+cache geometry, and fixed-state policy were deleted as well.
+Architecture modules import the canonical core contract directly. MLX manifest
+and array validation call core policy validation, symbolic shape resolution,
+and dtype-family matching; `runtime::cache::residency` does not forward these
+types.
 
 The neutral scheduler in core now owns both production single-rank realtime and
 distributed pipeline request lifecycles. Queueing, fairness, deadlines,

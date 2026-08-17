@@ -8,7 +8,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    num::NonZeroU32,
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Component, Path, PathBuf},
     sync::{
@@ -33,8 +32,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     core::cache::{
-        CachePoolError, CachePoolLimits, CachePoolMembership, CachePoolReservation,
-        CachePoolResource, CachePoolUsage, CacheResidencyPool,
+        CacheBlockId, CachePolicyError, CachePoolError, CachePoolLimits, CachePoolMembership,
+        CachePoolReservation, CachePoolResource, CachePoolUsage, CacheRankIdentity,
+        CacheRepresentation, CacheResidencyPool, CacheTier, LayerCachePolicy, StateTensorOwner,
+        StateTensorPolicy, StateTensorRole,
     },
     core::residency::CacheEvictionPolicy,
     runtime::attention::{AttentionPolicy, LayerSchedule},
@@ -279,75 +280,6 @@ pub(crate) fn cache_pool_for_paged_options(
         transfer_bytes,
         disk_bytes,
     )?))
-}
-
-/// Representation stored atomically in one cache block.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheRepresentation {
-    /// Standard attention keys and values.
-    KeyValue,
-    /// DeepSeek compressed latent state and rotary keys.
-    CompressedLatentRotary,
-}
-
-/// Optional rank identity included in a stable cache block identifier.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct CacheRankIdentity {
-    /// Pipeline rank, when pipeline partitioning is active.
-    pub pipeline_rank: Option<usize>,
-    /// Tensor-parallel rank, when cache heads are sharded.
-    pub tensor_parallel_rank: Option<usize>,
-    /// Expert-parallel rank for replicated attention state.
-    pub expert_parallel_rank: Option<usize>,
-}
-
-/// Stable identity for one immutable sealed cache block.
-#[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct CacheBlockId {
-    /// Identity shared by every block in one live cache.
-    pub session_id: u64,
-    /// Architecture-global decoder layer index.
-    pub global_layer: usize,
-    /// Stored attention representation.
-    pub representation: CacheRepresentation,
-    /// Inclusive absolute token position.
-    pub start: i64,
-    /// Exclusive absolute token position.
-    pub end: i64,
-    /// Rank-local ownership identity.
-    pub rank: Option<CacheRankIdentity>,
-}
-
-/// Logical location of a sealed cache block.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheTier {
-    /// Available to execution without a catalog load.
-    Device,
-    /// Evaluated CPU-resident state with no execution-device copy retained by the manager.
-    Host,
-    /// Stored in a live or persistent safetensors shard.
-    Disk,
-}
-
-/// Lifecycle state visible through cache diagnostics.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum CacheBlockLifecycle {
-    /// A layer-owned append target that has not been sealed.
-    MutableDeviceTail,
-    /// Immutable state kept on the execution device.
-    SealedDevice,
-    /// Immutable evaluated host state.
-    SealedHost,
-    /// Immutable disk-backed state.
-    DiskBacked,
-    /// A shared background disk transfer is queued or running.
-    InFlight,
-    /// State removed from live attention and persistence retention.
-    Discarded,
-    /// Read-only state cataloged from a prompt cache.
-    ImportedReadOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -3518,7 +3450,7 @@ impl CacheResidencyManager {
             ));
         }
         for policy in descriptor.layer_layout.iter() {
-            validate_layer_cache_policy(policy)?;
+            policy.validate()?;
         }
         let parent = destination.parent().ok_or_else(|| {
             CacheResidencyError::InvalidPromptCachePath(destination.to_path_buf())
@@ -3895,564 +3827,6 @@ impl Drop for CacheBlockLease {
     }
 }
 
-/// Exact state kind, attention policy, and tensor geometry for one decoder layer.
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LayerCachePolicy {
-    /// This layer contributes no independently persisted attention state.
-    NoState,
-    /// Ordinary attention keys and values.
-    KeyValue {
-        /// Exact full or sliding attention range for this layer.
-        attention: AttentionPolicy,
-        /// Rank-local key/value head count.
-        num_key_value_heads: NonZeroU32,
-        /// Per-head key/value dimension.
-        head_dim: NonZeroU32,
-    },
-    /// Attention history whose value payload is intentionally empty.
-    KeyOnly {
-        /// Exact full or sliding attention range for this layer.
-        attention: AttentionPolicy,
-        /// Rank-local key head count.
-        num_key_heads: NonZeroU32,
-        /// Per-head key dimension.
-        head_dim: NonZeroU32,
-    },
-    /// DeepSeek compressed latent state plus rotary keys.
-    CompressedLatentRotary {
-        /// Exact full or sliding attention range for this layer.
-        attention: AttentionPolicy,
-        /// Compressed latent width.
-        latent_dim: NonZeroU32,
-        /// Rotary-key width.
-        rotary_dim: NonZeroU32,
-    },
-    /// Fixed-size recurrent or convolution state without an attention payload.
-    FixedState {
-        /// Ordered tensors required to resume this layer.
-        tensors: Vec<StateTensorPolicy>,
-    },
-    /// Ordinary attention plus fixed-size recurrent or convolution state.
-    KeyValueWithFixedState {
-        /// Exact full or sliding attention range for this layer.
-        attention: AttentionPolicy,
-        /// Rank-local key/value head count.
-        num_key_value_heads: NonZeroU32,
-        /// Per-head key/value dimension.
-        head_dim: NonZeroU32,
-        /// Ordered tensors required in addition to keys and values.
-        tensors: Vec<StateTensorPolicy>,
-    },
-    /// Key-only attention plus mutable pooling or recurrent state.
-    KeyOnlyWithFixedState {
-        /// Exact full or sliding attention range for this layer.
-        attention: AttentionPolicy,
-        /// Rank-local key head count.
-        num_key_heads: NonZeroU32,
-        /// Per-head key dimension.
-        head_dim: NonZeroU32,
-        /// Ordered tensors required in addition to keys.
-        tensors: Vec<StateTensorPolicy>,
-    },
-}
-
-/// Semantic role of one non-attention cache tensor.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StateTensorRole {
-    /// Bounded causal-convolution history. `slot` distinguishes parallel histories.
-    Convolution {
-        /// Stable slot within the layer's ordered convolution states.
-        slot: u32,
-    },
-    /// Recurrent transition or linear-attention state.
-    Recurrent,
-    /// Prepared multimodal prefix embeddings needed for exact replay.
-    PrefixEmbedding,
-    /// Model-global multimodal position offset.
-    PositionDelta,
-    /// One tensor in an append-only token-pooling stream.
-    Pooling {
-        /// Stable stream slot within the owning layer.
-        stream: u32,
-        /// Exact component of the pooling state.
-        component: PoolingStateComponent,
-    },
-}
-
-/// Semantic component of one append-only pooling stream.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PoolingStateComponent {
-    /// Source values waiting for a complete pooling group.
-    PendingValues,
-    /// Source gate logits waiting for a complete pooling group.
-    PendingGates,
-    /// Complete pooled output history.
-    Pooled,
-    /// Source values retained for an overlapping group.
-    OverlapValues,
-    /// Source gate logits retained for an overlapping group.
-    OverlapGates,
-}
-
-/// Runtime ownership behavior for live model state.
-///
-/// The variants describe mutually exclusive physical lifecycles instead of a
-/// tier plus independent flags. Mutable rolling state cannot accidentally be
-/// admitted to the sealed pager, and layer-scoped state has an explicit
-/// promotion/demotion boundary.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StateResidencyClass {
-    /// Small mutable state that remains on the execution device for its lifetime.
-    AlwaysDeviceMutable,
-    /// Append-only state that becomes immutable blocks before paging.
-    SealablePaged,
-    /// Mutable state used by one layer at a time and eligible for host offload
-    /// between layer executions.
-    LayerScopedOffloadable,
-}
-
-/// Residency behaviors valid for mutable fixed-state tensors.
-///
-/// `SealablePaged` is deliberately absent: fixed mutable state cannot be
-/// constructed as an append-only paged payload.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MutableStateResidency {
-    /// Small mutable state that remains on the execution device.
-    AlwaysDeviceMutable,
-    /// Mutable state promoted only for its owning layer.
-    LayerScopedOffloadable,
-}
-
-impl From<MutableStateResidency> for StateResidencyClass {
-    fn from(value: MutableStateResidency) -> Self {
-        match value {
-            MutableStateResidency::AlwaysDeviceMutable => Self::AlwaysDeviceMutable,
-            MutableStateResidency::LayerScopedOffloadable => Self::LayerScopedOffloadable,
-        }
-    }
-}
-
-/// One dimension in a persisted fixed-state tensor.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StateTensorDimension {
-    /// Manifest batch size.
-    Batch,
-    /// Exact prompt token count.
-    PrefixTokens,
-    /// Integer quotient of the exact prompt token count and a positive divisor.
-    PrefixTokensDiv(NonZeroU32),
-    /// Integer remainder of the exact prompt token count and a positive divisor.
-    PrefixTokensRem(NonZeroU32),
-    /// Positive architecture-defined dimension.
-    Fixed(NonZeroU32),
-    /// Scalar dimension list marker; only valid as the sole entry.
-    Scalar,
-}
-
-/// Exact condition under which a state tensor must be materialized.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StateTensorPresence {
-    /// Every persisted cache materializes the tensor.
-    Required,
-    /// The tensor may be present independently of prefix geometry.
-    Optional,
-    /// The tensor is present exactly when the prefix has a non-zero remainder.
-    PrefixRemainderNonZero(NonZeroU32),
-    /// The tensor is present exactly when the prefix contains one complete group.
-    PrefixAtLeast(NonZeroU32),
-}
-
-/// Accepted dtype family for one fixed-state tensor.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StateTensorDtype {
-    /// Any MLX floating dtype; the exact stored dtype is still recorded and checked.
-    Floating,
-    /// Exactly IEEE F32.
-    Float32,
-    /// Signed 32-bit integer.
-    Int32,
-    /// Unsigned 32-bit integer.
-    Uint32,
-}
-
-/// Exact semantic role, symbolic shape, and dtype contract for a state tensor.
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub struct StateTensorPolicy {
-    /// Meaning of this tensor within its owning layer or global cache state.
-    pub role: StateTensorRole,
-    /// Exact shape with batch/prefix dimensions resolved from the manifest.
-    pub shape: Vec<StateTensorDimension>,
-    /// Accepted dtype family.
-    pub dtype: StateTensorDtype,
-    /// Authoritative live-state residency behavior.
-    pub residency: MutableStateResidency,
-    /// Exact condition under which persisted caches materialize this tensor.
-    pub presence: StateTensorPresence,
-}
-
-impl LayerCachePolicy {
-    /// Returns the residency behavior of this layer's attention payload.
-    pub const fn attention_residency_class(&self) -> Option<StateResidencyClass> {
-        match self {
-            Self::NoState | Self::FixedState { .. } => None,
-            Self::KeyValue { .. }
-            | Self::KeyOnly { .. }
-            | Self::CompressedLatentRotary { .. }
-            | Self::KeyValueWithFixedState { .. }
-            | Self::KeyOnlyWithFixedState { .. } => Some(StateResidencyClass::SealablePaged),
-        }
-    }
-
-    /// Constructs validated ordinary key/value state geometry.
-    pub fn key_value(
-        attention: AttentionPolicy,
-        num_key_value_heads: i32,
-        head_dim: i32,
-    ) -> Result<Self, CacheResidencyError> {
-        Ok(Self::KeyValue {
-            attention,
-            num_key_value_heads: positive_u32(num_key_value_heads, "key/value head count")?,
-            head_dim: positive_u32(head_dim, "key/value head dimension")?,
-        })
-    }
-
-    /// Constructs validated key-only attention state geometry.
-    pub fn key_only(
-        attention: AttentionPolicy,
-        num_key_heads: i32,
-        head_dim: i32,
-    ) -> Result<Self, CacheResidencyError> {
-        Ok(Self::KeyOnly {
-            attention,
-            num_key_heads: positive_u32(num_key_heads, "key head count")?,
-            head_dim: positive_u32(head_dim, "key head dimension")?,
-        })
-    }
-
-    /// Constructs validated compressed-latent state geometry.
-    pub fn compressed_latent_rotary(
-        attention: AttentionPolicy,
-        latent_dim: i32,
-        rotary_dim: i32,
-    ) -> Result<Self, CacheResidencyError> {
-        Ok(Self::CompressedLatentRotary {
-            attention,
-            latent_dim: positive_u32(latent_dim, "compressed latent dimension")?,
-            rotary_dim: positive_u32(rotary_dim, "rotary-key dimension")?,
-        })
-    }
-
-    /// Constructs a validated fixed-state-only layer policy.
-    pub fn fixed_only(tensors: Vec<StateTensorPolicy>) -> Result<Self, CacheResidencyError> {
-        let policy = Self::FixedState { tensors };
-        validate_layer_cache_policy(&policy)?;
-        Ok(policy)
-    }
-
-    /// Constructs validated ordinary attention plus fixed-state geometry.
-    pub fn key_value_with_fixed_state(
-        attention: AttentionPolicy,
-        num_key_value_heads: i32,
-        head_dim: i32,
-        tensors: Vec<StateTensorPolicy>,
-    ) -> Result<Self, CacheResidencyError> {
-        let policy = Self::KeyValueWithFixedState {
-            attention,
-            num_key_value_heads: positive_u32(num_key_value_heads, "key/value head count")?,
-            head_dim: positive_u32(head_dim, "key/value head dimension")?,
-            tensors,
-        };
-        validate_layer_cache_policy(&policy)?;
-        Ok(policy)
-    }
-
-    /// Constructs validated key-only attention plus mutable state geometry.
-    pub fn key_only_with_fixed_state(
-        attention: AttentionPolicy,
-        num_key_heads: i32,
-        head_dim: i32,
-        tensors: Vec<StateTensorPolicy>,
-    ) -> Result<Self, CacheResidencyError> {
-        let policy = Self::KeyOnlyWithFixedState {
-            attention,
-            num_key_heads: positive_u32(num_key_heads, "key head count")?,
-            head_dim: positive_u32(head_dim, "key head dimension")?,
-            tensors,
-        };
-        validate_layer_cache_policy(&policy)?;
-        Ok(policy)
-    }
-
-    /// Returns the exact attention policy when this layer owns attention state.
-    pub const fn attention(&self) -> Option<AttentionPolicy> {
-        match self {
-            Self::NoState | Self::FixedState { .. } => None,
-            Self::KeyValue { attention, .. }
-            | Self::KeyOnly { attention, .. }
-            | Self::CompressedLatentRotary { attention, .. }
-            | Self::KeyValueWithFixedState { attention, .. }
-            | Self::KeyOnlyWithFixedState { attention, .. } => Some(*attention),
-        }
-    }
-
-    /// Returns the ordered non-attention tensor policies for this layer.
-    pub fn fixed_state(&self) -> &[StateTensorPolicy] {
-        match self {
-            Self::FixedState { tensors }
-            | Self::KeyValueWithFixedState { tensors, .. }
-            | Self::KeyOnlyWithFixedState { tensors, .. } => tensors,
-            _ => &[],
-        }
-    }
-}
-
-impl StateTensorDimension {
-    /// Constructs a positive fixed dimension.
-    pub fn fixed(value: i32) -> Result<Self, CacheResidencyError> {
-        positive_u32(value, "fixed-state tensor dimension").map(Self::Fixed)
-    }
-}
-
-impl StateTensorPolicy {
-    /// Constructs a state-tensor policy after validating its symbolic shape.
-    pub fn new(
-        role: StateTensorRole,
-        shape: Vec<StateTensorDimension>,
-        dtype: StateTensorDtype,
-        residency: MutableStateResidency,
-    ) -> Result<Self, CacheResidencyError> {
-        let policy = Self {
-            role,
-            shape,
-            dtype,
-            residency,
-            presence: StateTensorPresence::Required,
-        };
-        validate_state_tensor_policies(std::slice::from_ref(&policy))?;
-        Ok(policy)
-    }
-
-    /// Marks this tensor as absent for cache instances that do not use the state.
-    pub const fn optional(mut self) -> Self {
-        self.presence = StateTensorPresence::Optional;
-        self
-    }
-
-    /// Requires this tensor exactly when `prefix_tokens % divisor != 0`.
-    pub const fn when_prefix_remainder_nonzero(mut self, divisor: NonZeroU32) -> Self {
-        self.presence = StateTensorPresence::PrefixRemainderNonZero(divisor);
-        self
-    }
-
-    /// Requires this tensor exactly when `prefix_tokens >= divisor`.
-    pub const fn when_prefix_at_least(mut self, divisor: NonZeroU32) -> Self {
-        self.presence = StateTensorPresence::PrefixAtLeast(divisor);
-        self
-    }
-
-    /// Returns whether this tensor must be present for the exact prompt length.
-    pub fn is_required_for(&self, prefix_tokens: usize) -> bool {
-        match self.presence {
-            StateTensorPresence::Required => true,
-            StateTensorPresence::Optional => false,
-            StateTensorPresence::PrefixRemainderNonZero(divisor) => {
-                !prefix_tokens.is_multiple_of(divisor.get() as usize)
-            }
-            StateTensorPresence::PrefixAtLeast(divisor) => prefix_tokens >= divisor.get() as usize,
-        }
-    }
-
-    /// Returns the unified residency classification for this fixed state.
-    pub fn residency_class(&self) -> StateResidencyClass {
-        self.residency.into()
-    }
-}
-
-fn positive_u32(value: i32, field: &str) -> Result<NonZeroU32, CacheResidencyError> {
-    u32::try_from(value)
-        .ok()
-        .and_then(NonZeroU32::new)
-        .ok_or_else(|| {
-            CacheResidencyError::InvalidOptions(format!(
-                "prompt-cache {field} must be positive and fit u32, got {value}"
-            ))
-        })
-}
-
-fn attention_policy_from_sliding_window(
-    window: Option<i32>,
-) -> Result<AttentionPolicy, CacheResidencyError> {
-    match window {
-        None => Ok(AttentionPolicy::Full),
-        Some(window) => {
-            let window = u32::try_from(window)
-                .ok()
-                .and_then(NonZeroU32::new)
-                .ok_or_else(|| {
-                    CacheResidencyError::InvalidOptions(format!(
-                        "attention sliding window must be positive and fit u32, got {window}"
-                    ))
-                })?;
-            Ok(AttentionPolicy::Sliding { window })
-        }
-    }
-}
-
-fn attention_policy_sliding_window_i32(
-    attention: AttentionPolicy,
-) -> Result<Option<i32>, CacheResidencyError> {
-    attention
-        .window()
-        .map(|window| {
-            i32::try_from(window.get()).map_err(|_| {
-                CacheResidencyError::IncompatiblePromptCache(format!(
-                    "attention sliding window {window} exceeds the runtime i32 range"
-                ))
-            })
-        })
-        .transpose()
-}
-
-fn validate_layer_cache_policy(policy: &LayerCachePolicy) -> Result<(), CacheResidencyError> {
-    if let Some(attention) = policy.attention() {
-        attention_policy_sliding_window_i32(attention)?;
-    }
-    let validate_dimension = |dimension: NonZeroU32| {
-        if dimension.get() > i32::MAX as u32 {
-            Err(CacheResidencyError::IncompatiblePromptCache(format!(
-                "prompt-cache layer dimension {dimension} exceeds the runtime i32 range"
-            )))
-        } else {
-            Ok(())
-        }
-    };
-    match policy {
-        LayerCachePolicy::NoState => {}
-        LayerCachePolicy::KeyValue {
-            num_key_value_heads,
-            head_dim,
-            ..
-        }
-        | LayerCachePolicy::KeyValueWithFixedState {
-            num_key_value_heads,
-            head_dim,
-            ..
-        } => {
-            validate_dimension(*num_key_value_heads)?;
-            validate_dimension(*head_dim)?;
-        }
-        LayerCachePolicy::KeyOnly {
-            num_key_heads,
-            head_dim,
-            ..
-        }
-        | LayerCachePolicy::KeyOnlyWithFixedState {
-            num_key_heads,
-            head_dim,
-            ..
-        } => {
-            validate_dimension(*num_key_heads)?;
-            validate_dimension(*head_dim)?;
-        }
-        LayerCachePolicy::CompressedLatentRotary {
-            latent_dim,
-            rotary_dim,
-            ..
-        } => {
-            validate_dimension(*latent_dim)?;
-            validate_dimension(*rotary_dim)?;
-        }
-        LayerCachePolicy::FixedState { .. } => {}
-    }
-    let tensors = policy.fixed_state();
-    if tensors.is_empty()
-        && matches!(
-            policy,
-            LayerCachePolicy::FixedState { .. }
-                | LayerCachePolicy::KeyValueWithFixedState { .. }
-                | LayerCachePolicy::KeyOnlyWithFixedState { .. }
-        )
-    {
-        return Err(CacheResidencyError::InvalidOptions(
-            "fixed-state cache policy must contain at least one tensor".into(),
-        ));
-    }
-    validate_state_tensor_policies(tensors)
-}
-
-fn validate_state_tensor_policies(
-    tensors: &[StateTensorPolicy],
-) -> Result<(), CacheResidencyError> {
-    let mut roles = BTreeSet::new();
-    for tensor in tensors {
-        if !roles.insert(tensor.role) {
-            return Err(CacheResidencyError::InvalidOptions(format!(
-                "duplicate fixed-state tensor role {:?}",
-                tensor.role
-            )));
-        }
-        if tensor.shape.is_empty()
-            || (tensor.shape.contains(&StateTensorDimension::Scalar)
-                && tensor.shape.as_slice() != [StateTensorDimension::Scalar])
-        {
-            return Err(CacheResidencyError::InvalidOptions(format!(
-                "invalid fixed-state tensor shape for role {:?}",
-                tensor.role
-            )));
-        }
-        let expected = match tensor.role {
-            StateTensorRole::Recurrent => MutableStateResidency::LayerScopedOffloadable,
-            StateTensorRole::Convolution { .. }
-            | StateTensorRole::PrefixEmbedding
-            | StateTensorRole::PositionDelta
-            | StateTensorRole::Pooling { .. } => MutableStateResidency::AlwaysDeviceMutable,
-        };
-        if tensor.residency != expected {
-            return Err(CacheResidencyError::InvalidOptions(format!(
-                "fixed-state tensor role {:?} requires {:?} residency, got {:?}",
-                tensor.role, expected, tensor.residency
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn resolved_state_shape(
-    policy: &StateTensorPolicy,
-    batch_size: usize,
-    prefix_tokens: usize,
-) -> Result<Vec<i32>, CacheResidencyError> {
-    policy
-        .shape
-        .iter()
-        .map(|dimension| match dimension {
-            StateTensorDimension::Batch => i32::try_from(batch_size),
-            StateTensorDimension::PrefixTokens => i32::try_from(prefix_tokens),
-            StateTensorDimension::PrefixTokensDiv(divisor) => {
-                i32::try_from(prefix_tokens / divisor.get() as usize)
-            }
-            StateTensorDimension::PrefixTokensRem(divisor) => {
-                i32::try_from(prefix_tokens % divisor.get() as usize)
-            }
-            StateTensorDimension::Fixed(value) => i32::try_from(value.get()),
-            StateTensorDimension::Scalar => Ok(1),
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            CacheResidencyError::InvalidOptions(
-                "fixed-state tensor dimension exceeds runtime i32 range".into(),
-            )
-        })
-}
-
 fn state_policy(
     layers: &LayerSchedule<LayerCachePolicy>,
     global_layer_start: usize,
@@ -4505,7 +3879,7 @@ fn validate_state_arrays(
                 ))
             })?,
         )?;
-        let expected = resolved_state_shape(policy, batch_size, layer_tokens)?;
+        let expected = policy.resolved_shape(batch_size, layer_tokens)?;
         if state.array.shape() != expected {
             return Err(CacheResidencyError::MalformedManifest(format!(
                 "fixed-state tensor {:?} for {:?} has shape {:?}, expected {:?}",
@@ -4516,7 +3890,7 @@ fn validate_state_arrays(
             )));
         }
         let dtype = dtype_name(state.array.dtype());
-        if !state_dtype_matches(policy.dtype, &dtype) {
+        if !policy.accepts_dtype_name(&dtype) {
             return Err(CacheResidencyError::MalformedManifest(format!(
                 "fixed-state tensor {:?} for {:?} has incompatible dtype {dtype}",
                 state.role, state.owner
@@ -4551,17 +3925,6 @@ fn validate_state_arrays(
         )));
     }
     Ok(())
-}
-
-fn state_dtype_matches(policy: StateTensorDtype, dtype: &str) -> bool {
-    match policy {
-        StateTensorDtype::Floating => {
-            matches!(dtype, "Float16" | "Bfloat16" | "Float32" | "Float64")
-        }
-        StateTensorDtype::Float32 => dtype == "Float32",
-        StateTensorDtype::Int32 => dtype == "Int32",
-        StateTensorDtype::Uint32 => dtype == "Uint32",
-    }
 }
 
 /// Compatibility identity supplied by a model when persisting a prefix cache.
@@ -4623,8 +3986,10 @@ impl PromptCacheModelIdentity {
         let policies = sliding_windows
             .into_iter()
             .map(|window| {
-                let attention = attention_policy_from_sliding_window(window)?;
+                let attention = AttentionPolicy::from_sliding_window(window)
+                    .map_err(|error| CacheResidencyError::InvalidOptions(error.to_string()))?;
                 LayerCachePolicy::key_value(attention, num_key_value_heads, head_dim)
+                    .map_err(CacheResidencyError::from)
             })
             .collect::<Result<Vec<_>, _>>()?;
         LayerSchedule::new(policies.len(), policies)
@@ -4643,6 +4008,7 @@ impl PromptCacheModelIdentity {
                     latent_dim,
                     rotary_dim,
                 )
+                .map_err(CacheResidencyError::from)
             })
             .collect::<Result<Vec<_>, _>>()?;
         LayerSchedule::new(layer_count, policies)
@@ -4831,14 +4197,6 @@ pub struct PromptCacheManifest {
     pub blocks: Vec<PromptCacheBlock>,
     /// Ordered fixed-size layer and model-global state tensors.
     pub state_tensors: Vec<PromptCacheStateTensor>,
-}
-
-/// Owner of one persisted non-attention state tensor.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StateTensorOwner {
-    /// Architecture-global decoder layer index.
-    Layer(usize),
 }
 
 /// One independently validated fixed-size state tensor.
@@ -5448,7 +4806,7 @@ fn validate_manifest(
         layer_prefix_tokens(manifest.total_prefix_tokens, *offset)?;
     }
     for (index, policy) in manifest.layer_layout.iter().enumerate() {
-        validate_layer_cache_policy(policy).map_err(|error| {
+        policy.validate().map_err(|error| {
             CacheResidencyError::MalformedManifest(format!(
                 "invalid policy for global layer {}: {error}",
                 manifest.global_layer_start + index
@@ -5706,10 +5064,11 @@ fn validate_manifest(
             manifest.total_prefix_tokens,
             manifest.layer_prefix_offsets[layer - manifest.global_layer_start],
         )?;
-        let expected_shape = resolved_state_shape(policy, manifest.batch_size, layer_prefix_tokens)
+        let expected_shape = policy
+            .resolved_shape(manifest.batch_size, layer_prefix_tokens)
             .map_err(|error| CacheResidencyError::MalformedManifest(error.to_string()))?;
         if entry.shape != expected_shape
-            || !state_dtype_matches(policy.dtype, &entry.dtype)
+            || !policy.accepts_dtype_name(&entry.dtype)
             || entry.logical_bytes == 0
             || !is_sha256_hex(&entry.payload_sha256)
             || entry.array != "state"
@@ -7229,6 +6588,9 @@ fn sample_process(_report: &mut CacheResidencyReport) {}
 /// Structured cache residency and persistence failures.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheResidencyError {
+    /// Backend-neutral cache identity, geometry, or state policy is invalid.
+    #[error(transparent)]
+    Policy(#[from] CachePolicyError),
     /// Backend-neutral aggregate cache ownership or admission failed.
     #[error(transparent)]
     Pool(#[from] CachePoolError),
@@ -7355,12 +6717,15 @@ mod tests {
         DiskCacheReadState, DiskLocation, DiskOperationKey, DiskOperationKind, DiskResult,
         DiskTask, DiskWorker, DiskWriteCommit, HostCacheBlock, HostCachePersistence,
         HostDemotionCompletion, HostDemotionTicket, HostWriteReservation, LayerCachePolicy,
-        LayerSchedule, MutableStateResidency, PagedCacheOptions, PendingDiskOperation,
-        PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology, StateTensorDimension,
-        StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole, TemporaryFileGuard,
-        CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
-        PROMPT_CACHE_GENERATIONS_DIRECTORY, PROMPT_CACHE_SCHEMA_VERSION,
+        LayerSchedule, PagedCacheOptions, PendingDiskOperation, PromptCacheBlock,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheStateTensor, PromptCacheTopology, StateTensorOwner, StateTensorPolicy,
+        StateTensorRole, TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+        MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_GENERATIONS_DIRECTORY,
+        PROMPT_CACHE_SCHEMA_VERSION,
+    };
+    use crate::core::cache::{
+        MutableStateResidency, StateResidencyClass, StateTensorDimension, StateTensorDtype,
     };
     use safemlx::{
         host_transfer_capacity_upper_bound, transforms::async_eval_with_event, Array, Device,
@@ -7663,8 +7028,8 @@ mod tests {
 
     #[test]
     fn attention_windows_reject_zero_negative_and_overflowing_sources() {
-        assert!(super::attention_policy_from_sliding_window(Some(0)).is_err());
-        assert!(super::attention_policy_from_sliding_window(Some(-1)).is_err());
+        assert!(AttentionPolicy::from_sliding_window(Some(0)).is_err());
+        assert!(AttentionPolicy::from_sliding_window(Some(-1)).is_err());
         for json in [
             r#"{"sliding":{"window":0}}"#,
             r#"{"sliding":{"window":-1}}"#,
@@ -7829,15 +7194,15 @@ mod tests {
         assert_eq!(hashes.len(), layouts.len());
         assert_eq!(
             convolution.residency_class(),
-            super::StateResidencyClass::AlwaysDeviceMutable
+            StateResidencyClass::AlwaysDeviceMutable
         );
         assert_eq!(
             recurrent.residency_class(),
-            super::StateResidencyClass::LayerScopedOffloadable
+            StateResidencyClass::LayerScopedOffloadable
         );
         assert_eq!(
             layouts[2].get(0).unwrap().attention_residency_class(),
-            Some(super::StateResidencyClass::SealablePaged)
+            Some(StateResidencyClass::SealablePaged)
         );
     }
 

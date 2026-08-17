@@ -47,6 +47,7 @@ use crate::{
         },
         input,
     },
+    core::cache::CacheRankIdentity,
     error::Error,
     nn::tensor::{
         create_causal_mask,
@@ -56,7 +57,7 @@ use crate::{
     runtime::cache::{
         residency::{
             open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            CacheRankIdentity, CacheResidencyManager, PromptCacheDescriptor, PromptCacheManifest,
+            CacheResidencyManager, PromptCacheDescriptor, PromptCacheManifest,
             PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,

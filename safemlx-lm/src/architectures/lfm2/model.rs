@@ -34,7 +34,10 @@ use crate::{
         input,
     },
     architectures::qwen::dense::gguf_string,
-    core::cache::CacheResidencyPool,
+    core::cache::{
+        CacheRankIdentity, CacheResidencyPool, LayerCachePolicy, StateTensorDimension,
+        StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+    },
     error::Error,
     nn::{
         parallel::forward_row_parallel,
@@ -48,12 +51,10 @@ use crate::{
     runtime::cache::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
-            CacheResidencyPolicy, CacheResidencyReport, LayerCachePolicy, PagedCacheOptions,
-            PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-            PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
-            StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-            StateTensorRole,
+            save_prompt_cache_snapshot, CacheBlockArrays, CacheResidencyManager,
+            CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
@@ -546,7 +547,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
             args.layer_schedule.len()
         )));
     }
-    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+    let cache_error = |error: crate::core::cache::CachePolicyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let history = args
@@ -2993,7 +2994,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_records_convolution_and_attention_in_order() {
-        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+        use crate::core::cache::{LayerCachePolicy, StateTensorRole};
 
         let args = model_args_from_config_value(&dense_config()).unwrap();
         let layout = super::prompt_cache_layer_layout(&args).unwrap();

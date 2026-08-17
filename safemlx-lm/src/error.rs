@@ -19,6 +19,10 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Invalid backend-neutral cache identity, geometry, or state policy.
+    #[error(transparent)]
+    CachePolicy(#[from] safemlx_lm_core::cache::CachePolicyError),
+
     /// Invalid dense disk streaming configuration or background work.
     #[error(transparent)]
     DenseStream(#[from] crate::runtime::residency::dense_stream::DenseStreamError),

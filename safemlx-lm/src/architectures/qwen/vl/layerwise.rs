@@ -3023,7 +3023,7 @@ mod tests {
 
     #[test]
     fn tensor_parallel_prompt_cache_identity_uses_planned_uneven_kv_heads() {
-        use crate::runtime::cache::residency::LayerCachePolicy;
+        use crate::core::cache::LayerCachePolicy;
 
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         for moe in [false, true] {

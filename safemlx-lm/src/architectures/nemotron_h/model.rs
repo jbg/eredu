@@ -38,18 +38,20 @@ use crate::{
         },
         input,
     },
+    core::cache::{
+        CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
+        StateTensorOwner, StateTensorPolicy, StateTensorRole,
+    },
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, load_prompt_cache_state_tensors,
-            open_prompt_cache, save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity,
-            CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, LayerCachePolicy,
-            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
-            PromptCacheStateArray, StateTensorDimension, StateTensorDtype, StateTensorOwner,
-            StateTensorPolicy, StateTensorRole,
+            open_prompt_cache, save_prompt_cache_snapshot, CacheBlockArrays, CacheResidencyManager,
+            CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
@@ -618,7 +620,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
     args: &ModelArgs,
     geometry: &[ParallelLayerGeometry],
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
-    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+    let cache_error = |error: crate::core::cache::CachePolicyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
@@ -5093,7 +5095,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_records_mamba_attention_and_stateless_layers() {
-        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+        use crate::core::cache::{LayerCachePolicy, StateTensorRole};
 
         let args = tiny_full_args();
         let layout = super::prompt_cache_layer_layout(&args).unwrap();

@@ -8,9 +8,11 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use crate::runtime::cache::residency::{
-    CacheBlockArrays, CacheBlockId, CacheRankIdentity, CacheRepresentation, CacheResidencyManager,
-    CacheResidencyReport, PagedCacheOptions,
+use crate::{
+    core::cache::{CacheBlockId, CacheRankIdentity, CacheRepresentation},
+    runtime::cache::residency::{
+        CacheBlockArrays, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,
+    },
 };
 
 // TODO: somehow move quantized methods to a separate trait?
@@ -2932,10 +2934,13 @@ mod tests {
         KeyValueAttentionBlock, KeyValueCache, PagedKeyValueCache, PoolingCache,
         SlidingKeyValueCache,
     };
-    use crate::runtime::cache::residency::{
-        inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheRankIdentity,
-        CacheRepresentation, CacheResidencyManager, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+    use crate::{
+        core::cache::{CacheRankIdentity, CacheRepresentation},
+        runtime::cache::residency::{
+            inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheResidencyManager,
+            PagedCacheOptions, PromptCacheDescriptor, PromptCacheModelIdentity, PromptCacheOptions,
+            PromptCacheTopology,
+        },
     };
     use safemlx::{
         fast::ScaledDotProductAttentionMask,

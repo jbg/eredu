@@ -29,6 +29,13 @@ fails closed per resource axis. Backends retain the cache tensors and native
 completion objects; dropping a reservation or manager membership releases only
 that owner's accounting.
 
+Cache semantics are core-owned as well. Stable block/rank identities, logical
+tiers, per-layer attention-state geometry, fixed-state roles,
+symbolic shapes, dtype families, and mutable-state residency classes have one
+canonical definition in this crate. Constructors and deserialized policies use
+the same validation. A backend maps these contracts to its arrays and storage;
+it cannot redefine cache geometry or fixed-state ownership.
+
 The production Moshi/PersonaPlex realtime scheduler uses the core request state
 machine. Its MLX adapter supplies opaque work, session branches, submissions,
 and exact completions while core owns fairness and transactional publication.

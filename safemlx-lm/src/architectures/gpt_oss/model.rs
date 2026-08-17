@@ -22,6 +22,7 @@ use tokenizers::Tokenizer;
 use crate::{
     api::{common, common::generation::CausalLm, input},
     architectures::qwen::dense::gguf_string,
+    core::cache::CacheRankIdentity,
     error::Error,
     nn::tensor::{
         create_causal_mask,
@@ -29,9 +30,9 @@ use crate::{
     },
     runtime::cache::residency::{
         derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
-        validate_prompt_cache_model_identity, CacheRankIdentity, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity,
+        validate_prompt_cache_model_identity, CacheResidencyManager, CacheResidencyPolicy,
+        CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+        PromptCacheModelIdentity,
     },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,

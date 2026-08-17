@@ -60,4 +60,16 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::CachePoolReport>(),
         TypeId::of::<safemlx_lm::core::cache::CachePoolReport>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::CacheBlockId>(),
+        TypeId::of::<safemlx_lm::core::cache::CacheBlockId>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::LayerCachePolicy>(),
+        TypeId::of::<safemlx_lm::core::cache::LayerCachePolicy>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::StateTensorPolicy>(),
+        TypeId::of::<safemlx_lm::core::cache::StateTensorPolicy>(),
+    );
 }

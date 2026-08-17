@@ -48,13 +48,10 @@ pub use api::{
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
 pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use runtime::cache::residency::{
-    inspect_prompt_cache, CacheBlockId, CacheBlockLifecycle, CacheLayerResidencyReport,
-    CacheLayerResidencyStats, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
-    CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, CacheTier, LayerCachePolicy,
-    LiveCacheDiskPolicy, MutableStateResidency, PagedCacheOptions, PoolingStateComponent,
-    PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
-    PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass, StateTensorDimension,
-    StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorPresence, StateTensorRole,
+    inspect_prompt_cache, CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyError,
+    CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, LiveCacheDiskPolicy,
+    PagedCacheOptions, PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology,
     CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 pub use runtime::cache::PagedKeyValueCache;
@@ -81,7 +78,11 @@ pub use runtime::residency::dense_stream::{
 };
 pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
 pub use safemlx_lm_core::cache::{
-    CachePoolError, CachePoolLimits, CachePoolReport, CachePoolResource, CacheResidencyPool,
+    CacheBlockId, CachePolicyError, CachePoolError, CachePoolLimits, CachePoolReport,
+    CachePoolResource, CacheRankIdentity, CacheRepresentation, CacheResidencyPool, CacheTier,
+    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateResidencyClass,
+    StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
+    StateTensorPresence, StateTensorRole,
 };
 pub use safemlx_lm_core::residency::{
     AllocatorMemoryMetrics, CacheEvictionPolicy, EvictionMetrics, MemoryTier, OffloadConfig,

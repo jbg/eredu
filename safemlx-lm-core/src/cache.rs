@@ -6,6 +6,15 @@
 //! admitted resource remains charged until its exact backend transition either
 //! publishes the bytes into a registered manager or drops the reservation.
 
+mod policy;
+
+pub use policy::{
+    CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
+    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateResidencyClass,
+    StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
+    StateTensorPresence, StateTensorRole,
+};
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,

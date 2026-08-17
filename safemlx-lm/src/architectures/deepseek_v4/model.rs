@@ -30,6 +30,10 @@ use crate::{
         input as runtime_input,
         qwen3_5::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
     },
+    core::cache::{
+        CacheRankIdentity, LayerCachePolicy, MutableStateResidency, PoolingStateComponent,
+        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
+    },
     error::Error,
     nn::{
         generation::CausalLm,
@@ -39,12 +43,9 @@ use crate::{
     runtime::cache::residency::{
         derive_prompt_cache_architecture_fingerprint, load_prompt_cache_state_tensors,
         open_prompt_cache, save_prompt_cache_snapshot, validate_prompt_cache_model_identity,
-        CacheBlockArrays, CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy,
-        CacheResidencyReport, LayerCachePolicy, MutableStateResidency, PagedCacheOptions,
-        PoolingStateComponent, PromptCacheDescriptor, PromptCacheManifest,
-        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
-        PromptCacheTopology, StateTensorDimension, StateTensorDtype, StateTensorPolicy,
-        StateTensorRole,
+        CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheTopology,
     },
     runtime::checkpoint::load::{
         gguf_quantization_configs,

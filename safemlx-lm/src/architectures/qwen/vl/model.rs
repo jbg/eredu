@@ -32,16 +32,19 @@ use crate::{
         qwen_vl::grid_thw_from_array,
     },
     architectures::qwen::dense as dense_qwen,
+    core::cache::{
+        LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorOwner,
+        StateTensorPolicy, StateTensorRole,
+    },
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
     runtime::attention::LayerSchedule,
     runtime::cache::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, LayerCachePolicy, PromptCacheDescriptor,
+            save_prompt_cache_snapshot, CacheBlockArrays, PromptCacheDescriptor,
             PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-            PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension,
-            StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+            PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache,
     },
@@ -203,7 +206,7 @@ pub(crate) fn prompt_cache_layer_layout_with_kv_heads(
     args: &ModelArgs,
     kv_heads: &[i32],
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
-    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+    let cache_error = |error: crate::core::cache::CachePolicyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let layers = args.text_config.num_hidden_layers as usize;
@@ -1701,7 +1704,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_records_multimodal_position_delta() {
-        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+        use crate::core::cache::{LayerCachePolicy, StateTensorRole};
 
         let layout = super::prompt_cache_layer_layout(&tiny_args()).unwrap();
         let LayerCachePolicy::KeyValueWithFixedState { tensors, .. } = layout.get(0).unwrap()
@@ -1714,7 +1717,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_accepts_exact_rank_local_kv_geometry() {
-        use crate::runtime::{attention::LayerSchedule, cache::residency::LayerCachePolicy};
+        use crate::{core::cache::LayerCachePolicy, runtime::attention::LayerSchedule};
 
         let mut args = tiny_args();
         args.text_config.num_hidden_layers = 2;

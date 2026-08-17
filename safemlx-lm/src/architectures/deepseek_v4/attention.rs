@@ -18,12 +18,10 @@ use safemlx::{
 
 use crate::{
     api::qwen3_5::QwenLinear as Linear,
+    core::cache::{CacheRankIdentity, PoolingStateComponent, StateTensorOwner, StateTensorRole},
     nn::attention::indexed_sparse_attention,
     runtime::cache::{
-        residency::{
-            CacheRankIdentity, CacheResidencyManager, PoolingStateComponent, PromptCacheStateArray,
-            StateTensorOwner, StateTensorRole,
-        },
+        residency::{CacheResidencyManager, PromptCacheStateArray},
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache, PoolingCache, PoolingCacheState,
     },
 };

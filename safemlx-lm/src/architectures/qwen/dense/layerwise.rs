@@ -30,6 +30,7 @@ use crate::{
         },
         input,
     },
+    core::cache::LayerCachePolicy,
     error::Error,
     nn::{
         parallel::{
@@ -40,9 +41,8 @@ use crate::{
         tensor::{create_attention_mask, AttentionMask},
     },
     runtime::cache::residency::{
-        CacheResidencyPolicy, CacheResidencyReport, LayerCachePolicy, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheTopology,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     },
     runtime::cache::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
