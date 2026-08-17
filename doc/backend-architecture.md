@@ -29,7 +29,9 @@ Core owns concepts whose meaning does not depend on tensor representation:
   exact-completion observation, cancellation, abandonment, and capacity;
 - backend/device descriptors and fail-closed capability discovery;
 - parallel axes, coordinates, membership, and portable placement descriptions;
-- residency policy, resource plans, accounting, and serialized reports.
+- weight-residency policy, atomic ownership/capacity transitions, protected
+  windows, deterministic eviction, exact transfer generations, accounting, and
+  serialized reports.
 
 A backend owns executable models, tensor values, streams/queues, cache storage,
 sampling math, transfers, collectives, kernels, native errors, and the concrete
@@ -84,21 +86,36 @@ and materializing arrays. `OffloadPlan` is the only weight-residency plan:
 budgets, tier assignments, eviction policy, transfer accounting, prefetch and
 eviction telemetry, process observations, and allocator observations all live
 in core. Its deserializer re-runs the same validation as programmatic
-construction. The MLX residency manager consumes that plan, owns concrete
-arrays and transfer leases, and records allocator samples obtained by
-`backend::mlx::residency` into the neutral telemetry schema.
+construction. `ResidencyLedger` is the canonical ownership state machine. It
+admits complete batches before mutation, distinguishes reserved from published
+copies, owns lease counts and named protected windows, selects deterministic
+victims, and keeps failed exact transfers from remaining logically resident.
+Every removal returns a typed copy descriptor that the backend must mirror by
+releasing its storage.
 
-## Coupling left for the next milestone
+The MLX residency manager embeds this ledger beside a storage-only map of
+`Array` and immutable host-transfer-buffer owners. It computes physical MLX
+allocation requirements, asks the ledger to reserve capacity, materializes and
+publishes concrete storage, and releases exactly the copies returned by ledger
+eviction or failed-completion transitions. MLX `Event` objects and retained
+transfer sources remain in the adapter; their stable generations are allocated
+and resolved by core. Allocator samples obtained by `backend::mlx::residency`
+are recorded into the neutral telemetry schema.
 
-The first vertical slice intentionally leaves these components MLX-coupled:
+## Coupling still present
+
+The current boundary leaves these components MLX-coupled:
 
 - non-Llama tensor execution, including multimodal and realtime model math;
 - MLX exact-completion objects, retained output arrays, and event-backend
   telemetry adapters;
 - concrete topology device assignment, communicator construction, collectives,
   and tensor movement;
-- weight/cache residency ownership state machines, array storage, prompt-cache
-  materialization, transfer buffers, and exact transfer completions;
+- cache-residency ownership and request-cache state machines, prompt-cache
+  materialization, and concrete cache tensors;
+- weight array/host-buffer materialization, native transfer events, retained
+  source mappings, and physical-capacity queries (the corresponding ownership,
+  admission, eviction, window, lease, and generation state is now in core);
 - checkpoint weight recipes/stores and MLX array materialization;
 - sampling, speculative decoding, activation observation, MLX allocator
   sampling, and Metal/CUDA kernels.
@@ -108,6 +125,13 @@ retained as a forwarding namespace. The earlier placeholder core
 `ResidencyPlan`, `ResourceSpec`, and `ResidencyReport` schemas were also deleted;
 the validated `OffloadPlan`, `OffloadUnitSpec`, and `OffloadReport` types used by
 production are now canonical and are reexported at the facade root.
+
+The former logical-copy records, byte counters, recency/frequency counters,
+window maps, blockers, eviction selection, lease accounting, and transfer
+generation state were also deleted from the MLX residency manager. They were
+not retained as forwarding wrappers or shadow state. `ResidencyLedger`,
+`ResidencyLedgerError`, `ResidencyBlocker`, and `UnitResidencyReport` in core
+are the sole definitions used by production.
 
 The neutral scheduler in core now owns both production single-rank realtime and
 distributed pipeline request lifecycles. Queueing, fairness, deadlines,
@@ -156,7 +180,11 @@ facade.
    exact ownership and synchronization semantics. For distributed scheduling,
    implement `ConsensusTransport` over a topology-wide, rank-ordered word
    all-gather and run the core mismatch/failure tests.
-7. Run the core mock conformance tests plus backend-specific Llama load,
+7. Pair concrete weight storage with `ResidencyLedger`: reserve full batches
+   before materialization, publish only complete copies, release every returned
+   eviction descriptor, and resolve the exact generation attached to native
+   transfer completion.
+8. Run the core mock conformance tests plus backend-specific Llama load,
    prefill, multi-step decode, cancellation, checkpoint, and parity tests.
-8. Add backend selection at the facade/application boundary. Do not dispatch
+9. Add backend selection at the facade/application boundary. Do not dispatch
    individual tensor operations between MLX and the new runtime.

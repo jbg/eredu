@@ -18,7 +18,8 @@ use safemlx::{
 
 use crate::{
     core::residency::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec,
+        ResidencyLedgerError, ResidencyPolicy,
     },
     error::Error,
     runtime::checkpoint::{
@@ -1020,10 +1021,10 @@ impl ExpertCache {
                 .acquire_many_with_demand(&host_requests, MemoryTier::Host)
             {
                 Ok(host) => drop(host),
-                Err(ResidencyError::BudgetExhausted {
+                Err(ResidencyError::Ledger(ResidencyLedgerError::BudgetExhausted {
                     tier: MemoryTier::Host,
                     ..
-                }) => {}
+                })) => {}
                 Err(error) => return Err(error.into()),
             }
         }

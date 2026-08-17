@@ -9,13 +9,17 @@ types at its facade root and supplies the default MLX backend. Backend authors
 can depend on this crate to implement whole-model preparation and session-level
 prefill/decode without implementing a primitive tensor algebra.
 
-Core owns the production weight-residency policy rather than a parallel summary
-schema. `OffloadPlan` validates stable unit identities, tier assignments,
-budgets, prefetch depth, and eviction policy. `OffloadTelemetry` and
+Core owns the production weight-residency policy and ownership state machine,
+not a parallel summary schema. `OffloadPlan` validates stable unit identities,
+tier assignments, budgets, prefetch depth, and eviction policy.
+`ResidencyLedger` atomically admits batches, reserves and publishes copies,
+tracks leases and protected windows, chooses deterministic eviction victims,
+and resolves exact transfer generations. Its transitions explicitly return the
+copies whose concrete storage a backend must release. `OffloadTelemetry` and
 `OffloadReport` account for transfers, prefetch, eviction, process memory, and
 backend allocator observations. Deserialization cannot bypass plan invariants.
-Backends own resource materialization, transfer submission, and exact transfer
-completion.
+Backends own only resource materialization, native transfer/completion objects,
+and destruction of the storage selected by ledger transitions.
 
 The production Moshi/PersonaPlex realtime scheduler uses the core request state
 machine. Its MLX adapter supplies opaque work, session branches, submissions,

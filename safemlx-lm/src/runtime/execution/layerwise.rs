@@ -17,7 +17,7 @@ use safemlx::{module::ModuleParameters, transforms::async_eval_with_event, Array
 use crate::{
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
-        ResidencyPolicy, TransferDirection,
+        ResidencyLedgerError, ResidencyPolicy, TransferDirection,
     },
     error::Error,
     runtime::cache::residency::{
@@ -2624,10 +2624,11 @@ impl<L> Drop for GroupExecutionState<L> {
 fn is_temporary_residency_contention(error: &Error) -> bool {
     matches!(
         error,
-        Error::Residency(ResidencyError::BudgetExhausted { .. })
-            | Error::LayerwiseModel(LayerwiseModelError::Residency(
-                ResidencyError::BudgetExhausted { .. }
-            ))
+        Error::Residency(ResidencyError::Ledger(
+            ResidencyLedgerError::BudgetExhausted { .. },
+        )) | Error::LayerwiseModel(LayerwiseModelError::Residency(ResidencyError::Ledger(
+            ResidencyLedgerError::BudgetExhausted { .. }
+        )))
     )
 }
 
@@ -3584,7 +3585,11 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                         .acquire_many_with_transfer(&requests, MemoryTier::Device)
                     {
                         Ok(transfer) => transfer,
-                        Err(error @ ResidencyError::BudgetExhausted { .. }) => {
+                        Err(
+                            error @ ResidencyError::Ledger(ResidencyLedgerError::BudgetExhausted {
+                                ..
+                            }),
+                        ) => {
                             let error = Error::Residency(error);
                             if states.iter().any(|state| state.completion.is_some()) {
                                 continue;
@@ -5577,7 +5582,7 @@ mod tests {
         architectures::llama::layerwise::{load_llama_safetensors_mlx, LlamaCache, LlamaModel},
         architectures::llama::model::{self as llama, ModelArgs},
         core::residency::TransferDirection,
-        runtime::residency::manager::UnitResidencyReport,
+        core::residency::UnitResidencyReport,
     };
 
     #[test]

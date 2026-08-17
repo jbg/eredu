@@ -84,8 +84,9 @@ pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheRe
 pub use safemlx_lm_core::residency::{
     AllocatorMemoryMetrics, CacheEvictionPolicy, EvictionMetrics, MemoryTier, OffloadConfig,
     OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry, OffloadUnitId, OffloadUnitSpec,
-    PrefetchMetrics, PrefetchOutcome, ProcessMetrics, ResidencyPolicy, TierByteTotals,
-    TierUnitTotals, TransferDirection, TransferMetrics, OFFLOAD_PLAN_SCHEMA_VERSION,
+    PrefetchMetrics, PrefetchOutcome, ProcessMetrics, ResidencyBlocker, ResidencyLedger,
+    ResidencyLedgerError, ResidencyPolicy, TierByteTotals, TierUnitTotals, TransferDirection,
+    TransferMetrics, UnitResidencyReport, OFFLOAD_PLAN_SCHEMA_VERSION,
 };
 pub use safemlx_lm_core::scheduler::{
     CancellationCause, RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,

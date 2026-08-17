@@ -26,8 +26,9 @@ use safemlx::{
 use crate::{
     backend::mlx::residency::sample_allocator_memory,
     core::residency::{
-        CacheEvictionPolicy, MemoryTier, OffloadPlan, OffloadReport, OffloadTelemetry,
-        OffloadUnitId, OffloadUnitSpec, PrefetchOutcome, ResidencyPolicy, TransferDirection,
+        EvictedResidencyCopy, MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId,
+        OffloadUnitSpec, PrefetchOutcome, ResidencyLedger, ResidencyLedgerError, TransferDirection,
+        UnitResidencyReport,
     },
     runtime::checkpoint::recipe::{DerivedWeightRecipe, WeightRecipeError},
     runtime::checkpoint::store::{
@@ -340,12 +341,7 @@ impl Drop for ResidentUnitLease {
         let Ok(mut state) = manager.state.lock() else {
             return;
         };
-        let Some(unit) = state.units.get_mut(&self.id) else {
-            return;
-        };
-        if let Some(copy) = unit.copy_mut(self.tier) {
-            copy.pins = copy.pins.saturating_sub(1);
-        }
+        state.ledger.unpin(&self.id, self.tier);
     }
 }
 
@@ -468,26 +464,10 @@ impl ResidentTransfer {
             .state
             .lock()
             .map_err(|_| ResidencyError::StatePoisoned)?;
-        for id in &self.ids {
-            let matches = state
-                .units
-                .get(id)
-                .and_then(|unit| unit.copy(self.tier))
-                .is_some_and(|copy| copy.in_flight == Some(generation));
-            if !matches {
-                continue;
-            }
-            if succeeded {
-                state
-                    .units
-                    .get_mut(id)
-                    .and_then(|unit| unit.copy_mut(self.tier))
-                    .expect("validated in-flight resident copy")
-                    .in_flight = None;
-            } else {
-                remove_copy_impl(&mut state, id, self.tier, false)?;
-            }
-        }
+        let removed = state
+            .ledger
+            .resolve_transfer(&self.ids, self.tier, generation, succeeded)?;
+        release_backend_copies(&mut state, &removed)?;
         manager.changed.notify_all();
         Ok(())
     }
@@ -499,25 +479,12 @@ impl Drop for ResidentTransfer {
     }
 }
 
-/// A resident unit that can prevent progress under a finite budget.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ResidencyBlocker {
-    /// Stable unit identifier.
-    pub id: OffloadUnitId,
-    /// Whether policy prevents eviction.
-    pub pinned: bool,
-    /// Number of active resident leases at the requested tier.
-    pub in_use: u64,
-    /// Whether the current execution window protects the unit.
-    pub active_window: bool,
-}
-
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
-    /// A named execution group had an empty identifier.
-    #[error("resident execution group id must not be empty")]
-    InvalidGroupId,
+    /// Backend-neutral ownership or capacity transition failed.
+    #[error(transparent)]
+    Ledger(#[from] ResidencyLedgerError),
     /// An ordered layer window had no units.
     #[error("device layer window requires at least one ordered unit")]
     EmptyLayerWindow,
@@ -572,9 +539,6 @@ pub enum ResidencyError {
         /// Duplicated identifier.
         id: OffloadUnitId,
     },
-    /// A batched acquisition requested the same unit more than once.
-    #[error("batched residency acquisition contains a duplicate unit")]
-    DuplicateBatchUnit,
     /// The plan had no matching unit definition.
     #[error("offload plan unit {id} has no residency unit definition")]
     MissingUnitDefinition {
@@ -620,24 +584,9 @@ pub enum ResidencyError {
         #[source]
         source: WeightRecipeError,
     },
-    /// A caller requested disk as an MLX array target.
-    #[error("{operation} requires Host or Device residency, not Disk")]
-    InvalidTargetTier {
-        /// Operation that rejected disk.
-        operation: &'static str,
-    },
     /// The configured source stream was not a CPU stream.
     #[error("the residency source stream must target the CPU")]
     InvalidSourceStream,
-    /// A transition was requested before explicit initialization completed.
-    #[error("the residency manager has not completed initialization")]
-    NotInitialized,
-    /// A requested unit does not exist.
-    #[error("unknown residency unit {id}")]
-    UnknownUnit {
-        /// Unknown identifier.
-        id: OffloadUnitId,
-    },
     /// A binding lookup failed on a valid resident unit.
     #[error("residency unit {id} has no binding named {name:?}")]
     UnknownBinding {
@@ -678,40 +627,6 @@ pub enum ResidencyError {
         /// Exact allocated capacity.
         actual_bytes: u64,
     },
-    /// A finite tier budget could not accommodate a unit.
-    #[error("cannot make {required_bytes} bytes resident for {requested} in {tier:?}: budget {budget_bytes}, currently resident {resident_bytes}, blockers {blocking_units:?}")]
-    BudgetExhausted {
-        /// Requested unit.
-        requested: OffloadUnitId,
-        /// Requested resident tier.
-        tier: MemoryTier,
-        /// Full unit size.
-        required_bytes: u64,
-        /// Configured finite budget.
-        budget_bytes: u64,
-        /// Bytes still resident after eligible evictions.
-        resident_bytes: u64,
-        /// Stable list of protected residents.
-        blocking_units: Vec<ResidencyBlocker>,
-    },
-    /// Explicit eviction targeted a pinned unit.
-    #[error("pinned residency unit {id} cannot be evicted from {tier:?}")]
-    PinnedEviction {
-        /// Unit identifier.
-        id: OffloadUnitId,
-        /// Protected tier.
-        tier: MemoryTier,
-    },
-    /// Explicit eviction targeted an in-use unit.
-    #[error("residency unit {id} has {pin_count} live leases in {tier:?}")]
-    InUseEviction {
-        /// Unit identifier.
-        id: OffloadUnitId,
-        /// Protected tier.
-        tier: MemoryTier,
-        /// Active lease count.
-        pin_count: u64,
-    },
     /// Checked byte or recency arithmetic overflowed.
     #[error("residency arithmetic overflow: {context}")]
     ArithmeticOverflow {
@@ -735,69 +650,6 @@ pub enum ResidencyError {
     /// Serialized manager state was poisoned by a prior panic.
     #[error("residency manager state is poisoned")]
     StatePoisoned,
-}
-
-/// Point-in-time state for one logical unit.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct UnitResidencyReport {
-    id: OffloadUnitId,
-    planned_tier: MemoryTier,
-    policy: ResidencyPolicy,
-    expected_bytes: u64,
-    host_allocated_bytes: u64,
-    device_allocated_bytes: u64,
-    host_resident: bool,
-    device_resident: bool,
-    host_pins: u64,
-    device_pins: u64,
-    active_window: bool,
-}
-
-impl UnitResidencyReport {
-    /// Returns the stable unit identifier.
-    pub fn id(&self) -> &OffloadUnitId {
-        &self.id
-    }
-    /// Returns the plan's initial tier.
-    pub const fn planned_tier(&self) -> MemoryTier {
-        self.planned_tier
-    }
-    /// Returns the operational residency policy.
-    pub const fn policy(&self) -> ResidencyPolicy {
-        self.policy
-    }
-    /// Returns the validated unit size.
-    pub const fn expected_bytes(&self) -> u64 {
-        self.expected_bytes
-    }
-    /// Returns exact physical capacity charged for host-transfer storage.
-    pub const fn host_allocated_bytes(&self) -> u64 {
-        self.host_allocated_bytes
-    }
-    /// Returns exact device-array bytes charged for this unit.
-    pub const fn device_allocated_bytes(&self) -> u64 {
-        self.device_allocated_bytes
-    }
-    /// Returns whether immutable typed host-transfer buffers are resident.
-    pub const fn host_resident(&self) -> bool {
-        self.host_resident
-    }
-    /// Returns whether evaluated execution-stream arrays are resident.
-    pub const fn device_resident(&self) -> bool {
-        self.device_resident
-    }
-    /// Returns active host leases.
-    pub const fn host_pins(&self) -> u64 {
-        self.host_pins
-    }
-    /// Returns active device leases.
-    pub const fn device_pins(&self) -> u64 {
-        self.device_pins
-    }
-    /// Returns whether the unit is in the current protected window.
-    pub const fn active_window(&self) -> bool {
-        self.active_window
-    }
 }
 
 /// Immutable manager, telemetry, and store diagnostic snapshot.
@@ -888,7 +740,7 @@ impl ResidentLayerGroup {
     ) -> Result<Self, ResidencyError> {
         let id = id.into();
         if id.trim().is_empty() {
-            return Err(ResidencyError::InvalidGroupId);
+            return Err(ResidencyLedgerError::InvalidGroupId.into());
         }
         Ok(Self {
             id,
@@ -1188,30 +1040,21 @@ impl ResidencyManager {
                 spec.id().clone(),
                 UnitRecord {
                     definition,
-                    spec: spec.clone(),
                     host: None,
                     device: None,
                 },
             );
         }
 
-        let telemetry = OffloadTelemetry::from_plan(&plan);
+        let ledger = ResidencyLedger::new(plan);
         Ok(Self {
             inner: Arc::new(ManagerInner {
                 store,
                 state: Mutex::new(ManagerState {
-                    plan,
+                    ledger,
                     units: records,
                     source_stream,
                     device_stream,
-                    active_windows: BTreeMap::new(),
-                    group_windows: BTreeMap::new(),
-                    telemetry,
-                    host_bytes: 0,
-                    device_bytes: 0,
-                    tick: 0,
-                    next_transfer_generation: 1,
-                    initialized: false,
                 }),
                 changed: Condvar::new(),
             }),
@@ -1225,20 +1068,22 @@ impl ResidencyManager {
     /// caller to inspect the report and retry initialization.
     pub fn initialize(&self) -> Result<(), ResidencyError> {
         let mut state = self.lock()?;
-        if state.initialized {
+        if state.ledger.initialized() {
             return Ok(());
         }
         let assignments = state
-            .units
-            .values()
-            .map(|unit| (unit.spec.id().clone(), unit.spec.tier()))
+            .ledger
+            .plan()
+            .units()
+            .iter()
+            .map(|unit| (unit.id().clone(), unit.tier()))
             .collect::<Vec<_>>();
         for (id, tier) in assignments {
             if tier != MemoryTier::Disk {
                 ensure_resident(&mut state, self.inner.store.as_ref(), &id, tier)?;
             }
         }
-        state.initialized = true;
+        state.ledger.mark_initialized();
         Ok(())
     }
 
@@ -1254,13 +1099,9 @@ impl ResidencyManager {
         validate_target(tier, "prefetch")?;
         let mut state = self.lock()?;
         loop {
-            require_initialized(&state)?;
-            let copy = state
-                .units
-                .get(id)
-                .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?
-                .copy(tier);
-            if !copy.is_some_and(|copy| copy.in_flight.is_some()) {
+            state.ledger.require_initialized()?;
+            let copy = state.ledger.copy_status(id, tier)?;
+            if !copy.is_some_and(|copy| copy.in_flight().is_some()) {
                 break;
             }
             state = self
@@ -1354,22 +1195,24 @@ impl ResidencyManager {
         return_transfer: bool,
     ) -> Result<(Vec<ResidentUnitLease>, Option<SubmittedResidentTransfer>), ResidencyError> {
         validate_target(tier, "acquire")?;
-        let mut seen = BTreeSet::new();
-        if requests.iter().any(|(id, _)| !seen.insert(id.clone())) {
-            return Err(ResidencyError::DuplicateBatchUnit);
-        }
         let mut state = self.lock()?;
+        let ids = requests
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        state.ledger.validate_batch(&ids, tier)?;
         loop {
-            require_initialized(&state)?;
+            state.ledger.require_initialized()?;
             for (id, _) in requests {
-                if !state.units.contains_key(id) {
-                    return Err(ResidencyError::UnknownUnit { id: id.clone() });
-                }
+                state.ledger.spec(id)?;
             }
             let waiting = requests.iter().any(|(id, _)| {
-                state.units[id]
-                    .copy(tier)
-                    .is_some_and(|copy| copy.in_flight.is_some())
+                state
+                    .ledger
+                    .copy_status(id, tier)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|copy| copy.in_flight().is_some())
             });
             if !waiting {
                 break;
@@ -1382,13 +1225,9 @@ impl ResidencyManager {
         }
         let missing = requests
             .iter()
-            .filter(|(id, _)| !state.units[id].is_resident(tier))
+            .filter(|(id, _)| !state.ledger.is_resident(id, tier).unwrap_or(false))
             .count();
         let started = Instant::now();
-        let ids = requests
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
         let residency = ensure_many_resident(
             &mut state,
             self.inner.store.as_ref(),
@@ -1397,40 +1236,20 @@ impl ResidencyManager {
             return_transfer,
         );
         if missing > 0 {
-            state.telemetry.record_prefetch_stall(started.elapsed());
+            state.ledger.record_prefetch_stall(started.elapsed());
         }
         let (_, submitted) = residency?;
         let leases = requests
             .iter()
             .map(|(id, demand)| {
-                let tick = next_tick(&mut state)?;
-                let unit = state
-                    .units
-                    .get_mut(id)
-                    .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?;
-                let copy = unit.copy_mut(tier).ok_or(ResidencyError::StatePoisoned)?;
-                copy.pins = copy
-                    .pins
-                    .checked_add(1)
-                    .ok_or(ResidencyError::ArithmeticOverflow {
-                        context: "resident lease count",
-                    })?;
-                copy.last_used = tick;
-                copy.frequency = copy.frequency.saturating_add(*demand);
+                state.ledger.pin(id, tier, *demand)?;
+                let unit = state.units.get(id).ok_or(ResidencyError::StatePoisoned)?;
                 let storage = match tier {
                     MemoryTier::Host => ResidentLeaseStorage::Host(Arc::clone(
-                        &unit
-                            .host
-                            .as_ref()
-                            .ok_or(ResidencyError::StatePoisoned)?
-                            .storage,
+                        unit.host.as_ref().ok_or(ResidencyError::StatePoisoned)?,
                     )),
                     MemoryTier::Device => ResidentLeaseStorage::Device(Arc::clone(
-                        &unit
-                            .device
-                            .as_ref()
-                            .ok_or(ResidencyError::StatePoisoned)?
-                            .storage,
+                        unit.device.as_ref().ok_or(ResidencyError::StatePoisoned)?,
                     )),
                     MemoryTier::Disk => unreachable!("validated above"),
                 };
@@ -1453,11 +1272,7 @@ impl ResidencyManager {
     ) -> Result<bool, ResidencyError> {
         validate_target(tier, "is_resident")?;
         let state = self.lock()?;
-        Ok(state
-            .units
-            .get(id)
-            .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?
-            .is_resident(tier))
+        Ok(state.ledger.is_resident(id, tier)?)
     }
 
     /// Replaces the protected window and synchronously prepares bounded lookahead.
@@ -1485,22 +1300,20 @@ impl ResidencyManager {
         upcoming: &[OffloadUnitId],
         tier: MemoryTier,
     ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, ResidencyError> {
-        if group.trim().is_empty() {
-            return Err(ResidencyError::InvalidGroupId);
-        }
         validate_target(tier, "prepare_group_window")?;
         let mut state = self.lock()?;
         loop {
-            require_initialized(&state)?;
+            state.ledger.require_initialized()?;
             for id in active.iter().chain(upcoming) {
-                if !state.units.contains_key(id) {
-                    return Err(ResidencyError::UnknownUnit { id: id.clone() });
-                }
+                state.ledger.spec(id)?;
             }
             let waiting = active.iter().chain(upcoming).any(|id| {
-                state.units[id]
-                    .copy(tier)
-                    .is_some_and(|copy| copy.in_flight.is_some())
+                state
+                    .ledger
+                    .copy_status(id, tier)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|copy| copy.in_flight().is_some())
             });
             if !waiting {
                 break;
@@ -1511,22 +1324,8 @@ impl ResidencyManager {
                 .wait(state)
                 .map_err(|_| ResidencyError::StatePoisoned)?;
         }
-        let key = (group.to_string(), tier);
-        if active.is_empty() {
-            state.group_windows.remove(&key);
-        } else {
-            state
-                .group_windows
-                .insert(key, active.iter().cloned().collect());
-        }
-        let active_window = state
-            .group_windows
-            .iter()
-            .filter(|((_, window_tier), _)| *window_tier == tier)
-            .flat_map(|(_, window)| window.iter().cloned())
-            .collect();
-        state.active_windows.insert(tier, active_window);
-        let depth = state.plan.config().prefetch_depth();
+        state.ledger.set_group_window(group, active, tier)?;
+        let depth = state.ledger.plan().config().prefetch_depth();
         let mut seen = BTreeSet::new();
         let selected = upcoming
             .iter()
@@ -1554,32 +1353,13 @@ impl ResidencyManager {
         active: &[OffloadUnitId],
         tier: MemoryTier,
     ) -> Result<(), ResidencyError> {
-        if group.trim().is_empty() {
-            return Err(ResidencyError::InvalidGroupId);
-        }
         let mut state = self.lock()?;
-        require_initialized(&state)?;
+        state.ledger.require_initialized()?;
         for id in active {
-            if !state.units.contains_key(id) {
-                return Err(ResidencyError::UnknownUnit { id: id.clone() });
-            }
+            state.ledger.spec(id)?;
         }
         validate_target(tier, "protect_group_window")?;
-        let key = (group.to_string(), tier);
-        if active.is_empty() {
-            state.group_windows.remove(&key);
-        } else {
-            state
-                .group_windows
-                .insert(key, active.iter().cloned().collect());
-        }
-        let active_window = state
-            .group_windows
-            .iter()
-            .filter(|((_, window_tier), _)| *window_tier == tier)
-            .flat_map(|(_, window)| window.iter().cloned())
-            .collect();
-        state.active_windows.insert(tier, active_window);
+        state.ledger.set_group_window(group, active, tier)?;
         Ok(())
     }
 
@@ -1589,27 +1369,17 @@ impl ResidencyManager {
     pub fn evict(&self, id: &OffloadUnitId, tier: MemoryTier) -> Result<bool, ResidencyError> {
         validate_target(tier, "evict")?;
         let mut state = self.lock()?;
-        let unit = state
-            .units
-            .get(id)
-            .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?;
-        let Some(copy) = unit.copy(tier) else {
+        let Some(evicted) = state.ledger.evict(id, tier)? else {
             return Ok(false);
         };
-        if unit.spec.policy() == ResidencyPolicy::Pinned {
-            return Err(ResidencyError::PinnedEviction {
-                id: id.clone(),
-                tier,
-            });
+        if !state
+            .units
+            .get_mut(id)
+            .is_some_and(|unit| unit.remove_storage(tier))
+        {
+            return Err(ResidencyError::StatePoisoned);
         }
-        if copy.pins != 0 {
-            return Err(ResidencyError::InUseEviction {
-                id: id.clone(),
-                tier,
-                pin_count: copy.pins,
-            });
-        }
-        remove_copy(&mut state, id, tier)?;
+        debug_assert_eq!(evicted.id, *id);
         Ok(true)
     }
 
@@ -1626,10 +1396,10 @@ impl ResidencyManager {
                 operation: "allocator memory sampling",
                 source,
             })?;
-            state.telemetry.record_allocator_memory(metrics);
+            state.ledger.record_allocator_memory(metrics);
         }
         if include_process {
-            state.telemetry.sample_process_metrics();
+            state.ledger.sample_process_metrics();
         }
         Ok(())
     }
@@ -1659,31 +1429,11 @@ impl ResidencyManager {
         ResidencyError,
     > {
         let state = self.lock()?;
-        let active = state
-            .active_windows
-            .values()
-            .flat_map(|window| window.iter().cloned())
-            .collect::<BTreeSet<_>>();
-        let units = state
-            .units
-            .values()
-            .map(|unit| UnitResidencyReport {
-                id: unit.spec.id().clone(),
-                planned_tier: unit.spec.tier(),
-                policy: unit.spec.policy(),
-                expected_bytes: unit.spec.bytes(),
-                host_allocated_bytes: unit.host.as_ref().map_or(0, |copy| copy.state.bytes),
-                device_allocated_bytes: unit.device.as_ref().map_or(0, |copy| copy.state.bytes),
-                host_resident: unit.host.is_some(),
-                device_resident: unit.device.is_some(),
-                host_pins: unit.host.as_ref().map_or(0, |copy| copy.state.pins),
-                device_pins: unit.device.as_ref().map_or(0, |copy| copy.state.pins),
-                active_window: active.contains(unit.spec.id()),
-            })
-            .collect();
+        let active = state.ledger.active_window();
+        let units = state.ledger.unit_reports();
         Ok((
-            state.initialized,
-            state.telemetry.snapshot(),
+            state.ledger.initialized(),
+            state.ledger.telemetry(),
             units,
             active.into_iter().collect(),
         ))
@@ -1704,18 +1454,10 @@ struct ManagerInner {
 }
 
 struct ManagerState {
-    plan: OffloadPlan,
+    ledger: ResidencyLedger,
     units: BTreeMap<OffloadUnitId, UnitRecord>,
     source_stream: Stream,
     device_stream: Stream,
-    active_windows: BTreeMap<MemoryTier, BTreeSet<OffloadUnitId>>,
-    group_windows: BTreeMap<(String, MemoryTier), BTreeSet<OffloadUnitId>>,
-    telemetry: OffloadTelemetry,
-    host_bytes: u64,
-    device_bytes: u64,
-    tick: u64,
-    next_transfer_generation: u64,
-    initialized: bool,
 }
 
 // SAFETY: every access to the MLX stream handles and resident arrays in this
@@ -1725,44 +1467,34 @@ unsafe impl Send for ManagerState {}
 
 struct UnitRecord {
     definition: OffloadUnit,
-    spec: OffloadUnitSpec,
-    host: Option<ResidentCopy<ResidentHostBuffers>>,
-    device: Option<ResidentCopy<ResidentArrays>>,
+    host: Option<Arc<ResidentHostBuffers>>,
+    device: Option<Arc<ResidentArrays>>,
 }
 
 impl UnitRecord {
-    fn copy(&self, tier: MemoryTier) -> Option<&ResidentCopyState> {
+    fn remove_storage(&mut self, tier: MemoryTier) -> bool {
         match tier {
-            MemoryTier::Host => self.host.as_ref().map(|copy| &copy.state),
-            MemoryTier::Device => self.device.as_ref().map(|copy| &copy.state),
-            MemoryTier::Disk => None,
+            MemoryTier::Host => self.host.take().is_some(),
+            MemoryTier::Device => self.device.take().is_some(),
+            MemoryTier::Disk => false,
         }
-    }
-
-    fn copy_mut(&mut self, tier: MemoryTier) -> Option<&mut ResidentCopyState> {
-        match tier {
-            MemoryTier::Host => self.host.as_mut().map(|copy| &mut copy.state),
-            MemoryTier::Device => self.device.as_mut().map(|copy| &mut copy.state),
-            MemoryTier::Disk => None,
-        }
-    }
-
-    fn is_resident(&self, tier: MemoryTier) -> bool {
-        self.copy(tier).is_some()
     }
 }
 
-struct ResidentCopy<T> {
-    storage: Arc<T>,
-    state: ResidentCopyState,
-}
-
-struct ResidentCopyState {
-    in_flight: Option<u64>,
-    bytes: u64,
-    pins: u64,
-    last_used: u64,
-    frequency: u64,
+fn release_backend_copies(
+    state: &mut ManagerState,
+    copies: &[EvictedResidencyCopy],
+) -> Result<(), ResidencyError> {
+    for copy in copies {
+        let removed = state
+            .units
+            .get_mut(&copy.id)
+            .is_some_and(|unit| unit.remove_storage(copy.tier));
+        if !removed {
+            return Err(ResidencyError::StatePoisoned);
+        }
+    }
+    Ok(())
 }
 
 struct ResidentArrays {
@@ -1847,17 +1579,9 @@ fn validate_unit_bytes(
     Ok(())
 }
 
-fn require_initialized(state: &ManagerState) -> Result<(), ResidencyError> {
-    if state.initialized {
-        Ok(())
-    } else {
-        Err(ResidencyError::NotInitialized)
-    }
-}
-
 fn validate_target(tier: MemoryTier, operation: &'static str) -> Result<(), ResidencyError> {
     if tier == MemoryTier::Disk {
-        Err(ResidencyError::InvalidTargetTier { operation })
+        Err(ResidencyLedgerError::InvalidTargetTier { operation }.into())
     } else {
         Ok(())
     }
@@ -1873,17 +1597,13 @@ fn prefetch_locked(
     id: &OffloadUnitId,
     tier: MemoryTier,
 ) -> Result<PrefetchOutcome, ResidencyError> {
-    let hit = state
-        .units
-        .get(id)
-        .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?
-        .is_resident(tier);
+    let hit = state.ledger.is_resident(id, tier)?;
     let outcome = if hit {
         PrefetchOutcome::Hit
     } else {
         PrefetchOutcome::Miss
     };
-    state.telemetry.record_tier_prefetch(tier, outcome);
+    state.ledger.record_prefetch(tier, outcome);
     ensure_resident(state, store, id, tier)?;
     Ok(outcome)
 }
@@ -1909,66 +1629,39 @@ fn ensure_many_resident(
     if ids.is_empty() {
         return Ok((Vec::new(), None));
     }
-    let mut unique = BTreeSet::new();
-    for id in ids {
-        if !unique.insert(id.clone()) {
-            return Err(ResidencyError::DuplicateBatchUnit);
-        }
-        if !state.units.contains_key(id) {
-            return Err(ResidencyError::UnknownUnit { id: id.clone() });
-        }
-    }
+    state.ledger.validate_batch(ids, tier)?;
     let created = ids
         .iter()
-        .map(|id| !state.units[id].is_resident(tier))
-        .collect::<Vec<_>>();
+        .map(|id| state.ledger.is_resident(id, tier).map(|resident| !resident))
+        .collect::<Result<Vec<_>, _>>()?;
     if created.iter().all(|value| !value) {
         for id in ids {
-            let tick = next_tick(state)?;
-            state
-                .units
-                .get_mut(id)
-                .and_then(|unit| unit.copy_mut(tier))
-                .ok_or(ResidencyError::StatePoisoned)?
-                .last_used = tick;
+            state.ledger.touch(id, tier)?;
         }
         return Ok((created, None));
     }
 
-    let temporary_protection = ids
-        .iter()
-        .filter(|id| {
-            state
-                .active_windows
-                .entry(tier)
-                .or_default()
-                .insert((*id).clone())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let temporary_protection = ids.iter().cloned().collect::<BTreeSet<_>>();
     let started = Instant::now();
-    let mut reserved = 0u64;
+    let mut reserved = Vec::new();
     let result = (|| {
+        let mut reservations = Vec::new();
         for (id, is_missing) in ids.iter().zip(&created) {
             if !is_missing {
                 continue;
             }
-            let required = resident_capacity_requirement(&state.units[id], tier)?;
-            reserve_capacity(state, id, tier, required)?;
-            let total = tier_bytes(state, tier).checked_add(required).ok_or(
-                ResidencyError::ArithmeticOverflow {
-                    context: "resident byte reservation",
-                },
+            let required = resident_capacity_requirement(
+                &state.units[id],
+                state.ledger.spec(id)?.bytes(),
+                tier,
             )?;
-            let next_reserved =
-                reserved
-                    .checked_add(required)
-                    .ok_or(ResidencyError::ArithmeticOverflow {
-                        context: "resident batch reservation",
-                    })?;
-            set_tier_bytes(state, tier, total);
-            reserved = next_reserved;
+            reservations.push((id.clone(), required));
+            reserved.push(id.clone());
         }
+        let evicted = state
+            .ledger
+            .reserve_copies(&reservations, tier, &temporary_protection)?;
+        release_backend_copies(state, &evicted)?;
 
         if tier == MemoryTier::Host {
             let mut prepared = Vec::new();
@@ -1979,7 +1672,7 @@ fn ensure_many_resident(
                 let bindings = state.units[id].definition.bindings.clone();
                 let buffers = materialize_host_buffers(id, store, &bindings, &state.source_stream)?;
                 let logical = host_buffers_nbytes(&buffers)?;
-                let planned = state.units[id].spec.bytes();
+                let planned = state.ledger.spec(id)?.bytes();
                 if logical != planned {
                     return Err(ResidencyError::UnitByteMismatch {
                         id: id.clone(),
@@ -1988,7 +1681,11 @@ fn ensure_many_resident(
                     });
                 }
                 let capacity = host_buffers_capacity(&buffers)?;
-                let reserved_capacity = resident_capacity_requirement(&state.units[id], tier)?;
+                let reserved_capacity = resident_capacity_requirement(
+                    &state.units[id],
+                    state.ledger.spec(id)?.bytes(),
+                    tier,
+                )?;
                 if capacity > reserved_capacity {
                     return Err(ResidencyError::HostCapacityBoundExceeded {
                         id: id.clone(),
@@ -1998,50 +1695,14 @@ fn ensure_many_resident(
                 }
                 prepared.push((id.clone(), buffers, logical, capacity, reserved_capacity));
             }
-            let actual_capacity =
-                prepared
-                    .iter()
-                    .try_fold(0u64, |total, (_, _, _, capacity, _)| {
-                        total
-                            .checked_add(*capacity)
-                            .ok_or(ResidencyError::ArithmeticOverflow {
-                                context: "resident host capacity total",
-                            })
-                    })?;
-            let reserved_capacity =
-                prepared
-                    .iter()
-                    .try_fold(0u64, |total, (_, _, _, _, capacity)| {
-                        total
-                            .checked_add(*capacity)
-                            .ok_or(ResidencyError::ArithmeticOverflow {
-                                context: "reserved host capacity total",
-                            })
-                    })?;
-            let charged = tier_bytes(state, tier)
-                .checked_sub(reserved_capacity)
-                .and_then(|total| total.checked_add(actual_capacity))
-                .ok_or(ResidencyError::StatePoisoned)?;
-            set_tier_bytes(state, tier, charged);
-            reserved = actual_capacity;
             for (id, buffers, logical, capacity, _) in prepared {
-                let tick = next_tick(state)?;
-                let copy = ResidentCopy {
-                    storage: Arc::new(buffers),
-                    state: ResidentCopyState {
-                        in_flight: None,
-                        bytes: capacity,
-                        pins: 0,
-                        last_used: tick,
-                        frequency: 0,
-                    },
-                };
+                state.ledger.publish_reserved(&id, tier, capacity, None)?;
                 state
                     .units
                     .get_mut(&id)
-                    .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?
-                    .host = Some(copy);
-                state.telemetry.record_transfer(
+                    .ok_or(ResidencyError::StatePoisoned)?
+                    .host = Some(Arc::new(buffers));
+                state.ledger.record_transfer(
                     TransferDirection::DiskToHost,
                     logical,
                     started.elapsed(),
@@ -2049,16 +1710,9 @@ fn ensure_many_resident(
             }
             for (id, is_missing) in ids.iter().zip(&created) {
                 if !is_missing {
-                    let tick = next_tick(state)?;
-                    state
-                        .units
-                        .get_mut(id)
-                        .and_then(|unit| unit.copy_mut(tier))
-                        .ok_or(ResidencyError::StatePoisoned)?
-                        .last_used = tick;
+                    state.ledger.touch(id, tier)?;
                 }
             }
-            update_resident_telemetry(state, tier);
             return Ok((created.clone(), None));
         }
 
@@ -2071,11 +1725,7 @@ fn ensure_many_resident(
             let item = loop {
                 let item = match tier {
                     MemoryTier::Device => {
-                        if let Some(host) = state.units[id]
-                            .host
-                            .as_ref()
-                            .map(|copy| Arc::clone(&copy.storage))
-                        {
+                        if let Some(host) = state.units[id].host.as_ref().map(Arc::clone) {
                             prepare_copy_to_device(id, host, &state.device_stream)
                         } else {
                             prepare_from_disk(
@@ -2127,7 +1777,7 @@ fn ensure_many_resident(
 
         for (id, item) in &prepared {
             let actual = arrays_nbytes(&item.arrays)?;
-            let required = state.units[id].spec.bytes();
+            let required = state.ledger.spec(id)?.bytes();
             if actual != required {
                 return Err(ResidencyError::UnitByteMismatch {
                     id: id.clone(),
@@ -2145,13 +1795,7 @@ fn ensure_many_resident(
                     source,
                 })?;
         let generation = if return_transfer {
-            let generation = state.next_transfer_generation;
-            state.next_transfer_generation = state.next_transfer_generation.checked_add(1).ok_or(
-                ResidencyError::ArithmeticOverflow {
-                    context: "resident transfer generation",
-                },
-            )?;
-            generation
+            state.ledger.next_transfer_generation()?
         } else {
             let completion = event.synchronize();
             for (_, item) in &mut prepared {
@@ -2191,43 +1835,33 @@ fn ensure_many_resident(
                 retained.retained_events.append(&mut item.retained_events);
             }
             let actual = arrays_nbytes(&item.arrays)?;
-            let tick = next_tick(state)?;
-            let copy = ResidentCopy {
-                storage: Arc::new(ResidentArrays {
-                    arrays: item.arrays,
-                }),
-                state: ResidentCopyState {
-                    in_flight: return_transfer.then_some(generation),
-                    bytes: actual,
-                    pins: 0,
-                    last_used: tick,
-                    frequency: 0,
-                },
-            };
+            state.ledger.publish_reserved(
+                &id,
+                tier,
+                actual,
+                return_transfer.then_some(generation),
+            )?;
             let unit = state
                 .units
                 .get_mut(&id)
-                .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?;
+                .ok_or(ResidencyError::StatePoisoned)?;
             match tier {
-                MemoryTier::Device => unit.device = Some(copy),
+                MemoryTier::Device => {
+                    unit.device = Some(Arc::new(ResidentArrays {
+                        arrays: item.arrays,
+                    }))
+                }
                 MemoryTier::Host | MemoryTier::Disk => unreachable!("validated above"),
             }
             state
-                .telemetry
+                .ledger
                 .record_transfer(item.direction, actual, started.elapsed());
         }
         for (id, is_missing) in ids.iter().zip(&created) {
             if !is_missing {
-                let tick = next_tick(state)?;
-                state
-                    .units
-                    .get_mut(id)
-                    .and_then(|unit| unit.copy_mut(tier))
-                    .ok_or(ResidencyError::StatePoisoned)?
-                    .last_used = tick;
+                state.ledger.touch(id, tier)?;
             }
         }
-        update_resident_telemetry(state, tier);
         let submitted = return_transfer.then_some(SubmittedResidentTransfer {
             event,
             retained,
@@ -2237,14 +1871,9 @@ fn ensure_many_resident(
         Ok((created.clone(), submitted))
     })();
 
-    if result.is_err() && reserved > 0 {
-        let current = tier_bytes(state, tier);
-        set_tier_bytes(state, tier, current.saturating_sub(reserved));
-        update_resident_telemetry(state, tier);
-    }
-    for id in temporary_protection {
-        if let Some(window) = state.active_windows.get_mut(&tier) {
-            window.remove(&id);
+    if result.is_err() {
+        for id in &reserved {
+            state.ledger.rollback_reserved(id, tier)?;
         }
     }
     result
@@ -2466,10 +2095,11 @@ fn arrays_nbytes(arrays: &BTreeMap<String, Array>) -> Result<u64, ResidencyError
 
 fn resident_capacity_requirement(
     unit: &UnitRecord,
+    planned_bytes: u64,
     tier: MemoryTier,
 ) -> Result<u64, ResidencyError> {
     if tier != MemoryTier::Host {
-        return Ok(unit.spec.bytes());
+        return Ok(planned_bytes);
     }
     host_capacity_upper_bound_for_bindings(&unit.definition.bindings)
 }
@@ -2537,190 +2167,6 @@ fn host_buffers_capacity(buffers: &ResidentHostBuffers) -> Result<u64, Residency
     })
 }
 
-fn reserve_capacity(
-    state: &mut ManagerState,
-    requested: &OffloadUnitId,
-    tier: MemoryTier,
-    required: u64,
-) -> Result<(), ResidencyError> {
-    let budget = match tier {
-        MemoryTier::Host => state.plan.config().host_budget_bytes(),
-        MemoryTier::Device => state.plan.config().device_budget_bytes(),
-        MemoryTier::Disk => None,
-    };
-    let Some(budget) = budget else {
-        return Ok(());
-    };
-    loop {
-        let resident = tier_bytes(state, tier);
-        let needed = resident
-            .checked_add(required)
-            .ok_or(ResidencyError::ArithmeticOverflow {
-                context: "budget reservation",
-            })?;
-        if needed <= budget {
-            return Ok(());
-        }
-        let victim = eviction_candidate(state, tier);
-        if let Some(victim) = victim {
-            remove_copy(state, &victim, tier)?;
-            continue;
-        }
-        return Err(ResidencyError::BudgetExhausted {
-            requested: requested.clone(),
-            tier,
-            required_bytes: required,
-            budget_bytes: budget,
-            resident_bytes: resident,
-            blocking_units: blockers(state, tier),
-        });
-    }
-}
-
-fn eviction_candidate(state: &ManagerState, tier: MemoryTier) -> Option<OffloadUnitId> {
-    state
-        .units
-        .values()
-        .filter_map(|unit| {
-            let copy = unit.copy(tier)?;
-            if unit.spec.policy() == ResidencyPolicy::Pinned
-                || copy.pins != 0
-                || state
-                    .active_windows
-                    .get(&tier)
-                    .is_some_and(|window| window.contains(unit.spec.id()))
-            {
-                return None;
-            }
-            let priority = match unit.spec.policy() {
-                ResidencyPolicy::Windowed => 0u8,
-                ResidencyPolicy::Cacheable => 1u8,
-                ResidencyPolicy::Pinned => return None,
-            };
-            let frequency = match state.plan.config().eviction_policy() {
-                CacheEvictionPolicy::LeastRecentlyUsed => 0,
-                CacheEvictionPolicy::LeastFrequentlyUsed => copy.frequency,
-            };
-            Some((priority, frequency, copy.last_used, unit.spec.id().clone()))
-        })
-        .min()
-        .map(|(_, _, _, id)| id)
-}
-
-fn blockers(state: &ManagerState, tier: MemoryTier) -> Vec<ResidencyBlocker> {
-    state
-        .units
-        .values()
-        .filter_map(|unit| {
-            let copy = unit.copy(tier)?;
-            let pinned = unit.spec.policy() == ResidencyPolicy::Pinned;
-            let active_window = state
-                .active_windows
-                .get(&tier)
-                .is_some_and(|window| window.contains(unit.spec.id()));
-            (pinned || copy.pins != 0 || active_window).then(|| ResidencyBlocker {
-                id: unit.spec.id().clone(),
-                pinned,
-                in_use: copy.pins,
-                active_window,
-            })
-        })
-        .collect()
-}
-
-fn remove_copy(
-    state: &mut ManagerState,
-    id: &OffloadUnitId,
-    tier: MemoryTier,
-) -> Result<(), ResidencyError> {
-    remove_copy_impl(state, id, tier, true)
-}
-
-fn remove_copy_impl(
-    state: &mut ManagerState,
-    id: &OffloadUnitId,
-    tier: MemoryTier,
-    record_eviction: bool,
-) -> Result<(), ResidencyError> {
-    let bytes = state
-        .units
-        .get(id)
-        .and_then(|unit| unit.copy(tier))
-        .ok_or(ResidencyError::StatePoisoned)?
-        .bytes;
-    let total = tier_bytes(state, tier)
-        .checked_sub(bytes)
-        .ok_or(ResidencyError::StatePoisoned)?;
-    match tier {
-        MemoryTier::Host => {
-            let copy = state
-                .units
-                .get_mut(id)
-                .and_then(|unit| unit.host.take())
-                .ok_or(ResidencyError::StatePoisoned)?;
-            debug_assert_eq!(copy.state.bytes, bytes);
-        }
-        MemoryTier::Device => {
-            let copy = state
-                .units
-                .get_mut(id)
-                .and_then(|unit| unit.device.take())
-                .ok_or(ResidencyError::StatePoisoned)?;
-            debug_assert_eq!(copy.state.bytes, bytes);
-        }
-        MemoryTier::Disk => return Err(ResidencyError::StatePoisoned),
-    }
-    set_tier_bytes(state, tier, total);
-    update_resident_telemetry(state, tier);
-    if record_eviction {
-        state.telemetry.record_tier_eviction(tier, bytes);
-    }
-    Ok(())
-}
-
-fn update_resident_telemetry(state: &mut ManagerState, tier: MemoryTier) {
-    let bytes = tier_bytes(state, tier);
-    let units = state
-        .units
-        .values()
-        .filter(|unit| unit.is_resident(tier))
-        .count();
-    state.telemetry.set_resident_bytes(tier, bytes);
-    state.telemetry.set_resident_units(tier, units);
-}
-
-fn tier_bytes(state: &ManagerState, tier: MemoryTier) -> u64 {
-    match tier {
-        MemoryTier::Host => state.host_bytes,
-        MemoryTier::Device => state.device_bytes,
-        MemoryTier::Disk => 0,
-    }
-}
-
-fn set_tier_bytes(state: &mut ManagerState, tier: MemoryTier, bytes: u64) {
-    match tier {
-        MemoryTier::Host => state.host_bytes = bytes,
-        MemoryTier::Device => state.device_bytes = bytes,
-        MemoryTier::Disk => {}
-    }
-}
-
-fn next_tick(state: &mut ManagerState) -> Result<u64, ResidencyError> {
-    if state.tick == u64::MAX {
-        for unit in state.units.values_mut() {
-            if let Some(copy) = unit.host.as_mut() {
-                copy.state.last_used /= 2;
-            }
-            if let Some(copy) = unit.device.as_mut() {
-                copy.state.last_used /= 2;
-            }
-        }
-        state.tick /= 2;
-    }
-    state.tick += 1;
-    Ok(state.tick)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2736,7 +2182,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        core::residency::{OffloadConfig, OffloadUnitSpec},
+        core::residency::{OffloadConfig, OffloadUnitSpec, ResidencyLedgerError, ResidencyPolicy},
         runtime::checkpoint::store::SafetensorsWeightStore,
     };
 
@@ -2973,7 +2419,9 @@ mod tests {
         manager.initialize().unwrap();
         assert!(matches!(
             manager.acquire_many_with_demand(&[(id("a"), 1), (id("b"), 1)], MemoryTier::Device),
-            Err(ResidencyError::BudgetExhausted { .. })
+            Err(ResidencyError::Ledger(
+                ResidencyLedgerError::BudgetExhausted { .. }
+            ))
         ));
         let report = manager.report().unwrap();
         assert_eq!(report.offload().resident_bytes().get(MemoryTier::Device), 0);
@@ -3026,9 +2474,13 @@ mod tests {
         let lease = &transfer.leases()[0];
         {
             let state = manager.lock().unwrap();
-            let copy = state.units[&id("a")].device.as_ref().unwrap();
-            assert_eq!(copy.state.pins, 1);
-            assert!(copy.state.in_flight.is_some());
+            let copy = state
+                .ledger
+                .copy_status(&id("a"), MemoryTier::Device)
+                .unwrap()
+                .unwrap();
+            assert_eq!(copy.pins(), 1);
+            assert!(copy.in_flight().is_some());
         }
 
         let consumer = cpu_stream();
@@ -3042,8 +2494,12 @@ mod tests {
         transfer.synchronize().unwrap();
         {
             let state = manager.lock().unwrap();
-            let copy = state.units[&id("a")].device.as_ref().unwrap();
-            assert!(copy.state.in_flight.is_none());
+            let copy = state
+                .ledger
+                .copy_status(&id("a"), MemoryTier::Device)
+                .unwrap()
+                .unwrap();
+            assert!(copy.in_flight().is_none());
         }
         let ready = manager
             .acquire_many_with_transfer(&[(id("a"), 1)], MemoryTier::Device)
@@ -3097,12 +2553,14 @@ mod tests {
             .add(Array::from_int(1), &consumer)
             .unwrap();
         drop(transfer);
-        assert!(manager.lock().unwrap().units[&id("a")]
-            .device
-            .as_ref()
+        assert!(manager
+            .lock()
             .unwrap()
-            .state
-            .in_flight
+            .ledger
+            .copy_status(&id("a"), MemoryTier::Device)
+            .unwrap()
+            .unwrap()
+            .in_flight()
             .is_none());
         assert_eq!(dependent.evaluated().unwrap().as_slice::<i32>(), &[2, 3]);
     }
@@ -3216,7 +2674,9 @@ mod tests {
                 .unwrap();
         assert!(matches!(
             valid.prefetch(&id("a"), MemoryTier::Disk),
-            Err(ResidencyError::InvalidTargetTier { .. })
+            Err(ResidencyError::Ledger(
+                ResidencyLedgerError::InvalidTargetTier { .. }
+            ))
         ));
     }
 
@@ -3260,7 +2720,7 @@ mod tests {
         );
         assert!(matches!(
             manager.acquire(&id("disk"), MemoryTier::Host),
-            Err(ResidencyError::NotInitialized)
+            Err(ResidencyError::Ledger(ResidencyLedgerError::NotInitialized))
         ));
         manager.initialize().unwrap();
         let report = manager.report().unwrap();
@@ -3275,7 +2735,9 @@ mod tests {
         assert_eq!(report.offload().resident_bytes().get(MemoryTier::Device), 8);
         assert!(matches!(
             manager.evict(&id("host"), MemoryTier::Host),
-            Err(ResidencyError::PinnedEviction { .. })
+            Err(ResidencyError::Ledger(
+                ResidencyLedgerError::PinnedEviction { .. }
+            ))
         ));
     }
 
@@ -3530,7 +2992,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_recency_uses_identifier_as_the_eviction_tie_breaker() {
+    fn oldest_copy_is_evicted_deterministically() {
         let (_dir, store) = fixture_store();
         let manager = manager(
             store,
@@ -3545,27 +3007,6 @@ mod tests {
         manager.initialize().unwrap();
         manager.prefetch(&id("a"), MemoryTier::Host).unwrap();
         manager.prefetch(&id("b"), MemoryTier::Host).unwrap();
-        {
-            let mut state = manager.lock().unwrap();
-            state
-                .units
-                .get_mut(&id("a"))
-                .unwrap()
-                .host
-                .as_mut()
-                .unwrap()
-                .state
-                .last_used = 10;
-            state
-                .units
-                .get_mut(&id("b"))
-                .unwrap()
-                .host
-                .as_mut()
-                .unwrap()
-                .state
-                .last_used = 10;
-        }
         manager.prefetch(&id("c"), MemoryTier::Host).unwrap();
         let report = manager.report().unwrap();
         assert!(!state(&report, "a").host_resident());
@@ -3613,7 +3054,9 @@ mod tests {
         let lease = manager.acquire(&id("a"), MemoryTier::Host).unwrap();
         assert!(matches!(
             manager.evict(&id("a"), MemoryTier::Host),
-            Err(ResidencyError::InUseEviction { pin_count: 1, .. })
+            Err(ResidencyError::Ledger(
+                ResidencyLedgerError::InUseEviction { pin_count: 1, .. }
+            ))
         ));
         drop(lease);
         assert!(manager.evict(&id("a"), MemoryTier::Host).unwrap());
@@ -3739,12 +3182,12 @@ mod tests {
             .prefetch(&id("wanted"), MemoryTier::Host)
             .unwrap_err();
         match error {
-            ResidencyError::BudgetExhausted {
+            ResidencyError::Ledger(ResidencyLedgerError::BudgetExhausted {
                 required_bytes,
                 budget_bytes,
                 blocking_units,
                 ..
-            } => {
+            }) => {
                 assert_eq!(required_bytes, fixture_binding_capacity());
                 assert_eq!(budget_bytes, fixture_host_capacity(2));
                 assert_eq!(blocking_units.len(), 2);

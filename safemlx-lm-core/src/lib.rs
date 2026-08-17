@@ -21,7 +21,7 @@ pub mod execution;
 pub mod generation;
 /// Stable model and artifact identities.
 pub mod model;
-/// Residency and resource planning schemas.
+/// Weight-residency ownership, capacity, and resource planning.
 pub mod residency;
 /// Transactional fair work scheduler.
 pub mod scheduler;

@@ -36,4 +36,16 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::OffloadReport>(),
         TypeId::of::<safemlx_lm::core::residency::OffloadReport>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::ResidencyLedger>(),
+        TypeId::of::<safemlx_lm::core::residency::ResidencyLedger>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::ResidencyLedgerError>(),
+        TypeId::of::<safemlx_lm::core::residency::ResidencyLedgerError>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::UnitResidencyReport>(),
+        TypeId::of::<safemlx_lm::core::residency::UnitResidencyReport>(),
+    );
 }
