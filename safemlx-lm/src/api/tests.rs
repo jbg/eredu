@@ -776,11 +776,10 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     .unwrap();
     let mut model = LoadedModel {
         runtime,
-        #[cfg(feature = "media-processing")]
-        processor: None,
         tokenizer,
         tokenizer_fingerprint,
         chat_template: None,
+        model_type: "qwen3_5_text".into(),
         model_id: "prepared-embedded-batch-test".into(),
         eos_token_ids: vec![2],
         checkpoint_generation_config: None,
@@ -4940,11 +4939,18 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                     )),
                 )
                 .unwrap();
-                let mut generation =
-                    crate::backend::mlx::MlxGeneration::new(&mut runtime, 0.0, input, None);
-                generation.next().unwrap().unwrap().item::<u32>(stream);
-                generation.next().unwrap().unwrap().item::<u32>(stream);
-                generation.next().unwrap().unwrap().item::<u32>(stream);
+                let sampling =
+                    safemlx_lm_core::resolve_generation_config(None, Default::default()).unwrap();
+                let mut generation = safemlx_lm_core::TextGeneration::new(
+                    &mut runtime,
+                    vec![1, 2],
+                    safemlx_lm_core::TextGenerationConfig::new(sampling),
+                )
+                .unwrap();
+                for _ in 0..3 {
+                    let token = generation.next().unwrap().unwrap();
+                    safemlx_lm_core::TokenOutput::token_id(&token).unwrap();
+                }
             }
             fs::remove_dir_all(saved_dir).unwrap();
         }

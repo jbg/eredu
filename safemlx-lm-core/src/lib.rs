@@ -43,7 +43,8 @@ pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use backend::{
     Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession, CollectiveScope,
     Completion, DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
-    DistributedSessionDescriptor, ModelRuntime, PreparedModel, Submission, ValueDescriptor,
+    DistributedSessionDescriptor, ModelRuntime, PreparedModel, Submission, TextGeneration,
+    TextGenerationBackend, TextGenerationConfig, TokenOutput, ValueDescriptor,
 };
 pub use generation::{
     resolve_generation_config, resolve_optimistic_reuse, CheckpointGenerationConfig, FinishReason,

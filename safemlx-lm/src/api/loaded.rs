@@ -8,17 +8,268 @@ use super::*;
 /// selected backend runtime, tokenizer, optional chat template, model id
 /// used by the template renderer, and EOS token ids collected from checkpoint
 /// and sidecar metadata.
-pub struct LoadedModel {
-    pub(super) runtime: safemlx_lm_core::ModelRuntime<crate::backend::mlx::MlxBackend<'static>>,
-    #[cfg(feature = "media-processing")]
-    pub(super) processor: Option<ModelProcessor>,
+pub struct LoadedModel<
+    B: safemlx_lm_core::TextGenerationBackend = crate::backend::mlx::MlxBackend<'static>,
+> {
+    pub(super) runtime: safemlx_lm_core::ModelRuntime<B>,
     pub(super) tokenizer: ChatTokenizer,
     pub(super) tokenizer_fingerprint: [u8; 32],
     pub(super) chat_template: Option<ModelChatTemplate>,
+    pub(super) model_type: String,
     pub(super) model_id: String,
     pub(super) eos_token_ids: Vec<u32>,
     pub(super) checkpoint_generation_config: Option<CheckpointGenerationConfig>,
     pub(super) constraint_compiler: Result<ConstraintCompiler, String>,
+}
+
+/// Backend-neutral tokenizer and chat metadata attached to a prepared runtime.
+pub struct LoadedTextModelConfig {
+    /// Normalized architecture identity reported to clients.
+    pub model_type: String,
+    /// Model identity supplied to chat-template rendering.
+    pub model_id: String,
+    /// Optional checkpoint chat template or named-template collection.
+    pub chat_template: Option<ModelChatTemplate>,
+    /// Checkpoint EOS vocabulary ids.
+    pub eos_token_ids: Vec<u32>,
+    /// Optional checkpoint sampling recommendations.
+    pub checkpoint_generation_config: Option<CheckpointGenerationConfig>,
+}
+
+impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
+    /// Combines any prepared backend runtime with portable tokenizer metadata.
+    pub fn from_runtime(
+        runtime: safemlx_lm_core::ModelRuntime<B>,
+        tokenizer: ChatTokenizer,
+        config: LoadedTextModelConfig,
+    ) -> Self {
+        let tokenizer_fingerprint = crate::api::tokenizer_vocabulary_fingerprint(&tokenizer);
+        let constraint_compiler =
+            ConstraintCompiler::from_tokenizer(&tokenizer, &config.eos_token_ids);
+        Self {
+            runtime,
+            tokenizer,
+            tokenizer_fingerprint,
+            chat_template: config.chat_template,
+            model_type: config.model_type,
+            model_id: config.model_id,
+            eos_token_ids: config.eos_token_ids,
+            checkpoint_generation_config: config.checkpoint_generation_config,
+            constraint_compiler,
+        }
+    }
+
+    /// Borrows the selected backend and its session owner.
+    pub const fn runtime(&self) -> &safemlx_lm_core::ModelRuntime<B> {
+        &self.runtime
+    }
+
+    /// Mutably borrows the selected backend and its session owner.
+    pub fn runtime_mut(&mut self) -> &mut safemlx_lm_core::ModelRuntime<B> {
+        &mut self.runtime
+    }
+
+    /// Returns the effective runtime model type.
+    pub fn model_type(&self) -> &str {
+        &self.model_type
+    }
+
+    /// Returns sampling values declared by `generation_config.json`, if present.
+    pub fn checkpoint_generation_config(&self) -> Option<&CheckpointGenerationConfig> {
+        self.checkpoint_generation_config.as_ref()
+    }
+
+    /// Resolves request overrides over checkpoint recommendations and fallbacks.
+    pub fn resolve_generation_config(
+        &self,
+        overrides: GenerationConfigOverrides,
+    ) -> Result<ResolvedGenerationConfig, Error> {
+        Ok(resolve_generation_config(
+            self.checkpoint_generation_config.as_ref(),
+            overrides,
+        )?)
+    }
+
+    /// Starts portable asynchronous text generation from tokenizer ids.
+    pub fn generate_tokens(
+        &mut self,
+        prompt_token_ids: Vec<u32>,
+        config: safemlx_lm_core::TextGenerationConfig,
+    ) -> Result<safemlx_lm_core::TextGeneration<'_, B>, B::Error> {
+        safemlx_lm_core::TextGeneration::new(&mut self.runtime, prompt_token_ids, config)
+    }
+
+    /// Returns the model id passed to chat-template rendering.
+    pub fn model_id_for_template(&self) -> &str {
+        &self.model_id
+    }
+
+    /// Returns whether a chat template is available for this model.
+    pub fn has_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
+    /// Returns the stable identity of the template selected for `tools`.
+    pub fn selected_chat_template_identity(
+        &self,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<Option<ChatTemplateIdentity>, Error> {
+        self.chat_template
+            .as_ref()
+            .map(|templates| {
+                templates
+                    .select(tools)
+                    .map(|selected| selected.identity().clone())
+            })
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Returns likely user-provided kwargs referenced by the chat template.
+    pub fn chat_template_kwargs(&self) -> Result<Vec<String>, Error> {
+        let Some(template) = &self.chat_template else {
+            return Ok(Vec::new());
+        };
+        let selected = template.select(None)?;
+        Ok(
+            inspect_chat_template_kwargs(selected.template(), &self.model_id)?
+                .into_iter()
+                .filter(|name| !self.tokenizer.template_kwargs().contains_key(name))
+                .collect(),
+        )
+    }
+
+    /// Prepares one JSON-valued chat for generation.
+    pub fn prepare_chat(&mut self, request: ChatTemplateRequest) -> Result<PreparedChat, Error> {
+        let template = self
+            .chat_template
+            .clone()
+            .ok_or(Error::MissingChatTemplate)?;
+        prepare_chat_from_parts(
+            &mut self.tokenizer,
+            template,
+            &self.model_id,
+            &self.eos_token_ids,
+            Some(&self.constraint_compiler),
+            request,
+        )
+    }
+
+    /// Applies the selected chat template to structured conversations.
+    pub fn apply_chat_template<'a, I, R, T>(
+        &'a mut self,
+        conversations: I,
+        tools: Option<&'a [serde_json::Value]>,
+        add_generation_prompt: bool,
+    ) -> Result<Option<String>, Error>
+    where
+        I: IntoIterator<Item = Chat<'a, R, T>>,
+        R: Serialize + 'a,
+        T: Serialize + 'a,
+    {
+        self.apply_chat_template_with_kwargs(conversations, tools, add_generation_prompt, None)
+    }
+
+    /// Applies the selected chat template with extra template variables.
+    pub fn apply_chat_template_with_kwargs<'a, I, R, T>(
+        &'a mut self,
+        conversations: I,
+        tools: Option<&'a [serde_json::Value]>,
+        add_generation_prompt: bool,
+        template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Option<String>, Error>
+    where
+        I: IntoIterator<Item = Chat<'a, R, T>>,
+        R: Serialize + 'a,
+        T: Serialize + 'a,
+    {
+        let Some(template) = self.chat_template.clone() else {
+            return Ok(None);
+        };
+        let rendered = self.tokenizer.apply_chat_template(
+            template,
+            ApplyChatTemplateArgs {
+                conversations,
+                tools,
+                documents: None,
+                model_id: &self.model_id,
+                chat_template_id: None,
+                add_generation_prompt: Some(add_generation_prompt),
+                continue_final_message: None,
+                template_kwargs,
+            },
+        )?;
+        Ok(rendered.into_iter().next())
+    }
+
+    /// Applies the selected chat template to JSON-valued conversations.
+    pub fn apply_chat_template_json(
+        &mut self,
+        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
+        tools: Option<&[serde_json::Value]>,
+        add_generation_prompt: bool,
+    ) -> Result<Option<String>, Error> {
+        self.apply_chat_template_json_with_kwargs(conversations, tools, add_generation_prompt, None)
+    }
+
+    /// Applies the selected chat template with extra JSON template variables.
+    pub fn apply_chat_template_json_with_kwargs(
+        &mut self,
+        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
+        tools: Option<&[serde_json::Value]>,
+        add_generation_prompt: bool,
+        template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Option<String>, Error> {
+        let Some(template) = self.chat_template.clone() else {
+            return Ok(None);
+        };
+        let rendered = self.tokenizer.apply_chat_template_json(
+            template,
+            conversations,
+            tools,
+            &self.model_id,
+            add_generation_prompt,
+            template_kwargs,
+        )?;
+        Ok(rendered.into_iter().next())
+    }
+
+    /// Encodes text to tokenizer ids.
+    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, Error> {
+        Ok(self
+            .tokenizer
+            .encode(text, add_special_tokens)?
+            .get_ids()
+            .to_vec())
+    }
+
+    /// Decodes tokenizer ids back to text.
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
+        self.tokenizer
+            .decode(ids, skip_special_tokens)
+            .map_err(Into::into)
+    }
+
+    /// Creates an independent stateful decoder for streaming generated tokens.
+    pub fn text_decoder(&self, skip_special_tokens: bool) -> TextDecoder {
+        TextDecoder {
+            tokenizer: (*self.tokenizer).clone(),
+            skip_special_tokens,
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+        }
+    }
+
+    /// Returns EOS token ids collected from checkpoint metadata.
+    pub fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_ids
+    }
+
+    /// Returns true when `id` is a configured EOS token id.
+    pub fn is_eos_token(&self, id: u32) -> bool {
+        self.eos_token_ids.contains(&id)
+    }
 }
 
 struct PreparedChatMtpLaneRuntime<'a, S> {
@@ -317,7 +568,7 @@ where
     })
 }
 
-impl LoadedModel {
+impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     pub(crate) fn model(&self) -> &Model {
         self.runtime.session().complete_model()
     }
@@ -491,17 +742,6 @@ impl LoadedModel {
             });
         }
         Ok(prepared_lanes)
-    }
-
-    /// Creates an independent stateful decoder for streaming generated tokens.
-    pub fn text_decoder(&self, skip_special_tokens: bool) -> TextDecoder {
-        TextDecoder {
-            tokenizer: (*self.tokenizer).clone(),
-            skip_special_tokens,
-            ids: Vec::new(),
-            prefix: String::new(),
-            prefix_index: 0,
-        }
     }
 
     /// Generates multiple independent prepared chats through one fair MTP
@@ -1562,17 +1802,23 @@ impl LoadedModel {
             let chat_template = chat_template.or(load_chat_template(sidecar_dir)?);
             let constraint_compiler =
                 ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
+            let model_type = model.model_type().to_owned();
             let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
                 crate::backend::mlx::MlxBackend::new(stream),
                 safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(model)),
             )?;
+            #[cfg(feature = "media-processing")]
+            let runtime = {
+                let mut runtime = runtime;
+                runtime.session_mut().set_processor(processor);
+                runtime
+            };
             return Ok(Self {
                 runtime,
-                #[cfg(feature = "media-processing")]
-                processor,
                 tokenizer,
                 tokenizer_fingerprint,
                 chat_template,
+                model_type,
                 model_id: model_dir.display().to_string(),
                 eos_token_ids,
                 checkpoint_generation_config,
@@ -1601,40 +1847,24 @@ impl LoadedModel {
             crate::backend::mlx::MlxBackend::new(stream),
             model,
         )?;
+        #[cfg(feature = "media-processing")]
+        let runtime = {
+            let mut runtime = runtime;
+            runtime.session_mut().set_processor(processor);
+            runtime
+        };
 
         Ok(Self {
             runtime,
-            #[cfg(feature = "media-processing")]
-            processor,
             tokenizer,
             tokenizer_fingerprint,
             chat_template,
+            model_type: model_type.clone(),
             model_id: model_type,
             eos_token_ids,
             checkpoint_generation_config,
             constraint_compiler,
         })
-    }
-
-    /// Returns the effective runtime model type.
-    pub fn model_type(&self) -> &str {
-        self.runtime.session().model_type()
-    }
-
-    /// Returns sampling values declared by `generation_config.json`, if present.
-    pub fn checkpoint_generation_config(&self) -> Option<&CheckpointGenerationConfig> {
-        self.checkpoint_generation_config.as_ref()
-    }
-
-    /// Resolves request overrides over checkpoint recommendations and SafeMLX fallbacks.
-    pub fn resolve_generation_config(
-        &self,
-        overrides: GenerationConfigOverrides,
-    ) -> Result<ResolvedGenerationConfig, Error> {
-        Ok(resolve_generation_config(
-            self.checkpoint_generation_config.as_ref(),
-            overrides,
-        )?)
     }
 
     /// Returns checkpoint-native quantization storage statistics when available.
@@ -1644,49 +1874,22 @@ impl LoadedModel {
         self.model().native_quantization_stats()
     }
 
-    /// Returns the model id passed to chat-template rendering.
-    pub fn model_id_for_template(&self) -> &str {
-        &self.model_id
-    }
-
-    /// Returns whether a chat template is available for this model.
-    pub fn has_chat_template(&self) -> bool {
-        self.chat_template.is_some()
-    }
-
-    /// Returns the stable identity of the template that would be selected for
-    /// the supplied tools.
-    pub fn selected_chat_template_identity(
-        &self,
-        tools: Option<&[serde_json::Value]>,
-    ) -> Result<Option<ChatTemplateIdentity>, Error> {
-        self.chat_template
-            .as_ref()
-            .map(|templates| {
-                templates
-                    .select(tools)
-                    .map(|selected| selected.identity().clone())
-            })
-            .transpose()
-            .map_err(Into::into)
-    }
-
     /// Returns whether this model directory includes a supported media processor.
     #[cfg(feature = "media-processing")]
     pub fn has_processor(&self) -> bool {
-        self.processor.is_some()
+        self.runtime.session().processor().is_some()
     }
 
     /// Returns the loaded architecture-dispatched media processor, if available.
     #[cfg(feature = "media-processing")]
     pub fn processor(&self) -> Option<&ModelProcessor> {
-        self.processor.as_ref()
+        self.runtime.session().processor()
     }
 
     /// Tokenizes and preprocesses ordered text and media segments.
     #[cfg(feature = "media-processing")]
     pub fn prepare_input(&self, input: &[ProcessorInput<'_>]) -> Result<PreparedModelInput, Error> {
-        let processor = self.processor.as_ref().ok_or_else(|| {
+        let processor = self.runtime.session().processor().ok_or_else(|| {
             Error::Processor(format!(
                 "model type '{}' does not have a loaded media processor",
                 self.model_type()
@@ -1707,7 +1910,7 @@ impl LoadedModel {
         prepared_chat: &PreparedChat,
         bindings: &[ChatMediaBinding<'_>],
     ) -> Result<PreparedModelInput, Error> {
-        let processor = self.processor.as_ref().ok_or_else(|| {
+        let processor = self.runtime.session().processor().ok_or_else(|| {
             Error::Processor(format!(
                 "model type '{}' does not have a loaded media processor",
                 self.model_type()
@@ -1716,144 +1919,6 @@ impl LoadedModel {
         processor.prepare_chat_input(prepared_chat.rendered_prompt(), bindings, &mut |text| {
             self.encode(text, false)
         })
-    }
-
-    /// Returns likely user-provided kwargs referenced by the loaded chat template.
-    ///
-    /// This is static template analysis and does not infer value types or
-    /// defaults. Standard chat-template variables supplied by this crate are
-    /// excluded.
-    pub fn chat_template_kwargs(&self) -> Result<Vec<String>, Error> {
-        let Some(template) = &self.chat_template else {
-            return Ok(Vec::new());
-        };
-        let selected = template.select(None)?;
-        Ok(
-            inspect_chat_template_kwargs(selected.template(), &self.model_id)?
-                .into_iter()
-                .filter(|name| !self.tokenizer.template_kwargs().contains_key(name))
-                .collect(),
-        )
-    }
-
-    /// Prepares one JSON-valued chat for generation.
-    ///
-    /// The selected checkpoint template is rendered with and without its
-    /// generation prompt so the appended contribution is available
-    /// independently. Native tool support is reported only when atomic
-    /// structural-token facts and bounded render probes establish one
-    /// unambiguous wire protocol.
-    pub fn prepare_chat(&mut self, request: ChatTemplateRequest) -> Result<PreparedChat, Error> {
-        let template = self
-            .chat_template
-            .clone()
-            .ok_or(Error::MissingChatTemplate)?;
-        prepare_chat_from_parts(
-            &mut self.tokenizer,
-            template,
-            &self.model_id,
-            &self.eos_token_ids,
-            Some(&self.constraint_compiler),
-            request,
-        )
-    }
-
-    /// Applies the loaded chat template to structured conversations.
-    ///
-    /// Returns `Ok(None)` when no chat template is available.
-    pub fn apply_chat_template<'a, I, R, T>(
-        &'a mut self,
-        conversations: I,
-        tools: Option<&'a [serde_json::Value]>,
-        add_generation_prompt: bool,
-    ) -> Result<Option<String>, Error>
-    where
-        I: IntoIterator<Item = Chat<'a, R, T>>,
-        R: Serialize + 'a,
-        T: Serialize + 'a,
-    {
-        self.apply_chat_template_with_kwargs(conversations, tools, add_generation_prompt, None)
-    }
-
-    /// Applies the loaded chat template to structured conversations with extra template variables.
-    ///
-    /// Returns `Ok(None)` when no chat template is available.
-    pub fn apply_chat_template_with_kwargs<'a, I, R, T>(
-        &'a mut self,
-        conversations: I,
-        tools: Option<&'a [serde_json::Value]>,
-        add_generation_prompt: bool,
-        template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Option<String>, Error>
-    where
-        I: IntoIterator<Item = Chat<'a, R, T>>,
-        R: Serialize + 'a,
-        T: Serialize + 'a,
-    {
-        let Some(template) = self.chat_template.clone() else {
-            return Ok(None);
-        };
-
-        let rendered = self.tokenizer.apply_chat_template(
-            template.clone(),
-            ApplyChatTemplateArgs {
-                conversations,
-                tools,
-                documents: None,
-                model_id: &self.model_id,
-                chat_template_id: None,
-                add_generation_prompt: Some(add_generation_prompt),
-                continue_final_message: None,
-                template_kwargs,
-            },
-        )?;
-        Ok(rendered.into_iter().next())
-    }
-
-    /// Applies the loaded chat template to JSON-valued conversations.
-    ///
-    /// Returns `Ok(None)` when no chat template is available.
-    pub fn apply_chat_template_json(
-        &mut self,
-        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
-        tools: Option<&[serde_json::Value]>,
-        add_generation_prompt: bool,
-    ) -> Result<Option<String>, Error> {
-        self.apply_chat_template_json_with_kwargs(conversations, tools, add_generation_prompt, None)
-    }
-
-    /// Applies the loaded chat template to JSON-valued conversations with extra template variables.
-    ///
-    /// Returns `Ok(None)` when no chat template is available.
-    pub fn apply_chat_template_json_with_kwargs(
-        &mut self,
-        conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
-        tools: Option<&[serde_json::Value]>,
-        add_generation_prompt: bool,
-        template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Option<String>, Error> {
-        let Some(template) = self.chat_template.clone() else {
-            return Ok(None);
-        };
-
-        let rendered = self.tokenizer.apply_chat_template_json(
-            template.clone(),
-            conversations,
-            tools,
-            &self.model_id,
-            add_generation_prompt,
-            template_kwargs,
-        )?;
-        Ok(rendered.into_iter().next())
-    }
-
-    /// Encodes text to tokenizer ids.
-    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, Error> {
-        Ok(self
-            .tokenizer
-            .encode(text, add_special_tokens)?
-            .get_ids()
-            .to_vec())
     }
 
     /// Encodes text and returns a `[1, len]` token-id array on `stream`.
@@ -1865,23 +1930,6 @@ impl LoadedModel {
     ) -> Result<Array, Error> {
         let ids = self.encode(text, add_special_tokens)?;
         Ok(Array::from(ids.as_slice()).try_index_device(NewAxis, stream)?)
-    }
-
-    /// Decodes tokenizer ids back to text.
-    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
-        self.tokenizer
-            .decode(ids, skip_special_tokens)
-            .map_err(Into::into)
-    }
-
-    /// Returns EOS token ids collected from the model's checkpoint metadata.
-    pub fn eos_token_ids(&self) -> &[u32] {
-        &self.eos_token_ids
-    }
-
-    /// Returns true when `id` is one of the configured EOS token ids.
-    pub fn is_eos_token(&self, id: u32) -> bool {
-        self.eos_token_ids.contains(&id)
     }
 
     /// Clears the backend-owned cache for a new independent sequence.

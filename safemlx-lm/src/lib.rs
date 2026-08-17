@@ -32,8 +32,10 @@ pub use safemlx_lm_core::generation::{
     ResolvedGenerationConfig, SemanticEvent,
 };
 pub use safemlx_lm_core::{
-    Backend, BackendSession, CollectiveScope, DistributedBackend, DistributedCapabilities,
-    DistributedSession, DistributedSessionDescriptor, ModelRuntime, ValueDescriptor,
+    Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession, CollectiveScope,
+    Completion, DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
+    DistributedSessionDescriptor, ModelRuntime, PreparedModel, Submission, TextGeneration,
+    TextGenerationBackend, TextGenerationConfig, TokenOutput, ValueDescriptor,
 };
 #[cfg(test)]
 mod test_utils;
@@ -86,7 +88,7 @@ pub use api::{
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
 pub use backend::mlx::{
     MlxBackend, MlxDistributedSession, MlxModel, MlxModelInput, MlxModelOutput, MlxModelSession,
-    MlxSessionCompletion,
+    MlxSessionCompletion, MlxTextCompletion, MlxTextGenerationState, MlxTextToken,
 };
 pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use runtime::cache::residency::{

@@ -17,6 +17,10 @@ name = "automatic_planner_api"
 path = "tests/automatic_planner_api.rs"
 
 [[test]]
+name = "backend_generic_text"
+path = "tests/backend_generic_text.rs"
+
+[[test]]
 name = "core_types"
 path = "tests/core_types.rs"
 

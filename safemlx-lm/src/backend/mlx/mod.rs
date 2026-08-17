@@ -22,6 +22,7 @@ pub use distributed::MlxDistributedSession;
 pub(crate) use session::{submit_decode_with_cache, submit_prefill_with_cache};
 pub use session::{
     MlxGeneration, MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion,
+    MlxTextCompletion, MlxTextGenerationState, MlxTextToken,
 };
 
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};

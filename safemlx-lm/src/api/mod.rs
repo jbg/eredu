@@ -16,8 +16,9 @@ use safemlx::{
 use safemlx_gguf::{MetadataArray as GgufMetadataArray, MetadataValue as GgufMetadataValue};
 use safemlx_lm_utils::tokenizer::{
     chat_template_kwargs as inspect_chat_template_kwargs, load_model_chat_template_from_file,
-    ApplyChatTemplateArgs, Chat, ModelChatTemplate, Tokenizer as ChatTokenizer,
+    ApplyChatTemplateArgs, Chat,
 };
+pub use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
@@ -305,7 +306,7 @@ pub mod realtime;
 
 mod loaded;
 pub(crate) use crate::backend::mlx::validate_gguf_quantization_source;
-pub use loaded::LoadedModel;
+pub use loaded::{LoadedModel, LoadedTextModelConfig};
 
 mod inspection;
 pub use inspection::{

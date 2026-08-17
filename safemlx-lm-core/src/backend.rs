@@ -5,6 +5,7 @@ use std::fmt::Debug;
 
 use crate::{
     checkpoint::TensorDtype,
+    generation::ResolvedGenerationConfig,
     topology::{ParallelAxis, ParallelTopology},
 };
 
@@ -371,6 +372,187 @@ impl<B: Backend> ModelRuntime<B> {
     }
 }
 
+/// Portable sampling inputs for one text-generation session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextGenerationConfig {
+    sampling: ResolvedGenerationConfig,
+    seed: u64,
+}
+
+impl TextGenerationConfig {
+    /// Uses resolved checkpoint/request sampling with deterministic seed zero.
+    pub const fn new(sampling: ResolvedGenerationConfig) -> Self {
+        Self { sampling, seed: 0 }
+    }
+
+    /// Selects the deterministic root seed used by a stochastic backend.
+    pub const fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// Returns the validated sampling configuration.
+    pub const fn sampling(&self) -> ResolvedGenerationConfig {
+        self.sampling
+    }
+
+    /// Returns the deterministic root seed.
+    pub const fn seed(&self) -> u64 {
+        self.seed
+    }
+}
+
+/// Backend-owned generated token that exposes only its portable token id.
+pub trait TokenOutput: Clone {
+    /// Error produced while observing the token value.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Waits only as required to read this token's canonical vocabulary id.
+    fn token_id(&self) -> Result<u32, Self::Error>;
+}
+
+impl TokenOutput for u32 {
+    type Error = std::convert::Infallible;
+
+    fn token_id(&self) -> Result<u32, Self::Error> {
+        Ok(*self)
+    }
+}
+
+/// High-level text-generation extension implemented once per backend.
+///
+/// The contract deliberately combines model execution and sampling. Core does
+/// not see logits or ask a backend to implement tensor primitives. The token,
+/// sampling state, cache state, and exact completion remain backend-owned.
+pub trait TextGenerationBackend: Backend {
+    /// Backend-owned generated token handle.
+    type Token: TokenOutput<Error = Self::Error>;
+    /// Backend-owned sampler and randomness state for one sequence.
+    type TextGenerationState;
+    /// Exact completion retaining model execution and token sampling.
+    type TextCompletion: Completion<Error = Self::Error>;
+
+    /// Creates backend sampling state for one sequence.
+    fn start_text_generation(
+        backend: &Self,
+        config: TextGenerationConfig,
+    ) -> Result<Self::TextGenerationState, Self::Error>;
+
+    /// Submits prompt prefill followed by sampling one token.
+    fn submit_text_prefill(
+        runtime: &mut ModelRuntime<Self>,
+        prompt_token_ids: Vec<u32>,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error>;
+
+    /// Submits cached decode from the preceding token and samples its successor.
+    fn submit_text_decode(
+        runtime: &mut ModelRuntime<Self>,
+        token: Self::Token,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error>;
+}
+
+enum TextGenerationStep<T> {
+    Prefill(Vec<u32>),
+    Decode(T),
+}
+
+/// Backend-generic asynchronous token-generation iterator.
+///
+/// Every yielded token handle may be fed into the following decode before its
+/// id is read on the host. Exact completions are retained until finished, and
+/// dropping the iterator waits for all still-retained submissions.
+pub struct TextGeneration<'a, B: TextGenerationBackend> {
+    runtime: &'a mut ModelRuntime<B>,
+    backend_state: B::TextGenerationState,
+    step: Option<TextGenerationStep<B::Token>>,
+    completions: Vec<B::TextCompletion>,
+    remaining_tokens: Option<usize>,
+}
+
+impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
+    /// Starts generation from portable prompt token ids.
+    pub fn new(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt_token_ids: Vec<u32>,
+        config: TextGenerationConfig,
+    ) -> Result<Self, B::Error> {
+        let backend_state = B::start_text_generation(runtime.backend(), config)?;
+        let remaining_tokens = config.sampling().max_new_tokens;
+        Ok(Self {
+            runtime,
+            backend_state,
+            step: Some(TextGenerationStep::Prefill(prompt_token_ids)),
+            completions: Vec::new(),
+            remaining_tokens,
+        })
+    }
+
+    fn retain_completion(&mut self, completion: B::TextCompletion) -> Result<(), B::Error> {
+        let existing = std::mem::take(&mut self.completions);
+        let mut retained = Vec::with_capacity(existing.len() + 1);
+        for pending in existing {
+            match pending.is_complete() {
+                Ok(true) => {}
+                Ok(false) => retained.push(pending),
+                Err(error) => {
+                    let _ = pending.wait();
+                    for retained_completion in retained.drain(..) {
+                        let _ = retained_completion.wait();
+                    }
+                    let _ = completion.wait();
+                    return Err(error);
+                }
+            }
+        }
+        retained.push(completion);
+        self.completions = retained;
+        Ok(())
+    }
+}
+
+impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
+    type Item = Result<B::Token, B::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_tokens == Some(0) {
+            self.step = None;
+            return None;
+        }
+        let step = self.step.take()?;
+        let submission = match step {
+            TextGenerationStep::Prefill(prompt) => {
+                B::submit_text_prefill(self.runtime, prompt, &mut self.backend_state)
+            }
+            TextGenerationStep::Decode(token) => {
+                B::submit_text_decode(self.runtime, token, &mut self.backend_state)
+            }
+        };
+        let submission = match submission {
+            Ok(submission) => submission,
+            Err(error) => return Some(Err(error)),
+        };
+        let token = submission.output;
+        if let Err(error) = self.retain_completion(submission.completion) {
+            return Some(Err(error));
+        }
+        self.step = Some(TextGenerationStep::Decode(token.clone()));
+        if let Some(remaining_tokens) = &mut self.remaining_tokens {
+            *remaining_tokens -= 1;
+        }
+        Some(Ok(token))
+    }
+}
+
+impl<B: TextGenerationBackend> Drop for TextGeneration<'_, B> {
+    fn drop(&mut self) {
+        for completion in self.completions.drain(..) {
+            let _ = completion.wait();
+        }
+    }
+}
+
 /// Optional high-level transfer and collective capability of a selected session.
 ///
 /// This contract deliberately operates on an opaque backend value. It models
@@ -514,6 +696,39 @@ mod tests {
         }
     }
 
+    impl TextGenerationBackend for Mock {
+        type Token = u32;
+        type TextGenerationState = (u32, u64);
+        type TextCompletion = Done;
+
+        fn start_text_generation(
+            _: &Self,
+            config: TextGenerationConfig,
+        ) -> Result<Self::TextGenerationState, Self::Error> {
+            Ok((config.sampling().top_k as u32, config.seed()))
+        }
+
+        fn submit_text_prefill(
+            runtime: &mut ModelRuntime<Self>,
+            prompt_token_ids: Vec<u32>,
+            state: &mut Self::TextGenerationState,
+        ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+            let submission = runtime.prefill(prompt_token_ids)?;
+            Ok(Submission {
+                output: submission.output + state.0 + state.1 as u32,
+                completion: submission.completion,
+            })
+        }
+
+        fn submit_text_decode(
+            runtime: &mut ModelRuntime<Self>,
+            token: Self::Token,
+            _: &mut Self::TextGenerationState,
+        ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+            runtime.decode(token)
+        }
+    }
+
     #[test]
     fn mock_prefill_and_multiple_decode_steps() {
         let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
@@ -522,6 +737,29 @@ mod tests {
         assert!(prefill.completion.is_complete().unwrap());
         assert_eq!(runtime.decode(3).unwrap().output, 13);
         assert_eq!(runtime.decode(4).unwrap().output, 14);
+    }
+
+    #[test]
+    fn portable_text_generation_prefills_and_decodes_without_tensor_types() {
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let sampling = crate::resolve_generation_config(
+            None,
+            crate::GenerationConfigOverrides {
+                max_new_tokens: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut generation = TextGeneration::new(
+            &mut runtime,
+            vec![1, 2],
+            TextGenerationConfig::new(sampling).with_seed(3),
+        )
+        .unwrap();
+        assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 55);
+        assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 13);
+        assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 14);
+        assert!(generation.next().is_none());
     }
 
     #[derive(Debug, Clone, Copy)]

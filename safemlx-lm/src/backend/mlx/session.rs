@@ -5,10 +5,15 @@ use safemlx::{
     random::RandomState,
     Array, Stream,
 };
-use safemlx_lm_core::{BackendSession, Completion, ModelRuntime, Submission};
+use safemlx_lm_core::{
+    BackendSession, Completion, ModelRuntime, Submission, TextGenerationBackend,
+    TextGenerationConfig, TokenOutput,
+};
 use std::path::Path;
 
 use crate::core::generation::MtpConfig;
+#[cfg(feature = "media-processing")]
+use crate::runtime::media::ModelProcessor;
 use crate::{
     api::{input, Model, ModelCache},
     architectures::distributed::{
@@ -54,6 +59,50 @@ impl MlxModelOutput {
 /// Opaque exact completion for any MLX model-session submission.
 pub struct MlxSessionCompletion {
     inner: MlxSessionCompletionKind,
+}
+
+/// MLX token handle yielded by backend-generic text generation.
+#[derive(Clone)]
+pub struct MlxTextToken {
+    value: Array,
+    stream: Stream,
+}
+
+impl TokenOutput for MlxTextToken {
+    type Error = Error;
+
+    fn token_id(&self) -> Result<u32, Self::Error> {
+        self.value
+            .clone()
+            .try_item::<u32>(&self.stream)
+            .map_err(Into::into)
+    }
+}
+
+/// Exact completion retaining both model execution and sampled token output.
+pub struct MlxTextCompletion {
+    model: MlxSessionCompletion,
+    token: MlxCompletion,
+}
+
+impl Completion for MlxTextCompletion {
+    type Error = Error;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        Ok(self.model.is_complete()? && self.token.is_complete()?)
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        self.model.wait()?;
+        self.token.wait()
+    }
+}
+
+/// MLX sampling and randomness state for backend-generic text generation.
+pub struct MlxTextGenerationState {
+    temperature: f32,
+    prng: Option<RandomState>,
+    sampler: crate::runtime::generation::sampler::GenerationSampler,
 }
 
 enum MlxSessionCompletionKind {
@@ -173,6 +222,8 @@ impl MlxModelInput {
 pub struct MlxModelSession<'a> {
     inner: MlxSessionKind,
     distributed: Option<MlxDistributedSession<'a>>,
+    #[cfg(feature = "media-processing")]
+    processor: Option<ModelProcessor>,
 }
 
 enum MlxSessionKind {
@@ -227,7 +278,24 @@ impl<'a> MlxModelSession<'a> {
                 MlxSessionKind::Expert(model, cache)
             }
         };
-        Ok(Self { inner, distributed })
+        Ok(Self {
+            inner,
+            distributed,
+            #[cfg(feature = "media-processing")]
+            processor: None,
+        })
+    }
+
+    /// Attaches MLX-owned multimodal preprocessing to this selected session.
+    #[cfg(feature = "media-processing")]
+    pub(crate) fn set_processor(&mut self, processor: Option<ModelProcessor>) {
+        self.processor = processor;
+    }
+
+    /// Returns MLX-owned multimodal preprocessing for this selected session.
+    #[cfg(feature = "media-processing")]
+    pub fn processor(&self) -> Option<&ModelProcessor> {
+        self.processor.as_ref()
     }
 
     /// Returns the normalized architecture name of the session-owned model.
@@ -750,6 +818,83 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
             }
         }
     }
+}
+
+impl<'a> TextGenerationBackend for MlxBackend<'a> {
+    type Token = MlxTextToken;
+    type TextGenerationState = MlxTextGenerationState;
+    type TextCompletion = MlxTextCompletion;
+
+    fn start_text_generation(
+        _: &Self,
+        config: TextGenerationConfig,
+    ) -> Result<Self::TextGenerationState, Error> {
+        let sampling = config.sampling();
+        let prng = if sampling.temperature == 0.0 {
+            None
+        } else {
+            Some(RandomState::from_key(safemlx::random::key(config.seed())?))
+        };
+        Ok(MlxTextGenerationState {
+            temperature: sampling.temperature,
+            prng,
+            sampler: crate::runtime::generation::sampler::GenerationSampler::from_resolved(
+                sampling,
+            ),
+        })
+    }
+
+    fn submit_text_prefill(
+        runtime: &mut ModelRuntime<Self>,
+        prompt_token_ids: Vec<u32>,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+        if prompt_token_ids.is_empty() {
+            return Err(Error::UnsupportedArchitecture(
+                "text generation requires at least one prompt token".into(),
+            ));
+        }
+        let stream = runtime.backend().stream().clone();
+        let tokens = Array::from(prompt_token_ids.as_slice()).try_index_device(NewAxis, &stream)?;
+        let parts = [input::InputPart::text_token_ids(&tokens)];
+        let submission = runtime.prefill(MlxModelInput::from(input::ModelInput::new(&parts)))?;
+        sample_text_submission(submission, state, stream)
+    }
+
+    fn submit_text_decode(
+        runtime: &mut ModelRuntime<Self>,
+        token: Self::Token,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+        let stream = runtime.backend().stream().clone();
+        let input = token.value.try_index_device((.., NewAxis), &stream)?;
+        let submission = runtime.decode(input)?;
+        sample_text_submission(submission, state, stream)
+    }
+}
+
+fn sample_text_submission(
+    submission: Submission<MlxModelOutput, MlxSessionCompletion>,
+    state: &mut MlxTextGenerationState,
+    stream: Stream,
+) -> Result<Submission<MlxTextToken, MlxTextCompletion>, Error> {
+    let logits = submission.output.into_logits().ok_or_else(|| {
+        Error::Parallel("text generation requires logits on the local session rank".into())
+    })?;
+    let token = state
+        .sampler
+        .sample(&logits, state.temperature, state.prng.as_mut(), &stream)?;
+    let sampled = MlxCompletion::submission(token)?;
+    Ok(Submission {
+        output: MlxTextToken {
+            value: sampled.output,
+            stream,
+        },
+        completion: MlxTextCompletion {
+            model: submission.completion,
+            token: sampled.completion,
+        },
+    })
 }
 
 fn model_submission(
