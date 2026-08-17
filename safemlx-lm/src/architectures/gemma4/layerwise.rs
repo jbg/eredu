@@ -930,7 +930,7 @@ pub fn load_gemma4_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Gemma4,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1024,7 +1024,7 @@ pub fn load_gemma4_tensor_parallel_layerwise_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Gemma4,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1062,7 +1062,7 @@ pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
     weights_stream: &Stream,
 ) -> Result<(Gemma4LayerwiseModel, Vec<u32>), Error> {
     let residency = options.weight_residency();
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::Gemma4,
         checkpoint,
         metadata,
@@ -1099,7 +1099,7 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(Gemma4LayerwiseModel, Vec<u32>), Error> {
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::Gemma4,
         checkpoint,
         metadata,

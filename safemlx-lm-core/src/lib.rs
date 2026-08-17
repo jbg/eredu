@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Portable artifact inspection and model-preparation planning.
+pub mod artifact;
 /// Validated decoder attention schedules.
 pub mod attention;
 /// High-level execution-backend contract.
@@ -30,6 +32,11 @@ pub mod scheduler;
 /// Parallel topology and placement planning.
 pub mod topology;
 
+pub use artifact::{
+    inspect_artifact, plan_model_preparation, validate_preparation_policy, ArtifactFormat,
+    ArtifactInspection, GgufArchitecture, MaterializationRoute, ModelArtifact, ModelConfiguration,
+    ModelKind, ModelPreparationPlan, PreparationPolicy, QuantizationRequest, ResidencyRequest,
+};
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use backend::{
     Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession, Completion,

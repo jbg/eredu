@@ -21,6 +21,11 @@ pub mod nn;
 pub mod runtime;
 /// Canonical backend-neutral runtime types.
 pub use safemlx_lm_core as core;
+pub use safemlx_lm_core::artifact::{
+    inspect_artifact, plan_model_preparation, ArtifactFormat, ArtifactInspection, GgufArchitecture,
+    MaterializationRoute, ModelArtifact, ModelConfiguration, ModelKind, ModelPreparationPlan,
+    PreparationPolicy, QuantizationRequest, ResidencyRequest,
+};
 #[cfg(test)]
 mod test_utils;
 

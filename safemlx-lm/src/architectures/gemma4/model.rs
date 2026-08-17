@@ -4524,7 +4524,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
     let options = quantization
         .map(crate::api::ModelLoadOptions::with_quantization)
         .unwrap_or_default();
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::Gemma4,
         checkpoint,
         metadata,
@@ -4568,8 +4568,10 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
 
     let (vision_config, image_token_id, video_token_id, audio_config, audio_token_id) =
         if let Some(projector) = projector {
-            crate::api::structural::validate_gemma4_mmproj_gguf(checkpoint, metadata, projector)
-                .into_loader_result()?;
+            crate::backend::mlx::structural::validate_gemma4_mmproj_gguf(
+                checkpoint, metadata, projector,
+            )
+            .into_loader_result()?;
             apply_mmproj_args(&mut args, metadata, projector)?
         } else {
             (None, None, None, None, None)
@@ -5978,7 +5980,7 @@ pub fn load_gemma4_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Gemma4,
         model_dir,
         crate::api::ModelLoadOptions::default(),
@@ -6022,7 +6024,7 @@ pub fn load_gemma4_model_quantized(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Gemma4,
         model_dir,
         crate::api::ModelLoadOptions::with_quantization(quantization),

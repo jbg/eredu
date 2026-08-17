@@ -1006,7 +1006,7 @@ pub fn load_deepseek_v3_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV3,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1070,7 +1070,7 @@ pub fn load_deepseek_v3_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV3,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1099,7 +1099,7 @@ pub(crate) fn load_deepseek_v3_gguf_tensor_parallel_model(
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
     let residency = options.weight_residency();
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::DeepSeek2,
         checkpoint,
         metadata,
@@ -1135,7 +1135,7 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::DeepSeek2,
         checkpoint,
         metadata,
@@ -1265,7 +1265,7 @@ pub fn load_deepseek_v3_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV3,
         model_dir,
         crate::api::ModelLoadOptions::default()

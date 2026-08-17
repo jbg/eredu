@@ -2,45 +2,7 @@
 
 use super::*;
 use crate::runtime::execution::layerwise::WeightResidency;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-/// Supported model-family dispatch target.
-pub enum ModelKind {
-    /// DeepSeek-V3/R1 MLA and MoE architecture.
-    DeepSeekV3,
-    /// DeepSeek-V4 compressed sparse-attention and mHC architecture.
-    DeepSeekV4,
-    /// Gemma 4 text architecture.
-    Gemma4,
-    /// OpenAI GPT-OSS MXFP4 sparse decoder architecture.
-    GptOss,
-    /// Thinking Machines Lab Inkling multimodal architecture.
-    Inkling,
-    /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder architecture.
-    KimiLinear,
-    /// Llama-compatible dense decoder architecture, including Mistral.
-    Llama,
-    /// Meta Muse-Glimmer dense multimodal architecture.
-    MuseGlimmer,
-    /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
-    Lfm2,
-    /// Nemotron-H hybrid Mamba2/attention/MoE architecture.
-    NemotronH,
-    /// PersonaPlex realtime speech-to-speech architecture.
-    PersonaPlex,
-    /// Qwen2 and Qwen2.5 dense text decoder architecture.
-    Qwen2,
-    /// Qwen3 decoder architecture.
-    Qwen3,
-    /// Qwen3-Next hybrid attention/MoE architecture.
-    Qwen3Next,
-    /// Qwen3-VL multimodal architecture.
-    Qwen3Vl,
-    /// Qwen3-VL multimodal architecture with a sparse MoE text decoder.
-    Qwen3VlMoe,
-    /// Qwen3.5 dense or mixture-of-experts architecture.
-    Qwen35,
-}
+pub use safemlx_lm_core::artifact::ModelKind;
 
 /// Architecture-independent options for loading model weights.
 ///
@@ -87,6 +49,64 @@ impl ModelLoadOptions {
         self.weight_residency = residency;
         self
     }
+
+    pub(crate) fn preparation_policy(self) -> Result<safemlx_lm_core::PreparationPolicy, Error> {
+        use crate::runtime::{
+            checkpoint::quantization::WeightQuantization,
+            execution::layerwise::LayerWeightResidency,
+        };
+        use safemlx_lm_core::{QuantizationRequest, ResidencyRequest};
+
+        if let Some(quantization) = self.quantization {
+            quantization.validate()?;
+        }
+        let quantization = match self.quantization {
+            Some(WeightQuantization::Affine(config)) => Some(QuantizationRequest::Affine {
+                group_size: u32::try_from(config.group_size).map_err(|_| {
+                    Error::Quantization(format!(
+                        "group_size must be non-negative, got {}",
+                        config.group_size
+                    ))
+                })?,
+                bits: u8::try_from(config.bits).map_err(|_| {
+                    Error::Quantization(format!("bits must fit in u8, got {}", config.bits))
+                })?,
+            }),
+            Some(WeightQuantization::MxFp4) => Some(QuantizationRequest::MxFp4),
+            Some(WeightQuantization::GgufIQuant { .. }) | None => None,
+        };
+        let residency = if self.weight_residency.expert_cache().is_some() {
+            ResidencyRequest::ExpertCache
+        } else {
+            match self.weight_residency.layers() {
+                LayerWeightResidency::FullyResident => ResidencyRequest::FullyResident,
+                LayerWeightResidency::LayerwiseHost(_) => ResidencyRequest::LayerwiseHost,
+                LayerWeightResidency::DenseDiskStream(_) => ResidencyRequest::DenseDiskStream,
+            }
+        };
+        Ok(safemlx_lm_core::PreparationPolicy {
+            quantization,
+            residency,
+            distributed: self
+                .parallel
+                .is_some_and(|topology| !topology.is_replicated()),
+        })
+    }
+
+    pub(crate) fn validate_preparation(
+        self,
+        kind: ModelKind,
+        gguf_architecture: Option<safemlx_lm_core::GgufArchitecture>,
+        format: safemlx_lm_core::ArtifactFormat,
+    ) -> Result<safemlx_lm_core::MaterializationRoute, Error> {
+        ensure_executable_load_options(self)?;
+        Ok(safemlx_lm_core::validate_preparation_policy(
+            kind,
+            gguf_architecture,
+            format,
+            self.preparation_policy()?,
+        )?)
+    }
 }
 
 pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Result<(), Error> {
@@ -128,330 +148,6 @@ pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Resul
     }
 }
 
-impl ModelKind {
-    /// Every model-family dispatch target supported by the high-level loader.
-    ///
-    /// Inspection parity tests iterate this list. The exhaustive matches in
-    /// the loader and preflight planner remain the compile-time backstop when
-    /// a new variant is added.
-    pub const ALL: [Self; 17] = [
-        Self::DeepSeekV3,
-        Self::DeepSeekV4,
-        Self::Gemma4,
-        Self::GptOss,
-        Self::Inkling,
-        Self::KimiLinear,
-        Self::Llama,
-        Self::MuseGlimmer,
-        Self::Lfm2,
-        Self::NemotronH,
-        Self::PersonaPlex,
-        Self::Qwen2,
-        Self::Qwen3,
-        Self::Qwen3Next,
-        Self::Qwen3Vl,
-        Self::Qwen3VlMoe,
-        Self::Qwen35,
-    ];
-
-    /// Returns a stable model-family name for diagnostics and capability dispatch.
-    pub const fn model_type_name(self) -> &'static str {
-        match self {
-            Self::DeepSeekV3 => "deepseek_v3",
-            Self::DeepSeekV4 => "deepseek_v4",
-            Self::Gemma4 => "gemma4",
-            Self::GptOss => "gpt_oss",
-            Self::Inkling => "inkling_mm_model",
-            Self::KimiLinear => "kimi_linear",
-            Self::Llama => "llama/mistral",
-            Self::MuseGlimmer => "muse_glimmer",
-            Self::Lfm2 => "lfm2/lfm2_moe",
-            Self::NemotronH => "nemotron_h",
-            Self::PersonaPlex => "personaplex",
-            Self::Qwen2 => "qwen2",
-            Self::Qwen3 => "qwen3",
-            Self::Qwen3Next => "qwen3_next",
-            Self::Qwen3Vl => "qwen3_vl",
-            Self::Qwen3VlMoe => "qwen3_vl_moe",
-            Self::Qwen35 => "qwen3_5",
-        }
-    }
-
-    pub(super) fn from_model_type(model_type: &str) -> Result<Self, Error> {
-        match model_type {
-            "deepseek_v3" => Ok(Self::DeepSeekV3),
-            "deepseek_v4" => Ok(Self::DeepSeekV4),
-            "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
-            "gpt_oss" => Ok(Self::GptOss),
-            "inkling_mm_model" => Ok(Self::Inkling),
-            "kimi_linear" => Ok(Self::KimiLinear),
-            "llama" | "mistral" => Ok(Self::Llama),
-            "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
-            "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
-            "nemotron_h" => Ok(Self::NemotronH),
-            "personaplex" => Ok(Self::PersonaPlex),
-            "qwen2" => Ok(Self::Qwen2),
-            "qwen3" | "qwen3_moe" => Ok(Self::Qwen3),
-            "qwen3_next" => Ok(Self::Qwen3Next),
-            "qwen3_vl" | "qwen3_vl_text" => Ok(Self::Qwen3Vl),
-            "qwen3_vl_moe" | "qwen3_vl_moe_text" => Ok(Self::Qwen3VlMoe),
-            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35),
-            other => Err(Error::UnsupportedModelType(other.to_string())),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ArtifactLoadKind {
-    Safetensors,
-    Gguf,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum GgufArchitecture {
-    KimiLinear,
-    DeepSeek2,
-    DeepSeek4,
-    GptOss,
-    Inkling,
-    Gemma4,
-    Llama,
-    Mistral,
-    MuseGlimmer,
-    Lfm2,
-    Lfm2Moe,
-    NemotronH,
-    NemotronHMoe,
-    Qwen2,
-    Qwen3,
-    Qwen3Moe,
-    Qwen3Vl,
-    Qwen3VlMoe,
-    Qwen35,
-    Qwen35Moe,
-    Qwen3Next,
-}
-
-impl GgufArchitecture {
-    pub(crate) const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, deepseek4, gpt-oss, inkling, gemma4, llama, mistral, muse-glimmer, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen3vlmoe, qwen35, qwen35moe, and qwen3next";
-
-    pub(crate) fn resolve(name: &str) -> Result<Self, Error> {
-        match name {
-            "kimi-linear" => Ok(Self::KimiLinear),
-            "deepseek2" => Ok(Self::DeepSeek2),
-            "deepseek4" => Ok(Self::DeepSeek4),
-            "gpt-oss" => Ok(Self::GptOss),
-            "inkling" => Ok(Self::Inkling),
-            "gemma4" => Ok(Self::Gemma4),
-            "llama" => Ok(Self::Llama),
-            "mistral" => Ok(Self::Mistral),
-            "muse-glimmer" => Ok(Self::MuseGlimmer),
-            "lfm2" => Ok(Self::Lfm2),
-            "lfm2moe" => Ok(Self::Lfm2Moe),
-            "nemotron_h" => Ok(Self::NemotronH),
-            "nemotron_h_moe" => Ok(Self::NemotronHMoe),
-            "qwen2" => Ok(Self::Qwen2),
-            "qwen3" => Ok(Self::Qwen3),
-            "qwen3moe" => Ok(Self::Qwen3Moe),
-            "qwen3vl" => Ok(Self::Qwen3Vl),
-            "qwen3vlmoe" => Ok(Self::Qwen3VlMoe),
-            "qwen35" => Ok(Self::Qwen35),
-            "qwen35moe" => Ok(Self::Qwen35Moe),
-            "qwen3next" => Ok(Self::Qwen3Next),
-            other => Err(Error::UnsupportedArchitecture(format!(
-                "GGUF architecture {other:?}; supported GGUF architectures are {}",
-                Self::SUPPORTED_NAMES
-            ))),
-        }
-    }
-
-    pub(crate) const fn model_kind(self) -> ModelKind {
-        match self {
-            Self::KimiLinear => ModelKind::KimiLinear,
-            Self::DeepSeek2 => ModelKind::DeepSeekV3,
-            Self::DeepSeek4 => ModelKind::DeepSeekV4,
-            Self::GptOss => ModelKind::GptOss,
-            Self::Inkling => ModelKind::Inkling,
-            Self::Gemma4 => ModelKind::Gemma4,
-            Self::Llama | Self::Mistral => ModelKind::Llama,
-            Self::MuseGlimmer => ModelKind::MuseGlimmer,
-            Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
-            Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
-            Self::Qwen2 => ModelKind::Qwen2,
-            Self::Qwen3 | Self::Qwen3Moe => ModelKind::Qwen3,
-            Self::Qwen3Vl => ModelKind::Qwen3Vl,
-            Self::Qwen3VlMoe => ModelKind::Qwen3VlMoe,
-            Self::Qwen35 | Self::Qwen35Moe => ModelKind::Qwen35,
-            Self::Qwen3Next => ModelKind::Qwen3Next,
-        }
-    }
-
-    pub(crate) fn validate_load_policy(self, options: ModelLoadOptions) -> Result<(), Error> {
-        let kind = self.model_kind();
-        validate_load_policy(kind, ArtifactLoadKind::Gguf, options)?;
-        let sparse = options.weight_residency.expert_cache().is_some();
-        if sparse
-            && !matches!(
-                self,
-                Self::KimiLinear
-                    | Self::DeepSeek2
-                    | Self::DeepSeek4
-                    | Self::GptOss
-                    | Self::Inkling
-                    | Self::Gemma4
-                    | Self::Lfm2Moe
-                    | Self::NemotronHMoe
-                    | Self::Qwen3Moe
-                    | Self::Qwen3VlMoe
-                    | Self::Qwen35Moe
-                    | Self::Qwen3Next
-            )
-        {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "sparse expert caching is unavailable for GGUF architecture {:?}",
-                self.metadata_name()
-            )));
-        }
-        Ok(())
-    }
-
-    pub(crate) const fn metadata_name(self) -> &'static str {
-        match self {
-            Self::KimiLinear => "kimi-linear",
-            Self::DeepSeek2 => "deepseek2",
-            Self::DeepSeek4 => "deepseek4",
-            Self::GptOss => "gpt-oss",
-            Self::Inkling => "inkling",
-            Self::Gemma4 => "gemma4",
-            Self::Llama => "llama",
-            Self::Mistral => "mistral",
-            Self::MuseGlimmer => "muse-glimmer",
-            Self::Lfm2 => "lfm2",
-            Self::Lfm2Moe => "lfm2moe",
-            Self::NemotronH => "nemotron_h",
-            Self::NemotronHMoe => "nemotron_h_moe",
-            Self::Qwen2 => "qwen2",
-            Self::Qwen3 => "qwen3",
-            Self::Qwen3Moe => "qwen3moe",
-            Self::Qwen3Vl => "qwen3vl",
-            Self::Qwen3VlMoe => "qwen3vlmoe",
-            Self::Qwen35 => "qwen35",
-            Self::Qwen35Moe => "qwen35moe",
-            Self::Qwen3Next => "qwen3next",
-        }
-    }
-
-    /// Validates container facts required by every concrete GGUF loader route.
-    /// Architecture modules remain responsible for their additional geometry
-    /// checks, but this common floor prevents a structurally valid, metadata-
-    /// only GGUF from being admitted as a model checkpoint.
-    pub(crate) fn validate_catalog(
-        self,
-        checkpoint: &GgufCheckpoint,
-        metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-    ) -> Result<(), Error> {
-        if checkpoint.catalog().physical_tensor_count() == 0 {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF model checkpoint contains no tensors".into(),
-            ));
-        }
-        let prefix = self.metadata_name();
-        for suffix in ["block_count", "embedding_length"] {
-            let key = format!("{prefix}.{suffix}");
-            let value = metadata.get(&key).ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "GGUF metadata is missing required key {key:?}"
-                ))
-            })?;
-            let value = value.as_i64().ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "GGUF metadata key {key:?} must be an integer"
-                ))
-            })?;
-            if value <= 0 {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "GGUF metadata key {key:?} must be positive, got {value}"
-                )));
-            }
-        }
-        if !checkpoint
-            .catalog()
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == "token_embd.weight")
-        {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF model checkpoint is missing required tensor \"token_embd.weight\"".into(),
-            ));
-        }
-        if matches!(self, Self::Qwen35 | Self::Qwen35Moe | Self::Qwen3Next)
-            && checkpoint.catalog().tensors().any(|tensor| {
-                let name = tensor.descriptor().name.as_str();
-                name.starts_with("v.") || name.starts_with("mm.")
-            })
-        {
-            return Err(Error::UnsupportedArchitecture(
-                "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Validates the architecture-independent part of the exact high-level load
-/// route. Both artifact inspection and weight loading call this function.
-pub(crate) fn validate_load_policy(
-    kind: ModelKind,
-    artifact: ArtifactLoadKind,
-    options: ModelLoadOptions,
-) -> Result<(), Error> {
-    ensure_executable_load_options(options)?;
-    if kind == ModelKind::PersonaPlex {
-        return Err(Error::UnsupportedArchitecture(
-            "PersonaPlex must be loaded through the realtime API".into(),
-        ));
-    }
-
-    if options.quantization.is_some()
-        && !options.weight_residency.is_fully_resident()
-        && artifact == ArtifactLoadKind::Safetensors
-        && options.weight_residency.expert_cache().is_none()
-        && !matches!(
-            kind,
-            ModelKind::DeepSeekV4 | ModelKind::Qwen2 | ModelKind::Qwen3
-        )
-    {
-        return Err(Error::Quantization(format!(
-            "load-time quantization is unsupported for {} nonresident loading; use a matching checkpoint-native packed format",
-            kind.model_type_name()
-        )));
-    }
-
-    let sparse = options.weight_residency.expert_cache().is_some();
-    if artifact == ArtifactLoadKind::Safetensors
-        && sparse
-        && !matches!(
-            kind,
-            ModelKind::KimiLinear
-                | ModelKind::DeepSeekV3
-                | ModelKind::DeepSeekV4
-                | ModelKind::GptOss
-                | ModelKind::Inkling
-                | ModelKind::Lfm2
-                | ModelKind::NemotronH
-                | ModelKind::Qwen3
-                | ModelKind::Qwen3Next
-                | ModelKind::Qwen3VlMoe
-                | ModelKind::Qwen35
-        )
-    {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "sparse expert caching requires a supported safetensors MoE architecture, not {}",
-            kind.model_type_name()
-        )));
-    }
-    Ok(())
-}
-
 /// Canonical resolution of a validated model config.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ResolvedModelConfig {
@@ -483,8 +179,11 @@ pub(crate) fn resolve_model_config(
     let metadata = serde_json::from_value::<ModelMetadata>(config.clone())
         .map_err(ModelConfigResolutionError::InvalidMetadata)?;
     let effective_model_type = effective_model_type(&metadata);
-    let kind = ModelKind::from_model_type(&effective_model_type)
-        .map_err(ModelConfigResolutionError::Loader)?;
+    let kind = ModelKind::from_model_type(&effective_model_type).map_err(|_| {
+        ModelConfigResolutionError::Loader(Error::UnsupportedModelType(
+            effective_model_type.clone(),
+        ))
+    })?;
     validate_model_config(kind, config).map_err(ModelConfigResolutionError::Loader)?;
     Ok(ResolvedModelConfig {
         kind,
@@ -517,7 +216,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_load_policy, ArtifactLoadKind, ModelKind, ModelLoadOptions};
+    use super::{ModelKind, ModelLoadOptions};
     use crate::{
         runtime::checkpoint::quantization::WeightQuantization, LayerwiseLoadOptions,
         WeightResidency,
@@ -529,11 +228,12 @@ mod tests {
             .with_weight_residency(WeightResidency::layerwise_host(
                 LayerwiseLoadOptions::default(),
             ));
-        validate_load_policy(
-            ModelKind::DeepSeekV4,
-            ArtifactLoadKind::Safetensors,
-            options,
-        )
-        .unwrap();
+        options
+            .validate_preparation(
+                ModelKind::DeepSeekV4,
+                None,
+                safemlx_lm_core::ArtifactFormat::SafeTensors,
+            )
+            .unwrap();
     }
 }

@@ -611,7 +611,7 @@ pub fn load_safetensors(
     let options = options.into();
     let residency = options.weight_residency();
     let args = resident::load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         args.model_kind(),
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -710,7 +710,7 @@ pub fn load_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     let args = resident::load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         args.model_kind(),
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -821,7 +821,7 @@ fn apply_mmproj_config(
     let Some(mmproj) = mmproj else {
         return Ok(());
     };
-    crate::api::structural::validate_muse_glimmer_projector_gguf(
+    crate::backend::mlx::structural::validate_muse_glimmer_projector_gguf(
         checkpoint,
         metadata,
         &mmproj.checkpoint,

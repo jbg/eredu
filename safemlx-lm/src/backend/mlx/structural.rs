@@ -1,12 +1,13 @@
-//! Pure checkpoint-structure plans shared by inspection and high-level loading.
+//! MLX architecture binding against portable checkpoint catalogs.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue, GgufType};
+use safemlx_lm_core::{GgufArchitecture, ModelKind};
 use serde_json::Value;
 
-use super::{GgufArchitecture, ModelKind, ModelLoadOptions};
+use crate::api::ModelLoadOptions;
 use crate::{
     architectures::{
         deepseek_v3::model as deepseek_v3,
@@ -32,6 +33,75 @@ use crate::{
         checkpoint::store::{SafetensorsWeightStore, StoredDtype, WeightStore},
     },
 };
+
+pub(crate) trait GgufArchitectureValidation {
+    fn validate_load_policy(self, options: ModelLoadOptions) -> Result<(), Error>;
+    fn validate_catalog(
+        self,
+        checkpoint: &GgufCheckpoint,
+        metadata: &HashMap<String, GgufMetadataValue>,
+    ) -> Result<(), Error>;
+}
+
+impl GgufArchitectureValidation for GgufArchitecture {
+    fn validate_load_policy(self, options: ModelLoadOptions) -> Result<(), Error> {
+        options.validate_preparation(
+            self.model_kind(),
+            Some(self),
+            safemlx_lm_core::ArtifactFormat::Gguf,
+        )?;
+        Ok(())
+    }
+
+    fn validate_catalog(
+        self,
+        checkpoint: &GgufCheckpoint,
+        metadata: &HashMap<String, GgufMetadataValue>,
+    ) -> Result<(), Error> {
+        if checkpoint.catalog().physical_tensor_count() == 0 {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF model checkpoint contains no tensors".into(),
+            ));
+        }
+        let prefix = self.metadata_name();
+        for suffix in ["block_count", "embedding_length"] {
+            let key = format!("{prefix}.{suffix}");
+            let value = metadata
+                .get(&key)
+                .and_then(GgufMetadataValue::as_i64)
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "GGUF metadata key {key:?} must be a present integer"
+                    ))
+                })?;
+            if value <= 0 {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "GGUF metadata key {key:?} must be positive, got {value}"
+                )));
+            }
+        }
+        if !checkpoint
+            .catalog()
+            .tensors()
+            .any(|tensor| tensor.descriptor().name == "token_embd.weight")
+        {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF model checkpoint is missing required tensor \"token_embd.weight\"".into(),
+            ));
+        }
+        if matches!(self, Self::Qwen35 | Self::Qwen35Moe | Self::Qwen3Next)
+            && checkpoint.catalog().tensors().any(|tensor| {
+                let name = tensor.descriptor().name.as_str();
+                name.starts_with("v.") || name.starts_with("mm.")
+            })
+        {
+            return Err(Error::UnsupportedArchitecture(
+                "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)] // Reserved for fail-closed structural policies.

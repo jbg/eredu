@@ -33,6 +33,7 @@ audio-processing = ["media-processing", "dep:rustfft"]
 safemlx = { workspace = true, features = ["safetensors"] }
 safemlx-lm-core.workspace = true
 safemlx-lm-utils = { workspace = true, default-features = false }
+safemlx-gguf.workspace = true
 
 # External dependencies
 serde = { version = "1", features = ["derive"] }
@@ -60,4 +61,3 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 lazy_static = "1"
-safemlx-gguf.workspace = true

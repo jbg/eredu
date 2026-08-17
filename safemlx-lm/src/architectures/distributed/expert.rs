@@ -4540,7 +4540,7 @@ fn load_gguf_ep(
         structural_options.parallel = None;
         structural_options.weight_residency =
             crate::runtime::execution::layerwise::WeightResidency::fully_resident();
-        crate::api::structural::validate_gguf(
+        crate::backend::mlx::structural::validate_gguf(
             crate::api::GgufArchitecture::DeepSeek4,
             checkpoint,
             &metadata,

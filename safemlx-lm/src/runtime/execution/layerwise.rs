@@ -109,7 +109,7 @@ pub(crate) fn validate_gguf_layerwise_source(
     };
     let architecture = crate::api::GgufArchitecture::resolve(architecture_name)?;
     let residency = options.weight_residency();
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         architecture,
         checkpoint,
         metadata,

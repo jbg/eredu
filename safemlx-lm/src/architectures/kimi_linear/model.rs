@@ -2869,7 +2869,7 @@ fn load_model_impl(
         crate::api::ModelLoadOptions::default,
         crate::api::ModelLoadOptions::with_quantization,
     );
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::KimiLinear,
         model_dir,
         inspection_options,
@@ -2949,7 +2949,7 @@ pub(crate) fn load_gguf_checkpoint(
         crate::api::ModelLoadOptions::default,
         crate::api::ModelLoadOptions::with_quantization,
     );
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::KimiLinear,
         checkpoint,
         &metadata,

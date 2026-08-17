@@ -51,6 +51,7 @@ use crate::{
         },
         input as runtime_input,
     },
+    backend::mlx::structural::GgufArchitectureValidation,
     core::cache::{
         CacheRankIdentity, CacheResidencyPool, LayerCachePolicy, StateTensorDimension,
         StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
@@ -5668,7 +5669,7 @@ fn qwen35_gguf_multimodal_geometry(
             "Qwen3-Next GGUF does not define multimodal projector semantics".into(),
         ));
     }
-    crate::api::structural::validate_qwen35_projector_gguf(
+    crate::backend::mlx::structural::validate_qwen35_projector_gguf(
         checkpoint,
         metadata,
         &mmproj.checkpoint,
@@ -5753,7 +5754,7 @@ pub(crate) fn load_qwen3_5_gguf_checkpoint(
     }
     let resolved = crate::api::GgufArchitecture::resolve(&architecture)?;
     resolved.validate_catalog(checkpoint, &metadata)?;
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         resolved,
         checkpoint,
         &metadata,
@@ -6848,7 +6849,7 @@ pub fn load_qwen3_5_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
         crate::api::ModelLoadOptions::default(),
@@ -6925,7 +6926,7 @@ pub fn load_qwen3_5_model_quantized(
     )? {
         return load_qwen3_5_model(model_dir, stream, weights_stream);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
         crate::api::ModelLoadOptions::with_quantization(quantization),

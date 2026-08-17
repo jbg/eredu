@@ -1823,7 +1823,7 @@ pub(crate) fn prepare_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports gpt-oss"
         )));
     }
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::GptOss,
         checkpoint,
         metadata,
@@ -2082,7 +2082,7 @@ pub fn load_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::GptOss,
         model_dir,
         crate::api::ModelLoadOptions::default(),
@@ -2114,7 +2114,7 @@ pub fn load_model_quantized(
         ));
     }
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::GptOss,
         model_dir,
         crate::api::ModelLoadOptions::with_quantization(quantization),

@@ -1048,7 +1048,7 @@ pub fn load_qwen3_next_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3Next,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1100,7 +1100,7 @@ pub fn load_qwen3_next_tensor_parallel_model(
         }
         return Ok(model);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3Next,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1130,7 +1130,7 @@ pub fn load_qwen35_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1217,7 +1217,7 @@ pub fn load_qwen35_tensor_parallel_model(
         }
         return Ok(model);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1272,7 +1272,7 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
         resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, mmproj, weights_stream)?;
     let architecture = crate::api::GgufArchitecture::resolve(&prepared.architecture)?;
     let residency = options.weight_residency();
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         architecture,
         checkpoint,
         metadata,
@@ -1325,7 +1325,7 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     let prepared =
         resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, mmproj, weights_stream)?;
     let architecture = crate::api::GgufArchitecture::resolve(&prepared.architecture)?;
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         architecture,
         checkpoint,
         metadata,
@@ -1484,7 +1484,7 @@ pub fn load_qwen3_next_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3Next,
         model_dir,
         crate::api::ModelLoadOptions::default()
@@ -1524,7 +1524,7 @@ pub fn load_qwen35_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
         crate::api::ModelLoadOptions::default()

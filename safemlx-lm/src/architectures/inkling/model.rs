@@ -3912,7 +3912,7 @@ pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
         .catalog()
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
@@ -3920,7 +3920,7 @@ pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
     )
     .into_loader_result()?;
     if let Some(mmproj) = mmproj {
-        crate::api::structural::validate_inkling_mmproj_gguf(metadata, mmproj)
+        crate::backend::mlx::structural::validate_inkling_mmproj_gguf(metadata, mmproj)
             .into_loader_result()?;
     }
     let mut configs = gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
@@ -4922,7 +4922,7 @@ pub fn load_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
         crate::api::ModelLoadOptions::default(),

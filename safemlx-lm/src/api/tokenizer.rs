@@ -60,7 +60,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, Error> {
     let submitted_path = model_dir.as_ref();
     let (template, model_id, tokenizer_template_kwargs) = if is_gguf_file(submitted_path) {
-        let metadata = GgufMetadata::from_file(submitted_path)?;
+        let metadata = portable_gguf_metadata(submitted_path)?;
         let sidecar_dir = gguf_sidecar_dir(submitted_path);
         let template = match metadata.get("tokenizer.chat_template") {
             Some(GgufMetadataValue::String(template)) => {
@@ -116,8 +116,18 @@ pub(super) fn gguf_sidecar_dir(path: &Path) -> &Path {
 }
 
 pub(super) fn load_gguf_tokenizer(gguf_file: &Path) -> Result<GgufTokenizer, Error> {
-    let metadata = GgufMetadata::from_file(gguf_file)?;
+    let metadata = portable_gguf_metadata(gguf_file)?;
     load_gguf_tokenizer_from_metadata(gguf_file, &metadata)
+}
+
+fn portable_gguf_metadata(
+    gguf_file: &Path,
+) -> Result<std::collections::HashMap<String, GgufMetadataValue>, Error> {
+    Ok(safemlx_gguf::Reader::open(gguf_file)?
+        .metadata()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect())
 }
 
 pub(super) fn load_gguf_tokenizer_from_metadata(

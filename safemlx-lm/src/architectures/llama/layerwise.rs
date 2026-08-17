@@ -467,7 +467,7 @@ pub(crate) fn load_llama_safetensors_mlx(
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(weight_residency),
@@ -536,7 +536,7 @@ pub fn load_llama_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),

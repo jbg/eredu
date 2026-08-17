@@ -4,14 +4,18 @@
 pub(crate) mod cache;
 /// Distributed scheduler consensus over MLX collectives.
 pub mod consensus;
+mod loading;
 /// MLX allocator observations for neutral residency telemetry.
 pub mod residency;
+/// Exact MLX loader binding against portable checkpoint catalogs.
+pub(crate) mod structural;
+pub(crate) use loading::{
+    materialize_gguf_plan, validate_gguf_quantization_source, MaterializedGgufModel,
+};
 /// Architecture-erased model/session execution.
 mod session;
 
 pub use session::{MlxGeneration, MlxModelInput, MlxModelSession};
-
-use std::path::PathBuf;
 
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
 use safemlx_lm_core::backend::{
@@ -27,9 +31,9 @@ use crate::{
 /// Request to prepare any facade-supported model on MLX.
 #[derive(Debug, Clone)]
 pub struct MlxModelConfig<'a> {
-    /// Checkpoint directory or GGUF file.
-    pub model_path: PathBuf,
-    /// Shared architecture-neutral load options.
+    /// Backend-neutral inspected artifact and materialization route.
+    pub plan: safemlx_lm_core::ModelPreparationPlan,
+    /// MLX materialization details for the selected neutral route.
     pub options: ModelLoadOptions,
     /// Stream used for checkpoint materialization and transfers.
     pub weights_stream: &'a Stream,
@@ -90,8 +94,8 @@ impl<'a> Backend for MlxBackend<'a> {
         &self,
         config: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        crate::api::load_model_with_options_mlx(
-            config.model_path,
+        loading::materialize_model_plan(
+            config.plan,
             config.options,
             self.stream,
             config.weights_stream,

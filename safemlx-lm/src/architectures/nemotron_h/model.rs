@@ -4127,7 +4127,7 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
     } else {
         crate::api::GgufArchitecture::NemotronH
     };
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
         &metadata,
@@ -4177,7 +4177,7 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
     } else {
         crate::api::GgufArchitecture::NemotronH
     };
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
         metadata,
@@ -4675,7 +4675,7 @@ pub fn load_nemotron_h_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::NemotronH,
         model_dir,
         crate::api::ModelLoadOptions::default(),

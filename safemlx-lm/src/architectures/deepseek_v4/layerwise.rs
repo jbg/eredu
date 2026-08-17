@@ -1514,7 +1514,7 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::DeepSeek4,
         checkpoint,
         metadata,
@@ -1580,7 +1580,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
     let residency = options.weight_residency();
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::DeepSeek4,
         checkpoint,
         metadata,
@@ -1641,7 +1641,7 @@ pub fn load_deepseek_v4_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV4,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency()),

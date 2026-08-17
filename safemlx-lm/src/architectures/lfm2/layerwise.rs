@@ -547,7 +547,7 @@ pub fn load_lfm2_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let residency = options.weight_residency();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Lfm2,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -610,7 +610,7 @@ pub fn load_lfm2_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Lfm2,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),

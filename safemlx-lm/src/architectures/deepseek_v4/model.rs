@@ -2232,7 +2232,7 @@ pub fn load_model(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let args = get_model_args(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV4,
         model_dir,
         crate::api::ModelLoadOptions::default(),

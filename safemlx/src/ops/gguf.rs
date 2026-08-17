@@ -268,6 +268,13 @@ impl Iterator for GgufTensorIter<'_> {
 }
 
 impl GgufCheckpoint {
+    /// Wrap a checkpoint already inspected by a backend-neutral planner.
+    ///
+    /// No header is reopened and no tensor payload is read.
+    pub fn from_portable(inner: safemlx_gguf::Checkpoint) -> Self {
+        Self { inner }
+    }
+
     /// Open and validate a single-file or canonically sharded GGUF checkpoint.
     ///
     /// This parses all shard headers and descriptors, but reads no tensor payloads.

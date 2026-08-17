@@ -3,6 +3,22 @@ use std::any::TypeId;
 #[test]
 fn facade_exports_are_the_canonical_core_types() {
     assert_eq!(
+        TypeId::of::<safemlx_lm::ModelKind>(),
+        TypeId::of::<safemlx_lm::core::artifact::ModelKind>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::GgufArchitecture>(),
+        TypeId::of::<safemlx_lm::core::artifact::GgufArchitecture>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::PreparationPolicy>(),
+        TypeId::of::<safemlx_lm::core::artifact::PreparationPolicy>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::ModelPreparationPlan>(),
+        TypeId::of::<safemlx_lm::core::artifact::ModelPreparationPlan>(),
+    );
+    assert_eq!(
         TypeId::of::<safemlx_lm::AttentionPolicy>(),
         TypeId::of::<safemlx_lm::core::attention::AttentionPolicy>(),
     );

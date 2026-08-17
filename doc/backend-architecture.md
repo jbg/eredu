@@ -22,7 +22,8 @@ or another tensor runtime. Its dependency-graph test enforces that property.
 
 Core owns concepts whose meaning does not depend on tensor representation:
 
-- artifact/model identity and neutral tensor catalog descriptors;
+- artifact/model identity, SafeTensors/GGUF header inspection, model-family
+  resolution, neutral tensor catalogs, and materialization-route selection;
 - validated attention schedules;
 - generation phases, cancellation, finish reasons, and semantic output events;
 - queue fairness, request/work lifecycle, transactional branch commit/discard,
@@ -68,8 +69,22 @@ capabilities and therefore fail closed when absent.
 
 ## MLX mapping
 
-`safemlx-lm::backend::mlx::MlxBackend` maps model preparation to the central
-`api::load_model_with_options` dispatcher and session creation to `ModelCache`.
+`api::load_model_with_options` first calls the core `inspect_artifact` and
+`plan_model_preparation` functions. The resulting `ModelPreparationPlan` owns
+the resolved `ModelKind`, raw portable configuration, neutral tensor catalog,
+validated load-policy route, and—when applicable—the already-opened
+`safemlx_gguf::Checkpoint`. Only then is the plan passed to
+`MlxBackend::prepare_model`.
+
+The MLX adapter's `loading` module is the sole materializer. It consumes the
+plan, performs exact architecture/module binding, creates MLX arrays and
+modules, and applies MLX quantization, residency, stream, mapping, and transfer
+semantics. It does not call back into the public facade loader. GGUF headers and
+metadata are not reopened: `GgufCheckpoint::from_portable` wraps the core-owned
+checkpoint for payload conversion. Combined model/tokenizer loading uses the
+same core plan; tokenizer and chat sidecars remain facade concerns.
+
+`MlxBackend` maps session creation to `ModelCache`.
 `MlxModelSession` is the sole architecture-erased prefill/decode
 implementation. It dispatches matching `Model` and `ModelCache` variants to
 their MLX architecture implementation, then wraps the output with
@@ -83,8 +98,9 @@ metadata. Backend submission therefore owns text, image, audio, video, and
 embedding inputs without placing MLX arrays or modality-specific tensor layouts
 in core.
 
-The public `api::load_model_with_options` route calls `Backend::prepare_model`
-before format and architecture dispatch. `MlxGeneration` is one
+The public `api::load_model_with_options` route performs format, architecture,
+catalog, and policy planning in core before calling `Backend::prepare_model`.
+`MlxGeneration` is one
 architecture-erased iterator over `Model` and `ModelCache`; every supported
 text and multimodal model submits prompt prefill and every cached decode through
 `MlxModelSession`. The former per-architecture `ModelGenerate` enum, Llama-only
@@ -104,8 +120,10 @@ truncation replacement, and mutable tails. The generic core
 device, host, backing, host-demotion, and I/O values. Its exact I/O keys bind a
 direction and generation to one block; private resource slots make conflicting
 phase/resource combinations unrepresentable. Neutral checkpoint descriptors
-describe names, shapes, dtypes, and byte locations; MLX weight stores remain
-responsible for validating source formats and materializing arrays. `OffloadPlan`
+describe names, shapes, dtypes, and byte locations. Core validates SafeTensors
+headers/index paths and GGUF shard catalogs without reading tensor payloads.
+MLX weight stores remain responsible for mapped payload access, exact
+architecture binding, and array materialization. `OffloadPlan`
 is the only weight-residency plan:
 budgets, tier assignments, eviction policy, transfer accounting, prefetch and
 eviction telemetry, process observations, and allocator observations all live
@@ -137,15 +155,18 @@ The current boundary leaves these components MLX-coupled:
   and tensor movement;
 - per-block MLX cache resources, native completion observation, transfer/disk
   worker scheduling, prompt-cache filesystem publication, safetensors payload
-  validation and materialization (the transition protocol, block registration,
-  exact leases, access ordering, protected prefixes, victim selection, mutable
-  tails, prompt identity, topology, manifests, catalogs, fingerprints,
-  compatibility, block identity, tier vocabulary, layer geometry, fixed-state
-  policy, and pure validation are already core-owned);
+  mapping and materialization (container/header validation, the transition
+  protocol, block registration, exact leases, access ordering, protected
+  prefixes, victim selection, mutable tails, prompt identity, topology,
+  manifests, catalogs, fingerprints, compatibility, block identity, tier
+  vocabulary, layer geometry, fixed-state policy, and pure validation are
+  already core-owned);
 - weight array/host-buffer materialization, native transfer events, retained
   source mappings, and physical-capacity queries (the corresponding ownership,
   admission, eviction, window, lease, and generation state is now in core);
-- checkpoint weight recipes/stores and MLX array materialization;
+- architecture-specific checkpoint binding/weight recipes, mapped payload
+  stores, GGUF decoding, and MLX array materialization (artifact detection,
+  model-family resolution, neutral catalogs, and route planning are core-owned);
 - sampling, speculative decoding, activation observation, MLX allocator
   sampling, and Metal/CUDA kernels.
 

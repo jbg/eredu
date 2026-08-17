@@ -943,7 +943,7 @@ pub fn load_personaplex_layerwise_model(
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::PersonaPlex,
         model_dir,
         crate::api::ModelLoadOptions::default(),
@@ -1011,7 +1011,7 @@ pub fn load_personaplex_tensor_parallel_layerwise_model(
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::PersonaPlex,
         model_dir,
         crate::api::ModelLoadOptions::default(),

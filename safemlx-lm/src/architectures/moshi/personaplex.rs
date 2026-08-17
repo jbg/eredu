@@ -234,7 +234,7 @@ pub fn load_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::PersonaPlex,
         model_dir.as_ref(),
         crate::api::ModelLoadOptions::default(),
@@ -270,7 +270,7 @@ pub fn load_model_quantized(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::PersonaPlex,
         model_dir.as_ref(),
         crate::api::ModelLoadOptions::with_quantization(quantization),

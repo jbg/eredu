@@ -61,7 +61,12 @@ if !report.is_loadable() {
 Use the high-level `api` module for loading, prepared inputs, generation, cache
 creation, and memory admission. `safemlx_lm::load_model_with_options` is the
 single model-loading entry point for supported checkpoint formats and
-architectures. The MLX backend performs architecture dispatch internally.
+architectures. It first builds a backend-neutral `ModelPreparationPlan` in
+`safemlx-lm-core`: format detection, model-family resolution,
+SafeTensors/GGUF header catalogs, and load-route validation happen without
+MLX. The selected MLX backend then consumes that plan to map payloads and
+construct executable arrays/modules; it never calls back into the public
+facade loader.
 All ordinary text and multimodal prefill/decode execution crosses the single
 `MlxModelSession` implementation of the core session contract. Direct
 submissions return their exact completion; callers either retain it or use

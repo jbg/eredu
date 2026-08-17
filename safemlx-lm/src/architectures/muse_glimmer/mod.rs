@@ -2401,7 +2401,7 @@ pub(crate) fn load_gguf_checkpoint(
     }
     let is_moe = false;
     let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
         &metadata,
@@ -2516,7 +2516,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     is_moe: bool,
 ) -> Result<(DecoderConfig, Vec<u32>), Error> {
     let gguf_architecture = crate::api::GgufArchitecture::resolve(architecture)?;
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
         metadata,
@@ -3428,7 +3428,7 @@ pub fn load_safetensors(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         model_args.model_kind(),
         model_dir,
         crate::api::ModelLoadOptions::default(),
@@ -3452,7 +3452,7 @@ pub fn load_safetensors_quantized(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let mut model_args = load_config(model_dir)?;
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         model_args.model_kind(),
         model_dir,
         crate::api::ModelLoadOptions::with_quantization(quantization),

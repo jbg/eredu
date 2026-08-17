@@ -5076,12 +5076,9 @@ fn load_policy_admits_fully_resident_inkling_and_nemotron_materialization() {
             super::config::ModelKind::Inkling,
             super::config::ModelKind::NemotronH,
         ] {
-            super::config::validate_load_policy(
-                kind,
-                super::config::ArtifactLoadKind::Safetensors,
-                options,
-            )
-            .unwrap();
+            options
+                .validate_preparation(kind, None, safemlx_lm_core::ArtifactFormat::SafeTensors)
+                .unwrap();
         }
     }
 }

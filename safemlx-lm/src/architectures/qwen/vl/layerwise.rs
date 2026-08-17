@@ -441,7 +441,7 @@ pub fn load_qwen3_vl_layerwise_model(
     } else {
         crate::api::ModelKind::Qwen3Vl
     };
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -513,7 +513,7 @@ pub fn load_qwen3_vl_tensor_parallel_layerwise_model(
     } else {
         crate::api::ModelKind::Qwen3Vl
     };
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -699,7 +699,7 @@ pub fn load_qwen3_vl_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3VlMoe,
         model_dir,
         crate::api::ModelLoadOptions::default()

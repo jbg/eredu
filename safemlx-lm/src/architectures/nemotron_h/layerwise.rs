@@ -1348,7 +1348,7 @@ pub fn load_nemotron_h_layerwise_model(
         .map(crate::api::ModelLoadOptions::with_quantization)
         .unwrap_or_default()
         .with_weight_residency(residency);
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::NemotronH,
         model_dir,
         load_options,
@@ -1401,7 +1401,7 @@ pub fn load_nemotron_h_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::NemotronH,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1489,8 +1489,13 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
         .map(crate::api::ModelLoadOptions::with_quantization)
         .unwrap_or_default()
         .with_weight_residency(residency);
-    crate::api::structural::validate_gguf(architecture, checkpoint, metadata, load_options)
-        .into_loader_result()?;
+    crate::backend::mlx::structural::validate_gguf(
+        architecture,
+        checkpoint,
+        metadata,
+        load_options,
+    )
+    .into_loader_result()?;
     let prepared =
         resident::prepare_nemotron_h_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let args = prepared.args;
@@ -1624,7 +1629,7 @@ pub fn load_nemotron_h_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::NemotronH,
         model_dir,
         crate::api::ModelLoadOptions::default()

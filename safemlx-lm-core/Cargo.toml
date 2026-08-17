@@ -14,8 +14,10 @@ default = []
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+safemlx-gguf.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+tempfile.workspace = true

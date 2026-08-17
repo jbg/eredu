@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
+use crate::backend::mlx::structural::{self, GgufArchitectureValidation};
+use safemlx::ops::GgufCheckpoint;
+use safemlx_gguf::MetadataValue as GgufMetadataValue;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
@@ -375,12 +377,12 @@ fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelIns
                 report.architecture = Some(supported.effective_model_type);
                 report.expected_modalities = modalities_for_safetensors(supported.kind, config);
                 report.architecture_support = InspectionReadiness::Ready;
-                match validate_load_policy(
+                match options.load.validate_preparation(
                     supported.kind,
-                    ArtifactLoadKind::Safetensors,
-                    options.load,
+                    None,
+                    safemlx_lm_core::ArtifactFormat::SafeTensors,
                 ) {
-                    Ok(()) => report.requested_load = InspectionReadiness::Ready,
+                    Ok(_) => report.requested_load = InspectionReadiness::Ready,
                     Err(error) => reject_load_policy(&mut report, &error),
                 }
             }
@@ -1473,6 +1475,18 @@ fn reject_load_policy(report: &mut ModelInspectionReport, error: &Error) {
         ),
         Error::Parallel(detail) => (
             InspectionIssueCode::UnsupportedParallelTopology,
+            detail.clone(),
+        ),
+        Error::Artifact(
+            safemlx_lm_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(detail),
+        ) => (
+            InspectionIssueCode::UnsupportedQuantizationRequest,
+            detail.clone(),
+        ),
+        Error::Artifact(safemlx_lm_core::artifact::ArtifactError::UnsupportedResidencyPolicy(
+            detail,
+        )) => (
+            InspectionIssueCode::UnsupportedResidencyPolicy,
             detail.clone(),
         ),
         Error::UnsupportedArchitecture(detail)
@@ -6426,10 +6440,10 @@ mod tests {
     #[test]
     fn loader_and_inspection_model_kind_dispatch_are_exhaustive() {
         for kind in ModelKind::ALL {
-            let result = validate_load_policy(
+            let result = ModelLoadOptions::default().validate_preparation(
                 kind,
-                ArtifactLoadKind::Safetensors,
-                ModelLoadOptions::default(),
+                None,
+                safemlx_lm_core::ArtifactFormat::SafeTensors,
             );
             assert_eq!(result.is_ok(), kind != ModelKind::PersonaPlex, "{kind:?}");
             assert_eq!(

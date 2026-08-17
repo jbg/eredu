@@ -1394,7 +1394,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
         )));
     }
     let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
         metadata,
@@ -1660,7 +1660,7 @@ pub fn load_resident_llama_model(
     weights_stream: &Stream,
 ) -> Result<ResidentModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
         crate::api::ModelLoadOptions::default(),
@@ -1682,7 +1682,7 @@ pub fn load_resident_llama_model_quantized(
     weights_stream: &Stream,
 ) -> Result<ResidentModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
         crate::api::ModelLoadOptions::with_quantization(quantization),

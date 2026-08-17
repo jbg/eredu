@@ -1079,7 +1079,7 @@ pub fn load_inkling_layerwise_model(
         .map(crate::api::ModelLoadOptions::with_quantization)
         .unwrap_or_default()
         .with_weight_residency(residency);
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
         load_options,
@@ -1139,7 +1139,7 @@ pub fn load_inkling_tensor_parallel_layerwise_model(
         )
         .map(|(model, _)| model);
     }
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1168,7 +1168,7 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
     weights_stream: &Stream,
 ) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
     let residency = options.weight_residency();
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
@@ -1201,7 +1201,7 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
         .map(crate::api::ModelLoadOptions::with_quantization)
         .unwrap_or_default()
         .with_weight_residency(residency);
-    crate::api::structural::validate_gguf(
+    crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
@@ -1304,7 +1304,7 @@ pub fn load_inkling_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
         crate::api::ModelLoadOptions::default()

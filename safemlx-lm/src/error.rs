@@ -19,6 +19,10 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Backend-neutral artifact inspection or preparation planning failed.
+    #[error(transparent)]
+    Artifact(#[from] safemlx_lm_core::artifact::ArtifactError),
+
     /// Invalid backend-neutral cache identity, geometry, or state policy.
     #[error(transparent)]
     CachePolicy(#[from] safemlx_lm_core::cache::CachePolicyError),
@@ -94,6 +98,10 @@ pub enum Error {
     /// Embedded GGUF tokenizer metadata is invalid or cannot be reconstructed.
     #[error("GGUF tokenizer error: {0}")]
     GgufTokenizer(String),
+
+    /// Portable GGUF header or catalog parsing failed.
+    #[error(transparent)]
+    Gguf(#[from] safemlx_gguf::Error),
 
     /// The loaded checkpoint does not provide a chat template.
     #[error("the loaded model does not provide a chat template")]

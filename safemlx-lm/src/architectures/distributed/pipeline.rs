@@ -9344,7 +9344,7 @@ pub fn load_pipeline_model_with_options(
         // nonresident-loader restriction.
         structural_options.weight_residency =
             crate::runtime::execution::layerwise::WeightResidency::fully_resident();
-        crate::api::structural::validate_gguf(
+        crate::backend::mlx::structural::validate_gguf(
             architecture,
             &checkpoint,
             &metadata,
@@ -9810,7 +9810,7 @@ pub fn load_pipeline_model_with_options(
     let store = open_safetensors_weight_store(model_dir, max_mapped_shards)?;
     match model_type {
         Some("llama" | "mistral") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::Llama,
                 model_dir,
                 options,
@@ -9826,7 +9826,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("deepseek_v3") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::DeepSeekV3,
                 model_dir,
                 options,
@@ -9843,7 +9843,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("deepseek_v4") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::DeepSeekV4,
                 model_dir,
                 options,
@@ -9860,7 +9860,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::Gemma4,
                 model_dir,
                 options,
@@ -9887,7 +9887,7 @@ pub fn load_pipeline_model_with_options(
         }
         Some("qwen2" | "qwen3" | "qwen3_moe") => {
             let args = dense_qwen::load_config(model_dir)?;
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 args.model_kind(),
                 model_dir,
                 options,
@@ -9910,7 +9910,7 @@ pub fn load_pipeline_model_with_options(
                 ));
             }
             let args = muse_glimmer::load_config(model_dir)?;
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::MuseGlimmer,
                 model_dir,
                 options,
@@ -9932,7 +9932,7 @@ pub fn load_pipeline_model_with_options(
             } else {
                 ModelKind::Qwen3Vl
             };
-            crate::api::structural::validate_safetensors_load_path(kind, model_dir, options)?;
+            crate::backend::mlx::structural::validate_safetensors_load_path(kind, model_dir, options)?;
             load_qwen3_vl_pipeline(
                 args,
                 store,
@@ -9945,7 +9945,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("gpt_oss") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::GptOss,
                 model_dir,
                 options,
@@ -9962,7 +9962,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("lfm2" | "lfm2_moe") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::Lfm2,
                 model_dir,
                 options,
@@ -9979,7 +9979,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("nemotron_h") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::NemotronH,
                 model_dir,
                 options,
@@ -9996,7 +9996,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("qwen3_next") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::Qwen3Next,
                 model_dir,
                 options,
@@ -10018,7 +10018,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::Qwen35,
                 model_dir,
                 options,
@@ -10040,7 +10040,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("kimi_linear") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::KimiLinear,
                 model_dir,
                 options,
@@ -10057,7 +10057,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         Some("inkling_mm_model") => {
-            crate::api::structural::validate_safetensors_load_path(
+            crate::backend::mlx::structural::validate_safetensors_load_path(
                 ModelKind::Inkling,
                 model_dir,
                 options,
@@ -10103,7 +10103,7 @@ fn pipeline_gguf_architecture(
             ));
         }
     };
-    crate::api::GgufArchitecture::resolve(architecture)
+    Ok(crate::api::GgufArchitecture::resolve(architecture)?)
 }
 
 fn load_llama_pipeline(

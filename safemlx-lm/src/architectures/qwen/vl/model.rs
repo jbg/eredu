@@ -924,7 +924,7 @@ pub fn load_qwen3_vl_model(
     } else {
         crate::api::ModelKind::Qwen3Vl
     };
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
         model_dir,
         crate::api::ModelLoadOptions::default(),
@@ -953,7 +953,7 @@ pub fn load_qwen3_vl_model_quantized(
     } else {
         crate::api::ModelKind::Qwen3Vl
     };
-    crate::api::structural::validate_safetensors_load_path(
+    crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
         model_dir,
         crate::api::ModelLoadOptions::with_quantization(quantization),
@@ -1165,7 +1165,7 @@ pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
             )))
         }
     };
-    crate::api::structural::validate_qwen3_vl_projector_gguf(
+    crate::backend::mlx::structural::validate_qwen3_vl_projector_gguf(
         checkpoint,
         metadata,
         vision_checkpoint,
