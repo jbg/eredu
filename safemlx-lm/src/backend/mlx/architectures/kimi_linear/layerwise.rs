@@ -35,9 +35,11 @@ use crate::{
         cache::residency::PagedCacheOptions,
         checkpoint::{
             binding::{
-                build_module_bindings_with_recipes, canonical_checkpoint_name,
+                build_module_binding_plan_with_recipes,
+                build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
                 populate_module_from_lease, populate_module_from_lease_excluding,
             },
+            binding_plan::{BindingPlan, PlannedBinding},
             quantization::{should_quantize_on_load, WeightQuantization},
             recipe::DerivedWeightRecipe,
             store::{GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend},
@@ -49,9 +51,8 @@ use crate::{
         },
         execution::layerwise::{
             load_layerwise_model, load_layerwise_model_with_quantization,
-            load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-            open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
-            LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
+            load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+            ArchitectureAdapter, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
             LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
         },
         residency::{
@@ -496,6 +497,10 @@ impl KimiLinearLayerwiseModel {
         self.execution.checkpoint_store()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Returns current weight-residency telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
@@ -656,43 +661,29 @@ impl CausalLm<Cache> for KimiLinearLayerwiseModel {
 pub fn load_kimi_linear_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::KimiLinear,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Kimi Linear", args.quantization, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = KimiLinearLayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(KimiLinearLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_kimi_linear_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<KimiLinearLayerwiseModel, Error> {
-    let adapter = KimiLinearLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(KimiLinearLayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -709,7 +700,6 @@ pub(crate) fn load_kimi_linear_tensor_parallel_model(
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -726,11 +716,6 @@ pub(crate) fn load_kimi_linear_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::KimiLinear,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     Ok(KimiLinearLayerwiseModel {
@@ -757,9 +742,12 @@ pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
         checkpoint, metadata, options,
     )?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -787,9 +775,11 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
 ) -> Result<(KimiLinearLayerwiseModel, Vec<u32>), Error> {
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let args = prepared.args;
+    let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -832,12 +822,6 @@ pub fn load_kimi_linear_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::KimiLinear,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let quantize_on_load = quantization
@@ -1201,6 +1185,15 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::backend::mlx::MlxParallelContext>,
@@ -1298,30 +1291,38 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.embedding,
                     "model.embed_tokens",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.norm,
                     "model.norm",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(lm_head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings_with_recipes(lm_head, "lm_head", store, BTreeMap::new())?,
+                    build_module_binding_plan_with_recipes(
+                        lm_head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -1710,20 +1711,14 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings = build_module_bindings_with_recipes(
+        let plan = build_module_binding_plan_with_recipes_excluding(
             layer,
             &format!("model.layers.{index}"),
             store,
             self.recipes_for_layer(layer, index, store)?,
+            |name| self.sparse_expert_cache && name.starts_with("mlp.experts."),
         )?;
-        if self.sparse_expert_cache {
-            Ok(bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("mlp.experts."))
-                .collect())
-        } else {
-            Ok(bindings)
-        }
+        Ok(plan.build_bindings(store)?)
     }
     fn parallel_layer_bindings(
         &self,
@@ -2025,7 +2020,7 @@ pub(crate) fn kimi_expert_catalog_for_layers(
         }
         let prefix = format!("model.layers.{layer}.mlp.experts");
         for expert in 0..args.num_experts as usize {
-            let mut bindings = Vec::new();
+            let mut planned = Vec::new();
             for (binding_name, recipe) in [
                 (
                     "gate_up_proj",
@@ -2036,7 +2031,13 @@ pub(crate) fn kimi_expert_catalog_for_layers(
                     expert_projection_recipe(&normalized, &prefix, expert, "down_proj")?,
                 ),
             ] {
-                bindings.push(recipe_binding(binding_name, recipe, store)?);
+                let metadata = recipe.infer(store)?;
+                planned.push(PlannedBinding {
+                    target_name: binding_name.into(),
+                    expected_shape: metadata.shape().to_vec(),
+                    expected_dtype: metadata.dtype().clone(),
+                    recipe,
+                });
             }
             for (name, projection, suffix) in [
                 ("gate_up_proj_scales", "gate_up_proj", "_scales"),
@@ -2051,9 +2052,18 @@ pub(crate) fn kimi_expert_catalog_for_layers(
                     projection,
                     suffix,
                 )? {
-                    bindings.push(recipe_binding(name, recipe, store)?);
+                    let metadata = recipe.infer(store)?;
+                    planned.push(PlannedBinding {
+                        target_name: name.into(),
+                        expected_shape: metadata.shape().to_vec(),
+                        expected_dtype: metadata.dtype().clone(),
+                        recipe,
+                    });
                 }
             }
+            let bindings = BindingPlan::new(planned)
+                .and_then(|plan| plan.build_bindings(store))
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
                     Error::UnsupportedArchitecture(
@@ -2180,637 +2190,6 @@ fn optional_expert_component_recipe(
     }
 }
 
-fn recipe_binding(
-    name: &str,
-    recipe: DerivedWeightRecipe,
-    store: &dyn WeightStore,
-) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
-}
-
 /// Token generation over a bounded Kimi model.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     crate::backend::mlx::nn::generation::Generate<'a, KimiLinearLayerwiseModel, Cache, S>;
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use std::fs;
-
-    use safemlx::{
-        module::ModuleParameters,
-        ops::{indexing::TryIndexOp, zeros_dtype},
-        Array, Device, DeviceType, ExecutionContext, Stream,
-    };
-
-    use super::{
-        expert_projection_recipe, load_kimi_linear_expert_cache_model,
-        load_kimi_linear_layerwise_model, normalized_checkpoint_keys,
-        optional_expert_component_recipe, KimiLinearLayerwiseAdapter,
-    };
-    use crate::{
-        backend::mlx::architectures::kimi_linear::model::{
-            load_model, model_args_from_config_value, Model, ModelInput,
-        },
-        backend::mlx::runtime::{
-            checkpoint::store::{SafetensorsWeightStore, WeightStore},
-            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-            execution::layerwise::{
-                ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
-            },
-            residency::expert_cache::ExpertCacheLoadOptions,
-        },
-        core::residency::OffloadConfig,
-        core::ModelKind,
-    };
-
-    fn tiny_config() -> serde_json::Value {
-        serde_json::json!({
-            "model_type": "kimi_linear",
-            "vocab_size": 32,
-            "hidden_size": 8,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "intermediate_size": 16,
-            "head_dim": 4,
-            "model_max_length": 128,
-            "rms_norm_eps": 0.00001,
-            "rope_theta": 10000.0,
-            "linear_attn_config": {
-                "kda_layers": [1],
-                "full_attn_layers": [2],
-                "num_heads": 2,
-                "head_dim": 4,
-                "short_conv_kernel_size": 2
-            },
-            "num_experts": 4,
-            "moe_intermediate_size": 8,
-            "kv_lora_rank": 4,
-            "q_lora_rank": null,
-            "qk_nope_head_dim": 2,
-            "qk_rope_head_dim": 2,
-            "v_head_dim": 2,
-            "mla_use_nope": true,
-            "num_experts_per_token": 2,
-            "num_shared_experts": 1,
-            "moe_router_activation_func": "sigmoid",
-            "moe_renormalize": true,
-            "routed_scaling_factor": 1.0,
-            "first_k_dense_replace": 1,
-            "moe_layer_freq": 1,
-            "use_grouped_topk": true,
-            "num_expert_group": 1,
-            "topk_group": 1,
-            "tie_word_embeddings": false,
-            "num_nextn_predict_layers": 0
-        })
-    }
-
-    #[test]
-    fn tensor_parallel_plan_shards_kda_and_packed_moe_geometry() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let args = model_args_from_config_value(&tiny_config()).unwrap();
-        let adapter = KimiLinearLayerwiseAdapter::new(args, execution.stream()).unwrap();
-        let context = ParallelBuildContext::new(
-            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap(),
-            ShardingPolicy::Require,
-        );
-        let mut planner = context.planner();
-        adapter
-            .register_parallel_parameters(context, &mut planner, execution.stream())
-            .unwrap();
-        let (_, layout) = planner.finish().unwrap();
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.self_attn.q_proj.weight")
-                .unwrap()
-                .local_shape(),
-            &[4, 8]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.self_attn.q_conv1d.weight")
-                .unwrap()
-                .local_shape(),
-            &[4, 1, 2]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.1.mlp.experts.gate_up_proj")
-                .unwrap()
-                .local_shape(),
-            &[4, 8, 8]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.1.mlp.experts.down_proj")
-                .unwrap()
-                .local_shape(),
-            &[4, 8, 4]
-        );
-    }
-
-    #[test]
-    fn cartesian_layer_composes_uneven_ep_ownership_with_tp_geometry() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let args = model_args_from_config_value(&tiny_config()).unwrap();
-
-        for rank in 0..12 {
-            let topology = MlxParallelContext::for_rank(
-                rank,
-                2,
-                2,
-                3,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap();
-            let adapter =
-                KimiLinearLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
-            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            let assignment = adapter
-                .expert_parallel_assignment(topology)
-                .unwrap()
-                .unwrap();
-            let layer = adapter
-                .new_cartesian_layer(0, 1, Some(&layout), Some(&assignment), execution.stream())
-                .unwrap();
-            let crate::backend::mlx::architectures::kimi_linear::model::FeedForward::Moe(moe) =
-                layer.mlp
-            else {
-                panic!("Kimi sparse layer lost its routed expert bank")
-            };
-            assert_eq!(
-                moe.experts.num_experts as usize,
-                assignment.local_expert_count()
-            );
-            assert_eq!(moe.experts.intermediate_dim, 4);
-            assert_eq!(assignment.group_size(), 3);
-        }
-
-        let topology =
-            MlxParallelContext::for_rank(0, 2, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap();
-        let adapter =
-            KimiLinearLayerwiseAdapter::new_external_experts(args, execution.stream()).unwrap();
-        let assignment = adapter
-            .expert_parallel_assignment(topology)
-            .unwrap()
-            .unwrap();
-        assert_eq!(assignment.group_size(), 1);
-        assert_eq!(assignment.local_expert_count(), 4);
-    }
-
-    #[test]
-    fn tensor_parallel_plan_supports_uneven_hybrid_heads_and_intermediates() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut config = tiny_config();
-        config["num_attention_heads"] = 3.into();
-        config["intermediate_size"] = 17.into();
-        config["linear_attn_config"]["num_heads"] = 3.into();
-        config["moe_intermediate_size"] = 9.into();
-        let args = model_args_from_config_value(&config).unwrap();
-
-        for (rank, local_heads, dense_width, expert_width) in
-            [(0, 2usize, 9usize, 5usize), (1, 1, 8, 4)]
-        {
-            let mut adapter =
-                KimiLinearLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
-            let topology = MlxParallelContext::for_rank(
-                rank,
-                2,
-                1,
-                1,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap();
-            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            adapter
-                .configure_parallel_static(context, &layout, execution.stream())
-                .unwrap();
-
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.self_attn.q_proj.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[local_heads * 4, 8]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.self_attn.A_log")
-                    .unwrap()
-                    .local_shape(),
-                &[1, 1, local_heads, 1]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.self_attn.q_proj.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[local_heads * 4, 8]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.mlp.gate_proj.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[dense_width, 8]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.mlp.experts.gate_up_proj")
-                    .unwrap()
-                    .local_shape(),
-                &[4, 2 * expert_width, 8]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.mlp.shared_experts.gate_proj.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[expert_width, 8]
-            );
-
-            adapter
-                .new_parallel_layer(0, 0, &layout, execution.stream())
-                .unwrap();
-            adapter
-                .new_parallel_layer(0, 1, &layout, execution.stream())
-                .unwrap();
-            let identity = adapter.prompt_cache_model_identity(Some(topology)).unwrap();
-            let recurrent = identity.layer_layout.get(0).unwrap().fixed_state()[3]
-                .shape
-                .clone();
-            assert_eq!(
-                recurrent,
-                vec![
-                    crate::StateTensorDimension::Batch,
-                    crate::StateTensorDimension::fixed(local_heads as i32).unwrap(),
-                    crate::StateTensorDimension::fixed(4).unwrap(),
-                    crate::StateTensorDimension::fixed(4).unwrap(),
-                ]
-            );
-            assert!(matches!(
-                identity.layer_layout.get(1).unwrap(),
-                crate::LayerCachePolicy::CompressedLatentRotary { .. }
-            ));
-        }
-    }
-
-    #[test]
-    fn tensor_parallel_plan_keeps_affine_blocks_aligned_without_equal_division() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut config = tiny_config();
-        config["hidden_size"] = 48.into();
-        config["num_attention_heads"] = 3.into();
-        config["head_dim"] = 16.into();
-        config["intermediate_size"] = 48.into();
-        config["linear_attn_config"]["num_heads"] = 3.into();
-        config["linear_attn_config"]["head_dim"] = 16.into();
-        config["moe_intermediate_size"] = 48.into();
-        config["kv_lora_rank"] = 16.into();
-        config["qk_nope_head_dim"] = 8.into();
-        config["qk_rope_head_dim"] = 8.into();
-        config["v_head_dim"] = 16.into();
-        config["quantization"] = serde_json::json!({
-            "group_size": 16,
-            "bits": 4,
-            "mode": "affine"
-        });
-        let args = model_args_from_config_value(&config).unwrap();
-
-        for (rank, local_heads, local_intermediate, packed_down, scale_groups) in
-            [(0, 2usize, 32usize, 4usize, 2usize), (1, 1, 16, 2, 1)]
-        {
-            let adapter =
-                KimiLinearLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
-            let context = ParallelBuildContext::new(
-                MlxParallelContext::for_rank(
-                    rank,
-                    2,
-                    1,
-                    1,
-                    DeviceAssignment::new(DeviceType::Cpu, 0),
-                )
-                .unwrap(),
-                ShardingPolicy::Require,
-            );
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.self_attn.q_proj.weight")
-                    .or_else(|| { layout.tensor("model.layers.0.self_attn.q_proj.inner.weight") })
-                    .unwrap()
-                    .local_shape()[0],
-                local_heads * 16
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.mlp.experts.gate_up_proj")
-                    .unwrap()
-                    .local_shape()[1],
-                2 * local_intermediate
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.mlp.experts.down_proj")
-                    .unwrap()
-                    .local_shape()[2],
-                packed_down
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.mlp.experts.down_proj_scales")
-                    .unwrap()
-                    .local_shape()[2],
-                scale_groups
-            );
-        }
-    }
-
-    fn write_official_style_fixture(directory: &std::path::Path, model: &Model, stream: &Stream) {
-        let mut arrays = Vec::<(String, Array)>::new();
-        for (name, parameter) in model.parameters().flatten() {
-            let value = zeros_dtype(parameter.shape(), parameter.dtype(), stream).unwrap();
-            if name.as_ref() == "model.layers.1.mlp.experts.gate_up_proj" {
-                for expert in 0..model.args.num_experts {
-                    arrays.push((
-                        format!("model.layers.1.block_sparse_moe.experts.{expert}.w1.weight"),
-                        value
-                            .try_index_device(
-                                (expert, ..model.args.moe_intermediate_size, ..),
-                                stream,
-                            )
-                            .unwrap(),
-                    ));
-                    arrays.push((
-                        format!("model.layers.1.block_sparse_moe.experts.{expert}.w3.weight"),
-                        value
-                            .try_index_device(
-                                (expert, model.args.moe_intermediate_size.., ..),
-                                stream,
-                            )
-                            .unwrap(),
-                    ));
-                }
-                continue;
-            }
-            if name.as_ref() == "model.layers.1.mlp.experts.down_proj" {
-                for expert in 0..model.args.num_experts {
-                    arrays.push((
-                        format!("model.layers.1.block_sparse_moe.experts.{expert}.w2.weight"),
-                        value.try_index_device((expert, .., ..), stream).unwrap(),
-                    ));
-                }
-                continue;
-            }
-            let checkpoint_name = if name.starts_with("model.layers.1.mlp.") {
-                name.replacen("model.layers.1.mlp.", "model.layers.1.block_sparse_moe.", 1)
-            } else {
-                name.to_string()
-            };
-            let value = if checkpoint_name.ends_with("_conv1d.weight") {
-                value
-                    .reshape(
-                        &[
-                            model.args.kda_config.num_heads * model.args.kda_config.head_dim,
-                            model.args.kda_config.short_conv_kernel_size,
-                        ],
-                        stream,
-                    )
-                    .unwrap()
-            } else {
-                value
-            };
-            arrays.push((checkpoint_name, value));
-        }
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
-            directory.join("model.safetensors"),
-        )
-        .unwrap();
-        fs::write(
-            directory.join("config.json"),
-            serde_json::to_vec(&tiny_config()).unwrap(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn high_level_resident_and_layerwise_dispatch_report_live_paged_mla_state() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let fixture = Model::new(
-            model_args_from_config_value(&tiny_config()).unwrap(),
-            gpu.stream(),
-        )
-        .unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        write_official_style_fixture(directory.path(), &fixture, gpu.stream());
-        let fully_resident = load_kimi_linear_layerwise_model(
-            directory.path(),
-            LayerWeightResidency::FullyResident,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let layerwise = load_kimi_linear_layerwise_model(
-            directory.path(),
-            LayerwiseLoadOptions::default(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-
-        for mut model in [
-            crate::backend::mlx::Model::KimiLinear(fully_resident),
-            crate::backend::mlx::Model::KimiLinear(layerwise),
-        ] {
-            let options = crate::backend::mlx::runtime::cache::residency::PagedCacheOptions::new(
-                1,
-                16 * 1024,
-                16 * 1024,
-                1,
-            )
-            .unwrap()
-            .with_full_attention(true);
-            let mut cache = model
-                .new_cache_with_options(
-                    crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
-                        options,
-                    ),
-                )
-                .unwrap();
-            assert_eq!(
-                cache
-                    .residency_report()
-                    .unwrap()
-                    .unwrap()
-                    .logical_cached_tokens,
-                0
-            );
-            let tokens = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-            let parts =
-                [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
-            model
-                .submit_prefill(
-                    crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
-                    &mut cache,
-                    gpu.stream(),
-                )
-                .unwrap()
-                .wait()
-                .unwrap()
-                .evaluated()
-                .unwrap();
-            let report = cache.residency_report().unwrap().unwrap();
-            assert_eq!(report.logical_cached_tokens, 3);
-            assert!(report.current_device_bytes > 0);
-        }
-    }
-
-    #[test]
-    fn packed_gguf_style_expert_recipes_combine_selected_gate_and_up_components() {
-        let dir = tempfile::tempdir().unwrap();
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let prefix = "model.layers.1.mlp.experts";
-        let arrays = [
-            (
-                format!("{prefix}.gate_proj"),
-                Array::from_slice(
-                    &(0..8).map(|value| value as f32).collect::<Vec<_>>(),
-                    &[2, 2, 2],
-                ),
-            ),
-            (
-                format!("{prefix}.up_proj"),
-                Array::from_slice(
-                    &(100..108).map(|value| value as f32).collect::<Vec<_>>(),
-                    &[2, 2, 2],
-                ),
-            ),
-            (
-                format!("{prefix}.gate_proj_scales"),
-                Array::from_slice(&[10.0f32, 11.0, 12.0, 13.0], &[2, 2, 1]),
-            ),
-            (
-                format!("{prefix}.up_proj_scales"),
-                Array::from_slice(&[20.0f32, 21.0, 22.0, 23.0], &[2, 2, 1]),
-            ),
-        ];
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
-            dir.path().join("model.safetensors"),
-        )
-        .unwrap();
-        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
-        let normalized = normalized_checkpoint_keys(&store);
-
-        let weights = expert_projection_recipe(&normalized, prefix, 1, "gate_up_proj")
-            .unwrap()
-            .materialize(&store, &stream)
-            .unwrap();
-        assert_eq!(weights.shape(), &[1, 4, 2]);
-        let weights = weights.evaluated().unwrap();
-        assert_eq!(
-            weights.as_slice::<f32>(),
-            &[4.0, 5.0, 6.0, 7.0, 104.0, 105.0, 106.0, 107.0]
-        );
-
-        let scales =
-            optional_expert_component_recipe(&normalized, prefix, 1, "gate_up_proj", "_scales")
-                .unwrap()
-                .unwrap()
-                .materialize(&store, &stream)
-                .unwrap();
-        assert_eq!(scales.shape(), &[1, 4, 1]);
-        let scales = scales.evaluated().unwrap();
-        assert_eq!(scales.as_slice::<f32>(), &[12.0, 13.0, 22.0, 23.0]);
-        assert_eq!(store.keys().len(), 4);
-    }
-
-    #[test]
-    fn sparse_cache_and_rank_owned_ep_load_official_split_experts() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let fixture = Model::new(
-            model_args_from_config_value(&tiny_config()).unwrap(),
-            gpu.stream(),
-        )
-        .unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        write_official_style_fixture(directory.path(), &fixture, gpu.stream());
-
-        let mut resident = load_model(directory.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options =
-            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
-                .unwrap();
-        let mut sparse = load_kimi_linear_expert_cache_model(
-            directory.path(),
-            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                OffloadConfig::new(None, None, 1).unwrap(),
-            )),
-            options,
-            None,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut resident_cache = resident.new_cache();
-        let mut sparse_cache = sparse.new_cache();
-        for tokens in [
-            Array::from_slice(&[1i32, 2], &[1, 2]),
-            Array::from_slice(&[3i32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = sparse
-                .forward(&tokens, &mut sparse_cache, gpu.stream())
-                .unwrap();
-            let expected = expected.evaluated().unwrap();
-            let actual = actual.evaluated().unwrap();
-            assert_eq!(actual.as_slice::<f32>(), expected.as_slice::<f32>());
-        }
-        let report = sparse.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.owned_experts, 4);
-        assert!(report.prefill.requested_routes > 0);
-        assert!(report.decode.requested_routes > 0);
-        assert!(report.prefill.compact_banks > 1);
-        crate::backend::mlx::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
-            directory.path(),
-            options,
-            ModelKind::KimiLinear,
-            2,
-            gpu.stream(),
-            cpu.stream(),
-        );
-    }
-}

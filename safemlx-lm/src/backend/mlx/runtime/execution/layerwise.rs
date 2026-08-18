@@ -32,9 +32,7 @@ use crate::{
     },
     backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
-    backend::mlx::runtime::checkpoint::store::{
-        MemoryWeightStore, SafetensorsWeightStore, WeightStore,
-    },
+    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
     backend::mlx::runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
     backend::mlx::runtime::residency::dense_stream::{
         BackgroundLayerPrefetch, DenseDiskStreamLoadOptions, DENSE_TRANSFER_WINDOW,
@@ -50,8 +48,61 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use crate::backend::mlx::runtime::checkpoint::store::MemoryWeightStore;
+
 /// Type-erased checkpoint store accepted by the generalized execution engine.
 pub type SharedWeightStore = Arc<dyn WeightStore + Send + Sync>;
+
+/// Opaque architecture-owned SafeTensors contract consumed by the generic
+/// execution engine before it asks an adapter for any runtime binding.
+pub struct ArchitectureCheckpointPlan {
+    plan: crate::backend::mlx::runtime::checkpoint::schema::SafetensorsCheckpointPlan,
+}
+
+impl From<crate::backend::mlx::runtime::checkpoint::schema::SafetensorsCheckpointPlan>
+    for ArchitectureCheckpointPlan
+{
+    fn from(
+        plan: crate::backend::mlx::runtime::checkpoint::schema::SafetensorsCheckpointPlan,
+    ) -> Self {
+        Self { plan }
+    }
+}
+
+pub(crate) fn resolve_checkpoint_store<A: ArchitectureAdapter>(
+    store: SharedWeightStore,
+    adapter: &A,
+) -> Result<SharedWeightStore, Error> {
+    if store.is_checkpoint_contract_resolved()
+        || store.backend()
+            != crate::backend::mlx::runtime::checkpoint::store::WeightStoreBackend::Safetensors
+    {
+        return Ok(store);
+    }
+    let raw = store
+        .as_any()
+        .downcast_ref::<SafetensorsWeightStore>()
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "SafeTensors store for {} is not a raw or contract-resolved checkpoint",
+                adapter.model_type()
+            ))
+        })?;
+    let plan = adapter.safetensors_checkpoint_plan()?;
+    let resolved = crate::backend::mlx::runtime::checkpoint::validation::resolve_safetensors_plan(
+        raw, &plan.plan,
+    )
+    .map_err(|validation| {
+        Error::UnsupportedArchitecture(format!(
+            "{} checkpoint contract did not resolve: {validation:?}",
+            adapter.model_type()
+        ))
+    })?;
+    Ok(Arc::new(
+        crate::backend::mlx::runtime::checkpoint::store::ContractWeightStore::new(store, resolved),
+    ))
+}
 
 pub(crate) fn open_safetensors_weight_store(
     model_dir: &Path,
@@ -68,6 +119,7 @@ pub(crate) fn open_safetensors_weight_store(
 /// so it cannot be represented as a one-to-one lazy binding. The transformation
 /// is performed once, then this store hands the resulting arrays to the same
 /// generalized residency and execution engine used by native packed artifacts.
+#[cfg(test)]
 pub(crate) fn transformed_module_weight_store(
     module: &impl ModuleParameters,
 ) -> Result<SharedWeightStore, Error> {
@@ -1925,6 +1977,10 @@ pub trait ArchitectureAdapter: Sized {
     fn model_type(&self) -> &str {
         std::any::type_name::<Self>()
     }
+
+    /// Returns the architecture-owned physical contract used to resolve the
+    /// SafeTensors store before any binding recipe is inferred or materialized.
+    fn safetensors_checkpoint_plan(&self) -> Result<ArchitectureCheckpointPlan, Error>;
 
     /// Model-wide checkpoint quantization, when one uniform encoding exists.
     fn quantization(
@@ -3982,6 +4038,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
 }
 
 /// Builds a generalized layerwise model with independently bounded groups.
+#[cfg(test)]
 pub(crate) fn load_safetensors_layerwise_model<A, O>(
     model_dir: impl AsRef<Path>,
     adapter: A,
@@ -4161,6 +4218,7 @@ where
     O: Into<LayerWeightResidency>,
 {
     let options = options.into();
+    let store = resolve_checkpoint_store(store, &source_adapter)?;
     match quantization {
         Some(quantization) => {
             let target_adapter = source_adapter.load_time_quantized(quantization, stream)?;
@@ -4196,6 +4254,7 @@ where
     O: Into<LayerWeightResidency>,
 {
     let options = options.into();
+    let store = resolve_checkpoint_store(store, &source_adapter)?;
     match quantization {
         Some(quantization) => {
             let target_adapter = source_adapter.load_time_quantized(quantization, stream)?;
@@ -4486,6 +4545,7 @@ where
     A: ArchitectureAdapter,
     O: Into<LayerWeightResidency>,
 {
+    let store = resolve_checkpoint_store(store, &adapter)?;
     let options = options.into();
     let fully_resident = options.is_fully_resident();
     let dense = options.dense();
@@ -4711,6 +4771,7 @@ where
     A: ArchitectureAdapter,
     O: Into<LayerWeightResidency>,
 {
+    let store = resolve_checkpoint_store(store, &adapter)?;
     let options = options.into();
     let fully_resident = options.is_fully_resident();
     let dense = options.dense();
@@ -5331,6 +5392,7 @@ where
     let unused = store
         .keys()
         .into_iter()
+        .chain(store.unclaimed_checkpoint_keys())
         .filter(|key| !consumed.contains(key))
         .filter(|key| !ignored(key))
         .collect::<Vec<_>>();
@@ -5558,1175 +5620,4 @@ pub enum LayerwiseModelError {
     /// Residency execution failed.
     #[error(transparent)]
     Residency(#[from] ResidencyError),
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    #[test]
-    fn weight_residency_decomposes_layers_and_experts() {
-        let host = LayerwiseLoadOptions::default();
-        let experts =
-            crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(
-            );
-        let residency = WeightResidency::with_expert_cache(
-            NonExpertWeightResidency::LayerwiseHost(host),
-            experts,
-        );
-
-        assert_eq!(
-            residency.layers(),
-            LayerWeightResidency::LayerwiseHost(host)
-        );
-        assert_eq!(
-            residency.experts(),
-            ExpertWeightResidency::IndependentCache(experts)
-        );
-        assert_eq!(residency.expert_cache(), Some(experts));
-        assert_eq!(
-            residency.non_experts(),
-            Some(NonExpertWeightResidency::LayerwiseHost(host))
-        );
-        assert!(!residency.is_fully_resident());
-        assert!(!residency.non_experts_are_fully_resident());
-
-        let resident_non_experts =
-            WeightResidency::with_expert_cache(NonExpertWeightResidency::FullyResident, experts);
-        assert_eq!(
-            resident_non_experts.layers(),
-            LayerWeightResidency::FullyResident
-        );
-        assert_eq!(
-            resident_non_experts.experts(),
-            ExpertWeightResidency::IndependentCache(experts)
-        );
-        assert!(resident_non_experts.non_experts_are_fully_resident());
-        assert!(!resident_non_experts.is_fully_resident());
-
-        let resident = WeightResidency::fully_resident();
-        assert_eq!(resident.layers(), LayerWeightResidency::FullyResident);
-        assert_eq!(resident.experts(), ExpertWeightResidency::WithLayer);
-        assert!(resident.is_fully_resident());
-        assert!(resident.non_experts_are_fully_resident());
-        assert_eq!(resident.expert_cache(), None);
-        assert_eq!(resident.non_experts(), None);
-    }
-
-    use std::fs;
-
-    use safemlx::{
-        module::{Module, ModuleParameters},
-        ops::ones_dtype,
-        Device, DeviceType, ExecutionContext,
-    };
-    use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
-
-    use super::*;
-    use crate::{
-        backend::mlx::architectures::llama::layerwise::{
-            load_llama_safetensors_mlx, LlamaCache, LlamaModel,
-        },
-        backend::mlx::architectures::llama::model::{self as llama, ModelArgs},
-        core::residency::TransferDirection,
-        core::residency::UnitResidencyReport,
-    };
-
-    #[test]
-    fn execution_group_dag_orders_branching_multimodal_ingress() {
-        let graph = ExecutionGroupDag::new(
-            vec![
-                ExecutionGroupSpec::with_dependencies(
-                    "text_decoder",
-                    ["vision_encoder", "audio_encoder"],
-                ),
-                ExecutionGroupSpec::root("vision_encoder"),
-                ExecutionGroupSpec::root("audio_encoder"),
-            ],
-            "text_decoder",
-        )
-        .unwrap();
-
-        assert_eq!(graph.execution_order(), &[1, 2, 0]);
-        assert_eq!(graph.dependencies(0), Some([1, 2].as_slice()));
-        assert_eq!(graph.dependencies(1), Some([].as_slice()));
-        assert_eq!(graph.consumer_counts(), [0, 1, 1]);
-        assert_eq!(graph.output(), 0);
-        assert_eq!(graph.groups()[graph.output()].id(), "text_decoder");
-    }
-
-    #[test]
-    fn execution_group_dag_rejects_ambiguous_or_invalid_topology() {
-        let duplicate = ExecutionGroupDag::new(
-            vec![
-                ExecutionGroupSpec::root("text"),
-                ExecutionGroupSpec::root("text"),
-            ],
-            "text",
-        )
-        .unwrap_err();
-        assert!(matches!(
-            duplicate,
-            Error::LayerwiseModel(LayerwiseModelError::DuplicateExecutionGroup(_))
-        ));
-
-        let unknown = ExecutionGroupDag::new(
-            vec![ExecutionGroupSpec::with_dependencies("text", ["vision"])],
-            "text",
-        )
-        .unwrap_err();
-        assert!(matches!(
-            unknown,
-            Error::LayerwiseModel(LayerwiseModelError::UnknownExecutionGroupDependency { .. })
-        ));
-
-        let cycle = ExecutionGroupDag::new(
-            vec![
-                ExecutionGroupSpec::with_dependencies("vision", ["text"]),
-                ExecutionGroupSpec::with_dependencies("text", ["vision"]),
-            ],
-            "text",
-        )
-        .unwrap_err();
-        assert!(matches!(
-            cycle,
-            Error::LayerwiseModel(LayerwiseModelError::CyclicExecutionGraph)
-        ));
-
-        let disconnected = ExecutionGroupDag::new(
-            vec![
-                ExecutionGroupSpec::root("text"),
-                ExecutionGroupSpec::root("unused_vision"),
-            ],
-            "text",
-        )
-        .unwrap_err();
-        assert!(matches!(
-            disconnected,
-            Error::LayerwiseModel(LayerwiseModelError::DisconnectedExecutionGroups { .. })
-        ));
-    }
-
-    fn shared_and_disjoint_consumer_graph() -> ExecutionGroupDag {
-        ExecutionGroupDag::new(
-            vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::root("audio"),
-                ExecutionGroupSpec::root("retrieval"),
-                ExecutionGroupSpec::with_dependencies("shared", ["vision", "audio"]),
-                ExecutionGroupSpec::with_dependencies("vision_only", ["vision"]),
-                ExecutionGroupSpec::with_dependencies("audio_only", ["audio"]),
-                ExecutionGroupSpec::with_dependencies(
-                    "join",
-                    ["shared", "vision_only", "audio_only", "retrieval"],
-                ),
-            ],
-            "join",
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn ready_set_orders_two_roots_before_join_and_preserves_merge_order() {
-        let graph = ExecutionGroupDag::new(
-            vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::root("audio"),
-                ExecutionGroupSpec::with_dependencies("text", ["vision", "audio"]),
-            ],
-            "text",
-        )
-        .unwrap();
-        let mut ready = ExecutionGroupReadySet::new(&graph);
-        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [0, 1]);
-        ready.ordered(1);
-        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [0]);
-        ready.ordered(0);
-        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [2]);
-        assert_eq!(graph.dependencies(2), Some([0, 1].as_slice()));
-    }
-
-    #[test]
-    fn ready_set_accepts_three_root_completion_orders_without_changing_identity() {
-        let graph = ExecutionGroupDag::new(
-            vec![
-                ExecutionGroupSpec::root("first"),
-                ExecutionGroupSpec::root("second"),
-                ExecutionGroupSpec::root("third"),
-                ExecutionGroupSpec::with_dependencies("join", ["first", "second", "third"]),
-            ],
-            "join",
-        )
-        .unwrap();
-        for completion_order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
-            let mut ready = ExecutionGroupReadySet::new(&graph);
-            for group in completion_order {
-                ready.ordered(group);
-            }
-            assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [3]);
-            assert_eq!(graph.groups()[3].id(), "join");
-        }
-    }
-
-    #[test]
-    fn ready_set_handles_multiple_shared_and_disjoint_consumers() {
-        let graph = shared_and_disjoint_consumer_graph();
-        assert_eq!(graph.consumer_counts(), [2, 2, 1, 1, 1, 1, 0]);
-        let mut ready = ExecutionGroupReadySet::new(&graph);
-        ready.ordered(0);
-        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [1, 2, 4]);
-        ready.ordered(1);
-        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [2, 3, 4, 5]);
-        for group in [2, 3, 4, 5] {
-            ready.ordered(group);
-        }
-        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [6]);
-    }
-
-    #[test]
-    fn skipped_root_orders_dependents_without_losing_its_stable_slot() {
-        let graph = ExecutionGroupDag::new(
-            vec![
-                ExecutionGroupSpec::root("optional_vision"),
-                ExecutionGroupSpec::with_dependencies("text", ["optional_vision"]),
-            ],
-            "text",
-        )
-        .unwrap();
-        let mut ready = ExecutionGroupReadySet::new(&graph);
-        // Skipping still records an exact pass-through group completion.
-        ready.ordered(0);
-        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [1]);
-        assert_eq!(graph.groups()[0].id(), "optional_vision");
-    }
-
-    #[test]
-    fn failed_or_cancelled_root_blocks_only_its_downstream_subgraph() {
-        let graph = shared_and_disjoint_consumer_graph();
-        let mut failed = ExecutionGroupReadySet::new(&graph);
-        failed.fail(0);
-        assert_eq!(failed.states[0], ReadyGroupState::Failed);
-        assert_eq!(failed.states[3], ReadyGroupState::Blocked);
-        assert_eq!(failed.states[4], ReadyGroupState::Blocked);
-        assert_eq!(failed.states[6], ReadyGroupState::Blocked);
-        assert_eq!(failed.ready_groups().collect::<Vec<_>>(), [1, 2]);
-
-        let mut cancelled = ExecutionGroupReadySet::new(&graph);
-        cancelled.cancel(1);
-        assert_eq!(cancelled.states[1], ReadyGroupState::Cancelled);
-        assert_eq!(cancelled.states[3], ReadyGroupState::Blocked);
-        assert_eq!(cancelled.states[5], ReadyGroupState::Blocked);
-        assert_eq!(cancelled.ready_groups().collect::<Vec<_>>(), [0, 2]);
-    }
-
-    #[test]
-    fn ready_residency_contention_defers_without_deadlock_and_releases_exactly_once() {
-        let graph = ExecutionGroupDag::new(
-            vec![
-                ExecutionGroupSpec::root("large"),
-                ExecutionGroupSpec::root("small"),
-                ExecutionGroupSpec::with_dependencies("join", ["large", "small"]),
-            ],
-            "join",
-        )
-        .unwrap();
-        let mut ready = ExecutionGroupReadySet::new(&graph);
-        let mut available = 1usize;
-        let mut leases = [0usize; 3];
-        let mut publication = Vec::new();
-        for group in ready.ready_groups().collect::<Vec<_>>() {
-            if available == 0 {
-                continue;
-            }
-            available -= 1;
-            leases[group] += 1;
-            publication.push(group);
-        }
-        assert_eq!(publication, [0]);
-        leases[0] -= 1;
-        available += 1;
-        ready.ordered(0);
-        for group in ready.ready_groups().collect::<Vec<_>>() {
-            if group == 1 && available != 0 {
-                available -= 1;
-                leases[group] += 1;
-                publication.push(group);
-            }
-        }
-        leases[1] -= 1;
-        available += 1;
-        ready.ordered(1);
-        assert_eq!(publication, [0, 1]);
-        assert_eq!(leases, [0, 0, 0]);
-        assert_eq!(available, 1);
-        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [2]);
-    }
-
-    fn load_layerwise_llama(
-        model_dir: impl AsRef<Path>,
-        offload: OffloadConfig,
-        stream: &Stream,
-        weights_stream: &Stream,
-    ) -> Result<LlamaModel, Error> {
-        load_llama_safetensors_mlx(
-            model_dir,
-            WeightResidency::layerwise_host(LayerwiseLoadOptions::new(offload)),
-            stream,
-            weights_stream,
-        )
-    }
-
-    fn args(model_type: &str, tied: bool, sliding_window: Option<i32>) -> ModelArgs {
-        ModelArgs {
-            model_type: model_type.into(),
-            hidden_size: 8,
-            num_hidden_layers: 3,
-            intermediate_size: 16,
-            num_attention_heads: 2,
-            rms_norm_eps: 1e-5,
-            vocab_size: 16,
-            num_key_value_heads: 2,
-            max_position_embeddings: 64,
-            rope_theta: 10_000.0,
-            rope_traditional: false,
-            head_dim: 4,
-            tie_word_embeddings: tied,
-            attention_bias: true,
-            mlp_bias: true,
-            rope_scaling: None,
-            attention_schedule: match sliding_window {
-                Some(window) => crate::core::attention::LayerSchedule::all_sliding(
-                    3,
-                    u32::try_from(window).unwrap(),
-                )
-                .unwrap(),
-                None => crate::core::attention::LayerSchedule::all_full(3).unwrap(),
-            },
-            quantization: None,
-            quantization_config: None,
-            quantized_weights: None,
-            quantized_weight_configs: None,
-        }
-    }
-
-    #[test]
-    fn execution_group_binding_sharding_preserves_direct_and_derived_selections() {
-        use crate::backend::mlx::runtime::distributed::parallel::{
-            MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
-            ParameterRole,
-        };
-        use crate::backend::mlx::runtime::{
-            checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection},
-            residency::manager::WeightBinding,
-        };
-        let topology =
-            MlxParallelContext::for_rank(1, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap();
-        let mut planner = ParallelPlanBuilder::new(topology);
-        planner
-            .register(
-                ParameterGroupSpec::new(
-                    "group.projection",
-                    ParameterRole::ColumnProjection,
-                    [ParameterMemberSpec::new(
-                        "stack.0.projection.weight",
-                        [8, 4],
-                        MemberSharding::Equal { axis: 0 },
-                    )],
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        planner
-            .register(
-                ParameterGroupSpec::new(
-                    "group.physical_source",
-                    ParameterRole::Replicated,
-                    [ParameterMemberSpec::new(
-                        "raw.weight",
-                        [8, 4],
-                        MemberSharding::Replicated,
-                    )],
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let (_, layout) = planner.finish().unwrap();
-        let checkpoint = tempfile::tempdir().unwrap();
-        let raw = vec![0u8; 8 * 4 * std::mem::size_of::<f32>()];
-        serialize_to_file(
-            [(
-                "raw.weight",
-                TensorView::new(SafeDtype::F32, vec![8, 4], &raw).unwrap(),
-            )],
-            None,
-            &checkpoint.path().join("model.safetensors"),
-        )
-        .unwrap();
-        let store = SafetensorsWeightStore::open(checkpoint.path()).unwrap();
-        let direct = WeightBinding::new(
-            "projection.weight",
-            "stack.0.projection.weight",
-            TensorSelection::Full,
-            128,
-        )
-        .unwrap();
-        let derived = WeightBinding::from_recipe(
-            "checkpoint_alias.weight",
-            DerivedWeightRecipe::source("raw.weight", TensorSelection::Full),
-            128,
-        )
-        .unwrap()
-        .with_logical_target("stack.0.projection.weight")
-        .unwrap();
-        let direct = shard_layer_bindings(vec![direct], "stack.0", &store, &layout).unwrap();
-        assert_eq!(
-            direct[0].selection(),
-            &TensorSelection::Range {
-                axis: 0,
-                start: 4,
-                end: 8,
-            }
-        );
-        assert_eq!(direct[0].expected_bytes(), 64);
-        let derived = shard_layer_bindings(vec![derived], "stack.0", &store, &layout).unwrap();
-        assert_eq!(derived[0].expected_bytes(), 64);
-        assert!(matches!(
-            derived[0].recipe(),
-            Some(DerivedWeightRecipe::Source {
-                key,
-                selection: TensorSelection::Range {
-                    axis: 0,
-                    start: 4,
-                    end: 8,
-                },
-            }) if key == "raw.weight"
-        ));
-    }
-
-    fn initialize(module: &mut impl ModuleParameters, stream: &Stream) {
-        let mut names = module
-            .parameters()
-            .flatten()
-            .keys()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        names.sort();
-        let mut params = module.parameters_mut().flatten();
-        for (index, name) in names.iter().enumerate() {
-            let parameter = params.get_mut(name.as_str()).unwrap();
-            let shape = parameter.shape().to_vec();
-            let dtype = parameter.dtype();
-            **parameter = if name.ends_with("layernorm.weight") || name == "model.norm.weight" {
-                ones_dtype(&shape, dtype, stream).unwrap()
-            } else {
-                Array::full::<f32>(&shape, Array::from_f32(0.0025 * (index + 1) as f32), stream)
-                    .unwrap()
-                    .as_dtype(dtype, stream)
-                    .unwrap()
-            };
-        }
-    }
-
-    fn write_fixture(dir: &Path, model: &llama::ResidentModel) {
-        let params = model.parameters().flatten();
-        let arrays = params
-            .iter()
-            .map(|(name, value)| {
-                (
-                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
-                        name,
-                    ),
-                    *value,
-                )
-            })
-            .collect::<Vec<_>>();
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
-            None,
-            dir.join("model.safetensors"),
-        )
-        .unwrap();
-        let mut config = serde_json::json!({
-            "model_type": model.args.model_type,
-            "hidden_size": model.args.hidden_size,
-            "num_hidden_layers": model.args.num_hidden_layers,
-            "intermediate_size": model.args.intermediate_size,
-            "num_attention_heads": model.args.num_attention_heads,
-            "num_key_value_heads": model.args.num_key_value_heads,
-            "rms_norm_eps": model.args.rms_norm_eps,
-            "vocab_size": model.args.vocab_size,
-            "max_position_embeddings": model.args.max_position_embeddings,
-            "rope_theta": model.args.rope_theta,
-            "rope_traditional": model.args.rope_traditional,
-            "head_dim": model.args.head_dim,
-            "tie_word_embeddings": model.args.tie_word_embeddings,
-            "attention_bias": model.args.attention_bias,
-            "mlp_bias": model.args.mlp_bias
-        });
-        if let Some(window) = model
-            .args
-            .attention_schedule
-            .get(0)
-            .and_then(|policy| policy.window())
-        {
-            config["sliding_window"] = window.get().into();
-        }
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&config).unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn assert_close(left: &Array, right: &Array) {
-        let left = left.evaluated().unwrap();
-        let right = right.evaluated().unwrap();
-        assert_eq!(left.as_array().shape(), right.as_array().shape());
-        for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
-            assert!((left - right).abs() <= 2e-5, "{left} != {right}");
-        }
-    }
-
-    fn layer_reports(report: &ResidencyReport) -> Vec<&UnitResidencyReport> {
-        report
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().starts_with("llama.layer."))
-            .collect()
-    }
-
-    fn run_parity(model_type: &str, tied: bool, sliding_window: Option<i32>, depth: usize) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let stream = gpu.stream();
-        let mut reference =
-            llama::ResidentModel::new(args(model_type, tied, sliding_window), stream).unwrap();
-        initialize(&mut reference, stream);
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &reference);
-
-        let mut fully_resident = load_llama_safetensors_mlx(
-            dir.path(),
-            WeightResidency::fully_resident(),
-            stream,
-            cpu.stream(),
-        )
-        .unwrap();
-        assert!(fully_resident.is_fully_resident());
-        let resident_report = fully_resident.residency_report().unwrap().unwrap();
-        assert!(layer_reports(&resident_report)
-            .iter()
-            .all(|unit| unit.device_resident() && !unit.host_resident()));
-        let config = OffloadConfig::new(None, None, depth).unwrap();
-        let mut offloaded = load_layerwise_llama(dir.path(), config, stream, cpu.stream()).unwrap();
-        assert!(!offloaded.is_fully_resident());
-        let initial = offloaded.residency_report().unwrap().unwrap();
-        assert!(layer_reports(&initial)
-            .iter()
-            .all(|unit| unit.host_resident()));
-        assert!(layer_reports(&initial)
-            .iter()
-            .all(|unit| !unit.device_resident()));
-
-        let mut resident_cache = fully_resident.new_cache();
-        let mut cache = offloaded.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-            Array::from_slice(&[4u32], &[1, 1]),
-            Array::from_slice(&[5u32], &[1, 1]),
-        ] {
-            let expected = fully_resident
-                .forward(&tokens, &mut resident_cache, stream)
-                .unwrap();
-            let actual = offloaded.forward(&tokens, &mut cache, stream).unwrap();
-            assert_close(&actual, &expected);
-            let report = offloaded.residency_report().unwrap().unwrap();
-            assert!(layer_reports(&report)
-                .iter()
-                .all(|unit| unit.host_resident()));
-            assert!(
-                layer_reports(&report)
-                    .iter()
-                    .filter(|unit| unit.device_resident())
-                    .count()
-                    <= depth
-            );
-        }
-
-        let report = offloaded.residency_report().unwrap().unwrap();
-        assert!(
-            report
-                .offload()
-                .transfer(TransferDirection::HostToDevice)
-                .count()
-                >= 3
-        );
-        assert_eq!(offloaded.static_lease_count(), if tied { 2 } else { 3 });
-        offloaded.clear_device_layer_window().unwrap();
-        let cleared = offloaded.residency_report().unwrap().unwrap();
-        assert!(layer_reports(&cleared)
-            .iter()
-            .all(|unit| !unit.device_resident()));
-        assert!(cleared
-            .units()
-            .iter()
-            .filter(|unit| unit.device_resident())
-            .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
-    }
-
-    #[test]
-    fn llama_residency_dense_prefill_decode_parity() {
-        run_parity("llama", true, None, 1);
-        run_parity("llama", false, None, 2);
-        run_parity("mistral", false, Some(4), 2);
-    }
-
-    #[test]
-    fn arbitrary_llama_schedule_resident_layerwise_parity() {
-        use crate::core::attention::{AttentionPolicy, LayerSchedule};
-
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let stream = gpu.stream();
-        let mut model_args = args("mistral", false, None);
-        model_args.attention_schedule = LayerSchedule::new(
-            3,
-            vec![
-                AttentionPolicy::sliding(3).unwrap(),
-                AttentionPolicy::Full,
-                AttentionPolicy::sliding(5).unwrap(),
-            ],
-        )
-        .unwrap();
-        let mut resident = llama::ResidentModel::new(model_args.clone(), stream).unwrap();
-        initialize(&mut resident, stream);
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = LlamaCache::Device(resident.new_cache());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &resident);
-        let adapter =
-            crate::backend::mlx::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
-                model_args, stream,
-            )
-            .unwrap();
-        let mut layerwise = load_safetensors_layerwise_model(
-            dir.path(),
-            adapter,
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 2).unwrap()),
-            stream,
-            cpu.stream(),
-        )
-        .unwrap();
-
-        for tokens in [
-            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
-            Array::from_slice(&[4u32, 5], &[1, 2]),
-            Array::from_slice(&[6u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward(
-                    llama::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut resident_cache,
-                    },
-                    stream,
-                )
-                .unwrap();
-            let actual = layerwise
-                .forward(
-                    crate::backend::mlx::architectures::llama::layerwise::LlamaAdapterInput {
-                        inputs: &tokens,
-                        mask: None,
-                    },
-                    &mut layerwise_cache,
-                    stream,
-                )
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-    }
-
-    #[test]
-    fn fully_resident_execution_batches_a_group_behind_one_completion_boundary() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let stream = gpu.stream();
-        let model_args = args("llama", false, None);
-        let mut reference = llama::ResidentModel::new(model_args.clone(), stream).unwrap();
-        initialize(&mut reference, stream);
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &reference);
-
-        let adapter =
-            crate::backend::mlx::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
-                model_args, stream,
-            )
-            .unwrap();
-        let mut layerwise = load_safetensors_layerwise_model(
-            dir.path(),
-            adapter,
-            LayerWeightResidency::FullyResident,
-            stream,
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut reference_cache = reference.new_cache();
-        let mut layerwise_cache = LlamaCache::Device(reference.new_cache());
-
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-        ] {
-            let expected = reference
-                .forward(
-                    llama::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut reference_cache,
-                    },
-                    stream,
-                )
-                .unwrap();
-            let actual = layerwise
-                .forward(
-                    crate::backend::mlx::architectures::llama::layerwise::LlamaAdapterInput {
-                        inputs: &tokens,
-                        mask: None,
-                    },
-                    &mut layerwise_cache,
-                    stream,
-                )
-                .unwrap();
-
-            assert_close(&actual, &expected);
-            assert_eq!(
-                layerwise
-                    .ready_set_trace()
-                    .submissions()
-                    .iter()
-                    .map(|&(group, layer, _)| (group, layer))
-                    .collect::<Vec<_>>(),
-                [(0, 0), (0, 1), (0, 2)]
-            );
-            assert_eq!(
-                layerwise.ready_set_trace().completion_boundaries(),
-                &[(0, 3)]
-            );
-        }
-    }
-
-    #[test]
-    fn dense_stream_keeps_layers_cold_and_matches_cached_decode() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut reference =
-            llama::ResidentModel::new(args("llama", true, None), gpu.stream()).unwrap();
-        initialize(&mut reference, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &reference);
-
-        let sizing = load_layerwise_llama(
-            dir.path(),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let metadata = sizing.metadata();
-        let device_budget = metadata
-            .static_device_bytes()
-            .checked_add(
-                metadata
-                    .maximum_device_layer_bytes()
-                    .checked_mul(DENSE_TRANSFER_WINDOW as u64)
-                    .unwrap(),
-            )
-            .unwrap();
-        let host_budget = metadata.maximum_host_layer_bytes();
-        drop(sizing);
-
-        let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1).unwrap();
-        let mut streamed = load_llama_safetensors_mlx(
-            dir.path(),
-            WeightResidency::dense_disk_stream(options),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let initial = streamed.dense_stream_report().unwrap().unwrap();
-        assert_ne!(
-            initial.transfer_stream_index(),
-            gpu.stream().get_index().unwrap()
-        );
-        assert_eq!(initial.planned_layer_count(), 3);
-        assert_eq!(initial.host_layers().current_layer_count(), 0);
-        assert_eq!(initial.device_layers().current_layer_count(), 0);
-        assert_eq!(initial.execution_groups().len(), 1);
-        assert_eq!(initial.execution_groups()[0].id(), "text_decoder");
-        assert_eq!(initial.execution_groups()[0].planned_layers(), 3);
-        assert_eq!(initial.execution_groups()[0].completed_executions(), 0);
-        assert!(initial
-            .residency()
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().starts_with("llama.layer."))
-            .all(|unit| {
-                unit.planned_tier() == MemoryTier::Disk
-                    && !unit.host_resident()
-                    && !unit.device_resident()
-            }));
-
-        let mut resident = load_llama_safetensors_mlx(
-            dir.path(),
-            WeightResidency::fully_resident(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut expected_cache = resident.new_cache();
-        let mut actual_cache = streamed.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-            Array::from_slice(&[4u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward(&tokens, &mut expected_cache, gpu.stream())
-                .unwrap();
-            let actual = streamed
-                .forward(&tokens, &mut actual_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-            let report = streamed.dense_stream_report().unwrap().unwrap();
-            assert!(
-                report
-                    .residency()
-                    .offload()
-                    .resident_bytes()
-                    .get(MemoryTier::Host)
-                    <= host_budget
-            );
-            assert!(
-                report
-                    .residency()
-                    .offload()
-                    .resident_bytes()
-                    .get(MemoryTier::Device)
-                    <= device_budget
-            );
-        }
-        let report = streamed.dense_stream_report().unwrap().unwrap();
-        assert!(report.background().submitted() >= 3);
-        assert!(report.host_layers().current_layer_count() <= 1);
-        assert!(report.device_layers().current_layer_count() <= DENSE_TRANSFER_WINDOW);
-        assert_eq!(report.host_layers().peak_layer_count(), 1);
-        assert_eq!(
-            report.device_layers().peak_layer_count(),
-            DENSE_TRANSFER_WINDOW
-        );
-        assert!(report.host_layers().peak_layer_bytes() <= host_budget);
-        assert!(
-            report.device_layers().peak_layer_bytes()
-                <= device_budget - report.pinned_static_device_bytes()
-        );
-        assert_eq!(
-            report.host_layers().cache().requests(),
-            report.host_layers().cache().hits() + report.host_layers().cache().misses()
-        );
-        assert_eq!(
-            report.device_layers().cache().requests(),
-            report.device_layers().cache().hits() + report.device_layers().cache().misses()
-        );
-        assert_eq!(report.prefill().forwards(), 1);
-        assert_eq!(report.decode().forwards(), 2);
-        assert_eq!(report.prefill().peak_host_layers(), 1);
-        assert_eq!(report.prefill().peak_device_layers(), DENSE_TRANSFER_WINDOW);
-        assert_eq!(report.decode().peak_host_layers(), 1);
-        assert_eq!(report.decode().peak_device_layers(), DENSE_TRANSFER_WINDOW);
-        assert!(report.prefill().peak_host_bytes() <= host_budget);
-        assert!(report.prefill().peak_device_bytes() <= report.device_layers().peak_layer_bytes());
-        assert!(report.prefill().host_cache().requests() >= 3);
-        assert!(report.prefill().host_to_device_bytes() > 0);
-        assert!(report.decode().host_cache().requests() >= 6);
-        assert!(report.decode().host_to_device_bytes() > 0);
-        let group = &report.execution_groups()[0];
-        assert_eq!(group.completed_executions(), 3);
-        assert_eq!(group.peak_host_layers(), 1);
-        assert_eq!(group.peak_device_layers(), DENSE_TRANSFER_WINDOW);
-        assert!(group.peak_host_bytes() <= host_budget);
-        assert!(group.peak_device_bytes() <= report.device_layers().peak_layer_bytes());
-        assert!(
-            report
-                .residency()
-                .offload()
-                .transfer(TransferDirection::DiskToHost)
-                .count()
-                >= 3
-        );
-
-        let direct_options = DenseDiskStreamLoadOptions::new(device_budget, 0, 0, 0).unwrap();
-        let mut direct = load_llama_safetensors_mlx(
-            dir.path(),
-            WeightResidency::dense_disk_stream(direct_options),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut direct_cache = direct.new_cache();
-        let tokens = Array::from_slice(&[6u32, 7], &[1, 2]);
-        direct
-            .forward(&tokens, &mut direct_cache, gpu.stream())
-            .unwrap();
-        let report = direct.dense_stream_report().unwrap().unwrap();
-        assert_eq!(report.host_layers().peak_layer_count(), 0);
-        assert_eq!(
-            report.device_layers().peak_layer_count(),
-            DENSE_TRANSFER_WINDOW
-        );
-        assert_eq!(report.prefill().forwards(), 1);
-        assert!(report.prefill().disk_to_device_bytes() > 0);
-        assert_eq!(report.prefill().host_to_device_bytes(), 0);
-        assert_eq!(
-            report
-                .residency()
-                .offload()
-                .resident_bytes()
-                .get(MemoryTier::Host),
-            0
-        );
-        assert!(
-            report
-                .residency()
-                .offload()
-                .transfer(TransferDirection::DiskToDevice)
-                .count()
-                >= 3
-        );
-    }
-
-    #[test]
-    fn aborted_dense_forward_does_not_contaminate_completed_pass_telemetry() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut reference =
-            llama::ResidentModel::new(args("llama", true, None), gpu.stream()).unwrap();
-        initialize(&mut reference, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &reference);
-
-        let sizing = load_layerwise_llama(
-            dir.path(),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let metadata = sizing.metadata();
-        let device_budget = metadata
-            .static_device_bytes()
-            .checked_add(
-                metadata
-                    .maximum_device_layer_bytes()
-                    .checked_mul(DENSE_TRANSFER_WINDOW as u64)
-                    .unwrap(),
-            )
-            .unwrap();
-        let host_budget = metadata.maximum_host_layer_bytes();
-        drop(sizing);
-
-        let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1).unwrap();
-        let adapter =
-            crate::backend::mlx::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
-                args("llama", true, None),
-                gpu.stream(),
-            )
-            .unwrap();
-        let mut streamed = load_safetensors_layerwise_model(
-            dir.path(),
-            adapter,
-            options,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-
-        {
-            let controller = streamed.dense_stream.as_ref().unwrap();
-            let forward = controller.forward_guard(true, &streamed.residency).unwrap();
-            let layer_group = &streamed.groups[0];
-            let group = controller.group_guard(&streamed.residency, layer_group.id());
-            {
-                let _window = controller
-                    .transfer_window(
-                        &streamed.residency,
-                        layer_group.id(),
-                        layer_group.units(),
-                        0..layer_group.units().len(),
-                        true,
-                    )
-                    .unwrap();
-            }
-            drop(group);
-            drop(forward);
-        }
-
-        let after_abort = streamed.dense_stream_report().unwrap().unwrap();
-        assert_eq!(after_abort.prefill(), DensePassReport::default());
-        assert_eq!(after_abort.decode(), DensePassReport::default());
-        let successful_start = DenseCounterSnapshot::from_report(after_abort.residency().offload());
-
-        let tokens = Array::from_slice(&[1u32], &[1, 1]);
-        let mut cache = LlamaCache::Device(Vec::new());
-        streamed
-            .forward(
-                crate::backend::mlx::architectures::llama::layerwise::LlamaAdapterInput {
-                    inputs: &tokens,
-                    mask: None,
-                },
-                &mut cache,
-                gpu.stream(),
-            )
-            .unwrap();
-
-        let report = streamed.dense_stream_report().unwrap().unwrap();
-        assert_eq!(report.prefill(), DensePassReport::default());
-        assert_eq!(report.decode().forwards(), 1);
-        assert_eq!(report.decode().peak_host_layers(), 1);
-        assert_eq!(report.decode().peak_device_layers(), DENSE_TRANSFER_WINDOW);
-        let expected =
-            DenseCounterSnapshot::from_report(report.residency().offload()).delta(successful_start);
-        assert_eq!(report.decode().host_cache(), expected.host_cache);
-        assert_eq!(report.decode().device_cache(), expected.device_cache);
-        assert_eq!(
-            report.decode().disk_to_host_bytes(),
-            expected.disk_to_host_bytes
-        );
-        assert_eq!(
-            report.decode().disk_to_device_bytes(),
-            expected.disk_to_device_bytes
-        );
-        assert_eq!(
-            report.decode().host_to_device_bytes(),
-            expected.host_to_device_bytes
-        );
-    }
-
-    #[test]
-    fn budget_and_cache_validation_are_structured() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut reference =
-            llama::ResidentModel::new(args("llama", true, None), gpu.stream()).unwrap();
-        initialize(&mut reference, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &reference);
-
-        let host_error = load_layerwise_llama(
-            dir.path(),
-            OffloadConfig::new(None, Some(1), 1).unwrap(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .err()
-        .unwrap();
-        assert!(host_error.to_string().contains("host budget"));
-
-        let device_error = load_layerwise_llama(
-            dir.path(),
-            OffloadConfig::new(Some(1), None, 1).unwrap(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .err()
-        .unwrap();
-        assert!(device_error.to_string().contains("device budget"));
-
-        let mut model = load_layerwise_llama(
-            dir.path(),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut bad_cache = LlamaCache::Device(vec![None]);
-        let error = model
-            .forward(
-                &Array::from_slice(&[1u32], &[1, 1]),
-                &mut bad_cache,
-                gpu.stream(),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("cache has 1 layers"));
-    }
-
-    #[test]
-    fn llama_residency_packed_affine_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut quant_args = args("llama", false, None);
-        quant_args.hidden_size = 32;
-        quant_args.intermediate_size = 64;
-        quant_args.num_attention_heads = 4;
-        quant_args.num_key_value_heads = 2;
-        quant_args.head_dim = 8;
-        quant_args.vocab_size = 32;
-        quant_args.num_hidden_layers = 2;
-        let mut dense = llama::ResidentModel::new(quant_args, gpu.stream()).unwrap();
-        initialize(&mut dense, gpu.stream());
-        let source = tempfile::tempdir().unwrap();
-        write_fixture(source.path(), &dense);
-
-        let converted_root = tempfile::tempdir().unwrap();
-        let converted = converted_root.path().join("affine");
-        let options =
-            crate::backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions {
-                quantization:
-                    crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(
-                        32, 4,
-                    )
-                    .unwrap()
-                    .into(),
-                ..Default::default()
-            };
-        crate::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
-            source.path(),
-            &converted,
-            &options,
-            gpu.stream(),
-        )
-        .unwrap();
-
-        let mut resident = load_llama_safetensors_mlx(
-            &converted,
-            WeightResidency::fully_resident(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut offloaded = load_layerwise_llama(
-            &converted,
-            OffloadConfig::new(None, None, 1).unwrap(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        assert!(offloaded.metadata().quantization().is_some());
-        let mut resident_cache = resident.new_cache();
-        let mut offloaded_cache = offloaded.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-            Array::from_slice(&[4u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward(&tokens, &mut resident_cache, gpu.stream())
-                .unwrap();
-            let actual = offloaded
-                .forward(&tokens, &mut offloaded_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-    }
 }

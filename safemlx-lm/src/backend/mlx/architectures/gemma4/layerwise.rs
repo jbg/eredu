@@ -46,11 +46,12 @@ use crate::{
     },
     backend::mlx::runtime::cache::{residency::PagedCacheOptions, KeyValueCache},
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
+        populate_module_from_lease, populate_module_from_lease_excluding,
     },
+    backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::{
-        quantization::WeightQuantization,
+        quantization::{should_quantize_on_load, WeightQuantization},
         recipe::DerivedWeightRecipe,
         store::{GgufWeightStore, TensorSelection, WeightStore},
     },
@@ -62,8 +63,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
@@ -660,6 +660,10 @@ impl Gemma4LayerwiseModel {
         self.execution.checkpoint_store()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Runs the text decoder while preserving alternating and shared KV state.
     pub fn forward(
         &mut self,
@@ -934,19 +938,21 @@ impl CausalLm<Cache> for Gemma4LayerwiseModel {
 pub fn load_gemma4_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Gemma4,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
         resident::get_gemma4_model_config(model_dir)?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Gemma 4", args.weight_quantization(), requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = Gemma4LayerwiseAdapter::new(
         args,
         vision,
@@ -956,49 +962,13 @@ pub fn load_gemma4_layerwise_model(
         audio_token_id,
         stream,
     )?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(Gemma4LayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_gemma4_model(
-    model_dir: &Path,
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Gemma4LayerwiseModel, Error> {
-    let (_, vision, _, _, audio, _) = resident::get_gemma4_model_config(model_dir)?;
-    execute_transformed_gemma4_model_with_modalities(model, vision, audio, stream, weights_stream)
-}
-
-pub(crate) fn execute_transformed_gemma4_model_with_modalities(
-    model: resident::Model,
-    vision: Option<Gemma4VisionConfig>,
-    audio: Option<Gemma4AudioConfig>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Gemma4LayerwiseModel, Error> {
-    let adapter = Gemma4LayerwiseAdapter::new(
-        model.args.clone(),
-        vision,
-        model.image_token_id,
-        model.video_token_id,
-        audio,
-        model.audio_token_id,
-        stream,
-    )?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(Gemma4LayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -1015,7 +985,6 @@ pub(crate) fn load_gemma4_tensor_parallel_layerwise_model(
 ) -> Result<Gemma4LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1034,11 +1003,6 @@ pub(crate) fn load_gemma4_tensor_parallel_layerwise_model(
         )
         .map(|(model, _)| model);
     }
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Gemma4,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
         resident::get_gemma4_model_config(model_dir)?;
     let adapter = Gemma4LayerwiseAdapter::new(
@@ -1080,7 +1044,14 @@ pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, mmproj, None)?;
-    let store = gemma4_gguf_store(checkpoint, mmproj, options.max_mapped_shards())?;
+    let store = gemma4_gguf_store(
+        checkpoint,
+        mmproj,
+        &prepared.args,
+        prepared.vision_config.as_ref(),
+        prepared.audio_config.as_ref(),
+        options.max_mapped_shards(),
+    )?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
         Gemma4LayerwiseAdapter::new(
@@ -1118,6 +1089,14 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
     .into_loader_result()?;
     let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, mmproj, None)?;
     let has_routed_experts = prepared.args.num_experts.is_some();
+    let store = gemma4_gguf_store(
+        checkpoint,
+        mmproj,
+        &prepared.args,
+        prepared.vision_config.as_ref(),
+        prepared.audio_config.as_ref(),
+        residency.max_mapped_shards(),
+    )?;
     let adapter = Gemma4LayerwiseAdapter::new(
         prepared.args,
         prepared.vision_config,
@@ -1127,7 +1106,6 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
         prepared.audio_token_id,
         stream,
     )?;
-    let store = gemma4_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
     if let Some(options) = residency.expert_cache() {
         if !has_routed_experts {
             return Err(Error::UnsupportedArchitecture(
@@ -1179,14 +1157,25 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
 pub(crate) fn gemma4_gguf_store(
     checkpoint: &GgufCheckpoint,
     mmproj: Option<&resident::Gemma4MmprojGguf>,
+    args: &ModelArgs,
+    vision: Option<&Gemma4VisionConfig>,
+    audio: Option<&Gemma4AudioConfig>,
     max_mapped_shards: usize,
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
-        .add_checkpoint(checkpoint.clone(), resident::translate_gguf_weight_name)?;
+        .add_checkpoint(
+            checkpoint.clone(),
+            &text_plan,
+            resident::translate_gguf_weight_name,
+        )?;
     if let Some(mmproj) = mmproj {
+        let projector_plan = super::checkpoint::mmproj_plan(args, vision, audio)
+            .map_err(Error::UnsupportedArchitecture)?;
         builder = builder.add_checkpoint(
             mmproj.checkpoint.clone(),
+            &projector_plan,
             resident::translate_mmproj_weight_name,
         )?;
     }
@@ -1352,8 +1341,16 @@ fn gemma_expert_recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 pub(crate) fn execute_acquired_gemma_experts(
@@ -1970,11 +1967,16 @@ impl Gemma4LayerwiseAdapter {
             let parameters = module.parameters().flatten();
             recipes.retain(|name, _| parameters.contains_key(name.as_str()));
         }
-        let mut bindings = build_module_bindings_with_recipes(module, prefix, store, recipes)?;
-        if self.external_experts && prefix.starts_with("model.language_model.layers.") {
-            bindings.retain(|binding| !binding.name().starts_with("experts."));
-        }
-        Ok(bindings)
+        let external_experts =
+            self.external_experts && prefix.starts_with("model.language_model.layers.");
+        Ok(build_module_binding_plan_with_recipes_excluding(
+            module,
+            prefix,
+            store,
+            recipes,
+            |name| external_experts && name.starts_with("experts."),
+        )?
+        .build_bindings(store)?)
     }
 
     fn prepare_per_layer_inputs_with_execution(
@@ -2525,6 +2527,20 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(
+            &self.args,
+            self.vision_config.as_ref(),
+            self.audio_config.as_ref(),
+            true,
+        )
+        .map_err(Error::UnsupportedArchitecture)
+        .map(Into::into)
     }
 
     fn quantization(
@@ -4656,1009 +4672,3 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 /// Gemma 4 token generation using bounded text-layer execution.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     crate::backend::mlx::nn::generation::Generate<'a, Gemma4LayerwiseModel, Cache, S>;
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use std::{collections::HashMap, fs, path::Path};
-
-    use safemlx::{
-        distributed::{Backend, Group},
-        module::ModuleParameters,
-        ops::ones_dtype,
-        Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
-    };
-
-    use super::*;
-    use crate::{
-        backend::mlx::architectures::gemma4::{
-            audio::Gemma4AudioConfig,
-            model::{self as resident, Model, ModelInput},
-            vision::Gemma4VisionConfig,
-        },
-        backend::mlx::nn::generation::CausalLm,
-        backend::mlx::runtime::{
-            cache::ConcatKeyValueCache,
-            checkpoint::quantization::{AffineQuantization, WeightQuantization},
-            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-            execution::inspection::ActivationRecorder,
-            execution::layerwise::{
-                ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
-                LoadTimeQuantizableAdapter,
-            },
-            media::input as runtime_input,
-            residency::dense_stream::DenseDiskStreamLoadOptions,
-        },
-        core::residency::{MemoryTier, OffloadConfig},
-    };
-
-    fn config() -> serde_json::Value {
-        serde_json::json!({
-            "model_type": "gemma4",
-            "tie_word_embeddings": false,
-            "text_config": {
-                "model_type": "gemma4",
-                "hidden_size": 8,
-                "num_hidden_layers": 4,
-                "intermediate_size": 16,
-                "num_attention_heads": 2,
-                "rms_norm_eps": 1e-6,
-                "vocab_size": 32,
-                "pad_token_id": 0,
-                "num_key_value_heads": 2,
-                "max_position_embeddings": 128,
-                "rope_theta": 10000.0,
-                "head_dim": 4,
-                "attention_bias": false,
-                "hidden_size_per_layer_input": 4,
-                "vocab_size_per_layer_input": 32,
-                "num_kv_shared_layers": 1,
-                "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
-                "sliding_window": 8,
-                "final_logit_softcapping": 4.0
-            }
-        })
-    }
-
-    #[test]
-    fn strict_layerwise_loading_ignores_auxiliary_gguf_rope_frequencies() {
-        assert!(super::ignores_gemma4_checkpoint_key("rope_freqs.weight"));
-        assert!(!super::ignores_gemma4_checkpoint_key(
-            "model.language_model.layers.0.self_attn.q_proj.weight"
-        ));
-    }
-
-    #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn load_time_adapter_packs_aligned_gemma4_media_projections() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut value = config();
-        value["text_config"]["hidden_size"] = 32.into();
-        value["text_config"]["intermediate_size"] = 64.into();
-        value["text_config"]["num_attention_heads"] = 4.into();
-        value["text_config"]["num_key_value_heads"] = 2.into();
-        value["text_config"]["head_dim"] = 8.into();
-        value["text_config"]["hidden_size_per_layer_input"] = 0.into();
-        value["text_config"]["num_kv_shared_layers"] = 0.into();
-        let args = resident::model_args_from_config_value(&value["text_config"]).unwrap();
-        let vision = Gemma4VisionConfig {
-            hidden_size: 32,
-            intermediate_size: 64,
-            num_hidden_layers: 1,
-            num_attention_heads: 4,
-            num_key_value_heads: 2,
-            head_dim: 8,
-            patch_size: 2,
-            pooling_kernel_size: 2,
-            position_embedding_size: 4096,
-            rms_norm_eps: 1e-6,
-            hidden_activation: "gelu_pytorch_tanh".into(),
-            standardize: false,
-            rope_parameters: None,
-            weight_quantization: None,
-        };
-        let audio = Gemma4AudioConfig {
-            hidden_size: 32,
-            num_hidden_layers: 1,
-            num_attention_heads: 4,
-            output_proj_dims: 32,
-            conv_kernel_size: 3,
-            attention_chunk_size: 4,
-            attention_context_left: 4,
-            attention_context_right: 0,
-            attention_invalid_logits_value: -1.0e9,
-            attention_logit_cap: 10.0,
-            residual_weight: 0.5,
-            rms_norm_eps: 1e-6,
-            subsampling_conv_channels: vec![4, 4],
-            weight_quantization: None,
-        };
-        let source = Gemma4LayerwiseAdapter::new(
-            args.clone(),
-            Some(vision.clone()),
-            Some(20),
-            Some(21),
-            Some(audio.clone()),
-            Some(22),
-            gpu.stream(),
-        )
-        .unwrap();
-        let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
-        let target = source
-            .load_time_quantized(quantization, gpu.stream())
-            .unwrap();
-
-        assert_eq!(target.quantization(), Some(quantization));
-        assert!(matches!(
-            target.vision.as_ref().unwrap().patch_embedder.input_proj,
-            MaybeQuantized::Original(_)
-        ));
-        assert!(target
-            .audio
-            .as_ref()
-            .unwrap()
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-        let Gemma4Layer::Vision(vision_layer) = target.new_layer(0, 0, gpu.stream()).unwrap()
-        else {
-            panic!("Gemma 4 vision group must build a vision layer")
-        };
-        assert!(vision_layer
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-        let Gemma4Layer::Audio(audio_layer) = target.new_layer(1, 0, gpu.stream()).unwrap() else {
-            panic!("Gemma 4 audio group must build an audio layer")
-        };
-        assert!(audio_layer
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-
-        let mut fixture = Model::new_with_modalities(
-            args.clone(),
-            Some(20),
-            Some(vision.clone()),
-            Some(21),
-            Some(22),
-            Some(audio.clone()),
-            gpu.stream(),
-        )
-        .unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let store = transformed_module_weight_store(&fixture).unwrap();
-        let execution = load_layerwise_model_with_quantization(
-            store,
-            Gemma4LayerwiseAdapter::new(
-                args,
-                Some(vision),
-                Some(20),
-                Some(21),
-                Some(audio),
-                Some(22),
-                gpu.stream(),
-            )
-            .unwrap(),
-            LayerWeightResidency::FullyResident,
-            Some(quantization),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let keys = execution.checkpoint_store_arc().keys();
-        assert!(
-            keys.iter()
-                .any(|key| key
-                    == "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.scales")
-        );
-        assert!(keys
-            .iter()
-            .any(|key| key == "model.audio_tower.layers.0.self_attn.q_proj.linear.scales"));
-        assert!(keys.iter().any(
-            |key| key == "model.audio_tower.subsample_conv_projection.input_proj_linear.scales"
-        ));
-        assert!(!keys
-            .iter()
-            .any(|key| key == "model.vision_tower.patch_embedder.input_proj.scales"));
-        let report = execution.residency_report().unwrap();
-        let materialization = report.materialization().unwrap();
-        assert!(materialization.transformed_weights > 20);
-        assert!(materialization.output_bytes < materialization.source_bytes_read);
-        assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
-
-        let mut quantized = Gemma4LayerwiseModel { execution };
-        let text = runtime_input::token_ids_array(&[1, 2], gpu.stream()).unwrap();
-        let pixels = Array::zeros::<f32>(&[1, 4, 12], gpu.stream()).unwrap();
-        let positions = Array::from_slice(&[0i32, 0, 0, 1, 1, 0, 1, 1], &[1, 4, 2]);
-        let audio_features = Array::zeros::<f32>(&[1, 8, 128], gpu.stream()).unwrap();
-        let audio_mask = Array::from_slice(&[true; 8], &[1, 8]);
-        let parts = [
-            runtime_input::InputPart::text_token_ids(&text),
-            runtime_input::InputPart::image_tensor(
-                &pixels,
-                runtime_input::InputMetadata::patch_position_ids(&positions),
-            ),
-            runtime_input::InputPart::audio_tensor(
-                &audio_features,
-                runtime_input::InputMetadata::audio_mask(&audio_mask),
-            ),
-        ];
-        let typed = runtime_input::ModelInput::new(&parts);
-        let mut dense_cache = Cache::default();
-        let mut quantized_cache = quantized.new_cache();
-        let expected = fixture
-            .prefill_input_logits(typed, &mut dense_cache, gpu.stream())
-            .unwrap();
-        let actual = quantized
-            .prefill_input_logits(typed, &mut quantized_cache, gpu.stream())
-            .unwrap();
-        assert!(actual
-            .all_close(&expected, Some(2e-2), Some(2e-2), None, gpu.stream())
-            .unwrap()
-            .item::<bool>(gpu.stream()));
-
-        value["image_token_id"] = serde_json::json!(20);
-        value["video_token_id"] = serde_json::json!(21);
-        value["audio_token_id"] = serde_json::json!(22);
-        value["tie_word_embeddings"] = serde_json::json!(true);
-        value["text_config"]["tie_word_embeddings"] = serde_json::json!(true);
-        value["vision_config"] = serde_json::json!({
-            "hidden_size": 32,
-            "intermediate_size": 64,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 8,
-            "patch_size": 2,
-            "pooling_kernel_size": 2,
-            "position_embedding_size": 4096,
-            "rms_norm_eps": 1e-6,
-            "hidden_activation": "gelu_pytorch_tanh",
-            "standardize": false
-        });
-        value["audio_config"] = serde_json::json!({
-            "hidden_size": 32,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 4,
-            "output_proj_dims": 32,
-            "conv_kernel_size": 3,
-            "attention_chunk_size": 4,
-            "attention_context_left": 4,
-            "attention_context_right": 0,
-            "attention_invalid_logits_value": -1.0e9,
-            "attention_logit_cap": 10.0,
-            "residual_weight": 0.5,
-            "rms_norm_eps": 1e-6,
-            "subsampling_conv_channels": [4, 4]
-        });
-        let dir = tempfile::tempdir().unwrap();
-        let arrays = fixture
-            .parameters()
-            .flatten()
-            .iter()
-            .map(|(name, value)| {
-                let name =
-                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
-                        name,
-                    )
-                    .replacen(
-                        "model.language_model.",
-                        "language_model.model.",
-                        1,
-                    );
-                (name, *value)
-            })
-            .collect::<Vec<_>>();
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
-            None,
-            dir.path().join("model.safetensors"),
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            serde_json::to_vec(&value).unwrap(),
-        )
-        .unwrap();
-        let eager_quantized = resident::load_gemma4_model_quantized(
-            dir.path(),
-            quantization,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        assert!(eager_quantized
-            .model
-            .vision_tower
-            .as_ref()
-            .unwrap()
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-        assert!(eager_quantized
-            .model
-            .audio_tower
-            .as_ref()
-            .unwrap()
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-    }
-
-    fn initialize(model: &mut Model, stream: &Stream) {
-        let mut names = model
-            .parameters()
-            .flatten()
-            .keys()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        names.sort();
-        let mut params = model.parameters_mut().flatten();
-        for (index, name) in names.iter().enumerate() {
-            let parameter = params.get_mut(name.as_str()).unwrap();
-            let shape = parameter.shape().to_vec();
-            let dtype = parameter.dtype();
-            **parameter = if name.ends_with("norm.weight") || name.ends_with("layernorm.weight") {
-                ones_dtype(&shape, dtype, stream).unwrap()
-            } else {
-                Array::full::<f32>(&shape, Array::from_f32(0.0005 * (index + 1) as f32), stream)
-                    .unwrap()
-                    .as_dtype(dtype, stream)
-                    .unwrap()
-            };
-        }
-    }
-
-    fn write_fixture(dir: &Path, model: &Model) {
-        let arrays = model
-            .parameters()
-            .flatten()
-            .iter()
-            .map(|(name, value)| {
-                let name =
-                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
-                        name,
-                    )
-                    .replacen(
-                        "model.language_model.",
-                        "language_model.model.",
-                        1,
-                    );
-                (name, *value)
-            })
-            .collect::<Vec<_>>();
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
-            None,
-            dir.join("model.safetensors"),
-        )
-        .unwrap();
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&config()).unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn assert_close(left: &Array, right: &Array) {
-        let left = left.evaluated().unwrap();
-        let right = right.evaluated().unwrap();
-        assert_eq!(left.as_array().shape(), right.as_array().shape());
-        for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
-            assert!((left - right).abs() <= 5e-5, "{left} != {right}");
-        }
-    }
-
-    fn parity(depth: usize) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut args = resident::model_args_from_config_value(&config()["text_config"]).unwrap();
-        args.tie_word_embeddings = false;
-        let mut fixture = Model::new(args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture);
-
-        let mut eager =
-            resident::load_gemma4_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_gemma4_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut eager_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-        let mut layerwise_cache = layerwise.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
-            Array::from_slice(&[4u32], &[1, 1]),
-            Array::from_slice(&[5u32], &[1, 1]),
-        ] {
-            let expected = eager
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: None,
-                        per_layer_input_ids: None,
-                        mask: None,
-                        sliding_masks: None,
-                        cache: &mut eager_cache,
-                    },
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = layerwise
-                .forward(&tokens, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-        assert_eq!(
-            layerwise_cache
-                .kv
-                .iter()
-                .map(|cache| cache.as_ref().map_or(0, KeyValueCache::offset))
-                .collect::<Vec<_>>(),
-            vec![5, 5, 5, 0]
-        );
-        let report = layerwise.residency_report().unwrap();
-        let resident_layers = report
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().starts_with("gemma4.layer."))
-            .filter(|unit| unit.device_resident())
-            .count();
-        assert!(resident_layers <= depth);
-    }
-
-    #[test]
-    #[ignore = "requires an MLX runtime with a Metal device"]
-    fn tensor_parallel_dense_stream_loads_text_static_and_decoder_group() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut args = resident::model_args_from_config_value(&config()["text_config"]).unwrap();
-        args.tie_word_embeddings = false;
-        let mut fixture = Model::new(args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture);
-
-        let group = Group::init(false, Backend::Any).unwrap();
-        assert_eq!(group.size(), 1);
-        let topology =
-            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
-                .unwrap();
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
-        let model = load_gemma4_tensor_parallel_layerwise_model(
-            dir.path(),
-            LayerWeightResidency::DenseDiskStream(options),
-            build,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let report = model.dense_stream_report().unwrap().unwrap();
-        assert!(report
-            .residency()
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().contains("gemma4.layer."))
-            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
-    }
-
-    #[test]
-    fn tensor_parallel_plan_derives_uneven_text_vision_and_audio_geometry() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut value = config();
-        value["text_config"]["hidden_size"] = 12.into();
-        value["text_config"]["intermediate_size"] = 7.into();
-        value["text_config"]["num_attention_heads"] = 6.into();
-        value["text_config"]["num_key_value_heads"] = 3.into();
-        value["text_config"]["head_dim"] = 2.into();
-        value["text_config"]["hidden_size_per_layer_input"] = 0.into();
-        value["text_config"]["enable_moe_block"] = true.into();
-        value["text_config"]["num_experts"] = 2.into();
-        value["text_config"]["top_k_experts"] = 1.into();
-        value["text_config"]["moe_intermediate_size"] = 5.into();
-        let args = resident::model_args_from_config_value(&value["text_config"]).unwrap();
-        let vision = Gemma4VisionConfig {
-            hidden_size: 11,
-            intermediate_size: 7,
-            num_hidden_layers: 1,
-            num_attention_heads: 6,
-            num_key_value_heads: 3,
-            head_dim: 2,
-            patch_size: 2,
-            pooling_kernel_size: 1,
-            position_embedding_size: 4,
-            rms_norm_eps: 1e-6,
-            hidden_activation: "gelu_pytorch_tanh".into(),
-            standardize: false,
-            rope_parameters: None,
-            weight_quantization: None,
-        };
-        let audio = Gemma4AudioConfig {
-            hidden_size: 12,
-            num_hidden_layers: 1,
-            num_attention_heads: 3,
-            output_proj_dims: 7,
-            conv_kernel_size: 3,
-            attention_chunk_size: 4,
-            attention_context_left: 4,
-            attention_context_right: 0,
-            attention_invalid_logits_value: -1.0e9,
-            attention_logit_cap: 10.0,
-            residual_weight: 0.5,
-            rms_norm_eps: 1e-6,
-            subsampling_conv_channels: vec![2, 2],
-            weight_quantization: None,
-        };
-
-        for (rank, query_heads, kv_heads, dense, expert, vision_hidden, vision_mlp, audio_heads) in
-            [(0, 4, 2, 4, 3, 6, 4, 2), (1, 2, 1, 3, 2, 5, 3, 1)]
-        {
-            let mut adapter = Gemma4LayerwiseAdapter::new(
-                args.clone(),
-                Some(vision.clone()),
-                Some(20),
-                Some(21),
-                Some(audio.clone()),
-                Some(22),
-                execution.stream(),
-            )
-            .unwrap();
-            let topology = MlxParallelContext::for_rank(
-                rank,
-                2,
-                1,
-                1,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap();
-            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            adapter
-                .configure_parallel_static(context, &layout, execution.stream())
-                .unwrap();
-
-            let geometry = adapter.parallel_text_geometry.as_ref().unwrap();
-            assert!(geometry.iter().all(|geometry| {
-                geometry.query_heads == query_heads
-                    && geometry.kv_heads == kv_heads
-                    && geometry.dense_intermediate == dense
-                    && geometry.expert_intermediate == Some(expert)
-            }));
-            assert_eq!(
-                adapter
-                    .vision
-                    .as_ref()
-                    .unwrap()
-                    .patch_embedder
-                    .position_embedding_table
-                    .dim(-1),
-                vision_hidden
-            );
-            assert_eq!(
-                adapter
-                    .embed_vision
-                    .as_ref()
-                    .unwrap()
-                    .parallel_input_range
-                    .as_ref()
-                    .unwrap()
-                    .len(),
-                vision_hidden as usize
-            );
-            assert_eq!(
-                adapter
-                    .embed_audio
-                    .as_ref()
-                    .unwrap()
-                    .parallel_input_range
-                    .as_ref()
-                    .unwrap()
-                    .len(),
-                if rank == 0 { 4 } else { 3 }
-            );
-
-            let Gemma4Layer::Vision(layer) = adapter
-                .new_parallel_layer(0, 0, &layout, execution.stream())
-                .unwrap()
-            else {
-                panic!("expected Gemma 4 vision layer")
-            };
-            assert_eq!(layer.self_attn.num_heads, query_heads);
-            assert_eq!(layer.self_attn.num_kv_heads, kv_heads);
-            assert_eq!(layer.mlp.gate_proj.output_dim, vision_mlp);
-
-            let Gemma4Layer::Audio(layer) = adapter
-                .new_parallel_layer(1, 0, &layout, execution.stream())
-                .unwrap()
-            else {
-                panic!("expected Gemma 4 audio layer")
-            };
-            assert_eq!(layer.self_attn.heads, audio_heads);
-            assert_eq!(layer.lconv1d.global_hidden_size, audio.hidden_size);
-
-            let Gemma4Layer::Text(layer) = adapter
-                .new_parallel_layer(2, 0, &layout, execution.stream())
-                .unwrap()
-            else {
-                panic!("expected Gemma 4 text layer")
-            };
-            assert_eq!(layer.num_attention_heads, query_heads);
-            assert_eq!(
-                layer.layer_policy.num_key_value_heads.get(),
-                kv_heads as u32
-            );
-            assert_eq!(layer.mlp.hidden_dim, dense);
-            assert_eq!(
-                layer
-                    .experts
-                    .as_ref()
-                    .unwrap()
-                    .switch_glu
-                    .gate_proj
-                    .output_dim,
-                expert
-            );
-
-            let identity = adapter.prompt_cache_model_identity(Some(topology)).unwrap();
-            match identity.layer_layout.get(0).unwrap() {
-                crate::LayerCachePolicy::KeyValueWithFixedState {
-                    num_key_value_heads,
-                    ..
-                } => assert_eq!(num_key_value_heads.get(), kv_heads as u32),
-                policy => panic!("unexpected Gemma 4 cache policy {policy:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn tensor_parallel_plan_keeps_gemma_expert_companions_block_aligned() {
-        use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
-
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut value = config();
-        value["text_config"]["hidden_size"] = 12.into();
-        value["text_config"]["num_attention_heads"] = 6.into();
-        value["text_config"]["num_key_value_heads"] = 3.into();
-        value["text_config"]["head_dim"] = 2.into();
-        value["text_config"]["hidden_size_per_layer_input"] = 0.into();
-        value["text_config"]["enable_moe_block"] = true.into();
-        value["text_config"]["num_experts"] = 2.into();
-        value["text_config"]["top_k_experts"] = 1.into();
-        value["text_config"]["moe_intermediate_size"] = 96.into();
-        let mut args = resident::model_args_from_config_value(&value["text_config"]).unwrap();
-        args.num_hidden_layers = 1;
-        args.layer_schedule =
-            crate::LayerSchedule::new(1, vec![*args.layer_policy(0).unwrap()]).unwrap();
-        args.quantized_weight_configs = Some(HashMap::from([(
-            "model.language_model.layers.0.experts.switch_glu.down_proj.weight".into(),
-            WeightQuantization::MxFp4,
-        )]));
-
-        for (rank, expert, packed, companions) in [(0, 64, 8, 2), (1, 32, 4, 1)] {
-            let mut adapter = Gemma4LayerwiseAdapter::new(
-                args.clone(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                execution.stream(),
-            )
-            .unwrap();
-            let topology = MlxParallelContext::for_rank(
-                rank,
-                2,
-                1,
-                1,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap();
-            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            adapter
-                .configure_parallel_static(context, &layout, execution.stream())
-                .unwrap();
-            assert_eq!(
-                adapter.parallel_text_geometry.as_ref().unwrap()[0].expert_intermediate,
-                Some(expert)
-            );
-            let prefix = "model.language_model.layers.0.experts.switch_glu.down_proj";
-            assert_eq!(
-                layout
-                    .tensor(&format!("{prefix}.weight"))
-                    .unwrap()
-                    .local_shape()[2],
-                packed
-            );
-            assert_eq!(
-                layout
-                    .tensor(&format!("{prefix}.scales"))
-                    .unwrap()
-                    .local_shape()[2],
-                companions
-            );
-        }
-    }
-
-    #[test]
-    fn gemma4_per_layer_inputs_and_shared_kv_parity() {
-        parity(1);
-        parity(2);
-    }
-
-    #[test]
-    fn gemma4_multimodal_vision_audio_and_text_group_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut args = resident::model_args_from_config_value(&config()["text_config"]).unwrap();
-        args.tie_word_embeddings = false;
-        let vision = Gemma4VisionConfig {
-            hidden_size: 8,
-            intermediate_size: 16,
-            num_hidden_layers: 1,
-            num_attention_heads: 2,
-            num_key_value_heads: 2,
-            head_dim: 4,
-            patch_size: 2,
-            pooling_kernel_size: 2,
-            position_embedding_size: 4,
-            rms_norm_eps: 1e-6,
-            hidden_activation: "gelu_pytorch_tanh".into(),
-            standardize: false,
-            rope_parameters: None,
-            weight_quantization: None,
-        };
-        let audio = Gemma4AudioConfig {
-            hidden_size: 8,
-            num_hidden_layers: 1,
-            num_attention_heads: 2,
-            output_proj_dims: 8,
-            conv_kernel_size: 3,
-            attention_chunk_size: 4,
-            attention_context_left: 4,
-            attention_context_right: 0,
-            attention_invalid_logits_value: -1.0e9,
-            attention_logit_cap: 10.0,
-            residual_weight: 0.5,
-            rms_norm_eps: 1e-6,
-            subsampling_conv_channels: vec![2, 2],
-            weight_quantization: None,
-        };
-        let mut fixture = Model::new_with_modalities(
-            args,
-            Some(20),
-            Some(vision),
-            Some(21),
-            Some(22),
-            Some(audio),
-            gpu.stream(),
-        )
-        .unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture);
-        let mut value = config();
-        value["image_token_id"] = serde_json::json!(20);
-        value["video_token_id"] = serde_json::json!(21);
-        value["audio_token_id"] = serde_json::json!(22);
-        value["vision_config"] = serde_json::json!({
-            "hidden_size": 8,
-            "intermediate_size": 16,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "head_dim": 4,
-            "patch_size": 2,
-            "pooling_kernel_size": 2,
-            "position_embedding_size": 4,
-            "rms_norm_eps": 1e-6,
-            "hidden_activation": "gelu_pytorch_tanh",
-            "standardize": false,
-        });
-        value["audio_config"] = serde_json::json!({
-            "hidden_size": 8,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 2,
-            "output_proj_dims": 8,
-            "conv_kernel_size": 3,
-            "attention_chunk_size": 4,
-            "attention_context_left": 4,
-            "attention_context_right": 0,
-            "attention_invalid_logits_value": -1.0e9,
-            "attention_logit_cap": 10.0,
-            "residual_weight": 0.5,
-            "rms_norm_eps": 1e-6,
-            "subsampling_conv_channels": [2, 2],
-        });
-        fs::write(
-            dir.path().join("config.json"),
-            serde_json::to_vec(&value).unwrap(),
-        )
-        .unwrap();
-
-        let mut resident =
-            resident::load_gemma4_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_gemma4_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut serial = load_gemma4_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        serial.execution.force_serial_reference(true);
-        let graph = layerwise.execution.execution_graph();
-        assert_eq!(
-            graph
-                .groups()
-                .iter()
-                .map(|group| group.id())
-                .collect::<Vec<_>>(),
-            ["vision_encoder", "audio_encoder", "text_decoder"]
-        );
-        assert_eq!(graph.dependencies(2), Some([0, 1].as_slice()));
-        assert_eq!(graph.output(), 2);
-        let text = runtime_input::token_ids_array(&[1, 2], gpu.stream()).unwrap();
-        let pixels = Array::zeros::<f32>(&[1, 4096, 12], gpu.stream()).unwrap();
-        let positions = (0..64)
-            .flat_map(|row| (0..64).flat_map(move |column| [row, column]))
-            .collect::<Vec<i32>>();
-        let positions = Array::from_slice(&positions, &[1, 4096, 2]);
-        let audio_features = Array::zeros::<f32>(&[1, 8, 128], gpu.stream()).unwrap();
-        let audio_mask = Array::from_slice(&[true; 8], &[1, 8]);
-        let parts = [
-            runtime_input::InputPart::text_token_ids(&text),
-            runtime_input::InputPart::image_tensor(
-                &pixels,
-                runtime_input::InputMetadata::patch_position_ids(&positions),
-            ),
-            runtime_input::InputPart::audio_tensor(
-                &audio_features,
-                runtime_input::InputMetadata::audio_mask(&audio_mask),
-            ),
-        ];
-        let typed = runtime_input::ModelInput::new(&parts);
-        let mut resident_cache = Cache::default();
-        let mut layerwise_cache = layerwise.new_cache();
-        let mut serial_cache = serial.new_cache();
-        let expected = resident
-            .prefill_input_logits(typed, &mut resident_cache, gpu.stream())
-            .unwrap();
-        let actual = layerwise
-            .prefill_input_logits(typed, &mut layerwise_cache, gpu.stream())
-            .unwrap();
-        let trace = layerwise.execution.ready_set_trace();
-        let vision_stream = trace
-            .submissions()
-            .iter()
-            .find_map(|&(group, _, stream)| (group == 0).then_some(stream))
-            .unwrap();
-        let audio_stream = trace
-            .submissions()
-            .iter()
-            .find_map(|&(group, _, stream)| (group == 1).then_some(stream))
-            .unwrap();
-        assert_ne!(vision_stream, audio_stream);
-        assert!(trace
-            .independent_group_events()
-            .iter()
-            .any(|&(producer, consumer)| [producer, consumer] == [0, 1]));
-        let serial_actual = serial
-            .prefill_input_logits(typed, &mut serial_cache, gpu.stream())
-            .unwrap();
-        assert_close(&actual, &expected);
-        assert_close(&actual, &serial_actual);
-        let mut concurrent_observer = ActivationRecorder::default();
-        let mut serial_observer = ActivationRecorder::default();
-        let mut concurrent_observer_cache = layerwise.new_cache();
-        let mut serial_observer_cache = serial.new_cache();
-        layerwise
-            .prefill_input_with_observer(
-                typed,
-                &mut concurrent_observer_cache,
-                gpu.stream(),
-                &mut concurrent_observer,
-            )
-            .unwrap();
-        serial
-            .prefill_input_with_observer(
-                typed,
-                &mut serial_observer_cache,
-                gpu.stream(),
-                &mut serial_observer,
-            )
-            .unwrap();
-        assert_eq!(
-            concurrent_observer
-                .activations()
-                .iter()
-                .map(|activation| activation.name.as_str())
-                .collect::<Vec<_>>(),
-            serial_observer
-                .activations()
-                .iter()
-                .map(|activation| activation.name.as_str())
-                .collect::<Vec<_>>()
-        );
-        let report = layerwise.residency_report().unwrap();
-        assert!(report
-            .units()
-            .iter()
-            .any(|unit| unit.id().as_str().starts_with("gemma4.vision.")));
-        assert!(report
-            .units()
-            .iter()
-            .any(|unit| unit.id().as_str().starts_with("gemma4.audio.")));
-
-        let dense_options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
-        let mut dense = load_gemma4_layerwise_model(
-            dir.path(),
-            LayerWeightResidency::DenseDiskStream(dense_options),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut dense_cache = dense.new_cache();
-        let dense_actual = dense
-            .prefill_input_logits(typed, &mut dense_cache, gpu.stream())
-            .unwrap();
-        assert_close(&dense_actual, &expected);
-        assert!(dense
-            .execution
-            .ready_set_trace()
-            .independent_group_events()
-            .iter()
-            .any(|&(producer, consumer)| [producer, consumer] == [0, 1]));
-        let dense_report = dense.dense_stream_report().unwrap().unwrap();
-        assert_eq!(dense_report.prefill_forwards(), 1);
-        assert!(dense_report
-            .execution_groups()
-            .iter()
-            .all(|group| group.completed_executions() == 1));
-
-        let group = Group::init(false, Backend::Any).unwrap();
-        assert_eq!(group.size(), 1);
-        let topology =
-            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
-                .unwrap();
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
-        let tp = load_gemma4_tensor_parallel_layerwise_model(
-            dir.path(),
-            LayerWeightResidency::DenseDiskStream(options),
-            build,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let report = tp.dense_stream_report().unwrap().unwrap();
-        assert_eq!(report.execution_groups().len(), 3);
-    }
-}

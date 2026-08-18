@@ -51,7 +51,7 @@ use crate::{
     },
     backend::mlx::runtime::cache::{residency::PagedCacheOptions, KeyValueCache},
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
+        build_module_binding_plan_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
@@ -61,8 +61,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
@@ -237,6 +236,10 @@ impl Qwen3VlLayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Runs typed multimodal prefill through vision and text execution groups.
@@ -443,47 +446,32 @@ impl CausalLm<Cache> for Qwen3VlLayerwiseModel {
 pub fn load_qwen3_vl_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
-    let residency = options.weight_residency();
-    let kind = if args.text_config.is_moe() {
-        crate::core::ModelKind::Qwen3VlMoe
-    } else {
-        crate::core::ModelKind::Qwen3Vl
-    };
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        kind,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Qwen3-VL",
+                args.text_config.weight_quantization(),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(Qwen3VlLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_qwen3_vl_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Qwen3VlLayerwiseModel, Error> {
-    let adapter = Qwen3VlLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(Qwen3VlLayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -522,17 +510,6 @@ pub(crate) fn load_qwen3_vl_tensor_parallel_layerwise_model(
         .map(|(model, _)| model);
     }
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
-    let residency = options.weight_residency();
-    let kind = if args.text_config.is_moe() {
-        crate::core::ModelKind::Qwen3VlMoe
-    } else {
-        crate::core::ModelKind::Qwen3Vl
-    };
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        kind,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     Ok(Qwen3VlLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
@@ -688,10 +665,23 @@ pub(crate) fn qwen3_vl_gguf_store(
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
     let deepstack = args.vision_config.deepstack_layers();
     let is_moe = args.text_config.is_moe();
+    let text_variant = if is_moe {
+        crate::backend::mlx::architectures::qwen::dense::checkpoint::GgufVariant::Qwen3Moe
+    } else {
+        crate::backend::mlx::architectures::qwen::dense::checkpoint::GgufVariant::Qwen3
+    };
+    let text_plan = crate::backend::mlx::architectures::qwen::dense::checkpoint::gguf_plan(
+        &args.text_config,
+        text_variant,
+    )
+    .map_err(Error::UnsupportedArchitecture)?;
+    let vision_plan =
+        super::checkpoint::projector_gguf_plan(&args.vision_config, args.text_config.hidden_size)
+            .map_err(Error::UnsupportedArchitecture)?;
     Ok(Arc::new(
         GgufWeightStore::builder()
             .max_cached_readers(max_mapped_shards)?
-            .add_checkpoint(checkpoint.clone(), move |name| {
+            .add_checkpoint(checkpoint.clone(), &text_plan, move |name| {
                 let name =
                     crate::backend::mlx::architectures::qwen::dense::translate_gguf_weight_name(
                         name, is_moe,
@@ -700,7 +690,7 @@ pub(crate) fn qwen3_vl_gguf_store(
                     .map(|name| format!("model.language_model.{name}"))
                     .unwrap_or(name)
             })?
-            .add_checkpoint(vision_checkpoint.clone(), move |name| {
+            .add_checkpoint(vision_checkpoint.clone(), &vision_plan, move |name| {
                 resident::translate_qwen3_vl_mmproj_name(name, &deepstack)
             })?
             .build()?,
@@ -717,12 +707,6 @@ pub fn load_qwen3_vl_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Qwen3VlMoe,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
     if !args.text_config.is_moe() {
         return Err(Error::UnsupportedArchitecture(
@@ -1546,6 +1530,15 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         }
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(&self.args, true)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
+    }
+
     fn quantization(
         &self,
     ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
@@ -1665,26 +1658,40 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         let mut units = vec![
             StaticUnitBindings::new(
                 VISION_STATIC_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.vision,
                     "model.visual",
                     store,
                     vision_recipes,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, "model.language_model.embed_tokens", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    "model.language_model.embed_tokens",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, "model.language_model.norm", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    "model.language_model.norm",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?,
         ];
         if let Some(head) = &self.lm_head {
             units.push(StaticUnitBindings::new(
                 HEAD_UNIT,
-                build_module_bindings(head, "lm_head", store)?,
+                build_module_binding_plan_with_recipes(head, "lm_head", store, BTreeMap::new())?
+                    .build_bindings(store)?,
             )?);
         }
         Ok(units)
@@ -2081,7 +2088,10 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
                 self.sparse_expert_cache,
             )
         } else {
-            Ok(build_module_bindings(layer, &prefix, store)?)
+            Ok(
+                build_module_binding_plan_with_recipes(layer, &prefix, store, BTreeMap::new())?
+                    .build_bindings(store)?,
+            )
         }
     }
 
@@ -2168,6 +2178,13 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         } else {
             Vec::new()
         }
+    }
+
+    fn ignores_checkpoint_key(&self, key: &str) -> bool {
+        crate::backend::mlx::architectures::qwen::dense::checkpoint::is_redundant_tied_output_head_key(
+            &self.args.text_config,
+            key,
+        )
     }
 
     fn forward_layer(
@@ -2633,645 +2650,3 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
 /// Qwen3-VL generation using shared vision/text bounded layer execution.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Qwen3VlLayerwiseModel, Cache, S>;
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use std::{fs, path::Path};
-
-    use safemlx::{
-        distributed::{Backend, Group},
-        module::ModuleParameters,
-        ops::{ones_dtype, zeros_dtype},
-        Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
-    };
-
-    use super::*;
-    use crate::{
-        backend::mlx::architectures::qwen::vl::model as eager,
-        backend::mlx::runtime::{
-            checkpoint::quantization::{AffineQuantization, WeightQuantization},
-            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-            execution::layerwise::{
-                ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
-                LoadTimeQuantizableAdapter,
-            },
-            residency::dense_stream::DenseDiskStreamLoadOptions,
-            residency::expert_cache::ExpertCacheLoadOptions,
-        },
-        core::residency::{MemoryTier, OffloadConfig},
-    };
-
-    fn config(moe: bool) -> serde_json::Value {
-        let model_type = if moe { "qwen3_vl_moe" } else { "qwen3_vl" };
-        serde_json::json!({
-            "model_type": model_type,
-            "image_token_id": 30,
-            "video_token_id": 31,
-            "tie_word_embeddings": true,
-            "text_config": {
-                "model_type": format!("{model_type}_text"),
-                "hidden_size": 12,
-                "num_hidden_layers": 2,
-                "intermediate_size": 24,
-                "num_attention_heads": 1,
-                "rms_norm_eps": 1e-6,
-                "vocab_size": 32,
-                "num_key_value_heads": 1,
-                "max_position_embeddings": 128,
-                "rope_theta": 10000.0,
-                "head_dim": 12,
-                "tie_word_embeddings": true,
-                "moe_intermediate_size": if moe { 8 } else { 0 },
-                "num_experts": if moe { 4 } else { 0 },
-                "num_experts_per_tok": if moe { 2 } else { 0 },
-                "norm_topk_prob": moe,
-                "rope_scaling": {
-                    "rope_type": "default",
-                    "mrope_interleaved": true,
-                    "mrope_section": [2, 2, 2]
-                }
-            },
-            "vision_config": {
-                "depth": 2,
-                "hidden_size": 8,
-                "hidden_act": "gelu_pytorch_tanh",
-                "intermediate_size": 16,
-                "num_heads": 2,
-                "num_position_embeddings": 16,
-                "in_channels": 3,
-                "patch_size": 2,
-                "spatial_merge_size": 2,
-                "temporal_patch_size": 2,
-                "out_hidden_size": 12,
-                "deepstack_visual_indexes": [0]
-            }
-        })
-    }
-
-    #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn load_time_adapter_packs_qwen3_vl_vision_projections() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut value = config(false);
-        value["text_config"]["hidden_size"] = 32.into();
-        value["text_config"]["intermediate_size"] = 64.into();
-        value["text_config"]["num_attention_heads"] = 4.into();
-        value["text_config"]["num_key_value_heads"] = 2.into();
-        value["text_config"]["head_dim"] = 8.into();
-        value["text_config"]["rope_scaling"]["mrope_section"] = serde_json::json!([2, 1, 1]);
-        value["vision_config"]["hidden_size"] = 32.into();
-        value["vision_config"]["intermediate_size"] = 64.into();
-        value["vision_config"]["num_heads"] = 4.into();
-        value["vision_config"]["out_hidden_size"] = 32.into();
-        let args = eager::model_args_from_config_value(&value).unwrap();
-        let source = Qwen3VlLayerwiseAdapter::new(args.clone(), gpu.stream()).unwrap();
-        let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
-        let target = source
-            .load_time_quantized(quantization, gpu.stream())
-            .unwrap();
-
-        assert_eq!(target.quantization(), Some(quantization));
-        assert_eq!(
-            target.vision.patch_embed.proj.weight.dtype(),
-            Dtype::Float32
-        );
-        assert!(target
-            .vision
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-        let Qwen3VlLayer::Vision(layer) = target.new_layer(0, 0, gpu.stream()).unwrap() else {
-            panic!("Qwen3-VL vision group must build a vision layer")
-        };
-        assert!(layer
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-
-        let mut fixture = eager::Model::new(args.clone(), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let store = transformed_module_weight_store(&fixture).unwrap();
-        let execution = load_layerwise_model_with_quantization(
-            store,
-            Qwen3VlLayerwiseAdapter::new(args, gpu.stream()).unwrap(),
-            LayerWeightResidency::FullyResident,
-            Some(quantization),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let keys = execution.checkpoint_store_arc().keys();
-        assert!(keys
-            .iter()
-            .any(|key| key == "model.visual.blocks.0.attn.qkv.scales"));
-        assert!(keys
-            .iter()
-            .any(|key| key == "model.visual.merger.linear_fc1.scales"));
-        assert!(!keys
-            .iter()
-            .any(|key| key == "model.visual.patch_embed.proj.scales"));
-        let report = execution.residency_report().unwrap();
-        let materialization = report.materialization().unwrap();
-        assert!(materialization.transformed_weights >= 12);
-        assert!(materialization.output_bytes < materialization.source_bytes_read);
-        assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
-
-        let mut quantized = Qwen3VlLayerwiseModel { execution };
-        let before = Array::from_slice(&[1u32], &[1, 1]);
-        let after = Array::from_slice(&[2u32], &[1, 1]);
-        let pixels = Array::from_slice(&[0.01f32; 96], &[4, 24]);
-        let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
-        let parts = [
-            input::InputPart::text_token_ids(&before),
-            input::InputPart::image_tensor(&pixels, input::InputMetadata::qwen_grid_thw(&grid)),
-            input::InputPart::text_token_ids(&after),
-        ];
-        let prompt = input::ModelInput::new(&parts);
-        let mut dense_cache = fixture.new_cache();
-        let mut quantized_cache = quantized.new_cache();
-        let expected = fixture
-            .prefill_input_logits(prompt, &mut dense_cache, gpu.stream())
-            .unwrap();
-        let actual = quantized
-            .prefill_input_logits(prompt, &mut quantized_cache, gpu.stream())
-            .unwrap();
-        assert!(actual
-            .all_close(&expected, Some(2e-2), Some(2e-2), None, gpu.stream())
-            .unwrap()
-            .item::<bool>(gpu.stream()));
-
-        let dir = tempfile::tempdir().unwrap();
-        let arrays = fixture
-            .parameters()
-            .flatten()
-            .iter()
-            .map(|(name, value)| {
-                (
-                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
-                        name,
-                    ),
-                    *value,
-                )
-            })
-            .collect::<Vec<_>>();
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
-            None,
-            dir.path().join("model.safetensors"),
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            serde_json::to_vec(&value).unwrap(),
-        )
-        .unwrap();
-        let eager_quantized = eager::load_qwen3_vl_model_quantized(
-            dir.path(),
-            quantization,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        assert!(eager_quantized
-            .model
-            .visual
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-    }
-
-    fn initialize(model: &mut eager::Model, stream: &Stream) {
-        let mut names = model
-            .parameters()
-            .flatten()
-            .keys()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        names.sort();
-        let mut params = model.parameters_mut().flatten();
-        for (index, name) in names.iter().enumerate() {
-            let parameter = params.get_mut(name.as_str()).unwrap();
-            let shape = parameter.shape().to_vec();
-            let dtype = parameter.dtype();
-            **parameter = if name.ends_with("norm.weight") || name.ends_with("layernorm.weight") {
-                ones_dtype(&shape, dtype, stream).unwrap()
-            } else if name.ends_with(".bias") {
-                zeros_dtype(&shape, dtype, stream).unwrap()
-            } else {
-                Array::full::<f32>(&shape, Array::from_f32(0.0002 * (index + 1) as f32), stream)
-                    .unwrap()
-                    .as_dtype(dtype, stream)
-                    .unwrap()
-            };
-        }
-    }
-
-    fn write_fixture(dir: &Path, model: &eager::Model, moe: bool) {
-        let arrays = model
-            .parameters()
-            .flatten()
-            .iter()
-            .map(|(name, value)| {
-                (
-                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
-                        name,
-                    ),
-                    *value,
-                )
-            })
-            .collect::<Vec<_>>();
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
-            None,
-            dir.join("model.safetensors"),
-        )
-        .unwrap();
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&config(moe)).unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn assert_close(left: &Array, right: &Array) {
-        let left = left.evaluated().unwrap();
-        let right = right.evaluated().unwrap();
-        assert_eq!(left.as_array().shape(), right.as_array().shape());
-        for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
-            assert!((left - right).abs() <= 5e-5, "{left} != {right}");
-        }
-    }
-
-    fn parity(moe: bool, depth: usize, dense_stream: bool) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let config_dir = tempfile::tempdir().unwrap();
-        fs::write(
-            config_dir.path().join("config.json"),
-            serde_json::to_vec(&config(moe)).unwrap(),
-        )
-        .unwrap();
-        let args = eager::get_qwen3_vl_model_args(config_dir.path()).unwrap();
-        let mut fixture = eager::Model::new(args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, moe);
-
-        let mut resident =
-            eager::load_qwen3_vl_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = if dense_stream {
-            LayerWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth).unwrap(),
-            )
-        } else {
-            LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                OffloadConfig::new(None, None, depth).unwrap(),
-            ))
-        };
-        let mut layerwise =
-            load_qwen3_vl_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
-        let graph = layerwise.execution.execution_graph();
-        assert_eq!(
-            graph
-                .groups()
-                .iter()
-                .map(|group| group.id())
-                .collect::<Vec<_>>(),
-            ["vision_encoder", "text_decoder"]
-        );
-        assert_eq!(graph.dependencies(1), Some([0].as_slice()));
-        assert_eq!(graph.output(), 1);
-        if dense_stream {
-            let report = layerwise.dense_stream_report().unwrap().unwrap();
-            assert!(report
-                .residency()
-                .units()
-                .iter()
-                .filter(|unit| {
-                    ["qwen3_vl.vision.", "qwen3_vl.text."]
-                        .iter()
-                        .any(|prefix| unit.id().as_str().starts_with(prefix))
-                })
-                .all(|unit| {
-                    unit.planned_tier() == MemoryTier::Disk
-                        && !unit.host_resident()
-                        && !unit.device_resident()
-                }));
-        }
-        let before = Array::from_slice(&[1u32], &[1, 1]);
-        let after = Array::from_slice(&[2u32], &[1, 1]);
-        let pixels = Array::from_slice(&[0.01f32; 96], &[4, 24]);
-        let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
-        let parts = [
-            input::InputPart::text_token_ids(&before),
-            input::InputPart::image_tensor(&pixels, input::InputMetadata::qwen_grid_thw(&grid)),
-            input::InputPart::text_token_ids(&after),
-        ];
-        let prompt = input::ModelInput::new(&parts);
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = layerwise.new_cache();
-        let expected = resident
-            .prefill_input_logits(prompt, &mut resident_cache, gpu.stream())
-            .unwrap();
-        let actual = layerwise
-            .prefill_input_logits(prompt, &mut layerwise_cache, gpu.stream())
-            .unwrap();
-        assert_close(&actual, &expected);
-        for token in [3u32, 4u32] {
-            let token = Array::from_slice(&[token], &[1, 1]);
-            let expected = resident
-                .decode_logits(&token, &mut resident_cache, gpu.stream())
-                .unwrap();
-            let actual = layerwise
-                .decode_logits(&token, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-        if !dense_stream {
-            let report = layerwise.residency_report().unwrap();
-            for prefix in ["qwen3_vl.vision.", "qwen3_vl.text."] {
-                let resident = report
-                    .units()
-                    .iter()
-                    .filter(|unit| unit.id().as_str().starts_with(prefix))
-                    .filter(|unit| unit.device_resident())
-                    .count();
-                assert!(resident <= depth);
-            }
-        } else {
-            let report = layerwise.dense_stream_report().unwrap().unwrap();
-            assert_eq!(report.prefill().forwards(), 1);
-            assert_eq!(report.decode().forwards(), 2);
-            assert!(report.prefill().peak_host_layers() > 0);
-            assert!(report.prefill().peak_device_layers() > 0);
-            assert!(report.decode().peak_host_layers() > 0);
-            assert!(report.decode().peak_device_layers() > 0);
-            let groups = report
-                .execution_groups()
-                .iter()
-                .map(|group| (group.id(), group))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            let vision = groups["vision_encoder"];
-            let text = groups["text_decoder"];
-            assert_eq!(vision.completed_executions(), 1);
-            assert_eq!(text.completed_executions(), 3);
-            assert!(vision.peak_device_layers() > 0);
-            assert!(text.peak_device_layers() > 0);
-        }
-    }
-
-    #[test]
-    #[ignore = "requires an MLX runtime with a Metal device"]
-    fn tensor_parallel_dense_stream_loads_composed_static_and_execution_groups() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let config_dir = tempfile::tempdir().unwrap();
-        fs::write(
-            config_dir.path().join("config.json"),
-            serde_json::to_vec(&config(false)).unwrap(),
-        )
-        .unwrap();
-        let args = eager::get_qwen3_vl_model_args(config_dir.path()).unwrap();
-        let mut fixture = eager::Model::new(args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, false);
-
-        let group = Group::init(false, Backend::Any).unwrap();
-        assert_eq!(group.size(), 1);
-        let topology =
-            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
-                .unwrap();
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
-        let model = load_qwen3_vl_tensor_parallel_layerwise_model(
-            dir.path(),
-            LayerWeightResidency::DenseDiskStream(options),
-            build,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let report = model.dense_stream_report().unwrap().unwrap();
-        assert!(report
-            .residency()
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().contains(".vision.")
-                || unit.id().as_str().contains(".text."))
-            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
-    }
-
-    #[test]
-    fn tensor_parallel_prompt_cache_identity_uses_planned_uneven_kv_heads() {
-        use crate::core::cache::LayerCachePolicy;
-
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        for moe in [false, true] {
-            let mut value = config(moe);
-            value["text_config"]["num_attention_heads"] = serde_json::json!(6);
-            value["text_config"]["num_key_value_heads"] = serde_json::json!(3);
-            value["text_config"]["head_dim"] = serde_json::json!(2);
-            value["text_config"]["intermediate_size"] = serde_json::json!(25);
-            value["text_config"]["rope_scaling"]["mrope_section"] = serde_json::json!([1, 0, 0]);
-            let args = eager::model_args_from_config_value(&value).unwrap();
-
-            for (rank, expected_kv_heads) in [(0, 2_u32), (1, 1_u32)] {
-                let topology = MlxParallelContext::for_rank(
-                    rank,
-                    2,
-                    1,
-                    1,
-                    DeviceAssignment::new(DeviceType::Cpu, 0),
-                )
-                .unwrap();
-                let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-                let mut adapter =
-                    Qwen3VlLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
-                assert!(adapter.prompt_cache_model_identity(Some(topology)).is_err());
-                let mut planner = build.planner();
-                adapter
-                    .register_parallel_parameters(build, &mut planner, execution.stream())
-                    .unwrap();
-                let (_, layout) = planner.finish().unwrap();
-                adapter
-                    .configure_parallel_static(build, &layout, execution.stream())
-                    .unwrap();
-                let identity = adapter.prompt_cache_model_identity(Some(topology)).unwrap();
-                assert_eq!(identity.layer_layout.len(), 2);
-                for (layer, policy) in identity.layer_layout.iter().enumerate() {
-                    let local_heads = match policy {
-                        LayerCachePolicy::KeyValue {
-                            num_key_value_heads,
-                            ..
-                        }
-                        | LayerCachePolicy::KeyValueWithFixedState {
-                            num_key_value_heads,
-                            ..
-                        } => num_key_value_heads.get(),
-                        other => panic!("unexpected Qwen3-VL layer {layer} cache policy {other:?}"),
-                    };
-                    assert_eq!(local_heads, expected_kv_heads);
-                }
-
-                let prefix_ids = [1_u32, 30, 2];
-                let mut cache = Cache {
-                    kv: (0..2)
-                        .map(|layer| {
-                            let mut kv =
-                                crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new();
-                            let shape = [1, expected_kv_heads as i32, 3, 2];
-                            let values = (0..shape.iter().product::<i32>())
-                                .map(|value| value as f32 + layer as f32)
-                                .collect::<Vec<_>>();
-                            let keys = Array::from_slice(&values, &shape);
-                            kv.update_and_fetch(keys.clone(), keys, execution.stream())
-                                .unwrap();
-                            Some(kv)
-                        })
-                        .collect(),
-                    rope_delta: 7,
-                };
-                let descriptor = PromptCacheDescriptor {
-                    model_family: identity.model_family.clone(),
-                    effective_model_type: identity.effective_model_type.clone(),
-                    checkpoint_fingerprint: "qwen3-vl-uneven-tp-fixture".into(),
-                    prefix_content_fingerprint: format!("rank-{rank}-multimodal-prefix"),
-                    architecture_fingerprint: identity.architecture_fingerprint.clone(),
-                    layer_count: identity.layer_count,
-                    global_layer_start: identity.global_layer_start,
-                    global_layer_end: identity.global_layer_end,
-                    batch_size: 1,
-                    layer_prefix_offsets: identity.layer_prefix_offsets.clone(),
-                    layer_layout: identity.layer_layout.clone(),
-                    sink_tokens: identity.sink_tokens,
-                    topology: identity.topology.clone(),
-                };
-                let directory = tempfile::tempdir().unwrap();
-                let snapshot = directory.path().join("prompt-cache");
-                adapter
-                    .save_prompt_cache(
-                        &mut cache,
-                        &snapshot,
-                        descriptor.clone(),
-                        &prefix_ids,
-                        &PromptCacheOptions::default(),
-                        execution.stream(),
-                    )
-                    .unwrap();
-                let (restored, _) = adapter
-                    .load_prompt_cache(
-                        &snapshot,
-                        &descriptor,
-                        &identity,
-                        &prefix_ids,
-                        PagedCacheOptions::new(2, u64::MAX, u64::MAX, 1).unwrap(),
-                        execution.stream(),
-                    )
-                    .unwrap();
-                assert_eq!(restored.rope_delta, 7);
-                for layer in restored.kv {
-                    let layer = layer.unwrap();
-                    let arrays = layer.retained_arrays();
-                    assert_eq!(arrays[0].shape(), &[1, expected_kv_heads as i32, 3, 2]);
-                    assert_eq!(arrays[1].shape(), &[1, expected_kv_heads as i32, 3, 2]);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn qwen3_vl_dense_multimodal_and_decode_parity() {
-        parity(false, 1, false);
-        parity(false, 2, false);
-    }
-
-    #[test]
-    fn qwen3_vl_moe_multimodal_and_decode_parity() {
-        parity(true, 1, false);
-    }
-
-    #[test]
-    fn qwen3_vl_dense_stream_multigroup_prefill_and_decode_parity() {
-        parity(false, 1, true);
-    }
-
-    #[test]
-    fn qwen3_vl_moe_sparse_expert_cache_multimodal_and_decode_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let config_dir = tempfile::tempdir().unwrap();
-        fs::write(
-            config_dir.path().join("config.json"),
-            serde_json::to_vec(&config(true)).unwrap(),
-        )
-        .unwrap();
-        let args = eager::get_qwen3_vl_model_args(config_dir.path()).unwrap();
-        let mut fixture = eager::Model::new(args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, true);
-        let mut resident =
-            eager::load_qwen3_vl_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options =
-            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
-                .unwrap();
-        let mut cached = load_qwen3_vl_expert_cache_model(
-            dir.path(),
-            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                OffloadConfig::new(None, None, 1).unwrap(),
-            )),
-            options,
-            None,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let before = Array::from_slice(&[1u32], &[1, 1]);
-        let after = Array::from_slice(&[2u32], &[1, 1]);
-        let pixels = Array::from_slice(&[0.01f32; 96], &[4, 24]);
-        let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
-        let parts = [
-            input::InputPart::text_token_ids(&before),
-            input::InputPart::image_tensor(&pixels, input::InputMetadata::qwen_grid_thw(&grid)),
-            input::InputPart::text_token_ids(&after),
-        ];
-        let prompt = input::ModelInput::new(&parts);
-        let mut resident_cache = resident.new_cache();
-        let mut cached_cache = cached.new_cache();
-        let expected = resident
-            .prefill_input_logits(prompt, &mut resident_cache, gpu.stream())
-            .unwrap();
-        let prompt = input::ModelInput::new(&parts);
-        let actual = cached
-            .prefill_input_logits(prompt, &mut cached_cache, gpu.stream())
-            .unwrap();
-        assert_close(&actual, &expected);
-        let token = Array::from_slice(&[3u32], &[1, 1]);
-        let expected = resident
-            .decode_logits(&token, &mut resident_cache, gpu.stream())
-            .unwrap();
-        let actual = cached
-            .decode_logits(&token, &mut cached_cache, gpu.stream())
-            .unwrap();
-        assert_close(&actual, &expected);
-        let report = cached.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.owned_experts, 8);
-        assert!(report.prefill.requested_routes > 0);
-        assert!(report.decode.requested_routes > 0);
-        assert!(report.prefill.compact_banks > 1);
-        crate::backend::mlx::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
-            dir.path(),
-            options,
-            crate::core::ModelKind::Qwen3VlMoe,
-            report.owned_experts / 2,
-            gpu.stream(),
-            cpu.stream(),
-        );
-    }
-}

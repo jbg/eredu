@@ -240,6 +240,8 @@ pub struct TopKRouter {
     pub top_k: i32,
     /// Total number of routed experts.
     pub num_experts: i32,
+    /// Logical input width of the router projection.
+    pub input_dims: i32,
     /// Router score transform.
     pub score_function: TopKRouterScoreFunction,
     /// Whether selected probabilities are normalized.
@@ -270,6 +272,8 @@ pub struct TopKRouter {
     pub bits: i32,
     /// Packed quantization encoding.
     pub mode: QuantizationMode,
+    /// Checkpoint-native GGML encoding and byte order.
+    pub iquant: Option<WeightQuantization>,
 }
 
 /// Selected expert ids plus the score and weight arrays produced by a top-k router.
@@ -308,6 +312,16 @@ impl TopKRouter {
         quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_quantization_and_dtype(config, quantization, Dtype::Float32, stream)
+    }
+
+    /// Creates an unloaded dense or affine-packed router with an explicit dense dtype.
+    pub fn new_with_quantization_and_dtype(
+        config: TopKRouterConfig,
+        quantization: Option<WeightQuantization>,
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         if let Some(quantization) = quantization {
             if config.hidden_size <= 0 || config.hidden_size % quantization.group_size() != 0 {
                 return Err(Exception::custom(format!(
@@ -317,32 +331,49 @@ impl TopKRouter {
                 )));
             }
         }
+        let affine = quantization.filter(|q| !matches!(q, WeightQuantization::GgufIQuant { .. }));
         Ok(Self {
             top_k: config.top_k,
             num_experts: config.num_experts,
+            input_dims: config.hidden_size,
             score_function: config.score_function,
             norm_topk_prob: config.norm_topk_prob,
             normalization_epsilon: config.normalization_epsilon,
             routed_scaling_factor: config.routed_scaling_factor,
             n_group: config.n_group,
             topk_group: config.topk_group,
-            weight: if let Some(quantization) = quantization {
-                Param::<Array>::unloaded(
+            weight: match quantization {
+                Some(WeightQuantization::GgufIQuant { ggml_type, .. }) => {
+                    let (block_values, block_bytes) =
+                        ggml_type.block_and_bytes().map_err(|_| {
+                            Exception::custom(format!(
+                                "{ggml_type:?} has no native router block geometry"
+                            ))
+                        })?;
+                    Param::<Array>::unloaded(
+                        &[
+                            config.num_experts,
+                            config.hidden_size / block_values as i32 * block_bytes as i32,
+                        ],
+                        Dtype::Uint8,
+                        stream,
+                    )?
+                }
+                Some(quantization) => Param::<Array>::unloaded(
                     &[
                         config.num_experts,
                         quantized_packed_dimension(config.hidden_size, quantization.bits()),
                     ],
                     Dtype::Uint32,
                     stream,
-                )?
-            } else {
-                Param::<Array>::unloaded(
+                )?,
+                None => Param::<Array>::unloaded(
                     &[config.num_experts, config.hidden_size],
-                    Dtype::Float32,
+                    dense_dtype,
                     stream,
-                )?
+                )?,
             },
-            scales: if let Some(quantization) = quantization {
+            scales: if let Some(quantization) = affine {
                 Param::<Option<Array>>::unloaded_some(
                     &[
                         config.num_experts,
@@ -358,7 +389,7 @@ impl TopKRouter {
             } else {
                 Param::new(None)
             },
-            biases: if let Some(quantization) = quantization.filter(|q| q.has_biases()) {
+            biases: if let Some(quantization) = affine.filter(|q| q.has_biases()) {
                 Param::<Option<Array>>::unloaded_some(
                     &[
                         config.num_experts,
@@ -371,17 +402,14 @@ impl TopKRouter {
                 Param::new(None)
             },
             e_score_correction_bias: if config.score_correction_bias {
-                Param::<Option<Array>>::unloaded_some(
-                    &[config.num_experts],
-                    Dtype::Float32,
-                    stream,
-                )?
+                Param::<Option<Array>>::unloaded_some(&[config.num_experts], dense_dtype, stream)?
             } else {
                 Param::new(None)
             },
-            group_size: quantization.map_or(0, WeightQuantization::group_size),
-            bits: quantization.map_or(0, WeightQuantization::bits),
-            mode: quantization.map_or(QuantizationMode::Affine, WeightQuantization::mode),
+            group_size: affine.map_or(0, WeightQuantization::group_size),
+            bits: affine.map_or(0, WeightQuantization::bits),
+            mode: affine.map_or(QuantizationMode::Affine, WeightQuantization::mode),
+            iquant: quantization.filter(|q| matches!(q, WeightQuantization::GgufIQuant { .. })),
         })
     }
 
@@ -404,7 +432,16 @@ impl TopKRouter {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
-        let logits = if let Some(scales) = self.scales.as_ref() {
+        let logits = if let Some(iquant) = self.iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ router format");
+            NativeQuantizedTensor::from_iq_array(
+                self.weight.value.clone(),
+                &[self.num_experts, self.input_dims],
+                ggml_type,
+                endian,
+            )?
+            .linear(&flat, true, stream)?
+        } else if let Some(scales) = self.scales.as_ref() {
             let input = if self.score_function.requires_fp32() {
                 flat.as_dtype(Dtype::Float32, stream)?
             } else {
@@ -472,7 +509,16 @@ impl TopKRouter {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
-        let logits = if let Some(scales) = self.scales.as_ref() {
+        let logits = if let Some(iquant) = self.iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ router format");
+            NativeQuantizedTensor::from_iq_array(
+                self.weight.value.clone(),
+                &[self.num_experts, self.input_dims],
+                ggml_type,
+                endian,
+            )?
+            .linear(&flat, true, stream)?
+        } else if let Some(scales) = self.scales.as_ref() {
             let input = if self.score_function.requires_fp32() {
                 flat.as_dtype(Dtype::Float32, stream)?
             } else {

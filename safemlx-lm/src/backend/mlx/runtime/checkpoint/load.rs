@@ -5,10 +5,12 @@ use std::{
 };
 
 use memmap2::MmapOptions;
+#[cfg(test)]
+use safemlx::ops::{concatenate_axis, stack_axis};
 use safemlx::{
     module::{FlattenedModuleParamMut, ModuleParameters},
     native_quantization::NativeQuantizationFormat,
-    ops::{concatenate_axis, stack_axis, GgufCheckpoint, GgufMetadataValue, GgufTensor},
+    ops::{GgufCheckpoint, GgufMetadataValue, GgufTensor},
     transforms::async_eval_with_event,
     Array, Stream,
 };
@@ -243,17 +245,7 @@ fn load_iq_array_strict(
     }
 }
 
-pub(crate) fn load_named_iq_array_strict<M: ModuleParameters>(
-    model: &mut M,
-    name: String,
-    value: Array,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) {
-    let mut params = model.parameters_mut().flatten();
-    load_iq_array_strict(&mut params, name, value, config, report);
-}
-
+#[cfg(test)]
 pub(crate) fn load_named_array_strict<M: ModuleParameters>(
     model: &mut M,
     name: String,
@@ -834,6 +826,7 @@ where
 
 /// Strict-loads a model directory while streaming and packing split ReLU2 experts.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn load_safetensors_dir_strict_with_split_relu2_experts<M, F>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
@@ -902,6 +895,7 @@ where
 /// runtime uses one expert-major gate/up bank plus a down bank. Completed layer
 /// banks are loaded immediately so all expert layers are never resident at once.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn load_safetensors_dir_strict_with_split_swiglu_experts<M>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
@@ -933,6 +927,7 @@ where
 /// The transform can split or rewrite architecture-specific tensors before
 /// expert detection and strict parameter matching without buffering a shard.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn load_safetensors_dir_strict_with_split_swiglu_experts_and_transform<M, F>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
@@ -1053,6 +1048,7 @@ pub enum SwiGluExpertComponent {
     Biases,
 }
 
+#[cfg(test)]
 impl SwiGluExpertComponent {
     fn packed_suffix(self) -> &'static str {
         match self {
@@ -1064,6 +1060,7 @@ impl SwiGluExpertComponent {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct SwiGluExpertParts {
     gate: Option<Array>,
     down: Option<Array>,
@@ -1101,6 +1098,7 @@ pub fn parse_split_swiglu_expert_projection_key(
     Some((prefix, expert, projection, component))
 }
 
+#[cfg(test)]
 fn split_swiglu_expert_prefix_complete(
     expert_parts: &HashMap<(String, SwiGluExpertComponent, i32), SwiGluExpertParts>,
     prefix: &str,
@@ -1114,6 +1112,7 @@ fn split_swiglu_expert_prefix_complete(
     })
 }
 
+#[cfg(test)]
 fn pack_split_swiglu_expert_prefix(
     expert_parts: &mut HashMap<(String, SwiGluExpertComponent, i32), SwiGluExpertParts>,
     prefix: &str,
@@ -1161,6 +1160,7 @@ fn pack_split_swiglu_expert_prefix(
 /// Packs a map of split SwiGLU experts into local expert-major banks.
 ///
 /// Expert ids in `loaded` must already be dense local ids `0..num_experts`.
+#[cfg(test)]
 pub fn transform_split_swiglu_experts(
     loaded: HashMap<String, Array>,
     num_experts: i32,
@@ -1211,6 +1211,7 @@ pub enum Relu2ExpertProjection {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct Relu2ExpertParts {
     up: Option<Array>,
     down: Option<Array>,
@@ -1235,6 +1236,7 @@ pub fn parse_split_relu2_expert_projection_key(
 }
 
 /// Packs split ReLU2 expert tensors into `prefix.experts.{up,down}_proj` banks.
+#[cfg(test)]
 pub fn transform_split_relu2_experts(
     loaded: HashMap<String, Array>,
     num_experts: i32,
@@ -1274,6 +1276,7 @@ pub fn transform_split_relu2_experts(
     Ok(transformed)
 }
 
+#[cfg(test)]
 fn split_relu2_expert_prefix_complete(
     expert_parts: &HashMap<(String, i32), Relu2ExpertParts>,
     prefix: &str,
@@ -1286,6 +1289,7 @@ fn split_relu2_expert_prefix_complete(
     })
 }
 
+#[cfg(test)]
 fn pack_split_relu2_expert_prefix(
     expert_parts: &mut HashMap<(String, i32), Relu2ExpertParts>,
     prefix: &str,

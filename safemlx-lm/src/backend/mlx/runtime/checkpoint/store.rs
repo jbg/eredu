@@ -198,7 +198,8 @@ pub enum WeightStoreBackend {
     Safetensors,
     /// Seekable GGUF payload shards.
     Gguf,
-    /// Immutable arrays produced by an explicit load-time transformation.
+    /// Immutable arrays used by checkpoint materialization tests.
+    #[cfg(test)]
     Memory,
 }
 
@@ -212,6 +213,15 @@ pub enum WeightStoreError {
     #[error("unknown checkpoint tensor {key:?}")]
     UnknownTensor {
         /// Requested logical key.
+        key: String,
+    },
+    /// A tensor exists physically but was not selected by the resolved
+    /// architecture checkpoint contract.
+    #[error("checkpoint contract {contract:?} does not authorize tensor {key:?}")]
+    UnauthorizedTensor {
+        /// Resolved architecture checkpoint identity.
+        contract: String,
+        /// Rejected physical source key.
         key: String,
     },
     /// An indexed payload shard does not exist when accessed.
@@ -360,10 +370,22 @@ pub trait WeightStore: Any {
         Vec::new()
     }
 
+    /// Returns catalog keys admitted by a non-strict architecture policy but
+    /// not claimed by its selected physical layout.
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Returns whether `key` is an authoritative output synthesized by this
     /// store and must supersede any source-side semantic recipe for the same
     /// logical parameter.
     fn is_authoritative_materialized_key(&self, _key: &str) -> bool {
+        false
+    }
+
+    /// Whether this store is already restricted by a resolved architecture
+    /// checkpoint contract.
+    fn is_checkpoint_contract_resolved(&self) -> bool {
         false
     }
 
@@ -383,15 +405,110 @@ pub trait WeightStore: Any {
     fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError>;
 }
 
+/// A checkpoint store restricted to the exact physical layout selected by an
+/// architecture contract.
+///
+/// This is the only store handed to binding recipes in production loaders.
+/// Consequently validation and materialization cannot choose layouts
+/// independently.
+pub(crate) struct ContractWeightStore {
+    source: Arc<dyn WeightStore + Send + Sync>,
+    contract: crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan,
+}
+
+impl ContractWeightStore {
+    pub(crate) fn new(
+        source: Arc<dyn WeightStore + Send + Sync>,
+        contract: crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan,
+    ) -> Self {
+        Self { source, contract }
+    }
+
+    fn authorize(&self, key: &str) -> Result<(), WeightStoreError> {
+        if self.contract.source_keys().contains(key)
+            || self.source.is_authoritative_materialized_key(key)
+        {
+            Ok(())
+        } else {
+            Err(WeightStoreError::UnauthorizedTensor {
+                contract: self.contract.identity().into(),
+                key: key.into(),
+            })
+        }
+    }
+}
+
+impl WeightStore for ContractWeightStore {
+    fn backend(&self) -> WeightStoreBackend {
+        self.source.backend()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.source
+            .keys()
+            .into_iter()
+            .filter(|key| {
+                self.contract.source_keys().contains(key)
+                    || self.source.is_authoritative_materialized_key(key)
+            })
+            .collect()
+    }
+
+    fn materialized_source_keys(&self) -> Vec<String> {
+        self.source
+            .materialized_source_keys()
+            .into_iter()
+            .filter(|key| self.contract.source_keys().contains(key))
+            .collect()
+    }
+
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.contract.unclaimed_keys().iter().cloned().collect()
+    }
+
+    fn is_authoritative_materialized_key(&self, key: &str) -> bool {
+        self.source.is_authoritative_materialized_key(key)
+    }
+
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        true
+    }
+
+    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
+        self.authorize(key)?;
+        self.source.metadata(key)
+    }
+
+    fn acquire_with_policy(
+        &self,
+        key: &str,
+        selection: TensorSelection,
+        policy: WeightReadPolicy,
+    ) -> Result<WeightLease, WeightStoreError> {
+        self.authorize(key)?;
+        self.source.acquire_with_policy(key, selection, policy)
+    }
+
+    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
+        self.source.diagnostics()
+    }
+}
+
 /// Immutable array-backed store used to hand transformed weights to the
 /// generalized execution engine without serializing an intermediate checkpoint.
 #[derive(Clone)]
+#[cfg(test)]
 pub(crate) struct MemoryWeightStore {
     arrays: Arc<BTreeMap<String, Array>>,
     metadata: Arc<BTreeMap<String, WeightMetadata>>,
     backing: Arc<PathBuf>,
 }
 
+#[cfg(test)]
 impl MemoryWeightStore {
     pub(crate) fn new(
         arrays: impl IntoIterator<Item = (String, Array)>,
@@ -434,6 +551,7 @@ impl MemoryWeightStore {
     }
 }
 
+#[cfg(test)]
 impl WeightStore for MemoryWeightStore {
     fn backend(&self) -> WeightStoreBackend {
         WeightStoreBackend::Memory
@@ -504,6 +622,7 @@ impl WeightStore for MemoryWeightStore {
     }
 }
 
+#[cfg(test)]
 fn stored_dtype_for_array(value: &Array) -> StoredDtype {
     match value.dtype() {
         safemlx::Dtype::Bool => StoredDtype::Bool,
@@ -569,6 +688,7 @@ struct GgufReaderCache {
 #[derive(Debug)]
 struct GgufStoreInner {
     catalog: BTreeMap<String, GgufCatalogEntry>,
+    unclaimed_keys: BTreeSet<String>,
     readers: Mutex<GgufReaderCache>,
     max_cached_readers: usize,
     converted_groups: Mutex<BTreeMap<GgufGroupCacheKey, Weak<CachedGgufGroup>>>,
@@ -577,15 +697,16 @@ struct GgufStoreInner {
 
 /// Builder for a logical GGUF store backed by one or more checkpoints.
 #[derive(Debug, Default)]
-pub struct GgufWeightStoreBuilder {
+pub(crate) struct GgufWeightStoreBuilder {
     checkpoints: Vec<GgufCheckpoint>,
     catalog: BTreeMap<String, GgufCatalogEntry>,
+    unclaimed_keys: BTreeSet<String>,
     max_cached_readers: usize,
 }
 
 impl GgufWeightStoreBuilder {
     /// Sets the nonzero bound shared with mapped-shard loader controls.
-    pub fn max_cached_readers(mut self, maximum: usize) -> Result<Self, WeightStoreError> {
+    pub(crate) fn max_cached_readers(mut self, maximum: usize) -> Result<Self, WeightStoreError> {
         if maximum == 0 {
             return Err(WeightStoreError::InvalidMappedShardLimit);
         }
@@ -593,10 +714,35 @@ impl GgufWeightStoreBuilder {
         Ok(self)
     }
 
-    /// Adds one checkpoint and translates every converted logical output name.
-    pub fn add_checkpoint<F>(
+    /// Resolves one architecture contract, then translates only outputs from
+    /// the selected physical layout into the logical catalog.
+    pub(crate) fn add_checkpoint<F>(
+        self,
+        checkpoint: GgufCheckpoint,
+        plan: &crate::backend::mlx::runtime::checkpoint::schema::GgufCheckpointPlan,
+        translate: F,
+    ) -> Result<Self, WeightStoreError>
+    where
+        F: FnMut(&str) -> String,
+    {
+        let resolved = crate::backend::mlx::runtime::checkpoint::validation::resolve_gguf_plan(
+            &checkpoint,
+            plan,
+        )
+        .map_err(|validation| WeightStoreError::Gguf {
+            key: String::new(),
+            message: format!(
+                "checkpoint contract {:?} did not resolve: {validation:?}",
+                plan.identity
+            ),
+        })?;
+        self.add_resolved_checkpoint(checkpoint, &resolved, translate)
+    }
+
+    fn add_resolved_checkpoint<F>(
         mut self,
         checkpoint: GgufCheckpoint,
+        resolved: &crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan,
         mut translate: F,
     ) -> Result<Self, WeightStoreError>
     where
@@ -605,9 +751,19 @@ impl GgufWeightStoreBuilder {
         let checkpoint_index = self.checkpoints.len();
         for shard in checkpoint.catalog().shards() {
             for tensor in shard.tensors() {
+                let physical_name = &tensor.descriptor().name;
+                let selected = resolved.source_keys().contains(physical_name);
+                let unclaimed = resolved.unclaimed_keys().contains(physical_name);
+                if !selected && !unclaimed {
+                    continue;
+                }
                 let physical_descriptor = tensor.descriptor().clone();
                 for output in tensor.outputs() {
                     let name = translate(&output.name);
+                    if unclaimed {
+                        self.unclaimed_keys.insert(name);
+                        continue;
+                    }
                     if self.catalog.contains_key(&name) {
                         return Err(WeightStoreError::Gguf {
                             key: name,
@@ -662,8 +818,28 @@ impl GgufWeightStoreBuilder {
         Ok(self)
     }
 
+    #[cfg(test)]
+    fn add_checkpoint_for_test<F>(
+        self,
+        checkpoint: GgufCheckpoint,
+        translate: F,
+    ) -> Result<Self, WeightStoreError>
+    where
+        F: FnMut(&str) -> String,
+    {
+        let resolved =
+            crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan::for_test(
+                "test GGUF catalog",
+                checkpoint
+                    .catalog()
+                    .tensors()
+                    .map(|tensor| tensor.descriptor().name.clone()),
+            );
+        self.add_resolved_checkpoint(checkpoint, &resolved, translate)
+    }
+
     /// Builds a non-empty immutable logical checkpoint store.
-    pub fn build(self) -> Result<GgufWeightStore, WeightStoreError> {
+    pub(crate) fn build(self) -> Result<GgufWeightStore, WeightStoreError> {
         if self.catalog.is_empty() {
             return Err(WeightStoreError::Gguf {
                 key: String::new(),
@@ -679,6 +855,7 @@ impl GgufWeightStoreBuilder {
         Ok(GgufWeightStore {
             inner: Arc::new(GgufStoreInner {
                 catalog: self.catalog,
+                unclaimed_keys: self.unclaimed_keys,
                 readers: Mutex::new(GgufReaderCache {
                     materializers,
                     last_used: vec![0; materializer_count],
@@ -702,29 +879,20 @@ impl GgufWeightStoreBuilder {
 
 /// Persistent logical tensor store backed by one or more GGUF checkpoints.
 #[derive(Debug, Clone)]
-pub struct GgufWeightStore {
+pub(crate) struct GgufWeightStore {
     inner: Arc<GgufStoreInner>,
 }
 
 impl GgufWeightStore {
     /// Starts a multi-checkpoint GGUF store builder.
-    pub fn builder() -> GgufWeightStoreBuilder {
+    pub(crate) fn builder() -> GgufWeightStoreBuilder {
         GgufWeightStoreBuilder::default()
     }
 
-    /// Creates a single-checkpoint store with translated logical names.
-    pub fn new<F>(checkpoint: GgufCheckpoint, translate: F) -> Result<Self, WeightStoreError>
-    where
-        F: FnMut(&str) -> String,
-    {
-        Self::builder()
-            .add_checkpoint(checkpoint, translate)?
-            .build()
-    }
-
     /// Creates a single-checkpoint store with an explicit cached-reader bound.
-    pub fn new_with_max_mapped_shards<F>(
+    pub(crate) fn new_with_max_mapped_shards<F>(
         checkpoint: GgufCheckpoint,
+        plan: &crate::backend::mlx::runtime::checkpoint::schema::GgufCheckpointPlan,
         translate: F,
         max_mapped_shards: usize,
     ) -> Result<Self, WeightStoreError>
@@ -733,7 +901,28 @@ impl GgufWeightStore {
     {
         Self::builder()
             .max_cached_readers(max_mapped_shards)?
-            .add_checkpoint(checkpoint, translate)?
+            .add_checkpoint(checkpoint, plan, translate)?
+            .build()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test<F>(
+        checkpoint: GgufCheckpoint,
+        translate: F,
+    ) -> Result<Self, WeightStoreError>
+    where
+        F: FnMut(&str) -> String,
+    {
+        let resolved =
+            crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan::for_test(
+                "test GGUF catalog",
+                checkpoint
+                    .catalog()
+                    .tensors()
+                    .map(|tensor| tensor.descriptor().name.clone()),
+            );
+        Self::builder()
+            .add_resolved_checkpoint(checkpoint, &resolved, translate)?
             .build()
     }
 }
@@ -819,8 +1008,16 @@ impl WeightStore for GgufWeightStore {
         self
     }
 
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        true
+    }
+
     fn keys(&self) -> Vec<String> {
         self.inner.catalog.keys().cloned().collect()
+    }
+
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.inner.unclaimed_keys.iter().cloned().collect()
     }
 
     fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
@@ -1589,10 +1786,12 @@ impl WeightStore for SafetensorsWeightStore {
 enum WeightLeaseSource {
     Safetensors(Arc<MappedShard>),
     Gguf(Box<GgufLeaseSource>),
+    #[cfg(test)]
     Memory(MemoryLeaseSource),
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct MemoryLeaseSource {
     value: Array,
     backing: Arc<PathBuf>,
@@ -1661,6 +1860,7 @@ impl WeightLease {
                 .backing_shard
                 .as_deref()
                 .expect("GGUF catalog entries always identify their shard"),
+            #[cfg(test)]
             WeightLeaseSource::Memory(source) => source.backing.as_path(),
         }
     }
@@ -1698,6 +1898,7 @@ impl WeightLease {
             WeightLeaseSource::Gguf(source) => {
                 self.prepare_gguf(*source, source_stream, execution_stream)
             }
+            #[cfg(test)]
             WeightLeaseSource::Memory(source) => {
                 self.prepare_memory(source, source_stream, execution_stream)
             }
@@ -1720,12 +1921,14 @@ impl WeightLease {
             WeightLeaseSource::Gguf(source) => {
                 self.prepare_gguf(*source, source_stream, source_stream)
             }
+            #[cfg(test)]
             WeightLeaseSource::Memory(source) => {
                 self.prepare_memory(source, source_stream, source_stream)
             }
         }
     }
 
+    #[cfg(test)]
     fn prepare_memory(
         self,
         source: MemoryLeaseSource,
@@ -3210,6 +3413,31 @@ mod tests {
     }
 
     #[test]
+    fn resolved_contract_store_rejects_unselected_physical_sources() {
+        let selected = Array::from_slice(&[1f32], &[1]);
+        let rejected = Array::from_slice(&[2f32], &[1]);
+        let source: Arc<dyn WeightStore + Send + Sync> = Arc::new(
+            MemoryWeightStore::new([
+                ("packed".to_string(), selected),
+                ("split".to_string(), rejected),
+            ])
+            .unwrap(),
+        );
+        let contract =
+            crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan::for_test(
+                "test architecture",
+                ["packed"],
+            );
+        let store = ContractWeightStore::new(source, contract);
+
+        assert_eq!(store.keys(), ["packed"]);
+        assert!(matches!(
+            store.metadata("split"),
+            Err(WeightStoreError::UnauthorizedTensor { key, .. }) if key == "split"
+        ));
+    }
+
+    #[test]
     fn weight_materialization_event_orders_multiple_cpu_consumers() {
         let source_stream = cpu_stream();
         let execution_stream = cpu_stream();
@@ -3396,6 +3624,31 @@ mod tests {
             .unwrap();
     }
 
+    fn write_two_dense_gguf(path: &Path) {
+        let selected = 1.0f32.to_le_bytes();
+        let unselected = 2.0f32.to_le_bytes();
+        Writer::default()
+            .write(
+                std::fs::File::create(path).unwrap(),
+                &BTreeMap::new(),
+                &[
+                    TensorInput {
+                        name: "selected.weight",
+                        dimensions: &[1],
+                        ggml_type: GgmlType::F32,
+                        data: &selected,
+                    },
+                    TensorInput {
+                        name: "unselected.weight",
+                        dimensions: &[1],
+                        ggml_type: GgmlType::F32,
+                        data: &unselected,
+                    },
+                ],
+            )
+            .unwrap();
+    }
+
     fn write_block_gguf(path: &Path, ty: GgmlType, byte_len: usize) {
         let bytes = vec![0u8; byte_len];
         Writer::default()
@@ -3438,12 +3691,12 @@ mod tests {
         write_dense_gguf(&first, "text.weight", 1.0);
         write_dense_gguf(&second, "vision.weight", 2.0);
         let builder = GgufWeightStore::builder()
-            .add_checkpoint(GgufCheckpoint::open(first).unwrap(), |_| {
+            .add_checkpoint_for_test(GgufCheckpoint::open(first).unwrap(), |_| {
                 "shared.weight".into()
             })
             .unwrap();
         let error = builder
-            .add_checkpoint(GgufCheckpoint::open(second).unwrap(), |_| {
+            .add_checkpoint_for_test(GgufCheckpoint::open(second).unwrap(), |_| {
                 "shared.weight".into()
             })
             .unwrap_err();
@@ -3455,15 +3708,52 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_dense_gguf(&path, "value.weight", 3.0);
-        let store =
-            GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), |name| name.to_string())
-                .unwrap();
+        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+            name.to_string()
+        })
+        .unwrap();
         assert_eq!(store.keys(), ["value.weight"]);
         assert_eq!(store.metadata("value.weight").unwrap().shape, [1]);
         let diagnostics = store.diagnostics().unwrap();
         assert_eq!(diagnostics.currently_mapped_shards, 0);
         assert!(diagnostics.touched_shard_paths.is_empty());
         assert_eq!(diagnostics.physical_reads, 0);
+    }
+
+    #[test]
+    fn gguf_store_catalog_contains_only_contract_selected_sources() {
+        use crate::backend::mlx::runtime::checkpoint::schema::{
+            CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+            TensorOperation,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        write_two_dense_gguf(&path);
+        let plan = GgufCheckpointPlan::new(
+            "selected layout",
+            vec![GgufTensorConstraint::required(
+                "selected.weight",
+                vec![1],
+                GgufTypeConstraint::OperationClass(TensorOperation::Dense),
+            )],
+            Vec::new(),
+            CatalogPolicy::non_strict(),
+        )
+        .unwrap();
+        let store = GgufWeightStore::builder()
+            .add_checkpoint(GgufCheckpoint::open(path).unwrap(), &plan, str::to_string)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(store.is_checkpoint_contract_resolved());
+        assert_eq!(store.keys(), ["selected.weight"]);
+        assert_eq!(store.unclaimed_checkpoint_keys(), ["unselected.weight"]);
+        assert!(matches!(
+            store.metadata("unselected.weight"),
+            Err(WeightStoreError::UnknownTensor { key }) if key == "unselected.weight"
+        ));
     }
 
     #[test]
@@ -3486,7 +3776,8 @@ mod tests {
                 )
                 .unwrap();
             let store =
-                GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), str::to_string).unwrap();
+                GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), str::to_string)
+                    .unwrap();
             let metadata = store.metadata("bank.weight").unwrap();
             assert_eq!(metadata.shape, [2, block_bytes as usize], "{ty:?}");
             assert_eq!(metadata.stored_dtype, StoredDtype::U8, "{ty:?}");
@@ -3500,9 +3791,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         let values = write_dense_bank_gguf(&path);
-        let store =
-            GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), |name| name.to_string())
-                .unwrap();
+        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+            name.to_string()
+        })
+        .unwrap();
         let lease = store
             .acquire(
                 "bank.weight",
@@ -3543,9 +3835,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_affine_gguf(&path);
-        let store =
-            GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), |name| name.to_string())
-                .unwrap();
+        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+            name.to_string()
+        })
+        .unwrap();
         let error = store
             .acquire(
                 "bank.weight",
@@ -3571,9 +3864,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_affine_gguf(&path);
-        let store =
-            GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), |name| name.to_string())
-                .unwrap();
+        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+            name.to_string()
+        })
+        .unwrap();
         let stream = cpu_stream();
         let selection = TensorSelection::Range {
             axis: 0,
@@ -3611,9 +3905,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_wide_affine_gguf(&path);
-        let store =
-            GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), |name| name.to_string())
-                .unwrap();
+        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+            name.to_string()
+        })
+        .unwrap();
         let stream = cpu_stream();
         let weight = store
             .acquire_with_policy(
@@ -3672,9 +3967,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_wide_affine_gguf(&path);
-        let store =
-            GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), |name| name.to_string())
-                .unwrap();
+        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+            name.to_string()
+        })
+        .unwrap();
         let selection = TensorSelection::Range {
             axis: 1,
             start: 1,
@@ -3730,8 +4026,10 @@ mod tests {
             let path = dir.path().join("model.gguf");
             write_block_gguf(&path, ty, byte_len);
             let store =
-                GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), |name| name.to_string())
-                    .unwrap();
+                GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+                    name.to_string()
+                })
+                .unwrap();
             for (key, start, end) in outputs {
                 let lease = store
                     .acquire_with_policy(

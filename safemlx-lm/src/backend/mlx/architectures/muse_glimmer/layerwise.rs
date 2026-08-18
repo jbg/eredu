@@ -18,15 +18,10 @@ use safemlx::{
 };
 
 use super::{
-    self as resident,
     vision::{VisionBlock, VisionConfig, VisionState, VisionStatic},
     DecoderConfig, Experts, FeedForward, TransformerBlock,
 };
-use crate::core::cache::{
-    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    PromptCacheTopology,
-};
-
+use crate::backend::mlx::architectures::muse_glimmer as resident;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
@@ -52,9 +47,10 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     },
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         populate_module_from_lease, populate_module_from_lease_excluding,
     },
+    backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -65,8 +61,7 @@ use crate::{
         MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
     },
     backend::mlx::runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, SharedWeightStore,
         StaticUnitBindings, WeightResidency,
@@ -79,7 +74,10 @@ use crate::{
     backend::mlx::runtime::residency::manager::{
         OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
     },
-    core::cache::LayerCachePolicy,
+    core::cache::{
+        LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheTopology,
+    },
 };
 
 const EMBEDDING_UNIT: &str = "muse_glimmer.static.embedding";
@@ -115,9 +113,10 @@ fn vision_static_bindings(
             },
         );
     }
-    Ok(build_module_bindings_with_recipes(
-        vision, "model", store, recipes,
-    )?)
+    Ok(
+        build_module_binding_plan_with_recipes(vision, "model", store, recipes)?
+            .build_bindings(store)?,
+    )
 }
 
 /// Architecture-owned KV cache accepted by the canonical Muse-Glimmer adapter.
@@ -633,34 +632,7 @@ impl CausalLm<Vec<Option<PagedKeyValueCache>>> for LayerwiseDecoder {
 pub fn load_safetensors(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    let model_dir = model_dir.as_ref();
-    let options = options.into();
-    let residency = options.weight_residency();
-    let args = resident::load_config(model_dir)?;
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        args.model_kind(),
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
-    let adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
-    Ok(LayerwiseDecoder {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn load_safetensors_quantized_residency(
-    model_dir: impl AsRef<Path>,
-    options: impl Into<LayerWeightResidency>,
-    quantization: WeightQuantization,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -668,28 +640,20 @@ pub(crate) fn load_safetensors_quantized_residency(
     let options = options.into();
     let args = resident::load_config(model_dir)?;
     let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
-    if !should_quantize_on_load(
-        "dense Qwen residency",
-        args.weight_quantization(),
-        quantization,
-    )? {
-        return Ok(LayerwiseDecoder {
-            execution: load_layerwise_model(
-                store,
-                MuseGlimmerLayerwiseAdapter::new(args, stream)?,
-                options,
-                stream,
-                weights_stream,
-            )?,
-        });
-    }
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Muse-Glimmer", args.weight_quantization(), requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let source_adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_layerwise_model_with_quantization(
             store,
             source_adapter,
             options,
-            Some(quantization),
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -707,7 +671,6 @@ pub(crate) fn load_tensor_parallel_model(
 ) -> Result<LayerwiseDecoder, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -739,11 +702,6 @@ pub(crate) fn load_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     let args = resident::load_config(model_dir)?;
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        args.model_kind(),
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_tensor_parallel_layerwise_model(
@@ -779,7 +737,12 @@ pub(crate) fn load_gguf_tensor_parallel_model(
     let (mut args, eos_token_ids) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
     apply_mmproj_config(checkpoint, metadata, &mut args, mmproj.as_ref())?;
-    let store = muse_gguf_store(checkpoint, mmproj.as_ref(), options.max_mapped_shards())?;
+    let store = muse_gguf_store(
+        checkpoint,
+        mmproj.as_ref(),
+        &args,
+        options.max_mapped_shards(),
+    )?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
         MuseGlimmerLayerwiseAdapter::new(args, stream)?,
@@ -810,7 +773,12 @@ pub(crate) fn load_gguf_checkpoint(
     let (mut args, eos_token_ids) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
     apply_mmproj_config(checkpoint, metadata, &mut args, mmproj.as_ref())?;
-    let store = muse_gguf_store(checkpoint, mmproj.as_ref(), residency.max_mapped_shards())?;
+    let store = muse_gguf_store(
+        checkpoint,
+        mmproj.as_ref(),
+        &args,
+        residency.max_mapped_shards(),
+    )?;
 
     if let Some(expert_options) = residency.expert_cache() {
         let _ = expert_options;
@@ -876,16 +844,26 @@ fn apply_mmproj_config(
 fn muse_gguf_store(
     checkpoint: &GgufCheckpoint,
     mmproj: Option<&resident::MuseGlimmerMmprojGguf>,
+    args: &DecoderConfig,
     max_mapped_shards: usize,
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
-        .add_checkpoint(checkpoint.clone(), |name| {
+        .add_checkpoint(checkpoint.clone(), &text_plan, |name| {
             resident::translate_gguf_weight_name(name, false)
         })?;
     if let Some(mmproj) = mmproj {
+        let vision = args.vision_config.as_ref().ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "Muse-Glimmer projector is present without validated vision geometry".into(),
+            )
+        })?;
+        let projector_plan = super::checkpoint::projector_gguf_plan(args, vision)
+            .map_err(Error::UnsupportedArchitecture)?;
         builder = builder.add_checkpoint(
             mmproj.checkpoint.clone(),
+            &projector_plan,
             resident::translate_mmproj_store_weight_name,
         )?;
     }
@@ -901,7 +879,7 @@ pub(crate) fn prepare_gguf_pipeline_source(
     let (mut args, _) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, "muse-glimmer", false)?;
     apply_mmproj_config(checkpoint, metadata, &mut args, mmproj.as_ref())?;
-    let store = muse_gguf_store(checkpoint, mmproj.as_ref(), max_mapped_shards)?;
+    let store = muse_gguf_store(checkpoint, mmproj.as_ref(), &args, max_mapped_shards)?;
     Ok((args, store))
 }
 
@@ -1673,6 +1651,15 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map(Into::into)
+    }
+
     fn quantization(
         &self,
     ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
@@ -1948,21 +1935,39 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             let root = self.language_model_root();
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, &format!("{root}.embed_tokens"), store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    &format!("{root}.embed_tokens"),
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             let root = self.language_model_root();
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, &format!("{root}.norm"), store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    &format!("{root}.norm"),
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings(head, "lm_head", store)?,
+                    build_module_binding_plan_with_recipes(
+                        head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2316,11 +2321,15 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         match layer {
-            MuseGlimmerLayer::Vision(_) if group == 0 => Ok(build_module_bindings(
-                layer,
-                &self.layer_checkpoint_prefix(group, index),
-                store,
-            )?),
+            MuseGlimmerLayer::Vision(_) if group == 0 => {
+                Ok(build_module_binding_plan_with_recipes(
+                    layer,
+                    &self.layer_checkpoint_prefix(group, index),
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?)
+            }
             MuseGlimmerLayer::Text(layer) if group == 1 => qwen_text_layer_bindings(
                 layer,
                 &self.args,
@@ -3072,12 +3081,14 @@ pub(crate) fn qwen_text_layer_bindings(
     external_experts: bool,
 ) -> Result<Vec<WeightBinding>, Error> {
     if external_experts {
-        return Ok(build_module_bindings_excluding(
+        return Ok(build_module_binding_plan_with_recipes_excluding(
             layer,
             prefix,
             store,
+            BTreeMap::new(),
             |name| name.starts_with("mlp.experts."),
-        )?);
+        )?
+        .build_bindings(store)?);
     }
     let expert_prefix = format!("{prefix}.mlp.experts");
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
@@ -3148,9 +3159,10 @@ pub(crate) fn qwen_text_layer_bindings(
             },
         );
     }
-    Ok(build_module_bindings_with_recipes(
-        layer, prefix, store, recipes,
-    )?)
+    Ok(
+        build_module_binding_plan_with_recipes(layer, prefix, store, recipes)?
+            .build_bindings(store)?,
+    )
 }
 
 pub(crate) fn qwen3_expert_catalog(
@@ -3343,8 +3355,18 @@ fn recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let plan = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    plan.build_bindings(store)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .pop()
+        .ok_or_else(|| Error::UnsupportedArchitecture("empty expert binding plan".into()))
 }
 
 fn split_expert_key(
@@ -3363,155 +3385,4 @@ fn split_expert_key(
                 projections
             ))
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-    use crate::backend::mlx::runtime::checkpoint::{
-        quantization::AffineQuantization, store::MemoryWeightStore,
-    };
-
-    fn tiny_vision_config() -> VisionConfig {
-        VisionConfig::from_hf_value(
-            &json!({
-                "model_type": "muse_glimmer_vision",
-                "hidden_act": "gelu",
-                "hidden_size": 4,
-                "intermediate_size": 8,
-                "num_attention_heads": 1,
-                "num_hidden_layers": 1,
-                "patch_size": 2,
-                "patch_temporal": 1,
-                "merge_size": 2,
-                "pos_emb_height": 2,
-                "pos_emb_width": 2,
-                "max_position_embeddings": 4,
-                "layer_norm_eps": 1e-5,
-                "layer_types": ["full_attention"],
-                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
-            }),
-            24,
-        )
-        .unwrap()
-    }
-
-    fn vision_store(vision: &VisionStatic, patch_weight: Array) -> MemoryWeightStore {
-        let mut arrays = vision
-            .parameters()
-            .flatten()
-            .into_iter()
-            .map(|(name, value)| (format!("model.{name}"), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        assert!(arrays
-            .insert(format!("model.{VISION_PATCH_WEIGHT}"), patch_weight)
-            .is_some());
-        MemoryWeightStore::new(arrays).unwrap()
-    }
-
-    #[test]
-    fn dflash_fuses_raw_target_residuals_in_configured_order() {
-        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let stream = ctx.stream();
-        let first = Array::from_slice(&[3.0_f32, 4.0], &[1, 1, 2]);
-        let second = Array::from_slice(&[12.0_f32, 5.0], &[1, 1, 2]);
-        let mut captured = BTreeMap::from([(1, first), (13, second)]);
-
-        let actual = concatenate_dflash_target_states(&mut captured, &[13, 1], stream).unwrap();
-        let expected = Array::from_slice(&[12.0_f32, 5.0, 3.0, 4.0], &[1, 1, 4]);
-
-        assert!(actual
-            .all_close(&expected, Some(0.0), Some(0.0), None, stream)
-            .unwrap()
-            .item::<bool>(stream));
-        assert!(captured.is_empty());
-    }
-
-    #[test]
-    fn vision_static_binding_flattens_collapsed_gguf_patch_kernel() {
-        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let stream = ctx.stream();
-        let vision = VisionStatic::new(tiny_vision_config(), 8, stream).unwrap();
-
-        let flat = zeros_dtype(&[4, 12], Dtype::Float32, stream).unwrap();
-        let flat_store = vision_store(&vision, flat);
-        let flat_bindings = vision_static_bindings(&vision, &flat_store).unwrap();
-        assert!(flat_bindings
-            .iter()
-            .find(|binding| binding.name() == VISION_PATCH_WEIGHT)
-            .unwrap()
-            .recipe()
-            .is_none());
-
-        let collapsed = zeros_dtype(&[4, 3, 2, 2], Dtype::Float32, stream).unwrap();
-        let collapsed_store = vision_store(&vision, collapsed);
-        let collapsed_bindings = vision_static_bindings(&vision, &collapsed_store).unwrap();
-        let binding = collapsed_bindings
-            .iter()
-            .find(|binding| binding.name() == VISION_PATCH_WEIGHT)
-            .unwrap();
-        assert!(matches!(
-            binding.recipe(),
-            Some(DerivedWeightRecipe::Reshape { shape, .. }) if shape == &[4, 12]
-        ));
-        assert_eq!(
-            binding
-                .source_recipe()
-                .infer(&collapsed_store)
-                .unwrap()
-                .shape(),
-            &[4, 12]
-        );
-    }
-
-    #[test]
-    fn load_time_quantization_skips_unaligned_static_vision_weights() {
-        let mut vision = VisionConfig::from_hf_value(
-            &json!({
-                "model_type": "muse_glimmer_vision",
-                "hidden_act": "gelu",
-                "hidden_size": 1024,
-                "intermediate_size": 4096,
-                "num_attention_heads": 16,
-                "num_hidden_layers": 1,
-                "patch_size": 14,
-                "patch_temporal": 2,
-                "merge_size": 2,
-                "pos_emb_height": 32,
-                "pos_emb_width": 32,
-                "max_position_embeddings": 1024,
-                "layer_norm_eps": 1e-5,
-                "layer_types": ["full_attention"],
-                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
-            }),
-            6656,
-        )
-        .unwrap();
-        vision.apply_load_time_quantization(WeightQuantization::Affine(
-            AffineQuantization::new(64, 4).unwrap(),
-        ));
-
-        assert!(!quantizes_static_target(
-            Some(&vision),
-            "model.vision_tower.patch_embedder.patch_embedding.weight",
-        ));
-        assert!(quantizes_static_target(
-            Some(&vision),
-            "model.vision_adapter.fc1.weight",
-        ));
-        assert!(quantizes_static_target(
-            Some(&vision),
-            "model.vision_projection.weight",
-        ));
-        assert!(!quantizes_static_target(
-            Some(&vision),
-            "model.vision_tower.patch_embedder.position_embedding_table.weight",
-        ));
-        assert!(quantizes_static_target(
-            Some(&vision),
-            "model.language_model.embed_tokens.weight",
-        ));
-    }
 }

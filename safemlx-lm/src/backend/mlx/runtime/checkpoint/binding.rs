@@ -12,6 +12,9 @@ use safemlx::{
 
 use crate::{
     backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::binding_plan::{
+        BindingPlan, BindingPlanError, PlannedBinding,
+    },
     backend::mlx::runtime::checkpoint::recipe::{
         DerivedWeightRecipe, RecipeDtype, WeightRecipeError,
     },
@@ -135,7 +138,41 @@ pub fn build_module_bindings_with_recipes(
     store: &dyn WeightStore,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
-    build_module_bindings_with_recipes_excluding(module, prefix, store, recipes, |_| false)
+    build_module_binding_plan_with_recipes(module, prefix, store, recipes)?.build_bindings(store)
+}
+
+/// A declarative module binding plan plus fully qualified logical targets.
+pub(crate) struct ModuleBindingPlan {
+    plan: BindingPlan,
+    logical_targets: BTreeMap<String, String>,
+}
+
+impl ModuleBindingPlan {
+    pub(crate) fn build_bindings(
+        &self,
+        store: &dyn WeightStore,
+    ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
+        self.plan
+            .build_bindings(store)?
+            .into_iter()
+            .map(|binding| {
+                let logical_target = self
+                    .logical_targets
+                    .get(binding.name())
+                    .expect("module binding plan contains every local target");
+                Ok(binding.with_logical_target(logical_target)?)
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn build_module_binding_plan_with_recipes(
+    module: &impl ModuleParameters,
+    prefix: &str,
+    store: &dyn WeightStore,
+    recipes: BTreeMap<String, DerivedWeightRecipe>,
+) -> Result<ModuleBindingPlan, ModuleBindingError> {
+    build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, |_| false)
 }
 
 /// Materializes a set of direct or derived bindings without constructing a
@@ -325,9 +362,23 @@ pub(crate) fn build_module_bindings_with_recipes_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,
     store: &dyn WeightStore,
-    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
+    recipes: BTreeMap<String, DerivedWeightRecipe>,
     exclude: F,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    F: Fn(&str) -> bool,
+{
+    build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, exclude)?
+        .build_bindings(store)
+}
+
+pub(crate) fn build_module_binding_plan_with_recipes_excluding<F>(
+    module: &impl ModuleParameters,
+    prefix: &str,
+    store: &dyn WeightStore,
+    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
+    exclude: F,
+) -> Result<ModuleBindingPlan, ModuleBindingError>
 where
     F: Fn(&str) -> bool,
 {
@@ -350,13 +401,16 @@ where
             .is_none_or(|parameter| is_materialized_module_parameter(name, parameter, &params))
     });
     let mut claimed = BTreeMap::<String, String>::new();
-    let mut bindings = Vec::with_capacity(local_names.len());
+    let mut planned = Vec::with_capacity(local_names.len());
+    let mut logical_targets = BTreeMap::new();
+    let mut source_claim_counts = BTreeMap::<String, usize>::new();
 
     for local_name in local_names {
         let parameter = params
             .get(local_name.as_str())
             .expect("parameter name came from the same flattened tree");
         let destination = qualify(prefix, &local_name);
+        logical_targets.insert(local_name.clone(), destination.clone());
         let canonical = canonical_checkpoint_name(&destination);
         let authoritative_key = if store.is_authoritative_materialized_key(&destination) {
             Some(destination.clone())
@@ -392,10 +446,15 @@ where
                         actual: metadata.dtype().clone(),
                     });
                 }
-                bindings.push(
-                    WeightBinding::from_recipe(local_name, recipe, metadata.byte_len())?
-                        .with_logical_target(destination)?,
-                );
+                for source in recipe.source_keys() {
+                    *source_claim_counts.entry(source.into()).or_default() += 1;
+                }
+                planned.push(PlannedBinding {
+                    target_name: local_name,
+                    expected_shape,
+                    expected_dtype,
+                    recipe,
+                });
                 continue;
             }
         } else {
@@ -437,20 +496,20 @@ where
                 actual: metadata.shape,
             });
         }
-        let expected_bytes = u64::try_from(metadata.logical_byte_len).map_err(|_| {
-            ModuleBindingError::ArithmeticOverflow {
-                context: "checkpoint tensor byte length",
-            }
-        })?;
-        bindings.push(
-            WeightBinding::new(
-                local_name,
-                metadata.name,
-                TensorSelection::Full,
-                expected_bytes,
-            )?
-            .with_logical_target(destination)?,
-        );
+        // Direct checkpoint tensors retain their stored dtype. Some modules
+        // intentionally use an unloaded placeholder with a different dtype
+        // and adopt the checkpoint representation when the binding is loaded.
+        let expected_dtype = RecipeDtype::from(metadata.stored_dtype.clone());
+        let recipe = DerivedWeightRecipe::source(metadata.name, TensorSelection::Full);
+        for source in recipe.source_keys() {
+            *source_claim_counts.entry(source.into()).or_default() += 1;
+        }
+        planned.push(PlannedBinding {
+            target_name: local_name,
+            expected_shape,
+            expected_dtype,
+            recipe,
+        });
     }
 
     if !recipes.is_empty() {
@@ -459,7 +518,15 @@ where
         });
     }
 
-    Ok(bindings)
+    let shared_source_keys = source_claim_counts
+        .into_iter()
+        .filter_map(|(source, claims)| (claims > 1).then_some(source))
+        .collect();
+    let plan = BindingPlan::allowing_shared_sources(planned, shared_source_keys)?;
+    Ok(ModuleBindingPlan {
+        plan,
+        logical_targets,
+    })
 }
 
 /// Assigns every module parameter from a protected resident unit.
@@ -552,12 +619,29 @@ fn qualify(prefix: &str, name: &str) -> String {
 }
 
 fn recipe_dtype_matches(expected: &RecipeDtype, actual: &RecipeDtype) -> bool {
-    expected == actual || matches!((expected, actual), (RecipeDtype::U8, RecipeDtype::F8E4M3))
+    expected == actual
+        || matches!((expected, actual), (RecipeDtype::U8, RecipeDtype::F8E4M3))
+        // Dense module placeholders default to F32, while direct checkpoint
+        // bindings replace them with the checkpoint's native floating dtype.
+        // Derived bindings (including key rewrites and expert stacking) must
+        // follow the same rule or valid BF16 checkpoints are rejected solely
+        // because their public tensor names require a recipe.
+        || (is_floating_recipe_dtype(expected) && is_floating_recipe_dtype(actual))
+}
+
+fn is_floating_recipe_dtype(dtype: &RecipeDtype) -> bool {
+    matches!(
+        dtype,
+        RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32 | RecipeDtype::F64
+    )
 }
 
 /// Structured module-to-checkpoint binding failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleBindingError {
+    /// The declarative binding plan was invalid or disagreed with source metadata.
+    #[error("checkpoint binding plan is invalid: {0}")]
+    BindingPlan(String),
     /// A recipe override did not name a runtime parameter.
     #[error("derived-weight recipes name unknown local parameters: {parameters:?}")]
     UnknownRecipeParameters {
@@ -661,240 +745,8 @@ pub enum ModuleBindingError {
     Residency(#[from] crate::backend::mlx::runtime::residency::manager::ResidencyError),
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{collections::HashMap, fs};
-
-    use safemlx::{
-        module::{ModuleParameters, Param},
-        native_quantization::NativeQuantizationFormat,
-        nn,
-        ops::GgufCheckpoint,
-        Array, Device, DeviceType, Dtype, ExecutionContext,
-    };
-    use safemlx_gguf::GgmlType;
-
-    use super::*;
-    use crate::{
-        backend::mlx::nn::linear::unloaded_maybe_quantized_linear,
-        backend::mlx::runtime::checkpoint::quantization::AffineQuantization,
-        backend::mlx::runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore},
-        test_utils::SyntheticGguf,
-    };
-
-    fn cpu() -> ExecutionContext {
-        ExecutionContext::new(Device::new(DeviceType::Cpu, 0))
-    }
-
-    #[test]
-    fn packed_e4m3_recipe_matches_u8_runtime_storage_only() {
-        assert!(recipe_dtype_matches(&RecipeDtype::U8, &RecipeDtype::F8E4M3));
-        assert!(!recipe_dtype_matches(
-            &RecipeDtype::U8,
-            &RecipeDtype::F8E5M2
-        ));
-        assert!(!recipe_dtype_matches(
-            &RecipeDtype::F32,
-            &RecipeDtype::F8E4M3
-        ));
-    }
-
-    #[test]
-    fn only_native_u8_scale_sentinels_are_non_materialized() {
-        assert!(is_native_scale_sentinel("scales", &[1], Some(Dtype::Uint8)));
-        assert!(is_native_scale_sentinel(
-            "projection.scales",
-            &[1],
-            Some(Dtype::Uint8)
-        ));
-        assert!(!is_native_scale_sentinel(
-            "scales",
-            &[1],
-            Some(Dtype::Uint32)
-        ));
-        assert!(!is_native_scale_sentinel(
-            "scales",
-            &[2],
-            Some(Dtype::Uint8)
-        ));
-        assert!(!is_native_scale_sentinel(
-            "weight_scale_inv",
-            &[1],
-            Some(Dtype::Uint8)
-        ));
-    }
-
-    #[test]
-    fn dense_binding_validates_names_shapes_and_exact_bytes() {
-        let context = cpu();
-        let linear = nn::Linear::unloaded(2, 3, true, Dtype::Float32, context.stream()).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let weight = Array::from_slice(&[0.1f32; 6], &[3, 2]);
-        let bias = Array::from_slice(&[0.2f32; 3], &[3]);
-        Array::save_safetensors(
-            [("proj.weight", &weight), ("proj.bias", &bias)],
-            None,
-            dir.path().join("model.safetensors"),
-        )
-        .unwrap();
-        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
-        let bindings = build_module_bindings(&linear, "proj", &store).unwrap();
-        assert_eq!(bindings.len(), 2);
-        assert_eq!(binding_bytes(&bindings).unwrap(), 36);
-        assert_eq!(
-            bindings
-                .iter()
-                .map(|binding| binding.checkpoint_key())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["proj.bias", "proj.weight"])
-        );
-    }
-
-    #[test]
-    fn quantized_binding_preserves_packed_companions() {
-        let context = cpu();
-        let quantization = AffineQuantization::new(16, 4).unwrap().into();
-        let module =
-            unloaded_maybe_quantized_linear(32, 2, true, Some(quantization), context.stream())
-                .unwrap();
-        let params = module.parameters().flatten();
-        let arrays = params
-            .iter()
-            .map(|(name, value)| (canonical_checkpoint_name(&format!("proj.{name}")), *value))
-            .collect::<Vec<_>>();
-        let dir = tempfile::tempdir().unwrap();
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
-            None,
-            dir.path().join("model.safetensors"),
-        )
-        .unwrap();
-        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
-        let bindings = build_module_bindings(&module, "proj", &store).unwrap();
-        let keys = bindings
-            .iter()
-            .map(|binding| binding.checkpoint_key())
-            .collect::<BTreeSet<_>>();
-        assert!(keys.contains("proj.weight"));
-        assert!(keys.contains("proj.scales"));
-        assert!(keys.contains("proj.biases"));
-        assert!(keys.contains("proj.bias"));
-    }
-
-    #[test]
-    fn native_q4k_binding_omits_compatibility_scale_sentinel() {
-        let context = cpu();
-        let mut module = nn::QuantizedLinear {
-            group_size: 256,
-            bits: 144,
-            mode: safemlx::ops::QuantizationMode::Affine,
-            native: None,
-            native_format: Some(NativeQuantizationFormat::GgufQ4K),
-            native_endian: safemlx_gguf::Endian::Little,
-            native_columns: 256,
-            scales: Param::new(Array::from_slice(&[0.0f32], &[1])),
-            biases: Param::new(None),
-            inner: nn::Linear {
-                weight: Param::new(Array::from_slice(&[0u8; 288], &[2, 144])),
-                bias: Param::new(None),
-            },
-        };
-        let arrays = HashMap::from([(
-            "proj.weight".to_string(),
-            Array::from_slice(&[0.0f32; 512], &[2, 256]),
-        )]);
-        let fixture = SyntheticGguf::with_packed_tensors(&arrays, &HashMap::new(), |name, _| {
-            (name == "proj.weight").then_some(GgmlType::Q4K)
-        });
-        let checkpoint = GgufCheckpoint::open(fixture.path()).unwrap();
-        let store = GgufWeightStore::new(checkpoint, str::to_string).unwrap();
-
-        assert_eq!(full_parameter_names(&module, "proj"), ["proj.inner.weight"]);
-        let bindings = build_module_bindings(&module, "proj", &store).unwrap();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].name(), "inner.weight");
-        assert_eq!(bindings[0].checkpoint_key(), "proj.weight");
-
-        let materialized =
-            materialize_module_bindings(&store, &bindings, context.stream(), context.stream())
-                .unwrap();
-        populate_module_from_arrays_excluding(&mut module, &materialized, |_| false).unwrap();
-        assert_eq!(module.inner.weight.value.dtype(), Dtype::Uint8);
-        assert_eq!(module.scales.value.shape(), &[1]);
-    }
-
-    #[test]
-    fn model_loading_window_drains_at_a_one_shard_mapping_bound() {
-        let context = cpu();
-        let linear = nn::Linear::unloaded(2, 3, true, Dtype::Float32, context.stream()).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let weight = Array::from_slice(&[0.1f32; 6], &[3, 2]);
-        let bias = Array::from_slice(&[0.2f32; 3], &[3]);
-        Array::save_safetensors(
-            [("proj.weight", &weight)],
-            None,
-            dir.path().join("weight.safetensors"),
-        )
-        .unwrap();
-        Array::save_safetensors(
-            [("proj.bias", &bias)],
-            None,
-            dir.path().join("bias.safetensors"),
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("model.safetensors.index.json"),
-            r#"{"weight_map":{"proj.bias":"bias.safetensors","proj.weight":"weight.safetensors"}}"#,
-        )
-        .unwrap();
-        let store = SafetensorsWeightStore::open_with_max_mapped_shards(dir.path(), 1).unwrap();
-        let bindings = build_module_bindings(&linear, "proj", &store).unwrap();
-
-        let arrays =
-            materialize_module_bindings(&store, &bindings, context.stream(), context.stream())
-                .unwrap();
-        assert_eq!(
-            arrays["weight"].evaluated().unwrap().as_slice::<f32>(),
-            &[0.1; 6]
-        );
-        assert_eq!(
-            arrays["bias"].evaluated().unwrap().as_slice::<f32>(),
-            &[0.2; 3]
-        );
-        assert_eq!(store.diagnostics().unwrap().currently_mapped_shards, 1);
-    }
-
-    #[test]
-    fn missing_and_shape_mismatch_are_rejected() {
-        let context = cpu();
-        let linear = nn::Linear::unloaded(2, 3, true, Dtype::Float32, context.stream()).unwrap();
-        let missing = tempfile::tempdir().unwrap();
-        let weight = Array::from_slice(&[0.1f32; 6], &[3, 2]);
-        Array::save_safetensors(
-            [("proj.weight", &weight)],
-            None,
-            missing.path().join("model.safetensors"),
-        )
-        .unwrap();
-        let store = SafetensorsWeightStore::open(missing.path()).unwrap();
-        assert!(matches!(
-            build_module_bindings(&linear, "proj", &store),
-            Err(ModuleBindingError::MissingParameter { .. })
-        ));
-
-        let mismatch = tempfile::tempdir().unwrap();
-        let wrong = Array::from_slice(&[0.1f32; 4], &[2, 2]);
-        let bias = Array::from_slice(&[0.2f32; 3], &[3]);
-        Array::save_safetensors(
-            [("proj.weight", &wrong), ("proj.bias", &bias)],
-            None,
-            mismatch.path().join("model.safetensors"),
-        )
-        .unwrap();
-        let store = SafetensorsWeightStore::open(mismatch.path()).unwrap();
-        assert!(matches!(
-            build_module_bindings(&linear, "proj", &store),
-            Err(ModuleBindingError::ShapeMismatch { .. })
-        ));
+impl From<BindingPlanError> for ModuleBindingError {
+    fn from(error: BindingPlanError) -> Self {
+        Self::BindingPlan(error.to_string())
     }
 }

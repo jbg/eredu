@@ -116,10 +116,21 @@ execution](cancellation.md).
 ## Recognized wire-format families
 
 Reusable profiles cover declarative JSON object/list formats, XML-wrapped JSON,
-named JSON arguments, structural-token JSON, Gemma structural channels,
-Inkling message frames, OpenAI Harmony channels, and LFM2-style Python call
-lists. Multiple model architectures can share a profile when their observable
-byte protocol is equivalent.
+named JSON arguments, Qwen3.6/3.8 tagged parameters, structural-token JSON,
+Gemma structural channels, Inkling message frames, OpenAI Harmony channels,
+and LFM2-style Python call lists. Multiple model architectures can share a
+profile when their observable byte protocol is equivalent.
+
+Qwen3.6 and Qwen3.8 calls contain a tagged function name and one repeated
+`<parameter=name>` block per top-level argument. String values are raw text;
+all other schema types are JSON encoded. SafeMLX retains the request's resolved
+schemas in the parser plan so ambiguous text such as `true` becomes either the
+JSON string `"true"` or boolean `true` according to the selected parameter.
+Arguments are emitted to applications as one canonical JSON object. Unknown or
+duplicate parameters, wrong types, unsafe names, incomplete tags, and raw
+strings containing the unescaped closing delimiter fail closed. Historical
+tool calls must use mapping-valued arguments; serialized argument strings are
+not accepted for these templates.
 
 Regardless of wire format, the public result is the same semantic event
 vocabulary. Unsupported behavior returns a capability error rather than

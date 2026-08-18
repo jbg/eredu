@@ -1,0 +1,91 @@
+diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
+index 7667cd0..ae9fe4a 100644
+--- a/mlx/backend/cuda/jit_module.cpp
++++ b/mlx/backend/cuda/jit_module.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "cuda_jit_sources.h"
+ 
++#include <algorithm>
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+@@ -50,10 +51,51 @@ const std::filesystem::path& default_cuda_toolkit_path() {
+   return cached_path;
+ }
+ 
++void add_include_path(
++    std::vector<std::string>& args,
++    const std::filesystem::path& path) {
++  auto argument = fmt::format("--include-path={}", path.string());
++  if (std::find(args.begin(), args.end(), argument) == args.end()) {
++    args.push_back(argument);
++  }
++}
++
++void add_configured_include_paths(std::vector<std::string>& args) {
++  const char* configured = std::getenv("MLX_CUDA_JIT_INCLUDE_DIRS");
++  if (!configured || !*configured) {
++    return;
++  }
++#if defined(_WIN32)
++  constexpr char separator = ';';
++#else
++  constexpr char separator = ':';
++#endif
++  std::string paths(configured);
++  for (size_t begin = 0; begin <= paths.size();) {
++    auto end = paths.find(separator, begin);
++    auto path = std::filesystem::path(paths.substr(begin, end - begin));
++    if (!path.empty()) {
++      if (!std::filesystem::is_directory(path)) {
++        throw std::runtime_error(fmt::format(
++            "MLX_CUDA_JIT_INCLUDE_DIRS contains a missing directory: {}",
++            path.string()));
++      }
++      add_include_path(args, path);
++    }
++    if (end == std::string::npos) {
++      break;
++    }
++    begin = end + 1;
++  }
++}
++
+ // Return the --include-path args used for invoking NVRTC.
+ const std::vector<std::string>& include_path_args() {
+   static std::vector<std::string> cached_args = []() {
+     std::vector<std::string> args;
++    // Explicit paths make statically linked and relocated executables independent
++    // of the location reported by dladdr().
++    add_configured_include_paths(args);
+     // Add path to bundled headers.
+     auto root_dir = current_binary_dir();
+ #if !defined(_WIN32)
+@@ -61,7 +103,7 @@ const std::vector<std::string>& include_path_args() {
+ #endif
+     auto path = root_dir / "include";
+     if (std::filesystem::exists(path)) {
+-      args.push_back(fmt::format("--include-path={}", path.string()));
++      add_include_path(args, path);
+     }
+     // Add path to CCCL headers.
+     path = path / "cccl";
+@@ -69,7 +111,7 @@ const std::vector<std::string>& include_path_args() {
+       path = cccl_dir();
+     }
+     if (std::filesystem::exists(path)) {
+-      args.push_back(fmt::format("--include-path={}", path.string()));
++      add_include_path(args, path);
+     }
+     // Add path to CUDA runtime headers, try local-installed python package
+     // first and then system-installed headers.
+@@ -91,7 +133,7 @@ const std::vector<std::string>& include_path_args() {
+             "variable CUDA_HOME or CUDA_PATH.");
+       }
+     }
+-    args.push_back(fmt::format("--include-path={}", path.string()));
++    add_include_path(args, path);
+     return args;
+   }();
+   return cached_args;

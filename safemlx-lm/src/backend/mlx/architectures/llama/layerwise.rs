@@ -1,6 +1,10 @@
 //! Unified Llama/Mistral loading across weight-residency policies.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+};
 
 use safemlx::{
     error::Exception,
@@ -43,20 +47,19 @@ use crate::{
     },
     backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings, populate_module_from_lease,
+        build_module_binding_plan_with_recipes, populate_module_from_lease,
     },
     backend::mlx::runtime::checkpoint::{
-        quantization::WeightQuantization,
+        quantization::{should_quantize_on_load, WeightQuantization},
         store::{GgufWeightStore, WeightStore},
     },
     backend::mlx::runtime::distributed::parallel::{
         register_replicated_module, ParallelPlanBuilder,
     },
     backend::mlx::runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
-        DenseDiskStreamReport, ExecutionResidency, LayerWeightResidency, LayerwiseForwardState,
+        load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
+        ExecutionResidency, LayerWeightResidency, LayerwiseForwardState, LayerwiseLoadOptions,
         LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings,
         WeightResidency,
     },
@@ -471,15 +474,11 @@ impl CausalLm<LlamaCache> for LlamaModel {
 pub(crate) fn load_llama_safetensors_mlx(
     model_dir: impl AsRef<Path>,
     weight_residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Llama,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(weight_residency),
-    )?;
     if weight_residency.expert_cache().is_some() {
         return Err(Error::UnsupportedArchitecture(
             "independent expert caching is not supported for Llama checkpoints".into(),
@@ -487,30 +486,21 @@ pub(crate) fn load_llama_safetensors_mlx(
     }
     let execution_options = weight_residency.layers();
     let args = resident::get_llama_model_args(model_dir)?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Llama", args.weight_quantization(), requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, execution_options.max_mapped_shards())?;
     Ok(LlamaModel {
-        execution: Box::new(load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            execution_options,
-            stream,
-            weights_stream,
-        )?),
-    })
-}
-
-pub(crate) fn execute_transformed_llama_model(
-    model: resident::ResidentModel,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LlamaModel, Error> {
-    let adapter = LlamaLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(LlamaModel {
-        execution: Box::new(load_layerwise_model(
+        execution: Box::new(load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            execution_options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?),
@@ -527,7 +517,6 @@ pub(crate) fn load_llama_tensor_parallel_model(
 ) -> Result<LlamaModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -544,11 +533,6 @@ pub(crate) fn load_llama_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Llama,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_llama_model_args(model_dir)?;
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
     Ok(LlamaModel {
@@ -576,9 +560,12 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     )?;
     let prepared =
         resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -610,9 +597,12 @@ pub(crate) fn load_llama_gguf_model(
 ) -> Result<(LlamaModel, Vec<u32>), Error> {
     let prepared =
         resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -780,6 +770,15 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map(Into::into)
+    }
+
     fn quantization(
         &self,
     ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
@@ -900,20 +899,38 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, "model.embed_tokens", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    "model.embed_tokens",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, "model.norm", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    "model.norm",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings(head, "lm_head", store)?,
+                    build_module_binding_plan_with_recipes(
+                        head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -1199,6 +1216,22 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         format!("model.layers.{index}")
     }
 
+    fn layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn WeightStore,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        Ok(build_module_binding_plan_with_recipes(
+            layer,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            BTreeMap::new(),
+        )?
+        .build_bindings(store)?)
+    }
+
     fn layer_unit_name(&self, _group: usize, index: usize) -> String {
         format!("llama.layer.{index:05}")
     }
@@ -1356,113 +1389,6 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn ignores_checkpoint_key(&self, key: &str) -> bool {
         key.starts_with("rope_freqs.") || key.ends_with(".rotary_emb.inv_freq")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use safemlx::{Device, DeviceType, ExecutionContext};
-
-    use super::*;
-    use crate::{
-        backend::mlx::runtime::{
-            checkpoint::quantization::AffineQuantization,
-            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-        },
-        core::attention::LayerSchedule,
-    };
-
-    fn build_context(rank: usize) -> ParallelBuildContext {
-        ParallelBuildContext::new(
-            MlxParallelContext::for_rank(rank, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap(),
-            ShardingPolicy::Require,
-        )
-    }
-
-    #[test]
-    fn quantized_llama_groups_share_uneven_aligned_head_and_mlp_ranges() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let quantization = AffineQuantization::new(32, 4).unwrap().into();
-        let args = ModelArgs {
-            model_type: "llama".into(),
-            hidden_size: 96,
-            num_hidden_layers: 1,
-            intermediate_size: 96,
-            num_attention_heads: 6,
-            rms_norm_eps: 1e-5,
-            vocab_size: 64,
-            num_key_value_heads: 3,
-            max_position_embeddings: 64,
-            rope_theta: 10_000.0,
-            rope_traditional: false,
-            head_dim: 16,
-            tie_word_embeddings: false,
-            attention_bias: false,
-            mlp_bias: false,
-            rope_scaling: None,
-            attention_schedule: LayerSchedule::all_full(1).unwrap(),
-            quantization: None,
-            quantization_config: None,
-            quantized_weights: Some(
-                [
-                    "model.layers.0.self_attn.o_proj.weight".to_string(),
-                    "model.layers.0.mlp.down_proj.weight".to_string(),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            quantized_weight_configs: Some(HashMap::from([
-                (
-                    "model.layers.0.self_attn.o_proj.weight".into(),
-                    quantization,
-                ),
-                ("model.layers.0.mlp.down_proj.weight".into(), quantization),
-            ])),
-        };
-        let layer = TransformerBlock::new_for_layer(&args, 0, execution.stream()).unwrap();
-
-        for (rank, local_heads, local_intermediate, packed_width, scale_width) in
-            [(0, 2, 64, 8, 2), (1, 1, 32, 4, 1)]
-        {
-            let mut planner = build_context(rank).planner();
-            register_llama_layer_parallel_plan(&mut planner, &layer, &args, "model.layers.0")
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            assert_eq!(
-                planned_kv_head_layout(&layout, 1, 16, "model.layers").unwrap(),
-                vec![local_heads]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.self_attn.o_proj.inner.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[96, packed_width]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.self_attn.o_proj.scales")
-                    .unwrap()
-                    .local_shape(),
-                &[96, scale_width]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.mlp.gate_proj.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[local_intermediate, 96]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.mlp.down_proj.inner.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[96, packed_width]
-            );
-        }
     }
 }
 

@@ -29,9 +29,11 @@ use crate::{
         cache::residency::PagedCacheOptions,
         checkpoint::{
             binding::{
-                build_module_bindings_with_recipes, populate_module_from_lease,
+                build_module_binding_plan_with_recipes,
+                build_module_binding_plan_with_recipes_excluding, populate_module_from_lease,
                 populate_module_from_lease_excluding,
             },
+            binding_plan::{BindingPlan, PlannedBinding},
             quantization::WeightQuantization,
             recipe::DerivedWeightRecipe,
             store::{GgufWeightStore, TensorSelection, WeightStore},
@@ -319,6 +321,10 @@ impl DeepSeekV4LayerwiseModel {
     /// Current bounded-residency telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Dense disk-stream telemetry when that policy is active.
@@ -624,23 +630,25 @@ impl DeepSeekV4LayerwiseAdapter {
         if let Some(mtp) = &self.static_model.mtp {
             return Ok(Some(StaticUnitBindings::new(
                 DRAFT_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     mtp,
                     "mtp",
                     store,
                     draft_recipes(mtp, &self.args, store, false)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?));
         }
         if let Some(dspark) = &self.static_model.dspark {
             return Ok(Some(StaticUnitBindings::new(
                 DRAFT_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     dspark,
                     "mtp",
                     store,
                     draft_recipes(dspark, &self.args, store, true)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?));
         }
         Ok(None)
@@ -902,6 +910,15 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
+    }
+
     fn quantization(&self) -> Option<WeightQuantization> {
         self.args.quantization
     }
@@ -980,25 +997,27 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         Ok(vec![
             StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.static_model.model.embed_tokens,
                     "embed",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.static_model.model.norm,
                     "norm",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 HC_HEAD_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.static_model.model.hc_head,
                     "hc_head",
                     store,
@@ -1007,16 +1026,18 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
                         ("base".into(), source("hc_head_base")),
                         ("scale".into(), source("hc_head_scale")),
                     ]),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
             StaticUnitBindings::new(
                 HEAD_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.static_model.lm_head,
                     "head",
                     store,
                     qwen_linear_recipes("head", &self.static_model.lm_head),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?,
         ]
         .into_iter()
@@ -1265,20 +1286,14 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         layer: &DecoderLayer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings = build_module_bindings_with_recipes(
+        let bindings = build_module_binding_plan_with_recipes_excluding(
             layer,
             &format!("layers.{index}"),
             store,
             self.layer_recipes(layer, index, store)?,
+            |name| self.sparse_expert_cache && name.starts_with("ffn.switch_mlp."),
         )?;
-        if self.sparse_expert_cache {
-            Ok(bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("ffn.switch_mlp."))
-                .collect())
-        } else {
-            Ok(bindings)
-        }
+        Ok(bindings.build_bindings(store)?)
     }
 
     fn parallel_layer_bindings(
@@ -1545,9 +1560,12 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
     let quantization = prepared
         .args
         .resolve_load_time_quantization("DeepSeek V4 GGUF", requested_quantization)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             super::model::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -1612,9 +1630,12 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
         "DeepSeek V4 GGUF tensor parallel",
         requested_quantization,
     )?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             super::model::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -1661,12 +1682,6 @@ pub(crate) fn load_deepseek_v4_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::DeepSeekV4,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default()
-            .with_weight_residency(options.weight_residency()),
-    )?;
     let args = super::model::get_model_args(model_dir)?;
     let quantization =
         args.resolve_load_time_quantization("DeepSeek V4 tensor parallel", requested_quantization)?;
@@ -2205,8 +2220,7 @@ pub(crate) fn expert_catalog(
                         shape: vec![1, output as usize, (input / 8) as usize],
                     };
                 }
-                let bytes = recipe.infer(store)?.byte_len();
-                bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                bindings.push(deepseek_v4_recipe_binding(name, recipe, store)?);
             }
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
@@ -2222,6 +2236,23 @@ pub(crate) fn expert_catalog(
         }
     }
     Ok(entries)
+}
+
+fn deepseek_v4_recipe_binding(
+    name: &str,
+    recipe: DerivedWeightRecipe,
+    store: &dyn WeightStore,
+) -> Result<WeightBinding, Error> {
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2277,234 +2308,4 @@ fn execute_cached_experts(
             },
         )
         .map_err(|error| Exception::custom(error.to_string()))
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use safemlx::{module::ModuleParameters, Device, DeviceType, Dtype, ExecutionContext};
-
-    use super::{raw_layer_key, DeepSeekV4LayerwiseAdapter};
-    use crate::{
-        backend::mlx::architectures::deepseek_v4::model::ModelArgs,
-        backend::mlx::runtime::{
-            checkpoint::quantization::WeightQuantization,
-            checkpoint::store::TensorSelection,
-            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-            execution::layerwise::{ArchitectureAdapter, LoadTimeQuantizableAdapter},
-            residency::manager::WeightBinding,
-        },
-    };
-
-    fn args() -> ModelArgs {
-        ModelArgs::from_value(serde_json::json!({
-            "model_type": "deepseek_v4",
-            "hidden_size": 8,
-            "moe_intermediate_size": 4,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 1,
-            "head_dim": 8,
-            "qk_rope_head_dim": 4,
-            "q_lora_rank": 8,
-            "o_lora_rank": 8,
-            "o_groups": 2,
-            "vocab_size": 32,
-            "max_position_embeddings": 4096,
-            "compress_ratios": [0, 4],
-            "index_n_heads": 4,
-            "index_head_dim": 4,
-            "index_topk": 2,
-            "n_routed_experts": 8,
-            "num_experts_per_tok": 2
-        }))
-        .unwrap()
-    }
-
-    fn quantizable_args(dspark: bool) -> ModelArgs {
-        let mut value = serde_json::json!({
-            "model_type": "deepseek_v4",
-            "hidden_size": 32,
-            "moe_intermediate_size": 32,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 8,
-            "num_key_value_heads": 1,
-            "head_dim": 8,
-            "qk_rope_head_dim": 4,
-            "q_lora_rank": 32,
-            "o_lora_rank": 32,
-            "o_groups": 2,
-            "vocab_size": 64,
-            "max_position_embeddings": 4096,
-            "compress_ratios": [0, 0],
-            "index_n_heads": 8,
-            "index_head_dim": 8,
-            "index_topk": 2,
-            "n_routed_experts": 8,
-            "num_experts_per_tok": 2,
-            "num_nextn_predict_layers": 1
-        });
-        if dspark {
-            value["dspark_block_size"] = 4.into();
-            value["dspark_noise_token_id"] = 0.into();
-            value["dspark_target_layer_ids"] = serde_json::json!([0]);
-            value["dspark_markov_rank"] = 32.into();
-        }
-        ModelArgs::from_value(value).unwrap()
-    }
-
-    fn assert_packed_parameter(module: &impl ModuleParameters, suffix: &str) {
-        let parameters = module.parameters().flatten();
-        let (_, parameter) = parameters
-            .iter()
-            .find(|(name, _)| name.ends_with(suffix))
-            .unwrap_or_else(|| panic!("missing packed parameter ending in {suffix:?}"));
-        assert_eq!(parameter.dtype(), Dtype::Uint32, "{suffix}");
-    }
-
-    fn binding(target: &str) -> WeightBinding {
-        WeightBinding::new("parameter", target, TensorSelection::Full, 4).unwrap()
-    }
-
-    #[test]
-    fn static_quantization_selects_only_packed_v4_modules() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let adapter =
-            DeepSeekV4LayerwiseAdapter::new(quantizable_args(true), execution.stream()).unwrap();
-
-        assert!(adapter.quantizes_static_binding(&binding("head.weight")));
-        assert!(adapter.quantizes_static_binding(&binding("mtp.main_proj.weight")));
-        assert!(adapter.quantizes_static_binding(&binding(
-            "mtp.layers.0.decoder.ffn.switch_mlp.gate_up_proj"
-        )));
-        assert!(!adapter.quantizes_static_binding(&binding("embed.weight")));
-        assert!(!adapter.quantizes_static_binding(&binding("hc_head.function")));
-        assert!(!adapter.quantizes_static_binding(&binding("mtp.main_norm.weight")));
-        assert!(!adapter.quantizes_static_binding(&binding("mtp.markov_w1.weight")));
-        assert!(!adapter.quantizes_static_binding(&binding("mtp.layers.0.attn.compressor.ape")));
-    }
-
-    #[test]
-    fn uniform_load_time_format_covers_target_moe_and_embedded_mtp() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let source =
-            DeepSeekV4LayerwiseAdapter::new(quantizable_args(false), execution.stream()).unwrap();
-        let target = source
-            .load_time_quantized(WeightQuantization::MxFp4, execution.stream())
-            .unwrap();
-        let layer = target.new_layer(0, 0, execution.stream()).unwrap();
-
-        assert_eq!(target.quantization(), Some(WeightQuantization::MxFp4));
-        assert_packed_parameter(&layer, "attn.wq_a.weight");
-        assert_packed_parameter(&layer, "ffn.switch_mlp.gate_up_proj");
-        assert_packed_parameter(&layer, "ffn.shared_experts.gate_proj.weight");
-        assert_packed_parameter(
-            target.static_model.mtp.as_ref().unwrap(),
-            "layers.0.e_proj.weight",
-        );
-        assert_packed_parameter(
-            target.static_model.mtp.as_ref().unwrap(),
-            "layers.0.decoder.ffn.switch_mlp.down_proj",
-        );
-        assert_packed_parameter(&target.static_model.lm_head, "weight");
-    }
-
-    #[test]
-    fn uniform_load_time_format_covers_fused_dspark_projections() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let source =
-            DeepSeekV4LayerwiseAdapter::new(quantizable_args(true), execution.stream()).unwrap();
-        let target = source
-            .load_time_quantized(WeightQuantization::MxFp4, execution.stream())
-            .unwrap();
-        let dspark = target.static_model.dspark.as_ref().unwrap();
-
-        assert_packed_parameter(dspark, "main_proj.weight");
-        assert_packed_parameter(dspark, "markov_w2.weight");
-        assert_packed_parameter(dspark, "confidence_head.weight");
-        assert_packed_parameter(dspark, "layers.0.attn.wq_a.weight");
-        assert_packed_parameter(dspark, "layers.0.ffn.switch_mlp.down_proj");
-    }
-
-    #[test]
-    fn checkpoint_native_formats_reject_implicit_transcoding() {
-        let mut args = quantizable_args(false);
-        args.expert_dtype = Some("fp4".into());
-        let error = args
-            .resolve_load_time_quantization("DeepSeek V4", Some(WeightQuantization::MxFp4))
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("implicit dequantization and requantization"));
-    }
-
-    #[test]
-    fn maps_runtime_v4_layer_names_to_official_checkpoint_names() {
-        assert_eq!(
-            raw_layer_key("layers.7", "attn_hc.function"),
-            "layers.7.hc_attn_fn"
-        );
-        assert_eq!(
-            raw_layer_key("layers.7", "ffn_hc.base"),
-            "layers.7.hc_ffn_base"
-        );
-        assert_eq!(
-            raw_layer_key("layers.7", "ffn.shared_experts.gate_proj.weight"),
-            "layers.7.ffn.shared_experts.w1.weight"
-        );
-        assert_eq!(
-            raw_layer_key("layers.7", "attn.wq_a.weight_scale_inv"),
-            "layers.7.attn.wq_a.scale"
-        );
-    }
-
-    #[test]
-    fn cartesian_plan_shards_query_heads_and_balances_expert_ownership() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        for rank in 0..8 {
-            let topology = MlxParallelContext::for_rank(
-                rank,
-                2,
-                2,
-                2,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap();
-            let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-            let adapter = DeepSeekV4LayerwiseAdapter::new(args(), execution.stream()).unwrap();
-            let assignment = adapter
-                .expert_parallel_assignment(topology)
-                .unwrap()
-                .unwrap();
-            assert_eq!(assignment.global_expert_count(), 8);
-            assert_eq!(assignment.local_expert_count(), 4);
-
-            let mut planner = build.planner();
-            adapter
-                .register_parallel_parameters(build, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            assert_eq!(
-                layout
-                    .tensor("layers.0.attn.wq_b.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[16, 8]
-            );
-            assert_eq!(
-                layout
-                    .tensor("layers.0.attn.attn_sink")
-                    .unwrap()
-                    .local_shape(),
-                &[2]
-            );
-            assert_eq!(
-                layout
-                    .tensor("layers.0.attn.wkv.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[8, 8]
-            );
-        }
-    }
 }

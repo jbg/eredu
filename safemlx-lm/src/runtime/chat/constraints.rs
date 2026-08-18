@@ -553,7 +553,7 @@ impl ConstraintCompiler {
         }
         let grammar_structural_token_ids =
             &resolved_structural_token_ids[..grammar_structural_token_spellings.len()];
-        dialect.incremental_parser_state(parameters)?;
+        dialect.incremental_parser_state_with_tools(parameters, tools)?;
         let configuration = if tool_surface {
             dialect.constraint_configuration(
                 parameters,
@@ -604,6 +604,7 @@ impl ConstraintCompiler {
             },
             dialect,
             dialect_parameters: parameters,
+            tools: tools.to_vec(),
             structural_token_spellings: runtime_structural_token_spellings,
             resolved_structural_token_ids,
             profile_stop_sequences: runtime_stop_sequences,

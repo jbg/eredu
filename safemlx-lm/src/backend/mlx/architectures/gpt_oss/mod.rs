@@ -1,6 +1,7 @@
 //! GPT-OSS model family.
 
+pub(crate) mod checkpoint;
 /// Bounded and unified residency execution.
 pub mod layerwise;
-/// Fully resident decoder implementation.
+/// Reusable decoder operators; checkpoint loading is exposed only by [`layerwise`].
 pub mod model;

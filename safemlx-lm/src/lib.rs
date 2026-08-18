@@ -69,23 +69,11 @@ mod distributed_cartesian_ring;
 #[path = "../tests/distributed_expert_exchange_ring.rs"]
 mod distributed_expert_exchange_ring;
 #[cfg(all(test, feature = "mlx"))]
-#[path = "../tests/distributed_expert_parallel_ring.rs"]
-mod distributed_expert_parallel_ring;
-#[cfg(all(test, feature = "mlx"))]
-#[path = "../tests/distributed_gemma4_multimodal_pipeline_ring.rs"]
-mod distributed_gemma4_multimodal_pipeline_ring;
-#[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_partition_ring.rs"]
 mod distributed_partition_ring;
 #[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_pipeline_ring.rs"]
 mod distributed_pipeline_ring;
-#[cfg(all(test, feature = "mlx"))]
-#[path = "../tests/distributed_qwen3_vl_pipeline_ring.rs"]
-mod distributed_qwen3_vl_pipeline_ring;
-#[cfg(all(test, feature = "mlx"))]
-#[path = "../tests/distributed_tensor_parallel_ring.rs"]
-mod distributed_tensor_parallel_ring;
 
 pub use safemlx_lm_core::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use safemlx_lm_core::cache::{

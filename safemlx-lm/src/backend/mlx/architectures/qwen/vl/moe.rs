@@ -4,41 +4,9 @@
 //! multimodal RoPE, and runtime input preparation. Its language decoder uses
 //! the sparse Qwen3 feed-forward blocks selected by the nested text config.
 
-use std::path::Path;
+use crate::backend::mlx::error::Error;
 
-use safemlx::Stream;
-
-use crate::{
-    backend::mlx::error::Error, backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
-};
-
-pub use super::model::{
-    Cache, Generate, Model, ModelArgs, Qwen3VLModel, QwenVisionTransformer, VisionConfig,
-};
-
-/// Reads Qwen3-VL-MoE arguments from a Hugging Face model directory.
-pub fn get_qwen3_vl_moe_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
-    super::model::get_qwen3_vl_model_args(model_dir)
-}
-
-/// Loads a Qwen3-VL-MoE safetensors checkpoint.
-pub fn load_qwen3_vl_moe_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    super::model::load_qwen3_vl_model(model_dir, stream, weights_stream)
-}
-
-/// Loads Qwen3-VL-MoE while affine-quantizing eligible language weights.
-pub fn load_qwen3_vl_moe_model_quantized(
-    model_dir: impl AsRef<Path>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    super::model::load_qwen3_vl_model_quantized(model_dir, quantization, stream, weights_stream)
-}
+pub(crate) use super::model::Cache;
 
 pub(crate) fn validate_model_config_value(config: &serde_json::Value) -> Result<(), Error> {
     super::model::validate_model_config_value(config)

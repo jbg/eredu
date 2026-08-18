@@ -12,22 +12,24 @@ use safemlx::{
 
 use crate::{
     backend::mlx::architectures::moshi::model::{
-        self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
-        MoshiTransformerLayer, SampleStepOutput, TokenStepOutput,
+        self as resident, DepFormerSlice, MoshiLayerwiseStatic, MoshiTransformerLayer,
     },
     backend::mlx::error::Error,
     backend::mlx::realtime::MlxRealtimeOutput,
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::artifact::LoadedArtifactIdentity,
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
+        build_module_binding_plan_with_recipes, build_module_bindings, populate_module_from_lease,
     },
-    backend::mlx::runtime::checkpoint::recipe::DerivedWeightRecipe,
     backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
     backend::mlx::runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model, transformed_module_weight_store,
-        ArchitectureAdapter, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
-        StaticUnitBindings,
+        load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, ArchitectureAdapter, LayerWeightResidency,
+        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
     },
     backend::mlx::runtime::generation::sampler::Sampler,
     backend::mlx::runtime::residency::manager::{
@@ -36,9 +38,14 @@ use crate::{
     core::realtime::RealtimeSpeechConfig,
 };
 
+pub use crate::backend::mlx::architectures::moshi::model::{
+    GenerationState, GenerationStepWithLogits, ModelArgs, MoshiCache, SampleStepOutput,
+    TokenStepOutput,
+};
+
 #[cfg(test)]
 use crate::backend::mlx::runtime::execution::layerwise::{
-    load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+    load_layerwise_model, transformed_module_weight_store,
 };
 
 const STATIC_UNIT: &str = "moshi.static";
@@ -476,7 +483,7 @@ impl MoshiLayerwiseModel {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_step_forced<TS: Sampler, AS: Sampler>(
         &mut self,
-        state: &mut resident::GenerationState,
+        state: &mut GenerationState,
         input_audio_tokens: &Array,
         forced_generated_audio_tokens: Option<&Array>,
         forced_text_token: Option<&Array>,
@@ -487,8 +494,39 @@ impl MoshiLayerwiseModel {
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<MlxRealtimeOutput, Exception> {
+        Ok(self
+            .generate_step_forced_with_logits(
+                state,
+                input_audio_tokens,
+                forced_generated_audio_tokens,
+                forced_text_token,
+                text_sampler,
+                audio_samplers,
+                text_temperature,
+                audio_temperature,
+                prng_state,
+                stream,
+            )?
+            .output)
+    }
+
+    /// Advances generation while retaining the text and audio decision logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_step_forced_with_logits<TS: Sampler, AS: Sampler>(
+        &mut self,
+        state: &mut GenerationState,
+        input_audio_tokens: &Array,
+        forced_generated_audio_tokens: Option<&Array>,
+        forced_text_token: Option<&Array>,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<GenerationStepWithLogits, Exception> {
         if self.args().existing_text_padding_id.is_some() && self.args().dep_q == self.args().n_q {
-            return self.generate_step_pytorch_style(
+            return self.generate_step_pytorch_style_with_logits(
                 state,
                 input_audio_tokens,
                 forced_generated_audio_tokens,
@@ -501,7 +539,7 @@ impl MoshiLayerwiseModel {
                 stream,
             );
         }
-        self.generate_step_native_style(
+        self.generate_step_native_style_with_logits(
             state,
             input_audio_tokens,
             forced_generated_audio_tokens,
@@ -516,9 +554,9 @@ impl MoshiLayerwiseModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn generate_step_native_style<TS: Sampler, AS: Sampler>(
+    fn generate_step_native_style_with_logits<TS: Sampler, AS: Sampler>(
         &mut self,
-        state: &mut resident::GenerationState,
+        state: &mut GenerationState,
         input_audio_tokens: &Array,
         forced_generated_audio_tokens: Option<&Array>,
         forced_text_token: Option<&Array>,
@@ -528,7 +566,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<MlxRealtimeOutput, Exception> {
+    ) -> Result<GenerationStepWithLogits, Exception> {
         let args = self.args().clone();
         let input_codebooks = args.input_audio_codebooks();
         if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
@@ -668,17 +706,21 @@ impl MoshiLayerwiseModel {
             .transpose()?;
         state.previous_text = Some(sampled.text_token.clone());
         state.step += 1;
-        Ok(MlxRealtimeOutput {
-            text_token: sampled.text_token,
-            sampled_audio_tokens: sampled.audio_tokens,
-            output_audio_tokens,
+        Ok(GenerationStepWithLogits {
+            output: MlxRealtimeOutput {
+                text_token: sampled.text_token,
+                sampled_audio_tokens: sampled.audio_tokens,
+                output_audio_tokens,
+            },
+            text_logits: Some(sampled.logits.text_logits),
+            audio_logits: sampled.logits.audio_logits,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn generate_step_pytorch_style<TS: Sampler, AS: Sampler>(
+    fn generate_step_pytorch_style_with_logits<TS: Sampler, AS: Sampler>(
         &mut self,
-        state: &mut resident::GenerationState,
+        state: &mut GenerationState,
         input_audio_tokens: &Array,
         forced_generated_audio_tokens: Option<&Array>,
         forced_text_token: Option<&Array>,
@@ -688,7 +730,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<MlxRealtimeOutput, Exception> {
+    ) -> Result<GenerationStepWithLogits, Exception> {
         let args = self.args().clone();
         let input_codebooks = args.input_audio_codebooks();
         if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
@@ -754,18 +796,22 @@ impl MoshiLayerwiseModel {
         }
         if offset == 0 {
             state.step += 1;
-            return Ok(MlxRealtimeOutput {
-                text_token: Array::full::<i32>(
-                    &[batch, 1],
-                    Array::from_int(args.text_card),
-                    stream,
-                )?,
-                sampled_audio_tokens: Array::full::<i32>(
-                    &[batch, args.dep_q],
-                    Array::from_int(args.audio_padding_token()),
-                    stream,
-                )?,
-                output_audio_tokens: None,
+            return Ok(GenerationStepWithLogits {
+                output: MlxRealtimeOutput {
+                    text_token: Array::full::<i32>(
+                        &[batch, 1],
+                        Array::from_int(args.text_card),
+                        stream,
+                    )?,
+                    sampled_audio_tokens: Array::full::<i32>(
+                        &[batch, args.dep_q],
+                        Array::from_int(args.audio_padding_token()),
+                        stream,
+                    )?,
+                    output_audio_tokens: None,
+                },
+                text_logits: None,
+                audio_logits: Vec::new(),
             });
         }
 
@@ -834,10 +880,14 @@ impl MoshiLayerwiseModel {
         };
         state.previous_text = Some(sampled.text_token.clone());
         state.step += 1;
-        Ok(MlxRealtimeOutput {
-            text_token: sampled.text_token,
-            sampled_audio_tokens: sampled.audio_tokens,
-            output_audio_tokens,
+        Ok(GenerationStepWithLogits {
+            output: MlxRealtimeOutput {
+                text_token: sampled.text_token,
+                sampled_audio_tokens: sampled.audio_tokens,
+                output_audio_tokens,
+            },
+            text_logits: Some(sampled.logits.text_logits),
+            audio_logits: sampled.logits.audio_logits,
         })
     }
 }
@@ -884,28 +934,20 @@ fn token_position(
 pub fn load_moshi_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let args = resident::get_model_args(model_dir)?;
-    let weights_name = args
-        .moshi_name
-        .clone()
-        .unwrap_or_else(|| "model.safetensors".to_string());
-    let source = if weights_name == "model.safetensors"
-        && model_dir.join("model.safetensors.index.json").exists()
-    {
-        model_dir.to_path_buf()
-    } else {
-        model_dir.join(weights_name)
-    };
+    let source = super::checkpoint::source_path(model_dir, &args);
     load_with_layout(
         source,
         args,
         CheckpointLayout::Native,
         options,
+        quantization,
         stream,
         weights_stream,
     )
@@ -923,17 +965,8 @@ pub(crate) fn load_moshi_tensor_parallel_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let args = resident::get_model_args(model_dir)?;
-    let weights_name = args
-        .moshi_name
-        .clone()
-        .unwrap_or_else(|| "model.safetensors".to_string());
-    let source = if weights_name == "model.safetensors"
-        && model_dir.join("model.safetensors.index.json").exists()
-    {
-        model_dir.to_path_buf()
-    } else {
-        model_dir.join(weights_name)
-    };
+    let source = super::checkpoint::source_path(model_dir, &args);
+    super::checkpoint::validate_safetensors_path(&source, &args)?;
     let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Native, stream)?;
     Ok(MoshiLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
@@ -952,16 +985,12 @@ pub(crate) fn load_moshi_tensor_parallel_layerwise_model(
 pub fn load_personaplex_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::PersonaPlex,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default(),
-    )?;
     let metadata =
         crate::backend::mlx::architectures::moshi::personaplex::get_model_metadata(model_dir)?;
     let mut args = crate::backend::mlx::architectures::moshi::personaplex::model_args_7b_v1();
@@ -971,6 +1000,7 @@ pub fn load_personaplex_layerwise_model(
         args,
         CheckpointLayout::Pytorch,
         options,
+        quantization,
         stream,
         weights_stream,
     )
@@ -982,6 +1012,7 @@ pub fn load_pytorch_layerwise_model(
     args: ModelArgs,
     checkpoint: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -990,25 +1021,52 @@ pub fn load_pytorch_layerwise_model(
         args,
         CheckpointLayout::Pytorch,
         options,
+        quantization,
         stream,
         weights_stream,
     )
 }
 
-/// Hands a completed Moshi/PersonaPlex load-time transformation to the
-/// canonical generalized execution engine.
-pub(crate) fn execute_transformed_model(
+#[cfg(test)]
+pub(crate) fn test_model_from_resident(
     model: resident::Model,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let adapter = MoshiLayerwiseAdapter::new(model.args.clone(), CheckpointLayout::Native, stream)?;
-    let store = transformed_module_weight_store(&model)?;
     Ok(MoshiLayerwiseModel {
         execution: load_layerwise_model(
-            store,
+            transformed_module_weight_store(&model)?,
             adapter,
             LayerWeightResidency::FullyResident,
+            stream,
+            weights_stream,
+        )?,
+        artifact_identity: LoadedArtifactIdentity::in_memory(),
+    })
+}
+
+/// Loads PersonaPlex with rank-local temporal and depth transformers.
+pub fn load_personaplex_tensor_parallel_layerwise_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MoshiLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let metadata =
+        crate::backend::mlx::architectures::moshi::personaplex::get_model_metadata(model_dir)?;
+    let mut args = crate::backend::mlx::architectures::moshi::personaplex::model_args_7b_v1();
+    args.quantization = metadata.quantization;
+    let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Pytorch, stream)?;
+    Ok(MoshiLayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
+            adapter,
+            options,
+            build,
             stream,
             weights_stream,
         )?,
@@ -1021,20 +1079,44 @@ fn load_with_layout(
     args: ModelArgs,
     layout: CheckpointLayout,
     options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
+    let source = source.as_ref();
+    let options = options.into();
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("Moshi family", args.quantization, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = MoshiLayerwiseAdapter::new(args, layout, stream)?;
+    let store = open_safetensors_weight_store(source, options.max_mapped_shards())?;
     Ok(MoshiLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            source,
+        execution: load_layerwise_model_with_quantization(
+            store,
             adapter,
             options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
         artifact_identity: LoadedArtifactIdentity::in_memory(),
     })
+}
+
+impl LoadTimeQuantizableAdapter for MoshiLayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.quantization = Some(quantization);
+        Self::new(args, self.layout, stream)
+    }
 }
 
 /// Family-specific input for teacher-forced or autoregressive depth execution.
@@ -1172,6 +1254,22 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
     type Cache = MoshiCache;
     type Layer = MoshiExecutionUnit;
     type ForwardContext = MoshiForwardContext;
+
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        match self.layout {
+            CheckpointLayout::Native => super::checkpoint::safetensors_plan(&self.args)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map(Into::into),
+            CheckpointLayout::Pytorch => {
+                super::personaplex_checkpoint::safetensors_plan(&self.args)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map(Into::into)
+            }
+        }
+    }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
         let bindings = match self.layout {
@@ -1922,9 +2020,10 @@ fn pytorch_static_bindings(
         };
         recipes.insert(name.to_string(), source_full(source));
     }
-    Ok(build_module_bindings_with_recipes(
-        module, "", store, recipes,
-    )?)
+    Ok(
+        build_module_binding_plan_with_recipes(module, "", store, recipes)?
+            .build_bindings(store)?,
+    )
 }
 
 fn pytorch_layer_bindings(
@@ -1944,9 +2043,10 @@ fn pytorch_layer_bindings(
         };
         recipes.insert(name.to_string(), recipe);
     }
-    Ok(build_module_bindings_with_recipes(
-        module, "", store, recipes,
-    )?)
+    Ok(
+        build_module_binding_plan_with_recipes(module, "", store, recipes)?
+            .build_bindings(store)?,
+    )
 }
 
 fn temporal_recipe(
@@ -2076,702 +2176,4 @@ fn validate_forced_depth(
 
 fn layerwise_exception(error: Error) -> Exception {
     Exception::custom(error.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use std::{collections::BTreeMap, fs, path::Path};
-
-    use safemlx::{
-        distributed::{Backend, Group},
-        module::ModuleParameters,
-        ops::{concatenate_axis, ones_dtype, zeros_dtype},
-        Array, Device, DeviceType, ExecutionContext, Stream,
-    };
-
-    use super::*;
-    use crate::{
-        backend::mlx::architectures::moshi::model as eager,
-        backend::mlx::realtime::MlxRealtimeBackend,
-        backend::mlx::realtime::{generate_encoded_greedy, MlxRealtimeModel},
-        backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-        backend::mlx::runtime::execution::layerwise::{
-            LayerWeightResidency, LayerwiseLoadOptions, WeightResidency,
-        },
-        backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        backend::mlx::ModelLoadOptions,
-        core::realtime::{
-            load_realtime_model, load_realtime_model_with_options, RealtimeSampling,
-            RealtimeScheduler,
-        },
-        core::residency::{MemoryTier, OffloadConfig},
-        RealtimeModel, RequestId, SchedulerLimits,
-    };
-
-    fn config() -> &'static str {
-        r#"{
-            "model_type": "moshi",
-            "dim": 16, "text_card": 32, "n_q": 4, "dep_q": 2, "card": 8,
-            "num_heads": 4, "num_layers": 2, "causal": true, "context": 16,
-            "max_period": 10000, "positional_embedding": "rope",
-            "depformer_dim": 8, "depformer_dim_feedforward": 32,
-            "depformer_num_heads": 2, "depformer_num_layers": 2,
-            "depformer_context": 2, "depformer_pos_emb": "none",
-            "delays": [0, 0, 1, 0, 1]
-        }"#
-    }
-
-    fn personaplex_style_config() -> &'static str {
-        r#"{
-            "model_type": "personaplex",
-            "dim": 16, "text_card": 32, "existing_text_padding_id": 3,
-            "n_q": 4, "dep_q": 4, "generated_audio_codebooks": 2, "card": 8,
-            "num_heads": 4, "num_layers": 2, "causal": true, "context": 16,
-            "max_period": 10000, "positional_embedding": "rope",
-            "depformer_dim": 8, "depformer_dim_feedforward": 32,
-            "depformer_num_heads": 2, "depformer_num_layers": 2,
-            "depformer_context": 4, "depformer_pos_emb": "none",
-            "delays": [0, 0, 1, 0, 1]
-        }"#
-    }
-
-    fn initialize(model: &mut eager::Model, stream: &Stream) {
-        let mut names = model
-            .parameters()
-            .flatten()
-            .keys()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        names.sort();
-        let mut params = model.parameters_mut().flatten();
-        for (index, name) in names.iter().enumerate() {
-            let parameter = params.get_mut(name.as_str()).unwrap();
-            let shape = parameter.shape().to_vec();
-            let dtype = parameter.dtype();
-            **parameter = if name.ends_with("norm1.weight")
-                || name.ends_with("norm2.weight")
-                || name == "out_norm.weight"
-            {
-                ones_dtype(&shape, dtype, stream).unwrap()
-            } else if name.ends_with(".bias") {
-                zeros_dtype(&shape, dtype, stream).unwrap()
-            } else {
-                Array::full::<f32>(&shape, Array::from_f32(0.0005 * (index + 1) as f32), stream)
-                    .unwrap()
-                    .as_dtype(dtype, stream)
-                    .unwrap()
-            };
-        }
-    }
-
-    fn write_fixture(dir: &Path, model: &eager::Model) {
-        let arrays = model
-            .parameters()
-            .flatten()
-            .iter()
-            .map(|(name, value)| (name.to_string(), *value))
-            .collect::<Vec<_>>();
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
-            None,
-            dir.join("model.safetensors"),
-        )
-        .unwrap();
-        fs::write(dir.join("config.json"), config()).unwrap();
-    }
-
-    fn write_pytorch_fixture(path: &Path, model: &eager::Model, stream: &Stream) {
-        let params = model.parameters().flatten();
-        let mut direct = BTreeMap::<String, Array>::new();
-        let mut packed = BTreeMap::<String, Vec<(usize, Array)>>::new();
-        for (name, value) in params.iter() {
-            let name = name.as_ref();
-            if let Some(rest) = name.strip_prefix("audio_embs.") {
-                direct.insert(format!("emb.{rest}"), (*value).clone());
-            } else if name == "out_norm.weight" {
-                direct.insert(
-                    "out_norm.alpha".into(),
-                    value.reshape(&[1, value.dim(0)], stream).unwrap(),
-                );
-            } else if name.starts_with("text_emb.") || name.starts_with("text_linear.") {
-                direct.insert(name.to_string(), (*value).clone());
-            } else if let Some(rest) = name.strip_prefix("transformer.layers.") {
-                let source = if rest.ends_with("norm1.weight") || rest.ends_with("norm2.weight") {
-                    format!("transformer.layers.{}", rest.replace(".weight", ".alpha"))
-                } else if rest.ends_with("self_attn.in_proj.weight") {
-                    format!(
-                        "transformer.layers.{}",
-                        rest.replace(".self_attn.in_proj.weight", ".self_attn.in_proj_weight")
-                    )
-                } else {
-                    format!("transformer.layers.{rest}")
-                };
-                let transformed = if source.ends_with(".alpha") {
-                    value.reshape(&[1, value.dim(0)], stream).unwrap()
-                } else {
-                    (*value).clone()
-                };
-                direct.insert(source, transformed);
-            } else if let Some(rest) = name.strip_prefix("depformer.slices.") {
-                let (slice, rest) = rest.split_once('.').unwrap();
-                let slice = slice.parse::<usize>().unwrap();
-                if let Some(suffix) = rest.strip_prefix("emb.") {
-                    direct.insert(
-                        if slice == 0 {
-                            format!("depformer_text_emb.{suffix}")
-                        } else {
-                            format!("depformer_emb.{}.{suffix}", slice - 1)
-                        },
-                        (*value).clone(),
-                    );
-                } else if let Some(suffix) = rest.strip_prefix("linear_in.") {
-                    direct.insert(format!("depformer_in.{slice}.{suffix}"), (*value).clone());
-                } else if let Some(suffix) = rest.strip_prefix("linear_out.") {
-                    direct.insert(format!("linears.{slice}.{suffix}"), (*value).clone());
-                } else {
-                    let rest = rest.strip_prefix("transformer.layers.").unwrap();
-                    let (layer, suffix) = rest.split_once('.').unwrap();
-                    if suffix == "norm1.weight" || suffix == "norm2.weight" {
-                        if slice == 0 {
-                            direct.insert(
-                                format!(
-                                    "depformer.layers.{layer}.{}",
-                                    suffix.replace(".weight", ".alpha")
-                                ),
-                                value.reshape(&[1, value.dim(0)], stream).unwrap(),
-                            );
-                        }
-                    } else if let Some(attention) = suffix.strip_prefix("self_attn.") {
-                        let attention = if attention == "in_proj.weight" {
-                            "in_proj_weight"
-                        } else {
-                            attention
-                        };
-                        packed
-                            .entry(format!("depformer.layers.{layer}.self_attn.{attention}"))
-                            .or_default()
-                            .push((slice, (*value).clone()));
-                    } else {
-                        let gating = suffix.strip_prefix("gating.").unwrap();
-                        direct.insert(
-                            format!("depformer.layers.{layer}.gating.{slice}.{gating}"),
-                            (*value).clone(),
-                        );
-                    }
-                }
-            }
-        }
-        for (key, mut slices) in packed {
-            slices.sort_by_key(|(slice, _)| *slice);
-            let values = slices.iter().map(|(_, value)| value).collect::<Vec<_>>();
-            direct.insert(key, concatenate_axis(&values, 0, stream).unwrap());
-        }
-        let arrays = direct.into_iter().collect::<Vec<_>>();
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
-            path,
-        )
-        .unwrap();
-    }
-
-    fn fixture(gpu: &ExecutionContext) -> tempfile::TempDir {
-        let args: ModelArgs = serde_json::from_str(config()).unwrap();
-        let mut model = eager::Model::new(args, gpu.stream()).unwrap();
-        initialize(&mut model, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &model);
-        dir
-    }
-
-    #[test]
-    #[ignore = "requires an MLX runtime with a Metal device"]
-    fn realtime_session_identity_tracks_checkpoint_content_across_residency() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let source = fixture(&gpu);
-        let resident = load_realtime_model(
-            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
-            source.path(),
-        )
-        .unwrap();
-        let layerwise = load_realtime_model_with_options(
-            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
-            source.path(),
-            ModelLoadOptions::default().with_weight_residency(WeightResidency::layerwise_host(
-                LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            )),
-        )
-        .unwrap();
-
-        let request = RequestId::new(19);
-        let mut resident_scheduler =
-            RealtimeScheduler::new(&resident, SchedulerLimits::new(1, 1).unwrap()).unwrap();
-        resident_scheduler
-            .register_request(&resident, request, RealtimeSampling::greedy())
-            .unwrap();
-        let session = resident_scheduler.release_request(request).unwrap();
-
-        let mut layerwise_scheduler =
-            RealtimeScheduler::new(&layerwise, SchedulerLimits::new(1, 1).unwrap()).unwrap();
-        layerwise_scheduler
-            .register_request_with_session(&layerwise, request, session)
-            .unwrap();
-        let session = layerwise_scheduler.release_request(request).unwrap();
-
-        let changed = tempfile::tempdir().unwrap();
-        fs::copy(
-            source.path().join("config.json"),
-            changed.path().join("config.json"),
-        )
-        .unwrap();
-        let mut weights = fs::read(source.path().join("model.safetensors")).unwrap();
-        let last = weights.last_mut().unwrap();
-        *last ^= 1;
-        fs::write(changed.path().join("model.safetensors"), weights).unwrap();
-        let changed_model = load_realtime_model(
-            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
-            changed.path(),
-        )
-        .unwrap();
-        let mut changed_scheduler =
-            RealtimeScheduler::new(&changed_model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
-        let error = changed_scheduler
-            .register_request_with_session(&changed_model, request, session)
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("checkpoint artifact fingerprint"));
-    }
-
-    #[test]
-    #[ignore = "requires an MLX runtime with a Metal device"]
-    fn tensor_parallel_dense_stream_loads_realtime_static_and_groups() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let dir = fixture(&gpu);
-        let group = Group::init(false, Backend::Any).unwrap();
-        assert_eq!(group.size(), 1);
-        let topology =
-            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
-                .unwrap();
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
-        let model = load_moshi_tensor_parallel_layerwise_model(
-            dir.path(),
-            LayerWeightResidency::DenseDiskStream(options),
-            build,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let report = model.dense_stream_report().unwrap().unwrap();
-        assert!(report
-            .residency()
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().contains("moshi.temporal.")
-                || unit.id().as_str().contains("moshi.depth."))
-            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
-    }
-
-    fn assert_close(left: &Array, right: &Array) {
-        let left = left.evaluated().unwrap();
-        let right = right.evaluated().unwrap();
-        assert_eq!(left.as_array().shape(), right.as_array().shape());
-        for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
-            assert!((left - right).abs() <= 5e-5, "{left} != {right}");
-        }
-    }
-
-    fn assert_tokens_equal(left: &Array, right: &Array, stream: &Stream) {
-        let left_array = left.as_dtype(safemlx::Dtype::Int32, stream).unwrap();
-        let right_array = right.as_dtype(safemlx::Dtype::Int32, stream).unwrap();
-        let left = left_array.evaluated().unwrap();
-        let right = right_array.evaluated().unwrap();
-        assert_eq!(left.as_slice::<i32>(), right.as_slice::<i32>());
-    }
-
-    #[test]
-    #[ignore = "requires an MLX runtime with a Metal device"]
-    fn native_teacher_forced_and_realtime_cache_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let dir = fixture(&gpu);
-        let mut resident = eager::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_moshi_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let text = Array::from_slice(&[1i32], &[1, 1]);
-        let audio = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
-        let depth = Array::from_slice(&[2i32, 3], &[1, 2]);
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = layerwise.new_cache();
-        let expected = resident
-            .token_step(&text, &audio, &depth, &mut resident_cache, gpu.stream())
-            .unwrap();
-        let actual = layerwise
-            .token_step(&text, &audio, &depth, &mut layerwise_cache, gpu.stream())
-            .unwrap();
-        assert_close(&expected.text_logits, &actual.text_logits);
-        assert_close(&expected.temporal_output, &actual.temporal_output);
-        for (expected, actual) in expected.audio_logits.iter().zip(&actual.audio_logits) {
-            assert_close(expected, actual);
-        }
-
-        let mut resident_state = resident::GenerationState::new(&resident);
-        let mut layerwise_state = layerwise.new_generation_state();
-        let input = Array::from_slice(&[4i32, 5], &[1, 2]);
-        let mut resident_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
-        let mut layerwise_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
-        let mut resident_audio = (0..2)
-            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
-            .collect::<Vec<_>>();
-        let mut layerwise_audio = (0..2)
-            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
-            .collect::<Vec<_>>();
-        for _ in 0..3 {
-            let expected = resident
-                .generate_step(
-                    &mut resident_state,
-                    &input,
-                    &mut resident_text,
-                    &mut resident_audio,
-                    0.0,
-                    0.0,
-                    None,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = layerwise
-                .generate_step(
-                    &mut layerwise_state,
-                    &input,
-                    &mut layerwise_text,
-                    &mut layerwise_audio,
-                    0.0,
-                    0.0,
-                    None,
-                    gpu.stream(),
-                )
-                .unwrap();
-            assert_tokens_equal(&expected.text_token, &actual.text_token, gpu.stream());
-            assert_tokens_equal(
-                &expected.sampled_audio_tokens,
-                &actual.sampled_audio_tokens,
-                gpu.stream(),
-            );
-            assert_eq!(
-                expected.output_audio_tokens.is_some(),
-                actual.output_audio_tokens.is_some()
-            );
-        }
-        assert_eq!(resident_state.step(), layerwise_state.step());
-        let groups = layerwise.execution_group_reports().unwrap();
-        assert_eq!(groups.len(), 2);
-        assert!(groups.iter().all(|group| group.host_bytes() > 0));
-        assert!(groups.iter().all(|group| group.device_units() <= 1));
-        layerwise
-            .clear_device_group("temporal_transformer")
-            .unwrap();
-        let groups = layerwise.execution_group_reports().unwrap();
-        assert_eq!(groups[0].device_units(), 0);
-        assert!(groups[1].device_units() <= 1);
-        assert_eq!(
-            layerwise.execution.execution_groups()[0].id(),
-            "temporal_transformer"
-        );
-        assert_eq!(
-            layerwise.execution.execution_groups()[1].id(),
-            "depth_codebook_slices"
-        );
-
-        let loaded = load_realtime_model_with_options(
-            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
-            dir.path(),
-            crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(
-                crate::backend::mlx::runtime::execution::layerwise::WeightResidency::layerwise_host(
-                    LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-                ),
-            ),
-        )
-        .unwrap();
-        assert!(matches!(
-            loaded.model(),
-            crate::backend::mlx::realtime::MlxRealtimeModel::Moshi(_)
-        ));
-        assert_eq!(
-            loaded
-                .model()
-                .execution_group_reports()
-                .unwrap()
-                .unwrap()
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    #[ignore = "requires an MLX runtime with a Metal device"]
-    fn dense_stream_teacher_forced_and_realtime_multigroup_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let dir = fixture(&gpu);
-        let mut resident = eager::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
-        let mut streamed = load_moshi_layerwise_model(
-            dir.path(),
-            LayerWeightResidency::DenseDiskStream(dense),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let initial = streamed.dense_stream_report().unwrap().unwrap();
-        assert!(initial
-            .residency()
-            .units()
-            .iter()
-            .filter(|unit| {
-                ["moshi.temporal.", "moshi.depth_slice."]
-                    .iter()
-                    .any(|prefix| unit.id().as_str().starts_with(prefix))
-            })
-            .all(|unit| {
-                unit.planned_tier() == MemoryTier::Disk
-                    && !unit.host_resident()
-                    && !unit.device_resident()
-            }));
-
-        let text = Array::from_slice(&[1i32], &[1, 1]);
-        let audio = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
-        let depth = Array::from_slice(&[2i32, 3], &[1, 2]);
-        let mut resident_cache = resident.new_cache();
-        let mut streamed_cache = streamed.new_cache();
-        let expected = resident
-            .token_step(&text, &audio, &depth, &mut resident_cache, gpu.stream())
-            .unwrap();
-        let actual = streamed
-            .token_step(&text, &audio, &depth, &mut streamed_cache, gpu.stream())
-            .unwrap();
-        assert_close(&expected.text_logits, &actual.text_logits);
-        assert_close(&expected.temporal_output, &actual.temporal_output);
-        for (expected, actual) in expected.audio_logits.iter().zip(&actual.audio_logits) {
-            assert_close(expected, actual);
-        }
-
-        let mut resident_state = resident::GenerationState::new(&resident);
-        let mut streamed_state = streamed.new_generation_state();
-        let input = Array::from_slice(&[4i32, 5], &[1, 2]);
-        let mut resident_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
-        let mut streamed_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
-        let mut resident_audio = (0..2)
-            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
-            .collect::<Vec<_>>();
-        let mut streamed_audio = (0..2)
-            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
-            .collect::<Vec<_>>();
-        for _ in 0..2 {
-            let expected = resident
-                .generate_step(
-                    &mut resident_state,
-                    &input,
-                    &mut resident_text,
-                    &mut resident_audio,
-                    0.0,
-                    0.0,
-                    None,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = streamed
-                .generate_step(
-                    &mut streamed_state,
-                    &input,
-                    &mut streamed_text,
-                    &mut streamed_audio,
-                    0.0,
-                    0.0,
-                    None,
-                    gpu.stream(),
-                )
-                .unwrap();
-            assert_tokens_equal(&expected.text_token, &actual.text_token, gpu.stream());
-            assert_tokens_equal(
-                &expected.sampled_audio_tokens,
-                &actual.sampled_audio_tokens,
-                gpu.stream(),
-            );
-        }
-        assert_eq!(resident_state.step(), streamed_state.step());
-        let report = streamed.dense_stream_report().unwrap().unwrap();
-        assert!(report.decode_forwards() >= 3);
-
-        let loaded = load_realtime_model_with_options(
-            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
-            dir.path(),
-            crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(
-                crate::backend::mlx::runtime::execution::layerwise::WeightResidency::dense_disk_stream(dense),
-            ),
-        )
-        .unwrap();
-        assert!(matches!(
-            loaded.model(),
-            crate::backend::mlx::realtime::MlxRealtimeModel::Moshi(_)
-        ));
-        assert!(loaded.model().dense_stream_report().unwrap().is_some());
-    }
-
-    #[test]
-    #[ignore = "requires an MLX runtime with a Metal device"]
-    fn native_offline_encoded_sequence_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let dir = fixture(&gpu);
-        let resident = load_moshi_layerwise_model(
-            dir.path(),
-            LayerWeightResidency::FullyResident,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let layerwise = load_moshi_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let input = Array::from_slice(&[1i32, 2, 3, 4, 5, 6], &[1, 2, 3]);
-        let mut resident = RealtimeModel::new(
-            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
-            MlxRealtimeModel::Moshi(resident),
-        );
-        let mut layerwise = RealtimeModel::new(
-            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
-            MlxRealtimeModel::Moshi(layerwise),
-        );
-        let expected = generate_encoded_greedy(&mut resident, &input).unwrap();
-        let actual = generate_encoded_greedy(&mut layerwise, &input).unwrap();
-        assert_eq!(
-            expected.text_tokens.evaluated().unwrap().as_slice::<u32>(),
-            actual.text_tokens.evaluated().unwrap().as_slice::<u32>()
-        );
-        assert_eq!(
-            expected.audio_tokens.evaluated().unwrap().as_slice::<u32>(),
-            actual.audio_tokens.evaluated().unwrap().as_slice::<u32>()
-        );
-    }
-
-    #[test]
-    #[ignore = "requires an MLX runtime with a Metal device"]
-    fn pytorch_layout_forced_prompt_cache_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let args: ModelArgs = serde_json::from_str(personaplex_style_config()).unwrap();
-        let mut fixture = eager::Model::new(args.clone(), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("model.safetensors");
-        write_pytorch_fixture(&path, &fixture, gpu.stream());
-
-        let mut resident =
-            eager::load_pytorch_safetensors_model(args.clone(), &path, gpu.stream(), cpu.stream())
-                .unwrap();
-        let mut layerwise = load_with_layout(
-            &path,
-            args,
-            CheckpointLayout::Pytorch,
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut resident_state = resident::GenerationState::new(&resident);
-        let mut layerwise_state = layerwise.new_generation_state();
-        let user = Array::from_slice(&[3i32, 4], &[1, 2]);
-        let agent = Array::from_slice(&[1i32, 2], &[1, 2]);
-        let forced_text = Array::from_slice(&[5i32], &[1, 1]);
-        let mut resident_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
-        let mut layerwise_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
-        let mut resident_audio = (0..4)
-            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
-            .collect::<Vec<_>>();
-        let mut layerwise_audio = (0..4)
-            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
-            .collect::<Vec<_>>();
-
-        for forced in [true, true, false] {
-            let expected = if forced {
-                resident
-                    .generate_step_forced(
-                        &mut resident_state,
-                        &user,
-                        Some(&agent),
-                        Some(&forced_text),
-                        &mut resident_text,
-                        &mut resident_audio,
-                        0.0,
-                        0.0,
-                        None,
-                        gpu.stream(),
-                    )
-                    .unwrap()
-            } else {
-                resident
-                    .generate_step(
-                        &mut resident_state,
-                        &user,
-                        &mut resident_text,
-                        &mut resident_audio,
-                        0.0,
-                        0.0,
-                        None,
-                        gpu.stream(),
-                    )
-                    .unwrap()
-            };
-            let actual = if forced {
-                layerwise
-                    .generate_step_forced(
-                        &mut layerwise_state,
-                        &user,
-                        Some(&agent),
-                        Some(&forced_text),
-                        &mut layerwise_text,
-                        &mut layerwise_audio,
-                        0.0,
-                        0.0,
-                        None,
-                        gpu.stream(),
-                    )
-                    .unwrap()
-            } else {
-                layerwise
-                    .generate_step(
-                        &mut layerwise_state,
-                        &user,
-                        &mut layerwise_text,
-                        &mut layerwise_audio,
-                        0.0,
-                        0.0,
-                        None,
-                        gpu.stream(),
-                    )
-                    .unwrap()
-            };
-            assert_tokens_equal(&expected.text_token, &actual.text_token, gpu.stream());
-            assert_tokens_equal(
-                &expected.sampled_audio_tokens,
-                &actual.sampled_audio_tokens,
-                gpu.stream(),
-            );
-        }
-        assert_eq!(resident_state.step(), 3);
-        assert_eq!(resident_state.step(), layerwise_state.step());
-    }
 }

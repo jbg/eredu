@@ -45,9 +45,10 @@ use crate::{
         KeyValueCache,
     },
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
+        populate_module_from_lease, populate_module_from_lease_excluding,
     },
+    backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -59,8 +60,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
@@ -434,6 +434,10 @@ impl Lfm2LayerwiseModel {
         self.execution.checkpoint_store()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Runs the hybrid decoder while preserving recurrent and KV state.
     pub fn forward(
         &mut self,
@@ -551,42 +555,28 @@ impl CausalLm<Cache> for Lfm2LayerwiseModel {
 pub fn load_lfm2_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Lfm2,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("LFM2", args.weight_quantization, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = Lfm2LayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(Lfm2LayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_lfm2_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Lfm2LayerwiseModel, Error> {
-    let adapter = Lfm2LayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(Lfm2LayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -603,7 +593,6 @@ pub(crate) fn load_lfm2_tensor_parallel_model(
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -620,11 +609,6 @@ pub(crate) fn load_lfm2_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Lfm2,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     Ok(Lfm2LayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
@@ -650,9 +634,12 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
     )?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let is_moe = prepared.args.model_type == "lfm2_moe";
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             move |name| resident::translate_gguf_weight_name(name, is_moe),
             options.max_mapped_shards(),
         )?);
@@ -678,9 +665,11 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let args = prepared.args;
     let is_moe = args.model_type == "lfm2_moe";
+    let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             |name| resident::translate_gguf_weight_name(name, is_moe),
             residency.max_mapped_shards(),
         )?);
@@ -1077,6 +1066,15 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(&self.args, true)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
+    }
+
     fn quantization(
         &self,
     ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
@@ -1187,20 +1185,38 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, "model.embed_tokens", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    "model.embed_tokens",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, "model.embedding_norm", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    "model.embedding_norm",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings(head, "lm_head", store)?,
+                    build_module_binding_plan_with_recipes(
+                        head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -1649,15 +1665,14 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
                 }
             }
         }
-        let bindings = build_module_bindings_with_recipes(layer, &prefix, store, recipes)?;
-        Ok(if self.sparse_expert_cache {
-            bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("feed_forward.experts."))
-                .collect()
-        } else {
-            bindings
-        })
+        Ok(build_module_binding_plan_with_recipes_excluding(
+            layer,
+            &prefix,
+            store,
+            recipes,
+            |name| self.sparse_expert_cache && name.starts_with("feed_forward.experts."),
+        )?
+        .build_bindings(store)?)
     }
     fn parallel_layer_bindings(
         &self,
@@ -1929,7 +1944,7 @@ pub(crate) fn lfm2_expert_catalog(
         let packed_down = format!("{prefix}.down_proj");
         for expert in 0..args.num_experts as usize {
             let identity = ExpertIdentity::new(layer, expert);
-            let mut bindings = Vec::new();
+            let mut planned = Vec::new();
             if keys.contains(&packed_gate_up) && keys.contains(&packed_down) {
                 for (name, key) in [
                     ("gate_up_proj", &packed_gate_up),
@@ -1943,8 +1958,7 @@ pub(crate) fn lfm2_expert_catalog(
                             end: expert + 1,
                         },
                     );
-                    let bytes = recipe.infer(store)?.byte_len();
-                    bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                    planned.push(planned_binding(name, recipe, store)?);
                 }
                 for (name, key) in [
                     ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
@@ -1961,8 +1975,7 @@ pub(crate) fn lfm2_expert_catalog(
                                 end: expert + 1,
                             },
                         );
-                        let bytes = recipe.infer(store)?.byte_len();
-                        bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                        planned.push(planned_binding(name, recipe, store)?);
                     }
                 }
             } else if keys.contains(&format!("{prefix}.gate_proj"))
@@ -1996,8 +2009,7 @@ pub(crate) fn lfm2_expert_catalog(
                         DerivedWeightRecipe::source(packed_down.clone(), selection.clone()),
                     ),
                 ] {
-                    let bytes = recipe.infer(store)?.byte_len();
-                    bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                    planned.push(planned_binding(name, recipe, store)?);
                 }
                 for suffix in ["_scales", "_biases"] {
                     let gate = format!("{prefix}.gate_proj{suffix}");
@@ -2010,21 +2022,19 @@ pub(crate) fn lfm2_expert_catalog(
                                 DerivedWeightRecipe::source(up, selection.clone()),
                             ],
                         };
-                        let bytes = recipe.infer(store)?.byte_len();
-                        bindings.push(WeightBinding::from_recipe(
+                        planned.push(planned_binding(
                             format!("gate_up_proj{suffix}"),
                             recipe,
-                            bytes,
+                            store,
                         )?);
                     }
                     let down = format!("{packed_down}{suffix}");
                     if keys.contains(&down) {
                         let recipe = DerivedWeightRecipe::source(down, selection.clone());
-                        let bytes = recipe.infer(store)?.byte_len();
-                        bindings.push(WeightBinding::from_recipe(
+                        planned.push(planned_binding(
                             format!("down_proj{suffix}"),
                             recipe,
-                            bytes,
+                            store,
                         )?);
                     }
                 }
@@ -2063,10 +2073,12 @@ pub(crate) fn lfm2_expert_catalog(
                         },
                     ),
                 ] {
-                    let bytes = recipe.infer(store)?.byte_len();
-                    bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                    planned.push(planned_binding(name, recipe, store)?);
                 }
             }
+            let bindings = BindingPlan::new(planned)
+                .and_then(|plan| plan.build_bindings(store))
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
                     Error::UnsupportedArchitecture("LFM2 expert byte total overflowed".into())
@@ -2082,648 +2094,20 @@ pub(crate) fn lfm2_expert_catalog(
     Ok(entries)
 }
 
+fn planned_binding(
+    name: impl Into<String>,
+    recipe: DerivedWeightRecipe,
+    store: &dyn WeightStore,
+) -> Result<PlannedBinding, Error> {
+    let metadata = recipe.infer(store)?;
+    Ok(PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    })
+}
+
 /// LFM2 token generation iterator using bounded layer execution.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Lfm2LayerwiseModel, Cache, S>;
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use std::{collections::HashMap, fs, path::Path};
-
-    use safemlx::{
-        module::ModuleParameters,
-        ops::{indexing::TryIndexOp, ones_dtype, zeros_dtype},
-        Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
-    };
-
-    use super::{
-        lfm2_conv_weight_recipe, load_lfm2_expert_cache_model, load_lfm2_layerwise_model,
-        Lfm2LayerwiseAdapter, Lfm2LayerwiseModel,
-    };
-    use crate::{
-        backend::mlx::architectures::lfm2::model::{
-            self as resident, Cache, FeedForwardPolicy, LayerCache, LayerPolicy, Model, ModelArgs,
-            OperatorPolicy,
-        },
-        backend::mlx::runtime::checkpoint::{
-            quantization::AffineQuantization, recipe::DerivedWeightRecipe,
-        },
-        backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        backend::mlx::runtime::{
-            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-            execution::layerwise::{
-                load_safetensors_layerwise_model, ArchitectureAdapter, LayerWeightResidency,
-                LayerwiseLoadOptions,
-            },
-        },
-        backend::mlx::{CacheResidencyPolicy, PagedCacheOptions},
-        core::attention::LayerSchedule,
-        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
-    };
-
-    fn args(moe: bool) -> ModelArgs {
-        resident::model_args_from_config_value(&serde_json::json!({
-            "model_type": if moe { "lfm2_moe" } else { "lfm2" },
-            "vocab_size": 31,
-            "hidden_size": 12,
-            "intermediate_size": 17,
-            "num_hidden_layers": 3,
-            "num_attention_heads": 6,
-            "num_key_value_heads": 3,
-            "max_position_embeddings": 64,
-            "norm_eps": 1e-5,
-            "layer_types": ["conv", "full_attention", "conv"],
-            "conv_L_cache": 3,
-            "conv_bias": true,
-            "block_auto_adjust_ff_dim": false,
-            "tie_word_embeddings": false,
-            "moe_intermediate_size": if moe { 9 } else { 0 },
-            "num_dense_layers": if moe { 1 } else { 0 },
-            "num_experts": if moe { 2 } else { 0 },
-            "num_experts_per_tok": if moe { 1 } else { 0 },
-            "norm_topk_prob": moe,
-            "use_expert_bias": moe
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn mlx_shortconv_layout_uses_a_transpose_recipe() {
-        let recipe = lfm2_conv_weight_recipe(
-            "model.layers.0.conv.conv.weight",
-            &[2048, 3, 1],
-            &[2048, 1, 3],
-            Dtype::Float32,
-        )
-        .unwrap();
-        let DerivedWeightRecipe::Cast { input, dtype } = recipe else {
-            panic!("LFM2 convolution recipe must cast to the parameter dtype")
-        };
-        assert_eq!(dtype, Dtype::Float32);
-        assert!(matches!(
-            *input,
-            DerivedWeightRecipe::Transpose { axes, .. } if axes == [0, 2, 1]
-        ));
-    }
-
-    #[test]
-    fn bf16_mlx_shortconv_layout_loads_layerwise() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(false), execution.stream()).unwrap();
-        initialize(&mut fixture, execution.stream());
-        {
-            let mut parameters = fixture.parameters_mut().flatten();
-            for (_, parameter) in &mut parameters {
-                **parameter = parameter
-                    .as_dtype(Dtype::Bfloat16, execution.stream())
-                    .unwrap();
-            }
-            let weight = parameters
-                .get_mut("model.layers.0.conv.conv.weight")
-                .unwrap();
-            **weight = weight.swap_axes(1, 2, execution.stream()).unwrap();
-        }
-        let directory = tempfile::tempdir().unwrap();
-        write_fixture(directory.path(), &fixture, execution.stream());
-
-        let options = LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-            OffloadConfig::new(None, None, 1).unwrap(),
-        ));
-        let mut model = load_lfm2_layerwise_model(
-            directory.path(),
-            options,
-            execution.stream(),
-            weights.stream(),
-        )
-        .unwrap();
-        let mut cache = model.new_cache();
-        model
-            .forward(
-                &Array::from_slice(&[1_u32], &[1, 1]),
-                &mut cache,
-                execution.stream(),
-            )
-            .unwrap()
-            .evaluated()
-            .unwrap();
-    }
-
-    #[test]
-    fn tensor_parallel_plan_preserves_attention_and_packed_moe_geometry() {
-        use crate::core::cache::{LayerCachePolicy, StateTensorDimension};
-
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        for (rank, query_width, kv_width, dense_width, expert_width, local_kv_heads) in
-            [(0, 8, 4, 9, 5, 2_u32), (1, 4, 2, 8, 4, 1_u32)]
-        {
-            let topology = MlxParallelContext::for_rank(
-                rank,
-                2,
-                1,
-                1,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap();
-            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-            let mut adapter = Lfm2LayerwiseAdapter::new(args(true), execution.stream()).unwrap();
-            assert!(adapter.prompt_cache_model_identity(Some(topology)).is_err());
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            for (name, expected) in [
-                (
-                    "model.layers.1.self_attn.q_proj.weight",
-                    vec![query_width, 12],
-                ),
-                ("model.layers.1.self_attn.k_proj.weight", vec![kv_width, 12]),
-                (
-                    "model.layers.0.feed_forward.w1.weight",
-                    vec![dense_width, 12],
-                ),
-                (
-                    "model.layers.0.feed_forward.w2.weight",
-                    vec![12, dense_width],
-                ),
-                (
-                    "model.layers.1.feed_forward.experts.gate_up_proj",
-                    vec![2, 2 * expert_width, 12],
-                ),
-                (
-                    "model.layers.1.feed_forward.experts.down_proj",
-                    vec![2, 12, expert_width],
-                ),
-                ("model.layers.0.conv.in_proj.weight", vec![18, 12]),
-                ("model.layers.0.conv.in_proj.bias", vec![18]),
-                ("model.layers.0.conv.conv.weight", vec![6, 1, 3]),
-                ("model.layers.0.conv.conv.bias", vec![6]),
-                ("model.layers.0.conv.out_proj.weight", vec![12, 6]),
-                ("model.layers.0.conv.out_proj.bias", vec![12]),
-            ] {
-                assert_eq!(layout.tensor(name).unwrap().local_shape(), expected);
-            }
-
-            adapter
-                .configure_parallel_static(context, &layout, execution.stream())
-                .unwrap();
-            let identity = adapter.prompt_cache_model_identity(Some(topology)).unwrap();
-            let assert_convolution = |policy: &LayerCachePolicy| {
-                let LayerCachePolicy::FixedState { tensors } = policy else {
-                    panic!("LFM2 convolution layer must persist fixed state")
-                };
-                assert_eq!(
-                    tensors[0].shape,
-                    vec![
-                        StateTensorDimension::Batch,
-                        StateTensorDimension::fixed(2).unwrap(),
-                        StateTensorDimension::fixed(6).unwrap(),
-                    ]
-                );
-            };
-            assert_convolution(identity.layer_layout.get(0).unwrap());
-            let LayerCachePolicy::KeyValue {
-                num_key_value_heads,
-                head_dim,
-                ..
-            } = identity.layer_layout.get(1).unwrap()
-            else {
-                panic!("LFM2 attention layer must persist KV state")
-            };
-            assert_eq!(num_key_value_heads.get(), local_kv_heads);
-            assert_eq!(head_dim.get(), 2);
-            assert_convolution(identity.layer_layout.get(2).unwrap());
-        }
-    }
-
-    #[test]
-    fn quantized_lfm2_groups_share_aligned_attention_dense_and_expert_ranges() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let quantization = AffineQuantization::new(32, 4).unwrap().into();
-        let mut args = args(true);
-        args.hidden_size = 96;
-        args.dense_intermediate_size = 96;
-        args.num_attention_heads = 6;
-        args.num_key_value_heads = 3;
-        args.moe_intermediate_size = 96;
-        args.quantized_weight_configs = Some(HashMap::from([
-            ("model.layers.0.conv.in_proj.weight".into(), quantization),
-            ("model.layers.0.conv.out_proj.weight".into(), quantization),
-            ("model.layers.0.feed_forward.w2.weight".into(), quantization),
-            (
-                "model.layers.1.self_attn.out_proj.weight".into(),
-                quantization,
-            ),
-            (
-                "model.layers.1.feed_forward.experts.down_proj".into(),
-                quantization,
-            ),
-        ]));
-
-        for (rank, query_width, kv_width, local_width, packed_width, scale_width) in
-            [(0, 64, 32, 64, 8, 2), (1, 32, 16, 32, 4, 1)]
-        {
-            let topology = MlxParallelContext::for_rank(
-                rank,
-                2,
-                1,
-                1,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap();
-            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-            let adapter = Lfm2LayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            for (name, expected) in [
-                (
-                    "model.layers.1.self_attn.q_proj.weight",
-                    vec![query_width, 96],
-                ),
-                ("model.layers.1.self_attn.k_proj.weight", vec![kv_width, 96]),
-                (
-                    "model.layers.0.feed_forward.w1.weight",
-                    vec![local_width, 96],
-                ),
-                (
-                    "model.layers.0.feed_forward.w2.inner.weight",
-                    vec![96, packed_width],
-                ),
-                (
-                    "model.layers.0.feed_forward.w2.scales",
-                    vec![96, scale_width],
-                ),
-                (
-                    "model.layers.1.feed_forward.experts.gate_up_proj",
-                    vec![2, 2 * local_width, 96],
-                ),
-                (
-                    "model.layers.1.feed_forward.experts.down_proj",
-                    vec![2, 96, packed_width],
-                ),
-                (
-                    "model.layers.1.feed_forward.experts.down_proj_scales",
-                    vec![2, 96, scale_width],
-                ),
-                (
-                    "model.layers.0.conv.in_proj.inner.weight",
-                    vec![3 * local_width, 12],
-                ),
-                (
-                    "model.layers.0.conv.in_proj.inner.bias",
-                    vec![3 * local_width],
-                ),
-                ("model.layers.0.conv.conv.weight", vec![local_width, 1, 3]),
-                ("model.layers.0.conv.conv.bias", vec![local_width]),
-                (
-                    "model.layers.0.conv.out_proj.inner.weight",
-                    vec![96, packed_width],
-                ),
-                ("model.layers.0.conv.out_proj.inner.bias", vec![96]),
-                ("model.layers.0.conv.out_proj.scales", vec![96, scale_width]),
-            ] {
-                assert_eq!(layout.tensor(name).unwrap().local_shape(), expected);
-            }
-        }
-    }
-
-    fn initialize(model: &mut Model, stream: &Stream) {
-        for (name, parameter) in model.parameters_mut().flatten() {
-            let shape = parameter.shape().to_vec();
-            let dtype = parameter.dtype();
-            *parameter = if name.ends_with("norm.weight") {
-                ones_dtype(&shape, dtype, stream).unwrap()
-            } else {
-                zeros_dtype(&shape, dtype, stream).unwrap()
-            };
-        }
-    }
-
-    fn write_fixture(dir: &Path, model: &Model, stream: &Stream) {
-        let params = model.parameters().flatten();
-        let mut arrays = Vec::<(String, Array)>::new();
-        for (name, value) in params {
-            let name =
-                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
-            if name.ends_with("feed_forward.experts.gate_up_proj") {
-                let prefix = name.trim_end_matches(".gate_up_proj");
-                for expert in 0..model.args.num_experts {
-                    arrays.push((
-                        format!("{prefix}.{expert}.w1.weight"),
-                        value
-                            .try_index_device(
-                                (expert, ..model.args.moe_intermediate_size, ..),
-                                stream,
-                            )
-                            .unwrap(),
-                    ));
-                    arrays.push((
-                        format!("{prefix}.{expert}.w3.weight"),
-                        value
-                            .try_index_device(
-                                (expert, model.args.moe_intermediate_size.., ..),
-                                stream,
-                            )
-                            .unwrap(),
-                    ));
-                }
-            } else if name.ends_with("feed_forward.experts.down_proj") {
-                let prefix = name.trim_end_matches(".down_proj");
-                for expert in 0..model.args.num_experts {
-                    arrays.push((
-                        format!("{prefix}.{expert}.w2.weight"),
-                        value.try_index_device((expert, .., ..), stream).unwrap(),
-                    ));
-                }
-            } else {
-                arrays.push((name, value.clone()));
-            }
-        }
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
-            dir.join("model.safetensors"),
-        )
-        .unwrap();
-        let num_dense_layers = if model.args.model_type == "lfm2_moe" {
-            model
-                .args
-                .layer_schedule
-                .iter()
-                .position(|policy| policy.feed_forward == resident::FeedForwardPolicy::SparseMoe)
-                .unwrap_or(model.args.layer_schedule.len())
-        } else {
-            0
-        };
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "model_type": model.args.model_type,
-                "vocab_size": model.args.vocab_size,
-                "hidden_size": model.args.hidden_size,
-                "intermediate_size": model.args.dense_intermediate_size,
-                "num_hidden_layers": model.args.num_hidden_layers,
-                "num_attention_heads": model.args.num_attention_heads,
-                "num_key_value_heads": model.args.num_key_value_heads,
-                "max_position_embeddings": model.args.max_position_embeddings,
-                "norm_eps": model.args.norm_eps,
-                "layer_types": model.args.layer_schedule.iter().map(|policy| match policy.operator {
-                    resident::OperatorPolicy::CausalConvolution => "conv",
-                    resident::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full) => "full_attention",
-                    resident::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Sliding { .. }) => unreachable!("validated LFM2 test schedule"),
-                }).collect::<Vec<_>>(),
-                "conv_L_cache": model.args.conv_l_cache,
-                "conv_bias": model.args.conv_bias,
-                "block_auto_adjust_ff_dim": false,
-                "tie_word_embeddings": model.args.tie_word_embeddings,
-                "moe_intermediate_size": model.args.moe_intermediate_size,
-                "num_dense_layers": num_dense_layers,
-                "num_experts": model.args.num_experts,
-                "num_experts_per_tok": model.args.num_experts_per_tok,
-                "norm_topk_prob": model.args.norm_topk_prob,
-                "use_expert_bias": model.args.use_expert_bias
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn assert_close(left: &Array, right: &Array) {
-        let left = left.evaluated().unwrap();
-        let right = right.evaluated().unwrap();
-        assert_eq!(left.as_array().shape(), right.as_array().shape());
-        for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
-            assert!((left - right).abs() <= 3e-5, "{left} != {right}");
-        }
-    }
-
-    fn parity(moe: bool, depth: usize, dense_stream: bool) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(moe), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, gpu.stream());
-
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = if dense_stream {
-            LayerWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth).unwrap(),
-            )
-        } else {
-            LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                OffloadConfig::new(None, None, depth).unwrap(),
-            ))
-        };
-        let mut layerwise =
-            load_lfm2_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
-        if dense_stream {
-            let report = layerwise.dense_stream_report().unwrap().unwrap();
-            assert!(report
-                .residency()
-                .units()
-                .iter()
-                .filter(|unit| unit.id().as_str().starts_with("lfm2.layer."))
-                .all(|unit| {
-                    unit.planned_tier() == MemoryTier::Disk
-                        && !unit.host_resident()
-                        && !unit.device_resident()
-                }));
-        }
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = Cache { layers: Vec::new() };
-        let paged_options = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
-            .unwrap()
-            .with_full_attention(true);
-        let mut paged_cache = layerwise
-            .new_cache_with_options(CacheResidencyPolicy::Paged(paged_options))
-            .unwrap();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-            Array::from_slice(&[4u32], &[1, 1]),
-            Array::from_slice(&[5u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(&tokens, Some(&mut resident_cache), false, gpu.stream())
-                .unwrap();
-            let actual = layerwise
-                .forward(&tokens, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            let paged = layerwise
-                .forward(&tokens, &mut paged_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-            assert_close(&paged, &expected);
-            for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
-                let expected_offset = match expected {
-                    LayerCache::Attention(cache) => {
-                        crate::backend::mlx::runtime::cache::KeyValueCache::offset(cache)
-                    }
-                    LayerCache::Conv(cache) => cache.offset,
-                };
-                let actual_offset = match actual {
-                    LayerCache::Attention(cache) => {
-                        crate::backend::mlx::runtime::cache::KeyValueCache::offset(cache)
-                    }
-                    LayerCache::Conv(cache) => cache.offset,
-                };
-                assert_eq!(expected_offset, actual_offset);
-            }
-            if !dense_stream {
-                let report = layerwise.residency_report().unwrap();
-                let layers = report
-                    .units()
-                    .iter()
-                    .filter(|unit| unit.id().as_str().starts_with("lfm2.layer."))
-                    .collect::<Vec<_>>();
-                assert!(layers.iter().all(|unit| unit.host_resident()));
-                assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
-                assert!(report
-                    .units()
-                    .iter()
-                    .filter(|unit| unit.device_resident() && !layers.contains(unit))
-                    .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
-            }
-        }
-        let report = layerwise
-            .cache_residency_report(&paged_cache)
-            .unwrap()
-            .expect("LFM2 paged cache report");
-        assert_eq!(report.logical_cached_tokens, 5);
-        assert!(report.block_seals > 0);
-    }
-
-    #[test]
-    fn lfm2_dense_hybrid_layerwise_prefill_and_cached_decode_parity() {
-        parity(false, 1, false);
-        parity(false, 2, false);
-    }
-
-    #[test]
-    fn lfm2_split_moe_hybrid_layerwise_prefill_and_cached_decode_parity() {
-        parity(true, 1, false);
-    }
-
-    #[test]
-    fn arbitrary_feed_forward_schedule_matches_resident_execution() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut custom_args = args(true);
-        custom_args.layer_schedule = LayerSchedule::new(
-            3,
-            vec![
-                LayerPolicy {
-                    operator: OperatorPolicy::CausalConvolution,
-                    feed_forward: FeedForwardPolicy::SparseMoe,
-                },
-                LayerPolicy {
-                    operator: OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full),
-                    feed_forward: FeedForwardPolicy::Dense,
-                },
-                LayerPolicy {
-                    operator: OperatorPolicy::CausalConvolution,
-                    feed_forward: FeedForwardPolicy::SparseMoe,
-                },
-            ],
-        )
-        .unwrap();
-        let mut resident = Model::new(custom_args.clone(), gpu.stream()).unwrap();
-        assert!(resident.model.layers[0].feed_forward.is_moe);
-        assert!(!resident.model.layers[1].feed_forward.is_moe);
-        assert!(resident.model.layers[2].feed_forward.is_moe);
-        initialize(&mut resident, gpu.stream());
-        let directory = tempfile::tempdir().unwrap();
-        write_fixture(directory.path(), &resident, gpu.stream());
-
-        let adapter = Lfm2LayerwiseAdapter::new(custom_args, gpu.stream()).unwrap();
-        let execution = load_safetensors_layerwise_model(
-            directory.path(),
-            adapter,
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut layerwise = Lfm2LayerwiseModel { execution };
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = Cache { layers: Vec::new() };
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(&tokens, Some(&mut resident_cache), false, gpu.stream())
-                .unwrap();
-            let actual = layerwise
-                .forward(&tokens, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-        assert_eq!(resident_cache.offset(), 3);
-        assert_eq!(layerwise_cache.offset(), 3);
-    }
-
-    #[test]
-    fn lfm2_dense_stream_hybrid_prefill_and_cached_decode_parity() {
-        parity(false, 1, true);
-    }
-
-    #[test]
-    fn lfm2_sparse_expert_cache_prefill_and_decode_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(true), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, gpu.stream());
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options =
-            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
-                .unwrap();
-        let mut cached = load_lfm2_expert_cache_model(
-            dir.path(),
-            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                OffloadConfig::new(None, None, 1).unwrap(),
-            )),
-            options,
-            None,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut resident_cache = resident.new_cache();
-        let mut cached_cache = Cache { layers: Vec::new() };
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(&tokens, Some(&mut resident_cache), false, gpu.stream())
-                .unwrap();
-            let actual = cached
-                .forward(&tokens, &mut cached_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-        let report = cached.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.owned_experts, 4);
-        assert!(report.prefill.requested_routes > 0);
-        assert!(report.decode.requested_routes > 0);
-        assert!(report.prefill.compact_banks > 1);
-        crate::backend::mlx::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
-            dir.path(),
-            options,
-            crate::core::ModelKind::Lfm2,
-            report.owned_experts / 2,
-            gpu.stream(),
-            cpu.stream(),
-        );
-    }
-}

@@ -12,7 +12,7 @@ use safemlx::{
     module::{Module, ModuleParameters, Param},
     ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
-    Array, Stream,
+    Array, Dtype, Stream,
 };
 
 use crate::core::cache::{
@@ -48,14 +48,15 @@ use crate::{
     },
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
-        canonical_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
+        canonical_checkpoint_name, is_materialized_module_parameter, populate_module_from_lease,
+        populate_module_from_lease_excluding, ModuleBindingPlan,
     },
     backend::mlx::runtime::checkpoint::store::{
         GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend,
     },
     backend::mlx::runtime::checkpoint::{
+        binding_plan::{BindingPlan, PlannedBinding},
         quantization::{should_quantize_on_load, WeightQuantization},
         recipe::DerivedWeightRecipe,
     },
@@ -67,8 +68,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
         LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
@@ -472,6 +472,10 @@ impl QwenHybridLayerwiseModel {
         self.execution.adapter().args()
     }
 
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
+    }
+
     pub(crate) fn bind_parallel_topology(
         &mut self,
         topology: crate::backend::mlx::MlxParallelContext,
@@ -602,6 +606,10 @@ impl QwenHybridLayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Runs the shared hybrid decoder while preserving recurrent and KV state.
@@ -1078,17 +1086,12 @@ impl crate::backend::mlx::architectures::qwen::hybrid::mtp::QwenMtpTarget
 pub fn load_qwen3_next_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Qwen3Next,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -1098,6 +1101,7 @@ pub fn load_qwen3_next_layerwise_model(
         args,
         QwenHybridFamily::Qwen3Next,
         options,
+        quantization,
         stream,
         weights_stream,
     )
@@ -1113,7 +1117,6 @@ pub(crate) fn load_qwen3_next_tensor_parallel_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1136,11 +1139,6 @@ pub(crate) fn load_qwen3_next_tensor_parallel_model(
         }
         return Ok(model);
     }
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Qwen3Next,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -1160,17 +1158,12 @@ pub(crate) fn load_qwen3_next_tensor_parallel_model(
 pub fn load_qwen35_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Qwen35,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let (args, image_token_id, video_token_id, vision) =
         resident::get_qwen3_5_model_args(model_dir)?;
     load_qwen_hybrid_layerwise_model_with_vision(
@@ -1181,42 +1174,10 @@ pub fn load_qwen35_layerwise_model(
         video_token_id,
         vision,
         options,
+        quantization,
         stream,
         weights_stream,
     )
-}
-
-pub(crate) fn execute_transformed_qwen_hybrid_model(
-    model: resident::Model,
-    quantization: crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<QwenHybridLayerwiseModel, Error> {
-    let mut args = model.args.clone();
-    args.quantization = Some(quantization);
-    let family = if args.model_type == "qwen3_next" {
-        QwenHybridFamily::Qwen3Next
-    } else {
-        QwenHybridFamily::Qwen35
-    };
-    let adapter = QwenHybridLayerwiseAdapter::new(
-        args,
-        family,
-        model.image_token_id,
-        model.video_token_id,
-        model.vision_args.clone(),
-        stream,
-    )?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(QwenHybridLayerwiseModel {
-        execution: load_layerwise_model(
-            store,
-            adapter,
-            LayerWeightResidency::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    })
 }
 
 /// Loads a Qwen3.5 dense or MoE checkpoint through the generalized tensor-parallel engine.
@@ -1229,7 +1190,6 @@ pub(crate) fn load_qwen35_tensor_parallel_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1253,11 +1213,6 @@ pub(crate) fn load_qwen35_tensor_parallel_model(
         }
         return Ok(model);
     }
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Qwen35,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let (args, _, _, vision) = resident::get_qwen3_5_model_args(model_dir)?;
     if vision.is_some() {
         return Err(Error::Parallel("the token-only Qwen3.5 TP loader does not accept a vision tower; use the multimodal execution-group loader".into()));
@@ -1321,9 +1276,12 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
     } else {
         QwenHybridFamily::Qwen35
     };
+    let gguf_variant = qwen_hybrid_gguf_variant(&prepared.args, is_next);
     let store = qwen_hybrid_gguf_store(
         checkpoint,
         mmproj,
+        &prepared.args,
+        gguf_variant,
         prepared.modalities.vision_config.as_ref(),
         options.max_mapped_shards(),
     )?;
@@ -1376,9 +1334,12 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     } else {
         QwenHybridFamily::Qwen35
     };
+    let gguf_variant = qwen_hybrid_gguf_variant(&args, is_next);
     let store = qwen_hybrid_gguf_store(
         checkpoint,
         mmproj,
+        &args,
+        gguf_variant,
         modalities.vision_config.as_ref(),
         residency.max_mapped_shards(),
     )?;
@@ -1424,13 +1385,18 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
 pub(crate) fn qwen_hybrid_gguf_store(
     checkpoint: &GgufCheckpoint,
     mmproj: Option<&resident::Qwen35MmprojGguf>,
+    args: &resident::ModelArgs,
+    variant: super::checkpoint::GgufVariant,
     vision_config: Option<&VisionConfig>,
     max_mapped_shards: usize,
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let text_plan = super::checkpoint::gguf_plan(args, checkpoint, variant)
+        .map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
         .add_checkpoint(
             checkpoint.clone(),
+            &text_plan,
             resident::qwen35_translate_gguf_weight_name,
         )?;
     if let Some(mmproj) = mmproj {
@@ -1441,18 +1407,35 @@ pub(crate) fn qwen_hybrid_gguf_store(
                 )
             })?
             .deepstack_layers();
-        builder = builder.add_checkpoint(mmproj.checkpoint.clone(), move |name| {
-            let translated =
-                crate::backend::mlx::architectures::qwen::vl::model::translate_qwen3_vl_mmproj_name(
-                    name, &deepstack,
-                );
-            translated
-                .strip_prefix("model.")
-                .unwrap_or(&translated)
-                .to_string()
-        })?;
+        let vision = vision_config.expect("vision geometry checked above");
+        let projector_plan = super::checkpoint::projector_gguf_plan(vision, args.hidden_size)
+            .map_err(Error::UnsupportedArchitecture)?;
+        builder =
+            builder.add_checkpoint(mmproj.checkpoint.clone(), &projector_plan, move |name| {
+                let translated =
+                    crate::backend::mlx::architectures::qwen::vl::model::translate_qwen3_vl_mmproj_name(
+                        name, &deepstack,
+                    );
+                translated
+                    .strip_prefix("model.")
+                    .unwrap_or(&translated)
+                    .to_string()
+            })?;
     }
     Ok(Arc::new(builder.build()?))
+}
+
+fn qwen_hybrid_gguf_variant(
+    args: &resident::ModelArgs,
+    is_next: bool,
+) -> super::checkpoint::GgufVariant {
+    if is_next {
+        super::checkpoint::GgufVariant::Qwen3Next
+    } else if args.num_experts > 0 {
+        super::checkpoint::GgufVariant::Qwen35Moe
+    } else {
+        super::checkpoint::GgufVariant::Qwen35
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1521,12 +1504,6 @@ pub fn load_qwen3_next_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Qwen3Next,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -1561,12 +1538,6 @@ pub fn load_qwen35_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Qwen35,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let (args, image_token_id, video_token_id, vision) =
         resident::get_qwen3_5_model_args(model_dir)?;
     if !args.is_moe() {
@@ -1613,17 +1584,8 @@ fn load_qwen_hybrid_sparse_model(
         stream,
     )?;
     source_adapter.sparse_expert_cache = true;
-    let quantize_on_load = quantization
-        .map(|requested| {
-            should_quantize_on_load(
-                "Qwen hybrid independent expert cache",
-                args.quantization,
-                requested,
-            )
-            .map(|required| required.then_some(requested))
-        })
-        .transpose()?
-        .flatten();
+    let quantize_on_load =
+        resolve_on_load_quantization(&args, quantization, "Qwen hybrid independent expert cache")?;
     let store = open_safetensors_weight_store(model_dir, non_expert.max_mapped_shards())?;
     let mut execution = load_layerwise_model_with_quantization(
         store,
@@ -1725,6 +1687,7 @@ fn load_qwen_hybrid_layerwise_model(
     args: ModelArgs,
     family: QwenHybridFamily,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1736,6 +1699,7 @@ fn load_qwen_hybrid_layerwise_model(
         None,
         None,
         options,
+        quantization,
         stream,
         weights_stream,
     )
@@ -1750,9 +1714,12 @@ fn load_qwen_hybrid_layerwise_model_with_vision(
     video_token_id: Option<i32>,
     vision_config: Option<VisionConfig>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
+    let options = options.into();
+    let quantize_on_load = resolve_on_load_quantization(&args, quantization, "Qwen hybrid")?;
     let adapter = QwenHybridLayerwiseAdapter::new(
         args,
         family,
@@ -1761,15 +1728,34 @@ fn load_qwen_hybrid_layerwise_model_with_vision(
         vision_config,
         stream,
     )?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(QwenHybridLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
+        execution: load_layerwise_model_with_quantization(
+            store,
             adapter,
             options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
     })
+}
+
+fn resolve_on_load_quantization(
+    args: &ModelArgs,
+    requested: Option<WeightQuantization>,
+    architecture: &str,
+) -> Result<Option<WeightQuantization>, Error> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if args.uses_fp8() {
+        return Err(Error::Quantization(format!(
+            "{architecture} on-load quantization requires floating-point weights; the checkpoint uses native FP8 weights"
+        )));
+    }
+    should_quantize_on_load(architecture, args.quantization, requested)
+        .map(|required| required.then_some(requested))
 }
 
 /// Shared adapter for recurrent linear-attention and full-attention Qwen blocks.
@@ -1892,7 +1878,8 @@ impl QwenHybridLayerwiseAdapter {
         let embedding = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.quantization,
+            args.quantization_for("model.embed_tokens.weight")
+                .or(args.quantization),
             stream,
         )?;
         let norm = Qwen3NextRmsNorm::new(args.hidden_size, args.rms_norm_eps, stream)?;
@@ -1903,7 +1890,8 @@ impl QwenHybridLayerwiseAdapter {
                 common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.hidden_size,
                     args.vocab_size,
-                    args.quantization,
+                    args.quantization_for("lm_head.weight")
+                        .or(args.quantization),
                     stream,
                 )?,
             )
@@ -2135,13 +2123,13 @@ impl QwenHybridLayerwiseAdapter {
         project_logits_maybe_quantized(&mut self.lm_head, &mut self.embedding, &hidden, stream)
     }
 
-    fn recipes_for_module(
+    fn binding_plan_for_module(
         &self,
         module: &impl ModuleParameters,
         prefix: &str,
         store: &dyn WeightStore,
         layer_index: Option<usize>,
-    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
+    ) -> Result<ModuleBindingPlan, Error> {
         let normalized = normalized_checkpoint_keys(store);
         let keys = store.keys();
         let mut recipes = BTreeMap::new();
@@ -2173,7 +2161,11 @@ impl QwenHybridLayerwiseAdapter {
             )?;
         }
 
-        for local_name in module.parameters().flatten().keys() {
+        let parameters = module.parameters().flatten();
+        for (local_name, parameter) in &parameters {
+            if !is_materialized_module_parameter(local_name, parameter, &parameters) {
+                continue;
+            }
             if recipes.contains_key(local_name.as_ref()) {
                 continue;
             }
@@ -2199,13 +2191,12 @@ impl QwenHybridLayerwiseAdapter {
                 DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
             );
         }
-        Ok(recipes)
+        Ok(build_module_binding_plan_with_recipes(
+            module, prefix, store, recipes,
+        )?)
     }
 
-    fn mtp_recipes(
-        &self,
-        store: &dyn WeightStore,
-    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
+    fn mtp_binding_plan(&self, store: &dyn WeightStore) -> Result<ModuleBindingPlan, Error> {
         let mtp = self.mtp.as_ref().ok_or_else(|| {
             Error::UnsupportedArchitecture("Qwen hybrid model has no MTP module".into())
         })?;
@@ -2224,7 +2215,13 @@ impl QwenHybridLayerwiseAdapter {
                 )?;
             }
         }
-        for local_name in mtp.parameters().flatten().keys() {
+        let parameters = mtp.parameters().flatten();
+        for (local_name, parameter) in &parameters {
+            if !is_materialized_module_parameter(local_name, parameter, &parameters)
+                || (self.sparse_expert_cache && local_name.contains(".mlp.experts."))
+            {
+                continue;
+            }
             if recipes.contains_key(local_name.as_ref()) {
                 continue;
             }
@@ -2246,7 +2243,13 @@ impl QwenHybridLayerwiseAdapter {
                 DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
             );
         }
-        Ok(recipes)
+        Ok(build_module_binding_plan_with_recipes_excluding(
+            mtp,
+            "mtp",
+            store,
+            recipes,
+            |name| self.sparse_expert_cache && name.contains(".mlp.experts."),
+        )?)
     }
 }
 
@@ -2433,19 +2436,27 @@ fn add_fused_projection_recipes(
                 (format!("linear_attn.in_proj_qkv.{suffix}"), vec![0, 1, 2]),
                 (format!("linear_attn.in_proj_z.{suffix}"), vec![3]),
             ] {
+                let selected = DerivedWeightRecipe::source(
+                    raw.clone(),
+                    TensorSelection::Indices {
+                        axis: 0,
+                        indices: grouped_component_indices(
+                            self::usize_from_i32(args.linear_num_key_heads)?,
+                            &qkvz_widths,
+                            &components,
+                        )?,
+                    },
+                );
                 recipes.insert(
                     local,
-                    DerivedWeightRecipe::source(
-                        raw.clone(),
-                        TensorSelection::Indices {
-                            axis: 0,
-                            indices: grouped_component_indices(
-                                self::usize_from_i32(args.linear_num_key_heads)?,
-                                &qkvz_widths,
-                                &components,
-                            )?,
-                        },
-                    ),
+                    if suffix == "weight" {
+                        selected
+                    } else {
+                        DerivedWeightRecipe::Cast {
+                            input: Box::new(selected),
+                            dtype: Dtype::Float32,
+                        }
+                    },
                 );
             }
         }
@@ -2455,19 +2466,27 @@ fn add_fused_projection_recipes(
                 (format!("linear_attn.in_proj_b.{suffix}"), 0),
                 (format!("linear_attn.in_proj_a.{suffix}"), 1),
             ] {
+                let selected = DerivedWeightRecipe::source(
+                    raw.clone(),
+                    TensorSelection::Indices {
+                        axis: 0,
+                        indices: grouped_component_indices(
+                            usize_from_i32(args.linear_num_key_heads)?,
+                            &[ba_width, ba_width],
+                            &[component],
+                        )?,
+                    },
+                );
                 recipes.insert(
                     local,
-                    DerivedWeightRecipe::source(
-                        raw.clone(),
-                        TensorSelection::Indices {
-                            axis: 0,
-                            indices: grouped_component_indices(
-                                usize_from_i32(args.linear_num_key_heads)?,
-                                &[ba_width, ba_width],
-                                &[component],
-                            )?,
-                        },
-                    ),
+                    if suffix == "weight" {
+                        selected
+                    } else {
+                        DerivedWeightRecipe::Cast {
+                            input: Box::new(selected),
+                            dtype: Dtype::Float32,
+                        }
+                    },
                 );
             }
         }
@@ -2960,8 +2979,16 @@ fn qwen_hybrid_recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 /// Input mode for typed prefill and cached text decode.
@@ -3342,6 +3369,19 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        let variant = match self.family {
+            QwenHybridFamily::Qwen3Next => super::checkpoint::SafetensorsVariant::Qwen3Next,
+            QwenHybridFamily::Qwen35 => super::checkpoint::SafetensorsVariant::Qwen35,
+        };
+        super::checkpoint::safetensors_plan(&self.args, self.vision_config.as_ref(), variant)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
+    }
+
     fn quantization(
         &self,
     ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
@@ -3440,49 +3480,31 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
-                    &self.embedding,
-                    "model.embed_tokens",
-                    store,
-                    self.recipes_for_module(&self.embedding, "model.embed_tokens", store, None)?,
-                )?,
+                self.binding_plan_for_module(&self.embedding, "model.embed_tokens", store, None)?
+                    .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
-                    &self.norm,
-                    "model.norm",
-                    store,
-                    self.recipes_for_module(&self.norm, "model.norm", store, None)?,
-                )?,
+                self.binding_plan_for_module(&self.norm, "model.norm", store, None)?
+                    .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings_with_recipes(
-                        head,
-                        "lm_head",
-                        store,
-                        self.recipes_for_module(head, "lm_head", store, None)?,
-                    )?,
+                    self.binding_plan_for_module(head, "lm_head", store, None)?
+                        .build_bindings(store)?,
                 )?);
             }
         }
         if select(MTP_STATIC_UNIT) {
-            if let Some(mtp) = &self.mtp {
+            if self.mtp.is_some() {
                 units.push(StaticUnitBindings::new(
                     MTP_STATIC_UNIT,
-                    build_module_bindings_with_recipes_excluding(
-                        mtp,
-                        "mtp",
-                        store,
-                        self.mtp_recipes(store)?,
-                        |name| self.sparse_expert_cache && name.contains(".mlp.experts."),
-                    )?,
+                    self.mtp_binding_plan(store)?.build_bindings(store)?,
                 )?);
             }
         }
@@ -3490,12 +3512,8 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             if let Some(vision) = &self.vision {
                 units.push(StaticUnitBindings::new(
                     VISION_STATIC_UNIT,
-                    build_module_bindings_with_recipes(
-                        vision,
-                        "visual",
-                        store,
-                        self.recipes_for_module(vision, "visual", store, None)?,
-                    )?,
+                    self.binding_plan_for_module(vision, "visual", store, None)?
+                        .build_bindings(store)?,
                 )?);
             }
         }
@@ -4146,17 +4164,14 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
-        let bindings = build_module_bindings_with_recipes(
-            layer,
-            &prefix,
-            store,
-            self.recipes_for_module(
+        let bindings = self
+            .binding_plan_for_module(
                 layer,
                 &prefix,
                 store,
                 (self.execution_group_name(group)? == "text_decoder").then_some(index),
-            )?,
-        )?;
+            )?
+            .build_bindings(store)?;
         Ok(
             if self.sparse_expert_cache && self.execution_group_name(group)? == "text_decoder" {
                 bindings
@@ -4618,779 +4633,3 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
 /// Shared Qwen hybrid token generation iterator using bounded layer execution.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, QwenHybridLayerwiseModel, Cache, S>;
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use std::{fs, path::Path};
-
-    use safemlx::{
-        module::ModuleParameters,
-        ops::{indexing::TryIndexOp, zeros_dtype},
-        Array, Device, DeviceType, ExecutionContext, Stream,
-    };
-
-    use super::{
-        load_qwen35_expert_cache_model, load_qwen35_layerwise_model,
-        load_qwen3_next_expert_cache_model, load_qwen3_next_layerwise_model, QwenHybridFamily,
-        QwenHybridLayer, QwenHybridLayerwiseAdapter,
-    };
-    use crate::{
-        backend::mlx::architectures::qwen::{
-            hybrid::{
-                qwen3_5::{self as resident, Cache, LayerCache, Model, ModelArgs, ModelInput},
-                qwen3_next,
-            },
-            vl::vision::VisionConfig,
-        },
-        backend::mlx::nn::generation::CausalLm,
-        backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-        backend::mlx::runtime::execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
-        backend::mlx::runtime::media::input as runtime_input,
-        backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        backend::mlx::{CacheResidencyPolicy, PagedCacheOptions},
-        core::residency::{OffloadConfig, ResidencyPolicy},
-    };
-
-    fn config(next: bool, moe: bool) -> serde_json::Value {
-        serde_json::json!({
-            "model_type": if next { "qwen3_next" } else if moe { "qwen3_5_moe_text" } else { "qwen3_5_text" },
-            "vocab_size": 32,
-            "hidden_size": 16,
-            "num_hidden_layers": 2,
-            "mtp_num_hidden_layers": 1,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 4,
-            "max_position_embeddings": 64,
-            "rms_norm_eps": 1e-5,
-            "tie_word_embeddings": false,
-            "linear_conv_kernel_dim": 3,
-            "linear_key_head_dim": 4,
-            "linear_value_head_dim": 4,
-            "linear_num_key_heads": 2,
-            "linear_num_value_heads": 4,
-            "intermediate_size": if moe { 0 } else { 32 },
-            "moe_intermediate_size": if moe { 8 } else { 0 },
-            "shared_expert_intermediate_size": if moe { 8 } else { 0 },
-            "num_experts_per_tok": if moe { 1 } else { 0 },
-            "num_experts": if moe { 2 } else { 0 },
-            "norm_topk_prob": moe,
-            "layer_types": ["linear_attention", "full_attention"]
-        })
-    }
-
-    fn args(next: bool, moe: bool) -> ModelArgs {
-        resident::parse_qwen3_5_config_value(config(next, moe))
-            .unwrap()
-            .0
-    }
-
-    #[test]
-    fn tensor_parallel_plan_preserves_recurrent_and_packed_moe_geometry() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let model_args = args(false, true);
-        let adapter = QwenHybridLayerwiseAdapter::new(
-            model_args,
-            QwenHybridFamily::Qwen35,
-            None,
-            None,
-            None,
-            execution.stream(),
-        )
-        .unwrap();
-        let context = ParallelBuildContext::new(
-            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap(),
-            ShardingPolicy::Require,
-        );
-        let mut planner = context.planner();
-        adapter
-            .register_parallel_parameters(context, &mut planner, execution.stream())
-            .unwrap();
-        let (_, layout) = planner.finish().unwrap();
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.linear_attn.in_proj_qkv.weight")
-                .unwrap()
-                .local_shape(),
-            &[16, 16]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.1.self_attn.q_proj.weight")
-                .unwrap()
-                .local_shape(),
-            &[16, 16]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.mlp.experts.gate_up_proj")
-                .unwrap()
-                .local_shape(),
-            &[2, 8, 16]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.mlp.experts.down_proj")
-                .unwrap()
-                .local_shape(),
-            &[2, 16, 4]
-        );
-        assert_eq!(
-            layout
-                .tensor("mtp.layers.0.self_attn.q_proj.weight")
-                .unwrap()
-                .local_shape(),
-            &[16, 16]
-        );
-        assert_eq!(
-            layout
-                .tensor("mtp.layers.0.mlp.experts.gate_up_proj")
-                .unwrap()
-                .local_shape(),
-            &[2, 8, 16]
-        );
-        assert_eq!(
-            layout
-                .tensor("mtp.layers.0.mlp.experts.down_proj")
-                .unwrap()
-                .local_shape(),
-            &[2, 16, 4]
-        );
-    }
-
-    #[test]
-    fn tensor_parallel_plan_derives_uneven_hybrid_geometry_for_both_families() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        for next in [false, true] {
-            let mut rank_geometry = Vec::new();
-            for rank in 0..2 {
-                let mut model_args = args(next, true);
-                model_args.mtp_num_hidden_layers = 0;
-                model_args.num_attention_heads = 6;
-                model_args.num_key_value_heads = 3;
-                model_args.linear_num_key_heads = 3;
-                model_args.linear_num_value_heads = 6;
-                model_args.moe_intermediate_size = 5;
-                model_args.shared_expert_intermediate_size = 7;
-                let mut adapter = QwenHybridLayerwiseAdapter::new(
-                    model_args,
-                    if next {
-                        QwenHybridFamily::Qwen3Next
-                    } else {
-                        QwenHybridFamily::Qwen35
-                    },
-                    None,
-                    None,
-                    None,
-                    execution.stream(),
-                )
-                .unwrap();
-                let context = ParallelBuildContext::new(
-                    MlxParallelContext::for_rank(
-                        rank,
-                        2,
-                        1,
-                        1,
-                        DeviceAssignment::new(DeviceType::Cpu, 0),
-                    )
-                    .unwrap(),
-                    ShardingPolicy::Require,
-                );
-                let mut planner = context.planner();
-                adapter
-                    .register_parallel_parameters(context, &mut planner, execution.stream())
-                    .unwrap();
-                let (_, layout) = planner.finish().unwrap();
-                adapter
-                    .configure_parallel_static(context, &layout, execution.stream())
-                    .unwrap();
-                let local_layer = adapter
-                    .new_parallel_layer(0, 0, &layout, execution.stream())
-                    .unwrap();
-                let QwenHybridLayer::Text(local_layer) = local_layer else {
-                    panic!("Qwen hybrid TP must construct a text layer")
-                };
-                let linear = local_layer.linear_attn.as_ref().unwrap();
-                assert_eq!(linear.num_k_heads, if rank == 0 { 2 } else { 1 });
-                assert_eq!(linear.num_v_heads, if rank == 0 { 4 } else { 2 });
-                let resident::FeedForward::Moe(moe) = &local_layer.mlp else {
-                    panic!("Qwen hybrid MoE fixture must construct experts")
-                };
-                assert_eq!(moe.experts.intermediate_dim, if rank == 0 { 3 } else { 2 });
-                rank_geometry.push(adapter.parallel_geometry.clone().unwrap());
-            }
-
-            assert_eq!(
-                rank_geometry[0][0],
-                resident::ParallelLayerGeometry {
-                    attention: resident::ParallelAttentionGeometry::Linear {
-                        key_heads: 2,
-                        value_heads: 4,
-                    },
-                    feed_forward: resident::ParallelFeedForwardGeometry::Moe {
-                        routed_intermediate: 3,
-                        shared_intermediate: 4,
-                    },
-                }
-            );
-            assert_eq!(
-                rank_geometry[1][0],
-                resident::ParallelLayerGeometry {
-                    attention: resident::ParallelAttentionGeometry::Linear {
-                        key_heads: 1,
-                        value_heads: 2,
-                    },
-                    feed_forward: resident::ParallelFeedForwardGeometry::Moe {
-                        routed_intermediate: 2,
-                        shared_intermediate: 3,
-                    },
-                }
-            );
-            assert_eq!(
-                rank_geometry[0][1].attention,
-                resident::ParallelAttentionGeometry::Full {
-                    query_heads: 4,
-                    kv_heads: 2,
-                }
-            );
-            assert_eq!(
-                rank_geometry[1][1].attention,
-                resident::ParallelAttentionGeometry::Full {
-                    query_heads: 2,
-                    kv_heads: 1,
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn qwen3_next_fused_sources_accept_runtime_local_parallel_selections() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let mut model_args = args(true, true);
-        model_args.mtp_num_hidden_layers = 0;
-        model_args.num_attention_heads = 6;
-        model_args.num_key_value_heads = 3;
-        model_args.linear_num_key_heads = 3;
-        model_args.linear_num_value_heads = 6;
-        model_args.moe_intermediate_size = 5;
-        model_args.shared_expert_intermediate_size = 7;
-        let mut fixture = Model::new(model_args.clone(), None, None, None, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, true, gpu.stream());
-        let store = super::open_safetensors_weight_store(dir.path(), 1).unwrap();
-
-        for rank in 0..2 {
-            let mut adapter = QwenHybridLayerwiseAdapter::new(
-                model_args.clone(),
-                QwenHybridFamily::Qwen3Next,
-                None,
-                None,
-                None,
-                gpu.stream(),
-            )
-            .unwrap();
-            let context = ParallelBuildContext::new(
-                MlxParallelContext::for_rank(
-                    rank,
-                    2,
-                    1,
-                    1,
-                    DeviceAssignment::new(DeviceType::Gpu, 0),
-                )
-                .unwrap(),
-                ShardingPolicy::Require,
-            );
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, gpu.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            adapter
-                .configure_parallel_static(context, &layout, gpu.stream())
-                .unwrap();
-            let layer = adapter
-                .new_parallel_layer(0, 0, &layout, gpu.stream())
-                .unwrap();
-            let bindings = adapter
-                .parallel_layer_bindings(0, 0, &layer, store.as_ref(), &layout, gpu.stream())
-                .unwrap();
-            assert!(bindings.iter().any(|binding| {
-                binding.name() == "linear_attn.in_proj_qkv.weight" && binding.recipe().is_some()
-            }));
-            assert!(bindings.iter().any(|binding| {
-                binding.name() == "linear_attn.in_proj_z.weight" && binding.recipe().is_some()
-            }));
-        }
-    }
-
-    fn initialize(model: &mut Model, stream: &Stream) {
-        for (_, parameter) in model.parameters_mut().flatten() {
-            *parameter = zeros_dtype(parameter.shape(), parameter.dtype(), stream).unwrap();
-        }
-    }
-
-    fn write_fixture(dir: &Path, model: &Model, next: bool, stream: &Stream) {
-        let params = model.parameters().flatten();
-        let mut arrays = Vec::<(String, Array)>::new();
-        for (name, value) in params {
-            let name =
-                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
-            if next && name.ends_with("mlp.experts.gate_up_proj") {
-                let prefix = name.trim_end_matches(".gate_up_proj");
-                for expert in 0..model.args.num_experts {
-                    arrays.push((
-                        format!("{prefix}.{expert}.gate_proj.weight"),
-                        value
-                            .try_index_device(
-                                (expert, ..model.args.moe_intermediate_size, ..),
-                                stream,
-                            )
-                            .unwrap(),
-                    ));
-                    arrays.push((
-                        format!("{prefix}.{expert}.up_proj.weight"),
-                        value
-                            .try_index_device(
-                                (expert, model.args.moe_intermediate_size.., ..),
-                                stream,
-                            )
-                            .unwrap(),
-                    ));
-                }
-                continue;
-            }
-            if next && name.ends_with("mlp.experts.down_proj") {
-                let prefix = name.trim_end_matches(".down_proj");
-                for expert in 0..model.args.num_experts {
-                    arrays.push((
-                        format!("{prefix}.{expert}.down_proj.weight"),
-                        value.try_index_device((expert, .., ..), stream).unwrap(),
-                    ));
-                }
-                continue;
-            }
-            let fused_part = next
-                && [
-                    "linear_attn.in_proj_qkv.weight",
-                    "linear_attn.in_proj_z.weight",
-                    "linear_attn.in_proj_b.weight",
-                    "linear_attn.in_proj_a.weight",
-                ]
-                .iter()
-                .any(|suffix| name.ends_with(suffix));
-            if !fused_part {
-                arrays.push((name, value.clone()));
-            }
-        }
-        if next {
-            let qkvz_rows = model.args.linear_num_key_heads
-                * (2 * model.args.linear_key_head_dim
-                    + 2 * model.args.linear_num_value_heads * model.args.linear_value_head_dim
-                        / model.args.linear_num_key_heads);
-            let ba_rows = 2 * model.args.linear_num_value_heads;
-            arrays.push((
-                "model.layers.0.linear_attn.in_proj_qkvz.weight".into(),
-                Array::zeros::<f32>(&[qkvz_rows, model.args.hidden_size], stream).unwrap(),
-            ));
-            arrays.push((
-                "model.layers.0.linear_attn.in_proj_ba.weight".into(),
-                Array::zeros::<f32>(&[ba_rows, model.args.hidden_size], stream).unwrap(),
-            ));
-        }
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
-            dir.join("model.safetensors"),
-        )
-        .unwrap();
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&config(next, model.args.is_moe())).unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn assert_close(left: &Array, right: &Array) {
-        let left = left.evaluated().unwrap();
-        let right = right.evaluated().unwrap();
-        assert_eq!(left.as_array().shape(), right.as_array().shape());
-        for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
-            assert!((left - right).abs() <= 3e-5, "{left} != {right}");
-        }
-    }
-
-    fn parity(next: bool, moe: bool, depth: usize) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(next, moe), None, None, None, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, next, gpu.stream());
-
-        let mut resident = if next {
-            qwen3_next::load_qwen3_next_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
-        } else {
-            resident::load_qwen3_5_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
-        };
-        let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
-        let mut layerwise = if next {
-            load_qwen3_next_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream())
-                .unwrap()
-        } else {
-            load_qwen35_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap()
-        };
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
-        let paged_options = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
-            .unwrap()
-            .with_full_attention(true);
-        let mut paged_cache = layerwise
-            .new_cache_with_options(CacheResidencyPolicy::Paged(paged_options))
-            .unwrap();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-            Array::from_slice(&[4u32], &[1, 1]),
-            Array::from_slice(&[5u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: None,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = layerwise
-                .forward(&tokens, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            let paged = layerwise
-                .forward(&tokens, &mut paged_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-            assert_close(&paged, &expected);
-            for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
-                let expected_offset = match expected {
-                    LayerCache::FullAttention(cache) => {
-                        crate::backend::mlx::runtime::cache::KeyValueCache::offset(cache)
-                    }
-                    LayerCache::LinearAttention(cache) => cache.offset,
-                };
-                let actual_offset = match actual {
-                    LayerCache::FullAttention(cache) => {
-                        crate::backend::mlx::runtime::cache::KeyValueCache::offset(cache)
-                    }
-                    LayerCache::LinearAttention(cache) => cache.offset,
-                };
-                assert_eq!(expected_offset, actual_offset);
-            }
-            let report = layerwise.residency_report().unwrap();
-            let layers = report
-                .units()
-                .iter()
-                .filter(|unit| unit.id().as_str().starts_with("qwen_hybrid.layer."))
-                .collect::<Vec<_>>();
-            assert!(layers.iter().all(|unit| unit.host_resident()));
-            assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
-            assert!(report
-                .units()
-                .iter()
-                .filter(|unit| unit.device_resident() && !layers.contains(unit))
-                .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
-        }
-        let report = layerwise
-            .cache_residency_report(&paged_cache)
-            .unwrap()
-            .expect("Qwen hybrid paged cache report");
-        assert_eq!(report.logical_cached_tokens, 5);
-        assert!(report.block_seals > 0);
-
-        let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let parts = [runtime_input::InputPart::text_token_ids(&prompt)];
-        let mtp_config = crate::core::generation::MtpConfig {
-            max_tokens: 3,
-            max_draft_tokens: 1,
-            temperature: 0.0,
-            eos_token_ids: Vec::new(),
-        };
-        let mut resident_cache = resident.new_cache();
-        let mut resident_executor =
-            crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut resident);
-        let (expected, expected_stats) =
-            crate::backend::mlx::speculative::scheduler::generate_tokens(
-                &mut resident_executor,
-                &mut resident_cache,
-                runtime_input::ModelInput::new(&parts),
-                &mtp_config,
-                None,
-                &mut crate::backend::mlx::runtime::generation::sampler::DefaultSampler,
-                crate::backend::mlx::speculative::MtpExecutionStreams::single(gpu.stream()),
-                crate::core::generation::MtpSchedulerOptions::default(),
-                |_| Ok(()),
-            )
-            .unwrap();
-        let mut layerwise_cache = layerwise.new_cache();
-        let mut layerwise_executor =
-            crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut layerwise);
-        let (actual, actual_stats) = crate::backend::mlx::speculative::scheduler::generate_tokens(
-            &mut layerwise_executor,
-            &mut layerwise_cache,
-            runtime_input::ModelInput::new(&parts),
-            &mtp_config,
-            None,
-            &mut crate::backend::mlx::runtime::generation::sampler::DefaultSampler,
-            crate::backend::mlx::speculative::MtpExecutionStreams::single(gpu.stream()),
-            crate::core::generation::MtpSchedulerOptions::default(),
-            |_| Ok(()),
-        )
-        .unwrap();
-        assert_eq!(actual, expected);
-        assert_eq!(actual_stats.rounds, expected_stats.rounds);
-        assert_eq!(actual_stats.accepted_tokens, expected_stats.accepted_tokens);
-    }
-
-    #[test]
-    fn qwen3_next_fused_hybrid_layerwise_parity() {
-        parity(true, false, 1);
-        parity(true, false, 2);
-        parity(true, true, 1);
-    }
-
-    #[test]
-    fn qwen35_dense_and_moe_hybrid_layerwise_parity() {
-        parity(false, false, 1);
-        parity(false, true, 1);
-    }
-
-    fn sparse_expert_cache_parity(next: bool) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(next, true), None, None, None, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, next, gpu.stream());
-        let mut resident = if next {
-            qwen3_next::load_qwen3_next_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
-        } else {
-            resident::load_qwen3_5_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
-        };
-        let options =
-            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
-                .unwrap();
-        let mut cached = if next {
-            load_qwen3_next_expert_cache_model(
-                dir.path(),
-                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                    OffloadConfig::new(None, None, 1).unwrap(),
-                )),
-                options,
-                None,
-                gpu.stream(),
-                cpu.stream(),
-            )
-            .unwrap()
-        } else {
-            load_qwen35_expert_cache_model(
-                dir.path(),
-                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                    OffloadConfig::new(None, None, 1).unwrap(),
-                )),
-                options,
-                None,
-                gpu.stream(),
-                cpu.stream(),
-            )
-            .unwrap()
-        };
-        let mut resident_cache = resident.new_cache();
-        let mut cached_cache = Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: None,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = cached
-                .forward(&tokens, &mut cached_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-        let report = cached.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.owned_experts, 6);
-        assert!(report.prefill.requested_routes > 0);
-        assert!(report.decode.requested_routes > 0);
-        assert!(report.prefill.compact_banks > 1);
-        crate::backend::mlx::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
-            dir.path(),
-            options,
-            if next {
-                crate::core::ModelKind::Qwen3Next
-            } else {
-                crate::core::ModelKind::Qwen35
-            },
-            report.owned_experts / 2,
-            gpu.stream(),
-            cpu.stream(),
-        );
-    }
-
-    #[test]
-    fn qwen_hybrid_sparse_expert_cache_prefill_and_decode_parity() {
-        sparse_expert_cache_parity(true);
-        sparse_expert_cache_parity(false);
-    }
-
-    #[test]
-    fn qwen35_multimodal_vision_and_text_group_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let vision = VisionConfig {
-            layer_schedule: crate::core::attention::LayerSchedule::new(
-                1,
-                vec![crate::backend::mlx::architectures::qwen::vl::vision::VisionLayerPolicy {
-                    attention: crate::backend::mlx::architectures::qwen::vl::vision::VisionAttentionPolicy::Full,
-                    deepstack_merger: None,
-                }],
-            )
-            .unwrap(),
-            hidden_size: 8,
-            hidden_act: "silu".into(),
-            intermediate_size: 4,
-            num_heads: 2,
-            num_position_embeddings: 16,
-            in_channels: 3,
-            patch_size: 2,
-            spatial_merge_size: 2,
-            temporal_patch_size: 1,
-            window_size: 8,
-            out_hidden_size: 16,
-            quantized_weight_configs: Default::default(),
-        };
-        let mut fixture = Model::new(
-            args(false, false),
-            Some(42),
-            Some(43),
-            Some(vision.clone()),
-            gpu.stream(),
-        )
-        .unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        let arrays = fixture
-            .parameters()
-            .flatten()
-            .iter()
-            .map(|(name, value)| {
-                (
-                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
-                        name,
-                    ),
-                    (*value).clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
-            dir.path().join("model.safetensors"),
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "model_type": "qwen3_5",
-                "image_token_id": 42,
-                "video_token_id": 43,
-                "text_config": config(false, false),
-                "vision_config": {
-                    "depth": 1,
-                    "hidden_size": 8,
-                    "hidden_act": "silu",
-                    "intermediate_size": 4,
-                    "num_heads": 2,
-                    "num_position_embeddings": 16,
-                    "in_channels": 3,
-                    "patch_size": 2,
-                    "spatial_merge_size": 2,
-                    "temporal_patch_size": 1,
-                    "window_size": 8,
-                    "out_hidden_size": 16,
-                    "fullatt_block_indexes": [0],
-                    "deepstack_visual_indexes": [],
-                },
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let mut resident =
-            resident::load_qwen3_5_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_qwen35_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let graph = layerwise.execution.execution_graph();
-        assert_eq!(
-            graph
-                .groups()
-                .iter()
-                .map(|group| group.id())
-                .collect::<Vec<_>>(),
-            ["vision_encoder", "text_decoder"]
-        );
-        assert_eq!(graph.dependencies(1), Some([0].as_slice()));
-        assert_eq!(graph.output(), 1);
-        let text = runtime_input::token_ids_array(&[1, 2], gpu.stream()).unwrap();
-        let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
-        let pixels = Array::zeros::<f32>(&[8, 12], gpu.stream()).unwrap();
-        let parts = [
-            runtime_input::InputPart::text_token_ids(&text),
-            runtime_input::InputPart::image_tensor(
-                &pixels,
-                runtime_input::InputMetadata::qwen_grid_thw(&grid),
-            ),
-        ];
-        let typed = runtime_input::ModelInput::new(&parts);
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = layerwise.new_cache();
-        let expected = resident
-            .prefill_input_logits(typed, &mut resident_cache, gpu.stream())
-            .unwrap();
-        let actual = layerwise
-            .prefill_input_logits(typed, &mut layerwise_cache, gpu.stream())
-            .unwrap();
-        assert_close(&actual, &expected);
-        assert_eq!(resident_cache.offset(), layerwise_cache.offset());
-        let report = layerwise.residency_report().unwrap();
-        assert!(report
-            .units()
-            .iter()
-            .any(|unit| unit.id().as_str().starts_with("qwen_hybrid.vision.")));
-    }
-}

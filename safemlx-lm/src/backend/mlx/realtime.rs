@@ -393,28 +393,21 @@ fn materialize_realtime_model(
         )));
     }
     let execution = options.weight_residency.layers();
-    let model = if let Some(quantization) = options.quantization {
-        let transformed = match kind {
-            RealtimeModelKind::Moshi => {
-                moshi::load_model_quantized(model_dir, quantization, stream, weights_stream)?
-            }
-            RealtimeModelKind::PersonaPlex => {
-                personaplex::load_model_quantized(model_dir, quantization, stream, weights_stream)?
-            }
-        };
-        layerwise::execute_transformed_model(transformed, stream, weights_stream)?
-    } else {
-        match kind {
-            RealtimeModelKind::Moshi => {
-                layerwise::load_moshi_layerwise_model(model_dir, execution, stream, weights_stream)?
-            }
-            RealtimeModelKind::PersonaPlex => layerwise::load_personaplex_layerwise_model(
-                model_dir,
-                execution,
-                stream,
-                weights_stream,
-            )?,
-        }
+    let model = match kind {
+        RealtimeModelKind::Moshi => layerwise::load_moshi_layerwise_model(
+            model_dir,
+            execution,
+            options.quantization,
+            stream,
+            weights_stream,
+        )?,
+        RealtimeModelKind::PersonaPlex => layerwise::load_personaplex_layerwise_model(
+            model_dir,
+            execution,
+            options.quantization,
+            stream,
+            weights_stream,
+        )?,
     };
     let model = model.with_artifact_identity(realtime_artifact_identity(model_dir, kind)?);
     Ok(match kind {

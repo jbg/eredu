@@ -866,6 +866,7 @@ fn production_gemma4_templates_render_exact_thinking_tool_history_and_prompts() 
                                 max_calls: std::num::NonZeroUsize::new(2),
                             },
                             enable_thinking: Some(enable_thinking),
+                            reasoning_effort: None,
                             allow_unparsed_reasoning: false,
                             add_generation_prompt,
                             extra_template_kwargs: serde_json::Map::from_iter([(

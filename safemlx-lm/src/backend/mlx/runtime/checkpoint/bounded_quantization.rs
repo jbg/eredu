@@ -370,8 +370,16 @@ impl WeightStore for BoundedQuantizedWeightStore {
             .collect()
     }
 
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.source.unclaimed_checkpoint_keys()
+    }
+
     fn is_authoritative_materialized_key(&self, key: &str) -> bool {
         self.is_transformed(key)
+    }
+
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        self.source.is_checkpoint_contract_resolved()
     }
 
     fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
@@ -1643,7 +1651,7 @@ mod tests {
             &HashMap::new(),
         );
         let source = Arc::new(
-            GgufWeightStore::new(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
+            GgufWeightStore::new_for_test(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
                 name.to_string()
             })
             .unwrap(),
@@ -1696,7 +1704,7 @@ mod tests {
             &HashMap::new(),
         );
         let source = Arc::new(
-            GgufWeightStore::new(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
+            GgufWeightStore::new_for_test(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
                 name.to_string()
             })
             .unwrap(),
@@ -1755,7 +1763,7 @@ mod tests {
             &HashMap::new(),
         );
         let source = Arc::new(
-            GgufWeightStore::new(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
+            GgufWeightStore::new_for_test(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
                 name.to_string()
             })
             .unwrap(),
@@ -1841,7 +1849,7 @@ mod tests {
             &HashMap::new(),
         );
         let source = Arc::new(
-            GgufWeightStore::new(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
+            GgufWeightStore::new_for_test(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
                 name.to_string()
             })
             .unwrap(),

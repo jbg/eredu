@@ -45,10 +45,11 @@ use crate::{
     },
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         packed_companion_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
+    backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -562,6 +563,10 @@ impl InklingLayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Runs the text decoder while preserving KV and convolution state.
@@ -1090,16 +1095,6 @@ pub fn load_inkling_layerwise_model(
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    let load_options = quantization
-        .map(crate::backend::mlx::ModelLoadOptions::with_quantization)
-        .unwrap_or_default()
-        .with_weight_residency(residency);
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Inkling,
-        model_dir,
-        load_options,
-    )?;
     let args = resident::get_model_args(model_dir)?;
     let quantize_on_load = quantization
         .map(|requested| {
@@ -1136,7 +1131,6 @@ pub(crate) fn load_inkling_tensor_parallel_layerwise_model(
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1155,11 +1149,6 @@ pub(crate) fn load_inkling_tensor_parallel_layerwise_model(
         )
         .map(|(model, _)| model);
     }
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Inkling,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
     Ok(InklingLayerwiseModel {
@@ -1192,7 +1181,12 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint_with_mmproj(checkpoint, metadata, mmproj)?;
-    let store = inkling_gguf_store(checkpoint, mmproj, options.max_mapped_shards())?;
+    let store = inkling_gguf_store(
+        checkpoint,
+        mmproj,
+        &prepared.args,
+        options.max_mapped_shards(),
+    )?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
         InklingLayerwiseAdapter::new(prepared.args, stream)?,
@@ -1225,7 +1219,12 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint_with_mmproj(checkpoint, metadata, mmproj)?;
-    let store = inkling_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
+    let store = inkling_gguf_store(
+        checkpoint,
+        mmproj,
+        &prepared.args,
+        residency.max_mapped_shards(),
+    )?;
     let args = prepared.args;
     if let Some(expert_options) = residency.expert_cache() {
         return Ok((
@@ -1255,14 +1254,23 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
 pub(crate) fn inkling_gguf_store(
     checkpoint: &GgufCheckpoint,
     mmproj: Option<&resident::InklingMmprojGguf>,
+    args: &ModelArgs,
     max_mapped_shards: usize,
 ) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
-        .add_checkpoint(checkpoint.clone(), resident::translate_gguf_weight_name)?;
+        .add_checkpoint(
+            checkpoint.clone(),
+            &text_plan,
+            resident::translate_gguf_weight_name,
+        )?;
     if let Some(mmproj) = mmproj {
+        let projector_plan =
+            super::checkpoint::mmproj_gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
         builder = builder.add_checkpoint(
             mmproj.checkpoint.clone(),
+            &projector_plan,
             resident::translate_mmproj_weight_name,
         )?;
     }
@@ -1320,12 +1328,6 @@ pub fn load_inkling_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::Inkling,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     if args.text_config.n_routed_experts <= 0
         || !args
@@ -2384,6 +2386,15 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
+    }
+
     fn quantization(&self) -> Option<WeightQuantization> {
         self.args.text_config.weight_quantization
     }
@@ -2501,57 +2512,62 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.embedding,
                     "model.embed_tokens",
                     store,
                     self.recipes_for_module(&self.embedding, "model.embed_tokens", store)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(EMBED_NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBED_NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.embed_norm,
                     "model.embed_norm",
                     store,
                     self.recipes_for_module(&self.embed_norm, "model.embed_norm", store)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.norm,
                     "model.norm",
                     store,
                     self.recipes_for_module(&self.norm, "model.norm", store)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             units.push(StaticUnitBindings::new(
                 HEAD_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.lm_head,
                     "lm_head",
                     store,
                     self.recipes_for_module(&self.lm_head, "lm_head", store)?,
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(MTP_UNIT) {
             if let Some(mtp) = &self.mtp {
                 units.push(StaticUnitBindings::new(
                     MTP_UNIT,
-                    build_module_bindings_with_recipes(
+                    build_module_binding_plan_with_recipes(
                         mtp,
                         "mtp",
                         store,
                         self.recipes_for_module(mtp, "mtp", store)?,
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2559,12 +2575,13 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             if let Some(audio) = &self.audio {
                 units.push(StaticUnitBindings::new(
                     AUDIO_UNIT,
-                    build_module_bindings_with_recipes(
+                    build_module_binding_plan_with_recipes(
                         audio,
                         "audio",
                         store,
                         self.recipes_for_module(audio, "audio", store)?,
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2572,12 +2589,13 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             if let Some(norm) = &self.vision_norm {
                 units.push(StaticUnitBindings::new(
                     VISION_NORM_UNIT,
-                    build_module_bindings_with_recipes(
+                    build_module_binding_plan_with_recipes(
                         norm,
                         "visual.final_norm",
                         store,
                         self.recipes_for_module(norm, "visual.final_norm", store)?,
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -3497,15 +3515,16 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
         let recipes = self.recipes_for_module(layer, &prefix, store)?;
-        let bindings = if self.sparse_expert_cache
-            && self.execution_group_name(group)? == "text_decoder"
-        {
-            build_module_bindings_with_recipes_excluding(layer, &prefix, store, recipes, |name| {
-                name.starts_with("moe.experts.")
-            })?
-        } else {
-            build_module_bindings_with_recipes(layer, &prefix, store, recipes)?
-        };
+        let external_experts =
+            self.sparse_expert_cache && self.execution_group_name(group)? == "text_decoder";
+        let bindings = build_module_binding_plan_with_recipes_excluding(
+            layer,
+            &prefix,
+            store,
+            recipes,
+            |name| external_experts && name.starts_with("moe.experts."),
+        )?
+        .build_bindings(store)?;
         bindings
             .into_iter()
             .map(|binding| {
@@ -4054,11 +4073,19 @@ pub(crate) fn inkling_expert_catalog(
                     })?;
                 recipes.push(("down_proj_biases", selected(raw)));
             }
-            let mut bindings = Vec::new();
+            let mut planned = Vec::with_capacity(recipes.len());
             for (name, recipe) in recipes {
-                let bytes = recipe.infer(store)?.byte_len();
-                bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
+                let metadata = recipe.infer(store)?;
+                planned.push(PlannedBinding {
+                    target_name: name.into(),
+                    expected_shape: metadata.shape().to_vec(),
+                    expected_dtype: metadata.dtype().clone(),
+                    recipe,
+                });
             }
+            let bindings = BindingPlan::new(planned)
+                .and_then(|plan| plan.build_bindings(store))
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
                     Error::UnsupportedArchitecture("Inkling expert byte total overflowed".into())
@@ -4077,1300 +4104,3 @@ pub(crate) fn inkling_expert_catalog(
 /// Inkling text token generation using bounded layer execution.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, InklingLayerwiseModel, Cache, S>;
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use std::{collections::HashMap, fs, path::Path};
-
-    use safemlx::{
-        distributed::{Backend, Group},
-        module::ModuleParameters,
-        ops::{indexing::TryIndexOp, ones_dtype, stack_axis, zeros_dtype},
-        Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
-    };
-
-    use super::{
-        load_inkling_expert_cache_model, load_inkling_layerwise_model,
-        load_inkling_tensor_parallel_layerwise_model, InklingLayer, InklingLayerwiseAdapter,
-        InklingLayerwiseModel,
-    };
-    use crate::{
-        backend::mlx::architectures::inkling::model::{self as resident, Model, ModelArgs},
-        backend::mlx::nn::generation::CausalLm,
-        backend::mlx::runtime::cache::{residency::CacheResidencyPolicy, KeyValueCache},
-        backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-        backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-        backend::mlx::runtime::execution::layerwise::{
-            load_layerwise_model_with_quantization, transformed_module_weight_store,
-            ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
-            LoadTimeQuantizableAdapter,
-        },
-        backend::mlx::runtime::media::input as runtime_input,
-        backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        backend::mlx::runtime::residency::expert_cache::{
-            ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch,
-        },
-        backend::mlx::PagedCacheOptions,
-        core::{
-            cache::{PromptCacheDescriptor, PromptCacheOptions},
-            residency::{OffloadConfig, ResidencyPolicy},
-        },
-    };
-
-    fn config() -> serde_json::Value {
-        serde_json::json!({
-            "model_type": "inkling_mm_model",
-            "eos_token_id": 1,
-            "text_config": {
-                "torch_dtype": "bfloat16",
-                "hidden_size": 16,
-                "num_hidden_layers": 3,
-                "vocab_size": 32,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 1,
-                "head_dim": 8,
-                "swa_num_attention_heads": 2,
-                "swa_num_key_value_heads": 1,
-                "swa_head_dim": 8,
-                "sliding_window_size": 4,
-                "layer_types": ["full_attention", "sliding_attention", "full_attention"],
-                "dense_mlp_idx": 1,
-                "sconv_kernel_size": 3,
-                "d_rel": 4,
-                "rel_extent": 8,
-                "intermediate_size": 8,
-                "dense_intermediate_size": 16,
-                "moe_intermediate_size": 8,
-                "n_routed_experts": 2,
-                "num_experts_per_tok": 1,
-                "n_shared_experts": 1,
-                "route_scale": 1.0,
-                "use_sconv": true,
-                "use_embed_norm": true,
-                "shared_expert_sink": true,
-                "use_gate_bias": true,
-                "norm_after_topk": true,
-                "use_global_scale": true,
-                "gate_activation": "sigmoid",
-                "hidden_act": "silu",
-                "attention_dropout": 0.0,
-                "q_bias": false,
-                "o_bias": false,
-                "logits_mup_width_multiplier": 2.0,
-                "unpadded_vocab_size": 30
-            }
-        })
-    }
-
-    fn args() -> ModelArgs {
-        resident::model_args_from_config_value(&config()).unwrap()
-    }
-
-    #[test]
-    fn published_mtp_geometry_builds_distinct_full_and_local_draft_state() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut value = config();
-        value["mtp_config"] = serde_json::json!({
-            "num_nextn_predict_layers": 3,
-            "chain_hidden_post_norm": true,
-            "local_layer_ids": [1],
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 8,
-            "intermediate_size": 32,
-            "sconv_kernel_size": 3,
-            "rel_extent": 32,
-            "d_rel": 32
-        });
-        let args = resident::model_args_from_config_value(&value).unwrap();
-        let adapter = InklingLayerwiseAdapter::new(args, execution.stream()).unwrap();
-        let mtp = adapter.mtp.as_ref().unwrap();
-        assert_eq!(mtp.len(), 3);
-        assert_eq!(mtp.policies[0], crate::AttentionPolicy::Full);
-        assert!(matches!(
-            mtp.policies[1],
-            crate::AttentionPolicy::Sliding { .. }
-        ));
-        assert_eq!(adapter.new_cache().mtp_layers.len(), 3);
-    }
-
-    fn quantizable_config() -> serde_json::Value {
-        let mut value = config();
-        value["text_config"]["hidden_size"] = 32.into();
-        value["text_config"]["vocab_size"] = 64.into();
-        value["text_config"]["num_attention_heads"] = 4.into();
-        value["text_config"]["num_key_value_heads"] = 2.into();
-        value["text_config"]["head_dim"] = 8.into();
-        value["text_config"]["swa_num_attention_heads"] = 4.into();
-        value["text_config"]["swa_num_key_value_heads"] = 2.into();
-        value["text_config"]["swa_head_dim"] = 8.into();
-        value["text_config"]["d_rel"] = 32.into();
-        value["text_config"]["rel_extent"] = 32.into();
-        value["text_config"]["intermediate_size"] = 32.into();
-        value["text_config"]["dense_intermediate_size"] = 32.into();
-        value["text_config"]["moe_intermediate_size"] = 32.into();
-        value
-    }
-
-    #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn load_time_adapter_packs_text_and_aligned_media_with_external_experts() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut value = config();
-        value["text_config"]["hidden_size"] = 32.into();
-        value["text_config"]["vocab_size"] = 64.into();
-        value["text_config"]["num_attention_heads"] = 4.into();
-        value["text_config"]["num_key_value_heads"] = 2.into();
-        value["text_config"]["head_dim"] = 8.into();
-        value["text_config"]["swa_num_attention_heads"] = 4.into();
-        value["text_config"]["swa_num_key_value_heads"] = 2.into();
-        value["text_config"]["swa_head_dim"] = 8.into();
-        value["text_config"]["intermediate_size"] = 32.into();
-        value["text_config"]["dense_intermediate_size"] = 32.into();
-        value["text_config"]["moe_intermediate_size"] = 32.into();
-        value["vision_config"] = serde_json::json!({
-            "decoder_dmodel": 32,
-            "patch_size": 40,
-            "temporal_patch_size": 2,
-            "n_channels": 3,
-            "n_layers": 4
-        });
-        value["audio_config"] = serde_json::json!({
-            "text_hidden_size": 32,
-            "num_codebooks": 2,
-            "codebook_size": 8,
-            "bias": false,
-            "use_audio_norm": true,
-            "audio_mode": "dmel",
-            "rms_norm_eps": 1e-6
-        });
-        let mut args = resident::model_args_from_config_value(&value).unwrap();
-        args.text_config.quantized_weight_configs = Some(HashMap::from([(
-            "model.layers.0.dense.down_proj.weight".into(),
-            WeightQuantization::MxFp4,
-        )]));
-        let source =
-            InklingLayerwiseAdapter::new_external_experts(args.clone(), execution.stream())
-                .unwrap();
-        let quantization = AffineQuantization::new(32, 4).unwrap().into();
-        let target = source
-            .load_time_quantized(quantization, execution.stream())
-            .unwrap();
-
-        assert_eq!(target.quantization(), Some(quantization));
-        assert_eq!(
-            target.args.text_config.weight_quantization,
-            Some(quantization)
-        );
-        assert!(target.args.text_config.quantized_weight_configs.is_none());
-        assert!(target.sparse_expert_cache);
-        assert!(target.audio.is_some());
-        assert_eq!(target.vision_depth, 4);
-        assert!(matches!(
-            target.embedding,
-            safemlx::quantization::MaybeQuantized::Quantized(_)
-        ));
-        assert!(target
-            .audio
-            .as_ref()
-            .unwrap()
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-
-        let InklingLayer::Text(text) = target.new_layer(1, 0, execution.stream()).unwrap() else {
-            panic!("Inkling decoder group must build a text layer")
-        };
-        assert!(text
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-        let InklingLayer::Vision(vision) = target.new_layer(0, 0, execution.stream()).unwrap()
-        else {
-            panic!("Inkling vision group must build a vision layer")
-        };
-        assert!(vision
-            .parameters()
-            .flatten()
-            .values()
-            .all(|parameter| parameter.dtype() != Dtype::Uint32));
-        let InklingLayer::Vision(vision) = target.new_layer(0, 1, execution.stream()).unwrap()
-        else {
-            panic!("Inkling vision group must build a vision layer")
-        };
-        assert!(vision
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-
-        let mxfp4 = source
-            .load_time_quantized(WeightQuantization::MxFp4, execution.stream())
-            .unwrap();
-        assert_eq!(mxfp4.quantization(), Some(WeightQuantization::MxFp4));
-        let InklingLayer::Text(text) = mxfp4.new_layer(1, 1, execution.stream()).unwrap() else {
-            panic!("Inkling MXFP4 target must build a text layer")
-        };
-        assert!(text
-            .parameters()
-            .flatten()
-            .values()
-            .any(|parameter| parameter.dtype() == Dtype::Uint32));
-
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        args.text_config.quantized_weight_configs = None;
-        let mut fixture = Model::new(args.clone(), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let store = transformed_module_weight_store(&fixture).unwrap();
-        let execution = load_layerwise_model_with_quantization(
-            store,
-            InklingLayerwiseAdapter::new(args, gpu.stream()).unwrap(),
-            LayerWeightResidency::FullyResident,
-            Some(quantization),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let keys = execution.checkpoint_store_arc().keys();
-        assert!(keys.iter().any(|key| key == "audio.encoder.scales"));
-        assert!(keys
-            .iter()
-            .any(|key| key == "visual.layers.1.projection.scales"));
-        assert!(!keys
-            .iter()
-            .any(|key| key == "visual.layers.0.projection.scales"));
-        let report = execution.residency_report().unwrap();
-        let materialization = report.materialization().unwrap();
-        assert!(materialization.transformed_weights > 20);
-        assert!(materialization.output_bytes < materialization.source_bytes_read);
-        assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
-
-        let mut quantized = InklingLayerwiseModel { execution };
-        let text = runtime_input::token_ids_array(&[1, 2], gpu.stream()).unwrap();
-        let pixels = Array::zeros::<f32>(&[1, 2, 40, 40, 3], gpu.stream()).unwrap();
-        let audio_ids = Array::from_slice(&[0u32, 1, 2, 3, 4, 5], &[3, 2]);
-        let audio_mask = Array::from_slice(&[true, true, false], &[1, 3]);
-        let parts = [
-            runtime_input::InputPart::text_token_ids(&text),
-            runtime_input::InputPart::image_tensor(
-                &pixels,
-                runtime_input::InputMetadata::default(),
-            ),
-            runtime_input::InputPart::audio_tensor(
-                &audio_ids,
-                runtime_input::InputMetadata::audio_mask(&audio_mask),
-            ),
-        ];
-        let typed = runtime_input::ModelInput::new(&parts);
-        let mut dense_cache = fixture.new_cache();
-        let mut quantized_cache = quantized.new_cache();
-        let expected = fixture
-            .prefill_input_logits(typed, &mut dense_cache, gpu.stream())
-            .unwrap();
-        let actual = quantized
-            .prefill_input_logits(typed, &mut quantized_cache, gpu.stream())
-            .unwrap();
-        assert!(actual
-            .all_close(&expected, Some(2e-2), Some(2e-2), None, gpu.stream())
-            .unwrap()
-            .item::<bool>(gpu.stream()));
-    }
-
-    #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn inkling_fully_resident_load_time_quantization_packs_complete_expert_banks() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let config = quantizable_config();
-        let args = resident::model_args_from_config_value(&config).unwrap();
-        let mut fixture = Model::new(args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
-
-        for quantization in [
-            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
-            WeightQuantization::MxFp4,
-        ] {
-            let expert_options = ExpertCacheLoadOptions::new(
-                OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
-                1 << 16,
-                1 << 16,
-            )
-            .unwrap();
-            let mut cached = load_inkling_expert_cache_model(
-                dir.path(),
-                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::FullyResident,
-                expert_options,
-                Some(quantization),
-                gpu.stream(),
-                cpu.stream(),
-            )
-            .unwrap();
-            let backend = crate::backend::mlx::MlxBackend::new(gpu.stream(), cpu.stream());
-            let loaded = crate::load_model(
-                &backend,
-                dir.path(),
-                crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
-            )
-            .unwrap()
-            .into_inner()
-            .into_complete()
-            .unwrap();
-            let crate::backend::mlx::Model::Inkling(mut quantized) = loaded else {
-                panic!("high-level dispatch did not return an Inkling model")
-            };
-            assert_eq!(
-                quantized.args().text_config.weight_quantization,
-                Some(quantization)
-            );
-            assert!(quantized.expert_cache_report().unwrap().is_none());
-            let report = quantized.residency_report().unwrap();
-            assert!(report.initialized());
-            assert!(report.units().iter().all(|unit| unit.device_resident()));
-            let materialization = report.materialization().unwrap();
-            assert!(materialization.transformed_weights > 0);
-            assert!(materialization.source_bytes_read > materialization.output_bytes);
-            assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
-
-            let mut cached_cache = cached.new_cache();
-            let mut quantized_cache = quantized.new_cache();
-            for tokens in [
-                Array::from_slice(&[1u32, 2, 3], &[1, 3]),
-                Array::from_slice(&[4u32], &[1, 1]),
-            ] {
-                let expected = cached
-                    .forward(&tokens, &mut cached_cache, gpu.stream())
-                    .unwrap();
-                let actual = quantized
-                    .forward(&tokens, &mut quantized_cache, gpu.stream())
-                    .unwrap();
-                assert_close(&actual, &expected, gpu.stream());
-            }
-        }
-    }
-
-    #[test]
-    fn inkling_multimodal_execution_graph_declares_vision_dependency() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut value = config();
-        value["image_token_id"] = 20.into();
-        value["vision_config"] = serde_json::json!({
-            "decoder_dmodel": 16,
-            "patch_size": 40,
-            "temporal_patch_size": 2,
-            "n_channels": 3,
-            "n_layers": 4
-        });
-        let adapter = InklingLayerwiseAdapter::new(
-            resident::model_args_from_config_value(&value).unwrap(),
-            execution.stream(),
-        )
-        .unwrap();
-        let graph = adapter.execution_graph().unwrap();
-        assert_eq!(
-            graph
-                .groups()
-                .iter()
-                .map(|group| group.id())
-                .collect::<Vec<_>>(),
-            ["vision_encoder", "text_decoder"]
-        );
-        assert_eq!(graph.dependencies(1), Some([0].as_slice()));
-        assert_eq!(graph.output(), 1);
-    }
-
-    #[test]
-    fn tensor_parallel_plan_supports_uneven_text_and_folded_vision_geometry() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut config = config();
-        config["text_config"]["num_attention_heads"] = 6.into();
-        config["text_config"]["num_key_value_heads"] = 3.into();
-        config["text_config"]["head_dim"] = 2.into();
-        config["text_config"]["swa_num_attention_heads"] = 6.into();
-        config["text_config"]["swa_num_key_value_heads"] = 3.into();
-        config["text_config"]["swa_head_dim"] = 2.into();
-        config["text_config"]["dense_intermediate_size"] = 17.into();
-        config["text_config"]["moe_intermediate_size"] = 9.into();
-        config["vision_config"] = serde_json::json!({
-            "decoder_dmodel": 16,
-            "patch_size": 40,
-            "temporal_patch_size": 2,
-            "n_channels": 3,
-            "n_layers": 4
-        });
-        let args = resident::model_args_from_config_value(&config).unwrap();
-
-        for (rank, query_heads, kv_heads, dense, expert, first_vision) in
-            [(0, 4, 2, 9, 5, 0..38), (1, 2, 1, 8, 4, 38..75)]
-        {
-            let mut adapter =
-                InklingLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
-            let topology = MlxParallelContext::for_rank(
-                rank,
-                2,
-                1,
-                1,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap();
-            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            adapter
-                .configure_parallel_static(context, &layout, execution.stream())
-                .unwrap();
-
-            let geometry = adapter.parallel_text_geometry.as_ref().unwrap();
-            assert_eq!(geometry[0].query_heads, query_heads);
-            assert_eq!(geometry[0].kv_heads, kv_heads);
-            assert_eq!(
-                geometry[0].feed_forward,
-                resident::ParallelFeedForwardGeometry::Dense {
-                    intermediate: dense
-                }
-            );
-            assert_eq!(geometry[1].query_heads, query_heads);
-            assert_eq!(geometry[1].kv_heads, kv_heads);
-            assert_eq!(
-                geometry[1].feed_forward,
-                resident::ParallelFeedForwardGeometry::SparseMoe {
-                    routed_intermediate: expert,
-                    shared_intermediate: expert,
-                }
-            );
-            assert_eq!(
-                adapter.parallel_vision_input_ranges.as_ref().unwrap()[0],
-                first_vision
-            );
-
-            let attention = layout
-                .tensor("model.layers.0.self_attn.q_proj.weight")
-                .unwrap();
-            assert_eq!(attention.logical_units(), Some(3));
-            assert_eq!(attention.local_shape(), &[query_heads as usize * 2, 16]);
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.moe.experts.gate_up_proj")
-                    .unwrap()
-                    .local_shape(),
-                &[2, 2 * expert as usize, 16]
-            );
-
-            let identity = adapter.prompt_cache_model_identity(Some(topology)).unwrap();
-            match identity.layer_layout.get(0).unwrap() {
-                crate::LayerCachePolicy::KeyValueWithFixedState {
-                    num_key_value_heads,
-                    ..
-                } => assert_eq!(num_key_value_heads.get(), kv_heads as u32),
-                policy => panic!("unexpected Inkling cache policy {policy:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn cartesian_layer_composes_uneven_ep_ownership_with_tp_geometry() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut value = config();
-        value["text_config"]["n_routed_experts"] = 5.into();
-        value["text_config"]["num_attention_heads"] = 4.into();
-        value["text_config"]["num_key_value_heads"] = 2.into();
-        value["text_config"]["head_dim"] = 4.into();
-        value["text_config"]["swa_num_attention_heads"] = 4.into();
-        value["text_config"]["swa_num_key_value_heads"] = 2.into();
-        value["text_config"]["swa_head_dim"] = 4.into();
-        let args = resident::model_args_from_config_value(&value).unwrap();
-
-        for rank in 0..12 {
-            let topology = MlxParallelContext::for_rank(
-                rank,
-                2,
-                2,
-                3,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap();
-            let mut adapter =
-                InklingLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
-            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            adapter
-                .configure_parallel_static(context, &layout, execution.stream())
-                .unwrap();
-            let assignment = adapter
-                .expert_parallel_assignment(topology)
-                .unwrap()
-                .unwrap();
-            let layer = adapter
-                .new_cartesian_layer(0, 1, Some(&layout), Some(&assignment), execution.stream())
-                .unwrap();
-            let parameters = layer.parameters().flatten();
-            assert_eq!(
-                parameters["moe.experts.gate_up_proj"].shape(),
-                &[assignment.local_expert_count() as i32, 8, 16]
-            );
-            assert_eq!(assignment.group_size(), 3);
-        }
-
-        let topology =
-            MlxParallelContext::for_rank(0, 2, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap();
-        let adapter =
-            InklingLayerwiseAdapter::new_external_experts(args, execution.stream()).unwrap();
-        let assignment = adapter
-            .expert_parallel_assignment(topology)
-            .unwrap()
-            .unwrap();
-        assert_eq!(assignment.group_size(), 1);
-        assert_eq!(assignment.local_expert_count(), 5);
-    }
-
-    #[test]
-    fn tensor_parallel_plan_keeps_quantized_inkling_intermediates_block_aligned() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut config = config();
-        config["text_config"]["num_attention_heads"] = 6.into();
-        config["text_config"]["num_key_value_heads"] = 3.into();
-        config["text_config"]["head_dim"] = 2.into();
-        config["text_config"]["swa_num_attention_heads"] = 6.into();
-        config["text_config"]["swa_num_key_value_heads"] = 3.into();
-        config["text_config"]["swa_head_dim"] = 2.into();
-        config["text_config"]["dense_intermediate_size"] = 160.into();
-        config["text_config"]["moe_intermediate_size"] = 160.into();
-        let mut args = resident::model_args_from_config_value(&config).unwrap();
-        let affine = AffineQuantization::new(32, 4).unwrap().into();
-        args.text_config.quantized_weight_configs = Some(HashMap::from([
-            ("model.layers.0.dense.down_proj.weight".into(), affine),
-            ("model.layers.1.moe.experts.down_proj".into(), affine),
-            ("model.layers.2.moe.experts.down_proj".into(), affine),
-        ]));
-
-        for (rank, local_width, packed_width, scale_width) in
-            [(0, 96usize, 12usize, 3usize), (1, 64, 8, 2)]
-        {
-            let mut adapter =
-                InklingLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
-            let context = ParallelBuildContext::new(
-                MlxParallelContext::for_rank(
-                    rank,
-                    2,
-                    1,
-                    1,
-                    DeviceAssignment::new(DeviceType::Cpu, 0),
-                )
-                .unwrap(),
-                ShardingPolicy::Require,
-            );
-            let mut planner = context.planner();
-            adapter
-                .register_parallel_parameters(context, &mut planner, execution.stream())
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            adapter
-                .configure_parallel_static(context, &layout, execution.stream())
-                .unwrap();
-
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.dense.down_proj.inner.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[16, packed_width]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.dense.down_proj.scales")
-                    .unwrap()
-                    .local_shape(),
-                &[16, scale_width]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.moe.experts.gate_up_proj")
-                    .unwrap()
-                    .local_shape(),
-                &[2, 2 * local_width, 16]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.moe.experts.down_proj")
-                    .unwrap()
-                    .local_shape(),
-                &[2, 16, packed_width]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.moe.experts.down_proj_scales")
-                    .unwrap()
-                    .local_shape(),
-                &[2, 16, scale_width]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.moe.shared_experts.gate_up_proj")
-                    .unwrap()
-                    .local_shape(),
-                &[1, 160, 16]
-            );
-            assert_eq!(
-                adapter.parallel_text_geometry.as_ref().unwrap()[1].feed_forward,
-                resident::ParallelFeedForwardGeometry::SparseMoe {
-                    routed_intermediate: local_width as i32,
-                    shared_intermediate: 80,
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn released_mixed_dtype_policy_keeps_only_router_scalars_in_f32() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let model = Model::new(args(), context.stream()).unwrap();
-        let parameters = model.parameters().flatten();
-        assert_eq!(
-            parameters["model.layers.0.dense_global_scale"].dtype(),
-            Dtype::Bfloat16
-        );
-        assert_eq!(
-            parameters["model.layers.1.moe.router.bias"].dtype(),
-            Dtype::Float32
-        );
-        assert_eq!(
-            parameters["model.layers.1.moe.router.global_scale"].dtype(),
-            Dtype::Float32
-        );
-    }
-
-    fn initialize(model: &mut Model, stream: &Stream) {
-        for (name, parameter) in model.parameters_mut().flatten() {
-            let shape = parameter.shape().to_vec();
-            *parameter = if name.ends_with("norm.weight")
-                || name.ends_with("layernorm.weight")
-                || name.ends_with("global_scale")
-            {
-                ones_dtype(&shape, parameter.dtype(), stream).unwrap()
-            } else {
-                Array::full::<f32>(&shape, Array::from_f32(0.01), stream)
-                    .unwrap()
-                    .as_dtype(parameter.dtype(), stream)
-                    .unwrap()
-            };
-        }
-    }
-
-    fn released_name(runtime: &str) -> String {
-        if runtime == "lm_head.weight" {
-            return "model.llm.unembed.weight".into();
-        }
-        if let Some(rest) = runtime.strip_prefix("audio.") {
-            return format!("model.audio.{rest}");
-        }
-        if let Some(rest) = runtime.strip_prefix("visual.") {
-            return format!("model.visual.{rest}");
-        }
-        let rest = runtime.strip_prefix("model.").unwrap();
-        let mut raw = format!("model.llm.{rest}");
-        raw = raw
-            .replace("model.llm.embed_tokens.weight", "model.llm.embed.weight")
-            .replace(".input_layernorm.weight", ".attn_norm.weight")
-            .replace(".post_attention_layernorm.weight", ".mlp_norm.weight")
-            .replace(".self_attn.q_proj.weight", ".attn.wq_du.weight")
-            .replace(".self_attn.k_proj.weight", ".attn.wk_dv.weight")
-            .replace(".self_attn.v_proj.weight", ".attn.wv_dv.weight")
-            .replace(".self_attn.r_proj.weight", ".attn.wr_du.weight")
-            .replace(".self_attn.o_proj.weight", ".attn.wo_ud.weight")
-            .replace(".self_attn.q_norm.weight", ".attn.q_norm.weight")
-            .replace(".self_attn.k_norm.weight", ".attn.k_norm.weight")
-            .replace(".self_attn.rel_proj", ".attn.rel_logits_proj.proj")
-            .replace(".self_attn.k_sconv.weight", ".attn.k_sconv.weight")
-            .replace(".self_attn.v_sconv.weight", ".attn.v_sconv.weight")
-            .replace(".dense.down_proj.weight", ".mlp.w2_md.weight")
-            .replace(".dense_global_scale", ".mlp.global_scale")
-            .replace(".moe.router.weight", ".mlp.gate.weight")
-            .replace(".moe.router.bias", ".mlp.gate.bias")
-            .replace(".moe.router.global_scale", ".mlp.gate.global_scale")
-            .replace(".moe.experts.down_proj", ".mlp.experts.w2_weight")
-            .replace(
-                ".moe.shared_experts.down_proj",
-                ".mlp.shared_experts.shared_w2_weight",
-            );
-        raw
-    }
-
-    fn interleave(gate: &Array, up: &Array, axis: i32, stream: &Stream) -> Array {
-        let stacked = stack_axis(&[gate.clone(), up.clone()], axis, stream).unwrap();
-        let mut shape = gate.shape().to_vec();
-        let row_axis = shape.len() - 2;
-        shape[row_axis] *= 2;
-        stacked.reshape(&shape, stream).unwrap()
-    }
-
-    fn write_fixture_with_config(
-        dir: &Path,
-        model: &Model,
-        config: &serde_json::Value,
-        stream: &Stream,
-    ) {
-        let parameters = model.parameters().flatten();
-        let mut arrays = Vec::<(String, Array)>::new();
-        for (name, value) in &parameters {
-            let name = name.as_ref();
-            if name.ends_with(".dense.up_proj.weight") {
-                continue;
-            }
-            if let Some(prefix) = name.strip_suffix(".dense.gate_proj.weight") {
-                let up_name = format!("{prefix}.dense.up_proj.weight");
-                let up = parameters.get(up_name.as_str()).unwrap();
-                arrays.push((
-                    format!("model.llm.{}.mlp.w13_dn.weight", &prefix["model.".len()..]),
-                    interleave(value, up, 1, stream),
-                ));
-                continue;
-            }
-            if let Some(prefix) = name.strip_suffix(".moe.experts.gate_up_proj") {
-                let intermediate = model.args.text_config.moe_intermediate_size.unwrap();
-                let gate = value
-                    .try_index_device((.., ..intermediate, ..), stream)
-                    .unwrap();
-                let up = value
-                    .try_index_device((.., intermediate.., ..), stream)
-                    .unwrap();
-                arrays.push((
-                    format!(
-                        "model.llm.{}.mlp.experts.w13_weight",
-                        &prefix["model.".len()..]
-                    ),
-                    interleave(&gate, &up, 2, stream),
-                ));
-                continue;
-            }
-            if let Some(prefix) = name.strip_suffix(".moe.shared_experts.gate_up_proj") {
-                let intermediate = model.args.text_config.moe_intermediate_size.unwrap();
-                let gate = value
-                    .try_index_device((.., ..intermediate, ..), stream)
-                    .unwrap();
-                let up = value
-                    .try_index_device((.., intermediate.., ..), stream)
-                    .unwrap();
-                arrays.push((
-                    format!(
-                        "model.llm.{}.mlp.shared_experts.shared_w13_weight",
-                        &prefix["model.".len()..]
-                    ),
-                    interleave(&gate, &up, 2, stream),
-                ));
-                continue;
-            }
-            let raw = released_name(name);
-            let value = if raw.ends_with("_sconv.weight") {
-                value.as_dtype(Dtype::Bfloat16, stream).unwrap()
-            } else {
-                (*value).clone()
-            };
-            arrays.push((raw, value));
-        }
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
-            dir.join("model.safetensors"),
-        )
-        .unwrap();
-        fs::write(dir.join("config.json"), serde_json::to_vec(config).unwrap()).unwrap();
-    }
-
-    fn write_fixture(dir: &Path, model: &Model, stream: &Stream) {
-        write_fixture_with_config(dir, model, &config(), stream);
-    }
-
-    fn assert_close(left: &Array, right: &Array, stream: &Stream) {
-        let left_f32 = left.as_dtype(Dtype::Float32, stream).unwrap();
-        let right_f32 = right.as_dtype(Dtype::Float32, stream).unwrap();
-        let left = left_f32.evaluated().unwrap();
-        let right = right_f32.evaluated().unwrap();
-        assert_eq!(left.as_array().shape(), right.as_array().shape());
-        for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
-            assert!((left - right).abs() <= 5e-5, "{left} != {right}");
-        }
-    }
-
-    fn parity(depth: usize) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, gpu.stream());
-
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
-        let mut layerwise =
-            load_inkling_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
-                .unwrap();
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = resident::Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
-        for tokens in [
-            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
-            Array::from_slice(&[4u32], &[1, 1]),
-            Array::from_slice(&[5u32], &[1, 1]),
-            Array::from_slice(&[6u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(
-                    &tokens,
-                    None,
-                    Some(&mut resident_cache),
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = layerwise
-                .forward(&tokens, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected, gpu.stream());
-            assert_eq!(resident_cache.offset(), layerwise_cache.offset());
-            for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
-                assert_eq!(expected.kv.offset(), actual.kv.offset());
-                for (expected, actual) in expected.convolutions.iter().zip(&actual.convolutions) {
-                    assert_eq!(expected.offset, actual.offset);
-                    assert_eq!(
-                        expected.state.as_ref().map(Array::shape),
-                        actual.state.as_ref().map(Array::shape)
-                    );
-                }
-            }
-            let report = layerwise.residency_report().unwrap();
-            let layers = report
-                .units()
-                .iter()
-                .filter(|unit| unit.id().as_str().starts_with("inkling.layer."))
-                .collect::<Vec<_>>();
-            assert!(layers.iter().all(|unit| unit.host_resident()));
-            assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
-            assert!(report
-                .units()
-                .iter()
-                .filter(|unit| unit.device_resident() && !layers.contains(unit))
-                .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
-        }
-    }
-
-    #[test]
-    #[ignore = "requires an MLX runtime with a Metal device"]
-    fn tensor_parallel_dense_stream_loads_multimodal_static_and_text_group() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, gpu.stream());
-        let group = Group::init(false, Backend::Any).unwrap();
-        assert_eq!(group.size(), 1);
-        let topology =
-            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
-                .unwrap();
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
-        let model = load_inkling_tensor_parallel_layerwise_model(
-            dir.path(),
-            LayerWeightResidency::DenseDiskStream(options),
-            build,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let report = model.dense_stream_report().unwrap().unwrap();
-        assert!(report
-            .residency()
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().contains("inkling.text."))
-            .all(|unit| unit.planned_tier() == crate::core::residency::MemoryTier::Disk));
-    }
-
-    #[test]
-    fn inkling_released_layout_layerwise_parity() {
-        parity(1);
-        parity(2);
-    }
-
-    #[test]
-    fn inkling_global_and_sliding_attention_paged_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let mut args = args();
-        args.text_config.layer_schedule = crate::core::attention::LayerSchedule::new(
-            3,
-            vec![
-                resident::LayerPolicy {
-                    attention: crate::core::attention::AttentionPolicy::Full,
-                    feed_forward: resident::FeedForwardPolicy::Dense,
-                },
-                resident::LayerPolicy {
-                    attention: crate::core::attention::AttentionPolicy::sliding(4).unwrap(),
-                    feed_forward: resident::FeedForwardPolicy::SparseMoe,
-                },
-                resident::LayerPolicy {
-                    attention: crate::core::attention::AttentionPolicy::sliding(2).unwrap(),
-                    feed_forward: resident::FeedForwardPolicy::SparseMoe,
-                },
-            ],
-        )
-        .unwrap();
-        let mut expected_model = Model::new(args.clone(), gpu.stream()).unwrap();
-        let mut paged_model = Model::new(args, gpu.stream()).unwrap();
-        initialize(&mut expected_model, gpu.stream());
-        initialize(&mut paged_model, gpu.stream());
-        let mut expected_cache = expected_model.new_cache();
-        let paging = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
-            .unwrap()
-            .with_full_attention(true);
-        let mut paged_cache = paged_model.new_paged_cache(paging).unwrap();
-
-        for tokens in [
-            Array::from_slice(&[1u32, 2, 3, 4, 5], &[1, 5]),
-            Array::from_slice(&[6u32], &[1, 1]),
-            Array::from_slice(&[7u32], &[1, 1]),
-        ] {
-            let expected = expected_model
-                .forward_logits(
-                    &tokens,
-                    None,
-                    Some(&mut expected_cache),
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = paged_model
-                .forward_logits(&tokens, None, Some(&mut paged_cache), false, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected, gpu.stream());
-            assert_eq!(paged_cache.offset(), expected_cache.offset());
-        }
-
-        let report = paged_cache.residency_report().unwrap().unwrap();
-        assert!(report.key_value_blocks > 0);
-        assert!(report.prefill_full_attention_blocks > 0);
-        assert!(report.decode_full_attention_blocks > 0);
-        assert_eq!(
-            expected_cache
-                .layers
-                .iter()
-                .map(|layer| {
-                    layer
-                        .kv
-                        .retained_arrays()
-                        .first()
-                        .map(|array| array.dim(-2))
-                        .unwrap_or(0)
-                })
-                .collect::<Vec<_>>(),
-            vec![7, 3, 1]
-        );
-    }
-
-    #[test]
-    fn inkling_sparse_expert_cache_prefill_and_decode_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, gpu.stream());
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options =
-            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 768, 768)
-                .unwrap();
-        let mut cached = load_inkling_expert_cache_model(
-            dir.path(),
-            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                OffloadConfig::new(None, None, 1).unwrap(),
-            )),
-            options,
-            None,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut resident_cache = resident.new_cache();
-        let mut cached_cache = resident::Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
-        for tokens in [
-            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
-            Array::from_slice(&[4u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(
-                    &tokens,
-                    None,
-                    Some(&mut resident_cache),
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = cached
-                .forward(&tokens, &mut cached_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected, gpu.stream());
-        }
-        let report = cached.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.owned_experts, 4);
-        assert_eq!(report.prefill.compact_banks, 6);
-        assert!(report.prefill.requested_routes > 0);
-        assert!(report.decode.requested_routes > 0);
-        crate::backend::mlx::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
-            dir.path(),
-            options,
-            crate::core::ModelKind::Inkling,
-            report.owned_experts / 2,
-            gpu.stream(),
-            cpu.stream(),
-        );
-    }
-
-    #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn inkling_quantized_expert_cache_is_bounded_empty_route_safe_and_persistent() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let config = quantizable_config();
-        let args = resident::model_args_from_config_value(&config).unwrap();
-        let mut fixture = Model::new(args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let expert_options = ExpertCacheLoadOptions::new(
-            OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
-            1 << 16,
-            1 << 16,
-        )
-        .unwrap();
-        let quantization: WeightQuantization = AffineQuantization::new(32, 4).unwrap().into();
-        let mut cached = load_inkling_expert_cache_model(
-            dir.path(),
-            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
-            )),
-            expert_options,
-            Some(quantization),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-
-        let mut resident_cache = resident.new_cache();
-        let mut cached_cache = cached.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
-            Array::from_slice(&[4u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(
-                    &tokens,
-                    None,
-                    Some(&mut resident_cache),
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = cached
-                .forward(&tokens, &mut cached_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected, gpu.stream());
-        }
-
-        let ordinary = cached.residency_report().unwrap();
-        let ordinary_materialization = ordinary.materialization().unwrap();
-        assert!(ordinary_materialization.transformed_weights > 0);
-        assert!(ordinary_materialization.source_bytes_read > ordinary_materialization.output_bytes);
-        let report = cached.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.weight_quantization, Some(quantization));
-        let expert_materialization = report.materialization.as_ref().unwrap();
-        assert!(expert_materialization.transformed_weights > 0);
-        assert!(expert_materialization.source_bytes_read > expert_materialization.output_bytes);
-        assert!(
-            expert_materialization.peak_planned_working_set_bytes
-                <= expert_options.compact_bank_scratch_bytes
-        );
-        assert!(report.owned_bytes < expert_materialization.source_bytes_read);
-
-        let empty_hidden = zeros_dtype(&[0, 32], Dtype::Float32, gpu.stream()).unwrap();
-        let empty_ids = zeros_dtype(&[0, 1], Dtype::Int32, gpu.stream()).unwrap();
-        let empty_weights = zeros_dtype(&[0, 1], Dtype::Float32, gpu.stream()).unwrap();
-        let sparse_layer = cached
-            .args()
-            .text_config
-            .layer_schedule
-            .iter()
-            .position(|policy| policy.feed_forward == resident::FeedForwardPolicy::SparseMoe)
-            .unwrap();
-        let empty = cached
-            .execution
-            .adapter()
-            .expert_cache
-            .as_ref()
-            .unwrap()
-            .execute_routes_bounded(
-                ExpertRouteBatch::new(
-                    sparse_layer,
-                    &empty_hidden,
-                    &empty_ids,
-                    &empty_weights,
-                    ExpertPass::Decode,
-                ),
-                gpu.stream(),
-                |hidden, acquired, _, _| {
-                    assert!(acquired.identities().is_empty());
-                    Ok(hidden.clone())
-                },
-            )
-            .unwrap();
-        assert_eq!(empty.shape(), &[0, 32]);
-
-        let paged = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
-            .unwrap()
-            .with_full_attention(true);
-        let mut original = cached
-            .new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))
-            .unwrap();
-        let prefix = [1_u32, 2, 3];
-        cached
-            .forward(
-                &Array::from_slice(&prefix, &[1, prefix.len() as i32]),
-                &mut original,
-                gpu.stream(),
-            )
-            .unwrap();
-        let identity = cached.prompt_cache_model_identity().unwrap();
-        let descriptor = PromptCacheDescriptor {
-            model_family: identity.model_family,
-            effective_model_type: identity.effective_model_type,
-            checkpoint_fingerprint: "inkling-quantized-expert-cache".into(),
-            prefix_content_fingerprint: "tokens:1,2,3".into(),
-            architecture_fingerprint: identity.architecture_fingerprint,
-            layer_count: identity.layer_count,
-            global_layer_start: identity.global_layer_start,
-            global_layer_end: identity.global_layer_end,
-            batch_size: 1,
-            layer_prefix_offsets: identity.layer_prefix_offsets,
-            layer_layout: identity.layer_layout,
-            sink_tokens: identity.sink_tokens,
-            topology: identity.topology,
-        };
-        let persisted = tempfile::tempdir().unwrap();
-        let destination = persisted.path().join("prompt-cache");
-        cached
-            .save_prompt_cache(
-                &mut original,
-                &destination,
-                descriptor.clone(),
-                &prefix,
-                &PromptCacheOptions::default(),
-                gpu.stream(),
-            )
-            .unwrap();
-        let (mut restored, _) = cached
-            .load_prompt_cache(&destination, &descriptor, &prefix, paged, gpu.stream())
-            .unwrap();
-        let next = Array::from_slice(&[4u32], &[1, 1]);
-        let expected = cached.forward(&next, &mut original, gpu.stream()).unwrap();
-        let actual = cached.forward(&next, &mut restored, gpu.stream()).unwrap();
-        assert_close(&actual, &expected, gpu.stream());
-
-        crate::backend::mlx::architectures::distributed::expert::assert_rank_owned_quantized_sparse_ep_load(
-            dir.path(),
-            expert_options,
-            quantization,
-            crate::core::ModelKind::Inkling,
-            report.owned_experts / 2,
-            gpu.stream(),
-            cpu.stream(),
-        );
-    }
-
-    #[test]
-    fn inkling_audio_and_text_layerwise_parity() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut value = config();
-        value["audio_config"] = serde_json::json!({
-            "text_hidden_size": 16,
-            "num_codebooks": 2,
-            "codebook_size": 8,
-            "bias": false,
-            "use_audio_norm": true,
-            "audio_mode": "dmel",
-            "rms_norm_eps": 1e-6,
-        });
-        value["audio_token_id"] = serde_json::json!(20);
-        let mut fixture = Model::new(
-            resident::model_args_from_config_value(&value).unwrap(),
-            gpu.stream(),
-        )
-        .unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, gpu.stream());
-        fs::write(
-            dir.path().join("config.json"),
-            serde_json::to_vec(&value).unwrap(),
-        )
-        .unwrap();
-
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_inkling_layerwise_model(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            None,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let text = runtime_input::token_ids_array(&[1, 2], gpu.stream()).unwrap();
-        let audio_ids = Array::from_slice(&[0u32, 1, 2, 3, 4, 5], &[3, 2]);
-        let mask = Array::from_slice(&[true, true, false], &[1, 3]);
-        let parts = [
-            runtime_input::InputPart::text_token_ids(&text),
-            runtime_input::InputPart::audio_tensor(
-                &audio_ids,
-                runtime_input::InputMetadata::audio_mask(&mask),
-            ),
-        ];
-        let typed = runtime_input::ModelInput::new(&parts);
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = layerwise.new_cache();
-        let expected = resident
-            .prefill_input_logits(typed, &mut resident_cache, gpu.stream())
-            .unwrap();
-        let actual = layerwise
-            .prefill_input_logits(typed, &mut layerwise_cache, gpu.stream())
-            .unwrap();
-        assert_close(&actual, &expected, gpu.stream());
-        assert_eq!(resident_cache.offset(), layerwise_cache.offset());
-
-        let next = runtime_input::token_ids_array(&[6], gpu.stream()).unwrap();
-        let expected = resident
-            .decode_logits(&next, &mut resident_cache, gpu.stream())
-            .unwrap();
-        let actual = layerwise
-            .decode_logits(&next, &mut layerwise_cache, gpu.stream())
-            .unwrap();
-        assert_close(&actual, &expected, gpu.stream());
-        assert_eq!(resident_cache.offset(), layerwise_cache.offset());
-    }
-}

@@ -60,254 +60,9 @@ fn materialize_gguf_model(
     #[cfg(feature = "mlx-media")]
     let mut processor = None;
 
-    let (model, _architecture_eos_token_ids) = if let Some(quantization) = options
-        .quantization
-        .filter(|_| options.weight_residency.is_fully_resident())
-    {
-        match gguf_architecture {
-            GgufArchitecture::KimiLinear => {
-                let loaded = kimi_linear::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model = crate::backend::mlx::architectures::kimi_linear::layerwise::execute_transformed_kimi_linear_model(
-                        loaded.model, stream, weights_stream,
-                    )?;
-                (Model::KimiLinear(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::DeepSeek2 => {
-                let loaded = deepseek_v3::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model = crate::backend::mlx::architectures::deepseek_v3::layerwise::execute_transformed_deepseek_v3_model(
-                        loaded.model, stream, weights_stream,
-                    )?;
-                (Model::DeepSeekV3(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::DeepSeek4 => {
-                let (loaded, eos_token_ids) = crate::backend::mlx::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        options.weight_residency,
-                        Some(quantization),
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::DeepSeekV4Layerwise(Box::new(loaded)), eos_token_ids)
-            }
-            GgufArchitecture::GptOss => {
-                let loaded = gpt_oss::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                    crate::backend::mlx::architectures::gpt_oss::layerwise::execute_transformed_gpt_oss_model(
-                        loaded.model,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::GptOss(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::Gemma4 => {
-                let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
-                #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
-                if let Some(mmproj) = &mmproj {
-                    processor = Some(ModelProcessor::load_gemma4_gguf(
-                        &metadata,
-                        &mmproj.metadata,
-                    )?);
-                }
-                let loaded = gemma4::load_gemma4_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    mmproj.as_ref(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                        crate::backend::mlx::architectures::gemma4::layerwise::execute_transformed_gemma4_model_with_modalities(
-                            loaded.model,
-                            loaded.vision_config,
-                            loaded.audio_config,
-                            stream,
-                            weights_stream,
-                        )?;
-                (Model::Gemma4(Box::new(model)), loaded.eos_token_ids)
-            }
-            GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-                let loaded = llama::load_llama_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                    crate::backend::mlx::architectures::llama::layerwise::execute_transformed_llama_model(
-                        loaded.model,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Llama(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::MuseGlimmer => {
-                #[cfg(feature = "mlx-image")]
-                if let Some(mmproj) =
-                    crate::backend::mlx::architectures::muse_glimmer::open_sibling_mmproj(
-                        gguf_file,
-                    )?
-                {
-                    processor = Some(ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata)?);
-                }
-                let (loaded, eos_token_ids) =
-                    crate::backend::mlx::architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
-                        &checkpoint,
-                        &metadata,
-                        gguf_architecture.metadata_name(),
-                        options.weight_residency,
-                        Some(quantization),
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::MuseGlimmer(loaded), eos_token_ids)
-            }
-            GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-                let loaded = lfm2::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model = crate::backend::mlx::architectures::lfm2::layerwise::execute_transformed_lfm2_model(
-                    loaded.model,
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::Lfm2(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-                let loaded = dense_qwen::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                    crate::backend::mlx::architectures::qwen::dense::layerwise::execute_transformed_model(
-                        loaded.model,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::DenseQwen(model), loaded.eos_token_ids)
-            }
-            GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-                let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
-                let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-                let vision_metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
-                    &vision_checkpoint,
-                );
-                let loaded = qwen3_vl::load_qwen3_vl_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    &vision_checkpoint,
-                    vision_metadata,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let model =
-                    crate::backend::mlx::architectures::qwen::vl::layerwise::execute_transformed_qwen3_vl_model(
-                        loaded.model,
-                        stream,
-                        weights_stream,
-                    )?;
-                let model = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
-                    Model::Qwen3VlMoe(model)
-                } else {
-                    Model::Qwen3Vl(model)
-                };
-                (model, loaded.eos_token_ids)
-            }
-            GgufArchitecture::Qwen35
-            | GgufArchitecture::Qwen35Moe
-            | GgufArchitecture::Qwen3Next => {
-                let mmproj = if gguf_architecture == GgufArchitecture::Qwen3Next {
-                    None
-                } else {
-                    qwen3_5::open_sibling_mmproj(gguf_file)?
-                };
-                #[cfg(feature = "mlx-image")]
-                if mmproj.is_some() {
-                    processor = ModelProcessor::load_qwen(
-                        gguf_file.parent().unwrap_or_else(|| Path::new(".")),
-                    )?;
-                }
-                let loaded = qwen3_5::load_qwen3_5_gguf_checkpoint(
-                    &checkpoint,
-                    metadata.clone(),
-                    mmproj.as_ref(),
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?;
-                let is_next = gguf_architecture == GgufArchitecture::Qwen3Next;
-                let model = crate::backend::mlx::architectures::qwen::hybrid::layerwise::execute_transformed_qwen_hybrid_model(
-                        loaded.model, quantization, stream, weights_stream,
-                    )?;
-                let model = if is_next {
-                    Model::Qwen3Next(model)
-                } else {
-                    Model::Qwen35(model)
-                };
-                (model, loaded.eos_token_ids)
-            }
-            GgufArchitecture::Inkling => {
-                let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
-                #[cfg(feature = "mlx-media")]
-                if mmproj.is_some() {
-                    processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
-                }
-                let (loaded, eos_token_ids) =
-                    crate::backend::mlx::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        mmproj.as_ref(),
-                        options.weight_residency,
-                        Some(quantization),
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Inkling(loaded), eos_token_ids)
-            }
-            GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-                let (loaded, eos_token_ids) = crate::backend::mlx::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        options.weight_residency,
-                        Some(quantization),
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::NemotronH(loaded), eos_token_ids)
-            }
-        }
-    } else {
-        match gguf_architecture {
-            GgufArchitecture::KimiLinear => {
-                let (loaded, eos_token_ids) =
+    let (model, _architecture_eos_token_ids) = match gguf_architecture {
+        GgufArchitecture::KimiLinear => {
+            let (loaded, eos_token_ids) =
                         crate::backend::mlx::architectures::kimi_linear::layerwise::load_kimi_linear_gguf_layerwise_model(
                             &checkpoint,
                             &metadata,
@@ -316,10 +71,10 @@ fn materialize_gguf_model(
                             stream,
                             weights_stream,
                         )?;
-                (Model::KimiLinear(loaded), eos_token_ids)
-            }
-            GgufArchitecture::DeepSeek2 => {
-                let (loaded, eos_token_ids) =
+            (Model::KimiLinear(loaded), eos_token_ids)
+        }
+        GgufArchitecture::DeepSeek2 => {
+            let (loaded, eos_token_ids) =
                         crate::backend::mlx::architectures::deepseek_v3::layerwise::load_deepseek_v3_gguf_layerwise_model(
                             &checkpoint,
                             &metadata,
@@ -328,10 +83,10 @@ fn materialize_gguf_model(
                             stream,
                             weights_stream,
                         )?;
-                (Model::DeepSeekV3(loaded), eos_token_ids)
-            }
-            GgufArchitecture::DeepSeek4 => {
-                let (loaded, eos_token_ids) = crate::backend::mlx::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
+            (Model::DeepSeekV3(loaded), eos_token_ids)
+        }
+        GgufArchitecture::DeepSeek4 => {
+            let (loaded, eos_token_ids) = crate::backend::mlx::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,
@@ -339,10 +94,10 @@ fn materialize_gguf_model(
                         stream,
                         weights_stream,
                     )?;
-                (Model::DeepSeekV4Layerwise(Box::new(loaded)), eos_token_ids)
-            }
-            GgufArchitecture::GptOss => {
-                let (loaded, eos_token_ids) =
+            (Model::DeepSeekV4Layerwise(Box::new(loaded)), eos_token_ids)
+        }
+        GgufArchitecture::GptOss => {
+            let (loaded, eos_token_ids) =
                     crate::backend::mlx::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
@@ -351,15 +106,15 @@ fn materialize_gguf_model(
                         stream,
                         weights_stream,
                     )?;
-                (Model::GptOss(loaded), eos_token_ids)
+            (Model::GptOss(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Inkling => {
+            let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
+            #[cfg(feature = "mlx-media")]
+            if mmproj.is_some() {
+                processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
             }
-            GgufArchitecture::Inkling => {
-                let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
-                #[cfg(feature = "mlx-media")]
-                if mmproj.is_some() {
-                    processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
-                }
-                let (loaded, eos_token_ids) =
+            let (loaded, eos_token_ids) =
                     crate::backend::mlx::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
@@ -369,18 +124,18 @@ fn materialize_gguf_model(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Inkling(loaded), eos_token_ids)
+            (Model::Inkling(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Gemma4 => {
+            let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
+            #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
+            if let Some(mmproj) = &mmproj {
+                processor = Some(ModelProcessor::load_gemma4_gguf(
+                    &metadata,
+                    &mmproj.metadata,
+                )?);
             }
-            GgufArchitecture::Gemma4 => {
-                let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
-                #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
-                if let Some(mmproj) = &mmproj {
-                    processor = Some(ModelProcessor::load_gemma4_gguf(
-                        &metadata,
-                        &mmproj.metadata,
-                    )?);
-                }
-                let (loaded, eos_token_ids) =
+            let (loaded, eos_token_ids) =
                     crate::backend::mlx::architectures::gemma4::layerwise::load_gemma4_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
@@ -390,43 +145,41 @@ fn materialize_gguf_model(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Gemma4(Box::new(loaded)), eos_token_ids)
+            (Model::Gemma4(Box::new(loaded)), eos_token_ids)
+        }
+        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+            let (loaded, eos_token_ids) =
+                crate::backend::mlx::architectures::llama::layerwise::load_llama_gguf_model(
+                    &checkpoint,
+                    &metadata,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::Llama(loaded), eos_token_ids)
+        }
+        GgufArchitecture::MuseGlimmer => {
+            #[cfg(feature = "mlx-image")]
+            if let Some(mmproj) =
+                crate::backend::mlx::architectures::muse_glimmer::open_sibling_mmproj(gguf_file)?
+            {
+                processor = Some(ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata)?);
             }
-            GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-                let (loaded, eos_token_ids) =
-                    crate::backend::mlx::architectures::llama::layerwise::load_llama_gguf_model(
-                        &checkpoint,
-                        &metadata,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::Llama(loaded), eos_token_ids)
-            }
-            GgufArchitecture::MuseGlimmer => {
-                #[cfg(feature = "mlx-image")]
-                if let Some(mmproj) =
-                    crate::backend::mlx::architectures::muse_glimmer::open_sibling_mmproj(
-                        gguf_file,
-                    )?
-                {
-                    processor = Some(ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata)?);
-                }
-                let (loaded, eos_token_ids) =
-                    crate::backend::mlx::architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
-                        &checkpoint,
-                        &metadata,
-                        gguf_architecture.metadata_name(),
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::MuseGlimmer(loaded), eos_token_ids)
-            }
-            GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-                let (loaded, eos_token_ids) =
+            let (loaded, eos_token_ids) =
+                crate::backend::mlx::architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    gguf_architecture.metadata_name(),
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::MuseGlimmer(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
+            let (loaded, eos_token_ids) =
                     crate::backend::mlx::architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
@@ -435,10 +188,10 @@ fn materialize_gguf_model(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Lfm2(loaded), eos_token_ids)
-            }
-            GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-                let (loaded, eos_token_ids) =
+            (Model::Lfm2(loaded), eos_token_ids)
+        }
+        GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
+            let (loaded, eos_token_ids) =
                     crate::backend::mlx::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
@@ -447,28 +200,27 @@ fn materialize_gguf_model(
                         stream,
                         weights_stream,
                     )?;
-                (Model::NemotronH(loaded), eos_token_ids)
-            }
-            GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-                let (loaded, eos_token_ids) =
-                    crate::backend::mlx::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
-                        &checkpoint,
-                        &metadata,
-                        gguf_architecture.metadata_name(),
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::DenseQwen(loaded), eos_token_ids)
-            }
-            GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-                let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
-                let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-                let vision_metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
-                    &vision_checkpoint,
-                );
-                let (loaded, eos_token_ids) =
+            (Model::NemotronH(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+            let (loaded, eos_token_ids) =
+                crate::backend::mlx::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    gguf_architecture.metadata_name(),
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+            (Model::DenseQwen(loaded), eos_token_ids)
+        }
+        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+            let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
+            let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
+            let vision_metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+            let (loaded, eos_token_ids) =
                     crate::backend::mlx::architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
@@ -479,28 +231,26 @@ fn materialize_gguf_model(
                         stream,
                         weights_stream,
                     )?;
-                let model = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
-                    Model::Qwen3VlMoe(loaded)
-                } else {
-                    Model::Qwen3Vl(loaded)
-                };
-                (model, eos_token_ids)
+            let model = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
+                Model::Qwen3VlMoe(loaded)
+            } else {
+                Model::Qwen3Vl(loaded)
+            };
+            (model, eos_token_ids)
+        }
+        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
+            let mmproj = if gguf_architecture == GgufArchitecture::Qwen3Next {
+                None
+            } else {
+                qwen3_5::open_sibling_mmproj(gguf_file)?
+            };
+            #[cfg(feature = "mlx-image")]
+            if mmproj.is_some() {
+                processor = ModelProcessor::load_qwen(
+                    gguf_file.parent().unwrap_or_else(|| Path::new(".")),
+                )?;
             }
-            GgufArchitecture::Qwen35
-            | GgufArchitecture::Qwen35Moe
-            | GgufArchitecture::Qwen3Next => {
-                let mmproj = if gguf_architecture == GgufArchitecture::Qwen3Next {
-                    None
-                } else {
-                    qwen3_5::open_sibling_mmproj(gguf_file)?
-                };
-                #[cfg(feature = "mlx-image")]
-                if mmproj.is_some() {
-                    processor = ModelProcessor::load_qwen(
-                        gguf_file.parent().unwrap_or_else(|| Path::new(".")),
-                    )?;
-                }
-                let (loaded, eos_token_ids, is_next) =
+            let (loaded, eos_token_ids, is_next) =
                         crate::backend::mlx::architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_layerwise_model(
                             &checkpoint,
                             &metadata,
@@ -510,13 +260,12 @@ fn materialize_gguf_model(
                             stream,
                             weights_stream,
                         )?;
-                let model = if is_next {
-                    Model::Qwen3Next(loaded)
-                } else {
-                    Model::Qwen35(loaded)
-                };
-                (model, eos_token_ids)
-            }
+            let model = if is_next {
+                Model::Qwen3Next(loaded)
+            } else {
+                Model::Qwen35(loaded)
+            };
+            (model, eos_token_ids)
         }
     };
     Ok(MaterializedGgufModel {
@@ -1103,7 +852,6 @@ pub(super) fn materialize_safetensors(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    structural::validate_safetensors_load_path(kind, model_dir, options)?;
     if let (Some(expert_cache), Some(non_expert)) = (
         options.weight_residency.expert_cache(),
         options.weight_residency.non_experts(),
@@ -1181,147 +929,22 @@ pub(super) fn materialize_safetensors(
     let execution = options.weight_residency.layers();
     if let Some(quantization) = options.quantization {
         quantization.validate()?;
-        return match kind {
-            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
-                crate::backend::mlx::architectures::deepseek_v3::layerwise::execute_transformed_deepseek_v3_model(
-                    deepseek_v3::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
-                crate::backend::mlx::architectures::deepseek_v4::layerwise::load_deepseek_v4_layerwise_model(
-                    model_dir,
-                    execution,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?,
-            ))),
-            ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
-                crate::backend::mlx::architectures::gemma4::layerwise::execute_transformed_gemma4_model(
-                    model_dir,
-                    gemma4::load_gemma4_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            ))),
-            ModelKind::Inkling => Ok(Model::Inkling(
-                crate::backend::mlx::architectures::inkling::layerwise::load_inkling_layerwise_model(
-                    model_dir,
-                    execution,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::GptOss => Ok(Model::GptOss(
-                crate::backend::mlx::architectures::gpt_oss::layerwise::execute_transformed_gpt_oss_model(
-                    gpt_oss::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::KimiLinear => Ok(Model::KimiLinear(
-                crate::backend::mlx::architectures::kimi_linear::layerwise::execute_transformed_kimi_linear_model(
-                    kimi_linear::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Llama => Ok(Model::Llama(
-                crate::backend::mlx::architectures::llama::layerwise::execute_transformed_llama_model(
-                    llama::load_resident_llama_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
-                crate::backend::mlx::architectures::muse_glimmer::layerwise::load_safetensors_quantized_residency(
-                    model_dir,
-                    execution,
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Lfm2 => Ok(Model::Lfm2(
-                crate::backend::mlx::architectures::lfm2::layerwise::execute_transformed_lfm2_model(
-                    lfm2::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::NemotronH => Ok(Model::NemotronH(
-                crate::backend::mlx::architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
-                    model_dir,
-                    execution,
-                    Some(quantization),
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(
-                crate::backend::mlx::architectures::qwen::dense::layerwise::load_safetensors_quantized_residency(
-                    model_dir,
-                    execution,
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
-                crate::backend::mlx::architectures::qwen::hybrid::layerwise::execute_transformed_qwen_hybrid_model(
-                    qwen3_next::load_qwen3_next_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(
-                crate::backend::mlx::architectures::qwen::vl::layerwise::execute_transformed_qwen3_vl_model(
-                    qwen3_vl::load_qwen3_vl_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
-                crate::backend::mlx::architectures::qwen::vl::layerwise::execute_transformed_qwen3_vl_model(
-                    qwen3_vl_moe::load_qwen3_vl_moe_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen35 => Ok(Model::Qwen35(
-                crate::backend::mlx::architectures::qwen::hybrid::layerwise::execute_transformed_qwen_hybrid_model(
-                    qwen3_5::load_qwen3_5_model_quantized(model_dir, quantization, stream, weights_stream)?,
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::PersonaPlex => {
-                unreachable!("load policy rejects unsupported load-time transformations")
-            }
-        };
     }
     match kind {
         ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
             crate::backend::mlx::architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
         )),
-        ModelKind::DeepSeekV4 if execution.is_fully_resident() => Ok(Model::DeepSeekV4(Box::new(
-            deepseek_v4::load_model(model_dir, stream, weights_stream)?,
-        ))),
         ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
             crate::backend::mlx::architectures::deepseek_v4::layerwise::load_deepseek_v4_layerwise_model(
                 model_dir,
                 execution,
-                None,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1330,6 +953,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1338,7 +962,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::inkling::layerwise::load_inkling_layerwise_model(
                 model_dir,
                 execution,
-                None,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1347,6 +971,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1355,6 +980,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::llama::layerwise::load_llama_safetensors_mlx(
                 model_dir,
                 execution.weight_residency(),
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1363,6 +989,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::muse_glimmer::layerwise::load_safetensors(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1371,6 +998,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::qwen::dense::layerwise::load_safetensors(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1379,6 +1007,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::gpt_oss::layerwise::load_gpt_oss_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1387,6 +1016,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::lfm2::layerwise::load_lfm2_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1395,7 +1025,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
                 model_dir,
                 execution,
-                None,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1404,6 +1034,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::qwen::hybrid::layerwise::load_qwen3_next_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1412,6 +1043,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1420,6 +1052,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1428,6 +1061,7 @@ pub(super) fn materialize_safetensors(
             crate::backend::mlx::architectures::qwen::hybrid::layerwise::load_qwen35_layerwise_model(
                 model_dir,
                 execution,
+                options.quantization,
                 stream,
                 weights_stream,
             )?,

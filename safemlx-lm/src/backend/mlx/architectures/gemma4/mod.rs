@@ -2,6 +2,7 @@
 
 pub(crate) mod assistant;
 pub(crate) mod audio;
+pub(crate) mod checkpoint;
 /// Bounded-residency multimodal execution.
 pub mod layerwise;
 /// Fully resident model implementation.

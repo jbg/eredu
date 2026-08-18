@@ -9,14 +9,14 @@ use std::{
 use safemlx::{
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt, Param},
+    module::{Module, Param},
     native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     nn,
     ops::{
         broadcast_to, concatenate_axis, exp, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros, GgufCheckpoint,
-        GgufMetadataValue,
+        maximum, quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros,
+        zeros_dtype, GgufCheckpoint, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
@@ -50,11 +50,7 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
-    backend::mlx::runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict,
-        load_safetensors_dir_strict_with_split_relu2_experts, transform_split_relu2_experts,
-        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
+    backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
     backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
@@ -475,6 +471,17 @@ impl ModelArgsSource {
 }
 
 impl ModelArgs {
+    pub(crate) fn weight_dtype(&self) -> Dtype {
+        match self.torch_dtype.as_deref() {
+            Some("bfloat16" | "bf16") => Dtype::Bfloat16,
+            Some("float16") => Dtype::Float16,
+            Some("float32") | None => Dtype::Float32,
+            Some(_) => {
+                unreachable!("Nemotron-H torch_dtype is validated before model construction")
+            }
+        }
+    }
+
     pub(crate) fn mtp_policies(&self) -> Result<Vec<LayerPolicy>, Error> {
         if self.num_nextn_predict_layers == 0 {
             return Ok(Vec::new());
@@ -879,8 +886,19 @@ impl MambaRmsNormGated {
         eps: f32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_dtype(intermediate_size, n_groups, eps, Dtype::Float32, stream)
+    }
+
+    /// Creates an unloaded gated RMSNorm with an explicit weight dtype.
+    pub fn new_with_dtype(
+        intermediate_size: i32,
+        n_groups: i32,
+        eps: f32,
+        dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            weight: Param::<Array>::unloaded(&[intermediate_size], Dtype::Float32, stream)?,
+            weight: Param::<Array>::unloaded(&[intermediate_size], dtype, stream)?,
             eps,
             n_groups,
             group_size: intermediate_size / n_groups,
@@ -889,8 +907,11 @@ impl MambaRmsNormGated {
 
     /// Applies SiLU gate modulation followed by grouped RMS normalization.
     pub fn forward(&self, x: &Array, gate: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let input_dtype = x.dtype();
         let original_shape = x.shape().to_vec();
-        let gated = x.multiply(silu(gate.clone(), stream)?, stream)?;
+        let x = x.as_dtype(Dtype::Float32, stream)?;
+        let gate = gate.as_dtype(Dtype::Float32, stream)?;
+        let gated = x.multiply(silu(gate, stream)?, stream)?;
         let grouped = gated.reshape(&[-1, self.n_groups, self.group_size], stream)?;
         let variance = safemlx::ops::mean_axis(&grouped.square(stream)?, -1, true, stream)?;
         let normalized = grouped
@@ -898,7 +919,8 @@ impl MambaRmsNormGated {
                 safemlx::ops::rsqrt(variance.add(Array::from_f32(self.eps), stream)?, stream)?,
                 stream,
             )?
-            .reshape(&original_shape, stream)?;
+            .reshape(&original_shape, stream)?
+            .as_dtype(input_dtype, stream)?;
         normalized.multiply(&*self.weight, stream)
     }
 
@@ -928,19 +950,40 @@ impl Mlp {
         quantization: [Option<WeightQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_dtype(
+            hidden_size,
+            intermediate_size,
+            bias,
+            quantization,
+            Dtype::Float32,
+            stream,
+        )
+    }
+
+    /// Creates an unloaded MLP with an explicit dense weight dtype.
+    pub fn new_with_dtype(
+        hidden_size: i32,
+        intermediate_size: i32,
+        bias: bool,
+        quantization: [Option<WeightQuantization>; 2],
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            up_proj: common::linear::unloaded_maybe_quantized_linear(
+            up_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 hidden_size,
                 intermediate_size,
                 bias,
                 quantization[0],
+                dense_dtype,
                 stream,
             )?,
-            down_proj: common::linear::unloaded_maybe_quantized_linear(
+            down_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 intermediate_size,
                 hidden_size,
                 bias,
                 quantization[1],
+                dense_dtype,
                 stream,
             )?,
         })
@@ -1037,6 +1080,25 @@ impl Experts {
         quantization: [Option<WeightQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_dtype(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            quantization,
+            Dtype::Float32,
+            stream,
+        )
+    }
+
+    /// Creates an unloaded expert bank with an explicit dense weight dtype.
+    pub fn new_with_dtype(
+        num_experts: i32,
+        hidden_size: i32,
+        intermediate_size: i32,
+        quantization: [Option<WeightQuantization>; 2],
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let split = |quantization| {
             Ok::<_, Exception>(match quantization {
                 Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
@@ -1110,7 +1172,7 @@ impl Experts {
                 None => Ok((
                     Param::<Array>::unloaded(
                         &[num_experts, out_features, in_features],
-                        Dtype::Float32,
+                        dense_dtype,
                         stream,
                     )?,
                     Param::new(None),
@@ -1261,7 +1323,7 @@ impl SparseMoeBlock {
     ) -> Result<Self, Exception> {
         let prefix = format!("model.layers.{layer_idx}.moe");
         Ok(Self {
-            gate: TopKRouter::new(
+            gate: TopKRouter::new_with_quantization_and_dtype(
                 common::moe::TopKRouterConfig {
                     top_k: args.num_experts_per_tok,
                     num_experts: args.n_routed_experts,
@@ -1274,9 +1336,11 @@ impl SparseMoeBlock {
                     topk_group: args.topk_group,
                     score_correction_bias: true,
                 },
+                None,
+                args.weight_dtype(),
                 stream,
             )?,
-            experts: Experts::new(
+            experts: Experts::new_with_dtype(
                 args.n_routed_experts,
                 args.hidden_size,
                 routed_intermediate,
@@ -1284,9 +1348,10 @@ impl SparseMoeBlock {
                     args.weight_quantization_for(&format!("{prefix}.experts.up_proj")),
                     args.weight_quantization_for(&format!("{prefix}.experts.down_proj")),
                 ],
+                args.weight_dtype(),
                 stream,
             )?,
-            shared_experts: Mlp::new(
+            shared_experts: Mlp::new_with_dtype(
                 args.hidden_size,
                 shared_intermediate,
                 args.mlp_bias,
@@ -1298,6 +1363,7 @@ impl SparseMoeBlock {
                         "{prefix}.shared_experts.down_proj.weight"
                     )),
                 ],
+                args.weight_dtype(),
                 stream,
             )?,
         })
@@ -1512,32 +1578,36 @@ impl Attention {
             n_kv_heads: kv_heads,
             scale: (args.head_dim as f32).sqrt().recip(),
             policy,
-            q_proj: common::linear::unloaded_maybe_quantized_linear(
+            q_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 query_heads * args.head_dim,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.q_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            k_proj: common::linear::unloaded_maybe_quantized_linear(
+            k_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 kv_heads * args.head_dim,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.k_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            v_proj: common::linear::unloaded_maybe_quantized_linear(
+            v_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 kv_heads * args.head_dim,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.v_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            o_proj: common::linear::unloaded_maybe_quantized_linear(
+            o_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 query_heads * args.head_dim,
                 args.hidden_size,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.o_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
         })
@@ -1686,6 +1756,8 @@ pub struct Mamba2Mixer {
     pub d_mlp: i32,
     /// Number of tokens per prefill scan chunk.
     pub chunk_size: i32,
+    /// Lower bound applied to the discretized SSM timestep.
+    pub time_step_min: f32,
     #[quantizable]
     #[param]
     /// Joint input projection.
@@ -1740,32 +1812,42 @@ impl Mamba2Mixer {
             conv_kernel_size: args.conv_kernel,
             d_mlp,
             chunk_size: args.chunk_size,
-            in_proj: common::linear::unloaded_maybe_quantized_linear(
+            time_step_min: args.time_step_min,
+            in_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 projection_size,
                 args.use_bias,
                 args.weight_quantization_for(&format!(
                     "model.layers.{layer_idx}.mamba.in_proj.weight"
                 )),
+                args.weight_dtype(),
                 stream,
             )?,
-            conv1d: DepthwiseConv1d::new(conv_dim, args.conv_kernel, args.use_conv_bias, stream)?,
-            dt_bias: Param::<Array>::unloaded(&[heads], Dtype::Float32, stream)?,
-            A_log: Param::<Array>::unloaded(&[heads], Dtype::Float32, stream)?,
-            D: Param::<Array>::unloaded(&[heads], Dtype::Float32, stream)?,
-            norm: MambaRmsNormGated::new(
+            conv1d: DepthwiseConv1d::new_with_dtype(
+                conv_dim,
+                args.conv_kernel,
+                args.use_conv_bias,
+                args.weight_dtype(),
+                stream,
+            )?,
+            dt_bias: Param::<Array>::unloaded(&[heads], args.weight_dtype(), stream)?,
+            A_log: Param::<Array>::unloaded(&[heads], args.weight_dtype(), stream)?,
+            D: Param::<Array>::unloaded(&[heads], args.weight_dtype(), stream)?,
+            norm: MambaRmsNormGated::new_with_dtype(
                 intermediate_size,
                 groups,
                 args.layer_norm_epsilon,
+                args.weight_dtype(),
                 stream,
             )?,
-            out_proj: common::linear::unloaded_maybe_quantized_linear(
+            out_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 intermediate_size,
                 args.hidden_size,
                 args.use_bias,
                 args.weight_quantization_for(&format!(
                     "model.layers.{layer_idx}.mamba.out_proj.weight"
                 )),
+                args.weight_dtype(),
                 stream,
             )?,
         })
@@ -1785,7 +1867,11 @@ impl Mamba2Mixer {
         let state = cache
             .as_ref()
             .and_then(|cache| cache.conv_state.clone())
-            .unwrap_or(zeros::<f32>(&[batch, state_len, channels], stream)?);
+            .unwrap_or(zeros_dtype(
+                &[batch, state_len, channels],
+                hidden_states_b_c.dtype(),
+                stream,
+            )?);
         let padded = concatenate_axis(&[state, hidden_states_b_c.clone()], 1, stream)?;
         if let Some(cache) = cache {
             cache.conv_state = Some(padded.try_index_device((.., seq_len.., ..), stream)?);
@@ -1863,8 +1949,9 @@ impl Mamba2Mixer {
             .try_index_device((.., .., .., NewAxis), stream)?
             .multiply(d_b.try_index_device((.., .., NewAxis, ..), stream)?, stream)?;
         let state = state.multiply(d_a, stream)?.add(d_b_x, stream)?;
+        let output_state = state.as_dtype(c_t.dtype(), stream)?;
         let y = sum_axis(
-            state.multiply(c_t.try_index_device((.., .., NewAxis, ..), stream)?, stream)?,
+            output_state.multiply(c_t.try_index_device((.., .., NewAxis, ..), stream)?, stream)?,
             -1,
             false,
             stream,
@@ -1898,8 +1985,11 @@ impl Mamba2Mixer {
                 dt.try_index_device((.., index..index + 1, ..), stream)?
                     .add(dt_bias, stream)?,
                 stream,
-            )?
-            .reshape(&[batch, self.num_heads], stream)?;
+            )?;
+            let dt_floor = Array::from_f32(self.time_step_min).as_dtype(dt_t.dtype(), stream)?;
+            let dt_t = maximum(dt_t, dt_floor, stream)?
+                .as_dtype(Dtype::Float32, stream)?
+                .reshape(&[batch, self.num_heads], stream)?;
             let (next_state, y) = self.scan_token(state, x_t, b_t, c_t, dt_t, a, d, stream)?;
             state = next_state;
             outputs.push(y.try_index_device((.., NewAxis, .., ..), stream)?);
@@ -1920,10 +2010,20 @@ impl Mamba2Mixer {
         let batch = shape[0];
         let seq_len = shape[1];
         let mut state = self.initial_ssm_state(batch, cache.as_deref(), stream)?;
-        let a = exp(self.A_log.as_ref(), stream)?
-            .multiply(Array::from_f32(-1.0), stream)?
-            .reshape(&[1, self.num_heads, 1, 1], stream)?;
-        let d = self.D.as_ref().reshape(&[1, self.num_heads, 1], stream)?;
+        let hidden_states = hidden_states.as_dtype(Dtype::Float32, stream)?;
+        let b_states = b_states.as_dtype(Dtype::Float32, stream)?;
+        let c_states = c_states.as_dtype(Dtype::Float32, stream)?;
+        let a = exp(
+            self.A_log.as_ref().as_dtype(Dtype::Float32, stream)?,
+            stream,
+        )?
+        .multiply(Array::from_f32(-1.0), stream)?
+        .reshape(&[1, self.num_heads, 1, 1], stream)?;
+        let d = self
+            .D
+            .as_ref()
+            .as_dtype(Dtype::Float32, stream)?
+            .reshape(&[1, self.num_heads, 1], stream)?;
         let dt_bias = self
             .dt_bias
             .as_ref()
@@ -1972,9 +2072,12 @@ impl Mamba2Mixer {
         }
         let batch = hidden_states.dim(0);
         let state = self.initial_ssm_state(batch, cache.as_deref(), stream)?;
-        let a = exp(self.A_log.as_ref(), stream)?
-            .multiply(Array::from_f32(-1.0), stream)?
-            .reshape(&[1, self.num_heads, 1, 1], stream)?;
+        let a = exp(
+            self.A_log.as_ref().as_dtype(Dtype::Float32, stream)?,
+            stream,
+        )?
+        .multiply(Array::from_f32(-1.0), stream)?
+        .reshape(&[1, self.num_heads, 1, 1], stream)?;
         let d = self.D.as_ref().reshape(&[1, self.num_heads, 1], stream)?;
         let dt_bias = self
             .dt_bias
@@ -1987,8 +2090,9 @@ impl Mamba2Mixer {
             dt.try_index_device((.., 0..1, ..), stream)?
                 .add(&dt_bias, stream)?,
             stream,
-        )?
-        .reshape(&[batch, self.num_heads], stream)?;
+        )?;
+        let dt_floor = Array::from_f32(self.time_step_min).as_dtype(dt_t.dtype(), stream)?;
+        let dt_t = maximum(dt_t, dt_floor, stream)?.reshape(&[batch, self.num_heads], stream)?;
         let (state, y) = self.scan_token(state, x_t, b_t, c_t, dt_t, &a, &d, stream)?;
         if let Some(cache) = cache {
             cache.ssm_state = Some(state);
@@ -2060,6 +2164,7 @@ impl Module<Mamba2Input<'_>> for Mamba2Mixer {
         }
         .reshape(&[batch, seq_len, self.intermediate_size], stream)?;
         let scan = self.norm.forward(&scan, &gate, stream)?;
+        let scan = scan.as_dtype(x.dtype(), stream)?;
         self.out_proj.forward(&scan, stream)
     }
 
@@ -2489,7 +2594,7 @@ impl TransformerBlock {
             norm: nn::RmsNorm::unloaded(
                 args.hidden_size,
                 args.layer_norm_epsilon,
-                Dtype::Float32,
+                args.weight_dtype(),
                 stream,
             )?,
             mamba: if policy == LayerPolicy::Mamba {
@@ -2525,7 +2630,7 @@ impl TransformerBlock {
                     unreachable!()
                 };
                 let prefix = format!("model.layers.{layer_idx}.mlp");
-                Some(Mlp::new(
+                Some(Mlp::new_with_dtype(
                     args.hidden_size,
                     intermediate,
                     args.mlp_bias,
@@ -2533,6 +2638,7 @@ impl TransformerBlock {
                         args.weight_quantization_for(&format!("{prefix}.up_proj.weight")),
                         args.weight_quantization_for(&format!("{prefix}.down_proj.weight")),
                     ],
+                    args.weight_dtype(),
                     stream,
                 )?)
             } else {
@@ -3443,10 +3549,11 @@ pub struct NemotronHModel {
 impl NemotronHModel {
     /// Creates an unloaded Nemotron-H transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let embeddings = common::linear::unloaded_maybe_quantized_embedding(
+        let embeddings = common::linear::unloaded_maybe_quantized_embedding_with_dtype(
             args.vocab_size,
             args.hidden_size,
             args.weight_quantization_for("model.embeddings.weight"),
+            args.weight_dtype(),
             stream,
         )?;
         let layers = (0..args.num_hidden_layers)
@@ -3454,7 +3561,7 @@ impl NemotronHModel {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| Exception::custom(error.to_string()))?;
         let norm_f =
-            nn::RmsNorm::unloaded(args.hidden_size, args.norm_eps, Dtype::Float32, stream)?;
+            nn::RmsNorm::unloaded(args.hidden_size, args.norm_eps, args.weight_dtype(), stream)?;
         Ok(Self {
             vocab_size: args.vocab_size,
             num_hidden_layers: args.num_hidden_layers,
@@ -3598,11 +3705,12 @@ impl Model {
         validate_model_args(&args).map_err(|error| Exception::custom(error.to_string()))?;
         let model = NemotronHModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
-            Some(common::linear::unloaded_maybe_quantized_linear(
+            Some(common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 args.vocab_size,
                 false,
                 args.weight_quantization_for("lm_head.weight"),
+                args.weight_dtype(),
                 stream,
             )?)
         } else {
@@ -3963,84 +4071,9 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
-pub(crate) struct LoadedNemotronHGguf {
-    pub(crate) model: Model,
-}
-
 pub(crate) struct PreparedNemotronHGguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
-}
-
-/// Loads a dense or sparse-MoE Nemotron-H text model from a GGUF checkpoint.
-pub fn load_nemotron_h_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    Ok(load_nemotron_h_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
-}
-
-pub(crate) fn load_nemotron_h_gguf_with_metadata(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedNemotronHGguf, Error> {
-    let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = gguf_metadata(&checkpoint);
-    load_nemotron_h_gguf_checkpoint(&checkpoint, metadata, stream, weights_stream)
-}
-
-pub(crate) fn load_nemotron_h_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LoadedNemotronHGguf, Error> {
-    let architecture = gguf_string(&metadata, "general.architecture")?;
-    if !matches!(architecture.as_str(), "nemotron_h" | "nemotron_h_moe") {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports nemotron_h and nemotron_h_moe"
-        )));
-    }
-    checkpoint
-        .catalog()
-        .translated_outputs(translate_gguf_weight_name)
-        .map_err(safemlx::error::IoError::from)?;
-
-    let gguf_architecture = if architecture == "nemotron_h_moe" {
-        crate::core::GgufArchitecture::NemotronHMoe
-    } else {
-        crate::core::GgufArchitecture::NemotronH
-    };
-    crate::backend::mlx::structural::validate_gguf(
-        gguf_architecture,
-        checkpoint,
-        &metadata,
-        crate::backend::mlx::ModelLoadOptions::default(),
-    )
-    .into_loader_result()?;
-    let mut args = model_args_from_gguf_catalog(checkpoint, &metadata, &architecture)?;
-    let quantized_weight_configs =
-        gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
-    args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
-    args.quantization = None;
-    args.quantized_weight_configs = Some(quantized_weight_configs);
-
-    let mut model = Model::new(args, stream)?;
-    let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
-    let mut report = StrictLoadReport::default();
-    load_gguf_strict(
-        &mut model,
-        checkpoint,
-        None,
-        &config,
-        &mut report,
-        |name, value| translate_gguf_weight(name, value, weights_stream),
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(LoadedNemotronHGguf { model })
 }
 
 pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
@@ -4365,27 +4398,6 @@ fn unique_nonzero_layer_value(key: &str, values: &[i32]) -> Result<i32, Error> {
     Ok(value)
 }
 
-fn translate_gguf_weight(
-    name: String,
-    value: Array,
-    stream: &Stream,
-) -> Result<(String, Array), Error> {
-    let translated = translate_gguf_weight_name(&name);
-    let value = if name.ends_with(".ssm_conv1d.weight") {
-        value.reshape(&[value.shape()[0], 1, value.shape()[1]], stream)?
-    } else if name.ends_with(".ssm_a") {
-        value
-            .multiply(Array::from_f32(-1.0), stream)?
-            .log(stream)?
-            .reshape(&[-1], stream)?
-    } else if name.ends_with(".ssm_d") || name.ends_with(".ssm_norm.weight") {
-        value.reshape(&[-1], stream)?
-    } else {
-        value
-    };
-    Ok((translated, value))
-}
-
 pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     const ROOTS: [(&str, &str); 3] = [
         ("token_embd", "model.embeddings"),
@@ -4554,56 +4566,6 @@ pub fn get_nemotron_h_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArg
     model_args_from_config_value(&serde_json::from_reader(file)?)
 }
 
-/// Loads a Nemotron-H model and safetensors weights from a model directory.
-pub fn load_nemotron_h_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::NemotronH,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default(),
-    )?;
-    let args = get_nemotron_h_model_args(model_dir)?;
-    let mut model = Model::new(args.clone(), stream)?;
-    let config = nemotron_h_strict_load_config();
-    let mut report = StrictLoadReport::default();
-    load_nemotron_h_safetensors_strict(
-        &mut model,
-        model_dir,
-        &args,
-        weights_stream,
-        stream,
-        &config,
-        &mut report,
-    )?;
-    report.finish(&model, &config)?;
-    model.copy_to_stream(stream)?;
-    Ok(model)
-}
-
-/// Strict-loading key rules for Nemotron-H checkpoints.
-pub fn nemotron_h_strict_load_config() -> StrictLoadConfig {
-    StrictLoadConfig::default()
-        .rewrite_prefix("backbone.", "model.")
-        .rewrite_prefix("model.backbone.", "model.")
-}
-
-/// Remaps public Nemotron-H checkpoint tensors to the runtime parameter tree.
-pub fn transform_nemotron_h_weights(
-    loaded: std::collections::HashMap<String, Array>,
-    args: &ModelArgs,
-    stream: &Stream,
-) -> Result<std::collections::HashMap<String, Array>, Error> {
-    let mut rewritten = std::collections::HashMap::with_capacity(loaded.len());
-    for (key, value) in loaded {
-        rewritten.insert(rewrite_nemotron_h_weight_key(&key, args)?, value);
-    }
-    transform_split_relu2_experts(rewritten, args.n_routed_experts, stream)
-}
-
 pub(crate) fn rewrite_nemotron_h_weight_key(key: &str, args: &ModelArgs) -> Result<String, Error> {
     let Some(rest) = key.strip_prefix("backbone.layers.") else {
         return Ok(key.to_string());
@@ -4623,28 +4585,6 @@ pub(crate) fn rewrite_nemotron_h_weight_key(key: &str, args: &ModelArgs) -> Resu
         LayerPolicy::SparseMoe => "moe",
     };
     Ok(format!("backbone.layers.{layer_idx}.{field}.{suffix}"))
-}
-
-/// Strict-loads Nemotron-H safetensors into a module after applying checkpoint remaps.
-pub fn load_nemotron_h_safetensors_strict<M: safemlx::module::ModuleParameters>(
-    model: &mut M,
-    model_dir: impl AsRef<Path>,
-    args: &ModelArgs,
-    weights_stream: &Stream,
-    transform_stream: &Stream,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    load_safetensors_dir_strict_with_split_relu2_experts(
-        model,
-        model_dir,
-        weights_stream,
-        transform_stream,
-        config,
-        report,
-        args.n_routed_experts,
-        |key| rewrite_nemotron_h_weight_key(key, args),
-    )
 }
 
 /// Validates a parsed Nemotron-H config value.
@@ -4808,1130 +4748,4 @@ pub(crate) fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        expand_layer_values, gguf_affine_quantization, hybrid_pattern_from_gguf_layers,
-        load_nemotron_h_gguf, load_nemotron_h_model, load_nemotron_h_safetensors_strict,
-        model_args_from_config_value, rewrite_nemotron_h_weight_key, translate_gguf_weight_name,
-        unique_nonzero_layer_value, validate_model_config_value, AttentionCache, Experts,
-        LayerCache, LayerPolicy, Model, ModelArgs, ModelInput, SparseMoeBlock,
-    };
-    use crate::backend::mlx::runtime::checkpoint::load::{StrictLoadConfig, StrictLoadReport};
-    use crate::{
-        backend::mlx::nn::{
-            generation::CausalLm,
-            moe::{quantize_expert_bank, TopKRouterScoreFunction},
-        },
-        backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-        AttentionPolicy, LayerSchedule,
-    };
-    use safemlx::{
-        module::{Module, ModuleParameters, Param},
-        ops::{dequantize_with_mode, indexing::TryIndexOp},
-        Array, Device, DeviceType, ExecutionContext,
-    };
-    use serde_json::json;
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicUsize, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn nemotron_nano_config() -> serde_json::Value {
-        serde_json::from_str(
-            r#"{
-              "attention_bias": false,
-              "chunk_size": 128,
-              "conv_kernel": 4,
-              "eos_token_id": 2,
-              "expand": 2,
-              "head_dim": 128,
-              "hidden_size": 2688,
-              "hybrid_override_pattern": "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME",
-              "intermediate_size": 1856,
-              "layer_norm_epsilon": 1e-05,
-              "mamba_head_dim": 64,
-              "mamba_hidden_act": "silu",
-              "mamba_num_heads": 64,
-              "mamba_proj_bias": false,
-              "max_position_embeddings": 262144,
-              "mlp_bias": false,
-              "mlp_hidden_act": "relu2",
-              "model_type": "nemotron_h",
-              "moe_intermediate_size": 1856,
-              "moe_shared_expert_intermediate_size": 3712,
-              "n_group": 1,
-              "n_groups": 8,
-              "n_routed_experts": 128,
-              "n_shared_experts": 1,
-              "norm_eps": 1e-05,
-              "norm_topk_prob": true,
-              "num_attention_heads": 32,
-              "num_experts_per_tok": 6,
-              "num_hidden_layers": 52,
-              "num_key_value_heads": 2,
-              "rescale_prenorm_residual": true,
-              "rope_theta": 10000,
-              "routed_scaling_factor": 2.5,
-              "ssm_state_size": 128,
-              "tie_word_embeddings": false,
-              "time_step_floor": 0.0001,
-              "time_step_max": 0.1,
-              "time_step_min": 0.001,
-              "topk_group": 1,
-              "torch_dtype": "bfloat16",
-              "use_bias": false,
-              "use_conv_bias": true,
-              "vocab_size": 131072
-            }"#,
-        )
-        .unwrap()
-    }
-
-    fn temp_model_dir() -> std::path::PathBuf {
-        let id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "nemotron_h_test_{}_{}_{}",
-            std::process::id(),
-            id,
-            counter
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn tiny_moe_args() -> ModelArgs {
-        let mut config = nemotron_nano_config();
-        config["hidden_size"] = json!(4);
-        config["intermediate_size"] = json!(3);
-        config["moe_intermediate_size"] = json!(3);
-        config["moe_shared_expert_intermediate_size"] = json!(5);
-        config["n_routed_experts"] = json!(2);
-        config["num_experts_per_tok"] = json!(2);
-        model_args_from_config_value(&config).unwrap()
-    }
-
-    fn tiny_full_args() -> ModelArgs {
-        let mut config = nemotron_nano_config();
-        config["vocab_size"] = json!(16);
-        config["hidden_size"] = json!(8);
-        config["intermediate_size"] = json!(12);
-        config["num_hidden_layers"] = json!(4);
-        config["hybrid_override_pattern"] = json!("M-E*");
-        config["num_attention_heads"] = json!(2);
-        config["num_key_value_heads"] = json!(1);
-        config["head_dim"] = json!(4);
-        config["mamba_num_heads"] = json!(2);
-        config["mamba_head_dim"] = json!(4);
-        config["n_groups"] = json!(1);
-        config["ssm_state_size"] = json!(4);
-        config["conv_kernel"] = json!(3);
-        config["chunk_size"] = json!(2);
-        config["moe_intermediate_size"] = json!(6);
-        config["moe_shared_expert_intermediate_size"] = json!(10);
-        config["n_routed_experts"] = json!(2);
-        config["num_experts_per_tok"] = json!(2);
-        model_args_from_config_value(&config).unwrap()
-    }
-
-    #[test]
-    fn parses_nemotron_nano_config_fields() {
-        let args = model_args_from_config_value(&nemotron_nano_config()).unwrap();
-        assert_eq!(args.model_type, "nemotron_h");
-        assert_eq!(args.hidden_size, 2688);
-        assert_eq!(args.num_hidden_layers, 52);
-        assert_eq!(args.n_routed_experts, 128);
-        assert_eq!(args.n_shared_experts, 1);
-        assert_eq!(args.num_experts_per_tok, 6);
-        assert_eq!(args.mlp_hidden_act, "relu2");
-        assert_eq!(args.mamba_hidden_act, "silu");
-        assert_eq!(args.torch_dtype.as_deref(), Some("bfloat16"));
-
-        let blocks = &args.layer_schedule;
-        assert_eq!(blocks.len(), 52);
-        assert_eq!(
-            blocks
-                .iter()
-                .filter(|&&block| block == LayerPolicy::Mamba)
-                .count(),
-            23
-        );
-        assert_eq!(
-            blocks
-                .iter()
-                .filter(|&&block| block == LayerPolicy::SparseMoe)
-                .count(),
-            23
-        );
-        assert_eq!(
-            blocks
-                .iter()
-                .filter(|block| matches!(block, LayerPolicy::SelfAttention(_)))
-                .count(),
-            6
-        );
-    }
-
-    #[test]
-    fn prompt_cache_layout_records_mamba_attention_and_stateless_layers() {
-        use crate::core::cache::{LayerCachePolicy, StateTensorRole};
-
-        let args = tiny_full_args();
-        let layout = super::prompt_cache_layer_layout(&args).unwrap();
-        assert_eq!(layout.len(), 4);
-        match layout.get(0).unwrap() {
-            LayerCachePolicy::FixedState { tensors } => {
-                assert_eq!(tensors.len(), 2);
-                assert_eq!(tensors[0].role, StateTensorRole::Convolution { slot: 0 });
-                assert_eq!(tensors[1].role, StateTensorRole::Recurrent);
-            }
-            policy => panic!("unexpected Nemotron-H Mamba policy {policy:?}"),
-        }
-        assert_eq!(layout.get(1), Some(&LayerCachePolicy::NoState));
-        assert_eq!(layout.get(2), Some(&LayerCachePolicy::NoState));
-        assert!(matches!(
-            layout.get(3).unwrap(),
-            LayerCachePolicy::KeyValue { .. }
-        ));
-        let mut reordered = args.clone();
-        reordered.layer_schedule = LayerSchedule::new(
-            4,
-            vec![
-                LayerPolicy::SelfAttention(AttentionPolicy::Full),
-                LayerPolicy::SparseMoe,
-                LayerPolicy::DenseMlp,
-                LayerPolicy::Mamba,
-            ],
-        )
-        .unwrap();
-        assert_ne!(
-            super::prompt_cache_architecture_fingerprint(&args),
-            super::prompt_cache_architecture_fingerprint(&reordered)
-        );
-    }
-
-    #[test]
-    fn validates_nemotron_nano_config() {
-        validate_model_config_value(&nemotron_nano_config()).unwrap();
-    }
-
-    #[test]
-    fn rewrites_public_mixer_keys_by_layer_type() {
-        let args = tiny_full_args();
-        assert_eq!(
-            rewrite_nemotron_h_weight_key("backbone.layers.0.mixer.in_proj.weight", &args).unwrap(),
-            "backbone.layers.0.mamba.in_proj.weight"
-        );
-        assert_eq!(
-            rewrite_nemotron_h_weight_key("backbone.layers.1.mixer.up_proj.weight", &args).unwrap(),
-            "backbone.layers.1.mlp.up_proj.weight"
-        );
-        assert_eq!(
-            rewrite_nemotron_h_weight_key("backbone.layers.2.mixer.gate.weight", &args).unwrap(),
-            "backbone.layers.2.moe.gate.weight"
-        );
-        assert_eq!(
-            rewrite_nemotron_h_weight_key("backbone.layers.3.mixer.q_proj.weight", &args).unwrap(),
-            "backbone.layers.3.attention.q_proj.weight"
-        );
-    }
-
-    #[test]
-    fn translates_nemotron_h_gguf_tensor_names() {
-        assert_eq!(
-            translate_gguf_weight_name("token_embd.weight"),
-            "model.embeddings.weight"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.12.attn_q.scales"),
-            "model.layers.12.attention.q_proj.scales"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.0.ssm_conv1d.weight"),
-            "model.layers.0.mamba.conv1d.weight"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.0.ssm_dt.bias"),
-            "model.layers.0.mamba.dt_bias"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.1.ffn_down.weight"),
-            "model.layers.1.mlp.down_proj.weight"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("output.weight"),
-            "lm_head.weight"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.1.ffn_gate_inp.weight"),
-            "model.layers.1.moe.gate.weight"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.1.exp_probs_b.bias"),
-            "model.layers.1.moe.gate.e_score_correction_bias"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.1.ffn_up_exps.weight"),
-            "model.layers.1.moe.experts.up_proj"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.1.ffn_up_exps.scales"),
-            "model.layers.1.moe.experts.up_proj_scales"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.1.ffn_down_exps.biases"),
-            "model.layers.1.moe.experts.down_proj_biases"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.1.ffn_up_shexp.weight"),
-            "model.layers.1.moe.shared_experts.up_proj.weight"
-        );
-    }
-
-    #[test]
-    fn reconstructs_dense_hybrid_layer_metadata() {
-        let feed_forward =
-            expand_layer_values("nemotron_h.feed_forward_length", vec![0, 12544, 0, 0], 4).unwrap();
-        let kv_heads =
-            expand_layer_values("nemotron_h.attention.head_count_kv", vec![0, 0, 0, 8], 4).unwrap();
-        let pattern = hybrid_pattern_from_gguf_layers(&feed_forward, &kv_heads, false);
-        assert_eq!(pattern, "M-M*");
-        assert_eq!(
-            hybrid_pattern_from_gguf_layers(&feed_forward, &kv_heads, true),
-            "MEM*"
-        );
-        assert_eq!(
-            unique_nonzero_layer_value("feed_forward", &feed_forward).unwrap(),
-            12544
-        );
-    }
-
-    #[test]
-    fn infers_mixed_q4_and_q8_affine_packing_per_tensor() {
-        assert_eq!(
-            gguf_affine_quantization(&[17504, 392], &[17504, 98], "ssm_in.weight").unwrap(),
-            AffineQuantization::new(32, 4).unwrap()
-        );
-        assert_eq!(
-            gguf_affine_quantization(&[131072, 784], &[131072, 98], "lm_head.weight").unwrap(),
-            AffineQuantization::new(32, 8).unwrap()
-        );
-        assert!(gguf_affine_quantization(&[16, 196], &[16, 98], "bad.weight").is_err());
-    }
-
-    #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn packed_nemotron_experts_match_dequantized_reference_with_empty_routes() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let stream = context.stream();
-        let bank_values = |offset: usize| {
-            (0..3 * 32 * 32)
-                .map(|index| {
-                    let value = (index + offset) % 41;
-                    (value as f32 - 20.0) / 32.0
-                })
-                .collect::<Vec<_>>()
-        };
-        for quantization in [
-            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
-            WeightQuantization::MxFp4,
-        ] {
-            let up = Array::from_slice(&bank_values(0), &[3, 32, 32]);
-            let down = Array::from_slice(&bank_values(17), &[3, 32, 32]);
-            let up = quantize_expert_bank(&up, quantization, stream).unwrap();
-            let down = quantize_expert_bank(&down, quantization, stream).unwrap();
-            let up_scales = up.scales.clone();
-            let up_biases = up.biases.clone();
-            let down_scales = down.scales.clone();
-            let down_biases = down.biases.clone();
-
-            let mut packed =
-                Experts::new(3, 32, 32, [Some(quantization), Some(quantization)], stream).unwrap();
-            packed.up_proj = Param::new(up.weight.clone());
-            packed.up_proj_scales = Param::new(Some(up_scales.clone()));
-            packed.up_proj_biases = Param::new(up_biases.clone());
-            packed.down_proj = Param::new(down.weight.clone());
-            packed.down_proj_scales = Param::new(Some(down_scales.clone()));
-            packed.down_proj_biases = Param::new(down_biases.clone());
-
-            let mut reference = Experts::new(3, 32, 32, [None, None], stream).unwrap();
-            reference.up_proj = Param::new(
-                dequantize_with_mode(
-                    &up.weight,
-                    &up_scales,
-                    up_biases.as_ref(),
-                    quantization.group_size(),
-                    quantization.bits(),
-                    quantization.mode(),
-                    stream,
-                )
-                .unwrap(),
-            );
-            reference.down_proj = Param::new(
-                dequantize_with_mode(
-                    &down.weight,
-                    &down_scales,
-                    down_biases.as_ref(),
-                    quantization.group_size(),
-                    quantization.bits(),
-                    quantization.mode(),
-                    stream,
-                )
-                .unwrap(),
-            );
-
-            let input_values = (0..3 * 32)
-                .map(|index| ((index * 7 % 29) as f32 - 14.0) / 16.0)
-                .collect::<Vec<_>>();
-            let hidden = Array::from_slice(&input_values, &[3, 32]);
-            // Expert 1 deliberately receives no routes.
-            let indices = Array::from_slice(&[2i32, 0, 2, 0, 2, 0], &[3, 2]);
-            let weights = Array::from_slice(&[0.75f32, 0.25, 0.6, 0.4, 0.9, 0.1], &[3, 2]);
-            let actual = packed.forward(&hidden, &indices, &weights, stream).unwrap();
-            let actual = actual.evaluated().unwrap();
-            let expected = reference
-                .forward(&hidden, &indices, &weights, stream)
-                .unwrap();
-            let expected = expected.evaluated().unwrap();
-            let maximum_error = actual
-                .as_slice::<f32>()
-                .iter()
-                .zip(expected.as_slice::<f32>())
-                .map(|(actual, expected)| (actual - expected).abs())
-                .fold(0.0f32, f32::max);
-            let tolerance = if quantization == WeightQuantization::MxFp4 {
-                0.4
-            } else {
-                2e-2
-            };
-            assert!(
-                maximum_error < tolerance,
-                "{quantization:?} maximum error {maximum_error}"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn strict_load_packs_public_split_moe_expert_weights() {
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let stream = ctx.stream();
-        let args = tiny_moe_args();
-        let dir = temp_model_dir();
-        let weights_path = dir.join("model.safetensors");
-        let arrays = [
-            (
-                "backbone.layers.1.mixer.gate.weight",
-                Array::zeros::<f32>(&[2, 4], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.gate.e_score_correction_bias",
-                Array::zeros::<f32>(&[2], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.experts.0.up_proj.weight",
-                Array::zeros::<f32>(&[3, 4], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.experts.0.down_proj.weight",
-                Array::zeros::<f32>(&[4, 3], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.experts.1.up_proj.weight",
-                Array::zeros::<f32>(&[3, 4], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.experts.1.down_proj.weight",
-                Array::zeros::<f32>(&[4, 3], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.shared_experts.up_proj.weight",
-                Array::zeros::<f32>(&[5, 4], stream).unwrap(),
-            ),
-            (
-                "backbone.layers.1.mixer.shared_experts.down_proj.weight",
-                Array::zeros::<f32>(&[4, 5], stream).unwrap(),
-            ),
-        ];
-        Array::save_safetensors(
-            arrays.iter().map(|(key, value)| (*key, value)),
-            None,
-            &weights_path,
-        )
-        .unwrap();
-
-        let mut moe = SparseMoeBlock::new(&args, 1, stream).unwrap();
-        let config = StrictLoadConfig::default().rewrite_prefix("backbone.layers.1.moe.", "");
-        let mut report = StrictLoadReport::default();
-        load_nemotron_h_safetensors_strict(
-            &mut moe,
-            &dir,
-            &args,
-            stream,
-            stream,
-            &config,
-            &mut report,
-        )
-        .unwrap();
-        report.finish(&moe, &config).unwrap();
-    }
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn full_model_parameter_tree_matches_public_checkpoint_roots() {
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let model = Model::new(tiny_full_args(), stream).unwrap();
-        let params = model.parameters().flatten();
-
-        for key in [
-            "model.embeddings.weight",
-            "model.layers.0.norm.weight",
-            "model.layers.0.mamba.in_proj.weight",
-            "model.layers.0.mamba.conv1d.weight",
-            "model.layers.1.mlp.up_proj.weight",
-            "model.layers.2.moe.gate.weight",
-            "model.layers.2.moe.gate.e_score_correction_bias",
-            "model.layers.2.moe.experts.up_proj",
-            "model.layers.2.moe.shared_experts.up_proj.weight",
-            "model.layers.3.attention.q_proj.weight",
-            "model.norm_f.weight",
-            "lm_head.weight",
-        ] {
-            assert!(params.contains_key(key), "missing parameter key {key}");
-        }
-    }
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn full_model_prefill_and_decode_shape_smoke() {
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let mut model = Model::new(tiny_full_args(), stream).unwrap();
-        let mut cache = model.new_cache();
-        let prompt = Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-        let input_parts =
-            [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
-        let input = crate::backend::mlx::runtime::media::input::ModelInput::new(&input_parts);
-        let logits = CausalLm::prefill_input_logits(&mut model, input, &mut cache, stream).unwrap();
-        assert_eq!(logits.shape(), &[1, 16]);
-        assert!(cache.offset() >= 3);
-
-        let next = Array::from_slice(&[4_u32], &[1, 1]);
-        let logits = CausalLm::decode_logits(&mut model, &next, &mut cache, stream).unwrap();
-        assert_eq!(logits.shape(), &[1, 16]);
-        assert!(cache.offset() >= 4);
-    }
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn heterogeneous_live_paging_matches_resident_mamba_and_attention() {
-        use crate::{
-            backend::mlx::runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
-            core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
-        };
-
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let args = tiny_full_args();
-        let mut resident = Model::new(args, stream).unwrap();
-        for (index, parameter) in resident.parameters_mut().flatten().values_mut().enumerate() {
-            **parameter = Array::full::<f32>(
-                parameter.shape(),
-                Array::from_f32((index + 1) as f32 * 0.001),
-                stream,
-            )
-            .unwrap();
-        }
-        let mut paged = resident.clone();
-        let mut resident_cache = resident.new_cache();
-        let mut paged_cache = paged
-            .new_cache_with_options(CacheResidencyPolicy::Paged(
-                PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
-                    .unwrap()
-                    .with_full_attention(true),
-            ))
-            .unwrap();
-        for tokens in [
-            Array::from_slice(&[1_u32, 2, 3], &[1, 3]),
-            Array::from_slice(&[4_u32, 5], &[1, 2]),
-            Array::from_slice(&[6_u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    stream,
-                )
-                .unwrap();
-            let actual = paged
-                .forward(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut paged_cache),
-                    },
-                    stream,
-                )
-                .unwrap();
-            assert!(expected
-                .all_close(&actual, 1e-5, 1e-5, None, stream)
-                .unwrap()
-                .item::<bool>(stream));
-            assert_eq!(paged_cache.offset(), resident_cache.offset());
-        }
-        match (&resident_cache.layers[0], &paged_cache.layers[0]) {
-            (LayerCache::Mamba(resident), LayerCache::Mamba(paged)) => {
-                assert_eq!(
-                    resident.conv_state.as_ref().unwrap().shape(),
-                    paged.conv_state.as_ref().unwrap().shape()
-                );
-                assert_eq!(
-                    resident.ssm_state.as_ref().unwrap().shape(),
-                    paged.ssm_state.as_ref().unwrap().shape()
-                );
-            }
-            _ => panic!("Nemotron-H layer zero must retain resident Mamba state"),
-        }
-        assert!(matches!(
-            &paged_cache.layers[3],
-            LayerCache::Attention(AttentionCache::Paged(_))
-        ));
-        let report = paged_cache.residency_report().unwrap().unwrap();
-        assert_eq!(report.logical_cached_tokens, 6);
-        assert!(report.key_value_blocks > 0);
-        assert!(report.prefill_full_attention_blocks > 0);
-        assert!(report.decode_full_attention_blocks > 0);
-
-        let prefix_ids = [1_u32, 2, 3, 4, 5, 6];
-        let layout = super::prompt_cache_layer_layout(&paged.args).unwrap();
-        let descriptor = PromptCacheDescriptor {
-            model_family: "nemotron_h".into(),
-            effective_model_type: paged.args.model_type.clone(),
-            checkpoint_fingerprint: "deterministic-paged-fixture".into(),
-            prefix_content_fingerprint: "tokens:1,2,3,4,5,6".into(),
-            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&paged.args),
-            layer_count: layout.len(),
-            global_layer_start: 0,
-            global_layer_end: layout.len(),
-            batch_size: 1,
-            layer_prefix_offsets: vec![0; layout.len()],
-            layer_layout: layout,
-            sink_tokens: 0,
-            topology: PromptCacheTopology::default(),
-        };
-        let directory = tempfile::tempdir().unwrap();
-        let destination = directory.path().join("paged-prompt-cache");
-        Model::save_prompt_cache(
-            &mut paged_cache,
-            &destination,
-            descriptor.clone(),
-            &prefix_ids,
-            &PromptCacheOptions::default(),
-            stream,
-        )
-        .unwrap();
-        drop(paged_cache);
-        let (mut restored, _) = Model::load_paged_prompt_cache(
-            &paged.args,
-            &destination,
-            &descriptor,
-            &prefix_ids,
-            PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
-                .unwrap()
-                .with_full_attention(true),
-            stream,
-        )
-        .unwrap();
-        let next = Array::from_slice(&[7_u32], &[1, 1]);
-        let expected = resident
-            .forward(
-                ModelInput {
-                    inputs: &next,
-                    mask: None,
-                    cache: Some(&mut resident_cache),
-                },
-                stream,
-            )
-            .unwrap();
-        let actual = paged
-            .forward(
-                ModelInput {
-                    inputs: &next,
-                    mask: None,
-                    cache: Some(&mut restored),
-                },
-                stream,
-            )
-            .unwrap();
-        assert!(expected
-            .all_close(&actual, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(stream));
-    }
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn heterogeneous_sliding_live_paging_matches_resident() {
-        use crate::backend::mlx::runtime::cache::residency::{
-            CacheResidencyPolicy, PagedCacheOptions,
-        };
-
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let mut args = tiny_full_args();
-        args.layer_schedule = LayerSchedule::new(
-            args.layer_schedule.len(),
-            args.layer_schedule
-                .iter()
-                .copied()
-                .map(|policy| match policy {
-                    LayerPolicy::SelfAttention(_) => {
-                        LayerPolicy::SelfAttention(AttentionPolicy::sliding(3).unwrap())
-                    }
-                    policy => policy,
-                })
-                .collect(),
-        )
-        .unwrap();
-        let mut resident = Model::new(args, stream).unwrap();
-        for (index, parameter) in resident.parameters_mut().flatten().values_mut().enumerate() {
-            **parameter = Array::full::<f32>(
-                parameter.shape(),
-                Array::from_f32((index + 1) as f32 * 0.001),
-                stream,
-            )
-            .unwrap();
-        }
-        let mut paged = resident.clone();
-        let mut resident_cache = resident.new_cache();
-        let mut paged_cache = paged
-            .new_cache_with_options(CacheResidencyPolicy::Paged(
-                PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
-            ))
-            .unwrap();
-        for tokens in [
-            Array::from_slice(&[1_u32, 2, 3, 4, 5], &[1, 5]),
-            Array::from_slice(&[6_u32], &[1, 1]),
-            Array::from_slice(&[7_u32, 8], &[1, 2]),
-        ] {
-            let expected = resident
-                .forward(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    stream,
-                )
-                .unwrap();
-            let actual = paged
-                .forward(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut paged_cache),
-                    },
-                    stream,
-                )
-                .unwrap();
-            assert!(expected
-                .all_close(&actual, 1e-5, 1e-5, None, stream)
-                .unwrap()
-                .item::<bool>(stream));
-        }
-        let report = paged_cache.residency_report().unwrap().unwrap();
-        assert_eq!(report.logical_cached_tokens, 8);
-        assert!(report.discarded_sliding_blocks > 0);
-        assert!(matches!(
-            &paged_cache.layers[3],
-            LayerCache::Attention(AttentionCache::Paged(cache))
-                if cache.attention_window() == Some(3)
-        ));
-    }
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn schema_v4_nemotron_h_save_drop_paged_reload_continue_matches_uninterrupted() {
-        use crate::{
-            backend::mlx::runtime::{
-                cache::residency::PagedCacheOptions,
-                media::input::{InputPart, ModelInput as RuntimeModelInput},
-            },
-            core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
-        };
-
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let args = tiny_full_args();
-        let mut model = Model::new(args.clone(), stream).unwrap();
-        for (index, parameter) in model.parameters_mut().flatten().values_mut().enumerate() {
-            **parameter = Array::full::<f32>(
-                parameter.shape(),
-                Array::from_f32((index + 1) as f32 * 0.001),
-                stream,
-            )
-            .unwrap();
-        }
-        let prefix_ids = [1_u32, 2, 3, 4];
-        let prefix = Array::from_slice(&prefix_ids, &[1, 4]);
-        let parts = [InputPart::text_token_ids(&prefix)];
-        let mut cache = model.new_cache();
-        CausalLm::prefill_input_logits(
-            &mut model,
-            RuntimeModelInput::new(&parts),
-            &mut cache,
-            stream,
-        )
-        .unwrap();
-        assert_eq!(cache.offset(), 4);
-        match &cache.layers[0] {
-            super::LayerCache::Mamba(cache) => {
-                assert_eq!(cache.conv_state.as_ref().unwrap().shape(), &[1, 2, 16]);
-                assert_eq!(cache.ssm_state.as_ref().unwrap().shape(), &[1, 2, 4, 4]);
-            }
-            _ => panic!("expected Nemotron-H Mamba cache"),
-        }
-        assert_eq!(cache.layers[3].retained_arrays()[0].dim(-2), 4);
-        let mut uninterrupted_cache = cache.clone();
-        let suffix = Array::from_slice(&[5_u32], &[1, 1]);
-        let uninterrupted =
-            CausalLm::decode_logits(&mut model, &suffix, &mut uninterrupted_cache, stream).unwrap();
-        let layout = super::prompt_cache_layer_layout(&args).unwrap();
-        let descriptor = PromptCacheDescriptor {
-            model_family: "nemotron_h".into(),
-            effective_model_type: args.model_type.clone(),
-            checkpoint_fingerprint: "deterministic-fixture".into(),
-            prefix_content_fingerprint: "tokens:1,2,3,4".into(),
-            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&args),
-            layer_count: layout.len(),
-            global_layer_start: 0,
-            global_layer_end: layout.len(),
-            batch_size: 1,
-            layer_prefix_offsets: vec![0; layout.len()],
-            layer_layout: layout,
-            sink_tokens: 0,
-            topology: PromptCacheTopology::default(),
-        };
-        let directory = tempfile::tempdir().unwrap();
-        let destination = directory.path().join("prompt-cache");
-        Model::save_prompt_cache(
-            &mut cache,
-            &destination,
-            descriptor.clone(),
-            &prefix_ids,
-            &PromptCacheOptions::default(),
-            stream,
-        )
-        .unwrap();
-        drop(cache);
-        let (mut restored, _) = Model::load_paged_prompt_cache(
-            &args,
-            &destination,
-            &descriptor,
-            &prefix_ids,
-            PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
-                .unwrap()
-                .with_full_attention(true),
-            stream,
-        )
-        .unwrap();
-        assert_eq!(restored.offset(), 4);
-        match &restored.layers[0] {
-            super::LayerCache::Mamba(cache) => {
-                assert_eq!(cache.conv_state.as_ref().unwrap().shape(), &[1, 2, 16]);
-                assert_eq!(cache.ssm_state.as_ref().unwrap().shape(), &[1, 2, 4, 4]);
-            }
-            _ => panic!("expected restored Nemotron-H Mamba cache"),
-        }
-        assert!(matches!(
-            &restored.layers[3],
-            LayerCache::Attention(AttentionCache::Paged(_))
-        ));
-        assert_eq!(
-            restored
-                .residency_report()
-                .unwrap()
-                .unwrap()
-                .logical_cached_tokens,
-            4
-        );
-        let continued =
-            CausalLm::decode_logits(&mut model, &suffix, &mut restored, stream).unwrap();
-        assert!(uninterrupted
-            .all_close(&continued, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(stream));
-    }
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn strict_load_full_model_from_public_checkpoint_key_shapes() {
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let weights_stream = weights_ctx.stream();
-        let args = tiny_full_args();
-        let source = Model::new(args.clone(), stream).unwrap();
-        let dir = temp_model_dir();
-        let weights_path = dir.join("model.safetensors");
-        let mut arrays = Vec::new();
-        for (key, value) in source.parameters().flatten() {
-            if key.as_ref() == "model.layers.2.moe.experts.up_proj" {
-                for expert in 0..args.n_routed_experts {
-                    arrays.push((
-                        format!("backbone.layers.2.mixer.experts.{expert}.up_proj.weight"),
-                        value.try_index_device((expert, .., ..), stream).unwrap(),
-                    ));
-                }
-                continue;
-            }
-            if key.as_ref() == "model.layers.2.moe.experts.down_proj" {
-                for expert in 0..args.n_routed_experts {
-                    arrays.push((
-                        format!("backbone.layers.2.mixer.experts.{expert}.down_proj.weight"),
-                        value.try_index_device((expert, .., ..), stream).unwrap(),
-                    ));
-                }
-                continue;
-            }
-
-            let public_key = key
-                .strip_prefix("model.embeddings.")
-                .map(|rest| format!("backbone.embeddings.{rest}"))
-                .or_else(|| {
-                    key.strip_prefix("model.norm_f.")
-                        .map(|rest| format!("backbone.norm_f.{rest}"))
-                })
-                .or_else(|| {
-                    key.strip_prefix("model.layers.").map(|rest| {
-                        let (layer, suffix) = rest.split_once('.').unwrap();
-                        if suffix.starts_with("norm.") {
-                            return format!("backbone.layers.{layer}.{suffix}");
-                        }
-                        let suffix = suffix
-                            .strip_prefix("mamba.")
-                            .or_else(|| suffix.strip_prefix("attention."))
-                            .or_else(|| suffix.strip_prefix("mlp."))
-                            .or_else(|| suffix.strip_prefix("moe."))
-                            .unwrap_or(suffix);
-                        format!("backbone.layers.{layer}.mixer.{suffix}")
-                    })
-                })
-                .unwrap_or_else(|| key.to_string());
-            arrays.push((public_key, value.clone()));
-        }
-        Array::save_safetensors(
-            arrays.iter().map(|(key, value)| (key.as_str(), value)),
-            None,
-            &weights_path,
-        )
-        .unwrap();
-
-        let mut target = Model::new(args.clone(), stream).unwrap();
-        let config = super::nemotron_h_strict_load_config();
-        let mut report = StrictLoadReport::default();
-        load_nemotron_h_safetensors_strict(
-            &mut target,
-            &dir,
-            &args,
-            weights_stream,
-            stream,
-            &config,
-            &mut report,
-        )
-        .unwrap();
-        report.finish(&target, &config).unwrap();
-    }
-
-    #[test]
-    #[ignore = "requires a local Nemotron-H checkpoint and MLX runtime execution"]
-    fn strict_loads_real_public_checkpoint() {
-        let model_dir = PathBuf::from(
-            std::env::var("NEMOTRON_H_MODEL_DIR")
-                .expect("set NEMOTRON_H_MODEL_DIR to a local Nemotron-H snapshot"),
-        );
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let weights_stream = weights_ctx.stream();
-
-        let model = load_nemotron_h_model(&model_dir, stream, weights_stream).unwrap();
-        assert_eq!(model.model_type(), "nemotron_h");
-        assert_eq!(model.args.num_hidden_layers, 52);
-        assert_eq!(model.args.n_routed_experts, 128);
-        assert_eq!(model.args.num_experts_per_tok, 6);
-        assert_eq!(model.new_cache().layers.len(), 52);
-    }
-
-    #[test]
-    #[ignore = "requires NEMOTRON_H_MOE_GGUF and Metal"]
-    fn strict_loads_and_runs_real_nemotron_h_moe_gguf() {
-        let gguf_file = PathBuf::from(
-            std::env::var("NEMOTRON_H_MOE_GGUF")
-                .expect("set NEMOTRON_H_MOE_GGUF to a local checkpoint"),
-        );
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut model = load_nemotron_h_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
-
-        assert_eq!(model.args.num_hidden_layers, 52);
-        assert_eq!(model.args.n_routed_experts, 128);
-        assert_eq!(model.args.num_experts_per_tok, 6);
-        assert!(model
-            .args
-            .layer_schedule
-            .iter()
-            .any(|policy| *policy == LayerPolicy::SparseMoe));
-
-        let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-        let parts =
-            [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
-        let mut cache = model.new_cache();
-        let logits = CausalLm::prefill_input_logits(
-            &mut model,
-            crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
-            &mut cache,
-            stream,
-        )
-        .unwrap();
-        assert_eq!(logits.shape(), &[1, 131072]);
-    }
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn moe_parameter_tree_uses_nemotron_weight_names_and_policy() {
-        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let args = model_args_from_config_value(&nemotron_nano_config()).unwrap();
-        let moe = SparseMoeBlock::new(&args, 0, stream).unwrap();
-        let params = moe.parameters().flatten();
-
-        assert_eq!(moe.gate.top_k, 6);
-        assert_eq!(moe.gate.num_experts, 128);
-        assert_eq!(moe.gate.score_function, TopKRouterScoreFunction::Sigmoid);
-        assert_eq!(moe.gate.routed_scaling_factor, 2.5);
-        assert!(moe.gate.norm_topk_prob);
-        assert_eq!(moe.experts.num_experts, 128);
-
-        for key in [
-            "gate.weight",
-            "gate.e_score_correction_bias",
-            "experts.up_proj",
-            "experts.down_proj",
-            "shared_experts.up_proj.weight",
-            "shared_experts.down_proj.weight",
-        ] {
-            assert!(params.contains_key(key), "missing parameter key {key}");
-        }
-        assert_eq!(params["gate.weight"].shape(), &[128, args.hidden_size]);
-        assert_eq!(params["gate.e_score_correction_bias"].shape(), &[128]);
-        assert_eq!(
-            params["experts.up_proj"].shape(),
-            &[128, args.moe_intermediate_size, args.hidden_size]
-        );
-        assert_eq!(
-            params["experts.down_proj"].shape(),
-            &[128, args.hidden_size, args.moe_intermediate_size]
-        );
-    }
-
-    #[test]
-    fn rejects_mismatched_hybrid_pattern_length() {
-        let mut config = nemotron_nano_config();
-        config["hybrid_override_pattern"] = json!("ME");
-
-        let error = validate_model_config_value(&config).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "unsupported model architecture: Nemotron-H hybrid_override_pattern layer schedule has 2 entries for 52 decoder layers"
-        );
-    }
-
-    #[test]
-    fn normalizes_four_operator_kinds_and_sliding_attention() {
-        let mut config = nemotron_nano_config();
-        config["num_hidden_layers"] = json!(4);
-        config["hybrid_override_pattern"] = json!("M*-E");
-        config["sliding_window"] = json!(7);
-        let args = model_args_from_config_value(&config).unwrap();
-        assert_eq!(
-            args.layer_schedule.iter().copied().collect::<Vec<_>>(),
-            vec![
-                LayerPolicy::Mamba,
-                LayerPolicy::SelfAttention(
-                    crate::core::attention::AttentionPolicy::sliding(7).unwrap()
-                ),
-                LayerPolicy::DenseMlp,
-                LayerPolicy::SparseMoe,
-            ]
-        );
-        let cache = super::Cache::new(&args);
-        assert!(matches!(cache.layers[0], super::LayerCache::Mamba(_)));
-        assert!(matches!(
-            &cache.layers[1],
-            super::LayerCache::Attention(cache)
-                if cache.policy() == crate::core::attention::AttentionPolicy::sliding(7).unwrap()
-        ));
-        assert!(matches!(cache.layers[2], super::LayerCache::Mlp));
-        assert!(matches!(cache.layers[3], super::LayerCache::Moe));
-    }
-
-    #[test]
-    fn rejects_invalid_sliding_windows_before_execution() {
-        for value in [json!(0), json!(-1), json!(i64::from(i32::MAX) + 1)] {
-            let mut config = nemotron_nano_config();
-            config["sliding_window"] = value;
-            let error = model_args_from_config_value(&config).unwrap_err();
-            assert!(error
-                .to_string()
-                .contains("sliding_window must be a positive integer in the executable i32 range"));
-        }
-    }
-
-    #[test]
-    fn architecture_fingerprint_tracks_ordered_layer_schedule() {
-        let mut first = nemotron_nano_config();
-        first["num_hidden_layers"] = json!(4);
-        first["hybrid_override_pattern"] = json!("M*-E");
-        let mut second = first.clone();
-        second["hybrid_override_pattern"] = json!("*M-E");
-        let first = model_args_from_config_value(&first).unwrap();
-        let second = model_args_from_config_value(&second).unwrap();
-        assert_ne!(
-            super::prompt_cache_architecture_fingerprint(&first),
-            super::prompt_cache_architecture_fingerprint(&second)
-        );
-    }
-
-    #[test]
-    fn rejects_incompatible_mamba_and_grouped_expert_geometry() {
-        let mut config = nemotron_nano_config();
-        config["n_groups"] = json!(3);
-        let error = validate_model_config_value(&config).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("mamba_num_heads (64) must be divisible by n_groups (3)"));
-
-        let mut config = nemotron_nano_config();
-        config["n_group"] = json!(3);
-        let error = validate_model_config_value(&config).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("invalid Nemotron-H grouped expert routing"));
-    }
 }

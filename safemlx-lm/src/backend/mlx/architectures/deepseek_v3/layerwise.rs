@@ -35,10 +35,11 @@ use crate::{
     },
     backend::mlx::runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         canonical_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        populate_module_from_lease_excluding, ModuleBindingPlan,
     },
+    backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
@@ -52,8 +53,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
     },
@@ -286,6 +286,10 @@ impl DeepSeekV3LayerwiseModel {
     /// Returns the validated architecture arguments.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
+    }
+
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
     }
 
     pub(crate) fn bind_parallel_topology(
@@ -556,6 +560,10 @@ impl DeepSeekV3LayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
     }
 
     /// Runs a rank-local tensor-parallel forward pass through the generalized engine.
@@ -1011,43 +1019,34 @@ impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekT
 pub fn load_deepseek_v3_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::DeepSeekV3,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
+    if quantization.is_some() && args.native_fp8_config().is_some() {
+        return Err(Error::Quantization(
+            "native DeepSeek block-FP8 weights cannot be implicitly transcoded".into(),
+        ));
+    }
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("DeepSeek-V3", args.affine_quantization()?, requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = DeepSeekV3LayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(DeepSeekV3LayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_deepseek_v3_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<DeepSeekV3LayerwiseModel, Error> {
-    let adapter = DeepSeekV3LayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(DeepSeekV3LayerwiseModel {
-        execution: load_layerwise_model(
+        execution: load_layerwise_model_with_quantization(
             store,
             adapter,
-            LayerWeightResidency::FullyResident,
+            options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -1064,7 +1063,6 @@ pub(crate) fn load_deepseek_v3_tensor_parallel_model(
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1081,11 +1079,6 @@ pub(crate) fn load_deepseek_v3_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::DeepSeekV3,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let adapter = DeepSeekV3LayerwiseAdapter::new(args, stream)?;
@@ -1118,9 +1111,12 @@ pub(crate) fn load_deepseek_v3_gguf_tensor_parallel_model(
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
@@ -1155,9 +1151,11 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let args = prepared.args;
+    let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
@@ -1276,12 +1274,6 @@ pub fn load_deepseek_v3_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::core::ModelKind::DeepSeekV3,
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
-    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let quantize_on_load = quantization
@@ -1491,18 +1483,7 @@ impl DeepSeekV3LayerwiseAdapter {
             }
             let destination = format!("{prefix}.{local_name}");
             let canonical = canonical_checkpoint_name(&destination);
-            if keys.contains(&destination) {
-                recipes.insert(
-                    local_name.to_string(),
-                    DerivedWeightRecipe::source(destination, TensorSelection::Full),
-                );
-                continue;
-            }
-            if keys.contains(&canonical) {
-                recipes.insert(
-                    local_name.to_string(),
-                    DerivedWeightRecipe::source(canonical, TensorSelection::Full),
-                );
+            if keys.contains(&destination) || keys.contains(&canonical) {
                 continue;
             }
             if let Some((projection, component)) = expert_destination(local_name.as_ref()) {
@@ -1539,6 +1520,22 @@ impl DeepSeekV3LayerwiseAdapter {
             );
         }
         Ok(recipes)
+    }
+
+    fn binding_plan_for_layer(
+        &self,
+        layer: &DecoderLayer,
+        index: usize,
+        store: &dyn WeightStore,
+    ) -> Result<ModuleBindingPlan, Error> {
+        let prefix = format!("model.layers.{index}");
+        Ok(build_module_binding_plan_with_recipes_excluding(
+            layer,
+            &prefix,
+            store,
+            self.recipes_for_layer(layer, index, store)?,
+            |name| self.sparse_expert_cache && name.starts_with("mlp.experts."),
+        )?)
     }
 
     fn mtp_recipes(
@@ -1941,6 +1938,15 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(&self.args, true)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::backend::mlx::MlxParallelContext>,
@@ -2015,47 +2021,51 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.embedding,
                     "model.embed_tokens",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.norm,
                     "model.norm",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             units.push(StaticUnitBindings::new(
                 HEAD_UNIT,
-                build_module_bindings_with_recipes(
+                build_module_binding_plan_with_recipes(
                     &self.lm_head,
                     "lm_head",
                     store,
                     BTreeMap::new(),
-                )?,
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(MTP_UNIT) {
             if let Some(mtp) = &self.mtp {
                 units.push(StaticUnitBindings::new(
                     MTP_UNIT,
-                    build_module_bindings_with_recipes_excluding(
+                    build_module_binding_plan_with_recipes_excluding(
                         mtp,
                         "",
                         store,
                         self.mtp_recipes(store)?,
                         |name| self.sparse_expert_cache && name.contains(".decoder.mlp.experts."),
-                    )?,
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -2542,15 +2552,9 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let prefix = format!("model.layers.{index}");
-        build_module_bindings_with_recipes_excluding(
-            layer,
-            &prefix,
-            store,
-            self.recipes_for_layer(layer, index, store)?,
-            |name| self.sparse_expert_cache && name.starts_with("mlp.experts."),
-        )
-        .map_err(Into::into)
+        Ok(self
+            .binding_plan_for_layer(layer, index, store)?
+            .build_bindings(store)?)
     }
 
     fn parallel_layer_bindings(
@@ -2907,661 +2911,18 @@ fn deepseek_recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 /// DeepSeek token generation using bounded layer execution.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, DeepSeekV3LayerwiseModel, Cache, S>;
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use std::{fs, path::Path};
-
-    use safemlx::{
-        module::{ModuleParameters, Param},
-        ops::{indexing::TryIndexOp, ones_dtype, zeros_dtype},
-        Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
-    };
-
-    use super::{
-        load_deepseek_v3_expert_cache_model, load_deepseek_v3_layerwise_model,
-        register_deepseek_layer_parallel_plan, DeepSeekV3LayerwiseAdapter,
-        DeepSeekV3LayerwiseModel,
-    };
-    use crate::{
-        backend::mlx::architectures::deepseek_v3::model::{
-            self as resident, FeedForward, LayerPolicy, Model, ModelArgs, ModelInput,
-        },
-        backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name,
-        backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-        backend::mlx::runtime::execution::layerwise::{
-            load_safetensors_layerwise_model, ArchitectureAdapter, LayerwiseLoadOptions,
-        },
-        backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        backend::mlx::{CacheResidencyPolicy, PagedCacheOptions},
-        core::attention::LayerSchedule,
-        core::residency::{OffloadConfig, ResidencyPolicy},
-    };
-
-    fn config(fp8: bool) -> serde_json::Value {
-        let mut value = serde_json::json!({
-            "architectures": ["DeepseekV3ForCausalLM"],
-            "model_type": "deepseek_v3",
-            "hidden_size": 8,
-            "intermediate_size": 16,
-            "moe_intermediate_size": 4,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "vocab_size": 32,
-            "rms_norm_eps": 1e-6,
-            "max_position_embeddings": 128,
-            "rope_theta": 10000,
-            "q_lora_rank": 4,
-            "kv_lora_rank": 4,
-            "qk_nope_head_dim": 2,
-            "qk_rope_head_dim": 2,
-            "v_head_dim": 2,
-            "first_k_dense_replace": 1,
-            "moe_layer_freq": 1,
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "num_experts_per_tok": 2,
-            "n_group": 2,
-            "topk_group": 1,
-            "topk_method": "noaux_tc",
-            "scoring_func": "sigmoid",
-            "norm_topk_prob": true,
-            "routed_scaling_factor": 1.5,
-            "num_nextn_predict_layers": 0,
-            "tie_word_embeddings": false,
-            "attention_bias": false,
-            "attention_dropout": 0.0,
-            "hidden_act": "silu",
-            "eos_token_id": 1
-        });
-        if fp8 {
-            value.as_object_mut().unwrap().insert(
-                "quantization_config".into(),
-                serde_json::json!({
-                    "activation_scheme": "dynamic",
-                    "fmt": "e4m3",
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128]
-                }),
-            );
-        }
-        value
-    }
-
-    fn args(fp8: bool) -> ModelArgs {
-        resident::model_args_from_config_value(&config(fp8)).unwrap()
-    }
-
-    #[test]
-    fn tensor_parallel_plan_balances_mla_dense_and_expert_domains() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut args = args(false);
-        args.hidden_size = 12;
-        args.intermediate_size = 17;
-        args.moe_intermediate_size = 5;
-        args.num_attention_heads = 3;
-        args.layer_schedule =
-            LayerSchedule::new(2, vec![LayerPolicy::DenseMlp, LayerPolicy::SparseMoe]).unwrap();
-        args.validate().unwrap();
-        for rank in 0..2 {
-            let context = ParallelBuildContext::new(
-                MlxParallelContext::for_rank(
-                    rank,
-                    2,
-                    1,
-                    1,
-                    DeviceAssignment::new(DeviceType::Cpu, 0),
-                )
-                .unwrap(),
-                ShardingPolicy::Require,
-            );
-            let mut planner = context.planner();
-            for layer in 0..2 {
-                let block =
-                    resident::DecoderLayer::new_layerwise(&args, layer as i32, execution.stream())
-                        .unwrap();
-                register_deepseek_layer_parallel_plan(&mut planner, &block, layer).unwrap();
-            }
-            let (_, layout) = planner.finish().unwrap();
-            let heads = if rank == 0 { 2 } else { 1 };
-            let dense = if rank == 0 { 9 } else { 8 };
-            let expert = if rank == 0 { 3 } else { 2 };
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.self_attn.q_b_proj.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[heads * 4, 4]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.0.mlp.gate_proj.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[dense, 12]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.mlp.experts.gate_proj")
-                    .unwrap()
-                    .local_shape(),
-                &[4, expert, 12]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.mlp.experts.down_proj")
-                    .unwrap()
-                    .local_shape(),
-                &[4, 12, expert]
-            );
-            assert_eq!(
-                layout
-                    .tensor("model.layers.1.mlp.shared_experts.gate_proj.weight")
-                    .unwrap()
-                    .local_shape(),
-                &[expert, 12]
-            );
-        }
-    }
-
-    #[test]
-    fn embedded_mtp_geometry_owns_one_draft_cache_per_prediction_layer() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut args = args(false);
-        args.num_nextn_predict_layers = 2;
-        let adapter = DeepSeekV3LayerwiseAdapter::new(args, execution.stream()).unwrap();
-        assert_eq!(adapter.mtp.as_ref().unwrap().len(), 2);
-        assert_eq!(adapter.new_cache().mtp_layers.len(), 2);
-    }
-
-    #[test]
-    fn embedded_mtp_parameters_share_the_tensor_parallel_plan() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut args = args(false);
-        args.num_nextn_predict_layers = 1;
-        let adapter = DeepSeekV3LayerwiseAdapter::new(args, execution.stream()).unwrap();
-        let context = ParallelBuildContext::new(
-            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap(),
-            ShardingPolicy::Require,
-        );
-        let mut planner = context.planner();
-        adapter
-            .register_parallel_parameters(context, &mut planner, execution.stream())
-            .unwrap();
-        let (_, layout) = planner.finish().unwrap();
-        assert_eq!(
-            layout
-                .tensor("layers.0.decoder.mlp.experts.gate_proj")
-                .unwrap()
-                .local_shape(),
-            &[4, 2, 8]
-        );
-        assert_eq!(
-            layout
-                .tensor("layers.0.shared_head.weight")
-                .unwrap()
-                .local_shape(),
-            &[16, 8]
-        );
-    }
-
-    fn initialize(model: &mut Model, stream: &Stream) {
-        for layer in &mut model.model.layers {
-            if let FeedForward::Moe(moe) = &mut layer.mlp {
-                let experts = model.args.n_routed_experts;
-                let hidden = model.args.hidden_size;
-                let intermediate = model.args.moe_intermediate_size;
-                let weight = |shape: &[i32]| {
-                    if model.args.native_fp8_config().is_some() {
-                        Array::full::<u8>(shape, Array::from_slice(&[0x38u8], &[]), stream).unwrap()
-                    } else {
-                        Array::full::<f32>(shape, Array::from_f32(0.01), stream).unwrap()
-                    }
-                };
-                moe.experts.gate_proj = Param::new(Some(weight(&[experts, intermediate, hidden])));
-                moe.experts.up_proj = Param::new(Some(weight(&[experts, intermediate, hidden])));
-                moe.experts.down_proj = Param::new(Some(weight(&[experts, hidden, intermediate])));
-                if model.args.native_fp8_config().is_some() {
-                    moe.experts.gate_proj_scale_inv =
-                        Param::new(Some(Array::ones::<f32>(&[experts, 1, 1], stream).unwrap()));
-                    moe.experts.up_proj_scale_inv =
-                        Param::new(Some(Array::ones::<f32>(&[experts, 1, 1], stream).unwrap()));
-                    moe.experts.down_proj_scale_inv =
-                        Param::new(Some(Array::ones::<f32>(&[experts, 1, 1], stream).unwrap()));
-                }
-            }
-        }
-        for (name, parameter) in model.parameters_mut().flatten() {
-            let shape = parameter.shape().to_vec();
-            let dtype = parameter.dtype();
-            *parameter = if dtype == Dtype::Uint8 {
-                Array::full::<u8>(&shape, Array::from_slice(&[0x38u8], &[]), stream).unwrap()
-            } else if name.ends_with("layernorm.weight")
-                || name.as_ref() == "model.norm.weight"
-                || name.ends_with("weight_scale_inv")
-                || name.ends_with("_scale_inv")
-            {
-                ones_dtype(&shape, dtype, stream).unwrap()
-            } else if dtype == Dtype::Float32 {
-                Array::full::<f32>(&shape, Array::from_f32(0.01), stream).unwrap()
-            } else {
-                zeros_dtype(&shape, dtype, stream).unwrap()
-            };
-        }
-    }
-
-    fn write_fixture(
-        dir: &Path,
-        model: &Model,
-        fp8: bool,
-        split_experts: bool,
-        mtp: bool,
-        stream: &Stream,
-    ) {
-        let mut arrays = Vec::<(String, Array)>::new();
-        for (name, value) in model.parameters().flatten() {
-            let name = canonical_checkpoint_name(&name);
-            let packed = ["gate_proj", "up_proj", "down_proj"]
-                .into_iter()
-                .find_map(|projection| {
-                    [
-                        ("", "weight"),
-                        ("_scale_inv", "weight_scale_inv"),
-                        ("_scales", "scales"),
-                        ("_biases", "biases"),
-                    ]
-                    .into_iter()
-                    .find_map(|(runtime_suffix, checkpoint_component)| {
-                        name.ends_with(&format!(".mlp.experts.{projection}{runtime_suffix}"))
-                            .then_some((projection, runtime_suffix, checkpoint_component))
-                    })
-                });
-            if let Some((projection, runtime_suffix, checkpoint_component)) =
-                packed.filter(|_| split_experts)
-            {
-                let suffix = format!(".experts.{projection}{runtime_suffix}");
-                let prefix = name.strip_suffix(&suffix).unwrap();
-                for expert in 0..model.args.n_routed_experts {
-                    arrays.push((
-                        format!("{prefix}.experts.{expert}.{projection}.{checkpoint_component}"),
-                        value.try_index_device(expert, stream).unwrap(),
-                    ));
-                }
-            } else {
-                arrays.push((name, value.clone()));
-            }
-        }
-        if mtp {
-            assert!(!fp8, "the deterministic MTP fixture uses dense weights");
-            let decoder = arrays
-                .iter()
-                .filter_map(|(name, value)| {
-                    name.strip_prefix("model.layers.1.")
-                        .map(|suffix| (format!("model.layers.2.{suffix}"), value.clone()))
-                })
-                .collect::<Vec<_>>();
-            arrays.extend(decoder);
-            arrays.extend([
-                (
-                    "model.layers.2.enorm.weight".into(),
-                    ones_dtype(&[8], Dtype::Float32, stream).unwrap(),
-                ),
-                (
-                    "model.layers.2.hnorm.weight".into(),
-                    ones_dtype(&[8], Dtype::Float32, stream).unwrap(),
-                ),
-                (
-                    "model.layers.2.eh_proj.weight".into(),
-                    Array::full::<f32>(&[8, 16], Array::from_f32(0.01), stream).unwrap(),
-                ),
-                (
-                    "model.layers.2.shared_head.norm.weight".into(),
-                    ones_dtype(&[8], Dtype::Float32, stream).unwrap(),
-                ),
-                (
-                    "model.layers.2.shared_head.head.weight".into(),
-                    Array::full::<f32>(&[32, 8], Array::from_f32(0.01), stream).unwrap(),
-                ),
-            ]);
-        }
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
-            dir.join("model.safetensors"),
-        )
-        .unwrap();
-        let mut fixture_config = config(fp8);
-        fixture_config["num_nextn_predict_layers"] = i32::from(mtp).into();
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&fixture_config).unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn assert_close(left: &Array, right: &Array, tolerance: f32) {
-        let left = left.evaluated().unwrap();
-        let right = right.evaluated().unwrap();
-        assert_eq!(left.as_array().shape(), right.as_array().shape());
-        for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
-            assert!((left - right).abs() <= tolerance, "{left} != {right}");
-        }
-    }
-
-    fn parity(fp8: bool, depth: usize) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(fp8), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, fp8, true, false, gpu.stream());
-
-        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
-        let mut layerwise =
-            load_deepseek_v3_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream())
-                .unwrap();
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = resident::Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-            Array::from_slice(&[4u32], &[1, 1]),
-            Array::from_slice(&[5u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = layerwise
-                .forward(&tokens, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected, if fp8 { 2e-4 } else { 3e-5 });
-            assert_eq!(resident_cache.offset(), layerwise_cache.offset());
-            for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
-                assert_eq!(expected.offset(), actual.offset());
-                let (expected_latent, expected_rotary) = expected.arrays().unwrap();
-                let (actual_latent, actual_rotary) = actual.arrays().unwrap();
-                assert_eq!(expected_latent.shape(), actual_latent.shape());
-                assert_eq!(expected_rotary.shape(), actual_rotary.shape());
-            }
-            let report = layerwise.residency_report().unwrap();
-            let layers = report
-                .units()
-                .iter()
-                .filter(|unit| unit.id().as_str().starts_with("deepseek_v3.layer."))
-                .collect::<Vec<_>>();
-            assert!(layers.iter().all(|unit| unit.host_resident()));
-            assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
-            assert!(report
-                .units()
-                .iter()
-                .filter(|unit| unit.device_resident() && !layers.contains(unit))
-                .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
-        }
-    }
-
-    #[test]
-    fn arbitrary_moe_dense_order_matches_resident_execution() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut custom_args = args(false);
-        custom_args.layer_schedule =
-            LayerSchedule::new(2, vec![LayerPolicy::SparseMoe, LayerPolicy::DenseMlp]).unwrap();
-        custom_args.validate().unwrap();
-        let mut resident = Model::new(custom_args.clone(), gpu.stream()).unwrap();
-        initialize(&mut resident, gpu.stream());
-        let directory = tempfile::tempdir().unwrap();
-        write_fixture(
-            directory.path(),
-            &resident,
-            false,
-            true,
-            false,
-            gpu.stream(),
-        );
-
-        let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-        let adapter = DeepSeekV3LayerwiseAdapter::new(custom_args, gpu.stream()).unwrap();
-        let execution = load_safetensors_layerwise_model(
-            directory.path(),
-            adapter,
-            options,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut layerwise = DeepSeekV3LayerwiseModel { execution };
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = resident::Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = layerwise
-                .forward(&tokens, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected, 3e-5);
-        }
-        assert_eq!(resident_cache.offset(), 3);
-        assert_eq!(layerwise_cache.offset(), 3);
-        assert!(resident_cache
-            .layers
-            .iter()
-            .all(|cache| cache.offset() == 3));
-        assert!(layerwise_cache
-            .layers
-            .iter()
-            .all(|cache| cache.offset() == 3));
-    }
-
-    #[test]
-    fn deepseek_v3_split_moe_layerwise_parity() {
-        parity(false, 1);
-        parity(false, 2);
-    }
-
-    #[test]
-    fn deepseek_v3_native_fp8_split_moe_layerwise_parity() {
-        parity(true, 1);
-    }
-
-    #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn deepseek_embedded_mtp_is_lossless_with_resident_and_paged_draft_state() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(false), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let directory = tempfile::tempdir().unwrap();
-        write_fixture(directory.path(), &fixture, false, true, true, gpu.stream());
-
-        let prompt = Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-        let parts =
-            [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
-        let input = crate::backend::mlx::runtime::media::input::ModelInput::new(&parts);
-        let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-        let mut ordinary =
-            load_deepseek_v3_layerwise_model(directory.path(), options, gpu.stream(), cpu.stream())
-                .unwrap();
-        assert_eq!(ordinary.mtp_len(), 1);
-        let mut ordinary_cache = ordinary.new_cache();
-        let expected = crate::backend::mlx::nn::generation::Generate::new(
-            &mut ordinary,
-            &mut ordinary_cache,
-            0.0,
-            input,
-            None,
-            gpu.stream(),
-        )
-        .take(4)
-        .map(|token| {
-            let token = token.unwrap();
-            let token = token.evaluated().unwrap();
-            token.as_slice::<u32>()[0]
-        })
-        .collect::<Vec<_>>();
-
-        let mtp_config = crate::core::generation::MtpConfig {
-            max_tokens: 4,
-            max_draft_tokens: 1,
-            temperature: 0.0,
-            eos_token_ids: Vec::new(),
-        };
-        for paged in [false, true] {
-            let mut model = load_deepseek_v3_layerwise_model(
-                directory.path(),
-                options,
-                gpu.stream(),
-                cpu.stream(),
-            )
-            .unwrap();
-            let mut cache = if paged {
-                model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(
-                        PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
-                            .unwrap()
-                            .with_full_attention(true),
-                    ))
-                    .unwrap()
-            } else {
-                model.new_cache()
-            };
-            let (actual, stats) = {
-                let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        &mut model,
-                    );
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
-                    &mut executor,
-                    &mut cache,
-                    input,
-                    &mtp_config,
-                    None,
-                    &mut crate::backend::mlx::runtime::generation::sampler::DefaultSampler,
-                    crate::backend::mlx::speculative::MtpExecutionStreams::single(gpu.stream()),
-                    crate::core::generation::MtpSchedulerOptions::default(),
-                    |_| Ok(()),
-                )
-                .unwrap()
-            };
-            assert_eq!(actual, expected);
-            assert!(stats.rounds > 0);
-            assert!(stats.draft_tokens > 0);
-            if paged {
-                let report = cache.residency_report().unwrap().unwrap();
-                assert!(report.block_seals > 0);
-            }
-        }
-    }
-
-    #[test]
-    fn deepseek_v3_sparse_expert_cache_layout_parity_and_telemetry() {
-        sparse_expert_cache_parity(false, true);
-        sparse_expert_cache_parity(false, false);
-        sparse_expert_cache_parity(true, true);
-    }
-
-    fn sparse_expert_cache_parity(fp8: bool, split_experts: bool) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = Model::new(args(fp8), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(
-            dir.path(),
-            &fixture,
-            fp8,
-            split_experts,
-            false,
-            gpu.stream(),
-        );
-
-        let mut resident = if split_experts {
-            resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
-        } else {
-            fixture
-        };
-        let expert_options =
-            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
-                .unwrap();
-        let mut cached = load_deepseek_v3_expert_cache_model(
-            dir.path(),
-            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                OffloadConfig::new(None, None, 1).unwrap(),
-            )),
-            expert_options,
-            None,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut resident_cache = resident.new_cache();
-        let mut cached_cache = resident::Cache {
-            layers: Vec::new(),
-            mtp_layers: Vec::new(),
-        };
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-            Array::from_slice(&[4u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward_logits(
-                    ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: Some(&mut resident_cache),
-                    },
-                    false,
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = cached
-                .forward(&tokens, &mut cached_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected, if fp8 { 2e-4 } else { 3e-5 });
-            assert_eq!(cached_cache.offset(), resident_cache.offset());
-        }
-        let report = cached.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.owned_experts, 4);
-        assert!(report.prefill.requested_routes > 0);
-        assert!(report.decode.requested_routes > 0);
-        assert!(report.prefill.compact_banks > 1);
-        assert!(report.decode.compact_banks > 0);
-    }
-}

@@ -17,12 +17,8 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use super::{self as resident, DecoderConfig, Experts, FeedForward, TransformerBlock};
-use crate::core::cache::{
-    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    PromptCacheTopology,
-};
-
+use super::{DecoderConfig, Experts, FeedForward, TransformerBlock};
+use crate::backend::mlx::architectures::qwen::dense as resident;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
@@ -48,11 +44,12 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     },
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
-        populate_module_from_lease, populate_module_from_lease_excluding,
+        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
+        populate_module_from_lease, populate_module_from_lease_excluding, ModuleBindingPlan,
     },
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
+        binding_plan::{BindingPlan, PlannedBinding},
         quantization::{should_quantize_on_load, WeightQuantization},
         recipe::DerivedWeightRecipe,
     },
@@ -62,8 +59,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
@@ -75,7 +71,10 @@ use crate::{
     backend::mlx::runtime::residency::manager::{
         OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
     },
-    core::cache::LayerCachePolicy,
+    core::cache::{
+        LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheTopology,
+    },
 };
 
 const EMBEDDING_UNIT: &str = "dense_qwen.static.embedding";
@@ -279,6 +278,10 @@ impl LayerwiseDecoder {
         self.execution.checkpoint_store()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+        self.execution.checkpoint_store_arc()
+    }
+
     /// Runs a rank-local tensor-parallel forward pass through the generalized
     /// execution-group engine.
     pub(crate) fn forward_tensor_parallel(
@@ -311,6 +314,25 @@ impl LayerwiseDecoder {
                 .forward(DenseQwenAdapterInput { inputs, mask }, &mut owned, stream);
         let DenseQwenLayerwiseCache::Concat(owned) = owned else {
             unreachable!("dense-Qwen concat cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    /// Runs Qwen2/Qwen2.5 or Qwen3 with an explicitly sliding KV cache.
+    pub fn forward_sliding(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<SlidingKeyValueCache>>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
+        let result =
+            self.execution
+                .forward(DenseQwenAdapterInput { inputs, mask }, &mut owned, stream);
+        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
+            unreachable!("dense-Qwen sliding cache wrapper changed variants")
         };
         *cache = owned;
         result
@@ -398,6 +420,27 @@ impl LayerwiseDecoder {
             self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
         let DenseQwenLayerwiseCache::Concat(owned) = owned else {
             unreachable!("dense-Qwen concat cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    pub(crate) fn forward_with_sliding_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<SlidingKeyValueCache>>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
+        let result =
+            self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
+        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
+            unreachable!("dense-Qwen sliding cache wrapper changed variants")
         };
         *cache = owned;
         result
@@ -496,6 +539,34 @@ impl LayerwiseDecoder {
         );
         let DenseQwenLayerwiseCache::Concat(owned) = owned else {
             unreachable!("dense-Qwen concat cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    pub(crate) fn forward_tensor_expert_parallel_sliding<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<SlidingKeyValueCache>>,
+        tensor_group: &safemlx::distributed::Group,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
+        let result = self.forward_tensor_expert_parallel_cache(
+            inputs,
+            mask,
+            &mut owned,
+            tensor_group,
+            execute,
+            stream,
+        );
+        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
+            unreachable!("dense-Qwen sliding cache wrapper changed variants")
         };
         *cache = owned;
         result
@@ -697,34 +768,7 @@ impl CausalLm<Vec<Option<PagedKeyValueCache>>> for LayerwiseDecoder {
 pub fn load_safetensors(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    let model_dir = model_dir.as_ref();
-    let options = options.into();
-    let residency = options.weight_residency();
-    let args = resident::load_config(model_dir)?;
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        args.model_kind(),
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
-    let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
-    Ok(LayerwiseDecoder {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn load_safetensors_quantized_residency(
-    model_dir: impl AsRef<Path>,
-    options: impl Into<LayerWeightResidency>,
-    quantization: WeightQuantization,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -732,46 +776,20 @@ pub(crate) fn load_safetensors_quantized_residency(
     let options = options.into();
     let args = resident::load_config(model_dir)?;
     let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
-    if !should_quantize_on_load(
-        "dense Qwen residency",
-        args.weight_quantization(),
-        quantization,
-    )? {
-        return Ok(LayerwiseDecoder {
-            execution: load_layerwise_model(
-                store,
-                DenseQwenLayerwiseAdapter::new(args, stream)?,
-                options,
-                stream,
-                weights_stream,
-            )?,
-        });
-    }
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load("dense Qwen", args.weight_quantization(), requested)
+                .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let source_adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_layerwise_model_with_quantization(
             store,
             source_adapter,
             options,
-            Some(quantization),
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseDecoder, Error> {
-    let adapter = DenseQwenLayerwiseAdapter::new(model.args.clone(), stream)?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(LayerwiseDecoder {
-        execution: load_layerwise_model(
-            store,
-            adapter,
-            LayerWeightResidency::FullyResident,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -789,7 +807,6 @@ pub(crate) fn load_tensor_parallel_model(
 ) -> Result<LayerwiseDecoder, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -821,11 +838,6 @@ pub(crate) fn load_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     let args = resident::load_config(model_dir)?;
-    crate::backend::mlx::structural::validate_safetensors_load_path(
-        args.model_kind(),
-        model_dir,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )?;
     let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_tensor_parallel_layerwise_model(
@@ -854,9 +866,17 @@ pub(crate) fn load_gguf_tensor_parallel_model(
     let is_moe = architecture == "qwen3moe";
     let (args, eos_token_ids) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
+    let variant = match architecture {
+        "qwen2" => super::checkpoint::GgufVariant::Qwen2,
+        "qwen3moe" => super::checkpoint::GgufVariant::Qwen3Moe,
+        _ => super::checkpoint::GgufVariant::Qwen3,
+    };
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&args, variant).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             move |name| resident::translate_gguf_weight_name(name, is_moe),
             options.max_mapped_shards(),
         )?);
@@ -883,9 +903,17 @@ pub(crate) fn load_gguf_checkpoint(
     let is_moe = architecture == "qwen3moe";
     let (args, eos_token_ids) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
+    let variant = match architecture {
+        "qwen2" => super::checkpoint::GgufVariant::Qwen2,
+        "qwen3moe" => super::checkpoint::GgufVariant::Qwen3Moe,
+        _ => super::checkpoint::GgufVariant::Qwen3,
+    };
+    let gguf_plan =
+        super::checkpoint::gguf_plan(&args, variant).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
+            &gguf_plan,
             |name| resident::translate_gguf_weight_name(name, is_moe),
             residency.max_mapped_shards(),
         )?);
@@ -1336,6 +1364,15 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
+    {
+        super::checkpoint::safetensors_plan(&self.args)
+            .map_err(Error::UnsupportedArchitecture)
+            .map(Into::into)
+    }
+
     fn quantization(
         &self,
     ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
@@ -1574,20 +1611,38 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
-                build_module_bindings(&self.embedding, "model.embed_tokens", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.embedding,
+                    "model.embed_tokens",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_bindings(&self.norm, "model.norm", store)?,
+                build_module_binding_plan_with_recipes(
+                    &self.norm,
+                    "model.norm",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_bindings(head, "lm_head", store)?,
+                    build_module_binding_plan_with_recipes(
+                        head,
+                        "lm_head",
+                        store,
+                        BTreeMap::new(),
+                    )?
+                    .build_bindings(store)?,
                 )?);
             }
         }
@@ -1961,6 +2016,10 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         }
     }
 
+    fn ignores_checkpoint_key(&self, key: &str) -> bool {
+        super::checkpoint::is_redundant_tied_output_head_key(&self.args, key)
+    }
+
     fn forward_layer(
         &mut self,
         _group: usize,
@@ -2320,11 +2379,25 @@ pub(crate) fn qwen_text_layer_bindings(
     store: &dyn WeightStore,
     external_experts: bool,
 ) -> Result<Vec<WeightBinding>, Error> {
+    Ok(
+        qwen_text_layer_binding_plan(layer, args, prefix, store, external_experts)?
+            .build_bindings(store)?,
+    )
+}
+
+pub(crate) fn qwen_text_layer_binding_plan(
+    layer: &TransformerBlock,
+    args: &DecoderConfig,
+    prefix: &str,
+    store: &dyn WeightStore,
+    external_experts: bool,
+) -> Result<ModuleBindingPlan, Error> {
     if external_experts {
-        return Ok(build_module_bindings_excluding(
+        return Ok(build_module_binding_plan_with_recipes_excluding(
             layer,
             prefix,
             store,
+            BTreeMap::new(),
             |name| name.starts_with("mlp.experts."),
         )?);
     }
@@ -2397,7 +2470,7 @@ pub(crate) fn qwen_text_layer_bindings(
             },
         );
     }
-    Ok(build_module_bindings_with_recipes(
+    Ok(build_module_binding_plan_with_recipes(
         layer, prefix, store, recipes,
     )?)
 }
@@ -2600,8 +2673,16 @@ fn recipe_binding(
     recipe: DerivedWeightRecipe,
     store: &dyn WeightStore,
 ) -> Result<WeightBinding, Error> {
-    let bytes = recipe.infer(store)?.byte_len();
-    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+    let metadata = recipe.infer(store)?;
+    let mut bindings = BindingPlan::new(vec![PlannedBinding {
+        target_name: name.into(),
+        expected_shape: metadata.shape().to_vec(),
+        expected_dtype: metadata.dtype().clone(),
+        recipe,
+    }])
+    .and_then(|plan| plan.build_bindings(store))
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(bindings.pop().expect("single planned expert binding"))
 }
 
 fn split_expert_key(
@@ -2620,890 +2701,4 @@ fn split_expert_key(
                 projections
             ))
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use std::{fs, path::Path};
-
-    use safemlx::{
-        module::ModuleParameters,
-        ops::{indexing::TryIndexOp, ones_dtype},
-        Array, Device, DeviceType, ExecutionContext,
-    };
-
-    use super::*;
-    use crate::{
-        backend::mlx::architectures::qwen::dense as dense_qwen,
-        backend::mlx::runtime::{
-            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-            execution::layerwise::{
-                ExecutionResidency, LayerWeightResidency, LayerwiseLoadOptions,
-            },
-        },
-        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
-    };
-
-    fn tensor_parallel_context_for(rank: usize) -> ParallelBuildContext {
-        ParallelBuildContext::new(
-            MlxParallelContext::for_rank(rank, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap(),
-            ShardingPolicy::Require,
-        )
-    }
-
-    fn tensor_parallel_context() -> ParallelBuildContext {
-        tensor_parallel_context_for(0)
-    }
-
-    fn args(moe: bool) -> DecoderConfig {
-        DecoderConfig {
-            model_type: "qwen3".into(),
-            hidden_size: 8,
-            num_hidden_layers: 3,
-            intermediate_size: if moe { 0 } else { 16 },
-            num_attention_heads: 2,
-            rms_norm_eps: 1e-5,
-            vocab_size: 16,
-            num_key_value_heads: 2,
-            max_position_embeddings: 64,
-            rope_theta: 10_000.0,
-            head_dim: 4,
-            tie_word_embeddings: false,
-            rope_scaling: None,
-            hidden_act: "silu".into(),
-            attention_dropout: 0.0,
-            attention_bias: Some(false),
-            mlp_bias: Some(false),
-            attention_schedule: crate::core::attention::LayerSchedule::all_full(3).unwrap(),
-            quantization: None,
-            quantization_config: None,
-            quantized_weights: None,
-            moe_intermediate_size: if moe { 9 } else { 0 },
-            num_experts: if moe { 4 } else { 0 },
-            num_experts_per_tok: if moe { 2 } else { 0 },
-            norm_topk_prob: moe,
-            quantized_weight_configs: None,
-        }
-    }
-
-    fn initialize(module: &mut impl ModuleParameters, stream: &Stream) {
-        let mut names = module
-            .parameters()
-            .flatten()
-            .keys()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        names.sort();
-        let mut params = module.parameters_mut().flatten();
-        for (index, name) in names.iter().enumerate() {
-            let parameter = params.get_mut(name.as_str()).unwrap();
-            let shape = parameter.shape().to_vec();
-            let dtype = parameter.dtype();
-            **parameter = if name.ends_with("layernorm.weight") || name == "model.norm.weight" {
-                ones_dtype(&shape, dtype, stream).unwrap()
-            } else {
-                Array::full::<f32>(&shape, Array::from_f32(0.001 * (index + 1) as f32), stream)
-                    .unwrap()
-                    .as_dtype(dtype, stream)
-                    .unwrap()
-            };
-        }
-    }
-
-    fn write_fixture(dir: &Path, model: &dense_qwen::Model, split_experts: bool, stream: &Stream) {
-        let params = model.parameters().flatten();
-        let mut arrays = Vec::<(String, Array)>::new();
-        for (name, value) in params {
-            let name =
-                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
-            if split_experts {
-                if let Some(prefix) = name.strip_suffix(".mlp.experts.gate_up_proj") {
-                    for expert in 0..model.args.num_experts {
-                        let selected = value.try_index_device(expert, stream).unwrap();
-                        let intermediate = model.args.moe_intermediate_size;
-                        arrays.push((
-                            format!("{prefix}.mlp.experts.{expert}.gate_proj.weight"),
-                            selected
-                                .try_index_device((..intermediate, ..), stream)
-                                .unwrap(),
-                        ));
-                        arrays.push((
-                            format!("{prefix}.mlp.experts.{expert}.up_proj.weight"),
-                            selected
-                                .try_index_device((intermediate.., ..), stream)
-                                .unwrap(),
-                        ));
-                    }
-                    continue;
-                }
-                if let Some(prefix) = name.strip_suffix(".mlp.experts.down_proj") {
-                    for expert in 0..model.args.num_experts {
-                        arrays.push((
-                            format!("{prefix}.mlp.experts.{expert}.down_proj.weight"),
-                            value.try_index_device(expert, stream).unwrap(),
-                        ));
-                    }
-                    continue;
-                }
-            }
-            arrays.push((name, value.clone()));
-        }
-        Array::save_safetensors(
-            arrays.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
-            dir.join("model.safetensors"),
-        )
-        .unwrap();
-        let policies = model.args.attention_schedule.iter().collect::<Vec<_>>();
-        let candidate_first = policies.iter().position(|policy| policy.window().is_some());
-        let sliding_window = candidate_first.and_then(|first| {
-            let window = policies[first].window().unwrap().get();
-            policies[first..]
-                .iter()
-                .all(|policy| policy.window().is_some_and(|value| value.get() == window))
-                .then_some(window)
-        });
-        let first_sliding = sliding_window.and(candidate_first);
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "model_type": model.args.model_type,
-                "hidden_size": model.args.hidden_size,
-                "num_hidden_layers": model.args.num_hidden_layers,
-                "intermediate_size": model.args.intermediate_size,
-                "num_attention_heads": model.args.num_attention_heads,
-                "num_key_value_heads": model.args.num_key_value_heads,
-                "rms_norm_eps": model.args.rms_norm_eps,
-                "vocab_size": model.args.vocab_size,
-                "max_position_embeddings": model.args.max_position_embeddings,
-                "rope_theta": model.args.rope_theta,
-                "head_dim": model.args.head_dim,
-                "tie_word_embeddings": model.args.tie_word_embeddings,
-                "attention_bias": model.args.attention_bias,
-                "use_sliding_window": first_sliding.is_some(),
-                "sliding_window": sliding_window,
-                "max_window_layers": first_sliding,
-                "moe_intermediate_size": model.args.moe_intermediate_size,
-                "num_experts": model.args.num_experts,
-                "num_experts_per_tok": model.args.num_experts_per_tok,
-                "norm_topk_prob": model.args.norm_topk_prob
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn assert_close(left: &Array, right: &Array) {
-        let left = left.evaluated().unwrap();
-        let right = right.evaluated().unwrap();
-        assert_eq!(left.as_array().shape(), right.as_array().shape());
-        for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
-            assert!((left - right).abs() <= 3e-5, "{left} != {right}");
-        }
-    }
-
-    fn parity_with_args(model_args: DecoderConfig, depth: usize) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = dense_qwen::Model::new(model_args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, false, gpu.stream());
-
-        let mut resident =
-            dense_qwen::load_safetensors(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_safetensors(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = layerwise.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-            Array::from_slice(&[4u32], &[1, 1]),
-            Array::from_slice(&[5u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward(
-                    dense_qwen::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut resident_cache,
-                    },
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = layerwise
-                .forward(&tokens, None, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-            let report = layerwise.residency_report().unwrap();
-            let layers = report
-                .units()
-                .iter()
-                .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
-                .collect::<Vec<_>>();
-            assert!(layers.iter().all(|unit| unit.host_resident()));
-            assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
-            assert!(report
-                .units()
-                .iter()
-                .filter(|unit| unit.device_resident() && !layers.contains(unit))
-                .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
-        }
-    }
-
-    fn parity(moe: bool, depth: usize) {
-        parity_with_args(args(moe), depth);
-    }
-
-    #[test]
-    fn generalized_tensor_parallel_loader_preserves_packed_moe_geometry() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = dense_qwen::Model::new(args(true), execution.stream()).unwrap();
-        initialize(&mut fixture, execution.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, false, execution.stream());
-
-        let model = load_tensor_parallel_model(
-            dir.path(),
-            LayerwiseLoadOptions::default(),
-            tensor_parallel_context(),
-            execution.stream(),
-            weights.stream(),
-        )
-        .unwrap();
-        let layout = model.execution.parallel_layout().unwrap();
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.self_attn.q_proj.weight")
-                .unwrap()
-                .local_shape(),
-            &[4, 8]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.mlp.experts.gate_up_proj")
-                .unwrap()
-                .local_shape(),
-            &[4, 10, 8]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.mlp.experts.down_proj")
-                .unwrap()
-                .local_shape(),
-            &[4, 8, 5]
-        );
-        assert!(model
-            .parallel_info()
-            .unwrap()
-            .owned_tensors()
-            .iter()
-            .any(|name| name == "model.layers.0.mlp.experts.gate_up_proj"));
-    }
-
-    #[test]
-    fn qwen3_moe_quantized_experts_share_uneven_block_aligned_partitions() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut config = args(true);
-        config.hidden_size = 64;
-        config.num_hidden_layers = 1;
-        config.num_attention_heads = 4;
-        config.num_key_value_heads = 2;
-        config.head_dim = 16;
-        config.vocab_size = 64;
-        config.moe_intermediate_size = 96;
-        config.attention_schedule = crate::core::attention::LayerSchedule::all_full(1).unwrap();
-        config.quantized_weight_configs = Some(HashMap::from([(
-            "model.layers.0.mlp.experts.down_proj".into(),
-            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
-                .unwrap()
-                .into(),
-        )]));
-        let layer = TransformerBlock::new_for_layer(&config, 0, execution.stream()).unwrap();
-
-        for (rank, gate_up_width, packed_width, scale_width) in [(0, 128, 8, 2), (1, 64, 4, 1)] {
-            let mut planner = tensor_parallel_context_for(rank).planner();
-            register_qwen_layer_parallel_plan(&mut planner, &layer, &config, "model.layers.0")
-                .unwrap();
-            let (_, layout) = planner.finish().unwrap();
-            let gate_up = layout
-                .tensor("model.layers.0.mlp.experts.gate_up_proj")
-                .unwrap();
-            let down = layout
-                .tensor("model.layers.0.mlp.experts.down_proj")
-                .unwrap();
-            let scales = layout
-                .tensor("model.layers.0.mlp.experts.down_proj_scales")
-                .unwrap();
-            assert_eq!(gate_up.local_shape(), &[4, gate_up_width, 64]);
-            assert_eq!(down.local_shape(), &[4, 64, packed_width]);
-            assert_eq!(scales.local_shape(), &[4, 64, scale_width]);
-            assert_eq!(
-                gate_up.logical_name(),
-                "model.layers.0.mlp.experts.intermediate"
-            );
-            assert_eq!(down.logical_name(), gate_up.logical_name());
-            assert_eq!(scales.logical_name(), gate_up.logical_name());
-        }
-    }
-
-    #[test]
-    fn generalized_fully_resident_execution_materializes_layers_once() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = dense_qwen::Model::new(args(false), execution.stream()).unwrap();
-        initialize(&mut fixture, execution.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, false, execution.stream());
-
-        let mut model = load_safetensors(
-            dir.path(),
-            LayerWeightResidency::FullyResident,
-            execution.stream(),
-            weights.stream(),
-        )
-        .unwrap();
-        let metadata = model.residency_metadata();
-        assert_eq!(metadata.residency(), ExecutionResidency::FullyResident);
-        assert_eq!(metadata.device_layer_capacity(), metadata.layer_count());
-        assert_eq!(
-            metadata.maximum_device_layer_bytes(),
-            metadata.layer_parameter_bytes()
-        );
-        let before = model.residency_report().unwrap();
-        let layers = before
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
-            .collect::<Vec<_>>();
-        assert_eq!(layers.len(), metadata.layer_count());
-        assert!(layers.iter().all(|unit| {
-            unit.policy() == ResidencyPolicy::Pinned
-                && unit.planned_tier() == MemoryTier::Device
-                && unit.device_resident()
-                && !unit.host_resident()
-                && unit.device_pins() == 1
-        }));
-
-        let initial_telemetry = before.offload().clone();
-        let mut cache = model.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-        ] {
-            model
-                .forward(&tokens, None, &mut cache, execution.stream())
-                .unwrap();
-        }
-        let after = model.residency_report().unwrap();
-        assert_eq!(after.offload(), &initial_telemetry);
-        assert!(after
-            .units()
-            .iter()
-            .all(|unit| { unit.policy() == ResidencyPolicy::Pinned && unit.device_resident() }));
-        model.clear_device_layer_window().unwrap();
-        assert!(model
-            .residency_report()
-            .unwrap()
-            .units()
-            .iter()
-            .all(|unit| unit.device_resident()));
-    }
-
-    #[test]
-    fn high_level_resident_and_layerwise_dispatch_execute_and_report_paged_kv_state() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = dense_qwen::Model::new(args(false), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, false, gpu.stream());
-
-        let fully_resident = load_safetensors(
-            dir.path(),
-            LayerWeightResidency::FullyResident,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let layerwise = load_safetensors(
-            dir.path(),
-            LayerwiseLoadOptions::default(),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        for mut model in [
-            crate::backend::mlx::Model::DenseQwen(fully_resident),
-            crate::backend::mlx::Model::DenseQwen(layerwise),
-        ] {
-            let options = PagedCacheOptions::new(1, 16 * 1024, 16 * 1024, 1)
-                .unwrap()
-                .with_full_attention(true);
-            let mut cache = model
-                .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                .unwrap();
-            assert_eq!(
-                cache
-                    .residency_report()
-                    .unwrap()
-                    .unwrap()
-                    .logical_cached_tokens,
-                0
-            );
-
-            let tokens = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-            let parts =
-                [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
-            model
-                .submit_prefill(
-                    crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
-                    &mut cache,
-                    gpu.stream(),
-                )
-                .unwrap()
-                .wait()
-                .unwrap()
-                .evaluated()
-                .unwrap();
-            let report = cache.residency_report().unwrap().unwrap();
-            assert_eq!(report.logical_cached_tokens, 3);
-            assert!(report.current_device_bytes > 0);
-        }
-    }
-
-    #[test]
-    fn generalized_fully_resident_tensor_parallel_reports_local_and_global_memory() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = dense_qwen::Model::new(args(false), execution.stream()).unwrap();
-        initialize(&mut fixture, execution.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, false, execution.stream());
-
-        let model = load_tensor_parallel_model(
-            dir.path(),
-            LayerWeightResidency::FullyResident,
-            tensor_parallel_context(),
-            execution.stream(),
-            weights.stream(),
-        )
-        .unwrap();
-        let info = model.parallel_info().unwrap();
-        assert_eq!(
-            info.pinned_device_parameter_bytes(),
-            info.local_parameter_bytes()
-        );
-        assert_eq!(
-            info.maximum_device_parameter_bytes(),
-            info.local_parameter_bytes()
-        );
-        assert!(info.global_parameter_bytes() > info.local_parameter_bytes());
-        let metadata = model.residency_metadata();
-        assert_eq!(metadata.residency(), ExecutionResidency::FullyResident);
-        assert_eq!(metadata.device_layer_capacity(), metadata.layer_count());
-        let report = model.residency_report().unwrap();
-        assert!(report.units().iter().all(|unit| {
-            unit.policy() == ResidencyPolicy::Pinned
-                && unit.planned_tier() == MemoryTier::Device
-                && unit.device_resident()
-                && !unit.host_resident()
-        }));
-    }
-
-    #[test]
-    fn qwen3_dense_layerwise_prefill_and_cached_decode_parity() {
-        parity(false, 1);
-        parity(false, 2);
-    }
-
-    #[test]
-    fn qwen2_resident_and_layerwise_full_and_sliding_attention_parity() {
-        let mut model_args = args(false);
-        model_args.model_type = "qwen2".into();
-        model_args.attention_bias = Some(true);
-        model_args.attention_schedule =
-            crate::core::attention::LayerSchedule::from_sliding_pattern(
-                3,
-                &[false, true, true],
-                Some(2),
-            )
-            .unwrap();
-        parity_with_args(model_args, 1);
-    }
-
-    #[test]
-    fn qwen2_resident_and_layerwise_arbitrary_pattern_parity() {
-        use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
-
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut model_args = args(false);
-        model_args.model_type = "qwen2".into();
-        model_args.attention_bias = Some(true);
-        model_args.attention_schedule =
-            crate::core::attention::LayerSchedule::from_sliding_pattern(
-                3,
-                &[true, false, true],
-                Some(2),
-            )
-            .unwrap();
-        let mut resident = dense_qwen::Model::new(model_args.clone(), gpu.stream()).unwrap();
-        initialize(&mut resident, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &resident, false, gpu.stream());
-
-        let store: Arc<dyn WeightStore + Send + Sync> =
-            Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
-        let adapter = DenseQwenLayerwiseAdapter::new(model_args, gpu.stream()).unwrap();
-        let execution = load_layerwise_model(
-            store,
-            adapter,
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut layerwise = LayerwiseDecoder { execution };
-        let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = layerwise.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
-            Array::from_slice(&[4u32], &[1, 1]),
-            Array::from_slice(&[5u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward(
-                    dense_qwen::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut resident_cache,
-                    },
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = layerwise
-                .forward(&tokens, None, &mut layerwise_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-    }
-
-    #[test]
-    fn qwen3_sparse_moe_layerwise_prefill_and_cached_decode_parity() {
-        parity(true, 1);
-    }
-
-    #[test]
-    fn qwen3_sparse_expert_cache_prefill_and_decode_parity() {
-        sparse_expert_cache_parity(false);
-        sparse_expert_cache_parity(true);
-    }
-
-    #[test]
-    fn qwen3_sparse_expert_cache_streams_non_expert_layers() {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = dense_qwen::Model::new(args(true), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, false, gpu.stream());
-
-        let expert_options =
-            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
-                .unwrap();
-        let dense =
-            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-                u64::MAX,
-                u64::MAX,
-                1,
-                1,
-            )
-            .unwrap();
-        let mut cached = load_qwen3_expert_cache_model(
-            dir.path(),
-            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense),
-            expert_options,
-            None,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let initial = cached.dense_stream_report().unwrap().unwrap();
-        assert!(initial
-            .residency()
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
-            .all(|unit| {
-                unit.planned_tier() == MemoryTier::Disk
-                    && !unit.host_resident()
-                    && !unit.device_resident()
-            }));
-
-        let mut resident =
-            dense_qwen::load_safetensors(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut resident_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-        let mut cached_cache = cached.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward(
-                    dense_qwen::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut resident_cache,
-                    },
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = cached
-                .forward(&tokens, None, &mut cached_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-        assert!(cached.expert_cache_report().unwrap().is_some());
-    }
-
-    #[test]
-    fn qwen3_load_time_quantization_packs_complete_and_cached_expert_banks() {
-        use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
-
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut model_args = args(true);
-        model_args.hidden_size = 32;
-        model_args.vocab_size = 32;
-        model_args.num_attention_heads = 4;
-        model_args.num_key_value_heads = 4;
-        model_args.head_dim = 8;
-        model_args.moe_intermediate_size = 32;
-        let mut fixture = dense_qwen::Model::new(model_args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, false, gpu.stream());
-
-        let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
-        let expert_options =
-            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
-                .unwrap();
-        let dense =
-            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-                u64::MAX,
-                u64::MAX,
-                1,
-                1,
-            )
-            .unwrap();
-        let mut loaded = load_qwen3_expert_cache_model(
-            dir.path(),
-            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense),
-            expert_options,
-            Some(quantization),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut complete = load_safetensors_quantized_residency(
-            dir.path(),
-            crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
-            quantization,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut streamed = load_safetensors_quantized_residency(
-            dir.path(),
-            dense,
-            quantization,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut layerwise = load_safetensors_quantized_residency(
-            dir.path(),
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            quantization,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-
-        let ordinary = loaded.residency_metadata().materialization().unwrap();
-        assert!(ordinary.transformed_weights > 0);
-        assert!(ordinary.output_bytes < ordinary.source_bytes_read);
-        assert!(ordinary.peak_planned_working_set_bytes <= ordinary.output_bytes);
-        let experts = loaded.expert_cache_report().unwrap().unwrap();
-        let expert_materialization = experts.materialization.unwrap();
-        assert!(expert_materialization.transformed_weights > 0);
-        assert!(expert_materialization.output_bytes < expert_materialization.source_bytes_read);
-        assert!(loaded
-            .dense_stream_report()
-            .unwrap()
-            .unwrap()
-            .residency()
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
-            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
-        let complete_materialization = complete.residency_metadata().materialization().unwrap();
-        assert!(complete_materialization.transformed_weights > 0);
-        assert!(complete_materialization.output_bytes < complete_materialization.source_bytes_read);
-        assert!(
-            complete_materialization.peak_planned_working_set_bytes
-                <= complete_materialization.output_bytes
-        );
-        assert!(complete.expert_cache_report().unwrap().is_none());
-        assert!(streamed.expert_cache_report().unwrap().is_none());
-        assert!(streamed
-            .dense_stream_report()
-            .unwrap()
-            .unwrap()
-            .residency()
-            .units()
-            .iter()
-            .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
-            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
-        assert!(layerwise.expert_cache_report().unwrap().is_none());
-
-        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let mut cache = loaded.new_cache();
-        let mut complete_cache = complete.new_cache();
-        let mut streamed_cache = streamed.new_cache();
-        let mut layerwise_cache = layerwise.new_cache();
-        let logits = loaded
-            .forward(&tokens, None, &mut cache, gpu.stream())
-            .unwrap();
-        let complete_logits = complete
-            .forward(&tokens, None, &mut complete_cache, gpu.stream())
-            .unwrap();
-        let streamed_logits = streamed
-            .forward(&tokens, None, &mut streamed_cache, gpu.stream())
-            .unwrap();
-        let layerwise_logits = layerwise
-            .forward(&tokens, None, &mut layerwise_cache, gpu.stream())
-            .unwrap();
-        assert_close(&complete_logits, &logits);
-        assert_close(&streamed_logits, &logits);
-        assert_close(&layerwise_logits, &logits);
-        safemlx::transforms::async_eval_with_event([&logits])
-            .unwrap()
-            .synchronize()
-            .unwrap();
-        assert_eq!(logits.shape(), &[1, 2, 32]);
-    }
-
-    #[test]
-    fn qwen3_dense_disk_load_time_quantization_accounts_only_packed_bytes() {
-        use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
-
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut model_args = args(false);
-        model_args.hidden_size = 32;
-        model_args.vocab_size = 32;
-        model_args.num_attention_heads = 4;
-        model_args.num_key_value_heads = 4;
-        model_args.head_dim = 8;
-        model_args.intermediate_size = 32;
-        let mut fixture = dense_qwen::Model::new(model_args, gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, false, gpu.stream());
-        let dense =
-            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-                u64::MAX,
-                u64::MAX,
-                1,
-                1,
-            )
-            .unwrap();
-        let loaded = load_safetensors_quantized_residency(
-            dir.path(),
-            dense,
-            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let materialization = loaded.residency_metadata().materialization().unwrap();
-        assert!(materialization.output_bytes < materialization.source_bytes_read);
-        let report = loaded.dense_stream_report().unwrap().unwrap();
-        assert_eq!(
-            report.planned_layer_bytes(),
-            loaded.residency_metadata().layer_parameter_bytes()
-        );
-        assert!(report.planned_layer_bytes() < materialization.source_bytes_read);
-    }
-
-    fn sparse_expert_cache_parity(split_experts: bool) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = dense_qwen::Model::new(args(true), gpu.stream()).unwrap();
-        initialize(&mut fixture, gpu.stream());
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, split_experts, gpu.stream());
-
-        let resident_dir = tempfile::tempdir().unwrap();
-        write_fixture(resident_dir.path(), &fixture, false, gpu.stream());
-
-        let mut resident =
-            dense_qwen::load_safetensors(resident_dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let non_expert = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-        let expert_options =
-            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
-                .unwrap();
-        let mut cached = load_qwen3_expert_cache_model(
-            dir.path(),
-            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(non_expert),
-            expert_options,
-            None,
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let mut resident_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-        let mut cached_cache = cached.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
-            Array::from_slice(&[4u32], &[1, 1]),
-        ] {
-            let expected = resident
-                .forward(
-                    dense_qwen::ModelInput {
-                        inputs: &tokens,
-                        mask: None,
-                        cache: &mut resident_cache,
-                    },
-                    gpu.stream(),
-                )
-                .unwrap();
-            let actual = cached
-                .forward(&tokens, None, &mut cached_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
-        }
-        let report = cached.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.owned_experts, 12);
-        assert!(report.prefill.requested_routes > 0);
-        assert!(report.decode.requested_routes > 0);
-        assert!(report.prefill.compact_banks > 1);
-        assert!(report.decode.compact_banks > 0);
-        assert_eq!(
-            cached_cache[0].as_ref().unwrap().offset(),
-            resident_cache[0].as_ref().unwrap().offset()
-        );
-    }
 }

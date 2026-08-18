@@ -596,6 +596,7 @@ fn prepares_prompt_and_generation_contribution_separately() {
             max_calls: std::num::NonZeroUsize::new(2),
         },
         enable_thinking: Some(false),
+        reasoning_effort: None,
         allow_unparsed_reasoning: false,
         add_generation_prompt: false,
         extra_template_kwargs: serde_json::Map::from_iter([("tone".into(), json!("brief"))]),

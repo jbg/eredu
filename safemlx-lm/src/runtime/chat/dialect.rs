@@ -2,7 +2,11 @@
 
 #![allow(dead_code)]
 
-use std::{any::Any, collections::BTreeSet, fmt};
+use std::{
+    any::Any,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use llguidance::api::TopLevelGrammar;
 use serde_json::Value;
@@ -143,6 +147,18 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         &self,
         parameters: DialectParameters,
     ) -> Result<Box<dyn ProtocolParser<Error = String>>, String>;
+
+    /// Builds a request-specific parser when decoding depends on tool schemas.
+    ///
+    /// Most protocols carry ordinary JSON and can use the schema-independent
+    /// parser. Dialects with unquoted values may override this hook.
+    fn incremental_parser_state_with_tools(
+        &self,
+        parameters: DialectParameters,
+        _tools: &[Value],
+    ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        self.incremental_parser_state(parameters)
+    }
 }
 
 /// An exact prefix/suffix pair.
@@ -187,9 +203,23 @@ pub(crate) enum DeclarativePayloadShape {
     /// Every call envelope contains an exact tool name followed by one JSON
     /// argument object.
     NamedJsonArguments(NamedJsonArgumentsEncoding),
+    /// Every call names a function and emits one tagged block per top-level
+    /// argument. String values are raw; all other values remain JSON.
+    TaggedParameters(TaggedParametersEncoding),
     /// Every call envelope contains an exact name marker, a declared tool
     /// name, and one structurally quoted JSON argument object.
     StructuralObject(StructuralObjectEncoding),
+}
+
+/// Exact surface syntax for a function with individually tagged parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaggedParametersEncoding {
+    pub(crate) function_prefix: &'static str,
+    pub(crate) function_name_suffix: &'static str,
+    pub(crate) parameter_prefix: &'static str,
+    pub(crate) parameter_name_suffix: &'static str,
+    pub(crate) parameter_suffix: &'static str,
+    pub(crate) function_suffix: &'static str,
 }
 
 /// Exact syntax around a tool name followed by a JSON argument object.
@@ -361,6 +391,27 @@ impl DeclarativeDialectSpec {
                     );
                 }
             }
+            DeclarativePayloadShape::TaggedParameters(encoding) => {
+                if [
+                    encoding.function_prefix,
+                    encoding.function_name_suffix,
+                    encoding.parameter_prefix,
+                    encoding.parameter_name_suffix,
+                    encoding.parameter_suffix,
+                    encoding.function_suffix,
+                ]
+                .iter()
+                .any(|delimiter| delimiter.is_empty())
+                {
+                    return Err("declarative tagged parameters require non-empty delimiters".into());
+                }
+                if self.json_function.is_some() {
+                    return Err(
+                        "declarative tagged parameters cannot carry a JSON function envelope"
+                            .into(),
+                    );
+                }
+            }
             DeclarativePayloadShape::StructuralObject(encoding) => {
                 if encoding.name_prefix.is_empty() || encoding.string_delimiter.is_empty() {
                     return Err(
@@ -402,6 +453,7 @@ impl DeclarativeDialectSpec {
                 self.payload_shape,
                 DeclarativePayloadShape::JsonObject
                     | DeclarativePayloadShape::NamedJsonArguments(_)
+                    | DeclarativePayloadShape::TaggedParameters(_)
                     | DeclarativePayloadShape::StructuralObject(_)
             ) || self.parallel_layout != ParallelCallLayout::RepeatedEnvelopes)
         {
@@ -460,6 +512,10 @@ impl DeclarativeDialectSpec {
             (DeclarativePayloadShape::JsonObject, ParallelCallLayout::RepeatedEnvelopes)
             | (
                 DeclarativePayloadShape::NamedJsonArguments(_),
+                ParallelCallLayout::RepeatedEnvelopes,
+            )
+            | (
+                DeclarativePayloadShape::TaggedParameters(_),
                 ParallelCallLayout::RepeatedEnvelopes,
             )
             | (
@@ -701,6 +757,24 @@ impl DeclarativeDialectSpec {
                 grammar.push_str(&format!("named_json_call: {}\n", alternatives.join(" | ")));
                 grammar.push_str(&argument_rules);
             }
+            DeclarativePayloadShape::TaggedParameters(encoding) => {
+                if self.output.prefix.is_empty() {
+                    grammar.push_str(&format!("tool_output: {calls}\n"));
+                } else {
+                    grammar.push_str(&format!(
+                        "tool_output: {} {} {}\n",
+                        literal(self.output.prefix)?,
+                        calls,
+                        literal(self.output.suffix)?
+                    ));
+                }
+                grammar.push_str(&format!(
+                    "call: {} tagged_call {}\n",
+                    literal(self.call.prefix)?,
+                    literal(self.call.suffix)?
+                ));
+                grammar.push_str(&tagged_parameters_grammar(tools, encoding)?);
+            }
             DeclarativePayloadShape::StructuralObject(encoding) => {
                 if self.output.prefix.is_empty() {
                     grammar.push_str(&format!("tool_output: {calls}\n"));
@@ -815,6 +889,260 @@ impl DeclarativeDialectSpec {
                 .join(" | ")
         ));
         Ok(grammar)
+    }
+}
+
+fn tagged_parameters_grammar(
+    tools: &[Value],
+    encoding: TaggedParametersEncoding,
+) -> Result<String, String> {
+    let tools = parse_tools(tools)?;
+    if tools.is_empty() {
+        return Ok("tagged_call: \"__safemlx_unreachable_tagged_tool_call__\"\n".into());
+    }
+
+    let mut rules = String::new();
+    let mut tool_rules = Vec::with_capacity(tools.len());
+    let mut next_value = 0usize;
+    for (tool_index, tool) in tools.iter().enumerate() {
+        let properties = tool
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let required = tool
+            .parameters
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut parameter_rules = Vec::with_capacity(properties.len());
+        for (name, schema) in properties {
+            validate_tagged_parameter_name(&name)?;
+            let value_rule = format!("tagged_value_{next_value}");
+            next_value += 1;
+            let mut value_consumes_suffix = false;
+            match tagged_value_kind(&schema)? {
+                TaggedValueKind::RawString => {
+                    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+                        let alternatives = values
+                            .iter()
+                            .map(|value| {
+                                let value = value.as_str().ok_or_else(|| {
+                                    "tagged string enum contains a non-string value".to_owned()
+                                })?;
+                                if value.contains(encoding.parameter_suffix) {
+                                    return Err(format!(
+                                        "tagged string enum value for {name:?} contains the parameter closing delimiter"
+                                    ));
+                                }
+                                Ok(literal(value))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        rules.push_str(&format!("{value_rule}: {}\n", alternatives.join(" | ")));
+                    } else {
+                        rules.push_str(&format!(
+                            "{value_rule}[lazy]: /(?s:.)*/ {}\n",
+                            literal(encoding.parameter_suffix)
+                        ));
+                        value_consumes_suffix = true;
+                    }
+                }
+                TaggedValueKind::Json => {
+                    let schema = serde_json::to_string(&schema)
+                        .expect("validated tagged parameter schemas serialize");
+                    rules.push_str(&format!("{value_rule}: %json {schema}\n"));
+                }
+            }
+            let parameter_rule = format!("tagged_parameter_{tool_index}_{}", parameter_rules.len());
+            rules.push_str(&format!(
+                "{parameter_rule}: {} {} {} {value_rule} {}\n",
+                literal(encoding.parameter_prefix),
+                literal(&name),
+                literal(encoding.parameter_name_suffix),
+                if value_consumes_suffix {
+                    literal("")
+                } else {
+                    literal(encoding.parameter_suffix)
+                },
+            ));
+            parameter_rules.push((name, parameter_rule));
+        }
+        let sequence = tagged_parameter_sequence(&parameter_rules, &required, 0);
+        let tool_rule = format!("tagged_tool_{tool_index}");
+        rules.push_str(&format!(
+            "{tool_rule}: {} {} {} {sequence} {}\n",
+            literal(encoding.function_prefix),
+            literal(&tool.name),
+            literal(encoding.function_name_suffix),
+            literal(encoding.function_suffix),
+        ));
+        tool_rules.push(tool_rule);
+    }
+    rules.push_str(&format!("tagged_call: {}\n", tool_rules.join(" | ")));
+    Ok(rules)
+}
+
+fn tagged_parameter_sequence(
+    fields: &[(String, String)],
+    required: &BTreeSet<&str>,
+    index: usize,
+) -> String {
+    let Some((name, rule)) = fields.get(index) else {
+        return literal("");
+    };
+    let tail = tagged_parameter_sequence(fields, required, index + 1);
+    let selected = format!("{rule} {tail}");
+    if required.contains(name.as_str()) {
+        selected
+    } else {
+        format!("({selected})?")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaggedValueKind {
+    RawString,
+    Json,
+}
+
+fn tagged_value_kind(schema: &Value) -> Result<TaggedValueKind, String> {
+    if schema.get("type").and_then(Value::as_str) == Some("string") {
+        return Ok(TaggedValueKind::RawString);
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        let strings = values.iter().filter(|value| value.is_string()).count();
+        if strings == values.len() {
+            return Ok(TaggedValueKind::RawString);
+        }
+        if strings != 0 {
+            return Err(
+                "tagged parameters cannot disambiguate enums mixing string and non-string values"
+                    .into(),
+            );
+        }
+    }
+    Ok(TaggedValueKind::Json)
+}
+
+fn validate_tagged_parameter_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|character| matches!(character, '<' | '>' | '\r' | '\n'))
+    {
+        return Err(format!(
+            "tagged parameter name {name:?} must be non-empty and cannot contain tag delimiters or newlines"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct TaggedToolSchema {
+    parameters: BTreeMap<String, Value>,
+    required: BTreeSet<String>,
+}
+
+fn tagged_tool_catalog(tools: &[Value]) -> Result<BTreeMap<String, TaggedToolSchema>, String> {
+    parse_tools(tools)?
+        .into_iter()
+        .map(|tool| {
+            let parameters = tool
+                .parameters
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, schema)| {
+                    validate_tagged_parameter_name(&name)?;
+                    tagged_value_kind(&schema)?;
+                    Ok((name, schema))
+                })
+                .collect::<Result<BTreeMap<_, _>, String>>()?;
+            let required = tool
+                .parameters
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            Ok((
+                tool.name,
+                TaggedToolSchema {
+                    parameters,
+                    required,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn tagged_value_matches_schema(value: &Value, schema: &Value) -> bool {
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.contains(value))
+    {
+        return false;
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("string") => value.is_string(),
+        Some("number") => value.is_number(),
+        Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
+        Some("boolean") => value.is_boolean(),
+        Some("null") => value.is_null(),
+        Some("array") => {
+            let Some(values) = value.as_array() else {
+                return false;
+            };
+            let minimum = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let maximum = schema
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .map(|maximum| maximum as usize);
+            values.len() >= minimum
+                && maximum.is_none_or(|maximum| values.len() <= maximum)
+                && schema.get("items").is_none_or(|item| {
+                    values
+                        .iter()
+                        .all(|value| tagged_value_matches_schema(value, item))
+                })
+        }
+        Some("object") => {
+            let Some(object) = value.as_object() else {
+                return false;
+            };
+            let properties = schema.get("properties").and_then(Value::as_object);
+            schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .all(|name| object.contains_key(name))
+                && object.iter().all(|(name, value)| {
+                    if let Some(property) = properties.and_then(|properties| properties.get(name)) {
+                        tagged_value_matches_schema(value, property)
+                    } else {
+                        match schema.get("additionalProperties") {
+                            Some(Value::Bool(false)) => false,
+                            Some(additional) if additional.is_object() => {
+                                tagged_value_matches_schema(value, additional)
+                            }
+                            _ => true,
+                        }
+                    }
+                })
+        }
+        None => true,
+        _ => false,
     }
 }
 
@@ -1220,6 +1548,17 @@ impl FormatDialect for DeclarativeDialect {
     ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
         Ok(Box::new(DeclarativeParser::new(Self::spec(parameters)?)))
     }
+
+    fn incremental_parser_state_with_tools(
+        &self,
+        parameters: DialectParameters,
+        tools: &[Value],
+    ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        Ok(Box::new(DeclarativeParser::new_with_tools(
+            Self::spec(parameters)?,
+            tools,
+        )?))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1247,6 +1586,21 @@ enum DeclarativeParserState {
         json: JsonFragmentBuffer,
         emitted: usize,
     },
+    TaggedFunctionPrefix,
+    TaggedFunctionName,
+    TaggedParameterOrEnd {
+        tool: String,
+        arguments: serde_json::Map<String, Value>,
+    },
+    TaggedParameterName {
+        tool: String,
+        arguments: serde_json::Map<String, Value>,
+    },
+    TaggedParameterValue {
+        tool: String,
+        parameter: String,
+        arguments: serde_json::Map<String, Value>,
+    },
     StructuralName {
         prefix_consumed: bool,
     },
@@ -1264,14 +1618,31 @@ enum DeclarativeParserState {
 #[derive(Debug)]
 struct DeclarativeParser {
     spec: &'static DeclarativeDialectSpec,
+    tagged_tools: BTreeMap<String, TaggedToolSchema>,
     state: DeclarativeParserState,
     pending: String,
 }
 
 impl DeclarativeParser {
     fn new(spec: &'static DeclarativeDialectSpec) -> Self {
-        Self {
+        Self::new_with_tools(spec, &[]).expect("empty declarative parser schema is valid")
+    }
+
+    fn new_with_tools(
+        spec: &'static DeclarativeDialectSpec,
+        tools: &[Value],
+    ) -> Result<Self, String> {
+        let tagged_tools = if matches!(
+            spec.payload_shape,
+            DeclarativePayloadShape::TaggedParameters(_)
+        ) {
+            tagged_tool_catalog(tools)?
+        } else {
+            BTreeMap::new()
+        };
+        Ok(Self {
             spec,
+            tagged_tools,
             state: spec
                 .reasoning_channel
                 .filter(|channel| channel.prefix_in_prompt)
@@ -1282,7 +1653,7 @@ impl DeclarativeParser {
                     }
                 }),
             pending: String::new(),
-        }
+        })
     }
 
     fn tool_start_delimiter(&self) -> &'static str {
@@ -1333,6 +1704,9 @@ impl DeclarativeParser {
                 DeclarativeParserState::JsonPayload(IncrementalJsonCall::default())
             }
             DeclarativePayloadShape::NamedJsonArguments(_) => DeclarativeParserState::NamedJsonName,
+            DeclarativePayloadShape::TaggedParameters(_) => {
+                DeclarativeParserState::TaggedFunctionPrefix
+            }
             DeclarativePayloadShape::StructuralObject(_) => {
                 DeclarativeParserState::StructuralName {
                     prefix_consumed: false,
@@ -1357,7 +1731,8 @@ impl DeclarativeParser {
                     DeclarativeParserState::JsonEnvelopeStart
                 }
             }
-            DeclarativePayloadShape::NamedJsonArguments(_) => self.start_payload_state(),
+            DeclarativePayloadShape::NamedJsonArguments(_)
+            | DeclarativePayloadShape::TaggedParameters(_) => self.start_payload_state(),
             DeclarativePayloadShape::StructuralObject(_) => self.start_payload_state(),
         }
     }
@@ -1524,6 +1899,7 @@ impl DeclarativeParser {
                     let expected = match self.spec.payload_shape {
                         DeclarativePayloadShape::JsonObject
                         | DeclarativePayloadShape::NamedJsonArguments(_)
+                        | DeclarativePayloadShape::TaggedParameters(_)
                         | DeclarativePayloadShape::StructuralObject(_) => {
                             self.spec.call.prefix.to_owned()
                         }
@@ -1655,6 +2031,154 @@ impl DeclarativeParser {
                     }
                     self.state = DeclarativeParserState::AfterPayload;
                 }
+                DeclarativeParserState::TaggedFunctionPrefix => {
+                    let DeclarativePayloadShape::TaggedParameters(encoding) =
+                        self.spec.payload_shape
+                    else {
+                        unreachable!("tagged-function state requires tagged parameters")
+                    };
+                    if !self.consume_exact(encoding.function_prefix)? {
+                        return Ok(());
+                    }
+                    self.state = DeclarativeParserState::TaggedFunctionName;
+                }
+                DeclarativeParserState::TaggedFunctionName => {
+                    let DeclarativePayloadShape::TaggedParameters(encoding) =
+                        self.spec.payload_shape
+                    else {
+                        unreachable!("tagged-function state requires tagged parameters")
+                    };
+                    let Some(position) = self.pending.find(encoding.function_name_suffix) else {
+                        return Ok(());
+                    };
+                    let name = self.pending[..position].to_owned();
+                    if !self.tagged_tools.contains_key(&name) {
+                        return Err(format!("unknown tagged tool function {name:?}"));
+                    }
+                    self.pending
+                        .drain(..position + encoding.function_name_suffix.len());
+                    let id = format!("call_{}", sink.next_tool_index());
+                    sink.start_tool_call(id, name.clone());
+                    self.state = DeclarativeParserState::TaggedParameterOrEnd {
+                        tool: name,
+                        arguments: serde_json::Map::new(),
+                    };
+                }
+                DeclarativeParserState::TaggedParameterOrEnd { tool, arguments } => {
+                    let DeclarativePayloadShape::TaggedParameters(encoding) =
+                        self.spec.payload_shape
+                    else {
+                        unreachable!("tagged-parameter state requires tagged parameters")
+                    };
+                    if self.pending.starts_with(encoding.function_suffix) {
+                        let schema = self
+                            .tagged_tools
+                            .get(tool)
+                            .expect("selected tagged tool has a schema");
+                        if let Some(missing) = schema
+                            .required
+                            .iter()
+                            .find(|name| !arguments.contains_key(*name))
+                        {
+                            return Err(format!(
+                                "tagged tool {tool:?} is missing required parameter {missing:?}"
+                            ));
+                        }
+                        self.pending.drain(..encoding.function_suffix.len());
+                        let arguments =
+                            serde_json::to_string(&Value::Object(std::mem::take(arguments)))
+                                .expect("tagged arguments serialize as JSON");
+                        sink.tool_arguments(&arguments);
+                        self.state = DeclarativeParserState::AfterPayload;
+                    } else if self.pending.starts_with(encoding.parameter_prefix) {
+                        self.pending.drain(..encoding.parameter_prefix.len());
+                        self.state = DeclarativeParserState::TaggedParameterName {
+                            tool: std::mem::take(tool),
+                            arguments: std::mem::take(arguments),
+                        };
+                    } else if encoding.function_suffix.starts_with(&self.pending)
+                        || encoding.parameter_prefix.starts_with(&self.pending)
+                    {
+                        return Ok(());
+                    } else {
+                        return Err(format!(
+                            "expected tagged parameter or function closing delimiter for {tool:?}"
+                        ));
+                    }
+                }
+                DeclarativeParserState::TaggedParameterName { tool, arguments } => {
+                    let DeclarativePayloadShape::TaggedParameters(encoding) =
+                        self.spec.payload_shape
+                    else {
+                        unreachable!("tagged-parameter state requires tagged parameters")
+                    };
+                    let Some(position) = self.pending.find(encoding.parameter_name_suffix) else {
+                        return Ok(());
+                    };
+                    let parameter = self.pending[..position].to_owned();
+                    validate_tagged_parameter_name(&parameter)?;
+                    let schema = self
+                        .tagged_tools
+                        .get(tool)
+                        .expect("selected tagged tool has a schema");
+                    if !schema.parameters.contains_key(&parameter) {
+                        return Err(format!(
+                            "tagged tool {tool:?} has no parameter {parameter:?}"
+                        ));
+                    }
+                    if arguments.contains_key(&parameter) {
+                        return Err(format!(
+                            "tagged tool {tool:?} repeats parameter {parameter:?}"
+                        ));
+                    }
+                    self.pending
+                        .drain(..position + encoding.parameter_name_suffix.len());
+                    self.state = DeclarativeParserState::TaggedParameterValue {
+                        tool: std::mem::take(tool),
+                        parameter,
+                        arguments: std::mem::take(arguments),
+                    };
+                }
+                DeclarativeParserState::TaggedParameterValue {
+                    tool,
+                    parameter,
+                    arguments,
+                } => {
+                    let DeclarativePayloadShape::TaggedParameters(encoding) =
+                        self.spec.payload_shape
+                    else {
+                        unreachable!("tagged-parameter state requires tagged parameters")
+                    };
+                    let Some(position) = self.pending.find(encoding.parameter_suffix) else {
+                        return Ok(());
+                    };
+                    let raw = &self.pending[..position];
+                    let schema = &self
+                        .tagged_tools
+                        .get(tool)
+                        .expect("selected tagged tool has a schema")
+                        .parameters[parameter];
+                    let value = match tagged_value_kind(schema)? {
+                        TaggedValueKind::RawString => Value::String(raw.to_owned()),
+                        TaggedValueKind::Json => serde_json::from_str(raw).map_err(|error| {
+                            format!(
+                                "tagged tool {tool:?} parameter {parameter:?} contains invalid JSON: {error}"
+                            )
+                        })?,
+                    };
+                    if !tagged_value_matches_schema(&value, schema) {
+                        return Err(format!(
+                            "tagged tool {tool:?} parameter {parameter:?} has the wrong type or value"
+                        ));
+                    }
+                    arguments.insert(parameter.clone(), value);
+                    self.pending
+                        .drain(..position + encoding.parameter_suffix.len());
+                    self.state = DeclarativeParserState::TaggedParameterOrEnd {
+                        tool: std::mem::take(tool),
+                        arguments: std::mem::take(arguments),
+                    };
+                }
                 DeclarativeParserState::StructuralName { prefix_consumed } => {
                     let DeclarativePayloadShape::StructuralObject(encoding) =
                         self.spec.payload_shape
@@ -1740,6 +2264,19 @@ impl DeclarativeParser {
                         };
                     }
                     DeclarativePayloadShape::StructuralObject(_) => {
+                        if !self.consume_exact(self.spec.call.suffix)? {
+                            return Ok(());
+                        }
+                        sink.end_tool_call();
+                        self.state = if self.spec.output.prefix.is_empty()
+                            && self.spec.call_separator.is_empty()
+                        {
+                            DeclarativeParserState::Outside
+                        } else {
+                            DeclarativeParserState::AfterEnvelope
+                        };
+                    }
+                    DeclarativePayloadShape::TaggedParameters(_) => {
                         if !self.consume_exact(self.spec.call.suffix)? {
                             return Ok(());
                         }
@@ -2494,6 +3031,21 @@ impl ProtocolParser for DeclarativeParser {
                 kind: ChannelKind::Text,
                 ..
             } => sink.text(std::mem::take(&mut self.pending)),
+            DeclarativeParserState::TaggedFunctionPrefix
+            | DeclarativeParserState::TaggedFunctionName
+            | DeclarativeParserState::TaggedParameterOrEnd { .. }
+            | DeclarativeParserState::TaggedParameterName { .. }
+            | DeclarativeParserState::TaggedParameterValue { .. } => {
+                return Err("incomplete tagged-parameter tool call".into());
+            }
+            DeclarativeParserState::AfterPayload
+                if matches!(
+                    self.spec.payload_shape,
+                    DeclarativePayloadShape::TaggedParameters(_)
+                ) =>
+            {
+                return Err("incomplete tagged-parameter tool call".into());
+            }
             _ => {}
         }
         Ok(())
