@@ -1,6 +1,5 @@
 //! GPT-OSS model family.
 
-pub(crate) mod format;
 /// Bounded and unified residency execution.
 pub mod layerwise;
 /// Fully resident decoder implementation.

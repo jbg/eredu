@@ -19,10 +19,8 @@ pub mod error;
 /// Reusable MLX neural-network building blocks.
 #[cfg(feature = "mlx")]
 pub mod nn;
-/// Facade execution infrastructure, including MLX-specific implementations.
-#[cfg(feature = "mlx")]
+/// Backend-independent chat/streaming infrastructure and optional MLX runtime implementations.
 pub mod runtime;
-#[cfg(feature = "mlx")]
 pub use api::{inspect_text_model, TextInspectionOptions};
 /// Canonical backend-neutral runtime types.
 pub use safemlx_lm_core as core;

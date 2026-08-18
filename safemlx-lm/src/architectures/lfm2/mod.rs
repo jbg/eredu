@@ -1,6 +1,5 @@
 //! LFM2 and LFM2.5 model family.
 
-pub(crate) mod format;
 /// Bounded and unified residency execution.
 pub mod layerwise;
 /// Fully resident decoder implementation.

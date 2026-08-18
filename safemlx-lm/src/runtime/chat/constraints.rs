@@ -19,8 +19,6 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
-#[cfg(test)]
-use crate::runtime::chat::ToolRuntimePlan;
 use crate::{
     runtime::chat::dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
     runtime::chat::{
@@ -30,6 +28,21 @@ use crate::{
 };
 
 const MAX_SCHEMA_DEPTH: usize = 64;
+
+/// Portable failure reported by prepared-chat constraint state.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct ConstraintError {
+    message: String,
+}
+
+impl ConstraintError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
 
 /// Tokenizer-wide llguidance data. A `LoadedModel` constructs exactly one and
 /// every request grammar shares it.
@@ -250,7 +263,7 @@ impl ConstraintCompiler {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: Vec<u32>,
-    ) -> Result<ToolRuntimePlan, String> {
+    ) -> Result<GenerationRuntimePlan, String> {
         let structural_token_spellings = dialect
             .required_structural_tokens(parameters)?
             .iter()
@@ -1016,7 +1029,10 @@ mod tests {
         })
     }
 
-    fn accepts(plan: &crate::runtime::chat::ToolRuntimePlan, value: serde_json::Value) -> bool {
+    fn accepts(
+        plan: &crate::runtime::chat::GenerationRuntimePlan,
+        value: serde_json::Value,
+    ) -> bool {
         let bytes = serde_json::to_vec(&value).unwrap();
         let mut state = plan.generation_constraint().grammar_state();
         for byte in bytes {

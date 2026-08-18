@@ -1,6 +1,41 @@
 //! Prepared-chat request types and semantic generation machinery.
 
-use super::*;
+use std::num::NonZeroUsize;
+
+use safemlx_lm_core::{
+    generation::{
+        FinishReason, GenerationCancellationToken, GenerationConfigOverrides, SemanticEvent,
+    },
+    MtpCapability, MtpSchedulerOptions, MtpSchedulerStats, MtpStats,
+};
+use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
+
+use super::{LoadedModel, TextDecoderError, TextModelError};
+use crate::runtime::chat::constraints::{ConstraintCompiler, ConstraintError};
+use crate::runtime::chat::{
+    prepare_format_profile, resolve_structural_tokens, CapabilitySupport, ChatCapabilities,
+    ChatTemplateIdentity, ChatTemplateRequest, NativeToolSupport, PreparedChat, SemanticSupport,
+    ToolChoice,
+};
+
+#[cfg(feature = "mlx")]
+use crate::{api::TextDecoder, runtime::chat::SemanticRuntimePlan};
+#[cfg(feature = "mlx")]
+use crate::{
+    error::Error,
+    runtime::generation::{
+        sampler::ConstrainedSampler,
+        streaming::{
+            CommittedTokenPipeline, CommittedTokenSource, RawTokenDecoder, TokenDecoderBackend,
+        },
+    },
+};
+#[cfg(feature = "mlx")]
+use safemlx::Array;
+#[cfg(feature = "mlx")]
+use safemlx_lm_core::{SpeculativeOutputError, SpeculativeSemanticState};
+#[cfg(feature = "mlx")]
+use std::collections::HashMap;
 
 /// Model sampling and stopping settings for one prepared chat generation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -11,6 +46,7 @@ pub struct PreparedChatGenerationSettings {
     pub seed: u64,
 }
 
+#[cfg(feature = "mlx")]
 pub(super) struct ResolvedPreparedChatGenerationSettings {
     pub(super) temperature: f32,
     pub(super) max_tokens: NonZeroUsize,
@@ -108,7 +144,7 @@ pub enum PreparedChatError<E: std::error::Error + Send + Sync + 'static> {
     Backend(#[source] E),
     /// Portable constraint construction or advancement failed.
     #[error(transparent)]
-    Constraint(#[from] crate::runtime::generation::sampler::ConstraintError),
+    Constraint(#[from] ConstraintError),
     /// Portable generation lifecycle state was invalid.
     #[error(transparent)]
     Generation(#[from] crate::core::generation::GenerationError),
@@ -124,9 +160,10 @@ pub enum PreparedChatError<E: std::error::Error + Send + Sync + 'static> {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[cfg(feature = "mlx")]
 pub(super) enum PreparedChatSetupError {
     #[error(transparent)]
-    Constraint(#[from] crate::runtime::generation::sampler::ConstraintError),
+    Constraint(#[from] ConstraintError),
     #[error("{0}")]
     Semantic(String),
 }
@@ -257,11 +294,13 @@ pub struct PreparedChatMtpBatchOutput {
     pub scheduler: MtpSchedulerStats,
 }
 
+#[cfg(feature = "mlx")]
 #[derive(Clone)]
 pub(super) struct PreparedChatTokenDecoder {
     pub(super) decoder: TextDecoder,
 }
 
+#[cfg(feature = "mlx")]
 impl TokenDecoderBackend for PreparedChatTokenDecoder {
     type Error = TextDecoderError;
 
@@ -287,16 +326,19 @@ impl TokenDecoderBackend for PreparedChatTokenDecoder {
     }
 }
 
+#[cfg(feature = "mlx")]
 pub(super) struct PreparedChatRuntime<S> {
     pub(super) sampler: ConstrainedSampler<S>,
 }
 
+#[cfg(feature = "mlx")]
 pub(super) struct PreparedChatControlRuntime {
     pub(super) controller: crate::runtime::generation::sampler::ConstraintController,
     pub(super) parser: crate::runtime::generation::streaming::ToolRuntimeParser,
     pub(super) structural_tokens: HashMap<u32, String>,
 }
 
+#[cfg(feature = "mlx")]
 pub(super) struct PreparedChatSemanticState {
     initial_decoder: PreparedChatTokenDecoder,
     plan: SemanticRuntimePlan,
@@ -306,6 +348,7 @@ pub(super) struct PreparedChatSemanticState {
     events: Vec<SemanticEvent>,
 }
 
+#[cfg(feature = "mlx")]
 impl PreparedChatSemanticState {
     pub(super) fn new(
         initial_decoder: PreparedChatTokenDecoder,
@@ -342,6 +385,7 @@ impl PreparedChatSemanticState {
     }
 }
 
+#[cfg(feature = "mlx")]
 impl SpeculativeSemanticState for PreparedChatSemanticState {
     fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
         let mut pipeline = Self::build_pipeline(
@@ -389,6 +433,7 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
     }
 }
 
+#[cfg(feature = "mlx")]
 pub(super) fn with_prepared_chat_runtime<R>(
     prepared_chat: &PreparedChat,
     sampling: crate::runtime::generation::sampler::GenerationSampler,
@@ -413,6 +458,7 @@ pub(super) fn with_prepared_chat_runtime<R>(
     execute(PreparedChatRuntime { sampler })
 }
 
+#[cfg(feature = "mlx")]
 pub(super) fn prepared_chat_control_runtime(
     prepared_chat: &PreparedChat,
     caller_stop_sequences: &[String],
@@ -448,6 +494,7 @@ pub(super) fn prepared_chat_control_runtime(
     })
 }
 
+#[cfg(feature = "mlx")]
 pub(super) struct BackendGenerationTokenSource<'a, B>
 where
     B: safemlx_lm_core::TextGenerationBackend,
@@ -459,14 +506,12 @@ where
     >,
 }
 
+#[cfg(feature = "mlx")]
 impl<B> CommittedTokenSource for BackendGenerationTokenSource<'_, B>
 where
     B: safemlx_lm_core::TextGenerationBackend,
 {
-    type Error = safemlx_lm_core::ControlledTextGenerationError<
-        B::Error,
-        crate::runtime::generation::sampler::ConstraintError,
-    >;
+    type Error = safemlx_lm_core::ControlledTextGenerationError<B::Error, ConstraintError>;
 
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
         self.generator
@@ -1110,19 +1155,15 @@ fn recognize_remaining_protocols(
     selected_template: &ModelChatTemplate,
     model_id: &str,
 ) -> Option<crate::runtime::chat::PreparedFormatProfile> {
-    use crate::{
-        architectures::{
-            gpt_oss::format::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
-            lfm2::format::{LFM2_DIALECT, LFM2_PARAMETERS},
-        },
-        runtime::chat::{
-            dialect::{DialectParameters, DECLARATIVE_DIALECT},
-            DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC, DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC,
-            KIMI_K2_NATIVE_TOOL_SPEC, LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC,
-            MINISTRAL_JSON_LIST_TOOL_SPEC, MISTRAL_JSON_LIST_TOOL_SPEC,
-            NEMOTRON_NANO_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC,
-            QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
-        },
+    use crate::runtime::chat::{
+        dialect::{DialectParameters, DECLARATIVE_DIALECT},
+        harmony::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
+        lfm2::{LFM2_DIALECT, LFM2_PARAMETERS},
+        DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC, DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC,
+        KIMI_K2_NATIVE_TOOL_SPEC, LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC,
+        MINISTRAL_JSON_LIST_TOOL_SPEC, MISTRAL_JSON_LIST_TOOL_SPEC,
+        NEMOTRON_NANO_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC,
+        QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
     };
 
     let mapping = render_protocol_probe(

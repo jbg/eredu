@@ -1,10 +1,10 @@
 use super::{
-    chat_template_kwargs, eos_token_ids_from_sidecar_dir, gguf_eos_token_ids,
-    inspect_chat_template_kwargs, load_chat_template, load_tokenizer,
-    load_tokenizer_template_kwargs, merge_eos_token_id_sources, prepare_chat_from_parts,
-    with_prepared_chat_runtime, LoadedModel, PreparedChatDraft, PreparedChatInput,
-    PreparedChatMtpBatchRequest, TextModelError,
+    eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, inspect_chat_template_kwargs,
+    load_chat_template, load_tokenizer_template_kwargs, merge_eos_token_id_sources,
+    prepare_chat_from_parts, with_prepared_chat_runtime, LoadedModel, PreparedChatDraft,
+    PreparedChatInput, PreparedChatMtpBatchRequest, TextModelError,
 };
+use crate::api::{chat_template_kwargs, load_tokenizer};
 use crate::{
     architectures::{
         gpt_oss::model as gpt_oss, llama::model as llama, qwen::dense as dense_qwen,
@@ -603,7 +603,7 @@ fn production_kimi_template_renders_parallel_tools_and_selects_native_dialect() 
     );
 }
 
-fn plan_accepts(plan: &crate::runtime::chat::ToolRuntimePlan, output: &str) -> bool {
+fn plan_accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, output: &str) -> bool {
     let mut grammar = plan.generation_constraint().grammar_state();
     let structural_tokens = plan.structural_tokens().collect::<Vec<_>>();
     let mut offset = 0;
@@ -4330,7 +4330,7 @@ fn checkpoint_generation_config_resolves_declared_values_and_request_overrides()
 
 #[test]
 fn checkpoint_generation_config_honors_do_sample_false() {
-    let checkpoint = super::CheckpointGenerationConfig {
+    let checkpoint = crate::CheckpointGenerationConfig {
         do_sample: Some(false),
         temperature: Some(0.8),
         top_k: Some(20),

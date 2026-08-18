@@ -2739,9 +2739,11 @@ dependencies = [
 name = "safemlx-lm-utils"
 version = "0.1.4"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "minijinja",
  "minijinja-contrib",
+ "safemlx-gguf",
  "serde",
  "serde_json",
  "sha2",

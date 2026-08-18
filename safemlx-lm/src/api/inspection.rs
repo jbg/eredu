@@ -10,19 +10,19 @@ use safemlx_lm_core::{
 use serde_json::{json, Map, Value};
 
 use super::load_tokenizer;
-use super::mlx::{
+use super::metadata::{
     eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, merge_eos_token_id_sources,
-    request::prepare_chat_from_parts,
-    tokenizer::{
-        gguf_sidecar_dir, load_chat_template, load_gguf_tokenizer_from_metadata,
-        load_tokenizer_template_kwargs,
-    },
-    ChatTokenizer, ModelChatTemplate,
+};
+use super::request::prepare_chat_from_parts;
+use super::tokenizer::{
+    gguf_sidecar_dir, load_chat_template, load_gguf_tokenizer_from_metadata,
+    load_tokenizer_template_kwargs,
 };
 use crate::runtime::chat::{
     constraints::ConstraintCompiler, ChatTemplateRequest, NativeToolSupport, PreparedChat,
     SemanticSupport, ToolChoice,
 };
+use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
 /// Portable text-sidecar checks applied after a selected backend inspects an artifact.
 #[derive(Debug, Clone, Default)]

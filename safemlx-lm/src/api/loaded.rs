@@ -29,7 +29,7 @@ where
 fn map_controlled_generation_error<E>(
     error: safemlx_lm_core::ControlledTextGenerationError<
         E,
-        crate::runtime::generation::sampler::ConstraintError,
+        crate::runtime::chat::constraints::ConstraintError,
     >,
 ) -> PreparedChatError<E>
 where
@@ -49,7 +49,7 @@ fn map_committed_generation_error<E>(
     error: CommittedGenerationError<
         safemlx_lm_core::ControlledTextGenerationError<
             E,
-            crate::runtime::generation::sampler::ConstraintError,
+            crate::runtime::chat::constraints::ConstraintError,
         >,
         TextDecoderError,
     >,

@@ -117,7 +117,7 @@ pub enum Error {
 
     /// Portable prepared-chat constraint construction or advancement failed.
     #[error(transparent)]
-    Constraint(#[from] crate::runtime::generation::sampler::ConstraintError),
+    Constraint(#[from] crate::runtime::chat::constraints::ConstraintError),
 
     /// A prepared semantic plan or event stream was invalid.
     #[error("prepared-chat semantic generation failed: {0}")]

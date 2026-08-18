@@ -105,6 +105,17 @@ one inspection between portable tokenizer/chat/EOS assembly and
 backend-specific facade constructor. `LoadedModel::from_runtime` remains the
 constructor for an already-prepared runtime assembled by an application.
 
+Tokenizer reconstruction is also outside the MLX boundary. The portable
+facade loads Hugging Face tokenizer sidecars, EOS metadata, chat templates, and
+semantic protocol plans without an execution feature. `safemlx-lm-utils` owns
+the canonical GGUF-tokenizer and Kimi tiktoken conversions; the facade owns
+artifact-relative discovery and inspection policy. GPT-OSS Harmony and LFM2
+wire protocols live with the other portable chat dialects rather than under
+their MLX tensor architectures. Consequently `inspect_text_model` can enrich a
+structural report produced by any backend in a `default-features = false`
+build. MLX keeps only payload materialization, tensor execution, sampling, and
+native completion in this path.
+
 Constrained generation uses the same contract rather than a parallel MLX
 loop. The core `TokenFilterController` contract lets a facade-owned grammar and
 activation state return a validated portable `TokenFilter` before each submission.

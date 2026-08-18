@@ -46,7 +46,8 @@ safemlx-lm = { version = "0.4", default-features = false }
 ```
 
 That build exposes the canonical `LoadedModel<B>`, `ModelRuntime<B>`, portable
-artifact and generation contracts, tokenizer ownership, and token-generation
+artifact and generation contracts, tokenizer loading, EOS and chat-template
+discovery, semantic chat inspection, and token-generation
 lifecycle. The `mlx` feature adds architecture implementations, native model
 loading, prepared MLX inputs, sampling, residency, distributed execution, and
 runtime diagnostics. `cuda`, `nccl`, and media-processing features imply
@@ -60,11 +61,13 @@ enable Oniguruma and select it as the faster tokenizer regex implementation.
 
 ## Inspect before loading
 
-MLX structural inspection performs the same architecture, tensor,
+Backend structural inspection performs the same architecture, tensor,
 quantization, residency, and topology preflight used by loading without
 creating a stream or loading weight payloads. Text inspection is a separate
 facade step because tokenizer, chat-template, EOS, and semantic behavior do not
-belong to an execution backend:
+belong to an execution backend. `inspect_text_model`, `load_tokenizer`, and the
+chat request types remain available with `default-features = false`; only the
+structural report producer is selected by the application:
 
 ```rust,no_run
 use safemlx_lm::{

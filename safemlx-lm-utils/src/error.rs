@@ -1,5 +1,11 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid tokenizer metadata: {0}")]
+    InvalidTokenizer(String),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
     #[error("invalid chat_template: {0}")]
     InvalidChatTemplate(String),
 

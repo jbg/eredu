@@ -1,4 +1,4 @@
-//! GPT-OSS Harmony output syntax and incremental parser state.
+//! Harmony output syntax and incremental parser state.
 
 use llguidance::api::TopLevelGrammar;
 use serde_json::Value;
@@ -636,7 +636,7 @@ mod tests {
         tools: &[Value],
         choice: ToolChoice,
         parallel: ParallelToolCallPolicy,
-    ) -> crate::runtime::chat::ToolRuntimePlan {
+    ) -> crate::runtime::chat::GenerationRuntimePlan {
         ConstraintCompiler::synthetic_for_tests()
             .compile_tool_plan(
                 &HARMONY_DIALECT,
@@ -649,7 +649,7 @@ mod tests {
             .unwrap()
     }
 
-    fn accepts(plan: &crate::runtime::chat::ToolRuntimePlan, text: &str) -> bool {
+    fn accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, text: &str) -> bool {
         let mut grammar = plan.generation_constraint().grammar_state();
         let structural = plan.structural_tokens().collect::<Vec<_>>();
         let mut offset = 0;

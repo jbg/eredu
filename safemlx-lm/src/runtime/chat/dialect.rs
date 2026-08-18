@@ -2792,7 +2792,7 @@ mod tests {
         })
     }
 
-    fn accepts(plan: &crate::runtime::chat::ToolRuntimePlan, text: &str) -> bool {
+    fn accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, text: &str) -> bool {
         let mut state = plan.generation_constraint().grammar_state();
         for byte in text.bytes() {
             if state.commit(byte as TokenId).is_err() {
@@ -3578,7 +3578,7 @@ mod tests {
     #[test]
     fn runtime_plan_creates_independent_parser_instances() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<crate::runtime::chat::ToolRuntimePlan>();
+        assert_send_sync::<crate::runtime::chat::GenerationRuntimePlan>();
 
         let parameters = DialectParameters::Declarative(&DECLARATIVE_OBJECT_SPEC);
         let plan = ConstraintCompiler::synthetic_for_tests()

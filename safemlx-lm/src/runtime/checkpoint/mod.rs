@@ -17,5 +17,3 @@ pub mod quantization;
 pub mod recipe;
 /// Persistent lazy checkpoint tensor storage.
 pub mod store;
-/// Import of rank-ordered byte BPE vocabularies used by tiktoken checkpoints.
-pub(crate) mod tiktoken;

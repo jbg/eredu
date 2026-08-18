@@ -1,11 +1,13 @@
 use safemlx_lm::api::{
-    AutomaticPlanRequest, AutomaticPlanner, ChatTokenizer, DevicePlan, LoadedModel,
-    LoadedTextModelConfig, AUTOMATIC_SCHEMA_VERSION,
+    inspect_text_model, load_tokenizer, AutomaticPlanRequest, AutomaticPlanner, ChatTokenizer,
+    DevicePlan, LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx_lm::{
-    Backend, BackendCapabilities, BackendDescriptor, BackendSession, Completion, DeviceDescriptor,
-    GenerationConfigOverrides, ModelRuntime, PreparedModel, Submission, TextGenerationBackend,
-    TextGenerationConfig, TokenFilter, TokenOutput,
+    ArtifactFormat, Backend, BackendCapabilities, BackendDescriptor, BackendSession, Completion,
+    DeviceDescriptor, GenerationConfigOverrides, InspectionReadiness, ModelInspectionReport,
+    ModelRuntime, PreparedModel, Submission, TextGenerationBackend, TextGenerationConfig,
+    TokenFilter, TokenOutput,
 };
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
@@ -194,4 +196,30 @@ fn automatic_planning_documents_are_available_without_mlx() {
             .unwrap(),
         request
     );
+}
+
+#[test]
+fn tokenizer_and_text_inspection_are_available_without_mlx() {
+    let directory = std::env::temp_dir().join(format!(
+        "safemlx-portable-inspection-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("tokenizer.json"),
+        br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1},"unk_token":"<unk>"}}"#,
+    )
+    .unwrap();
+    std::fs::write(directory.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+
+    assert_eq!(load_tokenizer(&directory).unwrap().get_vocab_size(false), 2);
+    let mut structural = ModelInspectionReport::unverified(&directory, ArtifactFormat::SafeTensors);
+    structural.model_loadability = InspectionReadiness::Ready;
+    structural.requested_load = InspectionReadiness::Ready;
+    let report = inspect_text_model(structural, TextInspectionOptions::default());
+    assert_eq!(report.tokenizer, InspectionReadiness::Ready);
+    assert_eq!(report.text_generation, InspectionReadiness::Ready);
+
+    std::fs::remove_dir_all(directory).unwrap();
 }

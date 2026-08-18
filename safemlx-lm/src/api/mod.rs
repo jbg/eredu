@@ -6,13 +6,28 @@
 //! MLX executable, cache, load-policy, and generation types live under
 //! `backend::mlx`, not in this namespace.
 
+mod metadata;
 mod portable;
+mod request;
+mod tokenizer;
+
+pub use crate::runtime::chat::constraints::ConstraintError;
+pub use crate::runtime::chat::{
+    CapabilitySupport, ChatCapabilities, ChatTemplateIdentity, ChatTemplateRequest,
+    NativeToolSupport, ParallelToolCallPolicy, PreparedChat, SemanticSupport, ToolChoice,
+};
+pub use request::{
+    PreparedChatDraft, PreparedChatError, PreparedChatGenerationOutput,
+    PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+    PreparedChatMtpBatchLane, PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest,
+    PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationOutput,
+    PreparedChatMtpGenerationRequest, PreparedChatSpeculativeBackend,
+};
+pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 
 #[cfg(feature = "mlx")]
 mod capability;
-#[cfg(feature = "mlx")]
 mod inspection;
-#[cfg(feature = "mlx")]
 pub use inspection::{inspect_text_model, TextInspectionOptions};
 
 pub use portable::{

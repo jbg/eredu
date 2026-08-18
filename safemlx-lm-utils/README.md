@@ -1,14 +1,15 @@
 # safemlx-lm-utils
 
-`safemlx-lm-utils` contains tokenizer and chat-template utilities for Rust MLX
-language-model runtimes. It supports structured messages, system roles, tool
-metadata, Jinja chat templates, and the tokenizer backends used by
+`safemlx-lm-utils` contains backend-neutral tokenizer and chat-template
+utilities for Rust language-model runtimes. It supports structured messages,
+system roles, tool metadata, Jinja chat templates, GGUF tokenizer metadata,
+Kimi-style tiktoken vocabularies, and the tokenizer backends used by
 [`safemlx-lm`](../safemlx-lm/).
 
 Most applications should depend on `safemlx-lm`, which exposes these
 capabilities through its higher-level loading and generation APIs. Use this
 crate directly when integrating the tokenizer or template layer into another
-runtime.
+runtime. It does not depend on SafeMLX or a native accelerator runtime.
 
 ```toml
 [dependencies]

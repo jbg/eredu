@@ -3432,7 +3432,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     if converted.exists() {
         return Ok(Tokenizer::from_file(converted)?);
     }
-    crate::runtime::checkpoint::tiktoken::load_kimi_k2(model_dir)
+    safemlx_lm_utils::tiktoken::load_kimi_k2(model_dir).map_err(Error::Template)
 }
 
 #[cfg(test)]

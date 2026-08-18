@@ -1,6 +1,16 @@
 //! Tokenizer, chat-template, and GGUF metadata loading.
 
-use super::*;
+use std::path::Path;
+
+use safemlx_gguf::MetadataValue as GgufMetadataValue;
+use safemlx_lm_core::ModelKind;
+use safemlx_lm_utils::gguf::{self as gguf_tokenizer, GgufTokenizer};
+use safemlx_lm_utils::tokenizer::{
+    chat_template_kwargs as inspect_chat_template_kwargs, load_model_chat_template_from_file,
+    ModelChatTemplate,
+};
+use serde_json::{Map, Value};
+use tokenizers::Tokenizer;
 
 /// Backend-independent tokenizer, chat-template, and text-sidecar failure.
 #[derive(Debug, thiserror::Error)]
@@ -58,7 +68,7 @@ pub(super) fn load_tokenizer_for_kind(
             if converted.exists() {
                 Ok(Tokenizer::from_file(converted)?)
             } else {
-                kimi_linear::load_tokenizer(model_dir)
+                safemlx_lm_utils::tiktoken::load_kimi_k2(model_dir)
                     .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
             }
         }

@@ -42,7 +42,7 @@ struct AddedTokenConfig {
 }
 
 fn tokenizer_error(message: impl Into<String>) -> Error {
-    Error::UnsupportedArchitecture(format!(
+    Error::InvalidTokenizer(format!(
         "invalid tiktoken.model checkpoint: {}",
         message.into()
     ))
@@ -233,7 +233,7 @@ fn special_tokens(config_path: &Path, base_count: usize) -> Result<Vec<AddedToke
 
 /// Loads the official Kimi/K2 `tiktoken.model` and registers its complete
 /// contiguous reserved-token range without permitting partial registration.
-pub(crate) fn load_kimi_k2(model_dir: &Path) -> Result<Tokenizer, Error> {
+pub fn load_kimi_k2(model_dir: &Path) -> Result<Tokenizer, Error> {
     let ranked = read_ranks(&model_dir.join("tiktoken.model"))?;
     let mut tokenizer = build_byte_bpe(&ranked)?;
     let tokens = special_tokens(&model_dir.join("tokenizer_config.json"), ranked.len())?;

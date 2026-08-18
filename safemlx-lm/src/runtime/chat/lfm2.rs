@@ -1,4 +1,4 @@
-//! LiquidAI LFM2 Python-style function-call syntax.
+//! Python-style function-call syntax used by LFM2 checkpoints.
 //!
 //! The common runtime owns activation, constrained sampling, structural-token
 //! decoding, stop matching, and semantic events. This module supplies only the
@@ -1018,7 +1018,7 @@ mod tests {
         tools: &[Value],
         choice: ToolChoice,
         parallel: ParallelToolCallPolicy,
-    ) -> crate::runtime::chat::ToolRuntimePlan {
+    ) -> crate::runtime::chat::GenerationRuntimePlan {
         ConstraintCompiler::synthetic_for_tests()
             .compile_tool_plan(
                 &LFM2_DIALECT,
@@ -1031,7 +1031,7 @@ mod tests {
             .unwrap()
     }
 
-    fn accepts(plan: &crate::runtime::chat::ToolRuntimePlan, text: &str) -> bool {
+    fn accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, text: &str) -> bool {
         let mut grammar = plan.generation_constraint().grammar_state();
         let structural = plan.structural_tokens().collect::<Vec<_>>();
         let mut offset = 0;

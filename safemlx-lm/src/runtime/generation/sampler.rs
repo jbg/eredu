@@ -10,7 +10,7 @@ use safemlx::{
 
 use crate::{
     core::{TokenFilter, TokenFilterController},
-    runtime::chat::constraints::GrammarState,
+    runtime::chat::constraints::{ConstraintError, GrammarState},
     runtime::chat::{GenerationRuntimePlan, ToolChoice},
 };
 
@@ -145,25 +145,6 @@ pub trait Sampler {
 pub(crate) struct ConstrainedSampler<S> {
     policy: S,
     controller: ConstraintController,
-}
-
-/// Portable failure reported by prepared-chat constraint state.
-///
-/// This error deliberately carries no MLX exception. Constraint evaluation is
-/// shared by every text-generation backend; MLX sampling converts it only when
-/// crossing into its tensor-facing sampler contract.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{message}")]
-pub struct ConstraintError {
-    message: String,
-}
-
-impl ConstraintError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
 }
 
 /// Canonical backend-independent grammar and activation state.
@@ -1369,7 +1350,7 @@ mod tests {
             GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
             DECLARATIVE_DIALECT,
         },
-        runtime::chat::{ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
+        runtime::chat::{GenerationRuntimePlan, ParallelToolCallPolicy, ToolChoice},
     };
 
     const SYNTHETIC_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
@@ -1450,7 +1431,7 @@ mod tests {
         }
     }
 
-    fn synthetic_plan(tool_choice: ToolChoice) -> ToolRuntimePlan {
+    fn synthetic_plan(tool_choice: ToolChoice) -> GenerationRuntimePlan {
         ConstraintCompiler::synthetic_for_tests()
             .compile_tool_plan(
                 &DECLARATIVE_DIALECT,
@@ -1473,7 +1454,7 @@ mod tests {
             .unwrap()
     }
 
-    fn boundary_plan() -> ToolRuntimePlan {
+    fn boundary_plan() -> GenerationRuntimePlan {
         ConstraintCompiler::synthetic_with_tokens_for_tests(BOUNDARY_TOKENS)
             .compile_tool_plan(
                 &DECLARATIVE_DIALECT,
