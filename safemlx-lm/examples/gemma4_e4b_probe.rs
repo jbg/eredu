@@ -3,15 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use safemlx::{
-    ops::indexing::{NewAxis, TryIndexOp},
-    ExecutionContext, Stream,
-};
+use safemlx::ExecutionContext;
 use safemlx_lm::{
     api::{LoadedModel, LoadedModelLoadError},
     error::Error,
-    runtime::media::input::{InputPart, ModelInput},
-    GenerationConfigOverrides,
+    GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
 use serde_json::Value;
 
@@ -69,34 +65,24 @@ fn main() -> anyhow::Result<()> {
     println!("temperature: {temp}");
 
     let ids = model.encode(&rendered, false)?;
-    let tokens = safemlx::Array::from(ids.as_slice()).try_index_device(NewAxis, stream)?;
     let eos = model.eos_token_ids().to_vec();
-    print_first_token_distribution(&mut model, &tokens, stream)?;
-    model.reset_session()?;
+    print_first_token_distribution(&mut model, ids.clone())?;
+    model.runtime_mut().session_mut().reset()?;
     let mut output_ids = Vec::new();
-    let prng_key = if temp == 0.0 {
-        None
-    } else {
-        Some(safemlx::random::key(0)?)
-    };
 
     {
-        let input_parts = [InputPart::text_token_ids(&tokens)];
-        let input = ModelInput::new(&input_parts);
-        let mut generator = model.generate_input(
-            input,
-            GenerationConfigOverrides {
-                temperature: Some(temp),
-                ..Default::default()
-            },
-            prng_key,
-        )?;
+        let resolved = model.resolve_generation_config(GenerationConfigOverrides {
+            temperature: Some(temp),
+            ..Default::default()
+        })?;
+        let mut generator =
+            model.generate_tokens(ids, TextGenerationConfig::new(resolved).with_seed(0))?;
         for _ in 0..120 {
             let token = match generator.next() {
                 Some(token) => token?,
                 None => break,
             };
-            let id = token.item::<u32>(stream);
+            let id = token.token_id()?;
             output_ids.push(id);
             if eos.contains(&id) {
                 break;
@@ -122,23 +108,17 @@ fn gemma4_message(prompt: &str, model_type: &str) -> serde_json::Value {
 
 fn print_first_token_distribution(
     model: &mut LoadedModel<safemlx_lm::backend::mlx::MlxBackend<'static>>,
-    tokens: &safemlx::Array,
-    stream: &Stream,
+    tokens: Vec<u32>,
 ) -> anyhow::Result<()> {
-    let input_parts = [InputPart::text_token_ids(tokens)];
-    let input = ModelInput::new(&input_parts);
-    let mut generator = model.generate_input(
-        input,
-        GenerationConfigOverrides {
-            temperature: Some(0.0),
-            ..Default::default()
-        },
-        None,
-    )?;
+    let resolved = model.resolve_generation_config(GenerationConfigOverrides {
+        temperature: Some(0.0),
+        ..Default::default()
+    })?;
+    let mut generator = model.generate_tokens(tokens, TextGenerationConfig::new(resolved))?;
     let Some(first) = generator.next() else {
         return Ok(());
     };
-    let first_id = first?.item::<u32>(stream);
+    let first_id = first?.token_id()?;
     drop(generator);
     println!(
         "first greedy id: {first_id} {:?}",

@@ -340,6 +340,64 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
+    /// Returns checkpoint-native quantization storage statistics when the
+    /// selected session has one complete local model.
+    pub fn native_quantization_stats(
+        &self,
+    ) -> Option<&safemlx::native_quantization::NativeQuantizationStats> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model.native_quantization_stats(),
+            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => None,
+        }
+    }
+
+    /// Returns the canonical cache-relevant architecture identity.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model
+                .prompt_cache_architecture_fingerprint()
+                .map_err(Into::into),
+            MlxSessionKind::Pipeline(model, _) => Ok(model
+                .prompt_cache_model_identity()?
+                .architecture_fingerprint),
+            MlxSessionKind::Expert(model, _) => Ok(model
+                .prompt_cache_model_identity()?
+                .architecture_fingerprint),
+        }
+    }
+
+    /// Returns the exact ordered rank-local prompt-cache layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => {
+                model.prompt_cache_layer_layout().map_err(Into::into)
+            }
+            MlxSessionKind::Pipeline(model, _) => {
+                Ok(model.prompt_cache_model_identity()?.layer_layout)
+            }
+            MlxSessionKind::Expert(model, _) => {
+                Ok(model.prompt_cache_model_identity()?.layer_layout)
+            }
+        }
+    }
+
+    /// Returns each owned layer's processed-token delta from the persisted prefix.
+    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model
+                .prompt_cache_layer_prefix_offsets()
+                .map_err(Into::into),
+            MlxSessionKind::Pipeline(model, _) => {
+                Ok(model.prompt_cache_model_identity()?.layer_prefix_offsets)
+            }
+            MlxSessionKind::Expert(model, _) => {
+                Ok(model.prompt_cache_model_identity()?.layer_prefix_offsets)
+            }
+        }
+    }
+
     pub(crate) fn complete_model(&self) -> &Model {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model,
@@ -676,8 +734,30 @@ impl<'a> MlxModelSession<'a> {
         result.map_err(|error| safemlx::error::Exception::custom(error.to_string()).into())
     }
 
-    /// Submits instrumented prefill through the MLX adapter.
-    pub(crate) fn submit_prefill_with_observer(
+    /// Submits instrumented prefill through this selected MLX session.
+    pub fn submit_prefill_with_observer(
+        &mut self,
+        backend: &MlxBackend<'a>,
+        input: MlxModelInput,
+        observer: &mut impl ActivationObserver,
+    ) -> Result<Submission<Array, MlxCompletion>, Error> {
+        match &mut self.inner {
+            MlxSessionKind::Complete(model, cache) => Self::submit_complete_prefill_with_observer(
+                model,
+                input,
+                cache,
+                backend.stream(),
+                observer,
+            ),
+            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
+                Err(Error::UnsupportedArchitecture(
+                    "activation observation is unavailable for distributed MLX sessions".into(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn submit_complete_prefill_with_observer(
         model: &mut Model,
         input: MlxModelInput,
         cache: &mut ModelCache,

@@ -348,10 +348,20 @@ retain the MLX streams selected when each was loaded; batch cache lanes are
 allocated inside the MLX adapter. The caller supplies the drafter tokenizer to
 the MLX loader, so vocabulary compatibility is exact without making the
 backend call into facade metadata loading.
-The lower-level `MlxMtpCache` remains an explicitly MLX resource for raw tensor
-APIs. Starting an unrelated sequence is an explicit `reset_session`
-transition; loading a prompt cache deliberately replaces the same session
-state so the next prefill/decode continues that prefix.
+MLX speculative lane caches are adapter-owned and are no longer part of the
+facade API. Starting an unrelated sequence is an explicit
+`MlxModelSession::reset` transition; loading a prompt cache deliberately
+replaces the same session state so the next prefill/decode continues that
+prefix.
+
+`LoadedModel<B>` has no public MLX-only inherent methods. Portable text and
+prepared-chat operations remain on the generic facade. Native cache policy,
+prompt-cache persistence, residency telemetry, media processor access,
+activation observation, and allocator diagnostics live on
+`backend::mlx::MlxModelSession` and are reached through `ModelRuntime` only
+when an application intentionally selects MLX. Raw prefill/decode callers use
+the generic `ModelRuntime` submission contract with `MlxModelInput`; the
+facade does not unwrap outputs into MLX arrays or accept caller streams.
 
 ## Tensor and cache ownership
 

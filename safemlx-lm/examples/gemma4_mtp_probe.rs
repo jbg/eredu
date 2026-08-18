@@ -1,11 +1,14 @@
-use std::{path::PathBuf, time::Instant};
+use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
 
-use safemlx::{transforms::eval, ExecutionContext, Stream};
+use safemlx::{ExecutionContext, Stream};
 use safemlx_lm::{
-    api::LoadedModel,
+    api::{
+        ChatTemplateRequest, LoadedModel, PreparedChat, PreparedChatDraft,
+        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
+        PreparedChatMtpGenerationRequest,
+    },
     backend::mlx::speculative::MlxDrafter,
-    runtime::media::input::{InputPart, ModelInput},
-    GenerationConfigOverrides, MtpConfig,
+    GenerationCancellationToken, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -37,10 +40,19 @@ fn main() -> anyhow::Result<()> {
     let stream = ctx.stream();
     let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let weights_stream = weights_ctx.stream();
-    let rendered = render_prompt(&target_dir, &prompt, stream, weights_stream)?;
-    println!("\n=== rendered prompt ===\n{rendered}\n");
+    let prepared = prepare_prompt(&target_dir, &prompt, stream, weights_stream)?;
+    println!(
+        "\n=== rendered prompt ===\n{}\n",
+        prepared.rendered_prompt()
+    );
 
-    let greedy = run_greedy(&target_dir, &rendered, max_tokens, stream, weights_stream)?;
+    let greedy = run_greedy(
+        &target_dir,
+        prepared.rendered_prompt(),
+        max_tokens,
+        stream,
+        weights_stream,
+    )?;
     println!("\n=== greedy ===");
     println!(
         "tokens: {} elapsed: {:.2?}",
@@ -52,7 +64,7 @@ fn main() -> anyhow::Result<()> {
     let mtp = run_mtp(
         &target_dir,
         &assistant_dir,
-        &rendered,
+        &prepared,
         max_tokens,
         stream,
         weights_stream,
@@ -76,27 +88,27 @@ struct ProbeResult {
     accept_lens: Vec<usize>,
 }
 
-fn render_prompt(
+fn prepare_prompt(
     target_dir: &PathBuf,
     prompt: &str,
     stream: &Stream,
     weights_stream: &Stream,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<PreparedChat> {
     let mut loaded = LoadedModel::load(
         safemlx_lm::backend::mlx::MlxBackend::new(stream, weights_stream),
         target_dir,
         Default::default(),
     )?;
-    Ok(loaded
-        .apply_chat_template_json(
-            vec![vec![serde_json::json!({
+    loaded
+        .prepare_chat(ChatTemplateRequest {
+            messages: vec![serde_json::json!({
                 "role": "user",
                 "content": [{"type": "text", "text": prompt, "content": prompt}],
-            })]],
-            None,
-            true,
-        )?
-        .unwrap_or_else(|| prompt.to_string()))
+            })],
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        })
+        .map_err(Into::into)
 }
 
 fn run_greedy(
@@ -111,27 +123,21 @@ fn run_greedy(
         target_dir,
         Default::default(),
     )?;
-    let prompt_tokens = loaded.encode_to_array(prompt, false, stream)?;
+    let prompt_tokens = loaded.encode(prompt, false)?;
     let eos = loaded.eos_token_ids().to_vec();
     let mut ids = Vec::new();
     let start = Instant::now();
     {
-        let input_parts = [InputPart::text_token_ids(&prompt_tokens)];
-        let input = ModelInput::new(&input_parts);
+        let resolved = loaded.resolve_generation_config(GenerationConfigOverrides {
+            temperature: Some(0.0),
+            max_new_tokens: Some(max_tokens),
+            ..Default::default()
+        })?;
         let generator = loaded
-            .generate_input(
-                input,
-                GenerationConfigOverrides {
-                    temperature: Some(0.0),
-                    ..Default::default()
-                },
-                None,
-            )?
+            .generate_tokens(prompt_tokens, TextGenerationConfig::new(resolved))?
             .take(max_tokens);
         for token in generator {
-            let token = token?;
-            eval([&token])?;
-            let id = token.item::<u32>(stream);
+            let id = token?.token_id()?;
             if eos.contains(&id) {
                 break;
             }
@@ -151,7 +157,7 @@ fn run_greedy(
 fn run_mtp(
     target_dir: &PathBuf,
     assistant_dir: &PathBuf,
-    prompt: &str,
+    prepared: &PreparedChat,
     max_tokens: usize,
     stream: &Stream,
     weights_stream: &Stream,
@@ -164,20 +170,30 @@ fn run_mtp(
     let assistant_tokenizer = safemlx_lm::api::load_tokenizer(assistant_dir)?;
     let mut assistant =
         MlxDrafter::load(assistant_dir, &assistant_tokenizer, stream, weights_stream)?;
-    let prompt_tokens = target.encode_to_array(prompt, false, stream)?;
-    let parts = [InputPart::text_token_ids(&prompt_tokens)];
-    let input = ModelInput::new(&parts);
-    let config = MtpConfig {
-        max_tokens,
-        max_draft_tokens: 3,
-        temperature: 0.0,
-        eos_token_ids: target.eos_token_ids().to_vec(),
-    };
-    let (mut generated, stats) =
-        target.generate_mtp_input(&mut assistant, input, &config, None, stream)?;
+    let output = target.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
+        input: PreparedChatInput::rendered_prompt(prepared),
+        drafting: PreparedChatDraft::External(&mut assistant),
+        settings: PreparedChatGenerationSettings {
+            overrides: GenerationConfigOverrides {
+                temperature: Some(0.0),
+                max_new_tokens: Some(max_tokens),
+                ..Default::default()
+            },
+            ..PreparedChatGenerationSettings::default()
+        },
+        options: PreparedChatMtpGenerationOptions {
+            max_draft_tokens: NonZeroUsize::new(3).unwrap(),
+            ..PreparedChatMtpGenerationOptions::default()
+        },
+        caller_stop_sequences: &[],
+        cancellation: GenerationCancellationToken::new(),
+        on_event: |_| {},
+    })?;
+    let mut generated = output.token_ids;
+    let stats = output.stats;
     if generated
         .last()
-        .is_some_and(|token| config.eos_token_ids.contains(token))
+        .is_some_and(|token| target.eos_token_ids().contains(token))
     {
         generated.pop();
     }

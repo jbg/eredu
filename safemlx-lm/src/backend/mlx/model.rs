@@ -37,7 +37,7 @@ use crate::runtime::cache::residency::{
 };
 use crate::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache};
 use crate::runtime::execution::inspection::ActivationObserver;
-use crate::runtime::generation::sampler::{DefaultSampler, SpeculativeSampler};
+use crate::runtime::generation::sampler::SpeculativeSampler;
 use crate::runtime::media::input;
 use crate::{LayerCachePolicy, LayerSchedule};
 
@@ -131,144 +131,6 @@ impl Model {
         }
     }
 
-    /// Generates with MTP using the default lossless sampling policy.
-    pub fn generate_mtp_input(
-        &mut self,
-        drafter: &mut MlxDrafter,
-        cache: &mut ModelCache,
-        input: input::ModelInput<'_>,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        stream: &Stream,
-    ) -> Result<(Vec<u32>, MtpStats), Exception> {
-        self.generate_mtp_input_with_sampler(
-            drafter,
-            cache,
-            input,
-            config,
-            prng_key,
-            &mut DefaultSampler,
-            stream,
-        )
-    }
-
-    /// Generates with MTP using a caller-provided lossless sampling policy.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
-        &mut self,
-        drafter: &mut MlxDrafter,
-        cache: &mut ModelCache,
-        input: input::ModelInput<'_>,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        sampler: &mut S,
-        stream: &Stream,
-    ) -> Result<(Vec<u32>, MtpStats), Exception> {
-        self.generate_mtp_input_with_sampler_callback_and_streams(
-            drafter,
-            cache,
-            input,
-            config,
-            prng_key,
-            sampler,
-            MtpExecutionStreams::single(stream),
-            |_| Ok(()),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn generate_mtp_input_with_sampler_callback_and_streams<S, F>(
-        &mut self,
-        drafter: &mut MlxDrafter,
-        cache: &mut ModelCache,
-        input: input::ModelInput<'_>,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        sampler: &mut S,
-        streams: MtpExecutionStreams<'_>,
-        on_token: F,
-    ) -> Result<(Vec<u32>, MtpStats), Exception>
-    where
-        S: SpeculativeSampler + Clone,
-        F: FnMut(u32) -> Result<(), Exception>,
-    {
-        self.generate_mtp_input_with_sampler_callback_and_streams_and_options(
-            drafter,
-            cache,
-            input,
-            config,
-            prng_key,
-            sampler,
-            streams,
-            MtpSchedulerOptions::default(),
-            on_token,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn generate_mtp_input_with_sampler_callback_and_streams_and_options<S, F>(
-        &mut self,
-        drafter: &mut MlxDrafter,
-        cache: &mut ModelCache,
-        input: input::ModelInput<'_>,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        sampler: &mut S,
-        streams: MtpExecutionStreams<'_>,
-        scheduler_options: MtpSchedulerOptions,
-        on_token: F,
-    ) -> Result<(Vec<u32>, MtpStats), Exception>
-    where
-        S: SpeculativeSampler + Clone,
-        F: FnMut(u32) -> Result<(), Exception>,
-    {
-        match self {
-            Self::Gemma4(target) => {
-                let ModelCache::Gemma4(cache) = cache else {
-                    return Err(Exception::custom("Gemma 4 MTP cache type mismatch"));
-                };
-                let assistant = drafter.gemma4_mut();
-                validate_gemma4_drafter(target.args(), assistant)?;
-                let mut executor =
-                    crate::architectures::gemma4::mtp::Gemma4MtpExecutor::new(target, assistant);
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
-                    &mut executor,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    streams,
-                    scheduler_options,
-                    on_token,
-                )
-            }
-            Self::MuseGlimmer(target) => {
-                let assistant = drafter.muse_glimmer_mut();
-                let mut backend =
-                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
-                        target, assistant,
-                    );
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
-                    &mut backend,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    streams,
-                    scheduler_options,
-                    on_token,
-                )
-            }
-            model => Err(Exception::custom(format!(
-                "MTP runtime adapter is unavailable for model type {} ({:?})",
-                model.model_type(),
-                model.mtp_capability()
-            ))),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_mtp_input_with_semantics_and_options<S, F>(
         &mut self,
@@ -339,31 +201,12 @@ impl Model {
         }
     }
 
-    /// Generates with MTP weights embedded in the target checkpoint.
-    pub fn generate_embedded_mtp_input(
-        &mut self,
-        cache: &mut ModelCache,
-        input: input::ModelInput<'_>,
-        config: &MtpConfig,
-        prng_key: Option<Array>,
-        stream: &Stream,
-    ) -> Result<(Vec<u32>, MtpStats), Exception> {
-        self.generate_embedded_mtp_input_with_sampler(
-            cache,
-            input,
-            config,
-            prng_key,
-            &mut DefaultSampler,
-            stream,
-        )
-    }
-
     /// Generates through embedded predictor layers on a tensor-parallel model.
     /// TP collectives and rank-synchronized sampling are
     /// derived from `execution`; EP and PP models use their architecture-erased
     /// distributed model containers.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_distributed<S: SpeculativeSampler + Clone>(
+    pub(crate) fn generate_embedded_mtp_distributed<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
@@ -507,7 +350,7 @@ impl Model {
 
     /// Generates with embedded MTP weights and a caller-provided sampler.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
+    pub(crate) fn generate_embedded_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
@@ -981,7 +824,7 @@ impl Model {
         stream: &Stream,
         observer: &mut impl ActivationObserver,
     ) -> Result<safemlx_lm_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        crate::backend::mlx::MlxModelSession::submit_prefill_with_observer(
+        crate::backend::mlx::MlxModelSession::submit_complete_prefill_with_observer(
             self,
             input.into(),
             cache,

@@ -58,14 +58,25 @@ fn prefill_tokens(
     model: &mut LoadedModel<safemlx_lm::backend::mlx::MlxBackend<'static>>,
 ) -> anyhow::Result<Array> {
     let parts = [InputPart::text_token_ids(tokens)];
-    Ok(model.submit_prefill(ModelInput::new(&parts))?.wait()?)
+    let input = safemlx_lm::backend::mlx::MlxModelInput::from(ModelInput::new(&parts));
+    model
+        .runtime_mut()
+        .prefill(input)?
+        .wait()?
+        .into_logits()
+        .ok_or_else(|| anyhow::anyhow!("selected MLX rank does not own prefill logits"))
 }
 
 fn decode_tokens(
     tokens: &Array,
     model: &mut LoadedModel<safemlx_lm::backend::mlx::MlxBackend<'static>>,
 ) -> anyhow::Result<Array> {
-    Ok(model.submit_decode(tokens.clone())?.wait()?)
+    model
+        .runtime_mut()
+        .decode(tokens.clone())?
+        .wait()?
+        .into_logits()
+        .ok_or_else(|| anyhow::anyhow!("selected MLX rank does not own decode logits"))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -97,7 +108,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let layer_layout = model.prompt_cache_layer_layout()?;
+    let layer_layout = model.runtime().session().prompt_cache_layer_layout()?;
     let has_full_attention = layer_layout
         .iter()
         .any(|policy| matches!(policy.attention(), Some(AttentionPolicy::Full)));
@@ -114,16 +125,22 @@ fn main() -> anyhow::Result<()> {
         paged = paged.with_live_disk(directory, args.live_disk_bytes, 2)?;
     }
 
-    model.configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
+    model
+        .runtime_mut()
+        .session_mut()
+        .configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
     let _ = prefill_tokens(&prefix, &mut model)?;
     let uninterrupted_logits = decode_tokens(&suffix, &mut model)?;
     async_eval_with_event([&uninterrupted_logits])?.synchronize()?;
     println!(
         "uninterrupted report: {:#?}",
-        model.cache_residency_report()?
+        model.runtime().session().cache_residency_report()?
     );
 
-    model.configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
+    model
+        .runtime_mut()
+        .session_mut()
+        .configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
     let _ = prefill_tokens(&prefix, &mut model)?;
     let model_type = model.model_type().to_owned();
     let model_family = if model_type.contains("deepseek") {
@@ -141,38 +158,60 @@ fn main() -> anyhow::Result<()> {
         effective_model_type: model_type,
         checkpoint_fingerprint: args.checkpoint_fingerprint,
         prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
-        architecture_fingerprint: model.prompt_cache_architecture_fingerprint()?,
+        architecture_fingerprint: model
+            .runtime()
+            .session()
+            .prompt_cache_architecture_fingerprint()?,
         layer_count,
         global_layer_start: 0,
         global_layer_end: layer_count,
         batch_size: 1,
-        layer_prefix_offsets: model.prompt_cache_layer_prefix_offsets()?,
+        layer_prefix_offsets: model
+            .runtime()
+            .session()
+            .prompt_cache_layer_prefix_offsets()?,
         layer_layout,
         sink_tokens: 0,
         topology: PromptCacheTopology::default(),
     };
-    let manifest = model.save_prompt_cache(
-        &args.cache_dir,
-        descriptor.clone(),
-        &prefix_ids,
-        &PromptCacheOptions {
-            application_namespace: Some("paged-prompt-cache-example".into()),
-            replace_existing: args.replace,
-        },
-    )?;
+    let manifest = {
+        let (backend, session) = model.runtime_mut().parts_mut();
+        session.save_prompt_cache(
+            backend,
+            &args.cache_dir,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions {
+                application_namespace: Some("paged-prompt-cache-example".into()),
+                replace_existing: args.replace,
+            },
+        )?
+    };
     println!("saved blocks: {}", manifest.blocks.len());
-    println!("save report: {:#?}", model.cache_residency_report()?);
+    println!(
+        "save report: {:#?}",
+        model.runtime().session().cache_residency_report()?
+    );
 
-    let inspected = model.load_prompt_cache(&args.cache_dir, &descriptor, &prefix_ids, paged)?;
+    let inspected = {
+        let (backend, session) = model.runtime_mut().parts_mut();
+        session.load_prompt_cache(backend, &args.cache_dir, &descriptor, &prefix_ids, paged)?
+    };
     println!("cataloged blocks: {}", inspected.blocks.len());
-    println!("load report: {:#?}", model.cache_residency_report()?);
+    println!(
+        "load report: {:#?}",
+        model.runtime().session().cache_residency_report()?
+    );
     let restored_logits = decode_tokens(&suffix, &mut model)?;
     async_eval_with_event([&restored_logits])?.synchronize()?;
     let equal = restored_logits
         .all_close(&uninterrupted_logits, 1e-4, 1e-4, None, stream)?
         .item::<bool>(stream);
     println!("restored suffix logits match uninterrupted execution: {equal}");
-    println!("continued report: {:#?}", model.cache_residency_report()?);
+    println!(
+        "continued report: {:#?}",
+        model.runtime().session().cache_residency_report()?
+    );
     anyhow::ensure!(
         equal,
         "restored suffix logits differ from uninterrupted execution"

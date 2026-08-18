@@ -53,8 +53,8 @@ pub enum MlxDrafterKind {
     MuseGlimmerDFlash,
 }
 
-/// MLX target caches for independently progressing speculative text lanes.
-pub struct MlxMtpCache {
+/// Adapter-owned target caches for independently progressing prepared-chat lanes.
+pub(crate) struct MlxMtpCache {
     pub(crate) lanes: Vec<ModelCache>,
 }
 
@@ -63,14 +63,8 @@ impl MlxMtpCache {
         Self { lanes }
     }
 
-    /// Number of independent sequence lanes.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.lanes.len()
-    }
-
-    /// Whether this cache contains no sequence lanes.
-    pub fn is_empty(&self) -> bool {
-        self.lanes.is_empty()
     }
 }
 

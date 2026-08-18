@@ -1,14 +1,12 @@
 use std::{path::PathBuf, time::Instant};
 
-use safemlx::{
-    ops::indexing::{NewAxis, TryIndexOp},
-    transforms::eval,
-    Array, ExecutionContext, Stream,
-};
+use safemlx::ExecutionContext;
 use safemlx_lm::architectures::qwen::hybrid::qwen3_5;
 use safemlx_lm::runtime::checkpoint::quantization::AffineQuantization;
-use safemlx_lm::runtime::media::input::{InputPart, ModelInput};
-use safemlx_lm::{api::LoadedModel, backend::mlx::ModelLoadOptions, GenerationConfigOverrides};
+use safemlx_lm::{
+    api::LoadedModel, backend::mlx::ModelLoadOptions, GenerationConfigOverrides,
+    TextGenerationConfig, TokenOutput,
+};
 
 const DEFAULT_DECODE_TOKENS: usize = 128;
 const CASES: &[(&str, usize)] = &[
@@ -79,7 +77,7 @@ fn main() -> anyhow::Result<()> {
 
     let warmup_start = Instant::now();
     let warmup_prompt = prompt_near_token_count(&mut model, 16)?;
-    let _ = run_case(&mut model, &warmup_prompt, 2, false, stream)?;
+    let _ = run_case(&mut model, &warmup_prompt, 2, false)?;
     println!("warmup_s={:.3}", warmup_start.elapsed().as_secs_f64());
 
     println!(
@@ -96,13 +94,7 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         let prompt = prompt_near_token_count(&mut model, *target_tokens)?;
-        let result = run_case(
-            &mut model,
-            &prompt,
-            decode_tokens,
-            profile_components,
-            stream,
-        )?;
+        let result = run_case(&mut model, &prompt, decode_tokens, profile_components)?;
         println!(
             "{},{},{:.6},{},{:.6},{:.3},{},{}",
             name,
@@ -155,21 +147,15 @@ fn run_case(
     prompt: &str,
     decode_tokens: usize,
     profile_components: bool,
-    stream: &Stream,
 ) -> anyhow::Result<BenchResult> {
     let prompt_ids = model.encode(prompt, false)?;
-    let prompt_tokens = Array::from(prompt_ids.as_slice()).try_index_device(NewAxis, stream)?;
-    let input_parts = [InputPart::text_token_ids(&prompt_tokens)];
-    let input = ModelInput::new(&input_parts);
-    model.reset_session()?;
-    let mut generator = model.generate_input(
-        input,
-        GenerationConfigOverrides {
-            temperature: Some(0.0),
-            ..Default::default()
-        },
-        None,
-    )?;
+    let prompt_tokens = prompt_ids.len();
+    model.runtime_mut().session_mut().reset()?;
+    let resolved = model.resolve_generation_config(GenerationConfigOverrides {
+        temperature: Some(0.0),
+        ..Default::default()
+    })?;
+    let mut generator = model.generate_tokens(prompt_ids, TextGenerationConfig::new(resolved))?;
     let mut ids = Vec::with_capacity(decode_tokens);
 
     qwen3_5::set_perf_profiling(profile_components);
@@ -179,10 +165,9 @@ fn run_case(
         anyhow::bail!("generator produced no tokens");
     };
     let first = first?;
-    eval([&first])?;
     let prefill_s = prefill_start.elapsed().as_secs_f64();
     let prefill_profile = profile_components.then(qwen3_5::perf_stats).flatten();
-    ids.push(first.item::<u32>(stream));
+    ids.push(first.token_id()?);
 
     qwen3_5::reset_perf_stats();
     let decode_start = Instant::now();
@@ -190,9 +175,7 @@ fn run_case(
         let Some(token) = generator.next() else {
             break;
         };
-        let token = token?;
-        eval([&token])?;
-        ids.push(token.item::<u32>(stream));
+        ids.push(token?.token_id()?);
     }
     let decode_s = decode_start.elapsed().as_secs_f64();
     let decode_profile = profile_components.then(qwen3_5::perf_stats).flatten();
@@ -208,7 +191,7 @@ fn run_case(
     let first_id = ids[0];
     let last_id = *ids.last().expect("first token was pushed");
     Ok(BenchResult {
-        prompt_tokens: prompt_ids.len(),
+        prompt_tokens,
         prefill_s,
         generated_tokens: ids.len(),
         decode_s,

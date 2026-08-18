@@ -258,10 +258,10 @@ component timing probes, and tensor execution.
 
 ## Inputs and generation
 
-`LoadedModel<B>` owns a selected backend `ModelRuntime`, tokenizer, optional
-processor, and chat-template metadata. The runtime owns the executable, cache,
-and backend queue as one session; applications do not construct or pair raw
-caches with models. Plain text clients can be generic over
+`LoadedModel<B>` owns a selected backend `ModelRuntime`, tokenizer, and
+chat-template metadata. The runtime owns the executable, cache, optional
+backend processor, and backend queue as one session; applications do not
+construct or pair raw caches with models. Plain text clients can be generic over
 `B: TextGenerationBackend`: `encode`, `generate_tokens`, token-id observation,
 and `decode` use the same API for MLX and a future backend. The MLX adapter keeps
 arrays, sampling math, PRNG state, streams, and exact events behind that
@@ -270,9 +270,12 @@ passes portable vocabulary filters to backend sampling while the facade owns
 grammar commitment, cancellation, stop/EOS precedence, and protocol-neutral
 semantic events. Ordered multimodal input crosses this API as the backend's
 opaque prompt type; MLX media processing returns `MlxModelInput`, while another
-backend can supply its own representation. Call `reset_session` before starting
-an unrelated sequence, or deliberately retain or restore the session cache
-when continuing a prefix.
+backend can supply its own representation. Backend-native controls do not
+appear as specialized methods on `LoadedModel`: MLX applications explicitly
+use `model.runtime().session()` for telemetry and processor access, or
+`model.runtime_mut().session_mut()` for cache reset and configuration. This
+keeps ordinary caller code identical across backends while making native
+operations visibly backend-specific.
 
 Raw generation remains available for completion workloads. It deliberately
 bypasses chat-template and native-tool guarantees.

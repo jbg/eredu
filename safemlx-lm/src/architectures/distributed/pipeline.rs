@@ -5646,7 +5646,7 @@ impl PipelineModel {
         root.join(format!("rank-{:05}", self.topology.global_rank))
     }
 
-    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         Ok(self.cache_identity.clone())
     }
 

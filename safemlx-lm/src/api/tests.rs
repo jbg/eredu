@@ -40,7 +40,7 @@ use crate::{
 use safemlx::{
     argmax_axis,
     module::ModuleParameters,
-    ops::{zeros_dtype, GgufMetadataArray, GgufMetadataValue},
+    ops::{indexing::TryIndexOp, zeros_dtype, GgufMetadataArray, GgufMetadataValue},
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
@@ -138,16 +138,20 @@ fn observer_forward_reports_attention_and_residual_hooks() {
         ModelLoadOptions::default(),
     )
     .unwrap();
-    let input = model.encode_to_array("hello", true, ctx.stream()).unwrap();
+    let ids = model.encode("hello", true).unwrap();
+    let input = safemlx::Array::from(ids.as_slice())
+        .try_index_device(safemlx::ops::indexing::NewAxis, ctx.stream())
+        .unwrap();
     let mut recorder = ActivationRecorder::new();
     let parts = [crate::runtime::media::input::InputPart::text_token_ids(
         &input,
     )];
-    model
-        .submit_prefill_with_observer(
-            crate::runtime::media::input::ModelInput::new(&parts),
-            &mut recorder,
-        )
+    let input = crate::backend::mlx::MlxModelInput::from(
+        crate::runtime::media::input::ModelInput::new(&parts),
+    );
+    let (backend, session) = model.runtime_mut().parts_mut();
+    session
+        .submit_prefill_with_observer(backend, input, &mut recorder)
         .unwrap()
         .wait()
         .unwrap();
@@ -851,6 +855,17 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         safemlx_lm_core::AdmissionResult::Admitted(_)
     ));
     model.static_memory().unwrap();
+    let session = model.runtime().session();
+    assert!(!session
+        .prompt_cache_architecture_fingerprint()
+        .unwrap()
+        .is_empty());
+    let cache_layout = session.prompt_cache_layer_layout().unwrap();
+    assert_eq!(
+        session.prompt_cache_layer_prefix_offsets().unwrap().len(),
+        cache_layout.len()
+    );
+    assert!(session.native_quantization_stats().is_none());
 
     let output = model
         .generate_prepared_chat_mtp_batch(PreparedChatMtpBatchRequest {
