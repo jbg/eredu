@@ -1461,7 +1461,7 @@ pub struct LayerwiseModelMetadata {
 /// Architecture-neutral information for a rank-local parallel model.
 #[derive(Debug, Clone)]
 pub struct ParallelModelInfo {
-    topology: crate::runtime::distributed::topology::ParallelTopology,
+    topology: crate::backend::mlx::MlxParallelContext,
     model_type: String,
     owned_tensors: Vec<String>,
     local_parameter_bytes: u64,
@@ -1472,7 +1472,7 @@ pub struct ParallelModelInfo {
 
 impl ParallelModelInfo {
     /// Returns the complete distributed topology and this process's coordinates.
-    pub const fn topology(&self) -> crate::runtime::distributed::topology::ParallelTopology {
+    pub const fn topology(&self) -> crate::backend::mlx::MlxParallelContext {
         self.topology
     }
 
@@ -1938,7 +1938,7 @@ pub trait ArchitectureAdapter: Sized {
     /// rank-local parallel execution.
     fn prompt_cache_model_identity(
         &self,
-        _topology: Option<crate::runtime::distributed::topology::ParallelTopology>,
+        _topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         Err(Error::Parallel(format!(
             "architecture adapter {} has not declared a prompt-cache identity",
@@ -2139,7 +2139,7 @@ pub trait ArchitectureAdapter: Sized {
     /// The default accepts an inactive EP axis and fails closed otherwise.
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size > 1 {
             Err(Error::Parallel(format!(
@@ -2537,7 +2537,7 @@ pub struct LayerwiseModel<A: ArchitectureAdapter> {
     sample_process_memory: bool,
     metadata: LayerwiseModelMetadata,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
-    parallel_topology: Option<crate::runtime::distributed::topology::ParallelTopology>,
+    parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
     parallel_info: Option<ParallelModelInfo>,
     execution_streams: Vec<Stream>,
     #[cfg(test)]
@@ -2929,7 +2929,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     /// Binds state and persistence identity to an enclosing Cartesian runtime.
     pub(crate) fn bind_parallel_topology(
         &mut self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) {
         self.parallel_topology = Some(topology);
     }
@@ -5523,6 +5523,7 @@ pub enum LayerwiseModelError {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     #[test]
     fn weight_residency_decomposes_layers_and_experts() {
         let host = LayerwiseLoadOptions::default();
@@ -5866,19 +5867,16 @@ mod tests {
 
     #[test]
     fn execution_group_binding_sharding_preserves_direct_and_derived_selections() {
-        use crate::runtime::distributed::{
-            parallel::{
-                MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
-                ParameterRole,
-            },
-            topology::{DeviceAssignment, ParallelTopology},
+        use crate::runtime::distributed::parallel::{
+            MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
+            ParameterRole,
         };
         use crate::runtime::{
             checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection},
             residency::manager::WeightBinding,
         };
         let topology =
-            ParallelTopology::from_rank(2, 1, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelContext::for_rank(1, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         let mut planner = ParallelPlanBuilder::new(topology);
         planner

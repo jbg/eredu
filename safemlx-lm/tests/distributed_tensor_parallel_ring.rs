@@ -29,8 +29,8 @@ use safemlx_lm::{
     runtime::checkpoint::binding::canonical_checkpoint_name,
     runtime::generation::sampler::DefaultSampler,
     CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, LayerCachePolicy,
-    LayerWeightResidency, LayerwiseLoadOptions, MlxBackend, ModelLoadOptions, PagedCacheOptions,
-    ParallelModelInfo, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
+    LayerWeightResidency, LayerwiseLoadOptions, MlxBackend, MlxParallelContext, ModelLoadOptions,
+    PagedCacheOptions, ParallelModelInfo, PromptCacheDescriptor, PromptCacheOptions,
     PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -310,7 +310,7 @@ impl GeneralizedTensorModel {
         checkpoint: &Path,
         family: FixtureFamily,
         residency: TensorParameterResidency,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
         stream: &Stream,
     ) -> Self {
         let options = ModelLoadOptions::default()
@@ -637,7 +637,7 @@ fn tensor_ring_worker() {
     let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology =
-        ParallelTopology::from_group(&group, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+        MlxParallelContext::for_group(&group, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());

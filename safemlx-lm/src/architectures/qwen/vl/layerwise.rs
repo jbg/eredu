@@ -87,7 +87,7 @@ impl Qwen3VlLayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -1537,7 +1537,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = self.args.text_config.num_hidden_layers as usize;
         let local_kv_heads = match topology {
@@ -1985,7 +1985,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
@@ -2591,6 +2591,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use std::{fs, path::Path};
 
     use safemlx::{
@@ -2606,10 +2607,7 @@ mod tests {
         core::residency::{MemoryTier, OffloadConfig},
         runtime::{
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
-            distributed::{
-                parallel::{ParallelBuildContext, ShardingPolicy},
-                topology::{DeviceAssignment, ParallelTopology},
-            },
+            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{
                 ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
                 LoadTimeQuantizableAdapter,
@@ -2998,7 +2996,7 @@ mod tests {
         let group = Group::init(false, Backend::Any).unwrap();
         assert_eq!(group.size(), 1);
         let topology =
-            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
                 .unwrap();
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
@@ -3035,8 +3033,7 @@ mod tests {
             let args = eager::model_args_from_config_value(&value).unwrap();
 
             for (rank, expected_kv_heads) in [(0, 2_u32), (1, 1_u32)] {
-                let topology = ParallelTopology::from_rank(
-                    2,
+                let topology = MlxParallelContext::for_rank(
                     rank,
                     2,
                     1,

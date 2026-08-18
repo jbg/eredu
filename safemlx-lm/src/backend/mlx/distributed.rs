@@ -8,7 +8,7 @@ use safemlx::{
 use safemlx_lm_core::checkpoint::TensorDtype;
 use safemlx_lm_core::{
     BackendError, CollectiveScope, DistributedBackend, DistributedCapabilities, DistributedSession,
-    DistributedSessionDescriptor, Submission, ValueDescriptor,
+    DistributedSessionDescriptor, ParallelAxis, ParallelCoordinates, Submission, ValueDescriptor,
 };
 
 use crate::{
@@ -17,18 +17,18 @@ use crate::{
         distributed::{
             completion::DistributedCompletion,
             parallel::{sample_and_synchronize, ParallelExecutionContext, SynchronizedToken},
-            topology::{ParallelCommunicators, ParallelCoordinates, ParallelTopology},
+            topology::ParallelCommunicators,
         },
         generation::sampler::Sampler,
     },
 };
 
-use super::MlxBackend;
+use super::{MlxBackend, MlxParallelContext};
 
 /// Inputs needed to attach MLX communication to one selected backend session.
 pub(crate) struct MlxDistributedConfig<'a> {
     /// Validated rank-local topology.
-    pub(crate) topology: ParallelTopology,
+    pub(crate) topology: MlxParallelContext,
     /// MLX world communicator selected for this complete session.
     pub(crate) world: &'a Group,
 }
@@ -41,7 +41,7 @@ pub(crate) struct MlxDistributedConfig<'a> {
 /// backend session.
 #[derive(Debug)]
 pub struct MlxDistributedSession<'a> {
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     communicators: ParallelCommunicators<'a>,
     stream: Stream,
 }
@@ -58,7 +58,7 @@ impl<'a> MlxDistributedSession<'a> {
     }
 
     /// Returns the validated MLX runtime topology.
-    pub const fn topology(&self) -> ParallelTopology {
+    pub const fn topology(&self) -> MlxParallelContext {
         self.topology
     }
 
@@ -136,27 +136,18 @@ impl<'a> MlxDistributedSession<'a> {
     fn group(&self, scope: CollectiveScope) -> Result<&Group, Error> {
         match scope {
             CollectiveScope::World => Ok(self.world()),
-            CollectiveScope::Axis(axis) => {
-                let axis = match axis {
-                    safemlx_lm_core::topology::ParallelAxis::Tensor => crate::ParallelAxis::Tensor,
-                    safemlx_lm_core::topology::ParallelAxis::Pipeline => {
-                        crate::ParallelAxis::Pipeline
-                    }
-                    safemlx_lm_core::topology::ParallelAxis::Expert => crate::ParallelAxis::Expert,
-                    safemlx_lm_core::topology::ParallelAxis::Data => {
-                        return Err(Error::Backend(BackendError::Unsupported {
-                            backend: "mlx".into(),
-                            capability: "data-parallel subgroup".into(),
-                        }))
-                    }
-                };
-                self.communicators.group(axis).ok_or_else(|| {
-                    Error::Backend(BackendError::Unsupported {
-                        backend: "mlx".into(),
-                        capability: format!("{axis:?} collective on a singleton axis"),
-                    })
-                })
+            CollectiveScope::Axis(ParallelAxis::Data) => {
+                return Err(Error::Backend(BackendError::Unsupported {
+                    backend: "mlx".into(),
+                    capability: "data-parallel subgroup".into(),
+                }))
             }
+            CollectiveScope::Axis(axis) => self.communicators.group(axis).ok_or_else(|| {
+                Error::Backend(BackendError::Unsupported {
+                    backend: "mlx".into(),
+                    capability: format!("{axis:?} collective on a singleton axis"),
+                })
+            }),
         }
     }
 
@@ -181,6 +172,7 @@ impl<'a> MlxDistributedSession<'a> {
             tensor: 0,
             pipeline: topology.pipeline_parallel_size - 1,
             expert: 0,
+            data: topology.data_parallel_rank,
         })?;
         self.sample_and_synchronize_on_rank(
             logits,
@@ -293,14 +285,7 @@ impl DistributedSession for MlxDistributedSession<'_> {
 
     fn descriptor(&self) -> DistributedSessionDescriptor {
         let topology = self.topology();
-        let portable = safemlx_lm_core::topology::ParallelTopology::new(
-            topology.tensor_parallel_size,
-            topology.pipeline_parallel_size,
-            topology.expert_parallel_size,
-            1,
-        )
-        .expect("MLX topology was validated");
-        DistributedSessionDescriptor::new(portable, topology.global_rank)
+        DistributedSessionDescriptor::new(topology.topology(), topology.global_rank)
             .expect("MLX rank belongs to its topology")
     }
 

@@ -4,7 +4,7 @@ use safemlx::{
     distributed::{self, Backend},
     DeviceType,
 };
-use safemlx_lm::{DeviceAssignment, ParallelTopology};
+use safemlx_lm::{DeviceAssignment, MlxParallelContext};
 
 fn parse(index: usize, name: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(std::env::args()
@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|rank| rank.parse().ok())
         .unwrap_or(0);
-    let topology = ParallelTopology::from_group(
+    let topology = MlxParallelContext::for_group(
         &world,
         tp,
         pp,

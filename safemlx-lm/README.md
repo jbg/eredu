@@ -83,6 +83,12 @@ only their tensor execution and exact MLX completion adapter remain here.
 Distributed pipeline schedule, cancellation, and completion agreement use the
 same core scheduler through the MLX collective and completion adapters; the
 facade does not maintain a second lifecycle implementation.
+The Cartesian shape, rank coordinates, subgroup membership, balanced
+layer/expert ownership, and preflight report are canonical
+`safemlx-lm-core` values. `MlxParallelContext` binds one validated core rank to
+an explicit process-local MLX device; native communicator construction and
+collective tensor execution remain inside the selected MLX session. MLX
+currently fails closed for data-parallel model sessions.
 `MlxBackend::with_distributed_world` selects the world before
 `Backend::create_session` consumes and binds the opaque model, topology-derived TP/PP/EP
 communicators, and the correct cache form into one lifecycle. There are no

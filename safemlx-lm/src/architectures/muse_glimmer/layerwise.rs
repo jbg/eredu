@@ -1658,7 +1658,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Muse-Glimmer cache layer count"))?;
@@ -2220,7 +2220,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);

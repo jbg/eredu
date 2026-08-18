@@ -18,19 +18,17 @@ use safemlx::{
 };
 
 use crate::{
+    core::balanced_contiguous_range,
     error::Error,
     nn::{convolution::DepthwiseConv1d, layers::silu, linear},
     runtime::{
         checkpoint::quantization::WeightQuantization,
-        distributed::{
-            parallel::{
-                aligned_partition_units, partitioned_projection_members,
-                register_partitioned_projection_group, register_projection_module,
-                register_replicated_module, MemberSharding, ParallelBuildContext,
-                ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec,
-                ParameterMemberSpec, ParameterRole, ProjectionSharding, ShardingPolicy,
-            },
-            topology::balanced_contiguous_range,
+        distributed::parallel::{
+            aligned_partition_units, partitioned_projection_members,
+            register_partitioned_projection_group, register_projection_module,
+            register_replicated_module, MemberSharding, ParallelBuildContext,
+            ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
+            ParameterRole, ProjectionSharding, ShardingPolicy,
         },
     },
 };
@@ -636,6 +634,7 @@ impl ParallelLinear {
             .map(|rank| {
                 balanced_contiguous_range(units, self.tensor_parallel_size, rank, false)
                     .map(|range| range.len() * (global / units))
+                    .map_err(Error::from)
             })
             .collect()
     }
@@ -931,7 +930,7 @@ impl VocabParallelEmbedding {
             Err(_error) if context.policy() == ShardingPolicy::ReplicateUnsupported => {
                 (0..global_vocabulary, true)
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let inner = linear::unloaded_maybe_quantized_embedding_with_dtype(
             i32::try_from(range.len())
@@ -1206,7 +1205,7 @@ impl VocabParallelLmHead {
             Err(_error) if context.policy() == ShardingPolicy::ReplicateUnsupported => {
                 (0..global_vocabulary, true)
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let inner = linear::unloaded_maybe_quantized_linear_with_dtype(
             global_input_dims,
@@ -1702,7 +1701,7 @@ impl ParallelSwiGluMlp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::distributed::topology::{DeviceAssignment, ParallelTopology};
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use safemlx::{module::ModuleParameters, DeviceType};
 
     fn build_context(parts: usize, rank: usize) -> ParallelBuildContext {
@@ -1715,8 +1714,7 @@ mod tests {
         policy: ShardingPolicy,
     ) -> ParallelBuildContext {
         ParallelBuildContext::new(
-            ParallelTopology::from_rank(
-                parts,
+            MlxParallelContext::for_rank(
                 rank,
                 parts,
                 1,

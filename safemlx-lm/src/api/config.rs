@@ -1,10 +1,10 @@
-//! Model-family detection and architecture-independent load options.
+//! Model-family detection and model-family-independent MLX load options.
 
 use super::*;
 use crate::runtime::execution::layerwise::WeightResidency;
 pub use safemlx_lm_core::artifact::ModelKind;
 
-/// Architecture-independent options for loading model weights.
+/// Model-family-independent options for loading model weights with MLX.
 ///
 /// When `quantization` is set for a dense checkpoint, eligible parameters are
 /// quantized and materialized one tensor at a time. Checkpoints already
@@ -17,7 +17,7 @@ pub struct ModelLoadOptions {
     ///
     /// Singleton topologies preserve replicated model loading. Non-replicated
     /// topologies select a rank-local executable behind [`crate::MlxModel`].
-    pub parallel: Option<ParallelTopology>,
+    pub parallel: Option<MlxParallelContext>,
     /// Parameter placement and execution policy for cataloged checkpoint stores.
     pub weight_residency: WeightResidency,
 }
@@ -33,13 +33,13 @@ impl ModelLoadOptions {
     }
 
     /// Adds a validated runtime parallel topology to these options.
-    pub fn with_parallel_topology(mut self, topology: ParallelTopology) -> Self {
+    pub fn with_parallel_topology(mut self, topology: MlxParallelContext) -> Self {
         self.parallel = Some(topology);
         self
     }
 
     /// Creates load options for a validated runtime parallel topology.
-    pub fn with_parallel(topology: ParallelTopology) -> Self {
+    pub fn with_parallel(topology: MlxParallelContext) -> Self {
         Self::default().with_parallel_topology(topology)
     }
 

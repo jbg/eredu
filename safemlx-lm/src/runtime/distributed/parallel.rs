@@ -17,11 +17,13 @@ use safemlx::{
 };
 
 use crate::{
+    backend::mlx::MlxParallelContext,
+    core::balanced_contiguous_range,
     error::Error,
     runtime::checkpoint::binding::is_materialized_module_parameter,
     runtime::distributed::{
         completion::synchronize_outputs,
-        topology::{balanced_contiguous_range, ParallelTopology, PlacementPlan, TensorPlacement},
+        topology::{PlacementPlan, TensorPlacement},
     },
     runtime::generation::sampler::Sampler,
 };
@@ -704,7 +706,7 @@ impl LocalModelLayout {
 
 /// Builds checkpoint placement and local model geometry from typed roles.
 pub struct ParallelPlanBuilder {
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     policy: ShardingPolicy,
     placement: PlacementPlan,
     local: LocalModelLayout,
@@ -712,12 +714,12 @@ pub struct ParallelPlanBuilder {
 
 impl ParallelPlanBuilder {
     /// Creates an empty strict planner for one rank.
-    pub fn new(topology: ParallelTopology) -> Self {
+    pub fn new(topology: MlxParallelContext) -> Self {
         Self::with_policy(topology, ShardingPolicy::Require)
     }
 
     /// Creates an empty planner with an explicit fallback policy.
-    pub fn with_policy(topology: ParallelTopology, policy: ShardingPolicy) -> Self {
+    pub fn with_policy(topology: MlxParallelContext, policy: ShardingPolicy) -> Self {
         Self {
             topology,
             policy,
@@ -994,18 +996,18 @@ fn checked_axis(member: &ParameterMemberSpec, axis: usize) -> Result<usize, Stri
 /// Construction-time topology and fallback policy supplied to model builders.
 #[derive(Debug, Clone, Copy)]
 pub struct ParallelBuildContext {
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     policy: ShardingPolicy,
 }
 
 impl ParallelBuildContext {
     /// Creates a construction context for a validated topology.
-    pub const fn new(topology: ParallelTopology, policy: ShardingPolicy) -> Self {
+    pub const fn new(topology: MlxParallelContext, policy: ShardingPolicy) -> Self {
         Self { topology, policy }
     }
 
     /// Returns the complete process topology.
-    pub const fn topology(self) -> ParallelTopology {
+    pub const fn topology(self) -> MlxParallelContext {
         self.topology
     }
 
@@ -1036,7 +1038,7 @@ impl ParallelBuildContext {
 /// The group is never retained by model state. In hybrid topologies callers
 /// supply the TP subgroup, whose rank is the tensor-parallel coordinate.
 pub struct ParallelExecutionContext<'a> {
-    topology: Option<ParallelTopology>,
+    topology: Option<MlxParallelContext>,
     group: Option<&'a Group>,
     stream: &'a Stream,
 }
@@ -1053,7 +1055,7 @@ impl<'a> ParallelExecutionContext<'a> {
 
     /// Creates a tensor-parallel context from a topology-derived subgroup.
     pub(crate) fn tensor_parallel(
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
         group: &'a Group,
         stream: &'a Stream,
     ) -> Result<Self, Error> {
@@ -1120,19 +1122,12 @@ impl<'a> ParallelExecutionContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::distributed::topology::DeviceAssignment;
+    use crate::backend::mlx::DeviceAssignment;
     use safemlx::DeviceType;
 
-    fn topology(rank: usize, parts: usize) -> ParallelTopology {
-        ParallelTopology::from_rank(
-            parts,
-            rank,
-            parts,
-            1,
-            1,
-            DeviceAssignment::new(DeviceType::Cpu, 0),
-        )
-        .unwrap()
+    fn topology(rank: usize, parts: usize) -> MlxParallelContext {
+        MlxParallelContext::for_rank(rank, parts, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            .unwrap()
     }
 
     #[test]

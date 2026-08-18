@@ -86,3 +86,8 @@ pub use speculative::{
     SpeculativeSchedule, SpeculativeSemanticConstraint, SpeculativeSemanticState,
     SpeculativeTelemetry,
 };
+pub use topology::{
+    balanced_contiguous_range, ParallelAxis, ParallelCoordinates, ParallelRankTopology,
+    ParallelTopology, SubgroupMembership, TensorPlacement as PortableTensorPlacement,
+    TopologyError, TopologyPreflightReport,
+};

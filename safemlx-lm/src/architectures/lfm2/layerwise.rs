@@ -311,7 +311,7 @@ impl Lfm2LayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -1073,7 +1073,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid LFM2 cache layer count"))?;
@@ -1397,7 +1397,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
@@ -2063,6 +2063,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use std::{collections::HashMap, fs, path::Path};
 
     use safemlx::{
@@ -2086,10 +2087,7 @@ mod tests {
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::{
             attention::LayerSchedule,
-            distributed::{
-                parallel::{ParallelBuildContext, ShardingPolicy},
-                topology::{DeviceAssignment, ParallelTopology},
-            },
+            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{
                 load_safetensors_layerwise_model, ArchitectureAdapter, LayerWeightResidency,
                 LayerwiseLoadOptions,
@@ -2194,8 +2192,7 @@ mod tests {
         for (rank, query_width, kv_width, dense_width, expert_width, local_kv_heads) in
             [(0, 8, 4, 9, 5, 2_u32), (1, 4, 2, 8, 4, 1_u32)]
         {
-            let topology = ParallelTopology::from_rank(
-                2,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 1,
@@ -2302,8 +2299,7 @@ mod tests {
         for (rank, query_width, kv_width, local_width, packed_width, scale_width) in
             [(0, 64, 32, 64, 8, 2), (1, 32, 16, 32, 4, 1)]
         {
-            let topology = ParallelTopology::from_rank(
-                2,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 1,

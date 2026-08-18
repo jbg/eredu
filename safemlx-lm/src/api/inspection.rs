@@ -9446,7 +9446,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn canonical_deepseek4_gguf_preflights_every_cartesian_pipeline_rank() {
-        use crate::runtime::distributed::topology::{DeviceAssignment, ParallelTopology};
+        use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("deepseek4.gguf");
@@ -9456,8 +9456,7 @@ mod tests {
         let weights =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         for rank in 0..8 {
-            let topology = ParallelTopology::from_rank(
-                8,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 2,
@@ -9497,7 +9496,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn canonical_deepseek4_gguf_preflights_every_tensor_expert_rank() {
-        use crate::runtime::distributed::topology::{DeviceAssignment, ParallelTopology};
+        use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("deepseek4.gguf");
@@ -9507,8 +9506,7 @@ mod tests {
         let weights =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         for rank in 0..4 {
-            let topology = ParallelTopology::from_rank(
-                4,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 1,

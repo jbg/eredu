@@ -603,7 +603,7 @@ impl NemotronHLayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -2289,7 +2289,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Nemotron-H cache layer count"))?;
@@ -2649,7 +2649,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
@@ -3286,6 +3286,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use std::{collections::HashMap, fs, path::Path};
 
     use safemlx::{
@@ -3311,10 +3312,7 @@ mod tests {
         runtime::{
             cache::KeyValueCache,
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
-            distributed::{
-                parallel::{ParallelBuildContext, ShardingPolicy},
-                topology::{DeviceAssignment, ParallelTopology},
-            },
+            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
         },
     };
@@ -3575,8 +3573,7 @@ mod tests {
         } in cases
         {
             let mut adapter = NemotronHLayerwiseAdapter::new(args(), execution.stream()).unwrap();
-            let topology = ParallelTopology::from_rank(
-                2,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 1,
@@ -3726,8 +3723,7 @@ mod tests {
         for (rank, local_heads, local_groups, local_width, packed_width, scale_width) in
             [(0, 4, 2, 64, 8, 2), (1, 2, 1, 32, 4, 1)]
         {
-            let topology = ParallelTopology::from_rank(
-                2,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 1,

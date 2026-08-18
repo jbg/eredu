@@ -10,7 +10,7 @@ use safemlx_lm::{
     load_model_with_options,
     runtime::residency::expert_cache::ExpertCacheLoadOptions,
     runtime::{generation::sampler::DefaultSampler, media::input},
-    DeviceAssignment, MlxBackend, ParallelTopology, WeightResidency,
+    DeviceAssignment, MlxBackend, MlxParallelContext, WeightResidency,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|rank| rank.parse().ok())
         .unwrap_or(0);
-    let topology = ParallelTopology::from_group(
+    let topology = MlxParallelContext::for_group(
         &group,
         1,
         1,

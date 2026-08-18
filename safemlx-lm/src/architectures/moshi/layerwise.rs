@@ -2071,6 +2071,7 @@ fn layerwise_exception(error: Error) -> Exception {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use std::{collections::BTreeMap, fs, path::Path};
 
     use safemlx::{
@@ -2086,10 +2087,7 @@ mod tests {
         api::{moshi as eager, ModelLoadOptions},
         backend::mlx::realtime::MlxRealtimeModel,
         core::residency::{MemoryTier, OffloadConfig},
-        runtime::distributed::{
-            parallel::{ParallelBuildContext, ShardingPolicy},
-            topology::{DeviceAssignment, ParallelTopology},
-        },
+        runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
         runtime::execution::layerwise::{
             LayerWeightResidency, LayerwiseLoadOptions, WeightResidency,
         },
@@ -2337,7 +2335,7 @@ mod tests {
         let group = Group::init(false, Backend::Any).unwrap();
         assert_eq!(group.size(), 1);
         let topology =
-            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
                 .unwrap();
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();

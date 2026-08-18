@@ -35,6 +35,7 @@ use crate::{
     backend::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
+    backend::mlx::MlxParallelContext,
     core::cache::CacheRankIdentity,
     core::generation::MtpConfig,
     core::{MtpCapability, MtpCheckpointKind, MtpStats},
@@ -49,7 +50,7 @@ use crate::{
     runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore, WeightStore},
     runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
     runtime::distributed::topology::{
-        load_partition_from_store_on_streams, ParallelTopology, PlacementPlan, TensorPlacement,
+        load_partition_from_store_on_streams, PlacementPlan, TensorPlacement,
     },
     runtime::execution::inspection::ActivationObserver,
     runtime::generation::sampler::SpeculativeSampler,
@@ -139,7 +140,7 @@ impl LocalExpertBank for gemma4::GemmaExperts {
 #[derive(Debug, Clone)]
 pub struct ExpertParallelInfo {
     /// Complete Cartesian topology and local TP/PP/EP coordinates.
-    pub topology: ParallelTopology,
+    pub topology: MlxParallelContext,
     /// Loaded architecture.
     pub model_kind: ModelKind,
     /// Assignment metadata.
@@ -267,7 +268,7 @@ enum ExpertArchitecture {
 }
 
 impl ExpertArchitecture {
-    fn bind_parallel_topology(&mut self, topology: ParallelTopology) {
+    fn bind_parallel_topology(&mut self, topology: MlxParallelContext) {
         match self {
             Self::DeepSeekLayerwise(model) => model.bind_parallel_topology(topology),
             Self::DeepSeekV4Layerwise(model) => model.bind_parallel_topology(topology),
@@ -287,7 +288,7 @@ impl ExpertArchitecture {
 
 /// Executable rank-local EP or TP+EP model.
 pub struct ExpertParallelModel {
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     info: ExpertParallelInfo,
     architecture: ExpertArchitecture,
     expert_cache: Option<ExpertCache>,
@@ -2515,6 +2516,7 @@ impl ExpertParallelModel {
                 tensor: 0,
                 pipeline: 0,
                 expert: 0,
+                data: topology.data_parallel_rank,
             })
             .map_err(|error| Exception::custom(error.to_string()))?;
         let mut synchronized =
@@ -2595,7 +2597,7 @@ impl ExpertParallelModel {
     }
 }
 
-fn validate_expert_topology(topology: ParallelTopology) -> Result<(), Error> {
+fn validate_expert_topology(topology: MlxParallelContext) -> Result<(), Error> {
     if topology.expert_parallel_size <= 1 {
         return Err(Error::Parallel(
             "expert-parallel loading requires expert_parallel_size > 1".into(),
@@ -2788,7 +2790,7 @@ fn load_expert_parallel_model_impl(
 fn resolve_model_assignment(
     assignment: Option<ExpertAssignment>,
     global_experts: usize,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
 ) -> Result<ExpertAssignment, Error> {
     let assignment = assignment.map_or_else(
         || {
@@ -3555,7 +3557,7 @@ fn localize_split_expert_name(name: &str, assignment: &ExpertAssignment) -> Opti
 
 fn expert_placement_plan(
     store: &(impl WeightStore + ?Sized),
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     assignment: &ExpertAssignment,
 ) -> Result<(PlacementPlan, bool), Error> {
     let mut plan = PlacementPlan::replicated(topology);
@@ -3643,7 +3645,7 @@ fn quantize_qwen3_local_experts(
 
 fn load_kimi_linear_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     options: ModelLoadOptions,
     assignment: Option<ExpertAssignment>,
     stream: &Stream,
@@ -3714,7 +3716,7 @@ fn load_gguf_ep(
     gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
     metadata: std::collections::HashMap<String, GgufMetadataValue>,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     options: ModelLoadOptions,
     assignment: Option<ExpertAssignment>,
     stream: &Stream,
@@ -3909,7 +3911,7 @@ fn load_external_gguf_ep(
     inkling_mmproj: Option<&inkling::InklingMmprojGguf>,
     qwen3_vl_mmproj: Option<&Path>,
     qwen35_mmproj: Option<&qwen3_5::Qwen35MmprojGguf>,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     assignment: Option<ExpertAssignment>,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
@@ -4525,7 +4527,7 @@ fn load_external_gguf_ep(
 }
 
 fn finish_resident_gguf_ep(
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     model_kind: ModelKind,
     assignment: ExpertAssignment,
     architecture: ExpertArchitecture,
@@ -4546,7 +4548,7 @@ fn finish_resident_gguf_ep(
 
 #[allow(clippy::too_many_arguments)]
 fn finish_external_ep(
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     kind: ModelKind,
     assignment: ExpertAssignment,
     mut architecture: ExpertArchitecture,
@@ -4602,7 +4604,7 @@ impl ExternalExpertResidency {
 #[allow(clippy::too_many_arguments)]
 fn load_kimi_linear_external_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     _options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
@@ -4653,7 +4655,7 @@ fn load_kimi_linear_external_ep(
 #[allow(clippy::too_many_arguments)]
 fn load_deepseek_external_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     _options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
@@ -4707,7 +4709,7 @@ fn load_deepseek_external_ep(
 #[allow(clippy::too_many_arguments)]
 fn load_deepseek_v4_external_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
@@ -4760,7 +4762,7 @@ fn load_deepseek_v4_external_ep(
 #[allow(clippy::too_many_arguments)]
 fn load_qwen3_external_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     _options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
@@ -4826,7 +4828,7 @@ fn reject_external_gguf_ep_quantization(
 
 fn load_deepseek_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     options: ModelLoadOptions,
     assignment: Option<ExpertAssignment>,
     stream: &Stream,
@@ -4973,7 +4975,7 @@ fn load_deepseek_ep(
 
 fn load_deepseek_v4_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     options: ModelLoadOptions,
     assignment: Option<ExpertAssignment>,
     stream: &Stream,
@@ -5013,7 +5015,7 @@ fn load_deepseek_v4_ep(
 
 fn load_qwen3_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     options: ModelLoadOptions,
     assignment: Option<ExpertAssignment>,
     stream: &Stream,
@@ -5242,7 +5244,7 @@ fn rank_owned_resident_experts(
 }
 
 fn finish_additional_cached_ep(
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     kind: ModelKind,
     assignment: ExpertAssignment,
     architecture: ExpertArchitecture,
@@ -5274,7 +5276,7 @@ fn open_external_safetensors_store(
 #[allow(clippy::too_many_arguments)]
 fn load_additional_external_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     _options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
@@ -5619,7 +5621,7 @@ fn load_additional_external_ep(
 #[allow(clippy::too_many_arguments)]
 fn load_additional_ep(
     model_dir: &Path,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     options: ModelLoadOptions,
     assignment: Option<ExpertAssignment>,
     kind: ModelKind,
@@ -5669,12 +5671,12 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
     stream: &Stream,
     weights_stream: &Stream,
 ) {
-    use crate::runtime::distributed::topology::DeviceAssignment;
+    use crate::backend::mlx::DeviceAssignment;
     use crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions;
     use safemlx::DeviceType;
 
     let topology =
-        ParallelTopology::from_rank(2, 1, 1, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
+        MlxParallelContext::for_rank(1, 1, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
             .unwrap();
     let model = load_expert_parallel_model_with_options(
         model_dir,
@@ -5761,11 +5763,11 @@ pub(crate) fn assert_rank_owned_quantized_sparse_ep_load(
     stream: &Stream,
     weights_stream: &Stream,
 ) {
-    use crate::runtime::distributed::topology::DeviceAssignment;
+    use crate::backend::mlx::DeviceAssignment;
     use safemlx::DeviceType;
 
     let topology =
-        ParallelTopology::from_rank(2, 1, 1, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
+        MlxParallelContext::for_rank(1, 1, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
             .unwrap();
     let model = load_expert_parallel_model_with_options(
         model_dir,
@@ -5797,7 +5799,7 @@ pub(crate) fn assert_rank_owned_quantized_sparse_ep_load(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::distributed::topology::DeviceAssignment;
+    use crate::backend::mlx::DeviceAssignment;
     use safemlx::{
         distributed::Backend,
         module::ModuleParameters,
@@ -5894,13 +5896,12 @@ mod tests {
         .unwrap();
     }
 
-    fn rank_one_topology() -> ParallelTopology {
-        ParallelTopology::from_rank(2, 1, 1, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
-            .unwrap()
+    fn rank_one_topology() -> MlxParallelContext {
+        MlxParallelContext::for_rank(1, 1, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0)).unwrap()
     }
 
-    fn tensor_expert_topology(rank: usize) -> ParallelTopology {
-        ParallelTopology::from_rank(4, rank, 2, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
+    fn tensor_expert_topology(rank: usize) -> MlxParallelContext {
+        MlxParallelContext::for_rank(rank, 2, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
             .unwrap()
     }
 

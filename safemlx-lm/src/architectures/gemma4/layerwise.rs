@@ -544,7 +544,7 @@ impl Gemma4LayerwiseModel {
         self.execution.metadata()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -2551,7 +2551,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = self.args.num_hidden_layers as usize;
         let layer_layout = match topology {
@@ -3627,13 +3627,14 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
             let width = global / units;
             (0..context.topology().tensor_parallel_size)
                 .map(|rank| {
-                    crate::runtime::distributed::topology::balanced_contiguous_range(
+                    crate::core::balanced_contiguous_range(
                         units,
                         context.topology().tensor_parallel_size,
                         rank,
                         false,
                     )
                     .map(|range| range.len() * width)
+                    .map_err(Error::from)
                 })
                 .collect()
         };
@@ -3674,7 +3675,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         }
         self.parallel_text_geometry = Some(text_geometry);
         let topology = context.topology();
-        let vocabulary = crate::runtime::distributed::topology::balanced_contiguous_range(
+        let vocabulary = crate::core::balanced_contiguous_range(
             self.args.vocab_size as usize,
             topology.tensor_parallel_size,
             topology.tensor_parallel_rank,
@@ -3693,7 +3694,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                 .args
                 .vocab_size_per_layer_input
                 .unwrap_or(self.args.vocab_size) as usize;
-            let range = crate::runtime::distributed::topology::balanced_contiguous_range(
+            let range = crate::core::balanced_contiguous_range(
                 global,
                 topology.tensor_parallel_size,
                 topology.tensor_parallel_rank,
@@ -3941,7 +3942,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
@@ -4584,7 +4585,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         };
         let widths = (0..execution.size())
             .map(|rank| {
-                crate::runtime::distributed::topology::balanced_contiguous_range(
+                crate::core::balanced_contiguous_range(
                     self.args.vocab_size as usize,
                     execution.size(),
                     rank,
@@ -4621,6 +4622,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use std::{collections::HashMap, fs, path::Path};
 
     use safemlx::{
@@ -4643,10 +4645,7 @@ mod tests {
         runtime::{
             cache::ConcatKeyValueCache,
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
-            distributed::{
-                parallel::{ParallelBuildContext, ShardingPolicy},
-                topology::{DeviceAssignment, ParallelTopology},
-            },
+            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::inspection::ActivationRecorder,
             execution::layerwise::{
                 ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
@@ -5084,7 +5083,7 @@ mod tests {
         let group = Group::init(false, Backend::Any).unwrap();
         assert_eq!(group.size(), 1);
         let topology =
-            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
                 .unwrap();
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
@@ -5166,8 +5165,7 @@ mod tests {
                 execution.stream(),
             )
             .unwrap();
-            let topology = ParallelTopology::from_rank(
-                2,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 1,
@@ -5313,8 +5311,7 @@ mod tests {
                 execution.stream(),
             )
             .unwrap();
-            let topology = ParallelTopology::from_rank(
-                2,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 1,
@@ -5598,7 +5595,7 @@ mod tests {
         let group = Group::init(false, Backend::Any).unwrap();
         assert_eq!(group.size(), 1);
         let topology =
-            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
                 .unwrap();
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();

@@ -66,11 +66,13 @@ use crate::{
     backend::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
+    backend::mlx::MlxParallelContext,
     core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
     core::generation::MtpConfig,
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
+    core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
     error::Error,
     nn::{
@@ -103,7 +105,6 @@ use crate::{
     runtime::distributed::parallel::{
         ParallelBuildContext, ParallelExecutionContext, ShardingPolicy,
     },
-    runtime::distributed::topology::{ParallelCoordinates, ParallelTopology},
     runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
         ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
@@ -175,7 +176,7 @@ pub struct PipelineStageInfo {
     /// Authoritative global placement of decoder and multimodal execution groups.
     pub placement: Arc<PlacedExecutionDag>,
     /// Complete Cartesian topology and local TP/PP/EP coordinates.
-    pub topology: ParallelTopology,
+    pub topology: MlxParallelContext,
     /// Zero-based pipeline coordinate.
     pub pipeline_stage: usize,
     /// Number of pipeline stages.
@@ -1297,7 +1298,7 @@ trait PipelineStageAdapter {
     /// Returns the exact cache identity and local semantic state schedule.
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error>;
     fn new_cache_layers(
         &self,
@@ -1470,7 +1471,7 @@ trait PipelineStageSemantics {
     }
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error>;
     fn new_cache_layers(
         &self,
@@ -1711,7 +1712,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         self.0.prompt_cache_model_identity(topology)
     }
@@ -2062,7 +2063,7 @@ where
 }
 
 fn pipeline_prompt_cache_identity(
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     model_family: &str,
     effective_model_type: &str,
     architecture_fingerprint: String,
@@ -2331,7 +2332,7 @@ impl PipelineStageSemantics for LlamaStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let replicated_kv_heads;
         let kv_heads = match &self.parallel_kv_heads {
@@ -2504,7 +2505,7 @@ impl PipelineStageSemantics for DeepSeekStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layout = PromptCacheModelIdentity::compressed_layouts(
             self.range.len(),
@@ -2708,7 +2709,7 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let target_count = self.args.num_hidden_layers as usize;
         let layer_count =
@@ -2917,7 +2918,7 @@ impl PipelineStageSemantics for GemmaStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = if self.parallel_layout.is_some() {
             self.layer_adapter.parallel_text_cache_layout()?
@@ -3028,7 +3029,7 @@ impl PipelineStageSemantics for DenseQwenStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let kv_heads = match &self.parallel_layout {
             Some(layout) => planned_kv_head_layout(
@@ -3242,7 +3243,7 @@ impl PipelineStageSemantics for MuseGlimmerStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = self
             .layer_adapter
@@ -3545,7 +3546,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = self
             .layer_adapter
@@ -4075,7 +4076,7 @@ impl PipelineStageSemantics for GptOssStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let replicated_kv_heads;
         let kv_heads = match &self.parallel_kv_heads {
@@ -4187,7 +4188,7 @@ impl PipelineStageSemantics for Lfm2Stage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let replicated_geometry;
         let geometry = match &self.parallel_cache_geometry {
@@ -4377,7 +4378,7 @@ impl PipelineStageSemantics for NemotronHStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = match &self.parallel_geometry {
             Some(geometry) => {
@@ -4658,7 +4659,7 @@ impl PipelineStageSemantics for QwenHybridStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = if topology.tensor_parallel_size > 1 {
             let geometry = self.parallel_geometry.as_deref().ok_or_else(|| {
@@ -4788,7 +4789,7 @@ impl PipelineStageSemantics for KimiLinearStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = match &self.parallel_cache_geometry {
             Some(geometry) => {
@@ -5035,7 +5036,7 @@ impl PipelineStageSemantics for InklingStage {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = if topology.tensor_parallel_size > 1 {
             self.layer_adapter
@@ -5151,7 +5152,7 @@ impl PipelineStageSemantics for InklingStage {
 
 /// An executable, rank-local piece of a pipeline-parallel model.
 pub struct PipelineModel {
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     info: PipelineStageInfo,
     stage: Box<dyn PipelineStageAdapter>,
     cache_identity: PromptCacheModelIdentity,
@@ -5203,7 +5204,7 @@ impl std::fmt::Debug for PipelineModel {
 
 impl PipelineModel {
     fn from_adapter(
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
         mut info: PipelineStageInfo,
         stage: impl PipelineStageAdapter + 'static,
     ) -> Result<Self, Error> {
@@ -6222,6 +6223,7 @@ impl PipelineModel {
                 tensor: 0,
                 pipeline: self.topology.pipeline_parallel_size - 1,
                 expert: 0,
+                data: self.topology.data_parallel_rank,
             })
             .map_err(|error| Exception::custom(error.to_string()))?;
         let mut synchronized =
@@ -6956,7 +6958,7 @@ impl PipelineEmbeddedMtpTarget<'_> {
     }
 }
 
-fn validate_pipeline_topology(topology: ParallelTopology) -> Result<(), Error> {
+fn validate_pipeline_topology(topology: MlxParallelContext) -> Result<(), Error> {
     if topology.pipeline_parallel_size <= 1 {
         return Err(Error::Parallel(
             "pipeline loading requires pipeline_parallel_size > 1".into(),
@@ -7061,7 +7063,7 @@ fn gemma_pipeline_ranges(
 }
 
 fn base_info(
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     range: Range<usize>,
     global_layers: usize,
     model_kind: ModelKind,
@@ -8856,7 +8858,7 @@ fn pipeline_gguf_architecture(
 fn load_llama_pipeline(
     source_args: llama::ModelArgs,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
@@ -10207,7 +10209,7 @@ impl LlamaStage {
 fn load_dense_qwen_pipeline(
     source_args: dense_qwen::DecoderConfig,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -10581,7 +10583,7 @@ fn load_dense_qwen_pipeline(
 fn load_muse_glimmer_pipeline(
     source_args: muse_glimmer::DecoderConfig,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
@@ -10913,7 +10915,7 @@ fn load_muse_glimmer_pipeline(
 fn load_qwen3_vl_pipeline(
     source_args: qwen3_vl::ModelArgs,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -12724,7 +12726,7 @@ fn execute_pipeline_cached_gpt_oss(
 fn load_gpt_oss_pipeline(
     source_args: gpt_oss::ModelArgs,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -13690,7 +13692,7 @@ impl GptOssStage {
 fn load_lfm2_pipeline(
     source_args: lfm2::ModelArgs,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -15174,7 +15176,7 @@ impl GemmaStage {
                     .as_linear(&hidden, stream)?;
                 let widths = (0..execution.size())
                     .map(|rank| {
-                        crate::runtime::distributed::topology::balanced_contiguous_range(
+                        crate::core::balanced_contiguous_range(
                             self.args.vocab_size as usize,
                             execution.size(),
                             rank,
@@ -15203,7 +15205,7 @@ impl GemmaStage {
 fn load_nemotron_h_pipeline(
     source_args: nemotron_h::ModelArgs,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -16495,7 +16497,7 @@ fn load_qwen_hybrid_pipeline(
     video_token_id: Option<i32>,
     vision_config: Option<crate::api::qwen_vl::VisionConfig>,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -18060,7 +18062,7 @@ impl QwenHybridStage {
 fn load_kimi_linear_pipeline(
     source_args: kimi_linear::ModelArgs,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -19148,7 +19150,7 @@ impl KimiLinearStage {
 fn load_inkling_pipeline(
     args: inkling::ModelArgs,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -20656,7 +20658,7 @@ struct GemmaPipelineConfig {
 fn load_gemma_pipeline(
     source: GemmaPipelineConfig,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -20802,7 +20804,7 @@ fn load_gemma_pipeline(
             .configure_parallel_static(build, &layout, stream)?;
         target_binding_adapter.configure_parallel_static(build, &layout, stream)?;
 
-        let vocabulary = crate::runtime::distributed::topology::balanced_contiguous_range(
+        let vocabulary = crate::core::balanced_contiguous_range(
             target_args.vocab_size as usize,
             topology.tensor_parallel_size,
             topology.tensor_parallel_rank,
@@ -20837,7 +20839,7 @@ fn load_gemma_pipeline(
             let global = target_args
                 .vocab_size_per_layer_input
                 .unwrap_or(target_args.vocab_size) as usize;
-            let range = crate::runtime::distributed::topology::balanced_contiguous_range(
+            let range = crate::core::balanced_contiguous_range(
                 global,
                 topology.tensor_parallel_size,
                 topology.tensor_parallel_rank,
@@ -22304,7 +22306,7 @@ impl GemmaStage {
 fn load_deepseek_pipeline(
     source_args: deepseek_v3::ModelArgs,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -22701,7 +22703,7 @@ fn load_deepseek_pipeline(
 fn load_deepseek_v4_pipeline(
     source_args: deepseek_v4::ModelArgs,
     store: SharedWeightStore,
-    topology: ParallelTopology,
+    topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
@@ -23268,7 +23270,7 @@ fn validate_expert_bank_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{runtime::distributed::topology::DeviceAssignment, test_utils::SyntheticGguf};
+    use crate::{backend::mlx::DeviceAssignment, test_utils::SyntheticGguf};
     use safemlx::{
         distributed::{self, Backend},
         module::Param,
@@ -23283,16 +23285,9 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    fn topology(world: usize, rank: usize, pp: usize) -> ParallelTopology {
-        ParallelTopology::from_rank(
-            world,
-            rank,
-            1,
-            pp,
-            1,
-            DeviceAssignment::new(DeviceType::Cpu, 0),
-        )
-        .unwrap()
+    fn topology(rank: usize, pp: usize) -> MlxParallelContext {
+        MlxParallelContext::for_rank(rank, 1, pp, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            .unwrap()
     }
 
     #[test]
@@ -23346,7 +23341,7 @@ mod tests {
         let args = inkling::model_args_from_config_value(&config).unwrap();
 
         for rank in 0..2 {
-            let topology = topology(2, rank, 2);
+            let topology = topology(rank, 2);
             let range = topology.layer_range(3).unwrap();
             let mut info = base_info(
                 topology,
@@ -23494,19 +23489,19 @@ mod tests {
 
     #[test]
     fn stage_roles_and_neighbor_ranks_are_explicit() {
-        let first = base_info(topology(3, 0, 3), 0..2, 5, ModelKind::Llama, 8);
+        let first = base_info(topology(0, 3), 0..2, 5, ModelKind::Llama, 8);
         assert!(first.is_first);
         assert!(!first.is_last);
         assert_eq!(first.predecessor_rank, None);
         assert_eq!(first.successor_rank, Some(1));
 
-        let middle = base_info(topology(3, 1, 3), 2..4, 5, ModelKind::Llama, 8);
+        let middle = base_info(topology(1, 3), 2..4, 5, ModelKind::Llama, 8);
         assert!(!middle.is_first);
         assert!(!middle.is_last);
         assert_eq!(middle.predecessor_rank, Some(0));
         assert_eq!(middle.successor_rank, Some(2));
 
-        let last = base_info(topology(3, 2, 3), 4..5, 5, ModelKind::Llama, 8);
+        let last = base_info(topology(2, 3), 4..5, 5, ModelKind::Llama, 8);
         assert!(!last.is_first);
         assert!(last.is_last);
         assert_eq!(last.predecessor_rank, Some(1));
@@ -23515,9 +23510,9 @@ mod tests {
 
     #[test]
     fn boundary_and_tied_embedding_ownership_is_not_replicated() {
-        let first = base_info(topology(3, 0, 3), 0..1, 3, ModelKind::Llama, 8);
-        let middle = base_info(topology(3, 1, 3), 1..2, 3, ModelKind::Llama, 8);
-        let last = base_info(topology(3, 2, 3), 2..3, 3, ModelKind::Llama, 8);
+        let first = base_info(topology(0, 3), 0..1, 3, ModelKind::Llama, 8);
+        let middle = base_info(topology(1, 3), 1..2, 3, ModelKind::Llama, 8);
+        let last = base_info(topology(2, 3), 2..3, 3, ModelKind::Llama, 8);
         assert!(owns_embedding_weight(&first, false));
         assert!(!owns_embedding_weight(&middle, false));
         assert!(!owns_embedding_weight(&last, false));
@@ -23528,21 +23523,21 @@ mod tests {
 
     #[test]
     fn pipeline_validation_accepts_pairwise_and_triple_axis_geometry() {
-        assert!(validate_pipeline_topology(topology(2, 0, 2)).is_ok());
-        assert!(validate_pipeline_topology(topology(1, 0, 1)).is_err());
+        assert!(validate_pipeline_topology(topology(0, 2)).is_ok());
+        assert!(validate_pipeline_topology(topology(0, 1)).is_err());
         let hybrid =
-            ParallelTopology::from_rank(4, 0, 2, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelContext::for_rank(0, 2, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         assert!(validate_pipeline_topology(hybrid).is_ok());
         let triple =
-            ParallelTopology::from_rank(8, 0, 2, 2, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelContext::for_rank(0, 2, 2, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         assert!(validate_pipeline_topology(triple).is_ok());
     }
 
     #[test]
     fn activation_shape_validation_is_role_aware() {
-        let later = base_info(topology(2, 1, 2), 1..2, 2, ModelKind::Llama, 8);
+        let later = base_info(topology(1, 2), 1..2, 2, ModelKind::Llama, 8);
         let step = PipelineStep::new(1, 3).unwrap();
         assert!(validate_hidden_metadata(&later, &[1, 3, 8], Dtype::Float32, step).is_ok());
         assert!(validate_hidden_metadata(&later, &[1, 3, 7], Dtype::Float32, step).is_err());
@@ -23586,7 +23581,7 @@ mod tests {
         )
         .unwrap();
         let identity = pipeline_prompt_cache_identity(
-            topology(2, 0, 2),
+            topology(0, 2),
             "synthetic",
             "synthetic",
             "synthetic".into(),
@@ -23614,7 +23609,7 @@ mod tests {
         ));
 
         let unsupported = pipeline_prompt_cache_identity(
-            topology(2, 0, 2),
+            topology(0, 2),
             "synthetic",
             "synthetic",
             "synthetic-fixed".into(),
@@ -23760,7 +23755,7 @@ mod tests {
         )
         .unwrap();
         let identity = pipeline_prompt_cache_identity(
-            topology(2, 0, 2),
+            topology(0, 2),
             "hybrid",
             "hybrid",
             "hybrid-layout".into(),
@@ -23795,23 +23790,23 @@ mod tests {
         ));
     }
 
-    fn gpu_topology(rank: usize) -> ParallelTopology {
-        ParallelTopology::from_rank(2, rank, 1, 2, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+    fn gpu_topology(rank: usize) -> MlxParallelContext {
+        MlxParallelContext::for_rank(rank, 1, 2, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
             .unwrap()
     }
 
-    fn tp_pp_gpu_topology(rank: usize) -> ParallelTopology {
-        ParallelTopology::from_rank(4, rank, 2, 2, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+    fn tp_pp_gpu_topology(rank: usize) -> MlxParallelContext {
+        MlxParallelContext::for_rank(rank, 2, 2, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
             .unwrap()
     }
 
-    fn pp_ep_gpu_topology(rank: usize) -> ParallelTopology {
-        ParallelTopology::from_rank(4, rank, 1, 2, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
+    fn pp_ep_gpu_topology(rank: usize) -> MlxParallelContext {
+        MlxParallelContext::for_rank(rank, 1, 2, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
             .unwrap()
     }
 
-    fn tp_pp_ep_gpu_topology(rank: usize) -> ParallelTopology {
-        ParallelTopology::from_rank(8, rank, 2, 2, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
+    fn tp_pp_ep_gpu_topology(rank: usize) -> MlxParallelContext {
+        MlxParallelContext::for_rank(rank, 2, 2, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
             .unwrap()
     }
 
@@ -23863,7 +23858,7 @@ mod tests {
     fn assert_nonresident_qwen_layer_recipe_parity(
         args: dense_qwen::DecoderConfig,
         store: SharedWeightStore,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
         assignment: Option<ExpertAssignment>,
         residency: PipelineLayerLoadOptions,
         global_layer: usize,
@@ -25354,8 +25349,7 @@ mod tests {
         let fixture = gpt_oss_gguf_fixture(stream);
 
         for rank in 0..4 {
-            let topology = ParallelTopology::from_rank(
-                4,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 1,
@@ -25527,8 +25521,7 @@ mod tests {
             write_parameter_fixture(fixture.path(), &config, &source);
 
             for rank in 0..12 {
-                let topology = ParallelTopology::from_rank(
-                    12,
+                let topology = MlxParallelContext::for_rank(
                     rank,
                     2,
                     2,
@@ -25747,7 +25740,7 @@ mod tests {
         model: &mut PipelineModel,
         cache: &mut PipelineCache,
         tokens: &Array,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
         group: &Group,
         tensor_parallel: bool,
         expert_parallel: bool,
@@ -25822,8 +25815,7 @@ mod tests {
             let path = std::env::var_os(path_variable).expect("combined fixture path");
             for pipeline_rank in 0..2 {
                 let global_rank = pipeline_rank * 2 + rank;
-                let topology = ParallelTopology::from_rank(
-                    4,
+                let topology = MlxParallelContext::for_rank(
                     global_rank,
                     if tensor_parallel { 2 } else { 1 },
                     2,
@@ -25854,8 +25846,7 @@ mod tests {
                         path_variable,
                         COMBINED_STREAM_GPT_OSS_ST | COMBINED_STREAM_GPT_OSS_GGUF
                     );
-                let reference_topology = ParallelTopology::from_rank(
-                    2,
+                let reference_topology = MlxParallelContext::for_rank(
                     pipeline_rank,
                     1,
                     2,
@@ -27607,7 +27598,7 @@ mod tests {
         initialize_parameters(&mut source, stream);
         let directory = tempfile::tempdir().unwrap();
         write_llama_fixture(directory.path(), &source, false);
-        let expected_topology = topology(2, 0, 2);
+        let expected_topology = topology(0, 2);
 
         let loaded = crate::api::load_model_with_options(
             directory.path(),
@@ -27872,7 +27863,7 @@ mod tests {
 
     fn llama_pipeline_dense_requirements(
         model_dir: &Path,
-        topology: ParallelTopology,
+        topology: MlxParallelContext,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> (u64, u64, u64, u64) {

@@ -35,9 +35,10 @@ pub use safemlx_lm_core::{
     Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession, CollectiveScope,
     Completion, ControlledTextGeneration, ControlledTextGenerationError, ControlledToken,
     DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
-    DistributedSessionDescriptor, ModelRuntime, MtpCapability, MtpCheckpointKind, PreparedModel,
+    DistributedSessionDescriptor, ModelRuntime, MtpCapability, MtpCheckpointKind, ParallelAxis,
+    ParallelCoordinates, ParallelRankTopology, ParallelTopology, PreparedModel, SubgroupMembership,
     Submission, TextGeneration, TextGenerationBackend, TextGenerationConfig, TokenFilter,
-    TokenFilterController, TokenFilterError, TokenOutput, ValueDescriptor,
+    TokenFilterController, TokenFilterError, TokenOutput, TopologyPreflightReport, ValueDescriptor,
 };
 #[cfg(test)]
 mod test_utils;
@@ -91,6 +92,7 @@ pub use backend::mlx::realtime::{
     MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput,
     MlxRealtimeModel, MlxRealtimeModelIdentity, MlxRealtimeOutput, MlxRealtimeSession,
 };
+pub use backend::mlx::{DeviceAssignment, MlxParallelContext};
 pub use backend::mlx::{
     MlxBackend, MlxDistributedSession, MlxModel, MlxModelInput, MlxModelOutput, MlxModelSession,
     MlxSessionCompletion, MlxTextCompletion, MlxTextGenerationState, MlxTextToken,
@@ -108,10 +110,7 @@ pub use runtime::distributed::parallel::{
     ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
     ParameterRole, ShardingPolicy, SynchronizedToken,
 };
-pub use runtime::distributed::topology::{
-    DeviceAssignment, ParallelAxis, ParallelCoordinates, ParallelTopology, PlacementPlan,
-    RankPartition, SubgroupMembership, TensorPlacement, TopologyPreflightReport,
-};
+pub use runtime::distributed::topology::{PlacementPlan, RankPartition, TensorPlacement};
 pub use runtime::execution::layerwise::{
     load_layerwise_model, ArchitectureAdapter, DenseCacheMetrics, DenseDiskStreamReport,
     DenseExecutionGroupReport, DensePassReport, DenseTierResidencyReport, ExecutionResidency,

@@ -28,7 +28,7 @@ use safemlx_lm::{
         PreparedModelInput,
     },
     DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions, MlxBackend,
-    ModelLoadOptions, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
+    MlxParallelContext, ModelLoadOptions, PagedCacheOptions, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 
@@ -672,7 +672,7 @@ fn gemma4_multimodal_pipeline_ring_worker() {
     let ep = if axes.is_some() { 2 } else { 1 };
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology =
-        ParallelTopology::from_group(&group, tp, 2, ep, DeviceAssignment::new(DeviceType::Cpu, 0))
+        MlxParallelContext::for_group(&group, tp, 2, ep, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap();
     assert_eq!(topology.global_rank, rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());

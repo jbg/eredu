@@ -356,6 +356,7 @@ impl Model {
                 tensor: 0,
                 pipeline: 0,
                 expert: 0,
+                data: topology.data_parallel_rank,
             })
             .map_err(|error| Exception::custom(error.to_string()))?;
         let mut synchronized =

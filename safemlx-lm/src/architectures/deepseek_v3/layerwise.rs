@@ -283,7 +283,7 @@ impl DeepSeekV3LayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -1928,7 +1928,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = self.args.layer_schedule.len();
         Ok(PromptCacheModelIdentity {
@@ -2231,7 +2231,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
@@ -2887,6 +2887,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use std::{fs, path::Path};
 
     use safemlx::{
@@ -2907,10 +2908,7 @@ mod tests {
         core::residency::{OffloadConfig, ResidencyPolicy},
         runtime::attention::LayerSchedule,
         runtime::checkpoint::binding::canonical_checkpoint_name,
-        runtime::distributed::{
-            parallel::{ParallelBuildContext, ShardingPolicy},
-            topology::{DeviceAssignment, ParallelTopology},
-        },
+        runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
         runtime::execution::layerwise::{
             load_safetensors_layerwise_model, ArchitectureAdapter, LayerwiseLoadOptions,
         },
@@ -2986,8 +2984,7 @@ mod tests {
         args.validate().unwrap();
         for rank in 0..2 {
             let context = ParallelBuildContext::new(
-                ParallelTopology::from_rank(
-                    2,
+                MlxParallelContext::for_rank(
                     rank,
                     2,
                     1,
@@ -3063,7 +3060,7 @@ mod tests {
         args.num_nextn_predict_layers = 1;
         let adapter = DeepSeekV3LayerwiseAdapter::new(args, execution.stream()).unwrap();
         let context = ParallelBuildContext::new(
-            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap(),
             ShardingPolicy::Require,
         );

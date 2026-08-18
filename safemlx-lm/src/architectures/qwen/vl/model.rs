@@ -2085,8 +2085,7 @@ mod tests {
         fs::copy(fixture.path(), &model_path).unwrap();
         fs::copy(vision_fixture.path(), mmproj_path).unwrap();
         let topology = |rank| {
-            crate::ParallelTopology::from_rank(
-                2,
+            crate::MlxParallelContext::for_rank(
                 rank,
                 1,
                 2,

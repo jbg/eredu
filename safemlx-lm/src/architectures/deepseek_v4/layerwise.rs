@@ -198,7 +198,7 @@ impl DeepSeekV4LayerwiseModel {
         self.execution.parallel_info()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -544,7 +544,7 @@ pub struct DeepSeekV4LayerwiseAdapter {
     static_model: ResidentModel,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
-    parallel_topology: Option<crate::ParallelTopology>,
+    parallel_topology: Option<crate::MlxParallelContext>,
 }
 
 impl DeepSeekV4LayerwiseAdapter {
@@ -909,7 +909,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         prompt_cache_model_identity(
             &self.args,
@@ -1169,7 +1169,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         let heads_per_unit = global_heads / units;
         let widths = (0..topology.tensor_parallel_size)
             .map(|rank| {
-                crate::runtime::distributed::topology::balanced_contiguous_range(
+                crate::core::balanced_contiguous_range(
                     units,
                     topology.tensor_parallel_size,
                     rank,
@@ -1213,7 +1213,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
@@ -2260,6 +2260,7 @@ fn execute_cached_experts(
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use safemlx::{module::ModuleParameters, Device, DeviceType, Dtype, ExecutionContext};
 
     use super::{raw_layer_key, DeepSeekV4LayerwiseAdapter};
@@ -2268,10 +2269,7 @@ mod tests {
         runtime::{
             checkpoint::quantization::WeightQuantization,
             checkpoint::store::TensorSelection,
-            distributed::{
-                parallel::{ParallelBuildContext, ShardingPolicy},
-                topology::{DeviceAssignment, ParallelTopology},
-            },
+            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{ArchitectureAdapter, LoadTimeQuantizableAdapter},
             residency::manager::WeightBinding,
         },
@@ -2443,8 +2441,7 @@ mod tests {
     fn cartesian_plan_shards_query_heads_and_balances_expert_ownership() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         for rank in 0..8 {
-            let topology = ParallelTopology::from_rank(
-                8,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 2,

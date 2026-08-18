@@ -39,8 +39,8 @@ use safemlx_lm::{
         media::{input::InputPayload, PreparedModelInput},
     },
     CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
-    LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, ModelLoadOptions, MtpCapability,
-    MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PagedCacheOptions, ParallelTopology,
+    LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
+    MtpCapability, MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PagedCacheOptions,
     PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -315,7 +315,7 @@ fn pipeline_ring_worker() {
         Some("tp-pp-ep") => (2, 2),
         Some(other) => panic!("unexpected Cartesian pipeline axes {other:?}"),
     };
-    let topology = ParallelTopology::from_group(
+    let topology = MlxParallelContext::for_group(
         &group,
         tensor_parallel_size,
         2,

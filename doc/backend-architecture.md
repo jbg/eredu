@@ -33,7 +33,9 @@ Core owns concepts whose meaning does not depend on tensor representation:
 - queue fairness, request/work lifecycle, transactional branch commit/discard,
   exact-completion observation, cancellation, abandonment, and capacity;
 - backend/device descriptors and fail-closed capability discovery;
-- parallel axes, coordinates, membership, and portable placement descriptions;
+- validated parallel shapes and rank snapshots, axes, coordinates, subgroup
+  membership, balanced ownership/preflight planning, and portable placement
+  descriptions;
 - weight-residency policy, atomic ownership/capacity transitions, protected
   windows, deterministic eviction, exact transfer generations, accounting, and
   serialized reports; and bounded prefetch FIFO admission, duplicate
@@ -128,6 +130,14 @@ point-to-point transfer, portable scheduler-word consensus, and exact
 completion. Core contains no communicator, stream, native event, or tensor
 type. Capability discovery is operation-specific and defaults to false.
 
+`ParallelTopology` is the canonical validated four-axis shape, and
+`ParallelRankTopology` is its canonical rank-local snapshot. Rank/coordinate
+mapping, TP/PP/EP/data subgroup membership, pipeline neighbors, balanced layer
+and expert ownership, and preflight reports are pure core operations. World
+size is derived from the axis sizes; there is no independent caller-supplied
+world size that can disagree with the shape. These values contain no device or
+communicator.
+
 ## MLX mapping
 
 `api::load_model_with_options` first calls the core `inspect_artifact` and
@@ -156,6 +166,14 @@ pipeline submissions preserve the stage completion that retains transfers and
 stage outputs. Both implement the same core exact-completion contract and
 synchronize on early drop where required. Native exceptions are converted at
 the facade boundary and never appear in core trait signatures.
+
+`MlxParallelContext` is the thin MLX binding around one
+`ParallelRankTopology`. It adds only the process-local `DeviceAssignment` and
+MLX stream/device validation. `ParallelCommunicators` consumes the core
+subgroup plans to construct native MLX groups; it does not recalculate
+coordinates, membership, ownership, or preflight policy. Data-parallel
+membership is already modeled in core and currently fails closed as an MLX
+collective capability.
 
 `MlxModelInput` owns cloned MLX array handles for every typed input part and its
 metadata. Backend submission therefore owns text, image, audio, video, and
@@ -449,8 +467,8 @@ types.
 Prompt-cache identity, topology, descriptors, options, versioned manifests,
 catalog entries, fingerprints, and structural/compatibility errors likewise
 have a single definition in core. Architecture implementations construct those
-types directly. The MLX adapter converts `ParallelTopology` to the portable
-rank description and owns only arrays, mapped shard storage, payload hashes,
+types directly. The MLX adapter binds the portable `ParallelRankTopology` to a
+process-local MLX device and owns only arrays, native groups, mapped shard storage, payload hashes,
 safetensors I/O, and atomic filesystem publication. It invokes core validation
 before accepting or publishing a catalog; there is no facade copy of the
 catalog validator or its error taxonomy.

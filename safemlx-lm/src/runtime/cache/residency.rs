@@ -5690,10 +5690,10 @@ mod tests {
 
     #[test]
     fn prompt_cache_topology_preserves_parallel_coordinates_and_rank_identity() {
-        use crate::runtime::distributed::topology::{DeviceAssignment, ParallelTopology};
+        use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
 
         let topology =
-            ParallelTopology::from_rank(8, 5, 2, 2, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelContext::for_rank(5, 2, 2, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         let cache_topology = crate::backend::mlx::cache::prompt_cache_topology(topology);
 
@@ -5710,7 +5710,7 @@ mod tests {
         );
 
         let replicated =
-            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelContext::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         let replicated = crate::backend::mlx::cache::prompt_cache_topology(replicated);
         assert_eq!(replicated, PromptCacheTopology::default());

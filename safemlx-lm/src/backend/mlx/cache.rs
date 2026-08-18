@@ -1,8 +1,8 @@
 //! MLX runtime topology conversion for the neutral prompt-cache contract.
 
-use crate::{core::cache::PromptCacheTopology, runtime::distributed::topology::ParallelTopology};
+use crate::{backend::mlx::MlxParallelContext, core::cache::PromptCacheTopology};
 
-pub(crate) fn prompt_cache_topology(topology: ParallelTopology) -> PromptCacheTopology {
+pub(crate) fn prompt_cache_topology(topology: MlxParallelContext) -> PromptCacheTopology {
     PromptCacheTopology {
         pipeline: (topology.pipeline_parallel_size > 1).then_some((
             topology.pipeline_parallel_size,

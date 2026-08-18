@@ -463,7 +463,7 @@ impl QwenHybridLayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -3321,7 +3321,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = self.args.num_hidden_layers as usize;
         let layer_layout = match topology {
@@ -3836,7 +3836,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
@@ -4574,6 +4574,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use std::{fs, path::Path};
 
     use safemlx::{
@@ -4596,10 +4597,7 @@ mod tests {
             qwen_vl::VisionConfig,
         },
         core::residency::{OffloadConfig, ResidencyPolicy},
-        runtime::distributed::{
-            parallel::{ParallelBuildContext, ShardingPolicy},
-            topology::{DeviceAssignment, ParallelTopology},
-        },
+        runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
         runtime::execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         CacheResidencyPolicy, PagedCacheOptions,
@@ -4653,7 +4651,7 @@ mod tests {
         )
         .unwrap();
         let context = ParallelBuildContext::new(
-            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap(),
             ShardingPolicy::Require,
         );
@@ -4741,8 +4739,7 @@ mod tests {
                 )
                 .unwrap();
                 let context = ParallelBuildContext::new(
-                    ParallelTopology::from_rank(
-                        2,
+                    MlxParallelContext::for_rank(
                         rank,
                         2,
                         1,
@@ -4847,8 +4844,7 @@ mod tests {
             )
             .unwrap();
             let context = ParallelBuildContext::new(
-                ParallelTopology::from_rank(
-                    2,
+                MlxParallelContext::for_rank(
                     rank,
                     2,
                     1,

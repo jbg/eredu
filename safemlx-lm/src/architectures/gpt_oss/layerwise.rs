@@ -82,7 +82,7 @@ impl GptOssLayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -977,7 +977,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid GPT-OSS cache layer count"))?;
@@ -1245,7 +1245,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
@@ -1750,6 +1750,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use std::{fs, path::Path};
 
     use safemlx::{
@@ -1769,10 +1770,7 @@ mod tests {
             cache::KeyValueCache,
         },
         runtime::{
-            distributed::{
-                parallel::{ParallelBuildContext, ShardingPolicy},
-                topology::{DeviceAssignment, ParallelTopology},
-            },
+            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{LayerWeightResidency, LayerwiseLoadOptions},
         },
     };
@@ -1814,15 +1812,8 @@ mod tests {
 
     fn tensor_parallel_context(rank: usize) -> ParallelBuildContext {
         ParallelBuildContext::new(
-            ParallelTopology::from_rank(
-                2,
-                rank,
-                2,
-                1,
-                1,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap(),
+            MlxParallelContext::for_rank(rank, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap(),
             ShardingPolicy::Require,
         )
     }

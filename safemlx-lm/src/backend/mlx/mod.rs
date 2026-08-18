@@ -13,6 +13,8 @@ pub mod residency;
 pub mod speculative;
 /// Exact MLX loader binding against portable checkpoint catalogs.
 pub(crate) mod structural;
+/// MLX process-local device binding for a canonical core rank topology.
+pub mod topology;
 pub(crate) use loading::{
     materialize_gguf_plan, validate_gguf_quantization_source, MaterializedGgufModel,
 };
@@ -26,6 +28,7 @@ pub use session::{
     MlxGeneration, MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion,
     MlxTextCompletion, MlxTextGenerationState, MlxTextToken,
 };
+pub use topology::{DeviceAssignment, MlxParallelContext};
 
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
 use safemlx_lm_core::backend::{
@@ -94,7 +97,7 @@ impl MlxModel {
     }
 
     /// Returns the rank-local topology for a distributed executable.
-    pub fn topology(&self) -> Option<crate::ParallelTopology> {
+    pub fn topology(&self) -> Option<crate::MlxParallelContext> {
         match &self.inner {
             MlxModelKind::Complete(model) => model.parallel_info().map(|info| info.topology()),
             MlxModelKind::Pipeline(model) => Some(model.stage_info().topology),
@@ -176,7 +179,7 @@ impl<'a> MlxBackend<'a> {
     #[cfg(test)]
     pub(crate) fn communication_for_topology(
         &self,
-        topology: crate::ParallelTopology,
+        topology: crate::MlxParallelContext,
         world: &'a safemlx::distributed::Group,
     ) -> Result<MlxDistributedSession<'a>, Error> {
         MlxDistributedSession::new(MlxDistributedConfig { topology, world }, &self.stream)

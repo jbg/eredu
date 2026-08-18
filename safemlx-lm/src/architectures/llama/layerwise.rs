@@ -778,7 +778,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
@@ -1339,29 +1339,20 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use safemlx::{Device, DeviceType, ExecutionContext};
 
     use super::*;
     use crate::runtime::{
         attention::LayerSchedule,
         checkpoint::quantization::AffineQuantization,
-        distributed::{
-            parallel::{ParallelBuildContext, ShardingPolicy},
-            topology::{DeviceAssignment, ParallelTopology},
-        },
+        distributed::parallel::{ParallelBuildContext, ShardingPolicy},
     };
 
     fn build_context(rank: usize) -> ParallelBuildContext {
         ParallelBuildContext::new(
-            ParallelTopology::from_rank(
-                2,
-                rank,
-                2,
-                1,
-                1,
-                DeviceAssignment::new(DeviceType::Cpu, 0),
-            )
-            .unwrap(),
+            MlxParallelContext::for_rank(rank, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap(),
             ShardingPolicy::Require,
         )
     }

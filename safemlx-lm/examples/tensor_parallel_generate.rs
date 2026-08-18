@@ -8,7 +8,7 @@ use safemlx_lm::{
     core::{Backend as _, BackendSession},
     load_model_with_options,
     runtime::{generation::sampler::DefaultSampler, media::input},
-    DeviceAssignment, MlxBackend, ModelLoadOptions, ParallelTopology,
+    DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|rank| rank.parse().ok())
         .unwrap_or(0);
-    let topology = ParallelTopology::from_group(
+    let topology = MlxParallelContext::for_group(
         &group,
         group.size(),
         1,

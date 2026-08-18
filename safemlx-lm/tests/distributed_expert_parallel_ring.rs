@@ -47,8 +47,8 @@ use safemlx_lm::{
         dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions,
     },
     Backend as _, BackendSession as _, CacheResidencyPolicy, DeviceAssignment, MlxBackend,
-    MlxDistributedSession, MtpCapability, MtpCheckpointKind, MtpConfig, NonExpertWeightResidency,
-    PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
+    MlxDistributedSession, MlxParallelContext, MtpCapability, MtpCheckpointKind, MtpConfig,
+    NonExpertWeightResidency, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
     PromptCacheTopology, WeightResidency,
 };
 
@@ -177,7 +177,7 @@ fn expert_parallel_model_ring_worker() {
     let predictor_moe_layers = config["mtp_num_hidden_layers"].as_u64().unwrap_or(0) as usize;
     let routed_layer_count = moe_layers + predictor_moe_layers;
     let group = distributed::init(true, Backend::Ring).unwrap();
-    let topology = ParallelTopology::from_group(
+    let topology = MlxParallelContext::for_group(
         &group,
         if tensor_expert { 2 } else { 1 },
         1,
@@ -1696,15 +1696,9 @@ fn qwen3_vl_moe_gguf_pipeline_expert_stages_own_rank_local_layers_and_experts() 
     .unwrap();
     drop(resident);
     for rank in 0..4 {
-        let topology = ParallelTopology::from_rank(
-            4,
-            rank,
-            1,
-            2,
-            2,
-            DeviceAssignment::new(DeviceType::Cpu, 0),
-        )
-        .unwrap();
+        let topology =
+            MlxParallelContext::for_rank(rank, 1, 2, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
         let model = load_pipeline_model_with_options(
             &checkpoint,
             ModelLoadOptions::with_parallel(topology),

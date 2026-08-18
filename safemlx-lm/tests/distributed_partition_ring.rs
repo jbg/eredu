@@ -14,8 +14,8 @@ use safemlx::{
 };
 use safemlx_lm::{
     runtime::checkpoint::load::StrictLoadConfig,
-    runtime::distributed::topology::load_safetensors_partition, DeviceAssignment, ParallelTopology,
-    PlacementPlan, TensorPlacement,
+    runtime::distributed::topology::load_safetensors_partition, DeviceAssignment,
+    MlxParallelContext, PlacementPlan, TensorPlacement,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -31,7 +31,7 @@ fn partition_ring_worker() {
     let checkpoint = std::env::var_os(CHECKPOINT_DIR).unwrap();
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology =
-        ParallelTopology::from_group(&group, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+        MlxParallelContext::for_group(&group, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
 

@@ -14,22 +14,15 @@ use safemlx::{
 use safemlx_lm::{
     architectures::distributed::expert::{AllToAllVPlan, RoutedTransport},
     core::{CollectiveScope, DistributedSession},
-    DeviceAssignment, MlxBackend, ParallelTopology,
+    DeviceAssignment, MlxBackend, MlxParallelContext,
 };
 
 const WORKER_ENV: &str = "SAFEMLX_CARTESIAN_RING_WORKER";
 const TRIPLE_WORKER_ENV: &str = "SAFEMLX_CARTESIAN_TRIPLE_RING_WORKER";
 
-fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> ParallelTopology {
-    ParallelTopology::from_rank(
-        4,
-        rank,
-        tp,
-        pp,
-        ep,
-        DeviceAssignment::new(DeviceType::Cpu, 0),
-    )
-    .unwrap()
+fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> MlxParallelContext {
+    MlxParallelContext::for_rank(rank, tp, pp, ep, DeviceAssignment::new(DeviceType::Cpu, 0))
+        .unwrap()
 }
 
 fn scalar(value: i32) -> Array {
@@ -266,8 +259,7 @@ fn cartesian_triple_ring_worker() {
     let expected_rank: usize = expected_rank.to_string_lossy().parse().unwrap();
     let world = distributed::init(true, Backend::Ring).unwrap();
     assert_eq!((world.rank(), world.size()), (expected_rank, 8));
-    let topology = ParallelTopology::from_rank(
-        8,
+    let topology = MlxParallelContext::for_rank(
         expected_rank,
         2,
         2,

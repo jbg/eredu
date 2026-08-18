@@ -399,7 +399,7 @@ impl KimiLinearLayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -1194,7 +1194,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::ParallelTopology>,
+        topology: Option<crate::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let geometry = match topology {
             Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
@@ -1485,7 +1485,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
 
     fn expert_parallel_assignment(
         &self,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
@@ -2172,6 +2172,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
     use std::fs;
 
     use safemlx::{
@@ -2193,10 +2194,7 @@ mod tests {
         core::residency::OffloadConfig,
         runtime::{
             checkpoint::store::{SafetensorsWeightStore, WeightStore},
-            distributed::{
-                parallel::{ParallelBuildContext, ShardingPolicy},
-                topology::{DeviceAssignment, ParallelTopology},
-            },
+            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{
                 ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
             },
@@ -2253,7 +2251,7 @@ mod tests {
         let args = model_args_from_config_value(&tiny_config()).unwrap();
         let adapter = KimiLinearLayerwiseAdapter::new(args, execution.stream()).unwrap();
         let context = ParallelBuildContext::new(
-            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap(),
             ShardingPolicy::Require,
         );
@@ -2298,8 +2296,7 @@ mod tests {
         let args = model_args_from_config_value(&tiny_config()).unwrap();
 
         for rank in 0..12 {
-            let topology = ParallelTopology::from_rank(
-                12,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 2,
@@ -2334,7 +2331,7 @@ mod tests {
         }
 
         let topology =
-            ParallelTopology::from_rank(4, 0, 2, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            MlxParallelContext::for_rank(0, 2, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         let adapter =
             KimiLinearLayerwiseAdapter::new_external_experts(args, execution.stream()).unwrap();
@@ -2361,8 +2358,7 @@ mod tests {
         {
             let mut adapter =
                 KimiLinearLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
-            let topology = ParallelTopology::from_rank(
-                2,
+            let topology = MlxParallelContext::for_rank(
                 rank,
                 2,
                 1,
@@ -2477,8 +2473,7 @@ mod tests {
             let adapter =
                 KimiLinearLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
             let context = ParallelBuildContext::new(
-                ParallelTopology::from_rank(
-                    2,
+                MlxParallelContext::for_rank(
                     rank,
                     2,
                     1,

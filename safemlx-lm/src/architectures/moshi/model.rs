@@ -1369,10 +1369,10 @@ impl MoshiLayerwiseStatic {
 
     pub(crate) fn new_tensor_parallel(
         args: &ModelArgs,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        use crate::runtime::distributed::topology::balanced_contiguous_range;
+        use crate::core::balanced_contiguous_range;
         let text_embedding = balanced_contiguous_range(
             (args.text_card + 1) as usize,
             topology.tensor_parallel_size,
@@ -1561,7 +1561,7 @@ impl MoshiLayerwiseStatic {
         let parallel = self.parallel.as_ref().expect("TP Moshi static modules");
         let widths = (0..parallel.parts)
             .map(|rank| {
-                crate::runtime::distributed::topology::balanced_contiguous_range(
+                crate::core::balanced_contiguous_range(
                     parallel.global_text_output,
                     parallel.parts,
                     rank,

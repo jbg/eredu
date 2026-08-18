@@ -40,6 +40,7 @@ use crate::core::{
     SpeculativeOutputError, SpeculativeSemanticState,
 };
 
+use crate::backend::mlx::MlxParallelContext;
 pub(crate) use crate::nn as common;
 use crate::runtime::chat::constraints::ConstraintCompiler;
 use crate::runtime::chat::{
@@ -51,7 +52,6 @@ pub use crate::runtime::chat::{
 };
 use crate::runtime::checkpoint::gguf::{self as gguf_tokenizer, GgufTokenizer};
 use crate::runtime::checkpoint::quantization::WeightQuantization;
-use crate::runtime::distributed::topology::ParallelTopology;
 use crate::runtime::execution::inspection::ActivationObserver;
 use crate::runtime::generation::sampler::{
     ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler,

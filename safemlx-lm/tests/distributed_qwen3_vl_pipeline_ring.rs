@@ -27,7 +27,7 @@ use safemlx_lm::{
     runtime::media::input::{InputMetadata, InputPart, ModelInput},
     runtime::media::PreparedModelInput,
     DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions, LayerwiseLoadOptions,
-    MlxBackend, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions, ParallelTopology,
+    MlxBackend, MlxParallelContext, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions,
     PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 
@@ -468,7 +468,7 @@ fn qwen3_vl_pipeline_ring_worker() {
     };
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology =
-        ParallelTopology::from_group(&group, tp, 2, ep, DeviceAssignment::new(DeviceType::Cpu, 0))
+        MlxParallelContext::for_group(&group, tp, 2, ep, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());

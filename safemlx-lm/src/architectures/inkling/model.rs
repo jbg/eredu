@@ -2835,11 +2835,11 @@ impl AudioModel {
     pub(crate) fn new_tensor_parallel(
         args: &AudioArgs,
         dense_dtype: Dtype,
-        topology: crate::runtime::distributed::topology::ParallelTopology,
+        topology: crate::backend::mlx::MlxParallelContext,
         stream: &Stream,
     ) -> Result<Self, Error> {
         let global = (args.num_codebooks * args.codebook_size) as usize;
-        let range = crate::runtime::distributed::topology::balanced_contiguous_range(
+        let range = crate::core::balanced_contiguous_range(
             global,
             topology.tensor_parallel_size,
             topology.tensor_parallel_rank,

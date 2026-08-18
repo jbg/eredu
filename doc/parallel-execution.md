@@ -4,10 +4,19 @@
 expert parallelism (EP) through one Cartesian topology. Each process has exact
 coordinates and subgroup membership for the axes that apply to its model.
 
-Use the ordinary high-level loader only for a replicated topology. A
-non-replicated request must use the selected family's tensor-parallel adapter,
-the pipeline loader, or the expert-parallel loader. Unsupported combinations
-fail preflight before checkpoint payloads are materialized.
+All supported families use the ordinary architecture-erased loader. Build the
+canonical `safemlx_lm::ParallelTopology` in core terms, bind its process rank
+to an MLX device with `MlxParallelContext`, and pass that context through
+`ModelLoadOptions::with_parallel`. Unsupported combinations fail preflight
+before checkpoint payloads are materialized; there are no public
+family-specific parallel loaders.
+
+`ParallelTopology` derives world size from its tensor, pipeline, expert, and
+data dimensions. `ParallelRankTopology` owns coordinate mapping, subgroup
+membership, pipeline neighbors, balanced layer/expert ownership, and pure
+preflight planning. `MlxParallelContext` adds only a process-local MLX device
+assignment. Native groups, arrays, transfers, and exact completions stay in
+the selected MLX session.
 
 ## Topology matrix
 
