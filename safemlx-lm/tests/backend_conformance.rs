@@ -1,6 +1,14 @@
+//! End-to-end conformance suite for a backend implemented without MLX.
+//!
+//! The client probes are generic over the facade contracts so new backend
+//! implementations can reuse the same loading, generation, capability, media,
+//! speculative, and realtime call shapes.
+
 use std::{
+    convert::Infallible,
     io::Write,
     num::{NonZeroU8, NonZeroUsize},
+    path::Path,
 };
 
 use safemlx_lm::{
@@ -14,13 +22,16 @@ use safemlx_lm::{
         PreparedChatMtpGenerationRequest, PreparedChatSpeculativeBackend, RgbImage,
     },
     core::{MtpSchedulerStats, MtpStats},
-    AdmissionRequest, AdmissionResult, Backend, BackendCapabilities, BackendDescriptor,
-    BackendSession, CacheStateStrategy, CapabilityError, DeviceDescriptor, EstimationCompleteness,
-    FinishReason, GenerationConfigOverrides, GrowingState, InputModalities, InputTokenCount,
-    ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend, ModelRuntime, MtpCapability,
-    MtpCheckpointKind, MultimodalPreparationBackend, Observed, PhysicalMemorySemantics,
-    PreparedModel, RuntimeStateEstimate, SemanticEvent, StateLayout, StaticMemoryReport,
-    Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
+    load_realtime_model_with_options, AdmissionRequest, AdmissionResult, Backend,
+    BackendCapabilities, BackendDescriptor, BackendSession, CacheStateStrategy, CapabilityError,
+    DeviceDescriptor, EstimationCompleteness, FinishReason, GenerationConfigOverrides,
+    GrowingState, InputModalities, InputTokenCount, ModelCapabilities, ModelCapabilityBackend,
+    ModelLoadingBackend, ModelRuntime, MtpCapability, MtpCheckpointKind,
+    MultimodalPreparationBackend, Observed, PhysicalMemorySemantics, PreparedModel,
+    RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler,
+    RealtimeSpeechConfig, RequestId, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
+    SemanticStateTransaction, StateLayout, StaticMemoryReport, Submission, TextGenerationBackend,
+    TextGenerationConfig, TokenFilter, TokenOutput, WorkDescriptor,
 };
 use safemlx_lm_core::Completion;
 use tokenizers::{
@@ -504,8 +515,7 @@ fn write_loadable_text_artifact(root: &std::path::Path) {
         .unwrap();
 }
 
-#[test]
-fn downstream_loader_selects_the_backend_without_backend_specific_arguments() {
+fn assert_loading_generation_capability_and_multimodal_conformance() {
     let artifact = tempfile::tempdir().unwrap();
     write_loadable_text_artifact(artifact.path());
 
@@ -513,41 +523,13 @@ fn downstream_loader_selects_the_backend_without_backend_specific_arguments() {
 
     assert_eq!(model.model_type(), "llama");
     assert_eq!(model.eos_token_ids(), &[0]);
-    capability_client_code(&model, &vec![1, 2, 3]);
+    let prepared = multimodal_client_code(&model);
+    assert_eq!(prepared, vec![1, 2_001, 7, 1]);
+    capability_client_code(&model, &prepared);
     assert_eq!(client_code(&mut model), vec![1, 2, 3]);
 }
 
-#[test]
-fn downstream_text_client_is_generic_over_the_selected_backend() {
-    let vocabulary = [("[UNK]".to_owned(), 0), ("hello".to_owned(), 1)]
-        .into_iter()
-        .collect();
-    let tokenizer = WordLevel::builder()
-        .vocab(vocabulary)
-        .unk_token("[UNK]".into())
-        .build()
-        .unwrap();
-    let tokenizer = ChatTokenizer::from_tokenizer(Tokenizer::new(tokenizer));
-    let runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
-    let mut model = LoadedModel::from_runtime(
-        runtime,
-        tokenizer,
-        LoadedTextModelConfig {
-            model_type: "mock_text".into(),
-            model_id: "mock".into(),
-            chat_template: None,
-            eos_token_ids: Vec::new(),
-            checkpoint_generation_config: None,
-        },
-    );
-
-    assert_eq!(client_code(&mut model), vec![1, 2, 3]);
-    assert_eq!(multimodal_client_code(&model), vec![1, 2_001, 7, 1]);
-    assert_eq!(model.model_type(), "mock_text");
-}
-
-#[test]
-fn prepared_chat_constraints_and_semantics_use_the_same_generic_client_api() {
+fn assert_prepared_generation_and_speculative_conformance() {
     let vocabulary = std::iter::once(("[UNK]".to_owned(), 0))
         .chain((0..64).map(|index| (format!("ordinary_{index}"), index + 1)))
         .collect();
@@ -660,4 +642,163 @@ fn prepared_chat_constraints_and_semantics_use_the_same_generic_client_api() {
             reason: FinishReason::MaxTokens
         }]
     );
+}
+
+#[derive(Clone)]
+struct MockRealtimeSession {
+    step: u32,
+    sampling: RealtimeSampling,
+}
+
+impl SemanticStateTransaction for MockRealtimeSession {
+    type Branch = Self;
+    type Error = Infallible;
+
+    fn branch(&self) -> Result<Self::Branch, Self::Error> {
+        Ok(self.clone())
+    }
+
+    fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Self::Error> {
+        *self = branch;
+        Ok(())
+    }
+}
+
+struct MockFrame(Vec<u32>);
+
+impl WorkDescriptor for MockFrame {
+    type Error = Infallible;
+
+    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Self::Error> {
+        output.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+struct RealtimeDone;
+
+impl Completion for RealtimeDone {
+    type Error = Infallible;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+struct MockRealtimeBackend;
+
+impl RealtimeBackend for MockRealtimeBackend {
+    type Model = u64;
+    type ModelIdentity = u64;
+    type Input = MockFrame;
+    type Output = u32;
+    type Session = MockRealtimeSession;
+    type Completion = RealtimeDone;
+    type Error = Infallible;
+
+    fn name(&self) -> &str {
+        "portable-mock-realtime"
+    }
+
+    fn model_identity(&self, model: &Self::Model) -> Self::ModelIdentity {
+        *model
+    }
+
+    fn speech_config(&self, _: &Self::Model) -> RealtimeSpeechConfig {
+        RealtimeSpeechConfig::new(2, 1, 1, 1, 0, 0, vec![0, 1]).unwrap()
+    }
+
+    fn create_session(
+        &self,
+        _: &Self::Model,
+        sampling: RealtimeSampling,
+    ) -> Result<Self::Session, Self::Error> {
+        Ok(MockRealtimeSession { step: 0, sampling })
+    }
+
+    fn validate_session(&self, _: &Self::Model, _: &Self::Session) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn validate_input(&self, _: &Self::Model, _: &Self::Input) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn input_batch_size(&self, input: &Self::Input) -> usize {
+        input.0.len()
+    }
+
+    fn set_sampling(
+        &self,
+        session: &mut Self::Session,
+        sampling: RealtimeSampling,
+    ) -> Result<(), Self::Error> {
+        session.sampling = sampling;
+        Ok(())
+    }
+
+    fn submit_step(
+        &self,
+        model: &mut Self::Model,
+        session: &mut Self::Session,
+        input: &Self::Input,
+    ) -> Result<Submission<Self::Output, Self::Completion>, Self::Error> {
+        session.step += 1;
+        Ok(Submission {
+            output: *model as u32 + session.step + input.0.iter().sum::<u32>(),
+            completion: RealtimeDone,
+        })
+    }
+}
+
+impl RealtimeModelLoadingBackend for MockRealtimeBackend {
+    type LoadOptions = u64;
+
+    fn prepare_realtime_model(
+        &self,
+        _: &Path,
+        options: Self::LoadOptions,
+    ) -> Result<Self::Model, Self::Error> {
+        Ok(options)
+    }
+}
+
+fn assert_realtime_conformance() {
+    let mut model =
+        load_realtime_model_with_options(MockRealtimeBackend, "mock-realtime-artifact", 23)
+            .unwrap();
+    assert_eq!(model.backend().name(), "portable-mock-realtime");
+    assert_eq!(*model.model(), 23);
+    assert_eq!(model.speech_config().generated_audio_codebooks(), 1);
+
+    let limits = SchedulerLimits::with_execution_bounds(1, 2, 1, 1, 1, usize::MAX).unwrap();
+    let mut scheduler = RealtimeScheduler::new(&model, limits).unwrap();
+    let request = RequestId::new(7);
+    scheduler
+        .register_request(&model, request, RealtimeSampling::greedy())
+        .unwrap();
+    scheduler
+        .enqueue(&model, request, MockFrame(vec![2]))
+        .unwrap();
+    let completed = scheduler.run_queued(&mut model).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed.into_iter().next().unwrap().into_parts().1, 26);
+
+    let sampling = RealtimeSampling::new(0.5, 0.75, 11).unwrap();
+    scheduler
+        .set_request_sampling(&model, request, sampling)
+        .unwrap();
+    let session = scheduler.release_request(request).unwrap();
+    assert_eq!(session.state().sampling, sampling);
+}
+
+#[test]
+fn non_mlx_backend_conforms_to_the_complete_generic_facade() {
+    assert_loading_generation_capability_and_multimodal_conformance();
+    assert_prepared_generation_and_speculative_conformance();
+    assert_realtime_conformance();
 }

@@ -232,3 +232,21 @@ fn portable_api_tests_do_not_depend_on_backend_implementations() {
         "MLX integration tests must have a dedicated module"
     );
 }
+
+#[test]
+fn backend_conformance_suite_remains_backend_independent() {
+    let suite =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend_conformance.rs");
+    let source = std::fs::read_to_string(suite).expect("conformance suite must be readable");
+    for forbidden in [
+        "safemlx::",
+        "safemlx_sys::",
+        "backend::mlx",
+        "cfg(feature = \"mlx\")",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "backend conformance suite contains MLX implementation reference {forbidden:?}"
+        );
+    }
+}

@@ -785,7 +785,10 @@ after that transaction reaches its exact safe boundary.
 8. Register every live cache with `CacheResidencyPool`, publish concrete
    occupancy, and retain each admission token through the exact native
    transfer or persistence transition that owns it.
-9. Run the core mock conformance tests plus backend-specific model load,
+9. Reuse the generic client probes in `tests/backend_conformance.rs` for model
+   loading, generation, capabilities and admission, multimodal preparation,
+   speculative execution, and realtime scheduling. Run that suite without
+   default features, then add backend-specific model load,
    architecture-erased prefill, multi-step decode, cancellation, checkpoint,
    and parity tests.
 10. Add backend selection at the facade/application boundary. Do not dispatch

@@ -94,12 +94,8 @@ path = "tests/automatic_planner_api.rs"
 required-features = ["mlx"]
 
 [[test]]
-name = "backend_generic_text"
-path = "tests/backend_generic_text.rs"
-
-[[test]]
-name = "backend_generic_realtime"
-path = "tests/backend_generic_realtime.rs"
+name = "backend_conformance"
+path = "tests/backend_conformance.rs"
 
 [[test]]
 name = "core_types"
