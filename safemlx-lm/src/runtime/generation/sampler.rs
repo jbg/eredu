@@ -6,10 +6,11 @@ use safemlx::{
     Array, Stream,
 };
 
+#[cfg(test)]
+use crate::runtime::chat::GenerationRuntimePlan;
 use crate::{
     core::{TokenFilter, TokenFilterController},
     runtime::chat::constraints::{ConstraintController, ConstraintError},
-    runtime::chat::GenerationRuntimePlan,
 };
 
 /// Sampling policy suitable for lossless speculative decoding.
@@ -160,15 +161,21 @@ impl<S: Clone> Clone for ConstrainedSampler<S> {
 }
 
 impl<S> ConstrainedSampler<S> {
+    /// Wraps `policy` with facade-prepared canonical constraint state.
+    pub(crate) fn with_controller(policy: S, controller: ConstraintController) -> Self {
+        Self { policy, controller }
+    }
+
     /// Wraps `policy` with the constraint and activation semantics in `plan`.
+    #[cfg(test)]
     pub(crate) fn from_generation_plan(
         policy: S,
         plan: &GenerationRuntimePlan,
     ) -> Result<Self, ConstraintError> {
-        Ok(Self {
+        Ok(Self::with_controller(
             policy,
-            controller: ConstraintController::from_generation_plan(plan)?,
-        })
+            ConstraintController::from_generation_plan(plan)?,
+        ))
     }
 
     #[cfg(test)]

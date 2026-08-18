@@ -157,7 +157,6 @@ impl ConstraintController {
         }
     }
 
-    #[cfg(feature = "mlx")]
     pub(crate) fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, ConstraintError> {
         match &mut self.runtime_at(history)? {
             ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
@@ -165,7 +164,6 @@ impl ConstraintController {
         }
     }
 
-    #[cfg(feature = "mlx")]
     fn runtime_at(&self, history: &[u32]) -> Result<ConstraintRuntime, ConstraintError> {
         if !history.starts_with(&self.committed_tokens) {
             return Err(ConstraintError::new(
@@ -179,7 +177,6 @@ impl ConstraintController {
         Ok(runtime)
     }
 
-    #[cfg(feature = "mlx")]
     pub(crate) fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, ConstraintError> {
         token_filter_at_runtime(&mut self.runtime_at(history)?)
     }

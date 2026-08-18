@@ -9,16 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use safemlx::{transforms::async_eval, Device, DeviceType, ExecutionContext};
+use safemlx::{Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    api::LoadedModel,
-    backend::mlx::MlxBackend,
-    runtime::{
-        chat::ChatTemplateRequest,
-        generation::sampler::GenerationSampler,
-        media::input::{InputPart, ModelInput},
-    },
-    GenerationConfigOverrides,
+    api::LoadedModel, backend::mlx::MlxBackend, runtime::chat::ChatTemplateRequest,
+    GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
 
 /// Receives one UTF-8 text fragment. The bytes are valid only during the call.
@@ -89,7 +83,6 @@ fn publish_error(out: *mut *mut c_char, message: String) {
 
 fn generate(
     model: &mut LoadedModel<MlxBackend<'static>>,
-    stream: &safemlx::Stream,
     prompt: &str,
     callback: TextCallback,
     context: usize,
@@ -115,49 +108,29 @@ fn generate(
         .map_err(|error| error.to_string())?;
 
     let tokens = model
-        .encode_to_array(&rendered.0, rendered.1, stream)
+        .encode(&rendered.0, rendered.1)
         .map_err(|error| error.to_string())?;
-    if tokens.shape().get(1).copied().unwrap_or_default() == 0 {
+    if tokens.is_empty() {
         return Err("the prompt produced no input tokens".into());
     }
 
-    let settings = model
+    let mut settings = model
         .resolve_generation_config(GenerationConfigOverrides::default())
         .map_err(|error| error.to_string())?;
     let max_tokens = settings.max_new_tokens.unwrap_or(256);
-    let prng_key = (settings.temperature != 0.0)
-        .then(|| safemlx::random::key(0))
-        .transpose()
-        .map_err(|error| error.to_string())?;
+    settings.max_new_tokens = Some(max_tokens);
     let eos = model.eos_token_ids().to_vec();
     let mut decoder = model.text_decoder(true);
-    let parts = [InputPart::text_token_ids(&tokens)];
-    let input = ModelInput::new(&parts);
-    let mut generator = model.generate_input_with_sampler(
-        settings.temperature,
-        input,
-        prng_key,
-        GenerationSampler::from_resolved(settings),
-    );
-
-    let mut current = generator
-        .next()
-        .transpose()
+    let generator = model
+        .generate_tokens(tokens, TextGenerationConfig::new(settings))
         .map_err(|error| error.to_string())?;
     let mut generated_tokens = 0_u64;
     let mut ttft = None;
-    for index in 0..max_tokens {
-        let Some(token) = current.take() else { break };
-        let next = if index + 1 < max_tokens {
-            let next = generator.next();
-            if let Some(Ok(next_token)) = next.as_ref() {
-                async_eval([next_token]).map_err(|error| error.to_string())?;
-            }
-            next
-        } else {
-            None
-        };
-        let token_id = token.item::<u32>(stream);
+    for token in generator {
+        let token_id = token
+            .map_err(|error| error.to_string())?
+            .token_id()
+            .map_err(|error| error.to_string())?;
         if eos.contains(&token_id) {
             break;
         }
@@ -170,9 +143,7 @@ fn generate(
             // which remains active until this worker reports completion.
             unsafe { callback(fragment.as_ptr(), fragment.len(), context as *mut c_void) };
         }
-        current = next.transpose().map_err(|error| error.to_string())?;
     }
-    stream.synchronize().map_err(|error| error.to_string())?;
     Ok(GenerationStats::new(
         generated_tokens,
         ttft,
@@ -212,8 +183,7 @@ fn worker_main(
                     context,
                     result,
                 } => {
-                    let generated =
-                        generate(&mut model, execution.stream(), &prompt, callback, context);
+                    let generated = generate(&mut model, &prompt, callback, context);
                     let _ = result.send(generated);
                 }
                 Command::Shutdown => break,

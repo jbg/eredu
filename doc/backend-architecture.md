@@ -327,6 +327,18 @@ are returned as opaque executor telemetry and folded into the core-owned
 in-flight transaction, optimistic promotion, cache-commit, callback ordering,
 or telemetry state machine.
 
+Prepared-chat speculative setup is facade orchestration, not backend work.
+`LoadedModel<B>` resolves checkpoint sampling defaults, tokenizes a rendered
+prompt through `B::prepare_text_prompt` (or accepts an already prepared opaque
+prompt), validates semantic support, and constructs both
+`PreparedChatSpeculativeConstraint` and the transactional
+`SpeculativeSemanticState`. `PreparedChatSpeculativeBackend` receives only the
+resulting execution-ready single request or batch lanes. A second backend can
+apply the portable constraint's filters around its own logits math and pass the
+semantic state to the core output runtime without reproducing dialect, stop,
+parser-fork, or replay semantics. MLX converts the resolved sampling policy to
+its array sampler and owns only execution, PRNG arrays, streams, and caches.
+
 The MLX adapter has one scheduler implementation in
 `backend/mlx/speculative/scheduler.rs`. Its `generate_tokens` and
 `generate_semantic` entry points accept every MLX `SpeculativeExecutor`.
@@ -361,7 +373,10 @@ contain only portable sampling settings, scheduler policy, cancellation, and
 semantic callbacks. `PreparedChatSpeculativeBackend` makes capability discovery,
 single-request execution, and fair batch execution operations on generic
 `LoadedModel<B>`; its associated drafter type prevents cross-backend pairing.
-The MLX implementation is the production path. The target and `MlxDrafter`
+The facade turns those caller requests into execution-ready requests with an
+opaque backend prompt, resolved generation settings, a canonical grammar state,
+and a transactional semantic parser before invoking the backend. The MLX
+implementation is the production path. The target and `MlxDrafter`
 retain the MLX streams selected when each was loaded; batch cache lanes are
 allocated inside the MLX adapter. The caller supplies the drafter tokenizer to
 the MLX loader, so vocabulary compatibility is exact without making the
@@ -655,9 +670,10 @@ values. `PreparedChatError<B::Error>` carries submission, exact-completion, and
 token-extraction failures as the selected backend's concrete error type;
 constraint, tokenizer, semantic-streaming, and lifecycle failures are separate
 portable variants. The committed-token driver likewise keeps source and decoder
-errors typed instead of formatting them into strings. Speculative capability has
-its own backend-associated error because a backend may expose different failure
-structure for target/drafter coordination. Tokenizer, chat-template, and
+errors typed instead of formatting them into strings.
+`PreparedChatMtpError<B::Error>` similarly separates facade tokenizer,
+configuration, constraint, and semantic setup from the selected backend's
+target/drafter execution failure. Tokenizer, chat-template, and
 sidecar loading use `TextMetadataError`, so generic `LoadedModel<B>` assembly
 does not mention the MLX facade error. `LoadedModelLoadError<B::Error>` also
 separates portable artifact inspection from backend materialization instead of

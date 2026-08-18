@@ -4,9 +4,11 @@ use std::num::NonZeroUsize;
 
 use safemlx_lm_core::{
     generation::{
-        FinishReason, GenerationCancellationToken, GenerationConfigOverrides, SemanticEvent,
+        FinishReason, GenerationCancellationToken, GenerationConfigOverrides, MtpConfig,
+        SemanticEvent,
     },
-    MtpCapability, MtpSchedulerOptions, MtpSchedulerStats, MtpStats,
+    MtpCapability, MtpSchedulerOptions, MtpSchedulerStats, MtpStats, SpeculativeOutputError,
+    SpeculativeSemanticState, TextGenerationConfig, TokenFilter,
 };
 use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
@@ -15,25 +17,16 @@ use crate::api::TextDecoder;
 use crate::runtime::chat::constraints::{
     ConstraintCompiler, ConstraintController, ConstraintError,
 };
+use crate::runtime::chat::SemanticRuntimePlan;
 use crate::runtime::chat::{
     prepare_format_profile, resolve_structural_tokens, CapabilitySupport, ChatCapabilities,
     ChatTemplateIdentity, ChatTemplateRequest, NativeToolSupport, PreparedChat, SemanticSupport,
     ToolChoice,
 };
-use crate::runtime::generation::streaming::{CommittedTokenSource, TokenDecoderBackend};
-use std::collections::HashMap;
-
-#[cfg(feature = "mlx")]
-use crate::{
-    error::Error,
-    runtime::chat::SemanticRuntimePlan,
-    runtime::generation::sampler::ConstrainedSampler,
-    runtime::generation::streaming::{CommittedTokenPipeline, RawTokenDecoder},
+use crate::runtime::generation::streaming::{
+    CommittedTokenPipeline, CommittedTokenSource, RawTokenDecoder, TokenDecoderBackend,
 };
-#[cfg(feature = "mlx")]
-use safemlx::Array;
-#[cfg(feature = "mlx")]
-use safemlx_lm_core::{SpeculativeOutputError, SpeculativeSemanticState};
+use std::collections::HashMap;
 
 /// Model sampling and stopping settings for one prepared chat generation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,14 +35,6 @@ pub struct PreparedChatGenerationSettings {
     pub overrides: GenerationConfigOverrides,
     /// Deterministic root seed used by the selected backend for stochastic sampling.
     pub seed: u64,
-}
-
-#[cfg(feature = "mlx")]
-pub(super) struct ResolvedPreparedChatGenerationSettings {
-    pub(super) temperature: f32,
-    pub(super) max_tokens: NonZeroUsize,
-    pub(super) prng_key: Option<Array>,
-    pub(super) checkpoint_sampler: crate::runtime::generation::sampler::GenerationSampler,
 }
 
 /// Explicit prompt source for structured generation from a [`PreparedChat`].
@@ -192,25 +177,42 @@ impl Default for PreparedChatMtpGenerationOptions {
 pub trait PreparedChatSpeculativeBackend: safemlx_lm_core::TextGenerationBackend {
     /// Backend-owned separately prepared draft model.
     type Drafter;
-    /// Backend-owned speculative execution failure.
-    type SpeculativeError: std::error::Error + Send + Sync + 'static;
-
     /// Reports fail-closed speculative support for the selected model session.
     fn mtp_capability(model: &LoadedModel<Self>) -> MtpCapability;
 
     /// Executes one prepared-chat speculative request.
     fn execute_prepared_chat_mtp<'a, F>(
         model: &mut LoadedModel<Self>,
-        request: PreparedChatMtpGenerationRequest<'a, Self, Self::Drafter, F>,
-    ) -> Result<PreparedChatMtpGenerationOutput, Self::SpeculativeError>
+        request: PreparedChatMtpExecutionRequest<'a, Self, Self::Drafter, F>,
+    ) -> Result<PreparedChatMtpGenerationOutput, Self::Error>
     where
         F: FnMut(SemanticEvent);
 
     /// Executes independent prepared-chat lanes through one fair scheduler.
     fn execute_prepared_chat_mtp_batch<'a>(
         model: &mut LoadedModel<Self>,
-        request: PreparedChatMtpBatchRequest<'a, Self, Self::Drafter>,
-    ) -> Result<PreparedChatMtpBatchOutput, Self::SpeculativeError>;
+        request: PreparedChatMtpBatchExecutionRequest<'a, Self, Self::Drafter>,
+    ) -> Result<PreparedChatMtpBatchOutput, Self::Error>;
+}
+
+/// Failure while the facade prepares or a backend executes speculative chat.
+#[derive(Debug, thiserror::Error)]
+pub enum PreparedChatMtpError<E: std::error::Error + Send + Sync + 'static> {
+    /// The selected backend failed prompt preparation or speculative execution.
+    #[error("selected backend failed prepared-chat speculative generation: {0}")]
+    Backend(#[source] E),
+    /// Portable generation configuration was invalid.
+    #[error(transparent)]
+    Generation(#[from] crate::core::generation::GenerationError),
+    /// Portable tokenizer preparation failed.
+    #[error(transparent)]
+    Text(#[from] TextModelError),
+    /// Portable constraint construction failed.
+    #[error(transparent)]
+    Constraint(#[from] ConstraintError),
+    /// The prepared semantic plan or parser state was invalid.
+    #[error("prepared-chat semantic generation failed: {0}")]
+    Semantic(String),
 }
 
 /// Draft-model source selected for one speculative request.
@@ -253,10 +255,10 @@ pub struct PreparedChatMtpGenerationOutput {
 /// One independently executable lane in a prepared-chat MTP batch.
 ///
 /// Every lane owns portable sampling, a random root, stop configuration, and
-/// callback. The backend allocates its cache while the runtime constructs a
-/// constrained sampler and decoder/parser pipeline from `input` before
-/// submitting the lane. Lanes are shared by the external-assistant and
-/// embedded-head drafting strategies.
+/// callback. The facade constructs its constraint and decoder/parser pipeline
+/// before dispatch; the backend allocates only its execution cache and sampling
+/// state. Lanes are shared by the external-assistant and embedded-head drafting
+/// strategies.
 pub struct PreparedChatMtpBatchLane<'a, B: safemlx_lm_core::TextGenerationBackend> {
     /// Explicit prompt source and embedded format/runtime plan.
     pub input: PreparedChatInput<'a, B>,
@@ -291,6 +293,103 @@ pub struct PreparedChatMtpBatchOutput {
     pub scheduler: MtpSchedulerStats,
 }
 
+/// Facade-prepared speculative grammar state consumed by a backend sampler.
+///
+/// The facade constructs this state from the prepared chat exactly once. A
+/// backend applies its portable filters to backend-owned logits and commits
+/// only tokens accepted by target verification.
+#[derive(Clone)]
+pub struct PreparedChatSpeculativeConstraint {
+    controller: ConstraintController,
+}
+
+impl PreparedChatSpeculativeConstraint {
+    pub(super) fn from_prepared_chat(
+        prepared_chat: &PreparedChat,
+    ) -> Result<Self, ConstraintError> {
+        let generation_plan = prepared_chat
+            .generation_runtime_plan()
+            .expect("supported prepared chats carry a generation runtime plan");
+        Ok(Self {
+            controller: ConstraintController::from_generation_plan(generation_plan)?,
+        })
+    }
+
+    /// Returns the vocabulary filter at a speculative logical history.
+    pub fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, ConstraintError> {
+        self.controller.filter_at(history)
+    }
+
+    /// Returns whether the grammar accepts a speculative logical history.
+    pub fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, ConstraintError> {
+        self.controller.prefix_is_complete(history)
+    }
+
+    /// Commits one target-accepted token to the durable grammar state.
+    pub fn commit(&mut self, token: u32) -> Result<(), ConstraintError> {
+        self.controller.commit(token)
+    }
+
+    #[cfg(feature = "mlx")]
+    pub(crate) fn into_controller(self) -> ConstraintController {
+        self.controller
+    }
+}
+
+/// Execution-ready speculative request assembled by the portable facade.
+///
+/// Backend implementations receive resolved settings, an opaque prepared
+/// prompt, and canonical grammar/parser state. They do not inspect chat plans,
+/// tokenize rendered prompts, or construct semantic state themselves.
+pub struct PreparedChatMtpExecutionRequest<'a, B: safemlx_lm_core::TextGenerationBackend, D, F> {
+    /// Backend-owned prompt prepared by the selected session backend.
+    pub prompt: B::Prompt,
+    /// Embedded or separately loaded draft-model selection.
+    pub drafting: PreparedChatDraft<'a, D>,
+    /// Fully resolved portable sampling configuration and random seed.
+    pub generation: TextGenerationConfig,
+    /// Resolved token budget, proposal width, temperature, and EOS ids.
+    pub config: MtpConfig,
+    /// Canonical facade-owned grammar state.
+    pub constraint: PreparedChatSpeculativeConstraint,
+    /// Transactional decoded semantic parser state.
+    pub semantic: Box<dyn SpeculativeSemanticState>,
+    /// Fair-scheduler controls.
+    pub scheduler: MtpSchedulerOptions,
+    /// One-shot cooperative-cancellation token.
+    pub cancellation: GenerationCancellationToken,
+    /// Called synchronously for each event after its cache transaction commits.
+    pub on_event: F,
+}
+
+/// One facade-prepared lane for backend speculative batch execution.
+pub struct PreparedChatMtpExecutionLane<'a, B: safemlx_lm_core::TextGenerationBackend> {
+    /// Backend-owned prompt prepared by the selected session backend.
+    pub prompt: B::Prompt,
+    /// Fully resolved portable sampling configuration and random seed.
+    pub generation: TextGenerationConfig,
+    /// Resolved token budget, proposal width, temperature, and EOS ids.
+    pub config: MtpConfig,
+    /// Canonical facade-owned grammar state.
+    pub constraint: PreparedChatSpeculativeConstraint,
+    /// Transactional decoded semantic parser state.
+    pub semantic: Box<dyn SpeculativeSemanticState>,
+    /// One-shot cooperative-cancellation token owned only by this lane.
+    pub cancellation: GenerationCancellationToken,
+    /// Called synchronously for canonical events from only this lane.
+    pub on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
+}
+
+/// Execution-ready fair-scheduler request assembled by the portable facade.
+pub struct PreparedChatMtpBatchExecutionRequest<'a, B: safemlx_lm_core::TextGenerationBackend, D> {
+    /// Embedded or separately loaded draft-model selection.
+    pub drafting: PreparedChatDraft<'a, D>,
+    /// Independently prepared speculative lanes.
+    pub lanes: Vec<PreparedChatMtpExecutionLane<'a, B>>,
+    /// Bounded scheduler and optimistic-lookahead controls.
+    pub scheduler: MtpSchedulerOptions,
+}
+
 #[derive(Clone)]
 pub(super) struct PreparedChatTokenDecoder {
     pub(super) decoder: TextDecoder,
@@ -321,18 +420,12 @@ impl TokenDecoderBackend for PreparedChatTokenDecoder {
     }
 }
 
-#[cfg(feature = "mlx")]
-pub(super) struct PreparedChatRuntime<S> {
-    pub(super) sampler: ConstrainedSampler<S>,
-}
-
 pub(super) struct PreparedChatControlRuntime {
     pub(super) controller: ConstraintController,
     pub(super) parser: crate::runtime::generation::streaming::ToolRuntimeParser,
     pub(super) structural_tokens: HashMap<u32, String>,
 }
 
-#[cfg(feature = "mlx")]
 pub(super) struct PreparedChatSemanticState {
     initial_decoder: PreparedChatTokenDecoder,
     plan: SemanticRuntimePlan,
@@ -342,7 +435,6 @@ pub(super) struct PreparedChatSemanticState {
     events: Vec<SemanticEvent>,
 }
 
-#[cfg(feature = "mlx")]
 impl PreparedChatSemanticState {
     pub(super) fn new(
         initial_decoder: PreparedChatTokenDecoder,
@@ -379,7 +471,6 @@ impl PreparedChatSemanticState {
     }
 }
 
-#[cfg(feature = "mlx")]
 impl SpeculativeSemanticState for PreparedChatSemanticState {
     fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
         let mut pipeline = Self::build_pipeline(
@@ -425,31 +516,6 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
     fn take_events(&mut self) -> Vec<SemanticEvent> {
         std::mem::take(&mut self.events)
     }
-}
-
-#[cfg(feature = "mlx")]
-pub(super) fn with_prepared_chat_runtime<R>(
-    prepared_chat: &PreparedChat,
-    sampling: crate::runtime::generation::sampler::GenerationSampler,
-    execute: impl FnOnce(
-        PreparedChatRuntime<crate::runtime::generation::sampler::GenerationSampler>,
-    ) -> Result<R, Error>,
-) -> Result<R, Error> {
-    let _semantic_plan = match prepared_chat.semantic_support() {
-        SemanticSupport::Supported => prepared_chat
-            .semantic_runtime_plan()
-            .expect("supported prepared chats carry a semantic runtime plan"),
-        SemanticSupport::Unsupported { reason } => {
-            return Err(Error::PreparedChatSemantic(format!(
-                "prepared chat does not have an executable semantic plan: {reason}"
-            )));
-        }
-    };
-    let generation_plan = prepared_chat
-        .generation_runtime_plan()
-        .expect("supported prepared chats carry a generation runtime plan");
-    let sampler = ConstrainedSampler::from_generation_plan(sampling, generation_plan)?;
-    execute(PreparedChatRuntime { sampler })
 }
 
 pub(super) fn prepared_chat_control_runtime(

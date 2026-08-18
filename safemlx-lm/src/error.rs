@@ -119,10 +119,6 @@ pub enum Error {
     #[error(transparent)]
     Constraint(#[from] crate::runtime::chat::constraints::ConstraintError),
 
-    /// A prepared semantic plan or event stream was invalid.
-    #[error("prepared-chat semantic generation failed: {0}")]
-    PreparedChatSemantic(String),
-
     /// MLX speculative execution failed.
     #[error("MLX speculative generation failed: {0}")]
     Speculative(String),

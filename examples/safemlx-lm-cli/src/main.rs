@@ -13,10 +13,9 @@ use anyhow::{bail, Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use safemlx::{
-    error::Exception,
-    ops::indexing::TryIndexOp,
+    ops::indexing::{NewAxis, TryIndexOp},
     random::RandomState,
-    transforms::{async_eval, eval},
+    transforms::eval,
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
@@ -29,10 +28,10 @@ use safemlx_lm::{
         discover_hardware, execution_plan_load_options, expert_cache_telemetry, mtp_telemetry,
         plan_automatic_execution, residency_telemetry,
     },
-    backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams},
+    backend::mlx::speculative::MlxDrafter,
     backend::mlx::{
         inspect_model, speculative::MtpComponentTimingGuard, MlxBackend, MlxInspectionOptions,
-        ModelLoadOptions,
+        MlxModelInput, ModelLoadOptions,
     },
     core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     core::speculative::MtpStats,
@@ -43,9 +42,7 @@ use safemlx_lm::{
     runtime::execution::layerwise::{
         LayerwiseLoadOptions, NonExpertWeightResidency, WeightResidency,
     },
-    runtime::generation::sampler::{
-        DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
-    },
+    runtime::generation::sampler::{MirostatV2Sampler, Sampler},
     runtime::media::input::{InputPart, ModelInput},
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     runtime::residency::expert_cache::{
@@ -54,9 +51,9 @@ use safemlx_lm::{
     AllocatorTelemetry, AutomaticPlanRequest, DevicePlan, DraftPlacementPlan, DraftingPlan,
     ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
     GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
-    HardwareProfile, ModelResourceProfile, MtpConfig, MtpSchedulerOptions, Observed,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, SemanticEvent, TimingTelemetry,
-    WeightTransformationPlan,
+    HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed, PlanExplanation,
+    PlanExplanationEntry, PlanExplanationLevel, SemanticEvent, TextGenerationConfig,
+    TimingTelemetry, TokenOutput, WeightTransformationPlan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -198,70 +195,6 @@ impl From<ExpertCacheEviction> for CacheEvictionPolicy {
         match value {
             ExpertCacheEviction::Lru => Self::LeastRecentlyUsed,
             ExpertCacheEviction::Lfu => Self::LeastFrequentlyUsed,
-        }
-    }
-}
-
-#[derive(Clone)]
-enum CliSampler {
-    Greedy(DefaultSampler),
-    Configured(GenerationSampler),
-    MirostatV2(MirostatV2Sampler),
-}
-
-impl Sampler for CliSampler {
-    fn sample(
-        &mut self,
-        logits: &Array,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        match self {
-            Self::Greedy(sampler) => sampler.sample(logits, temp, prng_state, stream),
-            Self::Configured(sampler) => sampler.sample(logits, temp, prng_state, stream),
-            Self::MirostatV2(sampler) => sampler.sample(logits, temp, prng_state, stream),
-        }
-    }
-}
-
-impl SpeculativeSampler for CliSampler {
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        match self {
-            Self::Greedy(sampler) => sampler.supports_exact_optimistic_promotion(),
-            Self::Configured(sampler) => sampler.supports_exact_optimistic_promotion(),
-            Self::MirostatV2(sampler) => sampler.supports_exact_optimistic_promotion(),
-        }
-    }
-
-    fn process_logits(
-        &mut self,
-        logits: &Array,
-        temperature: f32,
-        history: &[u32],
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        match self {
-            Self::Greedy(sampler) => sampler.process_logits(logits, temperature, history, stream),
-            Self::Configured(sampler) => {
-                sampler.process_logits(logits, temperature, history, stream)
-            }
-            Self::MirostatV2(sampler) => {
-                sampler.process_logits(logits, temperature, history, stream)
-            }
-        }
-    }
-
-    fn commit_token(
-        &mut self,
-        processed_logits: &Array,
-        token: u32,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        match self {
-            Self::Greedy(sampler) => sampler.commit_token(processed_logits, token, stream),
-            Self::Configured(sampler) => sampler.commit_token(processed_logits, token, stream),
-            Self::MirostatV2(sampler) => sampler.commit_token(processed_logits, token, stream),
         }
     }
 }
@@ -2257,11 +2190,15 @@ fn main() -> Result<()> {
         load_options,
     )
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
-    let resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
+    let mut resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: args.temperature,
         top_k: args.top_k,
         top_p: args.top_p,
         min_p: args.min_p,
+        repetition_penalty: Some(args.repeat_penalty),
+        repeat_last_n: Some(args.repeat_last_n),
+        frequency_penalty: Some(args.frequency_penalty),
+        presence_penalty: Some(args.presence_penalty),
         max_new_tokens: args.max_tokens,
         ..GenerationConfigOverrides::default()
     })?;
@@ -2270,6 +2207,7 @@ fn main() -> Result<()> {
     let top_p = resolved_generation.top_p;
     let min_p = resolved_generation.min_p;
     let max_tokens = resolved_generation.max_new_tokens.unwrap_or(256);
+    resolved_generation.max_new_tokens = Some(max_tokens);
     if args.mirostat_v2 && temperature == 0.0 {
         bail!("--mirostat-v2 requires an effective temperature greater than zero");
     }
@@ -2309,11 +2247,6 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to load draft model from {}", path.display()))
         })
         .transpose()?;
-    if let Some(drafter) = &drafter {
-        model
-            .validate_drafter_compatibility(drafter)
-            .context("target and draft models are not MTP-compatible")?;
-    }
     stream.synchronize()?;
     if draft_stream != stream {
         draft_stream.synchronize()?;
@@ -2391,48 +2324,18 @@ fn main() -> Result<()> {
         }
     };
 
-    let tokens = model.encode_to_array(&rendered_prompt, add_special_tokens, stream)?;
-    if tokens.shape()[1] == 0 {
+    let prompt_token_ids = model.encode(&rendered_prompt, add_special_tokens)?;
+    if prompt_token_ids.is_empty() {
         bail!("the prompt produced no input tokens");
     }
+    let tokens = Array::from(prompt_token_ids.as_slice()).try_index_device(NewAxis, stream)?;
 
     if args.expert_cache_benchmark {
         run_expert_cache_benchmark(&mut model, &tokens, stream)?;
+        model.runtime_mut().session_mut().reset()?;
     }
 
     let eos_token_ids = model.eos_token_ids().to_vec();
-    let configured_sampler = GenerationSampler::new()
-        .top_k(top_k)
-        .top_p(top_p)
-        .min_p(min_p)
-        .penalties(
-            args.repeat_penalty,
-            args.repeat_last_n,
-            args.frequency_penalty,
-            args.presence_penalty,
-        );
-    // Probability filters cannot change a greedy argmax. Avoid their full-vocabulary
-    // sorting and softmax work, as well as GenerationSampler's token-history readback,
-    // when no repetition/frequency/presence penalty is active.
-    let penalties_active =
-        args.repeat_penalty != 1.0 || args.frequency_penalty != 0.0 || args.presence_penalty != 0.0;
-    let mut sampler = if args.mirostat_v2 {
-        CliSampler::MirostatV2(
-            MirostatV2Sampler::new(args.mirostat_tau, args.mirostat_eta)?.penalties(
-                args.repeat_penalty,
-                args.repeat_last_n,
-                args.frequency_penalty,
-                args.presence_penalty,
-            ),
-        )
-    } else if temperature == 0.0 && !penalties_active {
-        CliSampler::Greedy(DefaultSampler)
-    } else {
-        CliSampler::Configured(configured_sampler)
-    };
-    let prng_key = (temperature != 0.0)
-        .then(|| safemlx::random::key(args.seed))
-        .transpose()?;
     let mut output_ids = Vec::with_capacity(max_tokens);
     let profile_gemma4 = args.profile_components && model.model_type() == "gemma4";
     if profile_gemma4 {
@@ -2604,96 +2507,29 @@ fn main() -> Result<()> {
         if let Some(error) = semantic_error {
             return Err(error);
         }
-    } else if let Some(drafter) = drafter.as_mut() {
+    } else if drafter.is_some() || embedded_mtp {
+        bail!(
+            "speculative generation requires a prepared chat with executable semantic support; raw and unrecognized-template fallbacks use ordinary generation"
+        );
+    } else if args.mirostat_v2 {
+        let mut sampler = MirostatV2Sampler::new(args.mirostat_tau, args.mirostat_eta)?.penalties(
+            args.repeat_penalty,
+            args.repeat_last_n,
+            args.frequency_penalty,
+            args.presence_penalty,
+        );
+        let mut random = RandomState::from_key(safemlx::random::key(args.seed)?);
         let parts = [InputPart::text_token_ids(&tokens)];
-        let input = ModelInput::new(&parts);
-        let config = MtpConfig {
-            max_tokens,
-            max_draft_tokens: args.mtp_draft_tokens,
-            temperature,
-            eos_token_ids: eos_token_ids.clone(),
-        };
-        let mtp_streams = MtpExecutionStreams::new(stream, draft_stream)?;
-        let (tokens, stats) = model
-            .generate_mtp_input_with_sampler_callback_and_streams_and_options(
-                drafter,
-                input,
-                &config,
-                prng_key,
-                &mut sampler,
-                mtp_streams,
-                scheduler_options,
-                |token_id| {
-                    if time_to_first_token.is_none() {
-                        time_to_first_token = Some(generation_started.elapsed());
-                    }
-                    if eos_token_ids.contains(&token_id) {
-                        Ok(())
-                    } else {
-                        write_streamed_token(
-                            &mut decoder,
-                            &mut stdout,
-                            &mut streamed_text,
-                            token_id,
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))
-                    }
-                },
-            )?;
-        output_ids = tokens;
-        mtp_stats = Some(stats);
-    } else if embedded_mtp {
-        let parts = [InputPart::text_token_ids(&tokens)];
-        let input = ModelInput::new(&parts);
-        let config = MtpConfig {
-            max_tokens,
-            max_draft_tokens: args.mtp_draft_tokens,
-            temperature,
-            eos_token_ids: eos_token_ids.clone(),
-        };
-        let (tokens, stats) = model.generate_embedded_mtp_input_with_sampler_callback(
-            input,
-            &config,
-            prng_key,
-            &mut sampler,
-            stream,
-            |token_id| {
-                if time_to_first_token.is_none() {
-                    time_to_first_token = Some(generation_started.elapsed());
-                }
-                if eos_token_ids.contains(&token_id) {
-                    Ok(())
-                } else {
-                    write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)
-                        .map_err(|error| Exception::custom(error.to_string()))
-                }
-            },
-        )?;
-        output_ids = tokens;
-        mtp_stats = Some(stats);
-    } else {
-        let parts = [InputPart::text_token_ids(&tokens)];
-        let input = ModelInput::new(&parts);
-        let mut generator =
-            model.generate_input_with_sampler(temperature, input, prng_key, sampler);
-
-        let mut current = generator.next().transpose()?;
+        let prompt = MlxModelInput::from(ModelInput::new(&parts));
+        let mut logits = model
+            .runtime_mut()
+            .prefill(prompt)?
+            .wait()?
+            .into_logits()
+            .context("raw generation requires logits on the local MLX rank")?;
         for index in 0..max_tokens {
-            let Some(token) = current.take() else {
-                break;
-            };
-            // Start the following decode before reading the current token back to
-            // the CPU. This mirrors mlx-lm's one-token async evaluation pipeline.
-            let next = if index + 1 < max_tokens {
-                let next = generator.next();
-                if let Some(Ok(next_token)) = next.as_ref() {
-                    async_eval([next_token])?;
-                }
-                next
-            } else {
-                None
-            };
-            let token_id = token.item::<u32>(stream);
+            let token = sampler.sample(&logits, temperature, Some(&mut random), stream)?;
+            let token_id = token.clone().item::<u32>(stream);
             if time_to_first_token.is_none() {
                 time_to_first_token = Some(generation_started.elapsed());
             }
@@ -2702,7 +2538,30 @@ fn main() -> Result<()> {
                 break;
             }
             write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)?;
-            current = next.transpose()?;
+            if index + 1 == max_tokens {
+                break;
+            }
+            let input = token.try_index_device((.., NewAxis), stream)?;
+            logits = model
+                .runtime_mut()
+                .decode(input)?
+                .wait()?
+                .into_logits()
+                .context("raw generation requires logits on the local MLX rank")?;
+        }
+    } else {
+        let config = TextGenerationConfig::new(resolved_generation).with_seed(args.seed);
+        let generator = model.generate_tokens(prompt_token_ids.clone(), config)?;
+        for token in generator {
+            let token_id = token?.token_id()?;
+            if time_to_first_token.is_none() {
+                time_to_first_token = Some(generation_started.elapsed());
+            }
+            output_ids.push(token_id);
+            if eos_token_ids.contains(&token_id) {
+                break;
+            }
+            write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)?;
         }
     }
     reasoning_stream.close(&mut stderr, reasoning_output)?;
@@ -2815,7 +2674,7 @@ fn main() -> Result<()> {
             "mlx_cache_memory: {}",
             format_bytes(allocator.cache_bytes as usize)
         );
-        if let Some(stats) = model.native_quantization_stats() {
+        if let Some(stats) = model.runtime().session().native_quantization_stats() {
             eprintln!(
                 "native_quantization: {} tensors / {}, fallback: {} tensors / {} checkpoint bytes",
                 stats.native_tensor_count,
@@ -2853,7 +2712,7 @@ fn main() -> Result<()> {
             }
             safemlx_lm::architectures::gemma4::model::set_perf_profiling(false);
         }
-        if let Some(report) = model.residency_report()? {
+        if let Some(report) = model.runtime().session().residency_report()? {
             let offload = report.offload();
             eprintln!(
                 "residency_current_host_device: {} / {} bytes",
@@ -2890,7 +2749,7 @@ fn main() -> Result<()> {
                 );
             }
         }
-        if let Some(report) = model.expert_cache_report()? {
+        if let Some(report) = model.runtime().session().expert_cache_report()? {
             eprintln!(
                 "expert_cache_owned: {} experts, {} bytes",
                 report.owned_experts, report.owned_bytes
@@ -2960,8 +2819,15 @@ fn main() -> Result<()> {
             },
             |report| report.explanation.clone(),
         );
-        let residency = model.residency_report()?.as_ref().map(residency_telemetry);
+        let residency = model
+            .runtime()
+            .session()
+            .residency_report()?
+            .as_ref()
+            .map(residency_telemetry);
         let expert_cache = model
+            .runtime()
+            .session()
             .expert_cache_report()?
             .as_ref()
             .map(expert_cache_telemetry);
@@ -3133,6 +2999,8 @@ fn expert_benchmark_snapshot(
     model: &LoadedModel<MlxBackend<'static>>,
 ) -> Result<ExpertBenchmarkSnapshot> {
     let report = model
+        .runtime()
+        .session()
         .expert_cache_report()?
         .context("sparse expert cache benchmark requires an expert-cache model")?;
     Ok(ExpertBenchmarkSnapshot {
@@ -3195,12 +3063,17 @@ fn run_expert_cache_benchmark(
     stream: &Stream,
 ) -> Result<()> {
     let parts = [InputPart::text_token_ids(tokens)];
-    let input = ModelInput::new(&parts);
+    let prompt = MlxModelInput::from(ModelInput::new(&parts));
 
     let before_cold = expert_benchmark_snapshot(model)?;
-    model.reset_session()?;
+    model.runtime_mut().session_mut().reset()?;
     let started = Instant::now();
-    let logits = model.submit_prefill(input)?.wait()?;
+    let logits = model
+        .runtime_mut()
+        .prefill(prompt.clone())?
+        .wait()?
+        .into_logits()
+        .context("expert-cache benchmark requires logits on the local MLX rank")?;
     eval([&logits])?;
     stream.synchronize()?;
     let cold_elapsed = started.elapsed();
@@ -3214,9 +3087,14 @@ fn run_expert_cache_benchmark(
     );
 
     let before_repeated = after_cold;
-    model.reset_session()?;
+    model.runtime_mut().session_mut().reset()?;
     let started = Instant::now();
-    let logits = model.submit_prefill(input)?.wait()?;
+    let logits = model
+        .runtime_mut()
+        .prefill(prompt)?
+        .wait()?
+        .into_logits()
+        .context("expert-cache benchmark requires logits on the local MLX rank")?;
     eval([&logits])?;
     stream.synchronize()?;
     let repeated_elapsed = started.elapsed();
@@ -3232,7 +3110,12 @@ fn run_expert_cache_benchmark(
     let last = tokens.try_index_device((.., tokens.dim(1) - 1..), stream)?;
     let before_decode = after_repeated;
     let started = Instant::now();
-    let logits = model.submit_decode(last)?.wait()?;
+    let logits = model
+        .runtime_mut()
+        .decode(last)?
+        .wait()?
+        .into_logits()
+        .context("expert-cache benchmark requires logits on the local MLX rank")?;
     eval([&logits])?;
     stream.synchronize()?;
     let decode_elapsed = started.elapsed();
@@ -3262,6 +3145,9 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if args.draft_model.is_some() && args.mtp_draft_tokens == 0 {
         bail!("--mtp-draft-tokens must be greater than zero when --draft-model is used");
+    }
+    if args.raw && args.draft_model.is_some() {
+        bail!("--draft-model requires prepared-chat generation and cannot be used with --raw");
     }
     if args.mtp_draft_device != MtpDraftDevice::Target && args.draft_model.is_none() {
         bail!(
@@ -3868,7 +3754,10 @@ mod tests {
 
     use clap::{CommandFactory, FromArgMatches, Parser};
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
-    use safemlx_lm::core::speculative::SpeculativeExecutionTopology;
+    use safemlx_lm::{
+        backend::mlx::speculative::MtpExecutionStreams,
+        core::speculative::SpeculativeExecutionTopology,
+    };
 
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
@@ -3881,9 +3770,9 @@ mod tests {
         use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
         write_semantic_event, write_timing_report, Array, AutoMode, AutoPlanCacheKey,
         AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType,
-        DraftingPlan, ExecutionPlan, MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions,
-        NativeToolSupport, ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel,
-        SemanticEvent, SemanticSupport, StopReason, WeightQuantization, WeightTransformationPlan,
+        DraftingPlan, ExecutionPlan, MtpDraftDevice, MtpSchedulerOptions, NativeToolSupport,
+        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
+        SemanticSupport, StopReason, WeightQuantization, WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -4316,6 +4205,25 @@ mod tests {
             validate_args(&raw).is_ok(),
             "raw unconstrained generation remains intentionally supported"
         );
+    }
+
+    #[test]
+    fn rejects_external_drafting_for_raw_generation() {
+        let raw = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--draft-model",
+            "draft-id",
+            "--raw",
+            "prompt",
+        ])
+        .unwrap();
+
+        assert!(validate_args(&raw)
+            .unwrap_err()
+            .to_string()
+            .contains("requires prepared-chat generation"));
     }
 
     #[test]

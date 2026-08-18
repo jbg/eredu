@@ -2,7 +2,7 @@ use crate::api::metadata::{
     eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, merge_eos_token_id_sources,
     read_checkpoint_generation_config,
 };
-use crate::api::request::{prepare_chat_from_parts, with_prepared_chat_runtime};
+use crate::api::request::prepare_chat_from_parts;
 use crate::api::tokenizer::{load_chat_template, load_tokenizer_template_kwargs};
 use crate::api::{
     chat_template_kwargs, load_tokenizer, LoadedModel, PreparedChatDraft, PreparedChatInput,
@@ -34,7 +34,7 @@ use crate::{
         AffineQuantization, CheckpointQuantizationOptions, WeightQuantization,
     },
     runtime::execution::inspection::ActivationRecorder,
-    runtime::generation::sampler::{ConstrainedSampler, DefaultSampler, GenerationSampler},
+    runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
     runtime::{chat::constraints::ConstraintCompiler, media::input},
 };
 use safemlx::{
@@ -681,7 +681,7 @@ fn chat_preparation_contracts_are_public_and_default_conservatively() {
 }
 
 #[test]
-fn unsupported_prepared_chat_fails_before_execution_boundary() {
+fn prepared_chat_input_keeps_its_semantic_owner_with_an_opaque_backend_prompt() {
     let prepared = PreparedChat {
         rendered_prompt: "prompt must not be prefetched".into(),
         generation_prompt: String::new(),
@@ -721,7 +721,6 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
         preserved_structural_token_ids: Vec::new(),
         profile_stop_sequences: Vec::new(),
     };
-    let execution_calls = AtomicUsize::new(0);
     let input: PreparedChatInput<'_, crate::backend::mlx::MlxBackend<'static>> =
         PreparedChatInput::rendered_prompt(&prepared);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
@@ -736,19 +735,6 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
         PreparedChatInput::prepared_backend_input(&prepared, model_input);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(input.backend_prompt().is_some());
-
-    let error = with_prepared_chat_runtime(&prepared, GenerationSampler::default(), |_| {
-        execution_calls.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    })
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        Error::PreparedChatSemantic(message)
-            if message.contains("synthetic unsupported profile")
-    ));
-    assert_eq!(execution_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]

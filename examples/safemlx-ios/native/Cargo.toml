@@ -10,5 +10,5 @@ crate-type = ["staticlib"]
 
 [dependencies]
 safemlx.workspace = true
-safemlx-lm = { path = "../../../safemlx-lm", default-features = false }
+safemlx-lm = { path = "../../../safemlx-lm", default-features = false, features = ["mlx"] }
 serde_json.workspace = true

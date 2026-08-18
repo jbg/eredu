@@ -20,9 +20,11 @@ pub use crate::runtime::chat::{
 pub use request::{
     PreparedChatDraft, PreparedChatError, PreparedChatGenerationOutput,
     PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-    PreparedChatMtpBatchLane, PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest,
-    PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationOutput,
-    PreparedChatMtpGenerationRequest, PreparedChatSpeculativeBackend,
+    PreparedChatMtpBatchExecutionRequest, PreparedChatMtpBatchLane, PreparedChatMtpBatchOutput,
+    PreparedChatMtpBatchRequest, PreparedChatMtpError, PreparedChatMtpExecutionLane,
+    PreparedChatMtpExecutionRequest, PreparedChatMtpGenerationOptions,
+    PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest,
+    PreparedChatSpeculativeBackend, PreparedChatSpeculativeConstraint,
 };
 pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 

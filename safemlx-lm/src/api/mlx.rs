@@ -10,8 +10,9 @@
 
 use super::portable::LoadedModel;
 use super::request::{
-    PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOutput,
-    PreparedChatMtpGenerationRequest, PreparedChatSpeculativeBackend,
+    PreparedChatMtpBatchExecutionRequest, PreparedChatMtpBatchOutput,
+    PreparedChatMtpExecutionRequest, PreparedChatMtpGenerationOutput,
+    PreparedChatSpeculativeBackend,
 };
 use crate::backend::mlx::speculative::MlxDrafter;
 use crate::core::generation::SemanticEvent;
@@ -20,7 +21,6 @@ use crate::error::Error;
 
 impl PreparedChatSpeculativeBackend for crate::backend::mlx::MlxBackend<'static> {
     type Drafter = MlxDrafter;
-    type SpeculativeError = Error;
 
     fn mtp_capability(model: &LoadedModel<Self>) -> MtpCapability {
         model.mlx_mtp_capability()
@@ -28,7 +28,7 @@ impl PreparedChatSpeculativeBackend for crate::backend::mlx::MlxBackend<'static>
 
     fn execute_prepared_chat_mtp<'a, F>(
         model: &mut LoadedModel<Self>,
-        request: PreparedChatMtpGenerationRequest<'a, Self, Self::Drafter, F>,
+        request: PreparedChatMtpExecutionRequest<'a, Self, Self::Drafter, F>,
     ) -> Result<PreparedChatMtpGenerationOutput, Error>
     where
         F: FnMut(SemanticEvent),
@@ -38,7 +38,7 @@ impl PreparedChatSpeculativeBackend for crate::backend::mlx::MlxBackend<'static>
 
     fn execute_prepared_chat_mtp_batch<'a>(
         model: &mut LoadedModel<Self>,
-        request: PreparedChatMtpBatchRequest<'a, Self, Self::Drafter>,
+        request: PreparedChatMtpBatchExecutionRequest<'a, Self, Self::Drafter>,
     ) -> Result<PreparedChatMtpBatchOutput, Error> {
         model.execute_prepared_chat_mtp_batch_mlx(request)
     }

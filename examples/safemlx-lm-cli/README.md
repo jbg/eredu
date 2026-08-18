@@ -246,6 +246,10 @@ cargo run --release -p safemlx-lm-cli -- \
   "Explain speculative decoding."
 ```
 
+Speculative generation requires a recognized chat template with executable
+semantic support. It is therefore unavailable with `--raw` or the
+unrecognized-template text fallback; those paths use ordinary generation.
+
 `--mtp-draft-device target` reuses the target stream. An explicit `cpu` or
 `gpu:N` creates a separate draft stream. Use `--disable-mtp-lookahead` for the
 canonical no-lookahead comparison. Details and capability limits are in
