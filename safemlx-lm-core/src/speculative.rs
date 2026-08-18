@@ -34,6 +34,36 @@ impl std::fmt::Display for SpeculativeExecutionTopology {
     }
 }
 
+/// How a model exposes speculative draft-token weights.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MtpCheckpointKind {
+    /// Drafting weights live in a separately prepared model.
+    Separate,
+    /// Drafting weights are embedded in the selected target model.
+    Embedded,
+}
+
+/// Fail-closed multi-token-prediction capability of a prepared model session.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MtpCapability {
+    /// The model does not advertise executable draft weights.
+    Unavailable,
+    /// Speculative execution is available with the stated checkpoint form.
+    Ready {
+        /// Location of the drafting weights.
+        checkpoint: MtpCheckpointKind,
+    },
+    /// Draft weights exist, but this backend cannot execute them.
+    Unsupported {
+        /// Location of the drafting weights.
+        checkpoint: MtpCheckpointKind,
+        /// Stable architecture identity reported by the backend.
+        architecture: String,
+    },
+}
+
 /// Statistics collected from one speculative sequence.
 #[derive(Debug, Clone, Default)]
 pub struct MtpStats {
@@ -2114,6 +2144,20 @@ mod tests {
     use std::{cell::RefCell, convert::Infallible, rc::Rc};
 
     type TransactionTrace = Rc<RefCell<Vec<&'static str>>>;
+
+    #[test]
+    fn mtp_capability_schema_round_trips_without_backend_identity() {
+        let capability = MtpCapability::Unsupported {
+            checkpoint: MtpCheckpointKind::Embedded,
+            architecture: "future_decoder".into(),
+        };
+        let json = serde_json::to_string(&capability).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MtpCapability>(&json).unwrap(),
+            capability
+        );
+        assert!(!json.contains("mlx"));
+    }
 
     #[derive(Debug, Clone, Default)]
     struct Done {

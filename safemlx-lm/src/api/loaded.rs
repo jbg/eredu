@@ -184,6 +184,37 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
         })
     }
 
+    /// Reports fail-closed speculative support for this backend model session.
+    pub fn mtp_capability(&self) -> MtpCapability
+    where
+        B: PreparedChatSpeculativeBackend,
+    {
+        B::mtp_capability(self)
+    }
+
+    /// Generates one structured response using embedded or external drafting.
+    pub fn generate_prepared_chat_mtp<'a, F>(
+        &mut self,
+        request: PreparedChatMtpGenerationRequest<'a, B, B::Drafter, F>,
+    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    where
+        B: PreparedChatSpeculativeBackend,
+        F: FnMut(SemanticEvent),
+    {
+        B::execute_prepared_chat_mtp(self, request)
+    }
+
+    /// Generates independent prepared chats through one fair speculative scheduler.
+    pub fn generate_prepared_chat_mtp_batch<'a>(
+        &mut self,
+        request: PreparedChatMtpBatchRequest<'a, B, B::Drafter>,
+    ) -> Result<PreparedChatMtpBatchOutput, Error>
+    where
+        B: PreparedChatSpeculativeBackend,
+    {
+        B::execute_prepared_chat_mtp_batch(self, request)
+    }
+
     /// Returns the model id passed to chat-template rendering.
     pub fn model_id_for_template(&self) -> &str {
         &self.model_id
@@ -817,7 +848,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     }
 
     /// Generates multiple independent prepared chats through one fair MTP scheduler.
-    pub fn generate_prepared_chat_mtp_batch(
+    pub(crate) fn execute_prepared_chat_mtp_batch_mlx(
         &mut self,
         request: PreparedChatMtpBatchRequest<
             '_,
@@ -976,7 +1007,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     }
 
     /// Generates one structured response using embedded or external drafting.
-    pub fn generate_prepared_chat_mtp<'a, F>(
+    pub(crate) fn execute_prepared_chat_mtp_mlx<'a, F>(
         &mut self,
         request: PreparedChatMtpGenerationRequest<
             'a,
@@ -1159,7 +1190,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     }
 
     /// Reports whether and how this target can perform MTP generation.
-    pub fn mtp_capability(&self) -> MtpCapability {
+    pub(crate) fn mlx_mtp_capability(&self) -> MtpCapability {
         self.model().mtp_capability()
     }
 

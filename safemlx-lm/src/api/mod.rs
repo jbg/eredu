@@ -4,6 +4,9 @@
 //! together with its tokenizer and chat template. Use
 //! [`crate::api::load_model`] and [`crate::api::load_tokenizer`] when you
 //! want to manage those pieces separately.
+//! Ordinary generation is available for every `TextGenerationBackend`;
+//! prepared-chat speculative generation is available through the
+//! [`PreparedChatSpeculativeBackend`] capability on the same `LoadedModel<B>`.
 
 use std::{collections::HashMap, num::NonZeroUsize, path::Path};
 
@@ -32,6 +35,7 @@ use crate::core::generation::{
     GenerationCancellationToken, GenerationConfigOverrides, MtpConfig, MtpSchedulerOptions,
     ResolvedGenerationConfig, SemanticEvent,
 };
+use crate::core::{MtpCapability, MtpCheckpointKind};
 
 pub(crate) use crate::nn as common;
 use crate::runtime::chat::constraints::ConstraintCompiler;
@@ -65,8 +69,7 @@ use crate::{
     runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::generation::speculative::{
-        MtpBatchOutput, MtpCapability, MtpCheckpointKind, MtpScheduler, MtpSchedulerStats,
-        MtpSemanticState, MtpStats,
+        MtpBatchOutput, MtpScheduler, MtpSchedulerStats, MtpSemanticState, MtpStats,
     },
 };
 
@@ -299,7 +302,8 @@ pub use request::{
     PreparedChatDraft, PreparedChatGenerationOutput, PreparedChatGenerationRequest,
     PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
     PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
-    PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest, TextDecoder,
+    PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest,
+    PreparedChatSpeculativeBackend, TextDecoder,
 };
 /// Codec-free realtime speech-to-speech token APIs.
 pub mod realtime;

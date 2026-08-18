@@ -31,34 +31,6 @@ use crate::{
     runtime::generation::sampler::SpeculativeSampler,
 };
 
-/// How an architecture exposes draft-token weights.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MtpCheckpointKind {
-    /// Drafting weights live in a separately loaded checkpoint.
-    Separate,
-    /// Drafting weights are embedded in the target checkpoint.
-    Embedded,
-}
-
-/// Runtime MTP status reported by a loaded model.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum MtpCapability {
-    /// The model does not advertise MTP weights.
-    Unavailable,
-    /// MTP is executable when the stated checkpoint form is provided.
-    Ready {
-        /// Location of the drafting weights.
-        checkpoint: MtpCheckpointKind,
-    },
-    /// The architecture can carry MTP weights, but its runtime adapter is pending.
-    Unsupported {
-        /// Location of the drafting weights.
-        checkpoint: MtpCheckpointKind,
-        /// Stable architecture name.
-        architecture: String,
-    },
-}
-
 /// Component timings accumulated by an architecture-specific MTP backend.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MtpComponentTimings {

@@ -24,6 +24,13 @@ usable proposal depth is capped by the checkpoint's validated capability.
 Applications should query `mtp_capability` or run model inspection instead of
 assuming support from a family name.
 
+The prepared-chat client surface is backend-generic. A backend implements
+`PreparedChatSpeculativeBackend`, supplies its own associated drafter type, and
+then uses the same `LoadedModel<B>::generate_prepared_chat_mtp` and batch APIs.
+`MtpCapability` and `MtpCheckpointKind` are portable core values; absence of the
+capability implementation fails at the type boundary rather than silently
+falling back to ordinary generation.
+
 ## Execution placement
 
 Prepared-chat requests do not accept streams. The target retains the execution

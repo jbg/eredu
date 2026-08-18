@@ -2281,9 +2281,8 @@ fn main() -> Result<()> {
     if draft_model_path.is_some()
         && !matches!(
             model.mtp_capability(),
-            safemlx_lm::runtime::generation::speculative::MtpCapability::Ready {
-                checkpoint:
-                    safemlx_lm::runtime::generation::speculative::MtpCheckpointKind::Separate
+            safemlx_lm::MtpCapability::Ready {
+                checkpoint: safemlx_lm::MtpCheckpointKind::Separate
             }
         )
     {
@@ -2453,9 +2452,8 @@ fn main() -> Result<()> {
     let embedded_mtp = args.mtp_draft_tokens > 0
         && matches!(
             model.mtp_capability(),
-            safemlx_lm::runtime::generation::speculative::MtpCapability::Ready {
-                checkpoint:
-                    safemlx_lm::runtime::generation::speculative::MtpCheckpointKind::Embedded
+            safemlx_lm::MtpCapability::Ready {
+                checkpoint: safemlx_lm::MtpCheckpointKind::Embedded
             }
         );
     let _component_timing_guard = args.verbose.then(MtpComponentTimingGuard::enable);

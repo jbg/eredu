@@ -10,7 +10,7 @@ use safemlx::{
     Array, Event, Stream,
 };
 use safemlx_lm_core::{
-    Completion, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
+    Completion, MtpCapability, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
     SpeculativeRandomness, SpeculativeSampling,
 };
 
@@ -20,7 +20,9 @@ use crate::{
             load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
             Gemma4AssistantDraftModel,
         },
-        ModelCache, ModelLoadOptions,
+        LoadedModel, ModelCache, ModelLoadOptions, PreparedChatMtpBatchOutput,
+        PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOutput,
+        PreparedChatMtpGenerationRequest, PreparedChatSpeculativeBackend,
     },
     architectures::muse_glimmer::assistant::{self as muse_dflash, MuseGlimmerDFlash},
     error::Error,
@@ -223,6 +225,31 @@ impl MlxDrafter {
     /// Execution stream selected when this drafter was loaded.
     pub const fn stream(&self) -> &Stream {
         &self.stream
+    }
+}
+
+impl PreparedChatSpeculativeBackend for super::MlxBackend<'static> {
+    type Drafter = MlxDrafter;
+
+    fn mtp_capability(model: &LoadedModel<Self>) -> MtpCapability {
+        model.mlx_mtp_capability()
+    }
+
+    fn execute_prepared_chat_mtp<'a, F>(
+        model: &mut LoadedModel<Self>,
+        request: PreparedChatMtpGenerationRequest<'a, Self, Self::Drafter, F>,
+    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    where
+        F: FnMut(safemlx_lm_core::SemanticEvent),
+    {
+        model.execute_prepared_chat_mtp_mlx(request)
+    }
+
+    fn execute_prepared_chat_mtp_batch<'a>(
+        model: &mut LoadedModel<Self>,
+        request: PreparedChatMtpBatchRequest<'a, Self, Self::Drafter>,
+    ) -> Result<PreparedChatMtpBatchOutput, Error> {
+        model.execute_prepared_chat_mtp_batch_mlx(request)
     }
 }
 

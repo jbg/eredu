@@ -14,8 +14,7 @@ use safemlx_lm::{
     },
     backend::mlx::speculative::MlxDrafter,
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
-    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind},
-    MtpSchedulerOptions, SemanticEvent,
+    MtpCapability, MtpCheckpointKind, MtpSchedulerOptions, SemanticEvent,
 };
 use serde_json::json;
 

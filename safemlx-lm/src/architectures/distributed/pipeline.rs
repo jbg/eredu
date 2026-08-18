@@ -68,6 +68,7 @@ use crate::{
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
+    core::{MtpCapability, MtpCheckpointKind},
     error::Error,
     nn::{
         parallel::{
@@ -110,7 +111,7 @@ use crate::{
     runtime::generation::{
         embedded_mtp::{DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget},
         sampler::SpeculativeSampler,
-        speculative::{MtpCapability, MtpCheckpointKind, MtpStats},
+        speculative::MtpStats,
     },
     runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
     runtime::residency::dense_stream::DENSE_TRANSFER_WINDOW,

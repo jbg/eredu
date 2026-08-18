@@ -1,13 +1,20 @@
-use std::convert::Infallible;
+use std::{convert::Infallible, num::NonZeroUsize};
 
 use safemlx_lm::{
     api::{
         ChatTemplateRequest, ChatTokenizer, LoadedModel, LoadedTextModelConfig, ModelChatTemplate,
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+        PreparedChat, PreparedChatDraft, PreparedChatGenerationRequest,
+        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
+        PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
+        PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest,
+        PreparedChatSpeculativeBackend,
     },
+    core::{MtpSchedulerStats, MtpStats},
+    error::Error,
     Backend, BackendCapabilities, BackendDescriptor, BackendSession, DeviceDescriptor,
-    FinishReason, GenerationConfigOverrides, ModelRuntime, PreparedModel, SemanticEvent,
-    Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
+    FinishReason, GenerationConfigOverrides, ModelRuntime, MtpCapability, MtpCheckpointKind,
+    PreparedModel, SemanticEvent, Submission, TextGenerationBackend, TextGenerationConfig,
+    TokenFilter, TokenOutput,
 };
 use safemlx_lm_core::Completion;
 use tokenizers::{
@@ -139,6 +146,63 @@ impl TextGenerationBackend for MockBackend {
     }
 }
 
+struct MockDrafter;
+
+impl PreparedChatSpeculativeBackend for MockBackend {
+    type Drafter = MockDrafter;
+
+    fn mtp_capability(_: &LoadedModel<Self>) -> MtpCapability {
+        MtpCapability::Ready {
+            checkpoint: MtpCheckpointKind::Embedded,
+        }
+    }
+
+    fn execute_prepared_chat_mtp<'a, F>(
+        _: &mut LoadedModel<Self>,
+        request: PreparedChatMtpGenerationRequest<'a, Self, Self::Drafter, F>,
+    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    where
+        F: FnMut(SemanticEvent),
+    {
+        assert!(matches!(request.drafting, PreparedChatDraft::Embedded));
+        let mut on_event = request.on_event;
+        on_event(SemanticEvent::TextDelta("mock speculative".into()));
+        on_event(SemanticEvent::Finished {
+            reason: FinishReason::MaxTokens,
+        });
+        Ok(PreparedChatMtpGenerationOutput {
+            token_ids: vec![7, 11],
+            finish_reason: FinishReason::MaxTokens,
+            stats: MtpStats::default(),
+        })
+    }
+
+    fn execute_prepared_chat_mtp_batch<'a>(
+        _: &mut LoadedModel<Self>,
+        request: PreparedChatMtpBatchRequest<'a, Self, Self::Drafter>,
+    ) -> Result<PreparedChatMtpBatchOutput, Error> {
+        assert!(matches!(request.drafting, PreparedChatDraft::Embedded));
+        let requests = request
+            .lanes
+            .into_iter()
+            .map(|mut lane| {
+                (lane.on_event)(SemanticEvent::Finished {
+                    reason: FinishReason::MaxTokens,
+                });
+                PreparedChatMtpGenerationOutput {
+                    token_ids: vec![13],
+                    finish_reason: FinishReason::MaxTokens,
+                    stats: MtpStats::default(),
+                }
+            })
+            .collect();
+        Ok(PreparedChatMtpBatchOutput {
+            requests,
+            scheduler: MtpSchedulerStats::default(),
+        })
+    }
+}
+
 fn apply_filter(candidate: u32, filter: &TokenFilter) -> u32 {
     let Some(allowed) = filter.allowed_mask() else {
         return candidate;
@@ -170,6 +234,51 @@ fn client_code<B: TextGenerationBackend>(model: &mut LoadedModel<B>) -> Vec<u32>
         .unwrap()
         .map(|token| token.unwrap().token_id().unwrap())
         .collect()
+}
+
+fn speculative_client_code<B: PreparedChatSpeculativeBackend>(
+    model: &mut LoadedModel<B>,
+    prepared: &PreparedChat,
+) -> (PreparedChatMtpGenerationOutput, Vec<SemanticEvent>) {
+    assert!(matches!(
+        model.mtp_capability(),
+        MtpCapability::Ready { .. }
+    ));
+    let mut events = Vec::new();
+    let output = model
+        .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
+            input: PreparedChatInput::rendered_prompt(prepared),
+            drafting: PreparedChatDraft::Embedded,
+            settings: PreparedChatGenerationSettings::default(),
+            options: PreparedChatMtpGenerationOptions::default(),
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |event| events.push(event),
+        })
+        .unwrap();
+    (output, events)
+}
+
+fn speculative_batch_client_code<B: PreparedChatSpeculativeBackend>(
+    model: &mut LoadedModel<B>,
+    prepared: &PreparedChat,
+) -> (PreparedChatMtpBatchOutput, Vec<SemanticEvent>) {
+    let mut events = Vec::new();
+    let output = model
+        .generate_prepared_chat_mtp_batch(PreparedChatMtpBatchRequest {
+            drafting: PreparedChatDraft::Embedded,
+            lanes: vec![PreparedChatMtpBatchLane {
+                input: PreparedChatInput::rendered_prompt(prepared),
+                settings: PreparedChatGenerationSettings::default(),
+                max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: Box::new(|event| events.push(event)),
+            }],
+            scheduler: Default::default(),
+        })
+        .unwrap();
+    (output, events)
 }
 
 #[test]
@@ -266,5 +375,28 @@ fn prepared_chat_constraints_and_semantics_use_the_same_generic_client_api() {
         Some(&SemanticEvent::Finished {
             reason: FinishReason::MaxTokens
         })
+    );
+
+    let (speculative, speculative_events) = speculative_client_code(&mut model, &prepared);
+    assert_eq!(speculative.token_ids, vec![7, 11]);
+    assert_eq!(speculative.finish_reason, FinishReason::MaxTokens);
+    assert_eq!(
+        speculative_events,
+        vec![
+            SemanticEvent::TextDelta("mock speculative".into()),
+            SemanticEvent::Finished {
+                reason: FinishReason::MaxTokens
+            }
+        ]
+    );
+
+    let (batch, batch_events) = speculative_batch_client_code(&mut model, &prepared);
+    assert_eq!(batch.requests.len(), 1);
+    assert_eq!(batch.requests[0].token_ids, vec![13]);
+    assert_eq!(
+        batch_events,
+        vec![SemanticEvent::Finished {
+            reason: FinishReason::MaxTokens
+        }]
     );
 }

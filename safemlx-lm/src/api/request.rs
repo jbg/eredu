@@ -145,6 +145,34 @@ impl Default for PreparedChatMtpGenerationOptions {
     }
 }
 
+/// High-level speculative-generation capability of a selected backend.
+///
+/// Implementations own draft models, target and draft placement, tensor caches,
+/// sampling execution, and exact completion. Callers use the same prepared-chat
+/// requests for every backend and cannot mix a drafter from one backend with a
+/// target session from another.
+pub trait PreparedChatSpeculativeBackend: safemlx_lm_core::TextGenerationBackend {
+    /// Backend-owned separately prepared draft model.
+    type Drafter;
+
+    /// Reports fail-closed speculative support for the selected model session.
+    fn mtp_capability(model: &LoadedModel<Self>) -> MtpCapability;
+
+    /// Executes one prepared-chat speculative request.
+    fn execute_prepared_chat_mtp<'a, F>(
+        model: &mut LoadedModel<Self>,
+        request: PreparedChatMtpGenerationRequest<'a, Self, Self::Drafter, F>,
+    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    where
+        F: FnMut(SemanticEvent);
+
+    /// Executes independent prepared-chat lanes through one fair scheduler.
+    fn execute_prepared_chat_mtp_batch<'a>(
+        model: &mut LoadedModel<Self>,
+        request: PreparedChatMtpBatchRequest<'a, Self, Self::Drafter>,
+    ) -> Result<PreparedChatMtpBatchOutput, Error>;
+}
+
 /// Draft-model source selected for one speculative request.
 pub enum PreparedChatDraft<'a, D> {
     /// Separately loaded assistant with its own backend-owned placement.

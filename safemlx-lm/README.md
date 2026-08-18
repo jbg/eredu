@@ -175,9 +175,11 @@ invariants, aggregate accounting, and ordered finalization. The facade supplies
 only the MLX executor and publisher used to instantiate it. Prepared-chat MTP
 requests contain portable sampling and scheduler settings; target and drafter
 execution placement is fixed when those models are loaded, and MLX cache lanes
-are adapter-owned. MLX retains the actual logits transforms, probability/residual
-arithmetic, random arrays, cross-stream transfers, component timing probes, and
-tensor execution.
+are adapter-owned. `PreparedChatSpeculativeBackend` makes the same capability,
+single-request, and batch methods available on `LoadedModel<B>`; its associated
+drafter type prevents mixing backend families. MLX retains the actual logits
+transforms, probability/residual arithmetic, random arrays, cross-stream
+transfers, component timing probes, and tensor execution.
 
 ## Inputs and generation
 

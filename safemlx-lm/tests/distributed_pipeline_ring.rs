@@ -33,16 +33,15 @@ use safemlx_lm::{
     core::{residency::OffloadConfig, Backend as _, BackendSession as _},
     load_model_with_options,
     runtime::generation::sampler::DefaultSampler,
-    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind},
     runtime::{
         checkpoint::binding::canonical_checkpoint_name,
         checkpoint::quantization::{AffineQuantization, WeightQuantization},
         media::{input::InputPayload, PreparedModelInput},
     },
     CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
-    LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, ModelLoadOptions, MtpConfig,
-    NonExpertWeightResidency, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology, WeightResidency,
+    LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, ModelLoadOptions, MtpCapability,
+    MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PagedCacheOptions, ParallelTopology,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 

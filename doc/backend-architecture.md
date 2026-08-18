@@ -254,8 +254,12 @@ Ordinary generation, prepared-chat generation, speculative single-request
 generation, cache-policy selection, and prompt-cache persistence all use the
 session-owned cache and selected execution placement. Prepared-chat MTP requests
 contain only portable sampling settings, scheduler policy, cancellation, and
-semantic callbacks. The target and `MlxDrafter` retain the MLX streams selected
-when each was loaded; batch cache lanes are allocated inside the MLX adapter.
+semantic callbacks. `PreparedChatSpeculativeBackend` makes capability discovery,
+single-request execution, and fair batch execution operations on generic
+`LoadedModel<B>`; its associated drafter type prevents cross-backend pairing.
+The MLX implementation is the production path. The target and `MlxDrafter`
+retain the MLX streams selected when each was loaded; batch cache lanes are
+allocated inside the MLX adapter.
 The lower-level `MlxMtpCache` remains an explicitly MLX resource for raw tensor
 APIs. Starting an unrelated sequence is an explicit `reset_session`
 transition; loading a prompt cache deliberately replaces the same session
@@ -369,10 +373,12 @@ The current boundary leaves these components MLX-coupled:
   backend implementations. Realtime request/session orchestration is generic,
   while codec-token arrays and Moshi/PersonaPlex model math remain MLX adapter
   types. Prepared-chat speculative requests no longer expose samplers, random
-  arrays, streams, or cache objects, and their drafter field is generic. Their
-  execution methods still live on `LoadedModel<MlxBackend>`; moving those methods
-  behind a backend capability trait is the remaining high-level boundary. Raw
-  tensor-oriented MTP APIs intentionally remain MLX adapter APIs.
+  arrays, streams, or cache objects, and their drafter field is generic. The
+  public methods live on `LoadedModel<B>` behind the production-used
+  `PreparedChatSpeculativeBackend` capability. `MtpCapability` and
+  `MtpCheckpointKind` are canonical core schemas. Raw tensor-oriented MTP APIs
+  remain explicitly MLX adapter APIs; the remaining coupling is the concrete
+  logits/sampler/executor implementation beneath the capability.
 
 The former facade `runtime::residency::policy` module was deleted. It was not
 retained as a forwarding namespace. The earlier placeholder core
@@ -457,12 +463,13 @@ core scheduler before any new model-session submission. Prepared branches are
 explicitly discarded during poisoning; submitted MLX resources remain retained
 until their exact completions resolve.
 
-Cache policy changes, prompt-cache publication/restoration, and embedded MTP
-generation also operate on `MlxModelSession`. They match the opaque model kind
-to its backend-owned cache internally, so callers cannot extract any complete,
-pipeline, or expert cache, replace it with a foreign cache, or combine a model
-with a different communicator. Architecture cache types and rank-local stage
-models remain private MLX implementation details.
+Cache policy changes and prompt-cache publication/restoration operate on
+`MlxModelSession`. The MLX implementation of generic prepared-chat speculative
+generation also uses that session's model, placement, and backend-owned cache.
+Callers cannot extract any complete, pipeline, or expert cache, replace it with
+a foreign cache, or combine a model with a different communicator. Architecture
+cache types and rank-local stage models remain private MLX implementation
+details.
 
 The former facade-only `FairScheduler`, `CompletedWork`, and `FailedWork` APIs
 were removed instead of retained as wrappers. `Scheduler`, `SchedulerProgress`,
