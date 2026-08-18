@@ -5623,8 +5623,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        architectures::llama::layerwise::{load_llama_safetensors_mlx, LlamaCache, LlamaModel},
-        architectures::llama::model::{self as llama, ModelArgs},
+        backend::mlx::architectures::llama::layerwise::{
+            load_llama_safetensors_mlx, LlamaCache, LlamaModel,
+        },
+        backend::mlx::architectures::llama::model::{self as llama, ModelArgs},
         core::residency::TransferDirection,
         core::residency::UnitResidencyReport,
     };
@@ -6204,8 +6206,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &resident);
         let adapter =
-            crate::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(model_args, stream)
-                .unwrap();
+            crate::backend::mlx::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
+                model_args, stream,
+            )
+            .unwrap();
         let mut layerwise = load_safetensors_layerwise_model(
             dir.path(),
             adapter,
@@ -6232,7 +6236,7 @@ mod tests {
                 .unwrap();
             let actual = layerwise
                 .forward(
-                    crate::architectures::llama::layerwise::LlamaAdapterInput {
+                    crate::backend::mlx::architectures::llama::layerwise::LlamaAdapterInput {
                         inputs: &tokens,
                         mask: None,
                     },
@@ -6256,8 +6260,10 @@ mod tests {
         write_fixture(dir.path(), &reference);
 
         let adapter =
-            crate::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(model_args, stream)
-                .unwrap();
+            crate::backend::mlx::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
+                model_args, stream,
+            )
+            .unwrap();
         let mut layerwise = load_safetensors_layerwise_model(
             dir.path(),
             adapter,
@@ -6285,7 +6291,7 @@ mod tests {
                 .unwrap();
             let actual = layerwise
                 .forward(
-                    crate::architectures::llama::layerwise::LlamaAdapterInput {
+                    crate::backend::mlx::architectures::llama::layerwise::LlamaAdapterInput {
                         inputs: &tokens,
                         mask: None,
                     },
@@ -6531,11 +6537,12 @@ mod tests {
         drop(sizing);
 
         let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1).unwrap();
-        let adapter = crate::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
-            args("llama", true, None),
-            gpu.stream(),
-        )
-        .unwrap();
+        let adapter =
+            crate::backend::mlx::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
+                args("llama", true, None),
+                gpu.stream(),
+            )
+            .unwrap();
         let mut streamed = load_safetensors_layerwise_model(
             dir.path(),
             adapter,
@@ -6574,7 +6581,7 @@ mod tests {
         let mut cache = LlamaCache::Device(Vec::new());
         streamed
             .forward(
-                crate::architectures::llama::layerwise::LlamaAdapterInput {
+                crate::backend::mlx::architectures::llama::layerwise::LlamaAdapterInput {
                     inputs: &tokens,
                     mask: None,
                 },

@@ -18,10 +18,11 @@ use safemlx::{
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::core::residency::OffloadConfig;
 use safemlx_lm::{
-    architectures::{
+    backend::mlx::architectures::{
         distributed::pipeline::{load_pipeline_model_with_options, PipelineStep},
         qwen::vl::model as qwen3_vl,
     },
+    backend::mlx::nn::generation::CausalLm,
     backend::mlx::runtime::generation::sampler::DefaultSampler,
     backend::mlx::runtime::media::input::{InputMetadata, InputPart, ModelInput},
     backend::mlx::runtime::media::PreparedModelInput,
@@ -30,7 +31,6 @@ use safemlx_lm::{
         MlxBackend, MlxParallelContext, ModelLoadOptions, NonExpertWeightResidency,
         PagedCacheOptions, WeightResidency,
     },
-    nn::generation::CausalLm,
     PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
 };
 
@@ -632,8 +632,8 @@ fn qwen3_vl_pipeline_ring_worker() {
         .unwrap();
     let token = Array::from_slice(&[3u32], &[1, 1]);
     let decode =
-        |model: &mut safemlx_lm::architectures::distributed::pipeline::PipelineModel,
-         cache: &mut safemlx_lm::architectures::distributed::pipeline::PipelineCache| {
+        |model: &mut safemlx_lm::backend::mlx::architectures::distributed::pipeline::PipelineModel,
+         cache: &mut safemlx_lm::backend::mlx::architectures::distributed::pipeline::PipelineCache| {
             model.forward_distributed(
                 (topology.pipeline_parallel_rank == 0).then_some(&token),
                 PipelineStep::new(1, 1).unwrap(),

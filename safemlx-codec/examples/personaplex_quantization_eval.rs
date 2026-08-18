@@ -9,7 +9,7 @@ use std::{
 use safemlx::{random::RandomState, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
-    architectures::moshi::{model as moshi, personaplex},
+    backend::mlx::architectures::moshi::{model as moshi, personaplex},
     backend::mlx::runtime::generation::sampler::{DefaultSampler, GenerationSampler},
 };
 use sentencepiece_rs::SentencePieceProcessor;

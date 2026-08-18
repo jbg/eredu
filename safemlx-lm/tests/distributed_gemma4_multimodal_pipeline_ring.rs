@@ -17,10 +17,11 @@ use safemlx::{
 };
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
-    architectures::{
+    backend::mlx::architectures::{
         distributed::pipeline::{load_pipeline_model_with_options, PipelineStep},
         gemma4::model::{self as gemma4, Cache, Model},
     },
+    backend::mlx::nn::generation::CausalLm,
     backend::mlx::runtime::media::{
         input::{InputMetadata, InputPart, ModelInput},
         PreparedModelInput,
@@ -30,7 +31,6 @@ use safemlx_lm::{
         MlxParallelContext, ModelLoadOptions, PagedCacheOptions, WeightResidency,
     },
     core::residency::OffloadConfig,
-    nn::generation::CausalLm,
     PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
 };
 

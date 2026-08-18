@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::architectures::{
+use crate::backend::mlx::architectures::{
     deepseek_v3::model as deepseek_v3,
     deepseek_v4::model as deepseek_v4,
     gemma4::model as gemma4,

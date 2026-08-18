@@ -100,11 +100,34 @@ fn facade_runtime_contains_only_backend_independent_orchestration() {
 
 #[test]
 fn crate_root_does_not_reexport_mlx_implementation_types() {
-    let library = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let library = manifest.join("src/lib.rs");
     let source = std::fs::read_to_string(library).expect("crate root must be readable");
     assert!(source.contains("pub mod backend;"));
     assert!(!source.contains("pub use backend::mlx"));
     assert!(!source.contains("pub mod error;"));
+    for removed in [
+        "pub mod architectures;",
+        "pub mod nn;",
+        "ModelInputBuilder",
+        "trait ModelInput",
+        "trait ModelOutput",
+    ] {
+        assert!(
+            !source.contains(removed),
+            "crate root retains MLX implementation API {removed:?}"
+        );
+    }
+    for removed in ["architectures", "nn"] {
+        assert!(
+            !manifest.join("src").join(removed).exists(),
+            "MLX implementation tree remains at crate root: {removed}"
+        );
+        assert!(
+            manifest.join("src/backend/mlx").join(removed).is_dir(),
+            "MLX backend does not own implementation tree: {removed}"
+        );
+    }
 }
 
 #[test]
@@ -115,7 +138,7 @@ fn generic_loaded_model_source_does_not_import_backend_implementations() {
         "safemlx::",
         "safemlx_sys::",
         "crate::backend::mlx",
-        "crate::architectures",
+        "crate::backend::mlx::architectures",
         "cfg(feature = \"mlx\")",
     ] {
         assert!(
@@ -134,8 +157,8 @@ fn portable_api_tests_do_not_depend_on_backend_implementations() {
         "safemlx::",
         "safemlx_sys::",
         "crate::backend::mlx",
-        "crate::architectures",
-        "crate::nn",
+        "crate::backend::mlx::architectures",
+        "crate::backend::mlx::nn",
     ] {
         assert!(
             !portable.contains(forbidden),

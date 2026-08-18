@@ -5,7 +5,7 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    architectures::moshi::{layerwise, model as moshi, personaplex},
+    backend::mlx::architectures::moshi::{layerwise, model as moshi, personaplex},
     backend::mlx::{
         realtime::{MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel},
         LayerWeightResidency,

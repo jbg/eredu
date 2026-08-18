@@ -5,7 +5,7 @@ use std::{path::PathBuf, time::Instant};
 use clap::Parser;
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    architectures::llama::model as llama,
+    backend::mlx::architectures::llama::model as llama,
     backend::mlx::runtime::execution::layerwise::LayerwiseLoadOptions,
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,

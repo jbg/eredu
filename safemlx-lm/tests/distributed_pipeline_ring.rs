@@ -17,10 +17,10 @@ use safemlx::{
 };
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
-    architectures::distributed::pipeline::{
+    backend::mlx::architectures::distributed::pipeline::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
     },
-    architectures::{
+    backend::mlx::architectures::{
         deepseek_v3::model as deepseek_v3,
         gemma4,
         gpt_oss::model as gpt_oss,
@@ -1002,10 +1002,10 @@ fn assert_final_logits_close(actual: &Array, expected: &[f32], tolerance: f32) {
 }
 
 fn forward_pipeline_model(
-    model: &mut safemlx_lm::architectures::distributed::pipeline::PipelineModel,
+    model: &mut safemlx_lm::backend::mlx::architectures::distributed::pipeline::PipelineModel,
     tokens: Option<&Array>,
     step: PipelineStep,
-    cache: &mut safemlx_lm::architectures::distributed::pipeline::PipelineCache,
+    cache: &mut safemlx_lm::backend::mlx::architectures::distributed::pipeline::PipelineCache,
     execution: &MlxDistributedSession<'_>,
 ) -> Option<Array> {
     model
@@ -1018,12 +1018,12 @@ fn forward_pipeline_model(
 fn assert_family_cache(
     family: FixtureFamily,
     rank: usize,
-    cache: &safemlx_lm::architectures::distributed::pipeline::PipelineCache,
+    cache: &safemlx_lm::backend::mlx::architectures::distributed::pipeline::PipelineCache,
     expected_offset: i32,
 ) {
     let populated = expected_offset > 0;
     let assert_slots =
-        |slots: &[safemlx_lm::architectures::distributed::pipeline::PipelineStateSlot], count| {
+        |slots: &[safemlx_lm::backend::mlx::architectures::distributed::pipeline::PipelineStateSlot], count| {
             assert_eq!(slots.len(), count);
             for slot in slots {
                 assert_eq!(slot.value().is_some(), populated);

@@ -1,9 +1,9 @@
 use super::*;
 
 use crate::api::{LoadedModel, PreparedChatDraft, PreparedChatInput, PreparedChatMtpBatchRequest};
-use crate::architectures::gemma4::model as gemma4;
+use crate::backend::mlx::architectures::gemma4::model as gemma4;
 use crate::{
-    architectures::{
+    backend::mlx::architectures::{
         gpt_oss::model as gpt_oss,
         llama::model as llama,
         qwen::dense as dense_qwen,
@@ -1760,7 +1760,7 @@ fn resolve_model_config_validates_qwen2_sliding_window() {
         invalid["sliding_window"] = invalid_window;
         assert_eq!(
             resolve_model_config(&invalid).is_ok(),
-            crate::architectures::qwen::dense::config_from_hf_value(&invalid).is_ok(),
+            crate::backend::mlx::architectures::qwen::dense::config_from_hf_value(&invalid).is_ok(),
             "inspection and load normalization diverged for {invalid}"
         );
     }

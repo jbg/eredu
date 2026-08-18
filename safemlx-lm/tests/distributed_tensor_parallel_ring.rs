@@ -18,11 +18,12 @@ use safemlx::{
 };
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
-    architectures::{
+    backend::mlx::architectures::{
         deepseek_v3::model as deepseek_v3, gpt_oss::model as gpt_oss_model,
         kimi_linear::model as kimi_model, lfm2::model as lfm2_model, llama::model as llama_model,
         nemotron_h::model as nemotron_model, qwen::dense as dense_qwen,
     },
+    backend::mlx::nn::generation::CausalLm,
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name,
     backend::mlx::runtime::generation::sampler::DefaultSampler,
@@ -32,7 +33,6 @@ use safemlx_lm::{
         ParallelModelInfo, WeightResidency,
     },
     core::BackendSession,
-    nn::generation::CausalLm,
     LayerCachePolicy, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};

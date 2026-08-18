@@ -12,7 +12,7 @@ use safemlx::{
     Array, Device, DeviceType, Stream,
 };
 use safemlx_lm::{
-    architectures::distributed::expert::{AllToAllVPlan, RoutedTransport},
+    backend::mlx::architectures::distributed::expert::{AllToAllVPlan, RoutedTransport},
     backend::mlx::{DeviceAssignment, MlxBackend, MlxParallelContext},
     core::{CollectiveScope, DistributedSession},
 };

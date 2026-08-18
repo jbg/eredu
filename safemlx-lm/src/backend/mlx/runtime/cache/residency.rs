@@ -6427,8 +6427,10 @@ mod tests {
     #[test]
     fn model_reset_surfaces_propagate_paged_clear_failures() {
         use crate::{
-            architectures::gpt_oss::model::{Cache as GptOssCache, LayerCache as GptOssLayerCache},
-            architectures::{
+            backend::mlx::architectures::gpt_oss::model::{
+                Cache as GptOssCache, LayerCache as GptOssLayerCache,
+            },
+            backend::mlx::architectures::{
                 distributed::{
                     expert::ExpertParallelCache,
                     pipeline::{PipelineCache, PipelineKeyValueCache, PipelineLayerCache},

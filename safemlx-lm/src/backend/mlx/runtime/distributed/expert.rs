@@ -22,7 +22,7 @@ use safemlx::{
 
 use crate::{
     backend::mlx::error::Error,
-    nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
+    backend::mlx::nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
 };
 
 thread_local! {

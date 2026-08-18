@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::{
-    architectures::{
+    backend::mlx::architectures::{
         gemma4::model as gemma4, inkling::model as inkling, muse_glimmer,
         qwen::vl::model as qwen3_vl,
     },
@@ -574,7 +574,9 @@ fn inspect_gguf_projector(
             }
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
-            match crate::architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(path) {
+            match crate::backend::mlx::architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(
+                path,
+            ) {
                 Ok(Some(mmproj)) => {
                     let projector_path =
                         crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(
@@ -982,7 +984,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        architectures::{deepseek_v4::model as deepseek_v4, moshi::personaplex},
+        backend::mlx::architectures::{deepseek_v4::model as deepseek_v4, moshi::personaplex},
         backend::mlx::{NonExpertWeightResidency, WeightResidency},
     };
 
@@ -6319,7 +6321,7 @@ mod tests {
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let weights =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let model = crate::architectures::lfm2::model::load_model(
+        let model = crate::backend::mlx::architectures::lfm2::model::load_model(
             directory.path(),
             execution.stream(),
             weights.stream(),
@@ -8126,7 +8128,7 @@ mod tests {
                 ),
                 structural::StructuralValidation::Exact
             );
-            crate::architectures::gemma4::model::prepare_gemma4_gguf_checkpoint(
+            crate::backend::mlx::architectures::gemma4::model::prepare_gemma4_gguf_checkpoint(
                 &checkpoint,
                 &metadata,
                 None,
@@ -8235,7 +8237,7 @@ mod tests {
             ),
             structural::StructuralValidation::Exact
         );
-        crate::architectures::inkling::model::prepare_gguf_checkpoint_with_mmproj(
+        crate::backend::mlx::architectures::inkling::model::prepare_gguf_checkpoint_with_mmproj(
             &checkpoint,
             &metadata,
             None,
@@ -8427,14 +8429,15 @@ mod tests {
         assert!(report.is_loadable(), "{:#?}", report.issues);
         let checkpoint = GgufCheckpoint::open(&model_path).unwrap();
         let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-        let mmproj = crate::architectures::inkling::model::open_sibling_mmproj(&model_path)
-            .unwrap()
-            .unwrap();
+        let mmproj =
+            crate::backend::mlx::architectures::inkling::model::open_sibling_mmproj(&model_path)
+                .unwrap()
+                .unwrap();
         assert_eq!(
             structural::validate_inkling_mmproj_gguf(&metadata, &mmproj),
             structural::StructuralValidation::Exact
         );
-        crate::architectures::inkling::model::prepare_gguf_checkpoint_with_mmproj(
+        crate::backend::mlx::architectures::inkling::model::prepare_gguf_checkpoint_with_mmproj(
             &checkpoint,
             &metadata,
             Some(&mmproj),
@@ -8523,9 +8526,10 @@ mod tests {
 
         let checkpoint = GgufCheckpoint::open(&model).unwrap();
         let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-        let mmproj = crate::architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(&model)
-            .unwrap()
-            .unwrap();
+        let mmproj =
+            crate::backend::mlx::architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(&model)
+                .unwrap()
+                .unwrap();
         assert_eq!(
             structural::validate_qwen35_projector_gguf(
                 &checkpoint,
@@ -8537,7 +8541,7 @@ mod tests {
         );
         let execution =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let prepared = crate::architectures::qwen::hybrid::qwen3_5::prepare_qwen35_gguf_checkpoint(
+        let prepared = crate::backend::mlx::architectures::qwen::hybrid::qwen3_5::prepare_qwen35_gguf_checkpoint(
             &checkpoint,
             &metadata,
             Some(&mmproj),
@@ -8548,13 +8552,14 @@ mod tests {
         assert_eq!(prepared.modalities.video_token_id, Some(31));
         let vision = prepared.modalities.vision_config.as_ref().unwrap();
         assert_eq!(vision.quantized_weight_configs.len(), 6);
-        let store = crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_gguf_store(
-            &checkpoint,
-            Some(&mmproj),
-            Some(vision),
-            1,
-        )
-        .unwrap();
+        let store =
+            crate::backend::mlx::architectures::qwen::hybrid::layerwise::qwen_hybrid_gguf_store(
+                &checkpoint,
+                Some(&mmproj),
+                Some(vision),
+                1,
+            )
+            .unwrap();
         assert!(store.keys().contains(&"model.embed_tokens.weight".into()));
         assert!(store
             .keys()
@@ -8800,7 +8805,7 @@ mod tests {
             ),
         ] {
             let (model, _) =
-                crate::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
+                crate::backend::mlx::architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
                     &checkpoint,
                     &metadata,
                     residency,
@@ -8849,7 +8854,7 @@ mod tests {
                 ),
             ] {
                 let loaded =
-                    crate::architectures::distributed::pipeline::load_pipeline_model_with_options(
+                    crate::backend::mlx::architectures::distributed::pipeline::load_pipeline_model_with_options(
                         &path,
                         ModelLoadOptions::with_parallel(topology).with_weight_residency(residency),
                         execution.stream(),
@@ -8898,7 +8903,7 @@ mod tests {
                     crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
                 ),
             ] {
-                let loaded = crate::architectures::distributed::expert::
+                let loaded = crate::backend::mlx::architectures::distributed::expert::
                     load_expert_parallel_model_with_options(
                         &path,
                         ModelLoadOptions::with_parallel(topology)

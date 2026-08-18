@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Instant};
 
 use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_lm::{
-    architectures::moshi::personaplex,
+    backend::mlx::architectures::moshi::personaplex,
     backend::mlx::runtime::checkpoint::quantization::AffineQuantization,
     backend::mlx::{
         realtime::{MlxRealtimeBackend, MlxRealtimeInput},

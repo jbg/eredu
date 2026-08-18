@@ -1,5 +1,7 @@
 //! MLX backend adapter.
 
+/// MLX model-family tensor implementations.
+pub mod architectures;
 /// MLX hardware discovery, planning admission, and plan realization.
 pub mod automatic;
 /// Prompt-cache topology conversion for MLX distributed execution.
@@ -18,6 +20,8 @@ mod loading;
 #[cfg(feature = "media-processing")]
 mod media;
 mod model;
+/// Reusable MLX neural-network building blocks.
+pub mod nn;
 /// Realtime Moshi/PersonaPlex session execution.
 pub mod realtime;
 /// MLX allocator observations for neutral residency telemetry.
@@ -69,7 +73,9 @@ use safemlx_lm_core::backend::{
 #[cfg(feature = "media-processing")]
 use crate::backend::mlx::runtime::media::ModelProcessor;
 use crate::{
-    architectures::distributed::{expert::ExpertParallelModel, pipeline::PipelineModel},
+    backend::mlx::architectures::distributed::{
+        expert::ExpertParallelModel, pipeline::PipelineModel,
+    },
     backend::mlx::error::Error,
 };
 

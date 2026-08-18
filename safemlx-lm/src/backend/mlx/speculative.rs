@@ -22,11 +22,13 @@ use safemlx_lm_core::{
 };
 
 use crate::{
-    architectures::gemma4::assistant::{
+    backend::mlx::architectures::gemma4::assistant::{
         load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
         Gemma4AssistantDraftModel,
     },
-    architectures::muse_glimmer::assistant::{self as muse_dflash, MuseGlimmerDFlash},
+    backend::mlx::architectures::muse_glimmer::assistant::{
+        self as muse_dflash, MuseGlimmerDFlash,
+    },
     backend::mlx::error::Error,
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::{ModelCache, ModelLoadOptions},

@@ -22,15 +22,15 @@ use crate::{
 /// Shared PCM waveform validation and spectral operations.
 #[cfg(feature = "audio-processing")]
 pub mod audio;
-use crate::architectures::gemma4::processor as gemma4;
+use crate::backend::mlx::architectures::gemma4::processor as gemma4;
 /// Shared decoded-image operations.
 #[cfg(feature = "image-processing")]
 pub mod image;
-use crate::architectures::inkling::processor as inkling;
+use crate::backend::mlx::architectures::inkling::processor as inkling;
 #[cfg(feature = "image-processing")]
-use crate::architectures::muse_glimmer::processor as muse_glimmer;
+use crate::backend::mlx::architectures::muse_glimmer::processor as muse_glimmer;
 #[cfg(feature = "image-processing")]
-use crate::architectures::qwen::vl::processor as qwen;
+use crate::backend::mlx::architectures::qwen::vl::processor as qwen;
 /// Shared decoded-video validation, sampling, and timing operations.
 #[cfg(feature = "image-processing")]
 pub mod video;

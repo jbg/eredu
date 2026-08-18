@@ -16,12 +16,13 @@ use safemlx::{
     Array, Device, DeviceType, Stream,
 };
 use safemlx_lm::{
-    architectures::deepseek_v3::model::RoutedExperts,
-    architectures::distributed::expert::{
+    backend::mlx::architectures::deepseek_v3::model::RoutedExperts,
+    backend::mlx::architectures::distributed::expert::{
         dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
         DispatchedRoutes, ExpertAssignment, RoutedTransport, ShardedRouteBlocks,
     },
     backend::mlx::error::Error,
+    backend::mlx::nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
     backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
@@ -29,7 +30,6 @@ use safemlx_lm::{
     },
     backend::mlx::runtime::residency::manager::{OffloadUnit, WeightBinding},
     core::residency::OffloadConfig,
-    nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
 };
 use safetensors::tensor::{serialize_to_file, Dtype as TensorDtype, TensorView};
 

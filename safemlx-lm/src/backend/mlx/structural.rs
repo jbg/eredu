@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::backend::mlx::ModelLoadOptions;
 use crate::{
-    architectures::{
+    backend::mlx::architectures::{
         deepseek_v3::model as deepseek_v3,
         deepseek_v4::model as deepseek_v4,
         gemma4::model as gemma4,
@@ -2379,7 +2379,7 @@ fn validate_gemma4_vision_catalog(
     keys: &BTreeSet<String>,
     allowed: &mut BTreeSet<String>,
     issues: &mut Vec<StructuralIssue>,
-    config: &crate::architectures::gemma4::vision::Gemma4VisionConfig,
+    config: &crate::backend::mlx::architectures::gemma4::vision::Gemma4VisionConfig,
     text_hidden: usize,
     quantization: Option<
         crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
@@ -2490,7 +2490,7 @@ fn validate_gemma4_audio_catalog(
     keys: &BTreeSet<String>,
     allowed: &mut BTreeSet<String>,
     issues: &mut Vec<StructuralIssue>,
-    config: &crate::architectures::gemma4::audio::Gemma4AudioConfig,
+    config: &crate::backend::mlx::architectures::gemma4::audio::Gemma4AudioConfig,
     text_hidden: usize,
     quantization: Option<
         crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,

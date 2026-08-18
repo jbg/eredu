@@ -1,0 +1,2213 @@
+//! Shared Qwen vision-language encoder building blocks.
+
+use std::collections::HashMap;
+
+use safemlx::{
+    error::Exception,
+    macros::ModuleParameters,
+    module::{Module, Param},
+    nn,
+    ops::{
+        concatenate_axis,
+        indexing::{NewAxis, TryIndexOp},
+        matmul,
+    },
+    quantization::MaybeQuantized,
+    Array, Dtype, Stream,
+};
+use serde::Deserialize;
+
+use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::nn::{layers::silu, linear::unloaded_maybe_quantized_linear},
+    backend::mlx::runtime::{
+        cache::ConcatKeyValueCache, checkpoint::quantization::WeightQuantization,
+    },
+    core::attention::LayerSchedule,
+};
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Attention topology for one Qwen vision transformer block.
+pub enum VisionAttentionPolicy {
+    /// Attend across each complete image or video-frame sequence.
+    Full,
+    /// Attend within the configured spatial vision window.
+    Windowed,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Canonical execution policy for one Qwen vision transformer block.
+pub struct VisionLayerPolicy {
+    /// Attention topology used by the block.
+    pub attention: VisionAttentionPolicy,
+    /// DeepStack merger bank captured after this block, when present.
+    pub deepstack_merger: Option<u32>,
+}
+
+impl VisionLayerPolicy {
+    fn new(attention: VisionAttentionPolicy) -> Self {
+        Self {
+            attention,
+            deepstack_merger: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Qwen VL vision encoder configuration.
+pub struct VisionConfig {
+    /// Authoritative ordered execution policy for every vision block.
+    pub layer_schedule: LayerSchedule<VisionLayerPolicy>,
+    /// Vision transformer hidden size.
+    pub hidden_size: i32,
+    /// Vision MLP activation function.
+    pub hidden_act: String,
+    /// Vision MLP intermediate size.
+    pub intermediate_size: i32,
+    /// Number of vision attention heads.
+    pub num_heads: i32,
+    /// Number of learned spatial position embeddings.
+    pub num_position_embeddings: i32,
+    /// Number of input pixel channels.
+    pub in_channels: i32,
+    /// Spatial patch size.
+    pub patch_size: i32,
+    /// Spatial merge factor used before language-model insertion.
+    pub spatial_merge_size: i32,
+    /// Temporal patch size.
+    pub temporal_patch_size: i32,
+    /// Spatial window size used by `Windowed` layers.
+    pub window_size: i32,
+    /// Output hidden size projected into the language model space.
+    pub out_hidden_size: i32,
+    /// Checkpoint-native projection formats keyed by the canonical relative
+    /// vision parameter name.
+    pub quantized_weight_configs: HashMap<String, WeightQuantization>,
+}
+
+impl VisionConfig {
+    /// Returns the number of vision transformer blocks.
+    pub fn layer_count(&self) -> usize {
+        self.layer_schedule.len()
+    }
+
+    /// Returns one block policy without an out-of-range fallback.
+    pub fn layer_policy(&self, layer: usize) -> Option<&VisionLayerPolicy> {
+        self.layer_schedule.get(layer)
+    }
+
+    /// Returns the number of configured DeepStack merger banks.
+    pub fn deepstack_layer_count(&self) -> usize {
+        self.layer_schedule
+            .iter()
+            .filter(|policy| policy.deepstack_merger.is_some())
+            .count()
+    }
+
+    /// Returns DeepStack source layers in merger-bank order.
+    pub fn deepstack_layers(&self) -> Vec<i32> {
+        let mut layers = self
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, policy)| {
+                policy.deepstack_merger.map(|merger| (merger, layer as i32))
+            })
+            .collect::<Vec<_>>();
+        layers.sort_unstable_by_key(|(merger, _)| *merger);
+        layers.into_iter().map(|(_, layer)| layer).collect()
+    }
+
+    /// Stable ordered component used by architecture diagnostics and tests.
+    pub fn layer_schedule_fingerprint(&self) -> String {
+        self.layer_schedule
+            .iter()
+            .map(|policy| {
+                let attention = match policy.attention {
+                    VisionAttentionPolicy::Full => "f",
+                    VisionAttentionPolicy::Windowed => "w",
+                };
+                match policy.deepstack_merger {
+                    Some(merger) => format!("{attention}d{merger}"),
+                    None => attention.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn weight_format(&self, name: &str) -> Option<WeightQuantization> {
+        self.quantized_weight_configs.get(name).copied()
+    }
+
+    pub(crate) fn apply_load_time_quantization(&mut self, quantization: WeightQuantization) {
+        let aligned =
+            |input: i32| input > 0 && input % quantization.group_size() == 0 && input % 32 == 0;
+        self.quantized_weight_configs.clear();
+        for index in 0..self.layer_count() {
+            for (name, input) in [
+                (format!("blocks.{index}.attn.qkv.weight"), self.hidden_size),
+                (format!("blocks.{index}.attn.proj.weight"), self.hidden_size),
+                (
+                    format!("blocks.{index}.mlp.linear_fc1.weight"),
+                    self.hidden_size,
+                ),
+                (
+                    format!("blocks.{index}.mlp.linear_fc2.weight"),
+                    self.intermediate_size,
+                ),
+            ] {
+                if aligned(input) {
+                    self.quantized_weight_configs.insert(name, quantization);
+                }
+            }
+        }
+        let merger_input = self.hidden_size * self.spatial_merge_size * self.spatial_merge_size;
+        for prefix in std::iter::once("merger".to_string()).chain(
+            (0..self.deepstack_layer_count()).map(|index| format!("deepstack_merger_list.{index}")),
+        ) {
+            for name in ["linear_fc1", "linear_fc2"] {
+                if aligned(merger_input) {
+                    self.quantized_weight_configs
+                        .insert(format!("{prefix}.{name}.weight"), quantization);
+                }
+            }
+        }
+    }
+
+    fn validate_for_mode(&self, mode: VisionMode) -> Result<(), Exception> {
+        let mut mergers = self
+            .layer_schedule
+            .iter()
+            .filter_map(|policy| policy.deepstack_merger)
+            .collect::<Vec<_>>();
+        mergers.sort_unstable();
+        let expected = (0..mergers.len())
+            .map(|index| index as u32)
+            .collect::<Vec<_>>();
+        if mergers != expected {
+            return Err(Exception::custom(format!(
+                "Qwen VL vision DeepStack merger banks must be unique and contiguous from zero, got {mergers:?}"
+            )));
+        }
+        if mode == VisionMode::Deepstack
+            && self
+                .layer_schedule
+                .iter()
+                .any(|policy| policy.attention != VisionAttentionPolicy::Full)
+        {
+            return Err(Exception::custom(
+                "Qwen3-VL vision schedules must use full attention in every block",
+            ));
+        }
+        if self
+            .layer_schedule
+            .iter()
+            .any(|policy| policy.attention == VisionAttentionPolicy::Windowed)
+            && self.window_size <= 0
+        {
+            return Err(Exception::custom(
+                "Qwen VL windowed vision schedules require a positive window_size",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct VisionConfigSource {
+    #[serde(default = "default_vision_depth")]
+    depth: i32,
+    #[serde(default = "default_vision_hidden_size")]
+    hidden_size: i32,
+    #[serde(default = "default_vision_hidden_act")]
+    hidden_act: String,
+    #[serde(default = "default_vision_intermediate_size")]
+    intermediate_size: i32,
+    #[serde(default = "default_vision_num_heads")]
+    num_heads: i32,
+    #[serde(default = "default_vision_num_position_embeddings")]
+    num_position_embeddings: i32,
+    #[serde(default = "default_vision_in_channels")]
+    in_channels: i32,
+    #[serde(default = "default_vision_patch_size")]
+    patch_size: i32,
+    #[serde(default = "default_vision_spatial_merge_size")]
+    spatial_merge_size: i32,
+    #[serde(default = "default_vision_temporal_patch_size")]
+    temporal_patch_size: i32,
+    #[serde(default)]
+    window_size: Option<i32>,
+    #[serde(default = "default_vision_out_hidden_size")]
+    out_hidden_size: i32,
+    #[serde(default)]
+    fullatt_block_indexes: Option<Vec<i32>>,
+    #[serde(default)]
+    deepstack_visual_indexes: Option<Vec<i32>>,
+}
+
+impl VisionConfigSource {
+    pub(crate) fn normalize_qwen3_vl(self) -> Result<VisionConfig, Error> {
+        if self.window_size.is_some() || self.fullatt_block_indexes.is_some() {
+            return Err(Error::UnsupportedArchitecture(
+                "qwen3_vl vision_config must not define window_size or fullatt_block_indexes; Qwen3-VL vision uses full attention in every block".into(),
+            ));
+        }
+        let deepstack = self
+            .deepstack_visual_indexes
+            .clone()
+            .unwrap_or_else(|| vec![8, 16, 24]);
+        let depth = positive_depth(self.depth, "qwen3_vl")?;
+        self.normalize(
+            vec![VisionAttentionPolicy::Full; depth],
+            deepstack,
+            default_vision_window_size(),
+            "qwen3_vl",
+        )
+    }
+
+    pub(crate) fn normalize_qwen3_5(self) -> Result<VisionConfig, Error> {
+        let depth = positive_depth(self.depth, "Qwen3.5")?;
+        let explicit_full = self.fullatt_block_indexes.clone();
+        let mut attention = if explicit_full.is_some() {
+            vec![VisionAttentionPolicy::Windowed; depth]
+        } else {
+            vec![VisionAttentionPolicy::Full; depth]
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for layer in explicit_full.unwrap_or_default() {
+            let index = checked_layer_index(layer, depth, "Qwen3.5 full-attention")?;
+            if !seen.insert(index) {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Qwen3.5 full-attention vision layer {layer} is duplicated"
+                )));
+            }
+            attention[index] = VisionAttentionPolicy::Full;
+        }
+        let window_size = self.window_size.unwrap_or_else(default_vision_window_size);
+        if window_size <= 0 {
+            return Err(Error::UnsupportedArchitecture(
+                "Qwen3.5 vision window_size must be positive".into(),
+            ));
+        }
+        let deepstack = self.deepstack_visual_indexes.clone().unwrap_or_default();
+        self.normalize(attention, deepstack, window_size, "Qwen3.5")
+    }
+
+    fn normalize(
+        self,
+        attention: Vec<VisionAttentionPolicy>,
+        deepstack: Vec<i32>,
+        window_size: i32,
+        architecture: &str,
+    ) -> Result<VisionConfig, Error> {
+        let depth = positive_depth(self.depth, architecture)?;
+        let mut policies = attention
+            .into_iter()
+            .map(VisionLayerPolicy::new)
+            .collect::<Vec<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+        for (merger, layer) in deepstack.into_iter().enumerate() {
+            let index = checked_layer_index(layer, depth, &format!("{architecture} DeepStack"))?;
+            if !seen.insert(index) {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "{architecture} DeepStack vision layer {layer} is duplicated"
+                )));
+            }
+            policies[index].deepstack_merger = Some(u32::try_from(merger).map_err(|_| {
+                Error::UnsupportedArchitecture(format!(
+                    "{architecture} has too many DeepStack vision layers"
+                ))
+            })?);
+        }
+        let layer_schedule = LayerSchedule::new(depth, policies).map_err(|error| {
+            Error::UnsupportedArchitecture(format!("{architecture} vision {error}"))
+        })?;
+        Ok(VisionConfig {
+            layer_schedule,
+            hidden_size: self.hidden_size,
+            hidden_act: self.hidden_act,
+            intermediate_size: self.intermediate_size,
+            num_heads: self.num_heads,
+            num_position_embeddings: self.num_position_embeddings,
+            in_channels: self.in_channels,
+            patch_size: self.patch_size,
+            spatial_merge_size: self.spatial_merge_size,
+            temporal_patch_size: self.temporal_patch_size,
+            window_size,
+            out_hidden_size: self.out_hidden_size,
+            quantized_weight_configs: HashMap::new(),
+        })
+    }
+}
+
+fn positive_depth(depth: i32, architecture: &str) -> Result<usize, Error> {
+    usize::try_from(depth)
+        .ok()
+        .filter(|depth| *depth > 0)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("{architecture} vision depth must be positive"))
+        })
+}
+
+fn checked_layer_index(layer: i32, depth: usize, label: &str) -> Result<usize, Error> {
+    usize::try_from(layer)
+        .ok()
+        .filter(|layer| *layer < depth)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "{label} layer {layer} is outside vision depth {depth}"
+            ))
+        })
+}
+
+fn default_vision_depth() -> i32 {
+    32
+}
+fn default_vision_hidden_size() -> i32 {
+    3584
+}
+fn default_vision_hidden_act() -> String {
+    "silu".to_string()
+}
+fn default_vision_intermediate_size() -> i32 {
+    3420
+}
+fn default_vision_num_heads() -> i32 {
+    16
+}
+fn default_vision_num_position_embeddings() -> i32 {
+    2304
+}
+fn default_vision_in_channels() -> i32 {
+    3
+}
+fn default_vision_patch_size() -> i32 {
+    14
+}
+fn default_vision_spatial_merge_size() -> i32 {
+    2
+}
+fn default_vision_temporal_patch_size() -> i32 {
+    2
+}
+fn default_vision_window_size() -> i32 {
+    112
+}
+fn default_vision_out_hidden_size() -> i32 {
+    3584
+}
+#[derive(Debug, Clone, ModuleParameters)]
+/// Layer normalization used by Qwen vision encoders.
+///
+/// Shared RMSNorm implementation for dense and MoE Qwen vision towers.
+pub struct QwenVisionRmsNorm {
+    #[param]
+    /// Learned scale.
+    pub weight: Param<Array>,
+    #[param]
+    /// Learned bias.
+    pub bias: Param<Array>,
+    /// Numerical epsilon.
+    pub eps: f32,
+}
+
+impl QwenVisionRmsNorm {
+    fn new(dim: i32, eps: f32, stream: &Stream) -> Result<Self, Exception> {
+        Ok(Self {
+            weight: Param::<Array>::unloaded(&[dim], Dtype::Float32, stream)?,
+            bias: Param::<Array>::unloaded(&[dim], Dtype::Float32, stream)?,
+            eps,
+        })
+    }
+
+    fn forward(&self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let mean = safemlx::ops::mean_axis(x, -1, true, stream)?;
+        let centered = x.subtract(mean, stream)?;
+        let variance = safemlx::ops::mean_axis(&centered.square(stream)?, -1, true, stream)?;
+        let normalized = centered.multiply(
+            safemlx::ops::rsqrt(variance.add(Array::from_f32(self.eps), stream)?, stream)?,
+            stream,
+        )?;
+        normalized
+            .multiply(&*self.weight, stream)?
+            .add(&*self.bias, stream)
+    }
+
+    fn training_mode(&mut self, _mode: bool) {}
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Conv3d patch-projection weight for Qwen vision inputs.
+pub struct QwenVisionPatchProjection {
+    #[param]
+    /// Projection weight shaped `[hidden, channels, temporal, height, width]`.
+    pub weight: Param<Array>,
+    #[param]
+    /// Projection bias.
+    pub bias: Param<Array>,
+}
+
+impl QwenVisionPatchProjection {
+    fn new(config: &VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+        Ok(Self {
+            weight: Param::<Array>::unloaded(
+                &[
+                    config.hidden_size,
+                    config.in_channels,
+                    config.temporal_patch_size,
+                    config.patch_size,
+                    config.patch_size,
+                ],
+                Dtype::Float32,
+                stream,
+            )?,
+            bias: Param::<Array>::unloaded(&[config.hidden_size], Dtype::Float32, stream)?,
+        })
+    }
+
+    fn training_mode(&mut self, _mode: bool) {}
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Patch embedding layer for preprocessed Qwen vision tensors.
+pub struct QwenVisionPatchEmbed {
+    /// Input channels.
+    pub in_channels: i32,
+    /// Temporal patch size.
+    pub temporal_patch_size: i32,
+    /// Spatial patch size.
+    pub patch_size: i32,
+    /// Output embedding dimension.
+    pub embed_dim: i32,
+    #[param]
+    /// Conv3d projection represented as a flattened matrix multiply.
+    pub proj: QwenVisionPatchProjection,
+}
+
+impl QwenVisionPatchEmbed {
+    fn new(config: &VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+        Ok(Self {
+            in_channels: config.in_channels,
+            temporal_patch_size: config.temporal_patch_size,
+            patch_size: config.patch_size,
+            embed_dim: config.hidden_size,
+            proj: QwenVisionPatchProjection::new(config, stream)?,
+        })
+    }
+
+    fn input_dim(&self) -> i32 {
+        self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
+    }
+
+    fn forward(&self, pixel_values: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let shape = pixel_values.shape();
+        if shape.len() != 2 || shape[1] != self.input_dim() {
+            return Err(Exception::custom(format!(
+                "Qwen VL image tensor must be shaped [patches, {}], got {shape:?}",
+                self.input_dim()
+            )));
+        }
+        let weight = self
+            .proj
+            .weight
+            .as_ref()
+            .reshape(&[self.embed_dim, self.input_dim()], stream)?;
+        let output = matmul(pixel_values, weight.transpose(stream)?, stream)?;
+        output.add(&*self.proj.bias, stream)
+    }
+
+    pub(crate) fn training_mode(&mut self, mode: bool) {
+        self.proj.training_mode(mode);
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Feed-forward block used by Qwen vision transformer layers.
+pub struct QwenVisionMlp {
+    /// Activation function name.
+    pub hidden_act: String,
+    #[param]
+    /// First projection.
+    pub linear_fc1: MaybeQuantized<nn::Linear>,
+    #[param]
+    /// Second projection.
+    pub linear_fc2: MaybeQuantized<nn::Linear>,
+}
+
+impl QwenVisionMlp {
+    fn new(config: &VisionConfig, index: usize, stream: &Stream) -> Result<Self, Exception> {
+        let prefix = format!("blocks.{index}.mlp");
+        Ok(Self {
+            hidden_act: config.hidden_act.clone(),
+            linear_fc1: unloaded_maybe_quantized_linear(
+                config.hidden_size,
+                config.intermediate_size,
+                true,
+                config.weight_format(&format!("{prefix}.linear_fc1.weight")),
+                stream,
+            )?,
+            linear_fc2: unloaded_maybe_quantized_linear(
+                config.intermediate_size,
+                config.hidden_size,
+                true,
+                config.weight_format(&format!("{prefix}.linear_fc2.weight")),
+                stream,
+            )?,
+        })
+    }
+
+    fn activate(hidden_act: &str, x: Array, stream: &Stream) -> Result<Array, Exception> {
+        match hidden_act {
+            "silu" => silu(x, stream),
+            "gelu" => nn::gelu(x, stream),
+            "gelu_pytorch_tanh" => nn::gelu_approximate(x, stream),
+            other => Err(Exception::custom(format!(
+                "Qwen VL vision MLP activation '{other}' is not supported"
+            ))),
+        }
+    }
+
+    fn forward(&mut self, hidden_states: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let hidden_act = self.hidden_act.clone();
+        let hidden = Self::activate(
+            hidden_act.as_str(),
+            self.linear_fc1.forward(hidden_states, stream)?,
+            stream,
+        )?;
+        self.linear_fc2.forward(&hidden, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let hidden_act = self.hidden_act.clone();
+        let hidden = Self::activate(
+            hidden_act.as_str(),
+            self.linear_fc1.forward(hidden_states, stream)?,
+            stream,
+        )?;
+        let mut partial = self.linear_fc2.forward(&hidden, stream)?;
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear_fc2) {
+            partial = partial.subtract(bias, stream)?;
+        }
+        let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear_fc2) {
+            output = output.add(bias, stream)?;
+        }
+        Ok(output)
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        self.linear_fc1.training_mode(mode);
+        self.linear_fc2.training_mode(mode);
+    }
+}
+
+fn maybe_quantized_linear_bias(linear: &MaybeQuantized<nn::Linear>) -> Option<&Array> {
+    match linear {
+        MaybeQuantized::Original(linear) => linear.bias.as_ref().as_ref(),
+        MaybeQuantized::Quantized(linear) => linear.inner.bias.as_ref().as_ref(),
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Full attention used inside the Qwen vision encoder.
+pub struct QwenVisionAttention {
+    /// Number of attention heads.
+    pub num_heads: i32,
+    /// Per-head dimension.
+    pub head_dim: i32,
+    /// Attention scale.
+    pub scale: f32,
+    #[param]
+    /// Packed query/key/value projection.
+    pub qkv: MaybeQuantized<nn::Linear>,
+    #[param]
+    /// Output projection.
+    pub proj: MaybeQuantized<nn::Linear>,
+}
+
+impl QwenVisionAttention {
+    fn new(config: &VisionConfig, index: usize, stream: &Stream) -> Result<Self, Exception> {
+        if config.hidden_size % config.num_heads != 0 {
+            return Err(Exception::custom(format!(
+                "Qwen VL vision hidden_size {} is not divisible by num_heads {}",
+                config.hidden_size, config.num_heads
+            )));
+        }
+        let head_dim = config.hidden_size / config.num_heads;
+        let prefix = format!("blocks.{index}.attn");
+        Ok(Self {
+            num_heads: config.num_heads,
+            head_dim,
+            scale: (head_dim as f32).sqrt().recip(),
+            qkv: unloaded_maybe_quantized_linear(
+                config.hidden_size,
+                config.hidden_size * 3,
+                true,
+                config.weight_format(&format!("{prefix}.qkv.weight")),
+                stream,
+            )?,
+            proj: unloaded_maybe_quantized_linear(
+                config.hidden_size,
+                config.hidden_size,
+                true,
+                config.weight_format(&format!("{prefix}.proj.weight")),
+                stream,
+            )?,
+        })
+    }
+
+    pub(crate) fn new_tensor_parallel(
+        config: &VisionConfig,
+        index: usize,
+        local_heads: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        if config.hidden_size % config.num_heads != 0 || local_heads <= 0 {
+            return Err(Exception::custom(
+                "invalid Qwen vision tensor-parallel head geometry",
+            ));
+        }
+        let head_dim = config.hidden_size / config.num_heads;
+        let local_width = local_heads * head_dim;
+        let prefix = format!("blocks.{index}.attn");
+        Ok(Self {
+            num_heads: local_heads,
+            head_dim,
+            scale: (head_dim as f32).sqrt().recip(),
+            qkv: unloaded_maybe_quantized_linear(
+                config.hidden_size,
+                3 * local_width,
+                true,
+                config.weight_format(&format!("{prefix}.qkv.weight")),
+                stream,
+            )?,
+            proj: unloaded_maybe_quantized_linear(
+                local_width,
+                config.hidden_size,
+                true,
+                config.weight_format(&format!("{prefix}.proj.weight")),
+                stream,
+            )?,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Array,
+        chunk_lengths: &[i32],
+        cos: &Array,
+        sin: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let seq_len = hidden_states.dim(0);
+        let qkv = self
+            .qkv
+            .forward(hidden_states, stream)?
+            .reshape(&[seq_len, 3, self.num_heads, self.head_dim], stream)?;
+        let mut query = qkv.try_index_device((.., 0, .., ..), stream)?;
+        let mut key = qkv.try_index_device((.., 1, .., ..), stream)?;
+        let value = qkv.try_index_device((.., 2, .., ..), stream)?;
+        (query, key) = apply_vision_rotary_pos_emb(query, key, cos, sin, stream)?;
+
+        let mut outputs = Vec::with_capacity(chunk_lengths.len());
+        let mut start = 0;
+        for &len in chunk_lengths {
+            let end = start + len;
+            let q = query
+                .try_index_device((start..end, .., ..), stream)?
+                .transpose_axes(&[1, 0, 2], stream)?
+                .try_index_device((NewAxis, .., .., ..), stream)?;
+            let k = key
+                .try_index_device((start..end, .., ..), stream)?
+                .transpose_axes(&[1, 0, 2], stream)?
+                .try_index_device((NewAxis, .., .., ..), stream)?;
+            let v = value
+                .try_index_device((start..end, .., ..), stream)?
+                .transpose_axes(&[1, 0, 2], stream)?
+                .try_index_device((NewAxis, .., .., ..), stream)?;
+            let out = crate::backend::mlx::nn::tensor::scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                Option::<ConcatKeyValueCache>::None,
+                self.scale,
+                None,
+                stream,
+            )?
+            .try_index_device((0, .., .., ..), stream)?
+            .transpose_axes(&[1, 0, 2], stream)?
+            .reshape(&[len, self.num_heads * self.head_dim], stream)?;
+            outputs.push(out);
+            start = end;
+        }
+        let out = concatenate_axis(&outputs, 0, stream)?;
+        self.proj.forward(&out, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        chunk_lengths: &[i32],
+        cos: &Array,
+        sin: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let mut partial = self.forward(hidden_states, chunk_lengths, cos, sin, stream)?;
+        if let Some(bias) = maybe_quantized_linear_bias(&self.proj) {
+            partial = partial.subtract(bias, stream)?;
+        }
+        let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
+        if let Some(bias) = maybe_quantized_linear_bias(&self.proj) {
+            output = output.add(bias, stream)?;
+        }
+        Ok(output)
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        self.qkv.training_mode(mode);
+        self.proj.training_mode(mode);
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Transformer block used by the Qwen vision encoder.
+pub struct QwenVisionBlock {
+    #[param]
+    /// First layer normalization.
+    pub norm1: QwenVisionRmsNorm,
+    #[param]
+    /// Attention module.
+    pub attn: QwenVisionAttention,
+    #[param]
+    /// Second layer normalization.
+    pub norm2: QwenVisionRmsNorm,
+    #[param]
+    /// Feed-forward module.
+    pub mlp: QwenVisionMlp,
+}
+
+impl QwenVisionBlock {
+    pub(crate) fn new(
+        config: &VisionConfig,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            norm1: QwenVisionRmsNorm::new(config.hidden_size, 1e-6, stream)?,
+            attn: QwenVisionAttention::new(config, index, stream)?,
+            norm2: QwenVisionRmsNorm::new(config.hidden_size, 1e-6, stream)?,
+            mlp: QwenVisionMlp::new(config, index, stream)?,
+        })
+    }
+
+    pub(crate) fn new_tensor_parallel(
+        config: &VisionConfig,
+        index: usize,
+        local_heads: i32,
+        local_intermediate: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut block = Self::new(config, index, stream)?;
+        block.attn = QwenVisionAttention::new_tensor_parallel(config, index, local_heads, stream)?;
+        let prefix = format!("blocks.{index}.mlp");
+        block.mlp.linear_fc1 = unloaded_maybe_quantized_linear(
+            config.hidden_size,
+            local_intermediate,
+            true,
+            config.weight_format(&format!("{prefix}.linear_fc1.weight")),
+            stream,
+        )?;
+        block.mlp.linear_fc2 = unloaded_maybe_quantized_linear(
+            local_intermediate,
+            config.hidden_size,
+            true,
+            config.weight_format(&format!("{prefix}.linear_fc2.weight")),
+            stream,
+        )?;
+        Ok(block)
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: Array,
+        chunk_lengths: &[i32],
+        cos: &Array,
+        sin: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normed = self.norm1.forward(&hidden_states, stream)?;
+        let attn = self
+            .attn
+            .forward(&normed, chunk_lengths, cos, sin, stream)?;
+        let hidden_states = hidden_states.add(attn, stream)?;
+        let normed = self.norm2.forward(&hidden_states, stream)?;
+        let mlp = self.mlp.forward(&normed, stream)?;
+        hidden_states.add(mlp, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: Array,
+        chunk_lengths: &[i32],
+        cos: &Array,
+        sin: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normed = self.norm1.forward(&hidden_states, stream)?;
+        let attention =
+            self.attn
+                .forward_tensor_parallel(&normed, chunk_lengths, cos, sin, group, stream)?;
+        let hidden_states = hidden_states.add(attention, stream)?;
+        let normed = self.norm2.forward(&hidden_states, stream)?;
+        let mlp = self.mlp.forward_tensor_parallel(&normed, group, stream)?;
+        hidden_states.add(mlp, stream)
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        self.norm1.training_mode(mode);
+        self.attn.training_mode(mode);
+        self.norm2.training_mode(mode);
+        self.mlp.training_mode(mode);
+    }
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Patch merger that maps vision features to language-model embeddings.
+pub struct QwenVisionPatchMerger {
+    /// Number of patch tokens merged per output token.
+    pub spatial_merge_unit: i32,
+    /// Vision hidden size.
+    pub context_dim: i32,
+    /// Flattened merger hidden size.
+    pub hidden_size: i32,
+    /// Whether normalization happens after spatial patches are flattened.
+    pub use_postshuffle_norm: bool,
+    /// Whether the merger uses tanh-approximated GELU.
+    pub approximate_gelu: bool,
+    #[param]
+    /// Pre-merge layer normalization.
+    pub norm: QwenVisionRmsNorm,
+    #[param]
+    /// First merger projection.
+    pub linear_fc1: MaybeQuantized<nn::Linear>,
+    #[param]
+    /// Final projection into language hidden size.
+    pub linear_fc2: MaybeQuantized<nn::Linear>,
+}
+
+impl QwenVisionPatchMerger {
+    fn new(
+        config: &VisionConfig,
+        parameter_prefix: &str,
+        use_postshuffle_norm: bool,
+        approximate_gelu: bool,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let spatial_merge_unit = config.spatial_merge_size * config.spatial_merge_size;
+        let hidden_size = config.hidden_size * spatial_merge_unit;
+        Ok(Self {
+            spatial_merge_unit,
+            context_dim: config.hidden_size,
+            hidden_size,
+            use_postshuffle_norm,
+            approximate_gelu,
+            norm: QwenVisionRmsNorm::new(
+                if use_postshuffle_norm {
+                    hidden_size
+                } else {
+                    config.hidden_size
+                },
+                1e-6,
+                stream,
+            )?,
+            linear_fc1: unloaded_maybe_quantized_linear(
+                hidden_size,
+                hidden_size,
+                true,
+                config.weight_format(&format!("{parameter_prefix}.linear_fc1.weight")),
+                stream,
+            )?,
+            linear_fc2: unloaded_maybe_quantized_linear(
+                hidden_size,
+                config.out_hidden_size,
+                true,
+                config.weight_format(&format!("{parameter_prefix}.linear_fc2.weight")),
+                stream,
+            )?,
+        })
+    }
+
+    pub(crate) fn new_tensor_parallel(
+        config: &VisionConfig,
+        parameter_prefix: &str,
+        use_postshuffle_norm: bool,
+        approximate_gelu: bool,
+        local_hidden_size: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let spatial_merge_unit = config.spatial_merge_size * config.spatial_merge_size;
+        let hidden_size = config.hidden_size * spatial_merge_unit;
+        Ok(Self {
+            spatial_merge_unit,
+            context_dim: config.hidden_size,
+            hidden_size,
+            use_postshuffle_norm,
+            approximate_gelu,
+            norm: QwenVisionRmsNorm::new(
+                if use_postshuffle_norm {
+                    hidden_size
+                } else {
+                    config.hidden_size
+                },
+                1e-6,
+                stream,
+            )?,
+            linear_fc1: unloaded_maybe_quantized_linear(
+                hidden_size,
+                local_hidden_size,
+                true,
+                config.weight_format(&format!("{parameter_prefix}.linear_fc1.weight")),
+                stream,
+            )?,
+            linear_fc2: unloaded_maybe_quantized_linear(
+                local_hidden_size,
+                config.out_hidden_size,
+                true,
+                config.weight_format(&format!("{parameter_prefix}.linear_fc2.weight")),
+                stream,
+            )?,
+        })
+    }
+
+    fn forward(&mut self, hidden_states: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let seq_len = hidden_states.dim(0);
+        if seq_len % self.spatial_merge_unit != 0 {
+            return Err(Exception::custom(format!(
+                "Qwen VL vision sequence length {seq_len} is not divisible by spatial merge unit {}",
+                self.spatial_merge_unit
+            )));
+        }
+        let hidden_states = if self.use_postshuffle_norm {
+            let hidden_states = hidden_states.reshape(&[-1, self.hidden_size], stream)?;
+            self.norm.forward(&hidden_states, stream)?
+        } else {
+            let hidden_states = self.norm.forward(hidden_states, stream)?;
+            hidden_states.reshape(&[-1, self.hidden_size], stream)?
+        };
+        let hidden_states = self.linear_fc1.forward(&hidden_states, stream)?;
+        let hidden_states = if self.approximate_gelu {
+            nn::gelu_approximate(hidden_states, stream)?
+        } else {
+            nn::gelu(hidden_states, stream)?
+        };
+        self.linear_fc2.forward(&hidden_states, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let seq_len = hidden_states.dim(0);
+        if seq_len % self.spatial_merge_unit != 0 {
+            return Err(Exception::custom(format!(
+                "Qwen VL vision sequence length {seq_len} is not divisible by spatial merge unit {}",
+                self.spatial_merge_unit
+            )));
+        }
+        let hidden_states = if self.use_postshuffle_norm {
+            let hidden_states = hidden_states.reshape(&[-1, self.hidden_size], stream)?;
+            self.norm.forward(&hidden_states, stream)?
+        } else {
+            let hidden_states = self.norm.forward(hidden_states, stream)?;
+            hidden_states.reshape(&[-1, self.hidden_size], stream)?
+        };
+        let hidden_states = self.linear_fc1.forward(&hidden_states, stream)?;
+        let hidden_states = if self.approximate_gelu {
+            nn::gelu_approximate(hidden_states, stream)?
+        } else {
+            nn::gelu(hidden_states, stream)?
+        };
+        let mut partial = self.linear_fc2.forward(&hidden_states, stream)?;
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear_fc2) {
+            partial = partial.subtract(bias, stream)?;
+        }
+        let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear_fc2) {
+            output = output.add(bias, stream)?;
+        }
+        Ok(output)
+    }
+
+    fn training_mode(&mut self, mode: bool) {
+        self.norm.training_mode(mode);
+        self.linear_fc1.training_mode(mode);
+        self.linear_fc2.training_mode(mode);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum VisionMode {
+    Windowed,
+    Deepstack,
+}
+
+/// Encoded Qwen vision features, including optional DeepStack projections.
+pub(crate) struct VisionOutput {
+    pub embeddings: Array,
+    pub deepstack_features: Vec<Array>,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Pinned Qwen vision modules surrounding the scheduled transformer blocks.
+pub(crate) struct QwenVisionLayerwiseStatic {
+    pub(crate) config: VisionConfig,
+    #[param]
+    pub(crate) pos_embed: nn::Embedding,
+    #[param]
+    pub(crate) patch_embed: QwenVisionPatchEmbed,
+    #[param]
+    pub(crate) merger: QwenVisionPatchMerger,
+    #[param]
+    pub(crate) deepstack_merger_list: Vec<QwenVisionPatchMerger>,
+    mode: VisionMode,
+}
+
+/// Per-input rotary, window, and DeepStack state for layerwise vision execution.
+pub(crate) struct QwenVisionLayerwiseState {
+    full_chunk_lengths: Vec<i32>,
+    window_chunk_lengths: Vec<i32>,
+    window_index: Vec<i32>,
+    cos: Array,
+    sin: Array,
+    deepstack_features: Vec<Array>,
+}
+
+impl QwenVisionLayerwiseState {
+    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
+        self.deepstack_features.iter().collect()
+    }
+
+    pub(crate) fn replace_deepstack_features(&mut self, features: Vec<Array>) {
+        self.deepstack_features = features;
+    }
+}
+
+impl QwenVisionLayerwiseStatic {
+    pub(crate) fn from_transformer(transformer: QwenVisionTransformer) -> Self {
+        Self {
+            config: transformer.config,
+            pos_embed: transformer.pos_embed,
+            patch_embed: transformer.patch_embed,
+            merger: transformer.merger,
+            deepstack_merger_list: transformer.deepstack_merger_list,
+            mode: transformer.mode,
+        }
+    }
+
+    pub(crate) fn begin(
+        &mut self,
+        pixel_values: &Array,
+        grid_thw: &Array,
+        stream: &Stream,
+    ) -> Result<(Array, QwenVisionLayerwiseState), Exception> {
+        let grid = grid_thw_from_array(grid_thw, stream)?;
+        validate_vision_grid(&grid, self.config.spatial_merge_size, pixel_values)?;
+        let mut hidden = self.patch_embed.forward(pixel_values, stream)?;
+        let seq_len = hidden.dim(0);
+        let positions = vision_interpolated_position_embeddings(
+            &mut self.pos_embed,
+            &grid,
+            self.config.num_position_embeddings,
+            self.config.spatial_merge_size,
+            stream,
+        )?;
+        hidden = hidden.add(positions.as_dtype(hidden.dtype(), stream)?, stream)?;
+        let state = self.continuation_state(pixel_values, grid_thw, stream)?;
+        let merge_unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
+        let window_index =
+            Array::from_slice(&state.window_index, &[state.window_index.len() as i32]);
+        hidden = hidden.reshape(&[seq_len / merge_unit, merge_unit, -1], stream)?;
+        hidden = hidden.try_index_device((&window_index, .., ..), stream)?;
+        hidden = hidden.reshape(&[seq_len, -1], stream)?;
+        Ok((hidden, state))
+    }
+
+    /// Reconstructs parameter-free routing and rotary state on a downstream
+    /// pipeline owner. The evolving hidden activation is transported
+    /// separately, so no patch, position, merger, or projector tensor is
+    /// required here.
+    pub(crate) fn continuation_state(
+        &self,
+        pixel_values: &Array,
+        grid_thw: &Array,
+        stream: &Stream,
+    ) -> Result<QwenVisionLayerwiseState, Exception> {
+        let grid = grid_thw_from_array(grid_thw, stream)?;
+        validate_vision_grid(&grid, self.config.spatial_merge_size, pixel_values)?;
+        let seq_len = pixel_values.dim(0);
+        let full_chunk_lengths = vision_attention_chunk_lengths(&grid);
+        let total: i32 = full_chunk_lengths.iter().sum();
+        if total != seq_len {
+            return Err(Exception::custom(format!(
+                "Qwen VL vision grid describes {total} patches but image tensor has {seq_len}"
+            )));
+        }
+        let merge_unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
+        let (window_index, window_chunk_lengths) = match self.mode {
+            VisionMode::Windowed => vision_window_index(
+                &grid,
+                self.config.spatial_merge_size,
+                self.config.window_size,
+                self.config.patch_size,
+            )?,
+            VisionMode::Deepstack => (
+                (0..seq_len / merge_unit).collect::<Vec<_>>(),
+                full_chunk_lengths.clone(),
+            ),
+        };
+        let window_index_array = Array::from_slice(&window_index, &[window_index.len() as i32]);
+
+        let (cos, sin) = vision_rotary_embeddings(
+            &grid,
+            self.config.spatial_merge_size,
+            self.config.hidden_size / self.config.num_heads,
+        );
+        let reorder = |array: Array| -> Result<Array, Exception> {
+            array
+                .reshape(&[seq_len / merge_unit, merge_unit, -1], stream)?
+                .try_index_device((&window_index_array, .., ..), stream)?
+                .reshape(&[seq_len, -1], stream)
+        };
+        Ok(QwenVisionLayerwiseState {
+            full_chunk_lengths,
+            window_chunk_lengths,
+            window_index,
+            cos: reorder(cos)?,
+            sin: reorder(sin)?,
+            deepstack_features: Vec::new(),
+        })
+    }
+
+    pub(crate) fn forward_block(
+        &self,
+        block: &mut QwenVisionBlock,
+        index: usize,
+        hidden: Array,
+        state: &QwenVisionLayerwiseState,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let policy = self.config.layer_policy(index).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen VL vision block {index} is outside the configured {}-layer schedule",
+                self.config.layer_count()
+            ))
+        })?;
+        let chunks = match policy.attention {
+            VisionAttentionPolicy::Full => &state.full_chunk_lengths,
+            VisionAttentionPolicy::Windowed => &state.window_chunk_lengths,
+        };
+        block.forward(hidden, chunks, &state.cos, &state.sin, stream)
+    }
+
+    pub(crate) fn forward_block_tensor_parallel(
+        &self,
+        block: &mut QwenVisionBlock,
+        index: usize,
+        hidden: Array,
+        state: &QwenVisionLayerwiseState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let policy = self.config.layer_policy(index).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen VL vision block {index} is outside the configured {}-layer schedule",
+                self.config.layer_count()
+            ))
+        })?;
+        let chunks = match policy.attention {
+            VisionAttentionPolicy::Full => &state.full_chunk_lengths,
+            VisionAttentionPolicy::Windowed => &state.window_chunk_lengths,
+        };
+        block.forward_tensor_parallel(hidden, chunks, &state.cos, &state.sin, group, stream)
+    }
+
+    pub(crate) fn capture_deepstack(
+        &mut self,
+        index: usize,
+        hidden: &Array,
+        state: &mut QwenVisionLayerwiseState,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let policy = self.config.layer_policy(index).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen VL vision block {index} is outside the configured {}-layer schedule",
+                self.config.layer_count()
+            ))
+        })?;
+        if let Some(merger_index) = policy.deepstack_merger {
+            let merger_index = merger_index as usize;
+            state.deepstack_features.push(
+                self.deepstack_merger_list
+                    .get_mut(merger_index)
+                    .ok_or_else(|| {
+                        Exception::custom(format!(
+                            "Qwen VL vision layer {index} selects missing DeepStack merger {merger_index}"
+                        ))
+                    })?
+                    .forward(hidden, stream)?
+                    .try_index_device((NewAxis, .., ..), stream)?,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capture_deepstack_tensor_parallel(
+        &mut self,
+        index: usize,
+        hidden: &Array,
+        state: &mut QwenVisionLayerwiseState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let policy = self.config.layer_policy(index).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen VL vision block {index} is outside the configured {}-layer schedule",
+                self.config.layer_count()
+            ))
+        })?;
+        if let Some(merger_index) = policy.deepstack_merger {
+            let merger_index = merger_index as usize;
+            state.deepstack_features.push(
+                self.deepstack_merger_list
+                    .get_mut(merger_index)
+                    .ok_or_else(|| Exception::custom("missing Qwen DeepStack merger"))?
+                    .forward_tensor_parallel(hidden, group, stream)?
+                    .try_index_device((NewAxis, .., ..), stream)?,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        hidden: &Array,
+        state: &mut QwenVisionLayerwiseState,
+        stream: &Stream,
+    ) -> Result<VisionOutput, Exception> {
+        let hidden = self.merger.forward(hidden, stream)?;
+        let reverse_index = reverse_permutation(&state.window_index);
+        let reverse_index_array = Array::from_slice(&reverse_index, &[reverse_index.len() as i32]);
+        let embeddings = hidden
+            .try_index_device((&reverse_index_array, ..), stream)?
+            .try_index_device((NewAxis, .., ..), stream)?;
+        Ok(VisionOutput {
+            embeddings,
+            deepstack_features: std::mem::take(&mut state.deepstack_features),
+        })
+    }
+
+    pub(crate) fn finish_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        state: &mut QwenVisionLayerwiseState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<VisionOutput, Exception> {
+        let hidden = self.merger.forward_tensor_parallel(hidden, group, stream)?;
+        let reverse_index = reverse_permutation(&state.window_index);
+        let reverse_index_array = Array::from_slice(&reverse_index, &[reverse_index.len() as i32]);
+        let embeddings = hidden
+            .try_index_device((&reverse_index_array, ..), stream)?
+            .try_index_device((NewAxis, .., ..), stream)?;
+        Ok(VisionOutput {
+            embeddings,
+            deepstack_features: std::mem::take(&mut state.deepstack_features),
+        })
+    }
+}
+
+/// Builds the shared semantic TP plan for a Qwen vision root.
+pub(crate) fn vision_parallel_parameter_groups(
+    config: &VisionConfig,
+    prefix: &str,
+    stream: &Stream,
+) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+    use crate::backend::mlx::runtime::distributed::parallel::{
+        partitioned_projection_members, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
+        ParameterRole, ProjectionSharding,
+    };
+    let intermediate = usize::try_from(config.intermediate_size)
+        .map_err(|_| Error::Parallel("Qwen vision intermediate size is invalid".into()))?;
+    let hidden = usize::try_from(config.hidden_size)
+        .map_err(|_| Error::Parallel("Qwen vision hidden size is invalid".into()))?;
+    let heads = usize::try_from(config.num_heads)
+        .map_err(|_| Error::Parallel("Qwen vision head count is invalid".into()))?;
+    let mut groups = Vec::new();
+    for index in 0..config.layer_count() {
+        let block = format!("{prefix}.blocks.{index}");
+        let module = QwenVisionBlock::new(config, index, stream)?;
+        let qkv_prefix = format!("{block}.attn.qkv");
+        let output_prefix = format!("{block}.attn.proj");
+        let (attention_units, attention_members) = partitioned_projection_members(
+            &[
+                (
+                    &module.attn.qkv,
+                    qkv_prefix.as_str(),
+                    ProjectionSharding::Column,
+                ),
+                (
+                    &module.attn.proj,
+                    output_prefix.as_str(),
+                    ProjectionSharding::Row,
+                ),
+            ],
+            heads,
+        )?;
+        let attention_members = attention_members
+            .into_iter()
+            .map(|member| {
+                if !member.target().starts_with(&qkv_prefix) {
+                    return Ok(member);
+                }
+                let shape = member.global_shape();
+                let rows = *shape.first().ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "Qwen vision QKV member {:?} is scalar",
+                        member.target()
+                    ))
+                })?;
+                if !rows.is_multiple_of(3) {
+                    return Err(Error::Parallel(format!(
+                        "Qwen vision QKV member {:?} has non-segmented shape {shape:?}",
+                        member.target()
+                    )));
+                }
+                let segment = rows / 3;
+                Ok(ParameterMemberSpec::new(
+                    member.target(),
+                    shape.to_vec(),
+                    MemberSharding::PartitionedSegments {
+                        axis: 0,
+                        segments: vec![0..segment, segment..2 * segment, 2 * segment..3 * segment],
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        groups.push(ParameterGroupSpec::partitioned(
+            format!("{block}.attention.heads"),
+            ParameterRole::AttentionHeads,
+            attention_units,
+            attention_members,
+        )?);
+
+        let fc1_prefix = format!("{block}.mlp.linear_fc1");
+        let fc2_prefix = format!("{block}.mlp.linear_fc2");
+        let (mlp_units, mlp_members) = partitioned_projection_members(
+            &[
+                (
+                    &module.mlp.linear_fc1,
+                    fc1_prefix.as_str(),
+                    ProjectionSharding::Column,
+                ),
+                (
+                    &module.mlp.linear_fc2,
+                    fc2_prefix.as_str(),
+                    ProjectionSharding::Row,
+                ),
+            ],
+            intermediate,
+        )?;
+        groups.push(ParameterGroupSpec::partitioned(
+            format!("{block}.mlp.intermediate"),
+            ParameterRole::FeedForwardIntermediate,
+            mlp_units,
+            mlp_members,
+        )?);
+    }
+    let merge = usize::try_from(config.spatial_merge_size)
+        .map_err(|_| Error::Parallel("Qwen vision merge size is invalid".into()))?;
+    let merger_hidden = hidden
+        .checked_mul(merge.pow(2))
+        .ok_or_else(|| Error::Parallel("Qwen vision merger width overflowed".into()))?;
+    for merger in std::iter::once(format!("{prefix}.merger")).chain(
+        (0..config.deepstack_layer_count())
+            .map(|index| format!("{prefix}.deepstack_merger_list.{index}")),
+    ) {
+        let relative = merger.strip_prefix(&format!("{prefix}.")).ok_or_else(|| {
+            Error::Parallel(format!("invalid Qwen vision merger prefix {merger}"))
+        })?;
+        let module = QwenVisionPatchMerger::new(config, relative, false, false, stream)?;
+        let fc1_prefix = format!("{merger}.linear_fc1");
+        let fc2_prefix = format!("{merger}.linear_fc2");
+        let (units, members) = partitioned_projection_members(
+            &[
+                (
+                    &module.linear_fc1,
+                    fc1_prefix.as_str(),
+                    ProjectionSharding::Column,
+                ),
+                (
+                    &module.linear_fc2,
+                    fc2_prefix.as_str(),
+                    ProjectionSharding::Row,
+                ),
+            ],
+            merger_hidden,
+        )?;
+        groups.push(ParameterGroupSpec::partitioned(
+            format!("{merger}.intermediate"),
+            ParameterRole::FeedForwardIntermediate,
+            units,
+            members,
+        )?);
+    }
+    Ok(groups)
+}
+
+/// Rebuilds merger projections for one rank-local Qwen vision TP layout.
+pub(crate) fn configure_vision_parallel_static(
+    vision: &mut QwenVisionLayerwiseStatic,
+    prefix: &str,
+    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+    stream: &Stream,
+) -> Result<(), Error> {
+    let target = format!("{prefix}.merger.linear_fc1");
+    let local_hidden = i32::try_from(
+        layout
+            .tensor(&format!("{target}.weight"))
+            .or_else(|| layout.tensor(&format!("{target}.inner.weight")))
+            .ok_or_else(|| Error::Parallel(format!("missing Qwen TP layout for {target}")))?
+            .local_shape()[0],
+    )
+    .map_err(|_| Error::Parallel("Qwen vision merger width exceeds i32".into()))?;
+    vision.merger = QwenVisionPatchMerger::new_tensor_parallel(
+        &vision.config,
+        "merger",
+        false,
+        false,
+        local_hidden,
+        stream,
+    )?;
+    for (index, merger) in vision.deepstack_merger_list.iter_mut().enumerate() {
+        let target = format!("{prefix}.deepstack_merger_list.{index}.linear_fc1");
+        let local_hidden = i32::try_from(
+            layout
+                .tensor(&format!("{target}.weight"))
+                .or_else(|| layout.tensor(&format!("{target}.inner.weight")))
+                .ok_or_else(|| Error::Parallel(format!("missing Qwen TP layout for {target}")))?
+                .local_shape()[0],
+        )
+        .map_err(|_| Error::Parallel("Qwen DeepStack width exceeds i32".into()))?;
+        *merger = QwenVisionPatchMerger::new_tensor_parallel(
+            &vision.config,
+            &format!("deepstack_merger_list.{index}"),
+            true,
+            false,
+            local_hidden,
+            stream,
+        )?;
+    }
+    Ok(())
+}
+
+/// Constructs one rank-local Qwen vision transformer block from its plan.
+pub(crate) fn new_parallel_vision_block(
+    config: &VisionConfig,
+    prefix: &str,
+    index: usize,
+    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+    stream: &Stream,
+) -> Result<QwenVisionBlock, Error> {
+    let block = format!("{prefix}.blocks.{index}");
+    let qkv = layout
+        .tensor(&format!("{block}.attn.qkv.weight"))
+        .or_else(|| layout.tensor(&format!("{block}.attn.qkv.inner.weight")))
+        .ok_or_else(|| Error::Parallel(format!("missing TP layout for {block} QKV")))?;
+    let fc1 = layout
+        .tensor(&format!("{block}.mlp.linear_fc1.weight"))
+        .or_else(|| layout.tensor(&format!("{block}.mlp.linear_fc1.inner.weight")))
+        .ok_or_else(|| Error::Parallel(format!("missing TP layout for {block} MLP")))?;
+    let head_dim = config.hidden_size / config.num_heads;
+    let local_heads = i32::try_from(qkv.local_shape()[0] / 3)
+        .map_err(|_| Error::Parallel("Qwen vision local width exceeds i32".into()))?
+        / head_dim;
+    let local_intermediate = i32::try_from(fc1.local_shape()[0])
+        .map_err(|_| Error::Parallel("Qwen vision local MLP exceeds i32".into()))?;
+    QwenVisionBlock::new_tensor_parallel(config, index, local_heads, local_intermediate, stream)
+        .map_err(Into::into)
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+/// Qwen VL vision transformer used to encode image tensors.
+pub struct QwenVisionTransformer {
+    /// Vision configuration.
+    pub config: VisionConfig,
+    #[param]
+    /// Learned spatial position embedding table.
+    pub pos_embed: nn::Embedding,
+    #[param]
+    /// Patch embedding.
+    pub patch_embed: QwenVisionPatchEmbed,
+    #[param]
+    /// Vision transformer blocks.
+    pub blocks: Vec<QwenVisionBlock>,
+    #[param]
+    /// Patch merger.
+    pub merger: QwenVisionPatchMerger,
+    #[param]
+    /// Per-layer DeepStack mergers used by Qwen3-VL.
+    pub deepstack_merger_list: Vec<QwenVisionPatchMerger>,
+    mode: VisionMode,
+}
+
+impl QwenVisionTransformer {
+    pub(crate) fn new(config: VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_mode(config, VisionMode::Windowed, stream)
+    }
+
+    pub(crate) fn new_deepstack(config: VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_mode(config, VisionMode::Deepstack, stream)
+    }
+
+    fn new_with_mode(
+        config: VisionConfig,
+        mode: VisionMode,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        config.validate_for_mode(mode)?;
+        if config.spatial_merge_size <= 0 {
+            return Err(Exception::custom(
+                "Qwen VL vision spatial_merge_size must be positive",
+            ));
+        }
+        let pos_embed = nn::Embedding::unloaded(
+            config.num_position_embeddings,
+            config.hidden_size,
+            Dtype::Float32,
+            stream,
+        )?;
+        let patch_embed = QwenVisionPatchEmbed::new(&config, stream)?;
+        let mut blocks = Vec::with_capacity(config.layer_count());
+        for index in 0..config.layer_count() {
+            blocks.push(QwenVisionBlock::new(&config, index, stream)?);
+        }
+        let merger = QwenVisionPatchMerger::new(
+            &config,
+            "merger",
+            false,
+            mode == VisionMode::Windowed,
+            stream,
+        )?;
+        let deepstack_merger_list = (0..config.deepstack_layer_count())
+            .map(|index| {
+                QwenVisionPatchMerger::new(
+                    &config,
+                    &format!("deepstack_merger_list.{index}"),
+                    true,
+                    false,
+                    stream,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            config,
+            pos_embed,
+            patch_embed,
+            blocks,
+            merger,
+            deepstack_merger_list,
+            mode,
+        })
+    }
+
+    pub(crate) fn forward(
+        &mut self,
+        pixel_values: &Array,
+        grid_thw: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        Ok(self
+            .forward_features(pixel_values, grid_thw, stream)?
+            .embeddings)
+    }
+
+    pub(crate) fn forward_features(
+        &mut self,
+        pixel_values: &Array,
+        grid_thw: &Array,
+        stream: &Stream,
+    ) -> Result<VisionOutput, Exception> {
+        let grid = grid_thw_from_array(grid_thw, stream)?;
+        validate_vision_grid(&grid, self.config.spatial_merge_size, pixel_values)?;
+        let mut hidden_states = self.patch_embed.forward(pixel_values, stream)?;
+        let seq_len = hidden_states.dim(0);
+        let position_embeddings = match self.mode {
+            VisionMode::Windowed => {
+                let indices = vision_position_indices(&grid, self.config.num_position_embeddings)?;
+                self.pos_embed.forward(
+                    &Array::from_slice(&indices, &[indices.len() as i32]),
+                    stream,
+                )?
+            }
+            VisionMode::Deepstack => vision_interpolated_position_embeddings(
+                &mut self.pos_embed,
+                &grid,
+                self.config.num_position_embeddings,
+                self.config.spatial_merge_size,
+                stream,
+            )?,
+        };
+        hidden_states = hidden_states.add(
+            position_embeddings.as_dtype(hidden_states.dtype(), stream)?,
+            stream,
+        )?;
+        let full_chunk_lengths = vision_attention_chunk_lengths(&grid);
+        let total: i32 = full_chunk_lengths.iter().sum();
+        if total != seq_len {
+            return Err(Exception::custom(format!(
+                "Qwen VL vision grid describes {total} patches but image tensor has {seq_len}"
+            )));
+        }
+        let (window_index, window_chunk_lengths) = match self.mode {
+            VisionMode::Windowed => vision_window_index(
+                &grid,
+                self.config.spatial_merge_size,
+                self.config.window_size,
+                self.config.patch_size,
+            )?,
+            VisionMode::Deepstack => (
+                (0..seq_len / (self.config.spatial_merge_size * self.config.spatial_merge_size))
+                    .collect(),
+                full_chunk_lengths.clone(),
+            ),
+        };
+        let window_index_array = Array::from_slice(&window_index, &[window_index.len() as i32]);
+        hidden_states = hidden_states.reshape(
+            &[
+                seq_len / (self.config.spatial_merge_size * self.config.spatial_merge_size),
+                self.config.spatial_merge_size * self.config.spatial_merge_size,
+                -1,
+            ],
+            stream,
+        )?;
+        hidden_states = hidden_states.try_index_device((&window_index_array, .., ..), stream)?;
+        hidden_states = hidden_states.reshape(&[seq_len, -1], stream)?;
+
+        let (cos, sin) = vision_rotary_embeddings(
+            &grid,
+            self.config.spatial_merge_size,
+            self.config.hidden_size / self.config.num_heads,
+        );
+        let cos = cos.reshape(
+            &[
+                seq_len / (self.config.spatial_merge_size * self.config.spatial_merge_size),
+                self.config.spatial_merge_size * self.config.spatial_merge_size,
+                -1,
+            ],
+            stream,
+        )?;
+        let cos = cos
+            .try_index_device((&window_index_array, .., ..), stream)?
+            .reshape(&[seq_len, -1], stream)?;
+        let sin = sin.reshape(
+            &[
+                seq_len / (self.config.spatial_merge_size * self.config.spatial_merge_size),
+                self.config.spatial_merge_size * self.config.spatial_merge_size,
+                -1,
+            ],
+            stream,
+        )?;
+        let sin = sin
+            .try_index_device((&window_index_array, .., ..), stream)?
+            .reshape(&[seq_len, -1], stream)?;
+
+        let mut deepstack_features = Vec::new();
+        for (layer_num, block) in self.blocks.iter_mut().enumerate() {
+            let policy = self.config.layer_policy(layer_num).ok_or_else(|| {
+                Exception::custom(format!(
+                    "Qwen VL vision block {layer_num} is outside the configured {}-layer schedule",
+                    self.config.layer_count()
+                ))
+            })?;
+            let chunk_lengths = match policy.attention {
+                VisionAttentionPolicy::Full => &full_chunk_lengths,
+                VisionAttentionPolicy::Windowed => &window_chunk_lengths,
+            };
+            hidden_states = block.forward(hidden_states, chunk_lengths, &cos, &sin, stream)?;
+            if let Some(merger_index) = policy.deepstack_merger {
+                let merger_index = merger_index as usize;
+                let feature = self
+                    .deepstack_merger_list
+                    .get_mut(merger_index)
+                    .ok_or_else(|| {
+                        Exception::custom(format!(
+                            "Qwen VL vision layer {layer_num} selects missing DeepStack merger {merger_index}"
+                        ))
+                    })?
+                    .forward(&hidden_states, stream)?
+                    .try_index_device((NewAxis, .., ..), stream)?;
+                deepstack_features.push(feature);
+            }
+        }
+        let hidden_states = self.merger.forward(&hidden_states, stream)?;
+        let reverse_index = reverse_permutation(&window_index);
+        let reverse_index_array = Array::from_slice(&reverse_index, &[reverse_index.len() as i32]);
+        let embeddings = hidden_states
+            .try_index_device((&reverse_index_array, ..), stream)?
+            .try_index_device((NewAxis, .., ..), stream)?;
+        Ok(VisionOutput {
+            embeddings,
+            deepstack_features,
+        })
+    }
+
+    pub(crate) fn training_mode(&mut self, mode: bool) {
+        self.patch_embed.training_mode(mode);
+        for block in &mut self.blocks {
+            block.training_mode(mode);
+        }
+        self.merger.training_mode(mode);
+        for merger in &mut self.deepstack_merger_list {
+            merger.training_mode(mode);
+        }
+    }
+}
+
+fn apply_vision_rotary_pos_emb(
+    query: Array,
+    key: Array,
+    cos: &Array,
+    sin: &Array,
+    stream: &Stream,
+) -> Result<(Array, Array), Exception> {
+    let query_dtype = query.dtype();
+    let key_dtype = key.dtype();
+    let query = query.as_dtype(Dtype::Float32, stream)?;
+    let key = key.as_dtype(Dtype::Float32, stream)?;
+    let cos = cos.try_index_device((.., NewAxis, ..), stream)?;
+    let sin = sin.try_index_device((.., NewAxis, ..), stream)?;
+    let query_embed = query.multiply(&cos, stream)?.add(
+        rotate_half_vision(&query, stream)?.multiply(&sin, stream)?,
+        stream,
+    )?;
+    let key_embed = key.multiply(cos, stream)?.add(
+        rotate_half_vision(&key, stream)?.multiply(sin, stream)?,
+        stream,
+    )?;
+    Ok((
+        query_embed.as_dtype(query_dtype, stream)?,
+        key_embed.as_dtype(key_dtype, stream)?,
+    ))
+}
+
+fn rotate_half_vision(x: &Array, stream: &Stream) -> Result<Array, Exception> {
+    let half = x.dim(-1) / 2;
+    let x1 = x.try_index_device((.., .., ..half), stream)?;
+    let x2 = x.try_index_device((.., .., half..), stream)?;
+    concatenate_axis(
+        &[x2.multiply(Array::from_f32(-1.0), stream)?, x1],
+        -1,
+        stream,
+    )
+}
+
+pub(crate) fn grid_thw_from_array(
+    grid_thw: &Array,
+    stream: &Stream,
+) -> Result<Vec<(i32, i32, i32)>, Exception> {
+    let shape = grid_thw.shape();
+    if shape.len() != 2 || shape[1] != 3 {
+        return Err(Exception::custom(format!(
+            "qwen3_5_moe qwen_grid_thw must be shaped [items, 3], got {shape:?}"
+        )));
+    }
+    let mut grid = Vec::with_capacity(shape[0] as usize);
+    for index in 0..shape[0] {
+        let t = grid_thw
+            .try_index_device((index, 0), stream)?
+            .item::<i32>(stream);
+        let h = grid_thw
+            .try_index_device((index, 1), stream)?
+            .item::<i32>(stream);
+        let w = grid_thw
+            .try_index_device((index, 2), stream)?
+            .item::<i32>(stream);
+        grid.push((t, h, w));
+    }
+    Ok(grid)
+}
+
+fn validate_vision_grid(
+    grid: &[(i32, i32, i32)],
+    spatial_merge_size: i32,
+    pixel_values: &Array,
+) -> Result<(), Exception> {
+    let patches: i32 = grid.iter().map(|(t, h, w)| t * h * w).sum();
+    if patches != pixel_values.dim(0) {
+        return Err(Exception::custom(format!(
+            "qwen3_5_moe qwen_grid_thw describes {patches} patches but image tensor has {}",
+            pixel_values.dim(0)
+        )));
+    }
+    for &(t, h, w) in grid {
+        if t <= 0 || h <= 0 || w <= 0 {
+            return Err(Exception::custom(format!(
+                "qwen3_5_moe qwen_grid_thw entries must be positive, got {:?}",
+                (t, h, w)
+            )));
+        }
+        if h % spatial_merge_size != 0 || w % spatial_merge_size != 0 {
+            return Err(Exception::custom(format!(
+                "qwen3_5_moe qwen_grid_thw spatial dimensions must be divisible by spatial_merge_size {spatial_merge_size}, got {:?}",
+                (t, h, w)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn vision_position_indices(
+    grid: &[(i32, i32, i32)],
+    num_position_embeddings: i32,
+) -> Result<Vec<u32>, Exception> {
+    let side = (num_position_embeddings as f64).sqrt() as i32;
+    if side * side != num_position_embeddings {
+        return Err(Exception::custom(format!(
+            "Qwen VL vision num_position_embeddings must be a square, got {num_position_embeddings}"
+        )));
+    }
+    let mut indices = Vec::new();
+    for &(t, h, w) in grid {
+        if h > side || w > side {
+            return Err(Exception::custom(format!(
+                "qwen3_5_moe qwen_grid_thw spatial dimensions {:?} exceed learned position table side {side}",
+                (h, w)
+            )));
+        }
+        for _ in 0..t {
+            for h_pos in 0..h {
+                for w_pos in 0..w {
+                    indices.push((h_pos * side + w_pos) as u32);
+                }
+            }
+        }
+    }
+    Ok(indices)
+}
+
+fn vision_interpolated_position_embeddings(
+    pos_embed: &mut nn::Embedding,
+    grid: &[(i32, i32, i32)],
+    num_position_embeddings: i32,
+    spatial_merge_size: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let side = (num_position_embeddings as f64).sqrt() as i32;
+    if side * side != num_position_embeddings {
+        return Err(Exception::custom(format!(
+            "Qwen VL vision num_position_embeddings must be a square, got {num_position_embeddings}"
+        )));
+    }
+    let mut corner_indices = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut corner_weights = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for &(t, h, w) in grid {
+        let axis = |position: i32, length: i32| {
+            if length == 1 {
+                (0, 0, 0.0)
+            } else {
+                let value = position as f32 * (side - 1) as f32 / (length - 1) as f32;
+                let floor = value.floor() as i32;
+                (floor, (floor + 1).min(side - 1), value - floor as f32)
+            }
+        };
+        for _ in 0..t {
+            for h_block in 0..h / spatial_merge_size {
+                for w_block in 0..w / spatial_merge_size {
+                    for h_inner in 0..spatial_merge_size {
+                        for w_inner in 0..spatial_merge_size {
+                            let (h0, h1, hf) = axis(h_block * spatial_merge_size + h_inner, h);
+                            let (w0, w1, wf) = axis(w_block * spatial_merge_size + w_inner, w);
+                            for (corner, index, weight) in [
+                                (0, h0 * side + w0, (1.0 - hf) * (1.0 - wf)),
+                                (1, h0 * side + w1, (1.0 - hf) * wf),
+                                (2, h1 * side + w0, hf * (1.0 - wf)),
+                                (3, h1 * side + w1, hf * wf),
+                            ] {
+                                corner_indices[corner].push(index as u32);
+                                corner_weights[corner].push(weight);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let seq_len = corner_indices[0].len() as i32;
+    let mut output: Option<Array> = None;
+    for corner in 0..4 {
+        let indices = Array::from_slice(&corner_indices[corner], &[seq_len]);
+        let weights = Array::from_slice(&corner_weights[corner], &[seq_len, 1]);
+        let weighted = pos_embed
+            .forward(&indices, stream)?
+            .multiply(weights, stream)?;
+        output = Some(match output {
+            Some(current) => current.add(weighted, stream)?,
+            None => weighted,
+        });
+    }
+    output.ok_or_else(|| Exception::custom("Qwen VL vision grid must not be empty"))
+}
+
+fn vision_attention_chunk_lengths(grid: &[(i32, i32, i32)]) -> Vec<i32> {
+    let mut lengths = Vec::new();
+    for &(t, h, w) in grid {
+        for _ in 0..t {
+            lengths.push(h * w);
+        }
+    }
+    lengths
+}
+
+pub(crate) fn vision_window_index(
+    grid: &[(i32, i32, i32)],
+    spatial_merge_size: i32,
+    window_size: i32,
+    patch_size: i32,
+) -> Result<(Vec<i32>, Vec<i32>), Exception> {
+    let vit_merger_window_size = window_size / spatial_merge_size / patch_size;
+    if vit_merger_window_size <= 0 {
+        return Err(Exception::custom(format!(
+            "Qwen VL vision window_size {window_size} is too small for spatial_merge_size {spatial_merge_size} and patch_size {patch_size}"
+        )));
+    }
+    let spatial_merge_unit = spatial_merge_size * spatial_merge_size;
+    let mut window_index = Vec::new();
+    let mut cumulative_seqlens = vec![0];
+    let mut window_index_id = 0;
+    for &(grid_t, grid_h, grid_w) in grid {
+        let llm_grid_h = grid_h / spatial_merge_size;
+        let llm_grid_w = grid_w / spatial_merge_size;
+        let pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size;
+        let pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size;
+        let num_windows_h = (llm_grid_h + pad_h) / vit_merger_window_size;
+        let num_windows_w = (llm_grid_w + pad_w) / vit_merger_window_size;
+        for t in 0..grid_t {
+            for window_h in 0..num_windows_h {
+                for window_w in 0..num_windows_w {
+                    let mut window_groups = 0;
+                    for inner_h in 0..vit_merger_window_size {
+                        for inner_w in 0..vit_merger_window_size {
+                            let h = window_h * vit_merger_window_size + inner_h;
+                            let w = window_w * vit_merger_window_size + inner_w;
+                            if h < llm_grid_h && w < llm_grid_w {
+                                let index = t * llm_grid_h * llm_grid_w + h * llm_grid_w + w;
+                                window_index.push(window_index_id + index);
+                                window_groups += 1;
+                            }
+                        }
+                    }
+                    let next = cumulative_seqlens.last().copied().unwrap_or(0)
+                        + window_groups * spatial_merge_unit;
+                    if cumulative_seqlens.last().copied() != Some(next) {
+                        cumulative_seqlens.push(next);
+                    }
+                }
+            }
+        }
+        window_index_id += grid_t * llm_grid_h * llm_grid_w;
+    }
+    let chunk_lengths = cumulative_seqlens
+        .windows(2)
+        .map(|window| window[1] - window[0])
+        .collect::<Vec<_>>();
+    Ok((window_index, chunk_lengths))
+}
+
+pub(crate) fn reverse_permutation(indices: &[i32]) -> Vec<i32> {
+    let mut reverse = vec![0; indices.len()];
+    for (position, &index) in indices.iter().enumerate() {
+        reverse[index as usize] = position as i32;
+    }
+    reverse
+}
+
+fn vision_rotary_embeddings(
+    grid: &[(i32, i32, i32)],
+    spatial_merge_size: i32,
+    head_dim: i32,
+) -> (Array, Array) {
+    let rotary_dim = head_dim / 2;
+    let inv_freq = (0..rotary_dim)
+        .step_by(2)
+        .map(|idx| 1.0f32 / 10000.0f32.powf(idx as f32 / rotary_dim as f32))
+        .collect::<Vec<_>>();
+    let mut cos_values = Vec::new();
+    let mut sin_values = Vec::new();
+    for &(t, h, w) in grid {
+        for _ in 0..t {
+            for h_block in 0..(h / spatial_merge_size) {
+                for w_block in 0..(w / spatial_merge_size) {
+                    for h_inner in 0..spatial_merge_size {
+                        for w_inner in 0..spatial_merge_size {
+                            let h_pos = h_block * spatial_merge_size + h_inner;
+                            let w_pos = w_block * spatial_merge_size + w_inner;
+                            let mut angles = Vec::with_capacity(rotary_dim as usize);
+                            for position in [h_pos, w_pos] {
+                                for inv in &inv_freq {
+                                    angles.push(position as f32 * inv);
+                                }
+                            }
+                            let full_angles = angles
+                                .iter()
+                                .chain(angles.iter())
+                                .copied()
+                                .collect::<Vec<_>>();
+                            for angle in full_angles {
+                                cos_values.push(angle.cos());
+                                sin_values.push(angle.sin());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let seq_len = (cos_values.len() as i32) / head_dim;
+    (
+        Array::from_slice(&cos_values, &[seq_len, head_dim]),
+        Array::from_slice(&sin_values, &[seq_len, head_dim]),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(depth: i32, full: Option<Vec<i32>>, deepstack: Vec<i32>) -> VisionConfigSource {
+        VisionConfigSource {
+            depth,
+            hidden_size: 8,
+            hidden_act: "gelu_pytorch_tanh".into(),
+            intermediate_size: 16,
+            num_heads: 2,
+            num_position_embeddings: 16,
+            in_channels: 3,
+            patch_size: 2,
+            spatial_merge_size: 2,
+            temporal_patch_size: 2,
+            window_size: None,
+            out_hidden_size: 12,
+            fullatt_block_indexes: full,
+            deepstack_visual_indexes: Some(deepstack),
+        }
+    }
+
+    #[test]
+    fn qwen3_vl_normalizes_full_attention_and_ordered_deepstack() {
+        let config = source(4, None, vec![2, 0]).normalize_qwen3_vl().unwrap();
+        assert_eq!(config.layer_count(), 4);
+        assert!(config
+            .layer_schedule
+            .iter()
+            .all(|policy| policy.attention == VisionAttentionPolicy::Full));
+        assert_eq!(config.deepstack_layers(), vec![2, 0]);
+        assert_eq!(config.layer_schedule_fingerprint(), "fd1,f,fd0,f");
+        assert!(config.layer_policy(4).is_none());
+    }
+
+    #[test]
+    fn qwen3_5_normalizes_arbitrary_attention_and_deepstack_policies() {
+        let config = source(4, Some(vec![3, 1]), vec![2])
+            .normalize_qwen3_5()
+            .unwrap();
+        assert_eq!(config.layer_schedule_fingerprint(), "w,f,wd0,f");
+        assert_eq!(config.deepstack_layers(), vec![2]);
+    }
+
+    #[test]
+    fn qwen3_5_without_window_metadata_uses_full_attention_at_every_depth() {
+        let config = source(27, None, Vec::new()).normalize_qwen3_5().unwrap();
+        assert_eq!(config.layer_count(), 27);
+        assert!(config
+            .layer_schedule
+            .iter()
+            .all(|policy| policy.attention == VisionAttentionPolicy::Full));
+    }
+
+    #[test]
+    #[ignore = "requires native MLX Metal quantization construction"]
+    fn q8_projection_plan_uses_shared_vision_semantics() {
+        let mut config = source(1, None, Vec::new()).normalize_qwen3_5().unwrap();
+        config.hidden_size = 32;
+        config.intermediate_size = 32;
+        config.num_heads = 4;
+        config.out_hidden_size = 32;
+        let format =
+            crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization::Affine(
+                crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(
+                    32, 8,
+                )
+                .unwrap(),
+            );
+        for name in [
+            "blocks.0.attn.qkv.weight",
+            "blocks.0.attn.proj.weight",
+            "blocks.0.mlp.linear_fc1.weight",
+            "blocks.0.mlp.linear_fc2.weight",
+            "merger.linear_fc1.weight",
+            "merger.linear_fc2.weight",
+        ] {
+            config.quantized_weight_configs.insert(name.into(), format);
+        }
+        let execution =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let groups =
+            vision_parallel_parameter_groups(&config, "visual", execution.stream()).unwrap();
+        assert_eq!(groups.len(), 3);
+    }
+
+    #[test]
+    fn vision_schedule_validation_rejects_conflicts_and_bad_layer_indexes() {
+        let conflict = source(2, Some(vec![0]), Vec::new())
+            .normalize_qwen3_vl()
+            .unwrap_err()
+            .to_string();
+        assert!(conflict.contains("must not define window_size or fullatt_block_indexes"));
+
+        let duplicate = source(2, Some(vec![0, 0]), Vec::new())
+            .normalize_qwen3_5()
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate.contains("duplicated"));
+
+        let out_of_range = source(2, Some(vec![0]), vec![2])
+            .normalize_qwen3_5()
+            .unwrap_err()
+            .to_string();
+        assert!(out_of_range.contains("outside vision depth 2"));
+    }
+
+    #[test]
+    fn ordered_policy_changes_vision_fingerprint() {
+        let first = source(4, Some(vec![0, 2]), vec![1])
+            .normalize_qwen3_5()
+            .unwrap();
+        let second = source(4, Some(vec![1, 2]), vec![0])
+            .normalize_qwen3_5()
+            .unwrap();
+        assert_ne!(
+            first.layer_schedule_fingerprint(),
+            second.layer_schedule_fingerprint()
+        );
+    }
+}

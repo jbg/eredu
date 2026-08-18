@@ -676,9 +676,9 @@ mod tests {
 
     use super::*;
     use crate::{
+        backend::mlx::nn::linear::unloaded_maybe_quantized_linear,
         backend::mlx::runtime::checkpoint::quantization::AffineQuantization,
         backend::mlx::runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore},
-        nn::linear::unloaded_maybe_quantized_linear,
         test_utils::SyntheticGguf,
     };
 

@@ -32,11 +32,15 @@ inside it: the default `mlx` feature exposes `backend::mlx`, while a build with
 `default-features = false` exposes no MLX implementation or native dependency.
 
 The facade-level `runtime` namespace contains only backend-independent chat
-preparation and committed semantic streaming. MLX arrays, checkpoint stores,
-KV-cache storage, native distributed transport, model execution, sampling,
-media tensor preparation, residency workers, and the MLX-aware error type live
-under `backend::mlx::runtime` and `backend::mlx::error`. Common MLX load-policy
-types are reexported within `backend::mlx`, never at the facade crate root.
+preparation and committed semantic streaming. MLX model-family tensor
+implementations and reusable neural-network layers live under
+`backend::mlx::architectures` and `backend::mlx::nn`. MLX arrays, checkpoint
+stores, KV-cache storage, native distributed transport, model execution,
+sampling, media tensor preparation, residency workers, and the MLX-aware error
+type live under `backend::mlx::runtime` and `backend::mlx::error`. Common MLX
+load-policy types are reexported within `backend::mlx`, never at the facade
+crate root. The crate root deliberately has no architecture or neural-network
+namespace.
 There are no forwarding modules at the former `runtime::{cache, checkpoint,
 distributed, execution, media, residency}` or `runtime::generation::sampler`
 paths. Backend-neutral attention types are canonical core exports rather than

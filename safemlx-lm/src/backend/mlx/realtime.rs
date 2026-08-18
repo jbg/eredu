@@ -19,7 +19,7 @@ use safemlx_lm_core::{
 use serde::Deserialize;
 
 use crate::{
-    architectures::moshi::{
+    backend::mlx::architectures::moshi::{
         layerwise::{self, MoshiLayerwiseModel},
         model as moshi, personaplex,
     },

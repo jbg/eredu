@@ -20,7 +20,7 @@ use super::{
     },
 };
 use crate::{
-    architectures::{
+    backend::mlx::architectures::{
         deepseek_v3::model as deepseek_v3, gemma4::model as gemma4, inkling::model as inkling,
         nemotron_h::model as nemotron_h, qwen::hybrid::qwen3_5,
     },
@@ -350,7 +350,9 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut backend =
-                    crate::architectures::gemma4::mtp::Gemma4MtpExecutor::new(target, assistant);
+                    crate::backend::mlx::architectures::gemma4::mtp::Gemma4MtpExecutor::new(
+                        target, assistant,
+                    );
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -364,7 +366,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             Model::MuseGlimmer(target) => {
                 let assistant = drafter.muse_glimmer_mut();
                 let mut backend =
-                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
+                    crate::backend::mlx::architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
                         target, assistant,
                     );
                 run_prepared_chat_mtp_batch(

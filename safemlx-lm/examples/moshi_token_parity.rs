@@ -5,7 +5,7 @@ use safemlx::{
     ExecutionContext,
 };
 use safemlx_lm::{
-    architectures::moshi::model as moshi,
+    backend::mlx::architectures::moshi::model as moshi,
     backend::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend},
     load_realtime_model,
 };

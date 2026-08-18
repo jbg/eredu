@@ -41,7 +41,7 @@ pub enum Error {
 
     /// Invalid unified Llama model configuration or cache usage.
     #[error(transparent)]
-    LlamaModel(#[from] crate::architectures::llama::layerwise::LlamaModelError),
+    LlamaModel(#[from] crate::backend::mlx::architectures::llama::layerwise::LlamaModelError),
 
     /// Invalid or failed layerwise model execution.
     #[error(transparent)]

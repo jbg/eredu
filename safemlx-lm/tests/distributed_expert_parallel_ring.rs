@@ -20,13 +20,13 @@ use safemlx::{
 };
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
-    architectures::distributed::expert::{
+    backend::mlx::architectures::distributed::expert::{
         load_expert_parallel_model_with_options,
         load_expert_parallel_model_with_options_and_assignment, profile_expert_parallel_timings,
         ExpertAssignment, ExpertParallelCache, ExpertParallelModel,
     },
-    architectures::distributed::pipeline::load_pipeline_model_with_options,
-    architectures::{
+    backend::mlx::architectures::distributed::pipeline::load_pipeline_model_with_options,
+    backend::mlx::architectures::{
         deepseek_v3::model as deepseek_v3,
         gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
@@ -1690,7 +1690,7 @@ fn qwen3_vl_moe_gguf_pipeline_expert_stages_own_rank_local_layers_and_experts() 
         .join("mmproj-qwen3vlmoe-f32.gguf");
     assert!(checkpoint.is_file(), "missing {}", checkpoint.display());
     assert!(mmproj.is_file(), "missing {}", mmproj.display());
-    let resident = safemlx_lm::architectures::qwen::vl::model::load_qwen3_vl_gguf(
+    let resident = safemlx_lm::backend::mlx::architectures::qwen::vl::model::load_qwen3_vl_gguf(
         &checkpoint,
         mmproj,
         context.stream(),

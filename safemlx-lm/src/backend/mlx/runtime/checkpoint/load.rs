@@ -1337,10 +1337,10 @@ mod tests {
     use safemlx_gguf::{Endian, GgmlType, TensorInput, Writer, WriterOptions};
 
     use crate::{
+        backend::mlx::nn::linear::unloaded_maybe_quantized_linear,
         backend::mlx::runtime::checkpoint::quantization::{
             quantize_tensor, AffineQuantization, WeightQuantization,
         },
-        nn::linear::unloaded_maybe_quantized_linear,
     };
 
     use super::{

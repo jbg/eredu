@@ -145,8 +145,10 @@ let model = LoadedModel::load(backend, artifact, ModelLoadOptions::default())?;
 
 MLX-owned executable, cache, load-policy, and generation types are exposed only
 from `backend::mlx`: `Model`, `ModelCache`, `ModelLoadOptions`, and
-`MlxGeneration`. MLX cache, checkpoint, distributed, execution, sampling,
-media, and residency infrastructure is grouped under `backend::mlx::runtime`.
+`MlxGeneration`. Architecture tensor implementations and MLX neural-network
+layers live under `backend::mlx::architectures` and `backend::mlx::nn`. MLX
+cache, checkpoint, distributed, execution, sampling, media, and residency
+infrastructure is grouped under `backend::mlx::runtime`.
 The backend-neutral `api`, crate root, and facade `runtime` namespaces do not
 alias these implementation types.
 

@@ -2339,8 +2339,8 @@ fn main() -> Result<()> {
     let mut output_ids = Vec::with_capacity(max_tokens);
     let profile_gemma4 = args.profile_components && model.model_type() == "gemma4";
     if profile_gemma4 {
-        safemlx_lm::architectures::gemma4::model::set_perf_profiling(true);
-        safemlx_lm::architectures::gemma4::model::reset_perf_stats();
+        safemlx_lm::backend::mlx::architectures::gemma4::model::set_perf_profiling(true);
+        safemlx_lm::backend::mlx::architectures::gemma4::model::reset_perf_stats();
     }
     let generation_started = Instant::now();
     let mut time_to_first_token = None;
@@ -2697,7 +2697,9 @@ fn main() -> Result<()> {
             );
         }
         if profile_gemma4 {
-            if let Some(stats) = safemlx_lm::architectures::gemma4::model::perf_stats() {
+            if let Some(stats) =
+                safemlx_lm::backend::mlx::architectures::gemma4::model::perf_stats()
+            {
                 eprintln!(
                     "gemma4_components_s: embed={:.6}, per_layer_inputs={:.6}, attention={:.6}, mlp={:.6}, per_layer_residual={:.6}, final_norm={:.6}, lm_head={:.6}, total={:.6}",
                     stats.embed_s,
@@ -2710,7 +2712,7 @@ fn main() -> Result<()> {
                     stats.component_total_s(),
                 );
             }
-            safemlx_lm::architectures::gemma4::model::set_perf_profiling(false);
+            safemlx_lm::backend::mlx::architectures::gemma4::model::set_perf_profiling(false);
         }
         if let Some(report) = model.runtime().session().residency_report()? {
             let offload = report.offload();

@@ -105,11 +105,11 @@ impl<S: SpeculativeSampler> SpeculativeSampler for DistributedEmbeddedMtpSampler
 
 use crate::{
     backend::mlx::error::Error,
+    backend::mlx::nn::parallel::VocabParallelLmHead,
     backend::mlx::runtime::{
         checkpoint::quantization::WeightQuantization,
         distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
     },
-    nn::parallel::VocabParallelLmHead,
 };
 
 /// One vocabulary projection whose parameter tree stays stable when TP turns
@@ -135,7 +135,7 @@ impl EmbeddedMtpVocabHead {
         stream: &Stream,
     ) -> Result<Self, Error> {
         Ok(Self {
-            ordinary: crate::nn::linear::unloaded_maybe_quantized_linear(
+            ordinary: crate::backend::mlx::nn::linear::unloaded_maybe_quantized_linear(
                 input_dims,
                 i32::try_from(vocabulary)
                     .map_err(|_| Error::Parallel("MTP vocabulary exceeds i32".into()))?,
@@ -170,13 +170,15 @@ impl EmbeddedMtpVocabHead {
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         prefix: &str,
     ) -> Result<(), Error> {
-        planner.register(crate::nn::parallel::vocab_lm_head_parameter_group(
-            &self.ordinary,
-            prefix,
-            self.input_dims,
-            self.vocabulary,
-            false,
-        )?)
+        planner.register(
+            crate::backend::mlx::nn::parallel::vocab_lm_head_parameter_group(
+                &self.ordinary,
+                prefix,
+                self.input_dims,
+                self.vocabulary,
+                false,
+            )?,
+        )
     }
 
     pub(crate) fn forward(
