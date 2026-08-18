@@ -25,6 +25,8 @@ pub mod execution;
 pub mod generation;
 /// Stable model and artifact identities.
 pub mod model;
+/// Backend-generic realtime token-session execution and scheduling.
+pub mod realtime;
 /// Weight-residency ownership, capacity, and resource planning.
 pub mod residency;
 /// Transactional fair work scheduler.
@@ -55,6 +57,10 @@ pub use generation::{
     MtpRequestPhase, MtpSchedulerOptions, OptimisticReuseDecision, ResolvedGenerationConfig,
     SemanticEvent, SpeculativeCommitPlan, SpeculativeRound, SpeculativeTail, TokenCommit,
     TokenTerminalSignals,
+};
+pub use realtime::{
+    RealtimeBackend, RealtimeCompletedStep, RealtimeConfigError, RealtimeError, RealtimeModel,
+    RealtimeSampling, RealtimeScheduler, RealtimeSession, RealtimeSpeechConfig,
 };
 pub use residency::{
     BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,

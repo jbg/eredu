@@ -7,180 +7,31 @@
 
 use safemlx::{
     ops::{indexing::TryIndexOp, stack_axis},
-    random::RandomState,
-    transforms::async_eval_with_event,
-    Array, Dtype, Event, Stream,
+    Array, Stream,
 };
-use safemlx_lm_core::scheduler::{
-    RequestId, RequestStatus, Scheduler, SchedulerLimits, SemanticStateTransaction,
-    TransitionOutput, WorkDescriptor, WorkId,
+pub use safemlx_lm_core::realtime::{
+    RealtimeCompletedStep, RealtimeConfigError, RealtimeError, RealtimeSampling, RealtimeScheduler,
+    RealtimeSession, RealtimeSpeechConfig,
 };
 pub use safemlx_lm_core::scheduler::{
     SchedulerCapabilities as RealtimeSchedulerCapabilities,
     SchedulerReport as RealtimeSchedulerReport,
 };
+use safemlx_lm_core::{
+    realtime::RealtimeModel,
+    scheduler::{RequestId, SchedulerLimits},
+};
 use serde::Deserialize;
-use std::{path::Path, time::Instant};
+use std::path::Path;
 
 use crate::{
     api::{ensure_replicated_load_options, moshi, personaplex, ModelLoadOptions},
-    architectures::moshi::layerwise::MoshiLayerwiseModel,
+    backend::mlx::realtime::{
+        MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel,
+    },
     error::Error,
     runtime::checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
-    runtime::generation::sampler::{DefaultSampler, Sampler},
 };
-
-/// Static token-stream metadata needed to pair a realtime model with a codec.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct RealtimeSpeechConfig<'a> {
-    /// Total number of audio codebooks consumed by the temporal model.
-    pub total_audio_codebooks: i32,
-    /// Number of live input-side codebooks expected per realtime step.
-    pub input_audio_codebooks: i32,
-    /// Number of generated-side codebooks emitted per realtime step.
-    pub generated_audio_codebooks: i32,
-    /// Number of depth-transformer codebooks sampled or teacher-forced per step.
-    pub depth_audio_codebooks: i32,
-    /// Text token used before any sampled text is available.
-    pub text_padding_token: i32,
-    /// Audio token used while delayed streams warm up.
-    pub audio_padding_token: i32,
-    /// Per-audio-codebook delays, excluding the leading text delay.
-    pub audio_delays: &'a [i32],
-}
-
-impl RealtimeSpeechConfig<'_> {
-    /// Largest audio delay in frames.
-    pub fn max_audio_delay(&self) -> i32 {
-        self.audio_delays.iter().copied().max().unwrap_or(0)
-    }
-}
-
-/// One encoded input-side audio frame for a realtime model step.
-#[derive(Debug, Clone)]
-pub struct RealtimeStepInput {
-    /// Encoded input-side audio tokens shaped `[batch, input_audio_codebooks]`.
-    input_audio_tokens: Array,
-    /// Optional generated-side codec tokens forced by a prompt frame.
-    forced_generated_audio_tokens: Option<Array>,
-    /// Optional text token forced by a prompt frame.
-    forced_text_token: Option<Array>,
-}
-
-impl RealtimeStepInput {
-    /// Creates an owned realtime step from encoded audio-codebook tokens.
-    pub fn encoded_audio(input_audio_tokens: &Array) -> Self {
-        Self {
-            input_audio_tokens: input_audio_tokens.clone(),
-            forced_generated_audio_tokens: None,
-            forced_text_token: None,
-        }
-    }
-
-    /// Forces the generated-side codec tokens for a prompt transition.
-    pub fn with_forced_generated_audio(mut self, tokens: &Array) -> Self {
-        self.forced_generated_audio_tokens = Some(tokens.clone());
-        self
-    }
-
-    /// Forces the generated text token for a prompt transition.
-    pub fn with_forced_text(mut self, token: &Array) -> Self {
-        self.forced_text_token = Some(token.clone());
-        self
-    }
-}
-
-impl WorkDescriptor for RealtimeStepInput {
-    type Error = Error;
-
-    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
-        encode_array_descriptor(&self.input_audio_tokens, output)?;
-        encode_optional_array_descriptor(self.forced_generated_audio_tokens.as_ref(), output)?;
-        encode_optional_array_descriptor(self.forced_text_token.as_ref(), output)
-    }
-}
-
-/// Request-owned sampling controls for a realtime session.
-#[derive(Debug, Clone)]
-pub struct RealtimeSampling {
-    /// Text sampling temperature.
-    text_temperature: f32,
-    /// Audio sampling temperature.
-    audio_temperature: f32,
-    /// Optional request-local PRNG state for stochastic samplers.
-    prng_state: Option<RandomState>,
-}
-
-impl RealtimeSampling {
-    /// Creates validated request-local sampling controls.
-    pub fn new(
-        text_temperature: f32,
-        audio_temperature: f32,
-        prng_state: Option<RandomState>,
-    ) -> Result<Self, Error> {
-        if !text_temperature.is_finite()
-            || text_temperature < 0.0
-            || !audio_temperature.is_finite()
-            || audio_temperature < 0.0
-        {
-            return Err(Error::Parallel(format!(
-                "realtime sampling temperatures must be finite and non-negative, got text={text_temperature} audio={audio_temperature}"
-            )));
-        }
-        Ok(Self {
-            text_temperature,
-            audio_temperature,
-            prng_state,
-        })
-    }
-
-    /// Deterministic greedy sampling controls.
-    pub fn greedy() -> Self {
-        Self {
-            text_temperature: 0.0,
-            audio_temperature: 0.0,
-            prng_state: None,
-        }
-    }
-
-    /// Returns the text sampling temperature.
-    pub const fn text_temperature(&self) -> f32 {
-        self.text_temperature
-    }
-
-    /// Returns the audio sampling temperature.
-    pub const fn audio_temperature(&self) -> f32 {
-        self.audio_temperature
-    }
-
-    /// Returns whether this request owns stochastic PRNG state.
-    pub const fn is_stochastic(&self) -> bool {
-        self.prng_state.is_some()
-    }
-}
-
-/// Output from one encoded-audio realtime generation step.
-pub struct RealtimeStepOutput {
-    /// Text token sampled at this model step, shaped `[batch, 1]`.
-    pub text_token: Array,
-    /// Newly sampled generated-codebook tokens before delay alignment.
-    pub sampled_audio_tokens: Array,
-    /// Delay-aligned codec frame ready for decoding, shaped `[batch, generated_audio_codebooks]`.
-    ///
-    /// This is `None` while delayed generated streams are warming up.
-    pub output_audio_tokens: Option<Array>,
-}
-
-/// Text tokens and delay-aligned codec tokens from offline generation.
-pub struct EncodedAudioOutput {
-    /// Sampled text tokens, shaped `[batch, input_frames]`.
-    pub text_tokens: Array,
-    /// Generated codec tokens, shaped `[batch, generated_audio_codebooks, output_frames]`.
-    ///
-    /// The output may have fewer frames than the input because delayed streams
-    /// need future encoded input frames before a coherent output frame exists.
-    pub audio_tokens: Array,
-}
 
 /// Supported realtime speech-to-speech model-family dispatch target.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -265,7 +116,7 @@ pub fn load_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<LoadedRealtimeModel, Error> {
+) -> Result<RealtimeModel<MlxRealtimeBackend>, Error> {
     load_model_with_options(
         model_dir,
         ModelLoadOptions::default(),
@@ -284,7 +135,7 @@ pub fn load_model_with_options(
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<LoadedRealtimeModel, Error> {
+) -> Result<RealtimeModel<MlxRealtimeBackend>, Error> {
     ensure_replicated_load_options(options)?;
     let model_dir = model_dir.as_ref();
     let kind = realtime_model_kind(model_dir)?;
@@ -330,733 +181,11 @@ pub fn load_model_with_options(
         }
     };
     let model = model.with_artifact_identity(realtime_artifact_identity(model_dir, kind)?);
-    Ok(match kind {
-        RealtimeModelKind::Moshi => LoadedRealtimeModel::Moshi(model),
-        RealtimeModelKind::PersonaPlex => LoadedRealtimeModel::PersonaPlex(model),
-    })
-}
-
-/// Loaded realtime speech-to-speech token model.
-///
-/// Both model families use the same scheduler, session, encoded-frame, and
-/// forced-frame APIs; checkpoint layout is the only dispatch distinction.
-pub enum LoadedRealtimeModel {
-    /// Moshi-family model.
-    Moshi(MoshiLayerwiseModel),
-    /// PersonaPlex model.
-    PersonaPlex(MoshiLayerwiseModel),
-}
-
-impl LoadedRealtimeModel {
-    fn artifact_identity(&self) -> &LoadedArtifactIdentity {
-        match self {
-            Self::Moshi(model) | Self::PersonaPlex(model) => model.artifact_identity(),
-        }
-    }
-
-    /// Returns the loaded realtime model family.
-    pub fn kind(&self) -> RealtimeModelKind {
-        match self {
-            Self::Moshi(_) => RealtimeModelKind::Moshi,
-            Self::PersonaPlex(_) => RealtimeModelKind::PersonaPlex,
-        }
-    }
-
-    /// Returns the loaded realtime model family as a model type string.
-    pub fn model_type(&self) -> &'static str {
-        self.kind().model_type()
-    }
-
-    /// Returns the parsed Moshi-family token-model configuration.
-    pub fn args(&self) -> &moshi::ModelArgs {
-        match self {
-            Self::Moshi(model) | Self::PersonaPlex(model) => model.args(),
-        }
-    }
-
-    /// Returns current residency telemetry for the selected parameter policy.
-    pub fn residency_report(
-        &self,
-    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
-        match self {
-            Self::Moshi(model) | Self::PersonaPlex(model) => model.residency_report().map(Some),
-        }
-    }
-
-    /// Returns dense-stream observations when that policy is active.
-    pub fn dense_stream_report(
-        &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
-        match self {
-            Self::Moshi(model) | Self::PersonaPlex(model) => model.dense_stream_report(),
-        }
-    }
-
-    /// Returns per-group residency for the selected parameter policy.
-    pub fn execution_group_reports(
-        &self,
-    ) -> Result<Option<Vec<crate::runtime::residency::manager::ResidentLayerGroupReport>>, Error>
-    {
-        match self {
-            Self::Moshi(model) | Self::PersonaPlex(model) => {
-                model.execution_group_reports().map(Some)
-            }
-        }
-    }
-}
-
-impl LoadedRealtimeModel {
-    /// Returns the codec-token stream configuration for this model.
-    pub fn realtime_config(&self) -> RealtimeSpeechConfig<'_> {
-        match self {
-            Self::Moshi(model) | Self::PersonaPlex(model) => model.realtime_config(),
-        }
-    }
-
-    fn new_generation_state(&self) -> moshi::GenerationState {
-        match self {
-            Self::Moshi(model) | Self::PersonaPlex(model) => model.new_generation_state(),
-        }
-    }
-
-    fn execute_realtime_step<TS, AS>(
-        &mut self,
-        state: &mut moshi::GenerationState,
-        input: &RealtimeStepInput,
-        text_sampler: &mut TS,
-        audio_samplers: &mut [AS],
-        sampling: &mut RealtimeSampling,
-        stream: &Stream,
-    ) -> Result<RealtimeStepOutput, Error>
-    where
-        TS: Sampler,
-        AS: Sampler,
-    {
-        let prng_state = sampling.prng_state.as_mut();
-        match self {
-            Self::Moshi(model) | Self::PersonaPlex(model) => model.generate_step_forced(
-                state,
-                &input.input_audio_tokens,
-                input.forced_generated_audio_tokens.as_ref(),
-                input.forced_text_token.as_ref(),
-                text_sampler,
-                audio_samplers,
-                sampling.text_temperature,
-                sampling.audio_temperature,
-                prng_state,
-                stream,
-            ),
-        }
-        .map_err(Error::from)
-    }
-}
-
-/// Request-local Moshi/PersonaPlex state owned by the canonical scheduler.
-///
-/// The state carries the immutable checkpoint artifact and normalized
-/// execution identity of the model that created it. A scheduler accepts a
-/// released session only when both identities match its loaded model exactly.
-#[derive(Clone)]
-pub struct RealtimeSession<TS, AS> {
-    model_identity: RealtimeModelIdentity,
-    generation: moshi::GenerationState,
-    text_sampler: TS,
-    audio_samplers: Vec<AS>,
-    sampling: RealtimeSampling,
-    batch_size: Option<i32>,
-}
-
-impl<TS, AS> SemanticStateTransaction for RealtimeSession<TS, AS>
-where
-    TS: Clone,
-    AS: Clone,
-{
-    type Branch = Self;
-    type Error = Error;
-
-    fn branch(&self) -> Result<Self::Branch, Error> {
-        // MLX arrays share immutable graph/backing ownership. Mutable cache
-        // metadata, samplers, delayed streams, and PRNG state are branch-local.
-        Ok(self.clone())
-    }
-
-    fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Error> {
-        *self = branch;
-        Ok(())
-    }
-}
-
-struct RealtimeTransitionOutput {
-    output: RealtimeStepOutput,
-    event: Event,
-    retained: Vec<Array>,
-}
-
-impl RealtimeTransitionOutput {
-    fn submit(output: RealtimeStepOutput) -> Result<Self, Error> {
-        let retained = std::iter::once(output.text_token.clone())
-            .chain(std::iter::once(output.sampled_audio_tokens.clone()))
-            .chain(output.output_audio_tokens.iter().cloned())
-            .collect::<Vec<_>>();
-        let event = async_eval_with_event(retained.iter())?;
-        Ok(Self {
-            output,
-            event,
-            retained,
-        })
-    }
-}
-
-impl TransitionOutput for RealtimeTransitionOutput {
-    type Error = Error;
-
-    fn is_complete(&self) -> Result<bool, Error> {
-        Ok(self.event.is_complete()?)
-    }
-
-    fn backend_name(&self) -> Option<String> {
-        self.event.backend().ok().map(|backend| {
-            match backend {
-                safemlx::EventBackend::None => "none",
-                safemlx::EventBackend::Cpu => "cpu",
-                safemlx::EventBackend::Metal => "metal",
-                safemlx::EventBackend::Cuda => "cuda",
-            }
-            .into()
-        })
-    }
-
-    fn retained_resources(&self) -> usize {
-        self.retained.len()
-    }
-}
-
-impl<TS, AS> RealtimeSession<TS, AS> {
-    /// Returns the number of encoded frames committed by this session.
-    pub fn step(&self) -> usize {
-        self.generation.step()
-    }
-
-    /// Returns the request-local temporal/depth generation state.
-    ///
-    /// Session state is exposed after [`RealtimeInferenceScheduler::release_request`]
-    /// for explicit application-level persistence or diagnostic inspection.
-    pub fn generation_state(&self) -> &moshi::GenerationState {
-        &self.generation
-    }
-
-    /// Returns the request-owned text sampler mutably while the session is released.
-    pub fn text_sampler_mut(&mut self) -> &mut TS {
-        &mut self.text_sampler
-    }
-
-    /// Returns the request-owned audio samplers mutably while the session is released.
-    pub fn audio_samplers_mut(&mut self) -> &mut [AS] {
-        &mut self.audio_samplers
-    }
-
-    /// Replaces sampling temperatures and PRNG state while the session is released.
-    pub fn set_sampling(&mut self, sampling: RealtimeSampling) {
-        self.sampling = sampling;
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct RealtimeModelIdentity {
-    artifact: LoadedArtifactIdentity,
-    execution: RealtimeExecutionIdentity,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct RealtimeExecutionIdentity {
-    kind: RealtimeModelKind,
-    dim: i32,
-    temporal_layers: i32,
-    temporal_heads: i32,
-    temporal_intermediate: i32,
-    temporal_context: i32,
-    temporal_rope_base_bits: u32,
-    depth_dim: i32,
-    depth_layers: i32,
-    depth_heads: i32,
-    depth_intermediate: i32,
-    depth_context: i32,
-    depth_rope_base_bits: u32,
-    text_card: i32,
-    text_padding_token: i32,
-    audio_card: i32,
-    total_codebooks: i32,
-    depth_codebooks: i32,
-    generated_codebooks: i32,
-    delays: Vec<i32>,
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
-}
-
-impl RealtimeModelIdentity {
-    fn new(model: &LoadedRealtimeModel) -> Self {
-        Self {
-            artifact: model.artifact_identity().clone(),
-            execution: RealtimeExecutionIdentity::new(model.kind(), model.args()),
-        }
-    }
-
-    fn mismatch(&self, other: &Self) -> Option<&'static str> {
-        if self.artifact != other.artifact {
-            Some("checkpoint artifact fingerprint")
-        } else if self.execution != other.execution {
-            Some("normalized execution identity")
-        } else {
-            None
-        }
-    }
-}
-
-impl RealtimeExecutionIdentity {
-    fn new(kind: RealtimeModelKind, args: &moshi::ModelArgs) -> Self {
-        Self {
-            kind,
-            dim: args.dim,
-            temporal_layers: args.num_layers,
-            temporal_heads: args.num_heads,
-            temporal_intermediate: args.dim_feedforward.unwrap_or(args.dim * 4),
-            temporal_context: args.context,
-            temporal_rope_base_bits: args.max_period.to_bits(),
-            depth_dim: args.depformer_dim,
-            depth_layers: args.depformer_num_layers,
-            depth_heads: args.depformer_num_heads,
-            depth_intermediate: args
-                .depformer_dim_feedforward
-                .unwrap_or(args.depformer_dim * 4),
-            // These defaults mirror the depth-transformer constructor, not
-            // the temporal transformer defaults in the checkpoint schema.
-            depth_context: args.depformer_context.unwrap_or(args.dep_q),
-            depth_rope_base_bits: args.depformer_max_period.unwrap_or(8.0).to_bits(),
-            text_card: args.text_card,
-            text_padding_token: args.text_padding_token(),
-            audio_card: args.card,
-            total_codebooks: args.n_q,
-            depth_codebooks: args.dep_q,
-            generated_codebooks: args.generated_audio_codebooks(),
-            delays: args.delays.clone(),
-            quantization: args.quantization,
-        }
-    }
-}
-
-/// One completed realtime transition and its stable work identity.
-pub struct RealtimeCompletedStep {
-    work: WorkId,
-    output: RealtimeStepOutput,
-}
-
-impl RealtimeCompletedStep {
-    /// Returns the scheduler-assigned work identity.
-    pub const fn work(&self) -> WorkId {
-        self.work
-    }
-
-    /// Returns the generated text/audio result.
-    pub const fn output(&self) -> &RealtimeStepOutput {
-        &self.output
-    }
-
-    /// Consumes this completion into its work identity and generated result.
-    pub fn into_parts(self) -> (WorkId, RealtimeStepOutput) {
-        (self.work, self.output)
-    }
-}
-
-/// Bounded fair scheduler for independent Moshi/PersonaPlex realtime sessions.
-///
-/// The shared scheduler is the sole owner of request/work identity, queueing,
-/// state isolation, lifecycle, cancellation, backpressure, poisoning, and
-/// telemetry. This adapter contributes only realtime input validation and the
-/// temporal/depth execution closure.
-pub struct RealtimeInferenceScheduler<TS: Clone, AS: Clone> {
-    model_identity: RealtimeModelIdentity,
-    scheduler: Scheduler<RealtimeStepInput, RealtimeSession<TS, AS>, RealtimeTransitionOutput>,
-}
-
-impl<TS, AS> RealtimeInferenceScheduler<TS, AS>
-where
-    TS: Sampler + Clone,
-    AS: Sampler + Clone,
-{
-    /// Binds an empty scheduler to one loaded realtime artifact and execution identity.
-    pub fn new(model: &LoadedRealtimeModel, limits: SchedulerLimits) -> Result<Self, Error> {
-        Ok(Self {
-            model_identity: RealtimeModelIdentity::new(model),
-            scheduler: Scheduler::new(limits)?,
-        })
-    }
-
-    /// Registers a request with fresh temporal/depth state and owned samplers.
-    pub fn register_request(
-        &mut self,
-        model: &LoadedRealtimeModel,
-        request: RequestId,
-        text_sampler: TS,
-        audio_samplers: Vec<AS>,
-        sampling: RealtimeSampling,
-    ) -> Result<(), Error> {
-        self.validate_model(model)?;
-        self.scheduler.validate_registration(request)?;
-        self.validate_audio_samplers(model, audio_samplers.len())?;
-        Ok(self.scheduler.register(
-            request,
-            RealtimeSession {
-                model_identity: self.model_identity.clone(),
-                generation: model.new_generation_state(),
-                text_sampler,
-                audio_samplers,
-                sampling,
-                batch_size: None,
-            },
-        )?)
-    }
-
-    /// Registers a released request session.
-    pub fn register_request_with_session(
-        &mut self,
-        model: &LoadedRealtimeModel,
-        request: RequestId,
-        session: RealtimeSession<TS, AS>,
-    ) -> Result<(), Error> {
-        self.validate_model(model)?;
-        self.scheduler.validate_registration(request)?;
-        if let Some(component) = session.model_identity.mismatch(&self.model_identity) {
-            return Err(Error::Parallel(format!(
-                "realtime session {component} does not match the scheduler model"
-            )));
-        }
-        self.validate_audio_samplers(model, session.audio_samplers.len())?;
-        validate_generation_state(model, &session.generation)?;
-        Ok(self.scheduler.register(request, session)?)
-    }
-
-    /// Enqueues one encoded or forced prompt frame.
-    pub fn enqueue(
-        &mut self,
-        model: &LoadedRealtimeModel,
-        request: RequestId,
-        input: RealtimeStepInput,
-    ) -> Result<WorkId, Error> {
-        self.enqueue_with_deadline(model, request, input, None)
-    }
-
-    /// Enqueues one frame with an optional absolute cancellation deadline.
-    pub fn enqueue_with_deadline(
-        &mut self,
-        model: &LoadedRealtimeModel,
-        request: RequestId,
-        input: RealtimeStepInput,
-        deadline: Option<Instant>,
-    ) -> Result<WorkId, Error> {
-        self.validate_model(model)?;
-        validate_realtime_input(model, &input)?;
-        let batch = input.input_audio_tokens.dim(0);
-        let state = self.scheduler.request_state(request).ok_or_else(|| {
-            Error::Parallel(format!(
-                "realtime request {} is not active",
-                request.value()
-            ))
-        })?;
-        if let Some(expected) = state.batch_size {
-            if expected != batch {
-                return Err(Error::Parallel(format!(
-                    "realtime request {} changed batch size from {expected} to {batch}",
-                    request.value()
-                )));
-            }
-        }
-        let work = self
-            .scheduler
-            .enqueue_with_deadline(request, input, deadline)?;
-        self.scheduler
-            .request_state_mut(request)?
-            .batch_size
-            .get_or_insert(batch);
-        Ok(work)
-    }
-
-    /// Atomically enqueues an ordered batch of encoded or forced prompt frames.
-    pub fn enqueue_batch(
-        &mut self,
-        model: &LoadedRealtimeModel,
-        request: RequestId,
-        inputs: Vec<RealtimeStepInput>,
-    ) -> Result<Vec<WorkId>, Error> {
-        self.validate_model(model)?;
-        let state = self.scheduler.request_state(request).ok_or_else(|| {
-            Error::Parallel(format!(
-                "realtime request {} is not active",
-                request.value()
-            ))
-        })?;
-        let mut expected_batch = state.batch_size;
-        for input in &inputs {
-            validate_realtime_input(model, input)?;
-            let batch = input.input_audio_tokens.dim(0);
-            if let Some(expected) = expected_batch {
-                if expected != batch {
-                    return Err(Error::Parallel(format!(
-                        "realtime request {} changed batch size from {expected} to {batch}",
-                        request.value()
-                    )));
-                }
-            } else {
-                expected_batch = Some(batch);
-            }
-        }
-        let work = self.scheduler.enqueue_batch(request, inputs)?;
-        if let Some(batch) = expected_batch {
-            self.scheduler
-                .request_state_mut(request)?
-                .batch_size
-                .get_or_insert(batch);
-        }
-        Ok(work)
-    }
-
-    /// Advances one bounded scheduler turn in fair request order.
-    pub fn run_queued(
-        &mut self,
-        model: &mut LoadedRealtimeModel,
-        stream: &Stream,
-    ) -> Result<Vec<RealtimeCompletedStep>, Error> {
-        self.run_bounded(model, usize::MAX, stream)
-    }
-
-    /// Runs at most `max_frames` fair-ordered transitions.
-    ///
-    /// Applications use bounded drains to regain control for deadlines and
-    /// cancellation between frame executions.
-    pub fn run_bounded(
-        &mut self,
-        model: &mut LoadedRealtimeModel,
-        max_frames: usize,
-        stream: &Stream,
-    ) -> Result<Vec<RealtimeCompletedStep>, Error> {
-        self.validate_model(model)?;
-        if max_frames == 0 {
-            return Err(Error::Parallel(
-                "realtime scheduler frame bound must be positive".into(),
-            ));
-        }
-        let now = Instant::now();
-        let mut progress = self.scheduler.poll_completions(now);
-        self.scheduler.prepare_bounded(max_frames, now)?;
-        progress.newly_submitted = self.scheduler.submit_prepared(now, |_, input, session| {
-            let output = model.execute_realtime_step(
-                &mut session.generation,
-                input,
-                &mut session.text_sampler,
-                &mut session.audio_samplers,
-                &mut session.sampling,
-                stream,
-            )?;
-            RealtimeTransitionOutput::submit(output)
-        })?;
-        let completed_now = self.scheduler.poll_completions(now);
-        progress.committed.extend(completed_now.committed);
-        progress.failed.extend(completed_now.failed);
-        if let Some((work, failure)) = progress.failed.first() {
-            return Err(Error::Parallel(format!(
-                "realtime work {:?} failed asynchronously: {}",
-                work, failure
-            )));
-        }
-        Ok(progress
-            .committed
-            .into_iter()
-            .map(|(work, _, output)| RealtimeCompletedStep {
-                work,
-                output: output.output,
-            })
-            .collect())
-    }
-
-    /// Completes a request and drops its temporal/depth state and samplers.
-    pub fn finish_request(&mut self, request: RequestId) -> Result<(), Error> {
-        Ok(self.scheduler.finish(request)?)
-    }
-
-    /// Cancels a request and discards all queued frames and owned state.
-    pub fn cancel_request(&mut self, request: RequestId) -> Result<(), Error> {
-        Ok(self.scheduler.cancel(request)?)
-    }
-
-    /// Releases an idle request for explicit persistence or later resumption.
-    pub fn release_request(
-        &mut self,
-        request: RequestId,
-    ) -> Result<RealtimeSession<TS, AS>, Error> {
-        Ok(self.scheduler.release(request)?)
-    }
-
-    /// Removes a terminal identity so it may be explicitly reused.
-    pub fn forget_terminal_request(&mut self, request: RequestId) -> Result<RequestStatus, Error> {
-        Ok(self.scheduler.forget_terminal(request)?)
-    }
-
-    /// Returns the lifecycle state for a known request.
-    pub fn request_status(&self, request: RequestId) -> Option<RequestStatus> {
-        self.scheduler.request_status(request)
-    }
-
-    /// Returns the queued frame count for an active request.
-    pub fn queued_for_request(&self, request: RequestId) -> usize {
-        self.scheduler.queued_for_request(request)
-    }
-
-    /// Replaces sampling controls for an idle active request.
-    ///
-    /// Queued frames retain a deterministic submission contract, so controls
-    /// may change only when the request queue is empty.
-    pub fn set_request_sampling(
-        &mut self,
-        request: RequestId,
-        sampling: RealtimeSampling,
-    ) -> Result<(), Error> {
-        let queued = self.scheduler.queued_for_request(request);
-        if queued != 0 {
-            return Err(Error::Parallel(format!(
-                "realtime request {} has {queued} queued frames; drain or cancel them before changing sampling",
-                request.value()
-            )));
-        }
-        self.scheduler.request_state_mut(request)?.sampling = sampling;
-        Ok(())
-    }
-
-    /// Returns generic scheduler occupancy and lifecycle telemetry.
-    pub fn report(&self) -> RealtimeSchedulerReport {
-        self.scheduler.report()
-    }
-
-    /// Returns configured bounds, backend identity, and physical-preemption support.
-    pub fn capabilities(&self) -> RealtimeSchedulerCapabilities {
-        self.scheduler.capabilities()
-    }
-
-    fn validate_model(&self, model: &LoadedRealtimeModel) -> Result<(), Error> {
-        let actual = RealtimeModelIdentity::new(model);
-        if let Some(component) = actual.mismatch(&self.model_identity) {
-            return Err(Error::Parallel(format!(
-                "realtime scheduler model {component} {:?} does not match {:?}",
-                actual, self.model_identity
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_audio_samplers(
-        &self,
-        model: &LoadedRealtimeModel,
-        actual: usize,
-    ) -> Result<(), Error> {
-        let expected = model.args().dep_q as usize;
-        if actual != expected {
-            return Err(Error::Parallel(format!(
-                "realtime request requires {expected} audio samplers, got {actual}"
-            )));
-        }
-        Ok(())
-    }
-}
-
-fn encode_array_descriptor(array: &Array, output: &mut Vec<u32>) -> Result<(), Error> {
-    output.extend_from_slice(&[array.dtype() as u32, array.ndim() as u32]);
-    for dimension in array.shape() {
-        output.push(u32::try_from(*dimension).map_err(|_| {
-            Error::Parallel(format!(
-                "realtime work dimension {dimension} exceeds descriptor range"
-            ))
-        })?);
-    }
-    Ok(())
-}
-
-fn encode_optional_array_descriptor(
-    array: Option<&Array>,
-    output: &mut Vec<u32>,
-) -> Result<(), Error> {
-    match array {
-        Some(array) => {
-            output.push(1);
-            encode_array_descriptor(array, output)
-        }
-        None => {
-            output.push(0);
-            Ok(())
-        }
-    }
-}
-
-fn validate_realtime_input(
-    model: &LoadedRealtimeModel,
-    input: &RealtimeStepInput,
-) -> Result<(), Error> {
-    let args = model.args();
-    let tokens = &input.input_audio_tokens;
-    if tokens.dtype() != Dtype::Int32
-        || tokens.ndim() != 2
-        || tokens.dim(1) != args.input_audio_codebooks()
-    {
-        return Err(Error::Parallel(format!(
-            "realtime input must be int32 [batch, {}], got {:?} {:?}",
-            args.input_audio_codebooks(),
-            tokens.dtype(),
-            tokens.shape()
-        )));
-    }
-    let batch = tokens.dim(0);
-    if batch <= 0 {
-        return Err(Error::Parallel(
-            "realtime input batch size must be positive".into(),
-        ));
-    }
-    if let Some(forced) = &input.forced_generated_audio_tokens {
-        if forced.dtype() != Dtype::Int32
-            || forced.shape() != [batch, args.generated_audio_codebooks()]
-        {
-            return Err(Error::Parallel(format!(
-                "forced realtime audio must be int32 [batch, {}], got {:?} {:?}",
-                args.generated_audio_codebooks(),
-                forced.dtype(),
-                forced.shape()
-            )));
-        }
-    }
-    if let Some(forced) = &input.forced_text_token {
-        if forced.dtype() != Dtype::Int32 || forced.shape() != [batch, 1] {
-            return Err(Error::Parallel(format!(
-                "forced realtime text must be int32 [batch, 1], got {:?} {:?}",
-                forced.dtype(),
-                forced.shape()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_generation_state(
-    model: &LoadedRealtimeModel,
-    state: &moshi::GenerationState,
-) -> Result<(), Error> {
-    let args = model.args();
-    if state.cache.temporal.len() != args.num_layers as usize
-        || state.cache.depth.len() != args.depformer_num_layers as usize
-        || state
-            .frames
-            .iter()
-            .any(|frame| frame.len() != args.n_q as usize + 1)
-    {
-        return Err(Error::Parallel(
-            "realtime session state does not match the loaded temporal/depth geometry".into(),
-        ));
-    }
-    Ok(())
+    let model = match kind {
+        RealtimeModelKind::Moshi => MlxRealtimeModel::Moshi(model),
+        RealtimeModelKind::PersonaPlex => MlxRealtimeModel::PersonaPlex(model),
+    };
+    Ok(RealtimeModel::new(MlxRealtimeBackend::new(stream), model))
 }
 
 /// Greedily generates delay-aligned codec tokens through the canonical scheduler.
@@ -1065,14 +194,13 @@ fn validate_generation_state(
 /// not append encoded silence, so delayed tail frames are not flushed after the
 /// supplied input ends.
 pub fn generate_encoded_greedy(
-    model: &mut LoadedRealtimeModel,
+    model: &mut RealtimeModel<MlxRealtimeBackend>,
     input_audio_tokens: &Array,
-    stream: &Stream,
-) -> Result<EncodedAudioOutput, Error> {
-    let config = model.realtime_config();
-    let input_audio_codebooks = config.input_audio_codebooks;
-    let generated_audio_codebooks = config.generated_audio_codebooks;
-    let depth_audio_codebooks = config.depth_audio_codebooks;
+) -> Result<MlxEncodedAudioOutput, Error> {
+    let stream = model.backend().stream().clone();
+    let config = model.speech_config();
+    let input_audio_codebooks = config.input_audio_codebooks() as i32;
+    let generated_audio_codebooks = config.generated_audio_codebooks() as i32;
     if input_audio_tokens.shape().len() != 3 || input_audio_tokens.dim(1) != input_audio_codebooks {
         return Err(Error::Parallel(format!(
             "encoded input sequence must have shape [batch, {}, frames], got {:?}",
@@ -1083,55 +211,61 @@ pub fn generate_encoded_greedy(
 
     let batch = input_audio_tokens.dim(0);
     let request = RequestId::new(0);
-    let mut scheduler = RealtimeInferenceScheduler::new(model, SchedulerLimits::new(1, 1)?)?;
-    let audio_samplers = (0..depth_audio_codebooks)
-        .map(|_| DefaultSampler)
-        .collect::<Vec<_>>();
-    scheduler.register_request(
-        model,
-        request,
-        DefaultSampler,
-        audio_samplers,
-        RealtimeSampling::greedy(),
-    )?;
+    let mut scheduler =
+        RealtimeScheduler::new(model, SchedulerLimits::new(1, 1)?).map_err(realtime_error)?;
+    scheduler
+        .register_request(model, request, RealtimeSampling::greedy())
+        .map_err(realtime_error)?;
     let mut text = Vec::with_capacity(input_audio_tokens.dim(2) as usize);
     let mut audio = Vec::new();
     for frame in 0..input_audio_tokens.dim(2) {
-        let input = input_audio_tokens.try_index_device((.., .., frame), stream)?;
-        scheduler.enqueue(model, request, RealtimeStepInput::encoded_audio(&input))?;
+        let input = input_audio_tokens.try_index_device((.., .., frame), &stream)?;
+        scheduler
+            .enqueue(model, request, MlxRealtimeInput::encoded_audio(&input))
+            .map_err(realtime_error)?;
         let output = loop {
-            if let Some(completed) = scheduler.run_queued(model, stream)?.pop() {
-                break completed.output;
+            if let Some(completed) = scheduler.run_queued(model).map_err(realtime_error)?.pop() {
+                break completed.into_parts().1;
             }
             std::thread::yield_now();
         };
-        text.push(output.text_token.squeeze_axes(&[-1], stream)?);
+        text.push(output.text_token.squeeze_axes(&[-1], &stream)?);
         if let Some(tokens) = output.output_audio_tokens {
             audio.push(tokens);
         }
     }
-    scheduler.finish_request(request)?;
+    scheduler.finish_request(request).map_err(realtime_error)?;
     let text_tokens = if text.is_empty() {
-        Array::zeros::<i32>(&[batch, 0], stream)?
+        Array::zeros::<i32>(&[batch, 0], &stream)?
     } else {
-        stack_axis(&text, 1, stream)?
+        stack_axis(&text, 1, &stream)?
     };
     let audio_tokens = if audio.is_empty() {
-        Array::zeros::<i32>(&[batch, generated_audio_codebooks, 0], stream)?
+        Array::zeros::<i32>(&[batch, generated_audio_codebooks, 0], &stream)?
     } else {
-        stack_axis(&audio, 2, stream)?
+        stack_axis(&audio, 2, &stream)?
     };
-    Ok(EncodedAudioOutput {
+    Ok(MlxEncodedAudioOutput {
         text_tokens,
         audio_tokens,
     })
 }
 
+fn realtime_error(error: RealtimeError<Error>) -> Error {
+    Error::Parallel(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use safemlx::{module::ModuleParameters, Array, Device, DeviceType, ExecutionContext, Stream};
+    use safemlx_lm_core::realtime::RealtimeBackend;
+    use safemlx_lm_core::scheduler::RequestStatus;
 
     use super::*;
+    use crate::{
+        backend::mlx::realtime::MlxRealtimeExecutionIdentity,
+        runtime::generation::sampler::DefaultSampler,
+    };
 
     fn tiny_args() -> moshi::ModelArgs {
         serde_json::from_value(serde_json::json!({
@@ -1159,7 +293,7 @@ mod tests {
         .unwrap()
     }
 
-    fn tiny_model(stream: &Stream) -> LoadedRealtimeModel {
+    fn tiny_model(stream: &Stream) -> RealtimeModel<MlxRealtimeBackend> {
         let mut resident = moshi::Model::new(tiny_args(), stream).unwrap();
         for (name, parameter) in resident.parameters_mut().flatten() {
             let shape = parameter.shape().to_vec();
@@ -1170,14 +304,15 @@ mod tests {
             };
         }
         let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        LoadedRealtimeModel::Moshi(
+        let model = MlxRealtimeModel::Moshi(
             crate::architectures::moshi::layerwise::execute_transformed_model(
                 resident,
                 stream,
                 &weights_stream,
             )
             .unwrap(),
-        )
+        );
+        RealtimeModel::new(MlxRealtimeBackend::new(stream), model)
     }
 
     fn default_audio_samplers() -> Vec<DefaultSampler> {
@@ -1197,15 +332,15 @@ mod tests {
         explicit.depformer_context = Some(explicit.dep_q);
         explicit.depformer_max_period = Some(8.0);
         assert_eq!(
-            RealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &implicit),
-            RealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)
+            MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &implicit),
+            MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)
         );
 
         explicit.quantization =
             Some(crate::runtime::checkpoint::quantization::AffineQuantization::default().into());
         assert_ne!(
-            RealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &implicit),
-            RealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)
+            MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &implicit),
+            MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)
         );
     }
 
@@ -1214,29 +349,20 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let first_model = tiny_model(context.stream());
         let second_model = tiny_model(context.stream());
-        let first_identity = RealtimeModelIdentity::new(&first_model);
-        let second_identity = RealtimeModelIdentity::new(&second_model);
-        assert_eq!(first_identity.execution, second_identity.execution);
-        assert_ne!(first_identity.artifact, second_identity.artifact);
+        let first_identity = first_model.backend().model_identity(first_model.model());
+        let second_identity = second_model.backend().model_identity(second_model.model());
+        assert_ne!(first_identity, second_identity);
 
         let request = RequestId::new(7);
         let mut first_scheduler =
-            RealtimeInferenceScheduler::new(&first_model, SchedulerLimits::new(1, 1).unwrap())
-                .unwrap();
+            RealtimeScheduler::new(&first_model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
         first_scheduler
-            .register_request(
-                &first_model,
-                request,
-                DefaultSampler,
-                default_audio_samplers(),
-                RealtimeSampling::greedy(),
-            )
+            .register_request(&first_model, request, RealtimeSampling::greedy())
             .unwrap();
         let session = first_scheduler.release_request(request).unwrap();
 
         let mut second_scheduler =
-            RealtimeInferenceScheduler::new(&second_model, SchedulerLimits::new(1, 1).unwrap())
-                .unwrap();
+            RealtimeScheduler::new(&second_model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
         let error = second_scheduler
             .register_request_with_session(&second_model, request, session)
             .unwrap_err();
@@ -1252,37 +378,14 @@ mod tests {
         let stream = context.stream();
         let model = tiny_model(stream);
         let mut scheduler =
-            RealtimeInferenceScheduler::new(&model, SchedulerLimits::new(2, 2).unwrap()).unwrap();
+            RealtimeScheduler::new(&model, SchedulerLimits::new(2, 2).unwrap()).unwrap();
         let first = RequestId::new(11);
         let second = RequestId::new(22);
         scheduler
-            .register_request(
-                &model,
-                first,
-                DefaultSampler,
-                default_audio_samplers(),
-                RealtimeSampling::greedy(),
-            )
+            .register_request(&model, first, RealtimeSampling::greedy())
             .unwrap();
-        assert!(scheduler
-            .register_request(
-                &model,
-                second,
-                DefaultSampler,
-                vec![DefaultSampler],
-                RealtimeSampling::greedy(),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("requires 2 audio samplers"));
         scheduler
-            .register_request(
-                &model,
-                second,
-                DefaultSampler,
-                default_audio_samplers(),
-                RealtimeSampling::greedy(),
-            )
+            .register_request(&model, second, RealtimeSampling::greedy())
             .unwrap();
 
         let frame = Array::from_slice(&[1i32, 2], &[1, 2]);
@@ -1291,9 +394,9 @@ mod tests {
                 &model,
                 first,
                 vec![
-                    RealtimeStepInput::encoded_audio(&frame),
-                    RealtimeStepInput::encoded_audio(&frame),
-                    RealtimeStepInput::encoded_audio(&frame),
+                    MlxRealtimeInput::encoded_audio(&frame),
+                    MlxRealtimeInput::encoded_audio(&frame),
+                    MlxRealtimeInput::encoded_audio(&frame),
                 ],
             )
             .unwrap_err()
@@ -1302,13 +405,13 @@ mod tests {
         assert_eq!(scheduler.report().queued_work, 0);
         assert_eq!(scheduler.report().submitted_work, 0);
         scheduler
-            .enqueue(&model, first, RealtimeStepInput::encoded_audio(&frame))
+            .enqueue(&model, first, MlxRealtimeInput::encoded_audio(&frame))
             .unwrap();
         scheduler
-            .enqueue(&model, second, RealtimeStepInput::encoded_audio(&frame))
+            .enqueue(&model, second, MlxRealtimeInput::encoded_audio(&frame))
             .unwrap();
         assert!(scheduler
-            .enqueue(&model, first, RealtimeStepInput::encoded_audio(&frame))
+            .enqueue(&model, first, MlxRealtimeInput::encoded_audio(&frame))
             .unwrap_err()
             .to_string()
             .contains("queue capacity"));
@@ -1318,7 +421,7 @@ mod tests {
             .enqueue(
                 &model,
                 first,
-                RealtimeStepInput::encoded_audio(&changed_batch),
+                MlxRealtimeInput::encoded_audio(&changed_batch),
             )
             .unwrap_err()
             .to_string()
@@ -1339,16 +442,10 @@ mod tests {
 
         scheduler.forget_terminal_request(first).unwrap();
         scheduler
-            .register_request(
-                &model,
-                first,
-                DefaultSampler,
-                default_audio_samplers(),
-                RealtimeSampling::greedy(),
-            )
+            .register_request(&model, first, RealtimeSampling::greedy())
             .unwrap();
         let session = scheduler.release_request(first).unwrap();
-        assert_eq!(session.step(), 0);
+        assert_eq!(session.state().step(), 0);
         scheduler
             .register_request_with_session(&model, first, session)
             .unwrap();
@@ -1360,8 +457,8 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         let mut model = tiny_model(stream);
-        let resident = match &mut model {
-            LoadedRealtimeModel::Moshi(model) => model,
+        let resident = match model.model_mut() {
+            MlxRealtimeModel::Moshi(model) => model,
             _ => unreachable!(),
         };
         let first_frame = Array::from_slice(&[1i32, 2], &[1, 2]);
@@ -1462,16 +559,10 @@ mod tests {
         let first = RequestId::new(11);
         let second = RequestId::new(22);
         let limits = SchedulerLimits::with_execution_bounds(2, 6, 2, 2, 1, 1).unwrap();
-        let mut scheduler = RealtimeInferenceScheduler::new(&model, limits).unwrap();
+        let mut scheduler = RealtimeScheduler::new(&model, limits).unwrap();
         for request in [first, second] {
             scheduler
-                .register_request(
-                    &model,
-                    request,
-                    DefaultSampler,
-                    default_audio_samplers(),
-                    RealtimeSampling::greedy(),
-                )
+                .register_request(&model, request, RealtimeSampling::greedy())
                 .unwrap();
         }
         for (request, frame) in [
@@ -1484,17 +575,17 @@ mod tests {
         ] {
             let sequence = scheduler.queued_for_request(request);
             let input = if sequence == 2 {
-                RealtimeStepInput::encoded_audio(frame)
+                MlxRealtimeInput::encoded_audio(frame)
                     .with_forced_generated_audio(&forced_audio)
                     .with_forced_text(&forced_text)
             } else {
-                RealtimeStepInput::encoded_audio(frame)
+                MlxRealtimeInput::encoded_audio(frame)
             };
             scheduler.enqueue(&model, request, input).unwrap();
         }
         let mut output = Vec::new();
         while output.len() < 6 {
-            output.extend(scheduler.run_bounded(&mut model, 2, stream).unwrap());
+            output.extend(scheduler.run_bounded(&mut model, 2).unwrap());
             std::thread::yield_now();
         }
         assert_eq!(
@@ -1513,8 +604,8 @@ mod tests {
             );
         }
         assert!((3..=6).contains(&scheduler.report().drain_cycles));
-        assert_eq!(scheduler.release_request(first).unwrap().step(), 3);
-        assert_eq!(scheduler.release_request(second).unwrap().step(), 3);
+        assert_eq!(scheduler.release_request(first).unwrap().state().step(), 3);
+        assert_eq!(scheduler.release_request(second).unwrap().state().step(), 3);
     }
 
     fn assert_tokens_equal(expected: &Array, actual: &Array, stream: &Stream) {

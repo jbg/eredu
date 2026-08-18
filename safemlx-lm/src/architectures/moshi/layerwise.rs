@@ -11,11 +11,12 @@ use safemlx::{
 };
 
 use crate::{
-    api::realtime::{RealtimeSpeechConfig, RealtimeStepOutput},
+    api::realtime::RealtimeSpeechConfig,
     architectures::moshi::model::{
         self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
         MoshiTransformerLayer, SampleStepOutput, TokenStepOutput,
     },
+    backend::mlx::realtime::MlxRealtimeOutput,
     error::Error,
     runtime::cache::KeyValueCache,
     runtime::checkpoint::artifact::LoadedArtifactIdentity,
@@ -75,16 +76,21 @@ impl MoshiLayerwiseModel {
     }
 
     /// Returns the codec-token stream geometry consumed by realtime scheduling.
-    pub fn realtime_config(&self) -> RealtimeSpeechConfig<'_> {
-        RealtimeSpeechConfig {
-            total_audio_codebooks: self.args().n_q,
-            input_audio_codebooks: self.args().input_audio_codebooks(),
-            generated_audio_codebooks: self.args().generated_audio_codebooks(),
-            depth_audio_codebooks: self.args().dep_q,
-            text_padding_token: self.args().text_padding_token(),
-            audio_padding_token: self.args().audio_padding_token(),
-            audio_delays: self.args().audio_delays(),
-        }
+    pub fn realtime_config(&self) -> RealtimeSpeechConfig {
+        RealtimeSpeechConfig::new(
+            self.args().n_q as usize,
+            self.args().input_audio_codebooks() as usize,
+            self.args().generated_audio_codebooks() as usize,
+            self.args().dep_q as usize,
+            self.args().text_padding_token(),
+            self.args().audio_padding_token(),
+            self.args()
+                .audio_delays()
+                .iter()
+                .map(|delay| *delay as usize)
+                .collect(),
+        )
+        .expect("validated Moshi arguments have valid realtime geometry")
     }
 
     /// Returns current logical residency and transfer telemetry.
@@ -448,7 +454,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<RealtimeStepOutput, Exception> {
+    ) -> Result<MlxRealtimeOutput, Exception> {
         self.generate_step_forced(
             state,
             input_audio_tokens,
@@ -477,7 +483,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<RealtimeStepOutput, Exception> {
+    ) -> Result<MlxRealtimeOutput, Exception> {
         if self.args().existing_text_padding_id.is_some() && self.args().dep_q == self.args().n_q {
             return self.generate_step_pytorch_style(
                 state,
@@ -519,7 +525,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<RealtimeStepOutput, Exception> {
+    ) -> Result<MlxRealtimeOutput, Exception> {
         let args = self.args().clone();
         let input_codebooks = args.input_audio_codebooks();
         if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
@@ -659,7 +665,7 @@ impl MoshiLayerwiseModel {
             .transpose()?;
         state.previous_text = Some(sampled.text_token.clone());
         state.step += 1;
-        Ok(RealtimeStepOutput {
+        Ok(MlxRealtimeOutput {
             text_token: sampled.text_token,
             sampled_audio_tokens: sampled.audio_tokens,
             output_audio_tokens,
@@ -679,7 +685,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<RealtimeStepOutput, Exception> {
+    ) -> Result<MlxRealtimeOutput, Exception> {
         let args = self.args().clone();
         let input_codebooks = args.input_audio_codebooks();
         if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
@@ -745,7 +751,7 @@ impl MoshiLayerwiseModel {
         }
         if offset == 0 {
             state.step += 1;
-            return Ok(RealtimeStepOutput {
+            return Ok(MlxRealtimeOutput {
                 text_token: Array::full::<i32>(
                     &[batch, 1],
                     Array::from_int(args.text_card),
@@ -825,7 +831,7 @@ impl MoshiLayerwiseModel {
         };
         state.previous_text = Some(sampled.text_token.clone());
         state.step += 1;
-        Ok(RealtimeStepOutput {
+        Ok(MlxRealtimeOutput {
             text_token: sampled.text_token,
             sampled_audio_tokens: sampled.audio_tokens,
             output_audio_tokens,
@@ -2076,11 +2082,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        api::realtime::{
-            generate_encoded_greedy, LoadedRealtimeModel, RealtimeInferenceScheduler,
-            RealtimeSampling,
-        },
+        api::realtime::{generate_encoded_greedy, RealtimeSampling, RealtimeScheduler},
         api::{moshi as eager, ModelLoadOptions},
+        backend::mlx::realtime::MlxRealtimeModel,
         core::residency::{MemoryTier, OffloadConfig},
         runtime::distributed::{
             parallel::{ParallelBuildContext, ShardingPolicy},
@@ -2089,9 +2093,8 @@ mod tests {
         runtime::execution::layerwise::{
             LayerWeightResidency, LayerwiseLoadOptions, WeightResidency,
         },
-        runtime::generation::sampler::DefaultSampler,
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        RequestId, SchedulerLimits,
+        MlxRealtimeBackend, RealtimeModel, RequestId, SchedulerLimits,
     };
 
     fn config() -> &'static str {
@@ -2289,24 +2292,15 @@ mod tests {
         .unwrap();
 
         let request = RequestId::new(19);
-        let samplers = || vec![DefaultSampler, DefaultSampler];
         let mut resident_scheduler =
-            RealtimeInferenceScheduler::new(&resident, SchedulerLimits::new(1, 1).unwrap())
-                .unwrap();
+            RealtimeScheduler::new(&resident, SchedulerLimits::new(1, 1).unwrap()).unwrap();
         resident_scheduler
-            .register_request(
-                &resident,
-                request,
-                DefaultSampler,
-                samplers(),
-                RealtimeSampling::greedy(),
-            )
+            .register_request(&resident, request, RealtimeSampling::greedy())
             .unwrap();
         let session = resident_scheduler.release_request(request).unwrap();
 
         let mut layerwise_scheduler =
-            RealtimeInferenceScheduler::new(&layerwise, SchedulerLimits::new(1, 1).unwrap())
-                .unwrap();
+            RealtimeScheduler::new(&layerwise, SchedulerLimits::new(1, 1).unwrap()).unwrap();
         layerwise_scheduler
             .register_request_with_session(&layerwise, request, session)
             .unwrap();
@@ -2325,8 +2319,7 @@ mod tests {
         let changed_model =
             crate::api::realtime::load_model(changed.path(), gpu.stream(), cpu.stream()).unwrap();
         let mut changed_scheduler =
-            RealtimeInferenceScheduler::new(&changed_model, SchedulerLimits::new(1, 1).unwrap())
-                .unwrap();
+            RealtimeScheduler::new(&changed_model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
         let error = changed_scheduler
             .register_request_with_session(&changed_model, request, session)
             .unwrap_err();
@@ -2493,10 +2486,18 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            &loaded,
-            crate::api::realtime::LoadedRealtimeModel::Moshi(_)
+            loaded.model(),
+            crate::backend::mlx::realtime::MlxRealtimeModel::Moshi(_)
         ));
-        assert_eq!(loaded.execution_group_reports().unwrap().unwrap().len(), 2);
+        assert_eq!(
+            loaded
+                .model()
+                .execution_group_reports()
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -2604,10 +2605,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            &loaded,
-            crate::api::realtime::LoadedRealtimeModel::Moshi(_)
+            loaded.model(),
+            crate::backend::mlx::realtime::MlxRealtimeModel::Moshi(_)
         ));
-        assert!(loaded.dense_stream_report().unwrap().is_some());
+        assert!(loaded.model().dense_stream_report().unwrap().is_some());
     }
 
     #[test]
@@ -2631,10 +2632,16 @@ mod tests {
         )
         .unwrap();
         let input = Array::from_slice(&[1i32, 2, 3, 4, 5, 6], &[1, 2, 3]);
-        let mut resident = LoadedRealtimeModel::Moshi(resident);
-        let mut layerwise = LoadedRealtimeModel::Moshi(layerwise);
-        let expected = generate_encoded_greedy(&mut resident, &input, gpu.stream()).unwrap();
-        let actual = generate_encoded_greedy(&mut layerwise, &input, gpu.stream()).unwrap();
+        let mut resident = RealtimeModel::new(
+            MlxRealtimeBackend::new(gpu.stream()),
+            MlxRealtimeModel::Moshi(resident),
+        );
+        let mut layerwise = RealtimeModel::new(
+            MlxRealtimeBackend::new(gpu.stream()),
+            MlxRealtimeModel::Moshi(layerwise),
+        );
+        let expected = generate_encoded_greedy(&mut resident, &input).unwrap();
+        let actual = generate_encoded_greedy(&mut layerwise, &input).unwrap();
         assert_eq!(
             expected.text_tokens.evaluated().unwrap().as_slice::<u32>(),
             actual.text_tokens.evaluated().unwrap().as_slice::<u32>()

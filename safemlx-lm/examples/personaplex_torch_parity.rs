@@ -5,12 +5,10 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    api::realtime::{
-        LoadedRealtimeModel, RealtimeInferenceScheduler, RealtimeSampling, RealtimeStepInput,
-    },
+    api::realtime::{RealtimeSampling, RealtimeScheduler},
     architectures::moshi::{layerwise, model as moshi, personaplex},
-    runtime::generation::sampler::DefaultSampler,
-    LayerWeightResidency, RequestId, SchedulerLimits,
+    LayerWeightResidency, MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel, RealtimeModel,
+    RequestId, SchedulerLimits,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -41,29 +39,21 @@ fn main() -> anyhow::Result<()> {
     let expected_sampled = required(&fixture, "expected.sampled")?;
     let expected_output_audio = required(&fixture, "expected.output_audio")?;
 
-    let mut model = LoadedRealtimeModel::PersonaPlex(model);
-    let config = model.realtime_config();
-    let depth_audio_codebooks = config.depth_audio_codebooks;
-    let generated_audio_codebooks = config.generated_audio_codebooks;
-    let audio_samplers = (0..depth_audio_codebooks)
-        .map(|_| DefaultSampler)
-        .collect::<Vec<_>>();
+    let mut model = RealtimeModel::new(
+        MlxRealtimeBackend::new(stream),
+        MlxRealtimeModel::PersonaPlex(model),
+    );
+    let generated_audio_codebooks = model.speech_config().generated_audio_codebooks() as i32;
     let request = RequestId::new(1);
-    let mut scheduler = RealtimeInferenceScheduler::new(&model, SchedulerLimits::new(1, 1)?)?;
-    scheduler.register_request(
-        &model,
-        request,
-        DefaultSampler,
-        audio_samplers,
-        RealtimeSampling::greedy(),
-    )?;
+    let mut scheduler = RealtimeScheduler::new(&model, SchedulerLimits::new(1, 1)?)?;
+    scheduler.register_request(&model, request, RealtimeSampling::greedy())?;
     let mut sampled = Vec::new();
     let mut emitted = Vec::new();
     for step in 0..input_audio.dim(2) {
         let input = input_audio.try_index_device((.., .., step), stream)?;
-        scheduler.enqueue(&model, request, RealtimeStepInput::encoded_audio(&input))?;
+        scheduler.enqueue(&model, request, MlxRealtimeInput::encoded_audio(&input))?;
         let output = loop {
-            if let Some(output) = scheduler.run_queued(&mut model, stream)?.pop() {
+            if let Some(output) = scheduler.run_queued(&mut model)?.pop() {
                 break output.into_parts().1;
             }
             std::thread::yield_now();

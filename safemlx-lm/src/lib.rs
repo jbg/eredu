@@ -70,9 +70,8 @@ mod distributed_tensor_parallel_ring;
 
 pub use api::realtime::{
     load_model as load_realtime_model, load_model_with_options as load_realtime_model_with_options,
-    LoadedRealtimeModel, RealtimeCompletedStep, RealtimeInferenceScheduler, RealtimeModelKind,
-    RealtimeSampling, RealtimeSchedulerCapabilities, RealtimeSchedulerReport, RealtimeSession,
-    RealtimeSpeechConfig, RealtimeStepInput, RealtimeStepOutput,
+    RealtimeCompletedStep, RealtimeModelKind, RealtimeSampling, RealtimeScheduler,
+    RealtimeSchedulerCapabilities, RealtimeSchedulerReport, RealtimeSession, RealtimeSpeechConfig,
 };
 pub use api::{
     discover_hardware, execution_plan_load_options, inspect_model, load_model,
@@ -88,6 +87,10 @@ pub use api::{
     TimingTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
+pub use backend::mlx::realtime::{
+    MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput,
+    MlxRealtimeModel, MlxRealtimeModelIdentity, MlxRealtimeOutput, MlxRealtimeSession,
+};
 pub use backend::mlx::{
     MlxBackend, MlxDistributedSession, MlxModel, MlxModelInput, MlxModelOutput, MlxModelSession,
     MlxSessionCompletion, MlxTextCompletion, MlxTextGenerationState, MlxTextToken,
@@ -131,6 +134,7 @@ pub use safemlx_lm_core::cache::{
     StateResidencyClass, StateTensorDimension, StateTensorDtype, StateTensorOwner,
     StateTensorPolicy, StateTensorPresence, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
 };
+pub use safemlx_lm_core::realtime::{RealtimeBackend, RealtimeError, RealtimeModel};
 pub use safemlx_lm_core::residency::{
     AllocatorMemoryMetrics, BackgroundPrefetchReport, CacheEvictionPolicy, EvictionMetrics,
     MemoryTier, OffloadConfig, OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry,

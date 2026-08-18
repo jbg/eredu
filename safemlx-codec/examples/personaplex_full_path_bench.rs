@@ -3,10 +3,9 @@ use std::{path::PathBuf, time::Instant};
 use safemlx::{transforms::eval, Array, Device, DeviceType, ExecutionContext, Stream};
 use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
-    api::realtime::{RealtimeInferenceScheduler, RealtimeSampling, RealtimeStepInput},
-    load_realtime_model,
-    runtime::generation::sampler::DefaultSampler,
-    LoadedRealtimeModel, RequestId, SchedulerLimits,
+    api::realtime::{RealtimeSampling, RealtimeScheduler},
+    load_realtime_model, MlxRealtimeBackend, MlxRealtimeInput, RealtimeModel, RequestId,
+    SchedulerLimits,
 };
 
 const SAMPLE_RATE: f64 = 24_000.0;
@@ -44,10 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let load_start = Instant::now();
     let mut model = load_realtime_model(&model_dir, stream, weights_stream)?;
-    let config = model.realtime_config();
-    let input_audio_codebooks = config.input_audio_codebooks;
-    let generated_audio_codebooks = config.generated_audio_codebooks;
-    let depth_audio_codebooks = config.depth_audio_codebooks;
+    let config = model.speech_config();
+    let input_audio_codebooks = config.input_audio_codebooks() as i32;
+    let generated_audio_codebooks = config.generated_audio_codebooks() as i32;
+    let depth_audio_codebooks = config.depth_audio_codebooks() as i32;
     let mut mimi = Mimi::load(
         &mimi_path,
         Some(input_audio_codebooks.max(generated_audio_codebooks)),
@@ -61,22 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let pcm_frame = Array::zeros::<f32>(&[1, 1, frame_samples], stream)?;
-    warmup(
-        &mut model,
-        &mut mimi,
-        &pcm_frame,
-        depth_audio_codebooks,
-        stream,
-    )?;
+    warmup(&mut model, &mut mimi, &pcm_frame, stream)?;
 
-    let (elapsed, encoded_frames, emitted_frames) = run_full_path(
-        &mut model,
-        &mut mimi,
-        &pcm_frame,
-        frames,
-        depth_audio_codebooks,
-        stream,
-    )?;
+    let (elapsed, encoded_frames, emitted_frames) =
+        run_full_path(&mut model, &mut mimi, &pcm_frame, frames, stream)?;
     println!("encoded_frames={encoded_frames} emitted_frames={emitted_frames}");
     report("full_path_pcm_to_pcm", elapsed, audio_s, frames);
 
@@ -84,36 +71,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn warmup(
-    model: &mut LoadedRealtimeModel,
+    model: &mut RealtimeModel<MlxRealtimeBackend>,
     mimi: &mut Mimi,
     pcm_frame: &Array,
-    depth_audio_codebooks: i32,
     stream: &Stream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = run_full_path(model, mimi, pcm_frame, 3, depth_audio_codebooks, stream)?;
+    let _ = run_full_path(model, mimi, pcm_frame, 3, stream)?;
     Ok(())
 }
 
 fn run_full_path(
-    model: &mut LoadedRealtimeModel,
+    model: &mut RealtimeModel<MlxRealtimeBackend>,
     mimi: &mut Mimi,
     pcm_frame: &Array,
     frames: i32,
-    depth_audio_codebooks: i32,
     stream: &Stream,
 ) -> Result<(f64, i32, i32), Box<dyn std::error::Error>> {
-    let audio_samplers = (0..depth_audio_codebooks)
-        .map(|_| DefaultSampler)
-        .collect::<Vec<_>>();
     let request = RequestId::new(1);
-    let mut scheduler = RealtimeInferenceScheduler::new(model, SchedulerLimits::new(1, 1)?)?;
-    scheduler.register_request(
-        model,
-        request,
-        DefaultSampler,
-        audio_samplers,
-        RealtimeSampling::greedy(),
-    )?;
+    let mut scheduler = RealtimeScheduler::new(model, SchedulerLimits::new(1, 1)?)?;
+    scheduler.register_request(model, request, RealtimeSampling::greedy())?;
     mimi.reset_encode_state();
     mimi.reset_decode_state();
 
@@ -128,10 +104,10 @@ fn run_full_path(
         scheduler.enqueue(
             model,
             request,
-            RealtimeStepInput::encoded_audio(&input_tokens),
+            MlxRealtimeInput::encoded_audio(&input_tokens),
         )?;
         let output = scheduler
-            .run_queued(model, stream)?
+            .run_queued(model)?
             .pop()
             .expect("one queued realtime frame")
             .into_parts()

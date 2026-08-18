@@ -134,11 +134,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut model = load_realtime_model(&model_dir, stream, cpu.stream())?;
-    let generated = generate_encoded_greedy(
-        &mut model,
-        required(&fixture, "generation.input_audio")?,
-        stream,
-    )?;
+    let generated =
+        generate_encoded_greedy(&mut model, required(&fixture, "generation.input_audio")?)?;
     compare_tokens(
         &generated.text_tokens,
         required(&fixture, "generation.expected_text")?,

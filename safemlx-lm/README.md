@@ -198,6 +198,13 @@ when continuing a prefix.
 Raw generation remains available for completion workloads. It deliberately
 bypasses chat-template and native-tool guarantees.
 
+Realtime speech-token clients use `RealtimeModel<B>` and
+`RealtimeScheduler<B>`. Request/session scheduling, portable sampling
+configuration, cancellation, and exact completion are backend-generic. The MLX
+adapter owns Moshi/PersonaPlex arrays, caches, samplers, random state, streams,
+and events; another backend implements the same whole-step contract without
+changing the scheduler client.
+
 ## Memory and execution policies
 
 Weights and runtime state have separate policies and budgets:

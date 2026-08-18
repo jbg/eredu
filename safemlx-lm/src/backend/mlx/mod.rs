@@ -5,6 +5,8 @@ pub(crate) mod cache;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
 mod loading;
+/// Realtime Moshi/PersonaPlex session execution.
+pub mod realtime;
 /// MLX allocator observations for neutral residency telemetry.
 pub mod residency;
 /// MLX stream assignment and exact completion for speculative sessions.

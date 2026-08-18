@@ -30,7 +30,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    api::realtime::{self, RealtimeSpeechConfig},
+    api::realtime::RealtimeSpeechConfig,
+    backend::mlx::realtime,
     error::Error,
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
@@ -1237,7 +1238,7 @@ pub struct SampleStepOutput {
 /// distribution per depth codebook.
 pub struct GenerationStepWithLogits {
     /// Normal realtime tokens and optional delay-aligned output frame.
-    pub output: realtime::RealtimeStepOutput,
+    pub output: realtime::MlxRealtimeOutput,
     /// Text logits shaped `[batch, 1, text_card]`, absent during initialization.
     pub text_logits: Option<Array>,
     /// Audio logits ordered by depth codebook.
@@ -1686,16 +1687,21 @@ impl Model {
     }
 
     /// Returns the codec-token stream geometry consumed by realtime scheduling.
-    pub fn realtime_config(&self) -> RealtimeSpeechConfig<'_> {
-        RealtimeSpeechConfig {
-            total_audio_codebooks: self.args.n_q,
-            input_audio_codebooks: self.args.input_audio_codebooks(),
-            generated_audio_codebooks: self.args.generated_audio_codebooks(),
-            depth_audio_codebooks: self.args.dep_q,
-            text_padding_token: self.args.text_padding_token(),
-            audio_padding_token: self.args.audio_padding_token(),
-            audio_delays: self.args.audio_delays(),
-        }
+    pub fn realtime_config(&self) -> RealtimeSpeechConfig {
+        RealtimeSpeechConfig::new(
+            self.args.n_q as usize,
+            self.args.input_audio_codebooks() as usize,
+            self.args.generated_audio_codebooks() as usize,
+            self.args.dep_q as usize,
+            self.args.text_padding_token(),
+            self.args.audio_padding_token(),
+            self.args
+                .audio_delays()
+                .iter()
+                .map(|delay| *delay as usize)
+                .collect(),
+        )
+        .expect("validated Moshi arguments have valid realtime geometry")
     }
 
     fn temporal_input(
@@ -2080,7 +2086,7 @@ impl Model {
     /// Consumes one Mimi input-side frame and advances delayed-stream generation.
     ///
     /// `input_audio_tokens` must be `[batch, n_q - dep_q]`. Supply one sampler
-    /// per generated codebook. [`realtime::RealtimeStepOutput::output_audio_tokens`]
+    /// per generated codebook. [`realtime::MlxRealtimeOutput::output_audio_tokens`]
     /// contains a delay-aligned `[batch, dep_q]` frame once one is available.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_step<TS: Sampler, AS: Sampler>(
@@ -2093,7 +2099,7 @@ impl Model {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<realtime::RealtimeStepOutput, Exception> {
+    ) -> Result<realtime::MlxRealtimeOutput, Exception> {
         self.generate_step_forced(
             state,
             input_audio_tokens,
@@ -2126,7 +2132,7 @@ impl Model {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<realtime::RealtimeStepOutput, Exception> {
+    ) -> Result<realtime::MlxRealtimeOutput, Exception> {
         Ok(self
             .generate_step_forced_internal(
                 state,
@@ -2369,7 +2375,7 @@ impl Model {
         state.previous_text = Some(text_token.clone());
         state.step += 1;
         Ok(GenerationStepWithLogits {
-            output: realtime::RealtimeStepOutput {
+            output: realtime::MlxRealtimeOutput {
                 text_token,
                 sampled_audio_tokens,
                 output_audio_tokens,
@@ -2476,7 +2482,7 @@ impl Model {
         if offset == 0 {
             state.step += 1;
             return Ok(GenerationStepWithLogits {
-                output: realtime::RealtimeStepOutput {
+                output: realtime::MlxRealtimeOutput {
                     text_token: Array::full::<i32>(
                         &[batch, 1],
                         Array::from_int(self.args.text_card),
@@ -2566,7 +2572,7 @@ impl Model {
         state.previous_text = Some(text_token.clone());
         state.step += 1;
         Ok(GenerationStepWithLogits {
-            output: realtime::RealtimeStepOutput {
+            output: realtime::MlxRealtimeOutput {
                 text_token,
                 sampled_audio_tokens,
                 output_audio_tokens,

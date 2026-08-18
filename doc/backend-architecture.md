@@ -109,6 +109,16 @@ and executable ownership coherent and avoids hidden cross-runtime transfers or
 per-operation dispatch costs. Transfers and collectives are optional explicit
 capabilities and therefore fail closed when absent.
 
+Realtime token models use the parallel `RealtimeBackend` contract. A
+`RealtimeModel<B>` binds one loaded temporal/depth model to its backend, and
+`RealtimeScheduler<B>` owns fair request registration, frame queueing, batch
+stability, session handoff, cancellation, and exact completion. Encoded frames,
+generated text/audio frames, cache state, and completions are opaque associated
+types. Sampling temperatures and the deterministic root seed are portable;
+backend sampler objects, random state, and execution queues are not public
+request fields. The production Moshi/PersonaPlex path uses this generic
+scheduler rather than a separate MLX coordinator.
+
 `DistributedBackend` is the optional extension for model sessions which
 communicate across ranks. It exposes the `DistributedSession` attached to the
 selected model session; communicator construction is not a second independent
@@ -170,6 +180,15 @@ returns an opaque `MlxModelInput` containing its arrays. Both enter
 `PreparedChatInput::PreparedBackendInput` and use the same generic constrained
 and semantic generation loop. A second backend may supply its own prompt and
 preprocessor without changing downstream request orchestration.
+
+`MlxRealtimeBackend` maps the realtime contract to `MlxRealtimeModel`, MLX
+codec-token arrays, Moshi temporal/depth cache state, `DefaultSampler`, MLX
+random state, one selected stream, and an exact event retaining every output
+array. A released core `RealtimeSession<MlxRealtimeBackend>` contains the
+opaque MLX session and can be resumed only against the same artifact and
+normalized execution identity. Another backend can implement the same model,
+session, input, output, and completion operations without reproducing scheduler
+state transitions or exposing its queue type to callers.
 
 Speculative model execution uses the core `SpeculativeExecutor` contract. Its
 input, target and assistant state, cache checkpoint, verification output,
@@ -344,9 +363,11 @@ The current boundary leaves these components MLX-coupled:
   stop/EOS precedence, and decoding now have one backend-generic client
   surface. Multimodal request orchestration is generic through the opaque
   backend prompt, while concrete media decoding and tensor preprocessing remain
-  backend implementations. Arbitrary custom samplers, speculative MTP, and
-  realtime token/audio paths still expose MLX adapter types; they require their
-  own high-level portable contracts rather than tensor escape hatches.
+  backend implementations. Realtime request/session orchestration is generic,
+  while codec-token arrays and Moshi/PersonaPlex model math remain MLX adapter
+  types. Arbitrary custom samplers and speculative MTP request surfaces still
+  expose MLX adapter types; they require their own high-level portable contracts
+  rather than tensor escape hatches.
 
 The former facade `runtime::residency::policy` module was deleted. It was not
 retained as a forwarding namespace. The earlier placeholder core

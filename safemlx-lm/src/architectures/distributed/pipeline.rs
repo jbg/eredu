@@ -8818,7 +8818,7 @@ pub(crate) fn load_pipeline_model_with_options(
             )
         }
         Some("personaplex") => Err(Error::UnsupportedArchitecture(
-            "PersonaPlex/Moshi is a realtime multi-stream temporal/depth model, not a single-hidden-stream decoder pipeline; use RealtimeInferenceScheduler"
+            "PersonaPlex/Moshi is a realtime multi-stream temporal/depth model, not a single-hidden-stream decoder pipeline; use RealtimeScheduler"
                 .into(),
         )),
         Some(model_type) => Err(Error::UnsupportedArchitecture(format!(

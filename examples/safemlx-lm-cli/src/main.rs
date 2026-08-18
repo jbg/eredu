@@ -2472,7 +2472,7 @@ fn main() -> Result<()> {
                 max_new_tokens: Some(max_tokens),
                 ..GenerationConfigOverrides::default()
             },
-            prng_key,
+            seed: args.seed,
         };
         let mut semantic_error = None;
         if let Some(drafter) = drafter.as_mut() {
@@ -2563,7 +2563,6 @@ fn main() -> Result<()> {
             let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
-                sampling_policy: sampler,
                 settings,
                 caller_stop_sequences: &args.stop_sequences,
                 cancellation,

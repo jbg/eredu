@@ -17,12 +17,12 @@ use serde::Deserialize;
 use crate::{
     api::{
         moshi,
-        realtime::{LoadedRealtimeModel, RealtimeInferenceScheduler, RealtimeStepInput},
+        realtime::{RealtimeError, RealtimeScheduler},
     },
+    backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
     error::Error,
     runtime::checkpoint::quantization::WeightQuantization,
-    runtime::generation::sampler::Sampler,
-    RequestId, WorkId,
+    RealtimeModel, RequestId, WorkId,
 };
 
 /// Hugging Face repository for the released PersonaPlex checkpoint.
@@ -342,19 +342,21 @@ fn repeated_frame(tokens: &[i32; 8], batch: i32, stream: &Stream) -> Result<Arra
 }
 
 /// Enqueues one forced PersonaPlex prompt frame on an existing request.
-pub fn enqueue_prompt_frame<TS: Sampler + Clone, AS: Sampler + Clone>(
-    scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
-    model: &LoadedRealtimeModel,
+pub fn enqueue_prompt_frame(
+    scheduler: &mut RealtimeScheduler<MlxRealtimeBackend>,
+    model: &RealtimeModel<MlxRealtimeBackend>,
     request: RequestId,
     frame: PromptFrame<'_>,
 ) -> Result<WorkId, Error> {
-    scheduler.enqueue(
-        model,
-        request,
-        RealtimeStepInput::encoded_audio(frame.user_audio_tokens)
-            .with_forced_generated_audio(frame.agent_audio_tokens)
-            .with_forced_text(frame.text_token),
-    )
+    scheduler
+        .enqueue(
+            model,
+            request,
+            MlxRealtimeInput::encoded_audio(frame.user_audio_tokens)
+                .with_forced_generated_audio(frame.agent_audio_tokens)
+                .with_forced_text(frame.text_token),
+        )
+        .map_err(realtime_error)
 }
 
 /// Enqueues a sequence of forced voice-prompt frames.
@@ -362,24 +364,26 @@ pub fn enqueue_prompt_frame<TS: Sampler + Clone, AS: Sampler + Clone>(
 /// `voice_prompt_tokens` uses codec layout `[batch, 8, frames]`; the user side
 /// is filled with PersonaPlex's sine-conditioning token frame and text is
 /// forced to the existing text pad id.
-pub fn enqueue_voice_prompt<TS: Sampler + Clone, AS: Sampler + Clone>(
-    scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
-    model: &LoadedRealtimeModel,
+pub fn enqueue_voice_prompt(
+    scheduler: &mut RealtimeScheduler<MlxRealtimeBackend>,
+    model: &RealtimeModel<MlxRealtimeBackend>,
     request: RequestId,
     voice_prompt_tokens: &Array,
     stream: &Stream,
 ) -> Result<Vec<WorkId>, Error> {
-    scheduler.enqueue_batch(
-        model,
-        request,
-        voice_prompt_inputs(voice_prompt_tokens, stream)?,
-    )
+    scheduler
+        .enqueue_batch(
+            model,
+            request,
+            voice_prompt_inputs(voice_prompt_tokens, stream)?,
+        )
+        .map_err(realtime_error)
 }
 
 fn voice_prompt_inputs(
     voice_prompt_tokens: &Array,
     stream: &Stream,
-) -> Result<Vec<RealtimeStepInput>, Error> {
+) -> Result<Vec<MlxRealtimeInput>, Error> {
     if voice_prompt_tokens.shape().len() != 3
         || voice_prompt_tokens.dim(1) != AUDIO_TOKENS_PER_STREAM
     {
@@ -395,7 +399,7 @@ fn voice_prompt_inputs(
     for frame in 0..voice_prompt_tokens.dim(2) {
         let agent = voice_prompt_tokens.try_index_device((.., .., frame), stream)?;
         inputs.push(
-            RealtimeStepInput::encoded_audio(&sine)
+            MlxRealtimeInput::encoded_audio(&sine)
                 .with_forced_generated_audio(&agent)
                 .with_forced_text(&text),
         );
@@ -409,24 +413,26 @@ fn voice_prompt_inputs(
 /// from the caller's PersonaPlex-compatible text tokenizer. The generated audio
 /// side is forced to PersonaPlex silence while the user side is filled with the
 /// sine-conditioning frame.
-pub fn enqueue_text_prompt<TS: Sampler + Clone, AS: Sampler + Clone>(
-    scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
-    model: &LoadedRealtimeModel,
+pub fn enqueue_text_prompt(
+    scheduler: &mut RealtimeScheduler<MlxRealtimeBackend>,
+    model: &RealtimeModel<MlxRealtimeBackend>,
     request: RequestId,
     text_prompt_tokens: &Array,
     stream: &Stream,
 ) -> Result<Vec<WorkId>, Error> {
-    scheduler.enqueue_batch(
-        model,
-        request,
-        text_prompt_inputs(text_prompt_tokens, stream)?,
-    )
+    scheduler
+        .enqueue_batch(
+            model,
+            request,
+            text_prompt_inputs(text_prompt_tokens, stream)?,
+        )
+        .map_err(realtime_error)
 }
 
 fn text_prompt_inputs(
     text_prompt_tokens: &Array,
     stream: &Stream,
-) -> Result<Vec<RealtimeStepInput>, Error> {
+) -> Result<Vec<MlxRealtimeInput>, Error> {
     if text_prompt_tokens.shape().len() != 2 {
         return Err(Error::Parallel(format!(
             "PersonaPlex text prompt tokens must have shape [batch, frames], got {:?}",
@@ -442,7 +448,7 @@ fn text_prompt_inputs(
             .try_index_device((.., frame), stream)?
             .expand_dims(1, stream)?;
         inputs.push(
-            RealtimeStepInput::encoded_audio(&sine)
+            MlxRealtimeInput::encoded_audio(&sine)
                 .with_forced_generated_audio(&silence)
                 .with_forced_text(&text),
         );
@@ -457,9 +463,9 @@ fn text_prompt_inputs(
 /// and tokenization stay outside this crate; callers can use
 /// [`wrap_system_prompt`] before tokenizing with a compatible SentencePiece
 /// tokenizer.
-pub fn enqueue_system_prompt<TS: Sampler + Clone, AS: Sampler + Clone>(
-    scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
-    model: &LoadedRealtimeModel,
+pub fn enqueue_system_prompt(
+    scheduler: &mut RealtimeScheduler<MlxRealtimeBackend>,
+    model: &RealtimeModel<MlxRealtimeBackend>,
     request: RequestId,
     voice_prompt_tokens: Option<&Array>,
     text_prompt_tokens: &Array,
@@ -470,7 +476,13 @@ pub fn enqueue_system_prompt<TS: Sampler + Clone, AS: Sampler + Clone>(
         inputs.extend(voice_prompt_inputs(tokens, stream)?);
     }
     inputs.extend(text_prompt_inputs(text_prompt_tokens, stream)?);
-    scheduler.enqueue_batch(model, request, inputs)
+    scheduler
+        .enqueue_batch(model, request, inputs)
+        .map_err(realtime_error)
+}
+
+fn realtime_error(error: RealtimeError<Error>) -> Error {
+    Error::Parallel(error.to_string())
 }
 
 #[cfg(test)]
@@ -479,10 +491,8 @@ mod tests {
         model_args_7b_v1, validate_model_config_value, AUDIO_TOKENS_PER_STREAM, TEXT_PADDING_TOKEN,
     };
     use crate::{
-        api::realtime::{
-            RealtimeInferenceScheduler, RealtimeModelKind, RealtimeSampling, RealtimeStepInput,
-        },
-        runtime::generation::sampler::DefaultSampler,
+        api::realtime::{RealtimeModelKind, RealtimeSampling, RealtimeScheduler},
+        backend::mlx::realtime::MlxRealtimeInput,
         RequestId, SchedulerLimits,
     };
     use safemlx::{Array, Device, DeviceType, ExecutionContext};
@@ -537,8 +547,8 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        assert_eq!(model.args().quantization.unwrap().bits(), 4);
-        assert_eq!(model.args().dep_q, 16);
+        assert_eq!(model.model().args().quantization.unwrap().bits(), 4);
+        assert_eq!(model.model().args().dep_q, 16);
     }
 
     #[test]
@@ -549,22 +559,13 @@ mod tests {
         let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let mut model =
             crate::api::realtime::load_model(&model_dir, ctx.stream(), ctx.stream()).unwrap();
-        assert_eq!(model.kind(), RealtimeModelKind::PersonaPlex);
+        assert_eq!(model.model().kind(), RealtimeModelKind::PersonaPlex);
         let stream = ctx.stream();
         let request = RequestId::new(1);
-        let audio_samplers = (0..model.realtime_config().depth_audio_codebooks)
-            .map(|_| DefaultSampler)
-            .collect::<Vec<_>>();
         let mut scheduler =
-            RealtimeInferenceScheduler::new(&model, SchedulerLimits::new(1, 4).unwrap()).unwrap();
+            RealtimeScheduler::new(&model, SchedulerLimits::new(1, 4).unwrap()).unwrap();
         scheduler
-            .register_request(
-                &model,
-                request,
-                DefaultSampler,
-                audio_samplers,
-                RealtimeSampling::greedy(),
-            )
+            .register_request(&model, request, RealtimeSampling::greedy())
             .unwrap();
 
         let text_prompt =
@@ -572,7 +573,7 @@ mod tests {
         super::enqueue_text_prompt(&mut scheduler, &model, request, &text_prompt, stream).unwrap();
         let mut prompt_completions = 0;
         while prompt_completions < 2 {
-            prompt_completions += scheduler.run_queued(&mut model, stream).unwrap().len();
+            prompt_completions += scheduler.run_queued(&mut model).unwrap().len();
             std::thread::yield_now();
         }
 
@@ -580,10 +581,10 @@ mod tests {
         let mut emitted = None;
         for _ in 0..3 {
             scheduler
-                .enqueue(&model, request, RealtimeStepInput::encoded_audio(&input))
+                .enqueue(&model, request, MlxRealtimeInput::encoded_audio(&input))
                 .unwrap();
             let output = loop {
-                if let Some(output) = scheduler.run_queued(&mut model, stream).unwrap().pop() {
+                if let Some(output) = scheduler.run_queued(&mut model).unwrap().pop() {
                     break output.into_parts().1;
                 }
                 std::thread::yield_now();
