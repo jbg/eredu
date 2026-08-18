@@ -3675,7 +3675,7 @@ fn load_kimi_linear_ep(
             options,
             LayerWeightResidency::FullyResident,
             ExternalExpertResidency::FullyResident(options.quantization),
-            crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            crate::core::DEFAULT_MAX_MAPPED_SHARDS,
             assignment,
             stream,
             weights_stream,
@@ -3811,7 +3811,7 @@ fn load_gguf_ep(
             assignment,
             LayerWeightResidency::FullyResident,
             ExternalExpertResidency::FullyResident(options.quantization),
-            crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            crate::core::DEFAULT_MAX_MAPPED_SHARDS,
             stream,
             weights_stream,
         );
@@ -4858,7 +4858,7 @@ fn load_deepseek_ep(
             options,
             LayerWeightResidency::FullyResident,
             ExternalExpertResidency::FullyResident(options.quantization),
-            crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            crate::core::DEFAULT_MAX_MAPPED_SHARDS,
             assignment,
             stream,
             weights_stream,
@@ -5004,7 +5004,7 @@ fn load_deepseek_v4_ep(
         options,
         LayerWeightResidency::FullyResident,
         ExternalExpertResidency::FullyResident(options.quantization),
-        crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+        crate::core::DEFAULT_MAX_MAPPED_SHARDS,
         assignment,
         stream,
         weights_stream,
@@ -5045,7 +5045,7 @@ fn load_qwen3_ep(
             options,
             LayerWeightResidency::FullyResident,
             ExternalExpertResidency::FullyResident(options.quantization),
-            crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            crate::core::DEFAULT_MAX_MAPPED_SHARDS,
             assignment,
             stream,
             weights_stream,
@@ -5638,7 +5638,7 @@ fn load_additional_ep(
         (
             LayerWeightResidency::FullyResident,
             ExternalExpertResidency::FullyResident(options.quantization),
-            crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            crate::core::DEFAULT_MAX_MAPPED_SHARDS,
         )
     } else {
         return Err(Error::Parallel(format!(

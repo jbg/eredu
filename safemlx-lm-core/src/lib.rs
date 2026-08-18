@@ -50,6 +50,11 @@ pub use backend::{
     TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenFilterController,
     TokenFilterError, TokenOutput, ValueDescriptor,
 };
+pub use execution::{
+    BackendId, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanError,
+    ExpertCachePlan, ResidencyPlan, WeightTransformationPlan, DEFAULT_MAX_MAPPED_SHARDS,
+    EXECUTION_PLAN_SCHEMA_VERSION,
+};
 pub use generation::{
     resolve_generation_config, resolve_optimistic_reuse, CheckpointGenerationConfig, FinishReason,
     GenerationCancellationToken, GenerationConfigOverrides, GenerationError, GenerationPhase,

@@ -272,13 +272,15 @@ pub use safemlx_lm_core::GgufArchitecture;
 mod automatic;
 pub use automatic::{
     discover_hardware, execution_plan_load_options, plan_automatic_execution, AllocatorTelemetry,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, BackendKind, DevicePlan,
-    DraftPlacementPlan, DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport,
-    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, DurationSeconds,
+    ExecutionPlanReport, ExecutionTelemetry, ExpertCacheTelemetry, HardwareBackendProfile,
     HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, ModelResourceProfile,
-    ObservationKind, Observed, ParallelismPlan, PlanExplanation, PlanExplanationEntry,
-    PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry, TimingTelemetry, TransferTelemetry,
-    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    ObservationKind, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
+    ResidencyTelemetry, TimingTelemetry, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
+};
+pub use safemlx_lm_core::{
+    BackendId, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExpertCachePlan,
+    ResidencyPlan, WeightTransformationPlan,
 };
 
 mod capability;

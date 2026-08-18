@@ -148,7 +148,7 @@ impl Default for LayerwiseLoadOptions {
     fn default() -> Self {
         Self {
             offload: OffloadConfig::default(),
-            max_mapped_shards: crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            max_mapped_shards: crate::core::DEFAULT_MAX_MAPPED_SHARDS,
             strict_loading: true,
             sample_mlx_memory: false,
             sample_process_memory: false,
@@ -172,7 +172,7 @@ impl LayerWeightResidency {
     /// Returns the backend shard/reader cache bound carried by this policy.
     pub(crate) const fn max_mapped_shards(self) -> usize {
         match self {
-            Self::FullyResident => crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            Self::FullyResident => crate::core::DEFAULT_MAX_MAPPED_SHARDS,
             Self::LayerwiseHost(options) => options.max_mapped_shards,
             Self::DenseDiskStream(options) => options.max_mapped_shards,
         }

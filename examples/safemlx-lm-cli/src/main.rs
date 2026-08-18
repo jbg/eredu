@@ -22,8 +22,8 @@ use safemlx::{
 use safemlx_lm::{
     api::{
         discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
-        AllocatorTelemetry, AutomaticPlanRequest, BackendKind, DevicePlan, DraftPlacementPlan,
-        DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
+        AllocatorTelemetry, AutomaticPlanRequest, DevicePlan, DraftPlacementPlan, DraftingPlan,
+        ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
         ExpertCacheTelemetry, HardwareMemorySemantics, HardwareProfile, LoadedModel,
         ModelInspectionOptions, ModelLoadOptions, ModelResourceProfile, Observed, PlanExplanation,
         PlanExplanationEntry, PlanExplanationLevel, PreparedChatDraft,
@@ -1101,12 +1101,12 @@ fn automatic_cache_key(
         .hardware
         .backends
         .iter()
-        .find(|backend| backend.kind == report.plan.device.backend)
+        .find(|backend| backend.backend == report.plan.device.backend)
         .and_then(|backend| {
             backend
                 .devices
                 .iter()
-                .find(|device| device.index == report.plan.device.index)
+                .find(|device| device.id == report.plan.device.device)
         })
         .and_then(|device| observed_u64(&device.total_memory_bytes));
     Ok(AutoPlanCacheKey {
@@ -1121,7 +1121,7 @@ fn automatic_cache_key(
         architecture: report.hardware.architecture.clone(),
         memory_semantics: format!("{:?}", report.hardware.physical_memory_semantics),
         physical_memory_bytes: observed_u64(&report.hardware.physical_memory_bytes),
-        device: report.plan.device,
+        device: report.plan.device.clone(),
         device_total_memory_bytes,
     })
 }
@@ -1205,34 +1205,37 @@ fn automatic_budget(available: Option<u64>, fallback: u64) -> u64 {
         .max(1)
 }
 
-fn selected_device_available_memory(hardware: &HardwareProfile, device: DevicePlan) -> Option<u64> {
+fn selected_device_available_memory(
+    hardware: &HardwareProfile,
+    device: &DevicePlan,
+) -> Option<u64> {
     hardware
         .backends
         .iter()
-        .find(|backend| backend.kind == device.backend && backend.available)
+        .find(|backend| backend.backend == device.backend && backend.available)
         .and_then(|backend| {
             backend
                 .devices
                 .iter()
-                .find(|candidate| candidate.index == device.index)
+                .find(|candidate| candidate.id == device.device)
         })
         .and_then(|device| observed_u64(&device.available_memory_bytes))
 }
 
-fn validate_automatic_device(hardware: &HardwareProfile, device: DevicePlan) -> Result<()> {
+fn validate_automatic_device(hardware: &HardwareProfile, device: &DevicePlan) -> Result<()> {
     let backend = hardware
         .backends
         .iter()
-        .find(|backend| backend.kind == device.backend)
+        .find(|backend| backend.backend == device.backend)
         .with_context(|| {
             format!(
-                "automatic planning did not discover the {:?} backend selected by --device",
+                "automatic planning did not discover the {} backend selected by --device",
                 device.backend
             )
         })?;
     if !backend.available {
         bail!(
-            "automatic planning cannot use unavailable {:?} backend: {}",
+            "automatic planning cannot use unavailable {} backend: {}",
             device.backend,
             backend.detail.as_deref().unwrap_or("no detail reported")
         );
@@ -1240,12 +1243,12 @@ fn validate_automatic_device(hardware: &HardwareProfile, device: DevicePlan) -> 
     if !backend
         .devices
         .iter()
-        .any(|candidate| candidate.index == device.index)
+        .any(|candidate| candidate.id == device.device)
     {
         bail!(
-            "automatic planning did not discover {:?} device index {}",
+            "automatic planning did not discover {} device {}",
             device.backend,
-            device.index
+            device.device
         );
     }
     Ok(())
@@ -1261,7 +1264,7 @@ fn automatic_model_bytes(resources: &ModelResourceProfile) -> Option<(u64, &'sta
 }
 
 fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &ExecutionPlan) -> bool {
-    let available_device = selected_device_available_memory(&observations.hardware, plan.device)
+    let available_device = selected_device_available_memory(&observations.hardware, &plan.device)
         .map(|bytes| automatic_budget(Some(bytes), 1));
     let available_host = observed_u64(&observations.hardware.available_memory_bytes)
         .map(|bytes| automatic_budget(Some(bytes), 1));
@@ -1325,8 +1328,8 @@ fn base_automatic_candidates(
     device_budget: u64,
     host_budget: u64,
 ) -> [ExecutionPlan; 3] {
-    let resident = ExecutionPlan::fully_resident(device);
-    let mut layerwise = ExecutionPlan::fully_resident(device);
+    let resident = ExecutionPlan::fully_resident(device.clone());
+    let mut layerwise = ExecutionPlan::fully_resident(device.clone());
     layerwise.residency = ResidencyPlan::LayerwiseHost {
         device_layer_window: 1,
         device_budget_bytes: Some(device_budget),
@@ -1429,7 +1432,7 @@ fn choose_automatic_residency(
 fn automatic_observations(model_path: &Path, device: CliDevice) -> Result<ExecutionPlanReport> {
     let hardware = discover_hardware();
     let selected_device = device_plan(device);
-    validate_automatic_device(&hardware, selected_device)?;
+    validate_automatic_device(&hardware, &selected_device)?;
     let resources = inspect_model(model_path, ModelInspectionOptions::default())?.resources;
     Ok(ExecutionPlanReport {
         schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
@@ -1496,7 +1499,7 @@ fn automatic_benchmark_candidates(
     heuristic: &ExecutionPlanReport,
 ) -> Result<Vec<ExecutionPlan>> {
     let device_available =
-        selected_device_available_memory(&heuristic.hardware, heuristic.plan.device);
+        selected_device_available_memory(&heuristic.hardware, &heuristic.plan.device);
     let host_available = observed_u64(&heuristic.hardware.available_memory_bytes);
     let device_budget = automatic_budget(device_available, AUTO_DEVICE_FALLBACK_BYTES);
     let host_budget = automatic_budget(host_available, AUTO_HOST_FALLBACK_BYTES);
@@ -1513,7 +1516,7 @@ fn automatic_benchmark_candidates(
     let mut plans = Vec::new();
     let mut seen = HashSet::new();
     for (index, plan) in
-        base_automatic_candidates(heuristic.plan.device, device_budget, host_budget)
+        base_automatic_candidates(heuristic.plan.device.clone(), device_budget, host_budget)
             .into_iter()
             .enumerate()
     {
@@ -1547,14 +1550,22 @@ fn automatic_benchmark_candidates(
     Ok(plans)
 }
 
-fn cli_device_for_plan(device: DevicePlan) -> Result<CliDevice> {
-    match device.backend {
-        BackendKind::Cpu if device.index == 0 => Ok(CliDevice::Cpu),
-        BackendKind::Metal | BackendKind::Cuda | BackendKind::Gpu => {
-            let index = i32::try_from(device.index).context("planned device index exceeds i32")?;
-            Ok(CliDevice::Gpu(index))
-        }
-        BackendKind::Cpu => bail!("CPU plan device index must be zero"),
+fn cli_device_for_plan(device: &DevicePlan) -> Result<CliDevice> {
+    if device.backend.as_str() != "mlx" {
+        bail!("the SafeMLX CLI cannot execute backend {}", device.backend);
+    }
+    let (family, index) = device
+        .device
+        .split_once(':')
+        .context("planned MLX device must use family:index syntax")?;
+    let index = index
+        .parse::<i32>()
+        .context("planned MLX device index is invalid")?;
+    match family {
+        "cpu" if index == 0 => Ok(CliDevice::Cpu),
+        "metal" | "cuda" | "gpu" => Ok(CliDevice::Gpu(index)),
+        "cpu" => bail!("CPU plan device index must be zero"),
+        _ => bail!("unsupported MLX device family {family:?}"),
     }
 }
 
@@ -1597,7 +1608,7 @@ fn isolated_benchmark_trial(
             .arg("--model")
             .arg(model_path)
             .arg("--device")
-            .arg(cli_device_for_plan(plan.device)?.to_string())
+            .arg(cli_device_for_plan(&plan.device)?.to_string())
             .arg("--auto-trial-plan")
             .arg(&plan_path)
             .arg("--telemetry-json")
@@ -1802,7 +1813,7 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
         );
     }
     let hardware = discover_hardware();
-    validate_automatic_device(&hardware, plan.device)?;
+    validate_automatic_device(&hardware, &plan.device)?;
     let inspection = inspect_model(
         model_path,
         ModelInspectionOptions {
@@ -1853,7 +1864,6 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
         }
     }
     args.mapped_shards = plan.max_mapped_shards;
-    args.mlx_cache_limit_bytes = plan.mlx_cache_limit_bytes;
     args.layerwise_host = false;
     args.dense_disk_stream = false;
     match &plan.residency {
@@ -2018,9 +2028,9 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to parse exact trial plan {}", path.display()))?;
             if plan.device != device_plan(args.device) {
                 bail!(
-                    "exact trial plan device {:?}:{} does not match --device {}",
+                    "exact trial plan device {}:{} does not match --device {}",
                     plan.device.backend,
-                    plan.device.index,
+                    plan.device.device,
                     args.device
                 );
             }
@@ -2986,20 +2996,17 @@ fn main() -> Result<()> {
 
 fn device_plan(device: CliDevice) -> DevicePlan {
     match device {
-        CliDevice::Cpu => DevicePlan {
-            backend: BackendKind::Cpu,
-            index: 0,
-        },
-        CliDevice::Gpu(index) => DevicePlan {
-            backend: if cfg!(feature = "cuda") {
-                BackendKind::Cuda
+        CliDevice::Cpu => DevicePlan::new("mlx", "cpu:0").expect("valid MLX CPU device"),
+        CliDevice::Gpu(index) => {
+            let family = if cfg!(feature = "cuda") {
+                "cuda"
             } else if cfg!(target_os = "macos") {
-                BackendKind::Metal
+                "metal"
             } else {
-                BackendKind::Gpu
-            },
-            index: index as usize,
-        },
+                "gpu"
+            };
+            DevicePlan::new("mlx", format!("{family}:{index}")).expect("valid MLX GPU device")
+        }
     }
 }
 
@@ -3049,7 +3056,8 @@ fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool
     ExecutionPlan {
         schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
         device: device_plan(args.device),
-        parallelism: Default::default(),
+        topology: safemlx_lm::core::topology::ParallelTopology::new(1, 1, 1, 1)
+            .expect("the singleton topology is valid"),
         residency,
         weight_transformation: match (args.quantize, args.quantization_mode) {
             (Some(bits), LoadQuantizationMode::Affine) => WeightTransformationPlan::Affine {
@@ -3067,7 +3075,10 @@ fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool
             prefill_bank_bytes: args.expert_cache_prefill_bank_bytes,
         }),
         drafting,
-        mlx_cache_limit_bytes: args.mlx_cache_limit_bytes,
+        required_capabilities: safemlx_lm::BackendCapabilities {
+            exact_completion: true,
+            ..safemlx_lm::BackendCapabilities::default()
+        },
     }
 }
 
@@ -3857,7 +3868,7 @@ mod tests {
 
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
-        cached_automatic_report, choose_automatic_residency, cli_execution_plan,
+        cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
         embedded_mtp_count, eval, execution_contexts, format_bytes,
         format_weight_store_diagnostics, median, model_advertises_embedded_mtp,
         read_automatic_feedback, requested_load_quantization, select_cached_gguf_from_revisions,
@@ -3865,11 +3876,10 @@ mod tests {
         select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
         use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
         write_semantic_event, write_timing_report, Array, AutoMode, AutoPlanCacheKey,
-        AutomaticCliOverrides, BackendKind, CachedGgufRole, Cli, CliDevice, CliToolChoice,
-        DevicePlan, DeviceType, DraftingPlan, ExecutionPlan, MtpDraftDevice, MtpExecutionStreams,
-        MtpSchedulerOptions, NativeToolSupport, ReasoningOutput, ReasoningStream, ResidencyPlan,
-        ResolvedModel, SemanticEvent, SemanticSupport, StopReason, WeightQuantization,
-        WeightTransformationPlan,
+        AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType,
+        DraftingPlan, ExecutionPlan, MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions,
+        NativeToolSupport, ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel,
+        SemanticEvent, SemanticSupport, StopReason, WeightQuantization, WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -3962,10 +3972,7 @@ mod tests {
         let cache_path = directory.path().join("plans.json");
         let model_path = directory.path().join("model.gguf");
         std::fs::write(&model_path, b"fixture").unwrap();
-        let device = DevicePlan {
-            backend: BackendKind::Cpu,
-            index: 0,
-        };
+        let device = device_plan(CliDevice::Cpu);
         let hardware = safemlx_lm::discover_hardware();
         let resources = safemlx_lm::ModelResourceProfile {
             schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
@@ -3987,7 +3994,7 @@ mod tests {
             schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
             hardware,
             resources,
-            plan: safemlx_lm::ExecutionPlan::fully_resident(device),
+            plan: safemlx_lm::ExecutionPlan::fully_resident(device.clone()),
             explanation: safemlx_lm::PlanExplanation {
                 summary: "fixture".into(),
                 entries: Vec::new(),
@@ -4040,10 +4047,7 @@ mod tests {
         assert!(!overrides.contains("quantization_group_size"));
         let original = Cli::from_arg_matches(&matches).unwrap();
         let mut applied = original.clone();
-        let plan = ExecutionPlan::fully_resident(DevicePlan {
-            backend: BackendKind::Cpu,
-            index: 0,
-        });
+        let plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu));
         apply_automatic_plan(&mut applied, &plan).unwrap();
         overrides.restore(&mut applied, &original);
         assert!(!applied.layerwise_host);
@@ -4091,10 +4095,7 @@ mod tests {
             "prompt",
         ])
         .unwrap();
-        let device = DevicePlan {
-            backend: BackendKind::Cpu,
-            index: 0,
-        };
+        let device = device_plan(CliDevice::Cpu);
         let mut plan = base_automatic_candidates(device, 1 << 30, 2 << 30)[1].clone();
         plan.expert_cache = Some(super::ExpertCachePlan {
             device_budget_bytes: Some(256 << 20),
@@ -4133,10 +4134,7 @@ mod tests {
             "prompt",
         ])
         .unwrap();
-        let mut plan = safemlx_lm::ExecutionPlan::fully_resident(DevicePlan {
-            backend: BackendKind::Cpu,
-            index: 0,
-        });
+        let mut plan = safemlx_lm::ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu));
         plan.weight_transformation = WeightTransformationPlan::Affine {
             bits: 4,
             group_size: 128,
@@ -4217,7 +4215,8 @@ mod tests {
         assert_eq!(args.telemetry_json.as_deref(), Some(Path::new("run.json")));
 
         let plan = cli_execution_plan(&args, None, false);
-        assert_eq!(plan.device.backend, safemlx_lm::BackendKind::Cpu);
+        assert_eq!(plan.device.backend.as_str(), "mlx");
+        assert_eq!(plan.device.device, "cpu:0");
         assert!(matches!(
             plan.residency,
             safemlx_lm::ResidencyPlan::LayerwiseHost {

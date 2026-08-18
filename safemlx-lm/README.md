@@ -135,14 +135,13 @@ telemetry all implement Serde serialization:
 
 ```rust,no_run
 use safemlx_lm::{
-    plan_automatic_execution, AutomaticPlanRequest, BackendKind, DevicePlan,
-    ExecutionTelemetry,
+    plan_automatic_execution, AutomaticPlanRequest, DevicePlan, ExecutionTelemetry,
 };
 
 let prior_runs: Vec<ExecutionTelemetry> = load_prior_runs();
 let request = AutomaticPlanRequest::new(
     "/path/to/model",
-    DevicePlan { backend: BackendKind::Metal, index: 0 },
+    DevicePlan::new("mlx", "metal:0")?,
 )
 .with_prior_telemetry(prior_runs);
 let report = plan_automatic_execution(&request)?;
@@ -157,7 +156,8 @@ hardware profile, or schema is ignored. Historical plans are also rechecked
 against current available memory and header-only loader admission. Use
 `AutomaticPlanner::new` with an `AutomaticPlannerPolicy` for explicit policy
 bounds, and `execution_plan_load_options` to apply a returned plan to model
-loading. Device creation remains owned by the embedding application.
+loading. Backend and device identifiers are adapter-defined rather than a
+closed core enumeration; device creation remains owned by the selected backend.
 Speculative generation uses the same core-owned committed-token and terminal
 lifecycle as ordinary generation. Its prefill/proposal/verification/commit
 executor contract is also core-owned; the MLX implementations supply opaque

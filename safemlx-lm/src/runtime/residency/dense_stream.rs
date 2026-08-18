@@ -67,7 +67,7 @@ impl DenseDiskStreamLoadOptions {
             host_lookahead,
             background_queue_capacity,
             eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
-            max_mapped_shards: crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            max_mapped_shards: crate::core::DEFAULT_MAX_MAPPED_SHARDS,
             strict_loading: true,
             sample_mlx_memory: false,
             sample_process_memory: false,

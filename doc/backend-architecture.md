@@ -339,6 +339,14 @@ capacity, coalescing, cancellation phase, or result publication.
 
 ## Coupling still present
 
+`safemlx-lm-core::execution::ExecutionPlan` is the canonical execution-plan
+document used by the automatic planner and CLI. It selects an extensible
+backend/device identifier for the whole session, embeds the canonical core
+topology, and contains only portable residency, transformation, drafting, and
+required-capability policy. MLX hardware discovery translates its concrete
+CPU, Metal, and CUDA devices into `mlx` device identifiers. Process-global MLX
+allocator cache configuration is deliberately not part of the neutral plan.
+
 The current boundary leaves these components MLX-coupled:
 
 - architecture tensor execution, including multimodal and realtime model math;

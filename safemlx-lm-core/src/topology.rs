@@ -30,7 +30,7 @@ pub struct ParallelCoordinates {
 }
 
 /// Validated sizes for every parallel axis.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct ParallelTopology {
     /// Tensor-parallel size.
     pub tensor: usize,
@@ -40,6 +40,24 @@ pub struct ParallelTopology {
     pub expert: usize,
     /// Data-parallel size.
     pub data: usize,
+}
+
+impl<'de> Deserialize<'de> for ParallelTopology {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawTopology {
+            tensor: usize,
+            pipeline: usize,
+            expert: usize,
+            data: usize,
+        }
+
+        let raw = RawTopology::deserialize(deserializer)?;
+        Self::new(raw.tensor, raw.pipeline, raw.expert, raw.data).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ParallelTopology {
@@ -183,5 +201,13 @@ mod tests {
             vec![5, 7]
         );
         assert!(topology.coordinates(8).is_err());
+    }
+
+    #[test]
+    fn deserialization_cannot_bypass_topology_validation() {
+        assert!(serde_json::from_str::<ParallelTopology>(
+            r#"{"tensor":0,"pipeline":1,"expert":1,"data":1}"#
+        )
+        .is_err());
     }
 }

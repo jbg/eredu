@@ -28,13 +28,24 @@ use crate::runtime::{
 use crate::{
     core::{
         residency::{MemoryTier, OffloadConfig, TransferDirection},
-        MtpStats,
+        BackendId, DevicePlan, DraftingPlan, ExecutionPlan, ExpertCachePlan, MtpStats,
+        ResidencyPlan, WeightTransformationPlan,
     },
     error::Error,
 };
 
 /// Schema version shared by automatic-planning and telemetry documents.
-pub const AUTOMATIC_SCHEMA_VERSION: u32 = 1;
+pub const AUTOMATIC_SCHEMA_VERSION: u32 = crate::core::EXECUTION_PLAN_SCHEMA_VERSION;
+
+fn mlx_backend_id() -> BackendId {
+    BackendId::new("mlx").expect("the MLX backend identifier is valid")
+}
+
+#[cfg(test)]
+fn mlx_device_plan(family: &str, index: usize) -> DevicePlan {
+    DevicePlan::new("mlx", format!("{family}:{index}"))
+        .expect("MLX device identifiers are non-empty")
+}
 
 /// Confidence attached to an observed or derived value.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -188,23 +199,13 @@ impl ModelResourceProfile {
     }
 }
 
-/// Execution backend represented in a hardware or execution plan.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendKind {
-    /// Host CPU execution.
-    Cpu,
-    /// GPU execution where the build does not identify a Metal or CUDA backend.
-    Gpu,
-    /// Apple Metal GPU execution.
-    Metal,
-    /// NVIDIA CUDA GPU execution.
-    Cuda,
-}
-
 /// One logical device visible to SafeMLX.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HardwareDeviceProfile {
+    /// Backend-stable device identifier.
+    pub id: String,
+    /// Backend-defined device family.
+    pub family: String,
     /// Process-local device index.
     pub index: usize,
     /// Total physical device capacity, if independently observable.
@@ -217,7 +218,7 @@ pub struct HardwareDeviceProfile {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HardwareBackendProfile {
     /// Backend identity.
-    pub kind: BackendKind,
+    pub backend: BackendId,
     /// Whether the runtime can execute through this backend.
     pub available: bool,
     /// Reason discovery could not establish availability.
@@ -292,16 +293,14 @@ pub fn discover_hardware() -> HardwareProfile {
         ),
     };
 
-    let mut backends = vec![HardwareBackendProfile {
-        kind: BackendKind::Cpu,
-        available: true,
-        detail: None,
-        devices: vec![HardwareDeviceProfile {
-            index: 0,
-            total_memory_bytes: physical_memory_bytes.clone(),
-            available_memory_bytes: available_memory_bytes.clone(),
-        }],
+    let mut devices = vec![HardwareDeviceProfile {
+        id: "cpu:0".into(),
+        family: "cpu".into(),
+        index: 0,
+        total_memory_bytes: physical_memory_bytes.clone(),
+        available_memory_bytes: available_memory_bytes.clone(),
     }];
+    let mut discovery_details = Vec::new();
 
     #[cfg(target_os = "macos")]
     {
@@ -324,19 +323,17 @@ pub fn discover_hardware() -> HardwareProfile {
                 ),
             )
         };
-        backends.push(HardwareBackendProfile {
-            kind: BackendKind::Metal,
-            available,
-            detail,
-            devices: available
-                .then(|| HardwareDeviceProfile {
-                    index: 0,
-                    total_memory_bytes: device_total,
-                    available_memory_bytes: device_available,
-                })
-                .into_iter()
-                .collect(),
-        });
+        if available {
+            devices.push(HardwareDeviceProfile {
+                id: "metal:0".into(),
+                family: "metal".into(),
+                index: 0,
+                total_memory_bytes: device_total,
+                available_memory_bytes: device_available,
+            });
+        } else if let Some(detail) = detail {
+            discovery_details.push(format!("Metal: {detail}"));
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -345,25 +342,29 @@ pub fn discover_hardware() -> HardwareProfile {
             Ok(available) => (available, None),
             Err(error) => (false, Some(error.to_string())),
         };
-        backends.push(HardwareBackendProfile {
-            kind: BackendKind::Cuda,
-            available,
-            detail,
-            devices: if available {
-                vec![HardwareDeviceProfile {
-                    index: 0,
-                    total_memory_bytes: Observed::unavailable(
-                        "SafeMLX does not yet expose CUDA device-memory discovery",
-                    ),
-                    available_memory_bytes: Observed::unavailable(
-                        "SafeMLX does not yet expose CUDA device-memory discovery",
-                    ),
-                }]
-            } else {
-                Vec::new()
-            },
-        });
+        if available {
+            devices.push(HardwareDeviceProfile {
+                id: "cuda:0".into(),
+                family: "cuda".into(),
+                index: 0,
+                total_memory_bytes: Observed::unavailable(
+                    "SafeMLX does not yet expose CUDA device-memory discovery",
+                ),
+                available_memory_bytes: Observed::unavailable(
+                    "SafeMLX does not yet expose CUDA device-memory discovery",
+                ),
+            });
+        } else if let Some(detail) = detail {
+            discovery_details.push(format!("CUDA: {detail}"));
+        }
     }
+
+    let backends = vec![HardwareBackendProfile {
+        backend: mlx_backend_id(),
+        available: true,
+        detail: (!discovery_details.is_empty()).then(|| discovery_details.join("; ")),
+        devices,
+    }];
 
     HardwareProfile {
         schema_version: AUTOMATIC_SCHEMA_VERSION,
@@ -374,183 +375,6 @@ pub fn discover_hardware() -> HardwareProfile {
         available_memory_bytes,
         physical_memory_semantics: semantics,
         backends,
-    }
-}
-
-/// Process-local device selected by an execution plan.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DevicePlan {
-    /// Execution backend.
-    pub backend: BackendKind,
-    /// Process-local device index.
-    pub index: usize,
-}
-
-/// Cartesian parallel topology selected by a plan.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ParallelismPlan {
-    /// Tensor-parallel rank count.
-    pub tensor: usize,
-    /// Pipeline-parallel rank count.
-    pub pipeline: usize,
-    /// Expert-parallel rank count.
-    pub expert: usize,
-}
-
-impl Default for ParallelismPlan {
-    fn default() -> Self {
-        Self {
-            tensor: 1,
-            pipeline: 1,
-            expert: 1,
-        }
-    }
-}
-
-/// Static weight placement selected by an execution plan.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum ResidencyPlan {
-    /// Retain all selected weights on the execution device.
-    FullyResident,
-    /// Retain repeated groups on the host and promote a bounded device window.
-    LayerwiseHost {
-        /// Maximum repeated groups resident on the device.
-        device_layer_window: usize,
-        /// Logical device parameter budget.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        device_budget_bytes: Option<u64>,
-        /// Charged host-transfer budget.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        host_budget_bytes: Option<u64>,
-    },
-    /// Stream repeated groups through disk, host, and device caches.
-    DenseDiskStream {
-        /// Finite logical device budget.
-        device_budget_bytes: u64,
-        /// Finite charged host budget.
-        host_budget_bytes: u64,
-        /// Protected host lookahead.
-        host_lookahead: usize,
-        /// Background materialization queue capacity.
-        background_queue: usize,
-    },
-}
-
-/// Optional independent routed-expert cache selected by a plan.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ExpertCachePlan {
-    /// Logical device expert-cache budget.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_budget_bytes: Option<u64>,
-    /// Charged host expert-cache budget.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host_budget_bytes: Option<u64>,
-    /// Hard compact-bank scratch bound.
-    pub scratch_bytes: u64,
-    /// Soft prefill compact-bank target.
-    pub prefill_bank_bytes: u64,
-}
-
-/// Speculative decoding selected by an execution plan.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum DraftingPlan {
-    /// Ordinary target-only decoding.
-    Disabled,
-    /// Use checkpoint-embedded prediction heads.
-    Embedded {
-        /// Maximum proposals per verification round.
-        max_draft_tokens: usize,
-        /// Whether same-request optimistic lookahead is enabled.
-        lookahead: bool,
-        /// Whether deterministic adaptive lookahead is enabled.
-        adaptive_lookahead: bool,
-    },
-    /// Use an explicitly supplied external assistant.
-    External {
-        /// Assistant artifact path or identifier.
-        model: String,
-        /// Stream/device placement used for assistant execution.
-        placement: DraftPlacementPlan,
-        /// Maximum proposals per verification round.
-        max_draft_tokens: usize,
-        /// Whether same-request optimistic lookahead is enabled.
-        lookahead: bool,
-        /// Whether deterministic adaptive lookahead is enabled.
-        adaptive_lookahead: bool,
-    },
-}
-
-/// External assistant placement selected by an execution plan.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum DraftPlacementPlan {
-    /// Reuse the target execution stream.
-    Target,
-    /// Create a distinct stream on an explicit device.
-    Device {
-        /// Explicit process-local assistant device.
-        device: DevicePlan,
-    },
-}
-
-/// Optional load-time transformation applied to checkpoint weights.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum WeightTransformationPlan {
-    /// Preserve checkpoint-native weight encodings.
-    PreserveCheckpoint,
-    /// Convert eligible weights to grouped affine quantization while loading.
-    Affine {
-        /// Quantized bits per weight.
-        bits: i32,
-        /// Adjacent weights sharing quantization parameters.
-        group_size: i32,
-    },
-    /// Convert eligible weights to MXFP4 while loading.
-    MxFp4,
-}
-
-/// A concrete, serializable set of runtime execution choices.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ExecutionPlan {
-    /// Version of this serialized plan schema.
-    pub schema_version: u32,
-    /// Main process-local execution device.
-    pub device: DevicePlan,
-    /// Distributed topology shape.
-    pub parallelism: ParallelismPlan,
-    /// Ordinary static-weight placement.
-    pub residency: ResidencyPlan,
-    /// Optional transformation applied while checkpoint weights are loaded.
-    pub weight_transformation: WeightTransformationPlan,
-    /// Maximum number of checkpoint shards or readers retained simultaneously.
-    pub max_mapped_shards: usize,
-    /// Independent routed-expert cache, when enabled.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expert_cache: Option<ExpertCachePlan>,
-    /// Speculative decoding configuration.
-    pub drafting: DraftingPlan,
-    /// Process-global allocator-cache limit.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mlx_cache_limit_bytes: Option<u64>,
-}
-
-impl ExecutionPlan {
-    /// Creates the minimal fully-resident, target-only plan for one device.
-    pub fn fully_resident(device: DevicePlan) -> Self {
-        Self {
-            schema_version: AUTOMATIC_SCHEMA_VERSION,
-            device,
-            parallelism: ParallelismPlan::default(),
-            residency: ResidencyPlan::FullyResident,
-            weight_transformation: WeightTransformationPlan::PreserveCheckpoint,
-            max_mapped_shards: crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
-            expert_cache: None,
-            drafting: DraftingPlan::Disabled,
-            mlx_cache_limit_bytes: None,
-        }
     }
 }
 
@@ -639,7 +463,7 @@ impl Default for AutomaticPlannerPolicy {
             memory_headroom_percent: 30,
             expert_cache_share_percent: 40,
             device_layer_window: 1,
-            max_mapped_shards: crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
+            max_mapped_shards: crate::core::DEFAULT_MAX_MAPPED_SHARDS,
             embedded_mtp_draft_tokens: 3,
             minimum_feedback_tokens: 1,
         }
@@ -734,10 +558,7 @@ pub fn execution_plan_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOpti
             plan.schema_version, AUTOMATIC_SCHEMA_VERSION
         )));
     }
-    if plan.parallelism.tensor != 1
-        || plan.parallelism.pipeline != 1
-        || plan.parallelism.expert != 1
-    {
+    if plan.topology.world_size() != 1 {
         return Err(Error::AutomaticPlanning(
             "single-device automatic plans require a 1x1x1 parallel topology".into(),
         ));
@@ -1113,16 +934,38 @@ struct AutomaticBoundedRequirement {
     depth: usize,
 }
 
-fn automatic_probe_device(device: DevicePlan) -> Result<Device, Error> {
-    let index = i32::try_from(device.index).map_err(|_| {
+fn automatic_probe_device(device: &DevicePlan) -> Result<Device, Error> {
+    if device.backend.as_str() != "mlx" {
+        return Err(Error::AutomaticPlanning(format!(
+            "MLX automatic planning cannot probe backend {}",
+            device.backend
+        )));
+    }
+    let (family, index) = device.device.split_once(':').ok_or_else(|| {
         Error::AutomaticPlanning(format!(
-            "automatic device index {} exceeds the MLX device-index range",
-            device.index
+            "MLX device identifier {:?} must use family:index syntax",
+            device.device
         ))
     })?;
-    let kind = match device.backend {
-        BackendKind::Cpu => DeviceType::Cpu,
-        BackendKind::Metal | BackendKind::Cuda | BackendKind::Gpu => DeviceType::Gpu,
+    let index = index.parse::<usize>().map_err(|_| {
+        Error::AutomaticPlanning(format!(
+            "MLX device identifier {:?} has an invalid index",
+            device.device
+        ))
+    })?;
+    let index = i32::try_from(index).map_err(|_| {
+        Error::AutomaticPlanning(format!(
+            "automatic device index {index} exceeds the MLX device-index range"
+        ))
+    })?;
+    let kind = match family {
+        "cpu" => DeviceType::Cpu,
+        "metal" | "cuda" | "gpu" => DeviceType::Gpu,
+        other => {
+            return Err(Error::AutomaticPlanning(format!(
+                "MLX automatic planning does not recognize device family {other:?}"
+            )))
+        }
     };
     Ok(Device::new(kind, index))
 }
@@ -1148,7 +991,7 @@ fn probe_automatic_bounded_requirement(
             ));
         }
     }
-    let stream = Stream::new_with_device(&automatic_probe_device(probe.device)?);
+    let stream = Stream::new_with_device(&automatic_probe_device(&probe.device)?);
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     match load_model_with_options(
         model_path,
@@ -1207,36 +1050,36 @@ fn apply_automatic_bounded_requirement(
     }
 }
 
-fn selected_device_profile(
-    hardware: &HardwareProfile,
-    device: DevicePlan,
-) -> Option<&HardwareDeviceProfile> {
+fn selected_device_profile<'a>(
+    hardware: &'a HardwareProfile,
+    device: &DevicePlan,
+) -> Option<&'a HardwareDeviceProfile> {
     hardware
         .backends
         .iter()
-        .find(|backend| backend.kind == device.backend && backend.available)
+        .find(|backend| backend.backend == device.backend && backend.available)
         .and_then(|backend| {
             backend
                 .devices
                 .iter()
-                .find(|candidate| candidate.index == device.index)
+                .find(|candidate| candidate.id == device.device)
         })
 }
 
-fn validate_automatic_device(hardware: &HardwareProfile, device: DevicePlan) -> Result<(), Error> {
+fn validate_automatic_device(hardware: &HardwareProfile, device: &DevicePlan) -> Result<(), Error> {
     let backend = hardware
         .backends
         .iter()
-        .find(|backend| backend.kind == device.backend)
+        .find(|backend| backend.backend == device.backend)
         .ok_or_else(|| {
             Error::AutomaticPlanning(format!(
-                "hardware discovery did not report the selected {:?} backend",
+                "hardware discovery did not report the selected {} backend",
                 device.backend
             ))
         })?;
     if !backend.available {
         return Err(Error::AutomaticPlanning(format!(
-            "selected {:?} backend is unavailable: {}",
+            "selected {} backend is unavailable: {}",
             device.backend,
             backend.detail.as_deref().unwrap_or("no detail reported")
         )));
@@ -1244,11 +1087,11 @@ fn validate_automatic_device(hardware: &HardwareProfile, device: DevicePlan) -> 
     if !backend
         .devices
         .iter()
-        .any(|candidate| candidate.index == device.index)
+        .any(|candidate| candidate.id == device.device)
     {
         return Err(Error::AutomaticPlanning(format!(
-            "hardware discovery did not report {:?} device index {}",
-            device.backend, device.index
+            "hardware discovery did not report {} device {}",
+            device.backend, device.device
         )));
     }
     Ok(())
@@ -1428,7 +1271,7 @@ fn automatic_plan_resource_admitted(
     plan: &ExecutionPlan,
     policy: &AutomaticPlannerPolicy,
 ) -> bool {
-    let selected_device = selected_device_profile(hardware, plan.device);
+    let selected_device = selected_device_profile(hardware, &plan.device);
     let observed_device =
         selected_device.and_then(|device| automatic_observed_u64(&device.available_memory_bytes));
     let observed_host = automatic_observed_u64(&hardware.available_memory_bytes);
@@ -1513,16 +1356,14 @@ fn automatic_telemetry_matches(
     };
     if plan.schema_version != AUTOMATIC_SCHEMA_VERSION
         || plan.device != device
-        || plan.parallelism.tensor != 1
-        || plan.parallelism.pipeline != 1
-        || plan.parallelism.expert != 1
+        || plan.topology.world_size() != 1
         || matches!(plan.drafting, DraftingPlan::External { .. })
     {
         return false;
     }
-    let current_total = selected_device_profile(hardware, device)
+    let current_total = selected_device_profile(hardware, &device)
         .and_then(|item| automatic_observed_u64(&item.total_memory_bytes));
-    let prior_total = selected_device_profile(prior_hardware, device)
+    let prior_total = selected_device_profile(prior_hardware, &device)
         .and_then(|item| automatic_observed_u64(&item.total_memory_bytes));
     canonical_path(&prior_resources.path) == canonical_path(&resources.path)
         && prior_resources.artifact_kind == resources.artifact_kind
@@ -1579,7 +1420,7 @@ fn automatic_feedback_plan(
             telemetry,
             hardware,
             resources,
-            request.device,
+            request.device.clone(),
             policy.minimum_feedback_tokens,
         ) {
             continue;
@@ -1634,10 +1475,10 @@ fn plan_automatic_execution_with_policy(
     }
     validate_automatic_policy(policy)?;
     let hardware = discover_hardware();
-    validate_automatic_device(&hardware, request.device)?;
+    validate_automatic_device(&hardware, &request.device)?;
     let mut resources =
         inspect_model(&request.model_path, ModelInspectionOptions::default())?.resources;
-    let selected_device = selected_device_profile(&hardware, request.device);
+    let selected_device = selected_device_profile(&hardware, &request.device);
     let device_available =
         selected_device.and_then(|device| automatic_observed_u64(&device.available_memory_bytes));
     let host_available = automatic_observed_u64(&hardware.available_memory_bytes);
@@ -1666,7 +1507,8 @@ fn plan_automatic_execution_with_policy(
         policy.memory_headroom_percent,
     );
     let model_bytes = automatic_model_bytes(&resources);
-    let candidates = automatic_base_candidates(request.device, device_budget, host_budget, policy);
+    let candidates =
+        automatic_base_candidates(request.device.clone(), device_budget, host_budget, policy);
     let resident = inspect_automatic_candidate(&request.model_path, &candidates[0])?;
     let mut layerwise = inspect_automatic_candidate(&request.model_path, &candidates[1])?;
     let mut disk = inspect_automatic_candidate(&request.model_path, &candidates[2])?;
@@ -1674,8 +1516,8 @@ fn plan_automatic_execution_with_policy(
         level: PlanExplanationLevel::Decision,
         code: "single_device_scope".into(),
         detail: format!(
-            "automatic planning is restricted to {:?}:{} with {}% memory headroom",
-            request.device.backend, request.device.index, policy.memory_headroom_percent
+            "automatic planning is restricted to {}:{} with {}% memory headroom",
+            request.device.backend, request.device.device, policy.memory_headroom_percent
         ),
     }];
     let resident_fits = match model_bytes {
@@ -2044,10 +1886,7 @@ mod tests {
         path: PathBuf,
     ) -> (HardwareProfile, ModelResourceProfile, ExecutionTelemetry) {
         let hardware = discover_hardware();
-        let device = DevicePlan {
-            backend: BackendKind::Cpu,
-            index: 0,
-        };
+        let device = mlx_device_plan("cpu", 0);
         let mut resources = ModelResourceProfile::empty(path, ArtifactKind::SafeTensorsDirectory);
         resources.model_kind = Some(ModelKind::Llama);
         resources.architecture = Some("llama".into());
@@ -2092,10 +1931,7 @@ mod tests {
 
     #[test]
     fn execution_plan_round_trips_through_json() {
-        let plan = ExecutionPlan::fully_resident(DevicePlan {
-            backend: BackendKind::Metal,
-            index: 0,
-        });
+        let plan = ExecutionPlan::fully_resident(mlx_device_plan("metal", 0));
         let json = serde_json::to_string(&plan).unwrap();
         assert_eq!(serde_json::from_str::<ExecutionPlan>(&json).unwrap(), plan);
     }
@@ -2116,10 +1952,11 @@ mod tests {
     #[test]
     fn hardware_discovery_always_reports_cpu() {
         let profile = discover_hardware();
-        assert!(profile
-            .backends
-            .iter()
-            .any(|backend| backend.kind == BackendKind::Cpu && backend.available));
+        assert!(profile.backends.iter().any(|backend| {
+            backend.backend == mlx_backend_id()
+                && backend.available
+                && backend.devices.iter().any(|device| device.id == "cpu:0")
+        }));
     }
 
     #[test]
@@ -2179,14 +2016,8 @@ mod tests {
     #[test]
     fn automatic_request_and_policy_are_stable_json_documents() {
         let (_, _, telemetry) = feedback_fixture("model".into());
-        let request = AutomaticPlanRequest::new(
-            "model",
-            DevicePlan {
-                backend: BackendKind::Cpu,
-                index: 0,
-            },
-        )
-        .with_prior_telemetry([telemetry]);
+        let request = AutomaticPlanRequest::new("model", mlx_device_plan("cpu", 0))
+            .with_prior_telemetry([telemetry]);
         let request_json = serde_json::to_string(&request).unwrap();
         assert_eq!(
             serde_json::from_str::<AutomaticPlanRequest>(&request_json).unwrap(),
@@ -2203,12 +2034,9 @@ mod tests {
 
     #[test]
     fn execution_plan_loader_conversion_rejects_non_singleton_topology() {
-        let mut plan = ExecutionPlan::fully_resident(DevicePlan {
-            backend: BackendKind::Cpu,
-            index: 0,
-        });
+        let mut plan = ExecutionPlan::fully_resident(mlx_device_plan("cpu", 0));
         assert!(execution_plan_load_options(&plan).is_ok());
-        plan.parallelism.tensor = 2;
+        plan.topology = crate::core::topology::ParallelTopology::new(2, 1, 1, 1).unwrap();
         assert!(matches!(
             execution_plan_load_options(&plan),
             Err(Error::AutomaticPlanning(_))
@@ -2219,12 +2047,13 @@ mod tests {
     fn prior_telemetry_requires_matching_model_and_hardware_identity() {
         let path = std::env::temp_dir().join("safemlx-automatic-feedback-fixture");
         let (hardware, resources, mut telemetry) = feedback_fixture(path.clone());
-        let device = DevicePlan {
-            backend: BackendKind::Cpu,
-            index: 0,
-        };
+        let device = mlx_device_plan("cpu", 0);
         assert!(automatic_telemetry_matches(
-            &telemetry, &hardware, &resources, device, 1
+            &telemetry,
+            &hardware,
+            &resources,
+            device.clone(),
+            1
         ));
         telemetry.resources.as_mut().unwrap().path = path.join("different");
         assert!(!automatic_telemetry_matches(

@@ -27,14 +27,12 @@ use safemlx::{
     transforms::async_eval_with_event,
     Array, Event, Stream,
 };
+use safemlx_lm_core::DEFAULT_MAX_MAPPED_SHARDS;
 use safetensors::{
     tensor::{Dtype, Metadata, TensorInfo, TensorView},
     SafeTensors,
 };
 use serde::{de::MapAccess, Deserialize, Deserializer};
-
-/// Default maximum number of simultaneously mapped payload shards.
-pub const DEFAULT_MAX_MAPPED_SHARDS: usize = 4;
 
 /// Backend-neutral description of a checkpoint's stored scalar encoding.
 #[derive(Debug, Clone, Eq, PartialEq)]
