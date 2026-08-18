@@ -816,6 +816,42 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         },
     );
 
+    let capabilities = model.capabilities().unwrap();
+    assert_eq!(capabilities.model_type, "qwen3_5_text");
+    let prompt = <crate::backend::mlx::MlxBackend<'static> as safemlx_lm_core::TextGenerationBackend>::prepare_text_prompt(
+        model.runtime().backend(),
+        vec![1, 2],
+    )
+    .unwrap();
+    let input = model.count_prepared_input(&prompt).unwrap();
+    assert_eq!(input.text_tokens, 2);
+    assert_eq!(input.model_positions, 2);
+    assert_eq!(
+        model
+            .estimate_runtime_state(input, 2, 1)
+            .unwrap()
+            .assumptions
+            .requested_positions,
+        4
+    );
+    assert!(matches!(
+        model
+            .admit(
+                safemlx_lm_core::AdmissionRequest {
+                    input,
+                    max_output_tokens: 2,
+                    batch_size: 1,
+                    safety_reserve_bytes: 0,
+                    application_memory_budget_bytes: None,
+                    require_complete_estimate: true,
+                },
+                None,
+            )
+            .unwrap(),
+        safemlx_lm_core::AdmissionResult::Admitted(_)
+    ));
+    model.static_memory().unwrap();
+
     let output = model
         .generate_prepared_chat_mtp_batch(PreparedChatMtpBatchRequest {
             drafting: PreparedChatDraft::Embedded,

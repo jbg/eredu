@@ -6,11 +6,11 @@ use safemlx::{Array, Stream};
 use safemlx_lm_core::{
     estimate_runtime_state, AvailableMemory, CacheStateStrategy, CapabilityError,
     EstimationCompleteness, GrowingState, InputModalities, InputTokenCount, ModelCapabilities,
-    ObservationKind, Observed, PhysicalMemorySemantics, RuntimeStateEstimate,
-    SlidingWindowLayerCount, StateLayout, StaticMemoryReport,
+    ModelCapabilityBackend, ModelRuntime, ObservationKind, Observed, PhysicalMemorySemantics,
+    RuntimeStateEstimate, SlidingWindowLayerCount, StateLayout, StaticMemoryReport,
 };
 
-use super::Model;
+use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
 use crate::{
     architectures::{
         deepseek_v3::model as deepseek_v3,
@@ -30,10 +30,7 @@ use crate::{
     nn::rope::FloatOrString,
     runtime::{
         attention::AttentionPolicy,
-        media::{
-            input::{self, InputPayload, Modality},
-            PreparedModelInput,
-        },
+        media::input::{self, InputPayload, Modality},
     },
 };
 
@@ -2092,14 +2089,14 @@ pub(crate) fn model_capabilities(model: &Model) -> Result<ModelCapabilities, Cap
 
 pub(crate) fn count_prepared_input(
     model: &Model,
-    prepared: &PreparedModelInput,
+    prepared: input::ModelInput<'_>,
     stream: &Stream,
 ) -> Result<InputTokenCount, CapabilityError> {
     let mut text_tokens = 0u64;
     let mut media_positions = 0u64;
     let mut media_execution_workspace_bytes = 0u64;
     let mut media_execution_workspace_kind = ObservationKind::Exact;
-    for part in prepared.input_parts() {
+    for part in prepared.parts {
         match (part.modality, part.payload) {
             (Modality::Text, InputPayload::TokenIds(tokens)) => {
                 if tokens.ndim() != 2 || tokens.dim(0) != 1 {
@@ -2182,8 +2179,10 @@ pub(crate) fn model_runtime_state(
     estimate_mlx_runtime_state(&estimate, input, max_output_tokens, batch_size)
 }
 
-pub(crate) fn static_model_memory(model: &Model) -> Result<StaticMemoryReport, CapabilityError> {
-    let residency = model
+pub(crate) fn static_model_memory(
+    session: &MlxModelSession<'_>,
+) -> Result<StaticMemoryReport, CapabilityError> {
+    let residency = session
         .residency_report()
         .map_err(|error| CapabilityError::Observation(error.to_string()))?;
     let (logical, host, device, disk, mappings) = if let Some(report) = residency {
@@ -2265,6 +2264,49 @@ pub(crate) fn static_model_memory(model: &Model) -> Result<StaticMemoryReport, C
         },
         currently_mapped_shards: mappings,
     })
+}
+
+fn complete_model<'a>(session: &'a MlxModelSession<'_>) -> Result<&'a Model, CapabilityError> {
+    session.complete_model_for_capabilities().ok_or_else(|| {
+        CapabilityError::Observation(
+            "MLX capability derivation for distributed model sessions is unavailable".into(),
+        )
+    })
+}
+
+impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
+    fn model_capabilities(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<ModelCapabilities, CapabilityError> {
+        model_capabilities(complete_model(runtime.session())?)
+    }
+
+    fn count_prepared_input(
+        runtime: &ModelRuntime<Self>,
+        prepared: &MlxModelInput,
+    ) -> Result<InputTokenCount, CapabilityError> {
+        let model = complete_model(runtime.session())?;
+        prepared
+            .with_borrowed(|input| count_prepared_input(model, input, runtime.backend().stream()))
+    }
+
+    fn estimate_runtime_state(
+        runtime: &ModelRuntime<Self>,
+        input: InputTokenCount,
+        max_output_tokens: u64,
+        batch_size: u64,
+    ) -> Result<RuntimeStateEstimate, CapabilityError> {
+        model_runtime_state(
+            complete_model(runtime.session())?,
+            input,
+            max_output_tokens,
+            batch_size,
+        )
+    }
+
+    fn static_memory(runtime: &ModelRuntime<Self>) -> Result<StaticMemoryReport, CapabilityError> {
+        static_model_memory(runtime.session())
+    }
 }
 
 #[cfg(target_os = "macos")]

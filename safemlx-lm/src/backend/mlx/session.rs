@@ -349,6 +349,13 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
+    pub(super) fn complete_model_for_capabilities(&self) -> Option<&Model> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => Some(model),
+            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => None,
+        }
+    }
+
     pub(crate) fn complete_parts_mut(&mut self) -> (&mut Model, &mut ModelCache) {
         match &mut self.inner {
             MlxSessionKind::Complete(model, cache) => (model, cache),

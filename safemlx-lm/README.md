@@ -99,6 +99,11 @@ Portable inspection and capability report types live in `safemlx-lm-core` and
 are reexported by the facade. Tensor structure and process-memory probes are
 selected-backend operations. Text sidecar and behavioral inspection composes
 above that result and is never called from the MLX adapter.
+Backends implement `ModelCapabilityBackend` against their selected
+`ModelRuntime`; generic callers then use the same `LoadedModel<B>` methods for
+capability discovery, token or prepared-input counting, runtime-state
+estimation, static-memory reporting, and admission. Prepared inputs remain the
+backend's opaque prompt type, so these methods expose no MLX arrays or streams.
 Replicated, tensor-, pipeline-, and expert-parallel prefill/decode execution
 crosses the single stateful `MlxModelSession` implementation of the core
 session contract. `load_model(&backend, artifact, options)` returns a

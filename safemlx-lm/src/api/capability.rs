@@ -1,21 +1,18 @@
-//! Facade composition of portable capability policy and MLX observations.
+//! Facade composition of portable capability policy and backend observations.
 
-use safemlx::Stream;
 use safemlx_lm_core::{
     apply_admission_policy, AdmissionRequest, AdmissionResult, AvailableMemory, CapabilityError,
-    InputTokenCount, ModelCapabilities, RuntimeStateEstimate, StaticMemoryReport,
+    InputTokenCount, ModelCapabilities, ModelCapabilityBackend, RuntimeStateEstimate,
+    StaticMemoryReport,
 };
 
 use super::LoadedModel;
-use crate::{
-    backend::mlx::{capability, MlxBackend},
-    runtime::{chat::PreparedChat, media::PreparedModelInput},
-};
+use crate::runtime::chat::PreparedChat;
 
-impl LoadedModel<MlxBackend<'static>> {
-    /// Returns architecture-independent capabilities derived from validated loaded state.
+impl<B: ModelCapabilityBackend> LoadedModel<B> {
+    /// Returns backend-independent capabilities derived from validated loaded state.
     pub fn capabilities(&self) -> Result<ModelCapabilities, CapabilityError> {
-        capability::model_capabilities(self.model())
+        B::model_capabilities(&self.runtime)
     }
 
     /// Counts an ordinary encoded prompt exactly.
@@ -47,13 +44,12 @@ impl LoadedModel<MlxBackend<'static>> {
         self.count_text(chat.rendered_prompt(), false)
     }
 
-    /// Counts text IDs and actual model positions in processor-prepared multimodal input.
+    /// Counts text IDs and actual model positions in a backend-prepared input.
     pub fn count_prepared_input(
         &self,
-        prepared: &PreparedModelInput,
-        stream: &Stream,
+        input: &B::Prompt,
     ) -> Result<InputTokenCount, CapabilityError> {
-        capability::count_prepared_input(self.model(), prepared, stream)
+        B::count_prepared_input(&self.runtime, input)
     }
 
     /// Estimates persistent request state and prepared-media execution workspace.
@@ -63,12 +59,12 @@ impl LoadedModel<MlxBackend<'static>> {
         max_output_tokens: u64,
         batch_size: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError> {
-        capability::model_runtime_state(self.model(), input, max_output_tokens, batch_size)
+        B::estimate_runtime_state(&self.runtime, input, max_output_tokens, batch_size)
     }
 
-    /// Reports logical checkpoint/residency accounting and MLX allocator observations.
+    /// Reports logical checkpoint/residency accounting and backend allocator observations.
     pub fn static_memory(&self) -> Result<StaticMemoryReport, CapabilityError> {
-        capability::static_model_memory(self.model())
+        B::static_memory(&self.runtime)
     }
 
     /// Applies portable context and memory policy without allocating a model cache.

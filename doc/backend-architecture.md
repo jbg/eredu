@@ -430,19 +430,27 @@ the neutral plan.
 
 Capability and inspection follow the same direction. Core owns `Observed`,
 `ModelCapabilities`, `StateLayout`, `RuntimeStateEstimate`, admission policy,
-and `ModelInspectionReport`. `backend::mlx::capability` maps validated MLX model
-configuration and prepared MLX media shapes into those values, fixes the
-current MLX cache scalar width, and supplies native allocator/memory
-observations. The facade composes portable token counting and admission policy
-over those adapter functions; the backend never implements methods on or
-imports the facade `LoadedModel` type. `backend::mlx::inspection` performs MLX
-loader binding, tensor-catalog validation, quantization/residency admission,
-and MLX media-companion checks. `MlxInspectionOptions` and structural
-`inspect_model` therefore live under the selected backend. The facade's
-`inspect_text_model` step enriches the same core report with tokenizer,
-chat-template, EOS, semantic-streaming, and native-tool readiness. A second
-backend reuses that text step and the core reports and policies while providing
-its own structural derivation and admission implementation.
+and `ModelInspectionReport`. Core's `ModelCapabilityBackend` extension binds
+capability discovery, prepared-input counting, runtime-state estimation, and
+static-memory observation to the selected `ModelRuntime<B>`. Its signatures
+contain only portable reports and the backend's existing opaque prompt type;
+native tensors, streams, allocators, and caches never enter the facade API.
+Consequently the same `LoadedModel<B>` methods perform token counting,
+estimation, memory reporting, and admission for every implementing backend.
+
+`backend::mlx::capability` maps validated MLX model configuration and prepared
+MLX media shapes into the portable values, fixes the current MLX cache scalar
+width, and supplies native allocator/memory observations from the selected MLX
+session. Distributed session shapes for which MLX cannot yet derive a complete
+capability document fail closed rather than manufacturing partial facts.
+`backend::mlx::inspection` performs MLX loader binding, tensor-catalog
+validation, quantization/residency admission, and MLX media-companion checks.
+`MlxInspectionOptions` and structural `inspect_model` therefore live under the
+selected backend. The facade's `inspect_text_model` step enriches the same core
+report with tokenizer, chat-template, EOS, semantic-streaming, and native-tool
+readiness. A second backend reuses that text step and the core reports and
+policies while providing its own structural derivation and admission
+implementation.
 
 Telemetry follows the same layering: MLX converts concrete residency and
 expert-cache snapshots into core telemetry documents, while the caller or

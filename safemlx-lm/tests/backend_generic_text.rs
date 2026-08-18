@@ -1,4 +1,7 @@
-use std::{io::Write, num::NonZeroUsize};
+use std::{
+    io::Write,
+    num::{NonZeroU8, NonZeroUsize},
+};
 
 use safemlx_lm::{
     api::{
@@ -10,9 +13,12 @@ use safemlx_lm::{
         PreparedChatSpeculativeBackend,
     },
     core::{MtpSchedulerStats, MtpStats},
-    Backend, BackendCapabilities, BackendDescriptor, BackendSession, DeviceDescriptor,
-    FinishReason, GenerationConfigOverrides, ModelLoadingBackend, ModelRuntime, MtpCapability,
-    MtpCheckpointKind, PreparedModel, SemanticEvent, Submission, TextGenerationBackend,
+    AdmissionRequest, AdmissionResult, Backend, BackendCapabilities, BackendDescriptor,
+    BackendSession, CacheStateStrategy, CapabilityError, DeviceDescriptor, EstimationCompleteness,
+    FinishReason, GenerationConfigOverrides, GrowingState, InputModalities, InputTokenCount,
+    ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend, ModelRuntime, MtpCapability,
+    MtpCheckpointKind, Observed, PhysicalMemorySemantics, PreparedModel, RuntimeStateEstimate,
+    SemanticEvent, StateLayout, StaticMemoryReport, Submission, TextGenerationBackend,
     TextGenerationConfig, TokenFilter, TokenOutput,
 };
 use safemlx_lm_core::Completion;
@@ -169,6 +175,65 @@ impl TextGenerationBackend for MockBackend {
     }
 }
 
+impl ModelCapabilityBackend for MockBackend {
+    fn model_capabilities(_: &ModelRuntime<Self>) -> Result<ModelCapabilities, CapabilityError> {
+        Ok(ModelCapabilities {
+            model_type: "llama".into(),
+            native_max_context: Observed::exact(32, "mock configuration"),
+            effective_max_context: Observed::exact(32, "mock configuration"),
+            state_strategy: CacheStateStrategy::FullKv,
+            modalities: InputModalities::TEXT,
+            estimation: EstimationCompleteness::Complete,
+        })
+    }
+
+    fn count_prepared_input(
+        _: &ModelRuntime<Self>,
+        input: &Self::Prompt,
+    ) -> Result<InputTokenCount, CapabilityError> {
+        Ok(InputTokenCount::text(input.len() as u64))
+    }
+
+    fn estimate_runtime_state(
+        _: &ModelRuntime<Self>,
+        input: InputTokenCount,
+        max_output_tokens: u64,
+        batch_size: u64,
+    ) -> Result<RuntimeStateEstimate, CapabilityError> {
+        safemlx_lm::core::estimate_runtime_state(
+            &StateLayout {
+                fixed_scalars_per_batch: 0,
+                growing: vec![GrowingState {
+                    layers: 1,
+                    scalars_per_position: 2,
+                    window: None,
+                }],
+                hidden_size: 1,
+                allocation_granularity: 1,
+                completeness: EstimationCompleteness::Complete,
+            },
+            input,
+            max_output_tokens,
+            batch_size,
+            NonZeroU8::new(4).unwrap(),
+        )
+    }
+
+    fn static_memory(_: &ModelRuntime<Self>) -> Result<StaticMemoryReport, CapabilityError> {
+        let unavailable = || Observed::unavailable("mock counter is unavailable");
+        Ok(StaticMemoryReport {
+            logical_parameter_bytes: Observed::exact(128, "mock model"),
+            current_host_resident_bytes: unavailable(),
+            current_device_resident_bytes: unavailable(),
+            planned_disk_backed_bytes: unavailable(),
+            backend_active_allocation_bytes: unavailable(),
+            backend_allocator_cache_bytes: unavailable(),
+            physical_semantics: PhysicalMemorySemantics::Unknown,
+            currently_mapped_shards: unavailable(),
+        })
+    }
+}
+
 impl ModelLoadingBackend for MockBackend {
     type LoadOptions = ();
 
@@ -283,6 +348,43 @@ fn client_code<B: TextGenerationBackend>(model: &mut LoadedModel<B>) -> Vec<u32>
         .collect()
 }
 
+fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, prepared: &B::Prompt) {
+    let capabilities = model.capabilities().unwrap();
+    assert_eq!(capabilities.model_type, model.model_type());
+    assert_eq!(model.count_token_ids(&[1, 2]).unwrap().model_positions, 2);
+    assert_eq!(model.count_text("hello", false).unwrap().text_tokens, 1);
+    let input = model.count_prepared_input(prepared).unwrap();
+    let state = model.estimate_runtime_state(input, 3, 1).unwrap();
+    assert_eq!(
+        state.assumptions.requested_positions,
+        input.model_positions + 3
+    );
+    assert_eq!(
+        model
+            .static_memory()
+            .unwrap()
+            .logical_parameter_bytes
+            .value(),
+        Some(&128)
+    );
+    assert!(matches!(
+        model
+            .admit(
+                AdmissionRequest {
+                    input,
+                    max_output_tokens: 3,
+                    batch_size: 1,
+                    safety_reserve_bytes: 0,
+                    application_memory_budget_bytes: None,
+                    require_complete_estimate: true,
+                },
+                None,
+            )
+            .unwrap(),
+        AdmissionResult::Admitted(_)
+    ));
+}
+
 fn speculative_client_code<B: PreparedChatSpeculativeBackend>(
     model: &mut LoadedModel<B>,
     prepared: &PreparedChat,
@@ -364,6 +466,7 @@ fn downstream_loader_selects_the_backend_without_backend_specific_arguments() {
 
     assert_eq!(model.model_type(), "llama");
     assert_eq!(model.eos_token_ids(), &[0]);
+    capability_client_code(&model, &vec![1, 2, 3]);
     assert_eq!(client_code(&mut model), vec![1, 2, 3]);
 }
 
@@ -437,6 +540,13 @@ fn prepared_chat_constraints_and_semantics_use_the_same_generic_client_api() {
             ..Default::default()
         })
         .unwrap();
+    assert!(
+        model
+            .count_prepared_chat(&prepared)
+            .unwrap()
+            .model_positions
+            > 0
+    );
     let mut events = Vec::new();
     let output = model
         .generate_prepared_chat(PreparedChatGenerationRequest {

@@ -8,6 +8,10 @@ use crate::{
         inspect_artifact, plan_model_preparation, ArtifactError, ArtifactInspection,
         ModelPreparationPlan, PreparationPolicy,
     },
+    capability::{
+        CapabilityError, InputTokenCount, ModelCapabilities, RuntimeStateEstimate,
+        StaticMemoryReport,
+    },
     checkpoint::TensorDtype,
     generation::ResolvedGenerationConfig,
     topology::{ParallelAxis, ParallelTopology},
@@ -625,6 +629,36 @@ pub trait TextGenerationBackend: Backend {
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error>;
 }
 
+/// Capability and resource observations for one selected text-model session.
+///
+/// Implementations inspect the opaque model and cache already owned by
+/// [`ModelRuntime`]. The contract exposes only portable documents and the
+/// backend's existing opaque prompt type; tensor, stream, allocator, and
+/// executable types remain inside the adapter.
+pub trait ModelCapabilityBackend: TextGenerationBackend {
+    /// Reports validated model capabilities for the selected session.
+    fn model_capabilities(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<ModelCapabilities, CapabilityError>;
+
+    /// Counts text and backend-specific model positions in a prepared prompt.
+    fn count_prepared_input(
+        runtime: &ModelRuntime<Self>,
+        input: &Self::Prompt,
+    ) -> Result<InputTokenCount, CapabilityError>;
+
+    /// Estimates persistent and transient request state for this session.
+    fn estimate_runtime_state(
+        runtime: &ModelRuntime<Self>,
+        input: InputTokenCount,
+        max_output_tokens: u64,
+        batch_size: u64,
+    ) -> Result<RuntimeStateEstimate, CapabilityError>;
+
+    /// Reports static model storage and current backend memory observations.
+    fn static_memory(runtime: &ModelRuntime<Self>) -> Result<StaticMemoryReport, CapabilityError>;
+}
+
 enum TextGenerationStep<P, T> {
     Prefill(P),
     Decode(T),
@@ -1204,6 +1238,72 @@ mod tests {
         }
     }
 
+    impl ModelCapabilityBackend for Mock {
+        fn model_capabilities(
+            _: &ModelRuntime<Self>,
+        ) -> Result<ModelCapabilities, CapabilityError> {
+            Ok(ModelCapabilities {
+                model_type: "mock".into(),
+                native_max_context: crate::Observed::exact(64, "mock configuration"),
+                effective_max_context: crate::Observed::exact(64, "mock configuration"),
+                state_strategy: crate::CacheStateStrategy::FullKv,
+                modalities: crate::InputModalities::TEXT,
+                estimation: crate::EstimationCompleteness::Complete,
+            })
+        }
+
+        fn count_prepared_input(
+            _: &ModelRuntime<Self>,
+            input: &Self::Prompt,
+        ) -> Result<InputTokenCount, CapabilityError> {
+            Ok(InputTokenCount::text(input.len() as u64))
+        }
+
+        fn estimate_runtime_state(
+            _: &ModelRuntime<Self>,
+            input: InputTokenCount,
+            max_output_tokens: u64,
+            batch_size: u64,
+        ) -> Result<RuntimeStateEstimate, CapabilityError> {
+            crate::estimate_runtime_state(
+                &crate::StateLayout {
+                    fixed_scalars_per_batch: 0,
+                    growing: vec![crate::GrowingState {
+                        layers: 1,
+                        scalars_per_position: 2,
+                        window: None,
+                    }],
+                    hidden_size: 1,
+                    allocation_granularity: 1,
+                    completeness: crate::EstimationCompleteness::Complete,
+                },
+                input,
+                max_output_tokens,
+                batch_size,
+                std::num::NonZeroU8::new(4).unwrap(),
+            )
+        }
+
+        fn static_memory(
+            runtime: &ModelRuntime<Self>,
+        ) -> Result<StaticMemoryReport, CapabilityError> {
+            let unavailable = || crate::Observed::unavailable("mock does not expose this counter");
+            Ok(StaticMemoryReport {
+                logical_parameter_bytes: crate::Observed::exact(
+                    u64::from(runtime.session().model),
+                    "mock model",
+                ),
+                current_host_resident_bytes: unavailable(),
+                current_device_resident_bytes: unavailable(),
+                planned_disk_backed_bytes: unavailable(),
+                backend_active_allocation_bytes: unavailable(),
+                backend_allocator_cache_bytes: unavailable(),
+                physical_semantics: crate::PhysicalMemorySemantics::Unknown,
+                currently_mapped_shards: unavailable(),
+            })
+        }
+    }
+
     fn apply_mock_filter(candidate: u32, filter: &TokenFilter) -> u32 {
         let Some(allowed) = filter.allowed_mask() else {
             return candidate;
@@ -1296,6 +1396,24 @@ mod tests {
         assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 13);
         assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 14);
         assert!(generation.next().is_none());
+    }
+
+    #[test]
+    fn model_capability_extension_observes_the_selected_mock_session() {
+        let runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let capabilities = Mock::model_capabilities(&runtime).unwrap();
+        assert_eq!(capabilities.model_type, "mock");
+        let input = Mock::count_prepared_input(&runtime, &vec![1, 2, 3]).unwrap();
+        assert_eq!(input.model_positions, 3);
+        let state = Mock::estimate_runtime_state(&runtime, input, 2, 1).unwrap();
+        assert_eq!(state.requested_state_bytes, 5 * 2 * 4);
+        assert_eq!(
+            Mock::static_memory(&runtime)
+                .unwrap()
+                .logical_parameter_bytes
+                .value(),
+            Some(&10)
+        );
     }
 
     #[test]
