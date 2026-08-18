@@ -13,6 +13,8 @@ mod family;
 /// MLX artifact admission and structural compatibility inspection.
 pub mod inspection;
 mod loading;
+#[cfg(feature = "media-processing")]
+mod media;
 mod model;
 /// Realtime Moshi/PersonaPlex session execution.
 pub mod realtime;

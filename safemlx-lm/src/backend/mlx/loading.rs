@@ -848,16 +848,19 @@ fn materialize_gguf_artifact(
             GgufArchitecture::Inkling if inkling::open_sibling_mmproj(&path)?.is_some() => {
                 Some(ModelProcessor::load_inkling_gguf(&metadata)?)
             }
+            #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
             GgufArchitecture::Gemma4 => gemma4::open_sibling_mmproj(&path)?
                 .as_ref()
                 .map(|mmproj| ModelProcessor::load_gemma4_gguf(&metadata, &mmproj.metadata))
                 .transpose()?,
+            #[cfg(feature = "image-processing")]
             GgufArchitecture::MuseGlimmer => {
                 crate::architectures::muse_glimmer::open_sibling_mmproj(&path)?
                     .as_ref()
                     .map(|mmproj| ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata))
                     .transpose()?
             }
+            #[cfg(feature = "image-processing")]
             GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe
                 if qwen3_5::open_sibling_mmproj(&path)?.is_some() =>
             {

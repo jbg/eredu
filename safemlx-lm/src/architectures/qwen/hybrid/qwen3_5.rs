@@ -9612,7 +9612,7 @@ mod tests {
         let pixels = vec![128u8; 8 * 4 * 3];
         let image = RgbImageView::packed(&pixels, 8, 4).unwrap();
         let prepared = processor
-            .prepare_input(
+            .prepare_input::<std::convert::Infallible>(
                 &[
                     ProcessorInput::TokenIds(&[7]),
                     ProcessorInput::Media(MediaInput::image_rgb8(image)),
@@ -9682,10 +9682,14 @@ mod tests {
             .map(|pixels| RgbImageView::packed(pixels, 8, 4).unwrap())
             .collect::<Vec<_>>();
         let prepared = processor
-            .prepare_input(
+            .prepare_input::<std::convert::Infallible>(
                 &[
                     ProcessorInput::TokenIds(&[7]),
-                    ProcessorInput::Media(MediaInput::video_rgb8(&frames, Some(2.0))),
+                    ProcessorInput::Media(MediaInput::video_rgb8_with_sampling(
+                        &frames,
+                        Some(2.0),
+                        crate::runtime::media::VideoSampling::ProcessorDefault,
+                    )),
                     ProcessorInput::TokenIds(&[8]),
                 ],
                 &mut |_timestamp| Ok(vec![50]),
@@ -9715,7 +9719,7 @@ mod tests {
         let pixels = vec![128u8; 480 * 320 * 3];
         let image = RgbImageView::packed(&pixels, 480, 320).unwrap();
         let prepared = processor
-            .prepare_input(
+            .prepare_input::<std::convert::Infallible>(
                 &[
                     ProcessorInput::TokenIds(&[7]),
                     ProcessorInput::Media(MediaInput::image_rgb8(image)),
@@ -9749,10 +9753,14 @@ mod tests {
         let frame = RgbImageView::packed(&video_pixels, 480, 320).unwrap();
         let frames = [frame; 4];
         let prepared_video = processor
-            .prepare_input(
+            .prepare_input::<std::convert::Infallible>(
                 &[
                     ProcessorInput::TokenIds(&[7]),
-                    ProcessorInput::Media(MediaInput::video_rgb8(&frames, Some(2.0))),
+                    ProcessorInput::Media(MediaInput::video_rgb8_with_sampling(
+                        &frames,
+                        Some(2.0),
+                        crate::runtime::media::VideoSampling::ProcessorDefault,
+                    )),
                     ProcessorInput::TokenIds(&[8]),
                 ],
                 &mut |_timestamp| Ok(vec![50]),

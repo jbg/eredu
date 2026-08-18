@@ -36,6 +36,14 @@ from backend policy and materialization failures; a backend error is not
 required to absorb `ArtifactError`. `ModelRuntime::load` combines ordinary
 loading with session creation under the same typed error boundary.
 
+Multimodal request semantics are portable. `RgbImage`, `Audio`, and `Video`
+describe validated decoded media; `MultimodalRequest` preserves exact ordered
+text/token/media composition and rendered-chat placeholder binding.
+`MultimodalPreparationBackend` lets the selected session preprocess those
+values into its existing opaque text-generation prompt while requesting any
+checkpoint-defined framing text from the facade tokenizer. Backends retain
+resizing, feature extraction, tensors, placement, and processor state.
+
 Core owns the production weight-residency policy and ownership state machine,
 not a parallel summary schema. `OffloadPlan` validates stable unit identities,
 tier assignments, budgets, prefetch depth, and eviction policy.

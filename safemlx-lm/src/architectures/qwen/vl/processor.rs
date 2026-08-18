@@ -10,7 +10,8 @@ use crate::runtime::media::video::{
 use crate::runtime::media::{
     image::{rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage, RgbImageView},
     prepared_model_input, push_text_token_ids, MediaInput, MediaPayload, OwnedInputMetadata,
-    PreparedInputPart, PreparedModelInput, ProcessorInput, VideoFrames, VideoSampling,
+    PreparedInputPart, PreparedModelInput, ProcessorInput, ProcessorPreparationError, VideoFrames,
+    VideoSampling,
 };
 use crate::{error::Error, runtime::media::input::Modality};
 
@@ -116,17 +117,14 @@ impl QwenProcessor {
         }))
     }
 
-    pub(crate) fn prepare_input(
+    pub(crate) fn prepare_input<E>(
         &self,
         input: &[ProcessorInput<'_>],
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<PreparedModelInput, Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<PreparedModelInput, ProcessorPreparationError<E>> {
         let mut parts = Vec::new();
         for item in input {
             match *item {
-                ProcessorInput::Text(text) => {
-                    push_text_token_ids(&mut parts, &encode_text(text)?);
-                }
                 ProcessorInput::TokenIds(token_ids) => {
                     push_text_token_ids(&mut parts, token_ids);
                 }
@@ -135,15 +133,15 @@ impl QwenProcessor {
                 }
             }
         }
-        prepared_model_input(parts)
+        Ok(prepared_model_input(parts)?)
     }
 
-    fn push_media_parts(
+    fn push_media_parts<E>(
         &self,
         parts: &mut Vec<PreparedInputPart>,
         item: MediaInput<'_>,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<(), Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<(), ProcessorPreparationError<E>> {
         match (item.modality, item.payload) {
             (Modality::Image, MediaPayload::Rgb8(image)) => {
                 push_text_token_ids(parts, &[self.vision_start_token_id()?]);
@@ -157,7 +155,8 @@ impl QwenProcessor {
                 return Err(Error::Processor(format!(
                     "Qwen processor does not support {} media yet",
                     modality.as_str()
-                )));
+                ))
+                .into());
             }
         }
         Ok(())
@@ -214,11 +213,11 @@ impl QwenProcessor {
         ))
     }
 
-    fn process_video(
+    fn process_video<E>(
         &self,
         video: VideoFrames<'_>,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<Vec<PreparedInputPart>, Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<Vec<PreparedInputPart>, ProcessorPreparationError<E>> {
         let config = self.video_config.as_ref().ok_or_else(|| {
             Error::Processor("Qwen model directory has no video processor config".into())
         })?;
@@ -227,7 +226,8 @@ impl QwenProcessor {
         if !source_fps.is_finite() || source_fps <= 0.0 {
             return Err(Error::Processor(format!(
                 "video source FPS must be finite and positive, got {source_fps}"
-            )));
+            ))
+            .into());
         }
         let total_frames = video.frames.len();
         let sample_count = match video.sampling {
@@ -298,7 +298,8 @@ impl QwenProcessor {
             .iter()
             .zip(frames.chunks(config.temporal_patch_size))
         {
-            let mut prefix = encode_text(&format!("<{timestamp:.1} seconds>"))?;
+            let mut prefix = encode_text(&format!("<{timestamp:.1} seconds>"))
+                .map_err(ProcessorPreparationError::Text)?;
             prefix.push(self.vision_start_token_id()?);
             push_text_token_ids(&mut parts, &prefix);
             let (patches, grid_thw) = pack_video_patches(chunk, config)?;
@@ -643,7 +644,7 @@ mod tests {
         let pixels = vec![128u8; 4 * 4 * 3];
         let image = RgbImageView::packed(&pixels, 4, 4).unwrap();
         let prepared = processor
-            .prepare_input(
+            .prepare_input::<std::convert::Infallible>(
                 &[
                     ProcessorInput::TokenIds(&[10]),
                     ProcessorInput::Media(MediaInput::image_rgb8(image)),
@@ -698,7 +699,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut timestamp_text = Vec::new();
         let prepared = processor
-            .prepare_input(
+            .prepare_input::<std::convert::Infallible>(
                 &[
                     ProcessorInput::TokenIds(&[10]),
                     ProcessorInput::Media(MediaInput::video_rgb8_with_sampling(

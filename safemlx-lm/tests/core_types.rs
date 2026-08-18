@@ -196,4 +196,12 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::ModelInspectionReport>(),
         TypeId::of::<safemlx_lm::core::inspection::ModelInspectionReport>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::MultimodalRequest>(),
+        TypeId::of::<safemlx_lm::core::media::MultimodalRequest>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::MediaBinding>(),
+        TypeId::of::<safemlx_lm::core::media::MediaBinding>(),
+    );
 }

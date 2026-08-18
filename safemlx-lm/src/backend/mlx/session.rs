@@ -195,7 +195,7 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
 impl MlxModelInput {
     /// Converts processor-owned MLX values into an opaque backend prompt.
     #[cfg(feature = "media-processing")]
-    pub fn from_prepared(input: &PreparedModelInput) -> Self {
+    pub(crate) fn from_prepared(input: &PreparedModelInput) -> Self {
         input.with_model_input(|input| Self::from(input))
     }
 
@@ -296,9 +296,8 @@ impl<'a> MlxModelSession<'a> {
         })
     }
 
-    /// Returns MLX-owned multimodal preprocessing for this selected session.
     #[cfg(feature = "media-processing")]
-    pub fn processor(&self) -> Option<&ModelProcessor> {
+    pub(crate) fn processor(&self) -> Option<&ModelProcessor> {
         self.processor.as_ref()
     }
 

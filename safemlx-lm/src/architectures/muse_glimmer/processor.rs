@@ -16,7 +16,7 @@ use crate::{
         prepared_model_input, push_text_token_ids,
         video::{pad_frame_indices, uniform_sample_indices, validate_rgb_frames},
         MediaInput, MediaPayload, OwnedInputMetadata, PreparedInputPart, PreparedModelInput,
-        ProcessorInput, VideoFrames, VideoSampling,
+        ProcessorInput, ProcessorPreparationError, VideoFrames, VideoSampling,
     },
 };
 
@@ -186,33 +186,38 @@ impl MuseGlimmerProcessor {
         })
     }
 
-    pub(crate) fn prepare_input(
+    pub(crate) fn prepare_input<E>(
         &self,
         input: &[ProcessorInput<'_>],
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<PreparedModelInput, Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<PreparedModelInput, ProcessorPreparationError<E>> {
         let mut parts = Vec::new();
         for item in input {
             match *item {
-                ProcessorInput::Text(text) => push_text_token_ids(&mut parts, &encode_text(text)?),
                 ProcessorInput::TokenIds(ids) => push_text_token_ids(&mut parts, ids),
                 ProcessorInput::Media(media) => self.push_media(&mut parts, media, encode_text)?,
             }
         }
-        prepared_model_input(parts)
+        Ok(prepared_model_input(parts)?)
     }
 
-    fn push_media(
+    fn push_media<E>(
         &self,
         parts: &mut Vec<PreparedInputPart>,
         media: MediaInput<'_>,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<(), Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<(), ProcessorPreparationError<E>> {
         match (media.modality, media.payload) {
             (Modality::Image, MediaPayload::Rgb8(image)) => {
-                push_text_token_ids(parts, &encode_text("<|image_start|>")?);
+                push_text_token_ids(
+                    parts,
+                    &encode_text("<|image_start|>").map_err(ProcessorPreparationError::Text)?,
+                );
                 parts.push(process_image(image, &self.image)?);
-                push_text_token_ids(parts, &encode_text("<|image_end|>")?);
+                push_text_token_ids(
+                    parts,
+                    &encode_text("<|image_end|>").map_err(ProcessorPreparationError::Text)?,
+                );
                 Ok(())
             }
             (Modality::Video, MediaPayload::VideoFrames(video)) => {
@@ -220,29 +225,32 @@ impl MuseGlimmerProcessor {
                     return Err(Error::Processor(
                         "the official Muse-Glimmer GGUF projector is image-only because its temporal patch weights are collapsed"
                             .into(),
-                    ));
+                    )
+                    .into());
                 }
                 self.push_video(parts, video, encode_text)
             }
             (modality, _) => Err(Error::Processor(format!(
                 "Muse-Glimmer processor does not support {} media",
                 modality.as_str()
-            ))),
+            ))
+            .into()),
         }
     }
 
-    fn push_video(
+    fn push_video<E>(
         &self,
         parts: &mut Vec<PreparedInputPart>,
         video: VideoFrames<'_>,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<(), Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<(), ProcessorPreparationError<E>> {
         let (width, height) = validate_rgb_frames(video.frames)?;
         let source_fps = video.source_fps.unwrap_or(24.0);
         if !source_fps.is_finite() || source_fps <= 0.0 {
             return Err(Error::Processor(format!(
                 "Muse-Glimmer video source FPS must be positive, got {source_fps}"
-            )));
+            ))
+            .into());
         }
         let total = video.frames.len();
         let requested = match video.sampling {
@@ -273,7 +281,10 @@ impl MuseGlimmerProcessor {
         for index in &indices {
             frames.push(normalize(video.frames[*index], target, &self.video)?);
         }
-        push_text_token_ids(parts, &encode_text("<|vid_start|>")?);
+        push_text_token_ids(
+            parts,
+            &encode_text("<|vid_start|>").map_err(ProcessorPreparationError::Text)?,
+        );
         let groups = frames.len() / self.video.temporal_patch_size;
         for group in 0..groups {
             let source_index = unpadded
@@ -283,7 +294,8 @@ impl MuseGlimmerProcessor {
                 .unwrap_or(0);
             push_text_token_ids(
                 parts,
-                &encode_text(&format!("Time: {:.1}s", source_index as f64 / source_fps))?,
+                &encode_text(&format!("Time: {:.1}s", source_index as f64 / source_fps))
+                    .map_err(ProcessorPreparationError::Text)?,
             );
             let start = group * self.video.temporal_patch_size;
             let end = start + self.video.temporal_patch_size;
@@ -293,7 +305,10 @@ impl MuseGlimmerProcessor {
             } else {
                 "<|vid_frame_separator|>"
             };
-            push_text_token_ids(parts, &encode_text(boundary)?);
+            push_text_token_ids(
+                parts,
+                &encode_text(boundary).map_err(ProcessorPreparationError::Text)?,
+            );
         }
         Ok(())
     }

@@ -39,6 +39,9 @@ Core owns concepts whose meaning does not depend on tensor representation:
 - queue fairness, request/work lifecycle, transactional branch commit/discard,
   exact-completion observation, cancellation, abandonment, and capacity;
 - backend/device descriptors and fail-closed capability discovery;
+- validated decoded RGB image, mono PCM audio, and RGB video descriptions;
+  ordered text/token/media request composition, exact rendered-chat placeholder
+  binding, and portable video-sampling policy;
 - model capability, input-position, cache-layout, runtime-state, static-memory,
   admission request/result, and artifact-inspection schemas; checked state
   estimation and context/memory admission policy;
@@ -104,6 +107,15 @@ one inspection between portable tokenizer/chat/EOS assembly and
 `prepare_inspected_model`; a second backend uses the same call rather than a
 backend-specific facade constructor. `LoadedModel::from_runtime` remains the
 constructor for an already-prepared runtime assembled by an application.
+
+`MultimodalPreparationBackend` is the optional preparation capability for that
+same selected session. `LoadedModel::prepare_multimodal_input` tokenizes caller
+text, then passes ordered token IDs and decoded media to the backend and returns
+the backend's existing opaque `Prompt`. Processors may ask the facade tokenizer
+to encode checkpoint-defined framing text or timestamps through a typed
+callback; tokenizer failures do not become backend errors. The chat helper
+first replaces exact rendered placeholders with media in core, so placeholder
+count and ordering semantics are shared by every backend.
 
 Tokenizer reconstruction is also outside the MLX boundary. The portable
 facade loads Hugging Face tokenizer sidecars, EOS metadata, chat templates, and
@@ -246,12 +258,18 @@ The GGUF generation example puts its encode/generate/decode loop in a function
 generic over the backend; only model loading and device selection are MLX
 specific.
 
-`TextGenerationBackend::Prompt` is also the multimodal boundary. Text clients
-receive a prompt from portable token ids; an MLX media processor instead
-returns an opaque `MlxModelInput` containing its arrays. Both enter
-`PreparedChatInput::PreparedBackendInput` and use the same generic constrained
-and semantic generation loop. A second backend may supply its own prompt and
-preprocessor without changing downstream request orchestration.
+`TextGenerationBackend::Prompt` is also the multimodal boundary. Generic
+clients construct `MultimodalRequest` from decoded `RgbImage`, `Audio`, or
+`Video` values and call the same `LoadedModel` method for every backend. The
+MLX `MultimodalPreparationBackend` adapter locates the processor owned by the
+selected `MlxModelSession`, performs architecture-specific resizing,
+normalization, feature extraction, framing, tensor construction, and placement,
+then returns an opaque `MlxModelInput`. It fails closed when the selected model
+has no processor or a required media feature is disabled. The resulting prompt
+enters `PreparedChatInput::PreparedBackendInput` and the ordinary generic
+generation loop. Raw `MediaInput`, `ProcessorInput`, processor access, and the
+former duplicate MLX chat-placeholder composer are private implementation
+details rather than a second caller API.
 
 `MlxRealtimeBackend` maps the realtime contract to `MlxRealtimeModel`, MLX
 codec-token arrays, Moshi temporal/depth cache state, `DefaultSampler`, MLX
@@ -474,7 +492,9 @@ No version-1 compatibility decoder or duplicate facade schema is retained.
 
 The current boundary leaves these components MLX-coupled:
 
-- architecture tensor execution, including multimodal and realtime model math;
+- architecture tensor execution, including multimodal preprocessing and
+  realtime model math (portable decoded media, ordering, placeholder binding,
+  and the session preparation capability are core-owned);
 - MLX exact-completion objects, retained output arrays, and event-backend
   telemetry adapters;
 - MLX device assignment, concrete communicator construction, collective tensor

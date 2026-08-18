@@ -20,7 +20,7 @@ use crate::runtime::media::video::{
 };
 use crate::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
-    ProcessorInput,
+    ProcessorInput, ProcessorPreparationError,
 };
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
 use crate::runtime::media::{MediaPayload, OwnedInputMetadata};
@@ -240,6 +240,8 @@ impl Gemma4Processor {
         projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
     ) -> Result<Self, Error> {
         use safemlx::ops::GgufMetadataValue;
+        #[cfg(not(feature = "image-processing"))]
+        let _ = projector_metadata;
 
         let optional_u32 = |metadata: &std::collections::HashMap<String, GgufMetadataValue>,
                             key: &str|
@@ -312,17 +314,14 @@ impl Gemma4Processor {
         })
     }
 
-    pub(crate) fn prepare_input(
+    pub(crate) fn prepare_input<E>(
         &self,
         input: &[ProcessorInput<'_>],
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<PreparedModelInput, Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<PreparedModelInput, ProcessorPreparationError<E>> {
         let mut parts = Vec::new();
         for item in input {
             match *item {
-                ProcessorInput::Text(text) => {
-                    push_text_token_ids(&mut parts, &encode_text(text)?);
-                }
                 ProcessorInput::TokenIds(token_ids) => {
                     push_text_token_ids(&mut parts, token_ids);
                 }
@@ -331,15 +330,15 @@ impl Gemma4Processor {
                 }
             }
         }
-        prepared_model_input(parts)
+        Ok(prepared_model_input(parts)?)
     }
 
-    fn push_media_parts(
+    fn push_media_parts<E>(
         &self,
         parts: &mut Vec<PreparedInputPart>,
         item: MediaInput<'_>,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<(), Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<(), ProcessorPreparationError<E>> {
         #[cfg(not(feature = "image-processing"))]
         let _ = &encode_text;
         #[cfg(not(any(feature = "image-processing", feature = "audio-processing")))]
@@ -387,7 +386,8 @@ impl Gemma4Processor {
             _ => Err(Error::Processor(format!(
                 "Gemma 4 processor does not support {} media with the enabled features",
                 item.modality.as_str()
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -419,11 +419,11 @@ impl Gemma4Processor {
     }
 
     #[cfg(feature = "image-processing")]
-    fn process_video(
+    fn process_video<E>(
         &self,
         video: VideoFrames<'_>,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<Vec<PreparedInputPart>, Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<Vec<PreparedInputPart>, ProcessorPreparationError<E>> {
         let boi_token_id = self.boi_token_id.ok_or_else(|| {
             Error::Processor("Gemma 4 video processor requires boi_token_id".into())
         })?;
@@ -468,7 +468,8 @@ impl Gemma4Processor {
             } else {
                 format!(" {timestamp} ")
             };
-            let mut prefix = encode_text(&timestamp_text)?;
+            let mut prefix =
+                encode_text(&timestamp_text).map_err(ProcessorPreparationError::Text)?;
             prefix.push(boi_token_id);
             replacement.push(PreparedInputPart::text_token_ids(&prefix));
 
@@ -624,7 +625,7 @@ mod tests {
     use super::{aspect_ratio_preserving_size, Gemma4Processor};
     use crate::{
         runtime::media::input::{InputPayload, Modality},
-        runtime::media::{MediaInput, ProcessorInput, RgbImageView},
+        runtime::media::{MediaInput, ProcessorInput, RgbImageView, VideoSampling},
     };
 
     #[test]
@@ -684,7 +685,7 @@ mod tests {
         let pixels = vec![128u8; 4 * 4 * 3];
         let image = RgbImageView::packed(&pixels, 4, 4).unwrap();
         let prepared = processor
-            .prepare_input(
+            .prepare_input::<std::convert::Infallible>(
                 &[
                     ProcessorInput::TokenIds(&[7]),
                     ProcessorInput::Media(MediaInput::image_rgb8(image)),
@@ -724,10 +725,14 @@ mod tests {
         ];
         let mut encoded = Vec::new();
         let prepared = processor
-            .prepare_input(
+            .prepare_input::<std::convert::Infallible>(
                 &[
                     ProcessorInput::TokenIds(&[7]),
-                    ProcessorInput::Media(MediaInput::video_rgb8(&frames, Some(1.0))),
+                    ProcessorInput::Media(MediaInput::video_rgb8_with_sampling(
+                        &frames,
+                        Some(1.0),
+                        VideoSampling::ProcessorDefault,
+                    )),
                     ProcessorInput::TokenIds(&[8]),
                 ],
                 &mut |text| {
@@ -784,7 +789,7 @@ mod audio_tests {
         let samples = vec![0.0f32; 16_000];
         let audio = MediaInput::audio_f32(&samples, 16_000).unwrap();
         let prepared = processor
-            .prepare_input(
+            .prepare_input::<std::convert::Infallible>(
                 &[
                     ProcessorInput::TokenIds(&[7]),
                     ProcessorInput::Media(audio),

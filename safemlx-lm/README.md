@@ -153,8 +153,9 @@ its associated options change. It shares one artifact inspection between
 portable tokenizer/chat/EOS assembly and backend materialization. Metadata
 assembly returns `TextMetadataError`, while tokenizer-aware operations
 on an assembled model return `TextModelError`; neither type contains an MLX
-exception. MLX media preprocessing is prepared with the opaque `MlxModel` and transferred into the
-session atomically rather than being injected by the facade after loading.
+exception. Portable decoded media requests are prepared by the capability of
+the already-selected session rather than by injecting an MLX processor after
+loading.
 Cache policy selection, prompt-cache save/load, and embedded MTP generation
 likewise stay on that session; there is no parallel stage-cache or distributed
 request-scheduler API beside it, and no complete-model cache extraction or
@@ -268,14 +269,18 @@ arrays, sampling math, PRNG state, streams, and exact events behind that
 contract. `generate_prepared_chat` is generic over the same backend: core
 passes portable vocabulary filters to backend sampling while the facade owns
 grammar commitment, cancellation, stop/EOS precedence, and protocol-neutral
-semantic events. Ordered multimodal input crosses this API as the backend's
-opaque prompt type; MLX media processing returns `MlxModelInput`, while another
-backend can supply its own representation. Backend-native controls do not
-appear as specialized methods on `LoadedModel`: MLX applications explicitly
-use `model.runtime().session()` for telemetry and processor access, or
-`model.runtime_mut().session_mut()` for cache reset and configuration. This
-keeps ordinary caller code identical across backends while making native
-operations visibly backend-specific.
+semantic events. `MultimodalRequest` owns ordered text/token segments and
+decoded `RgbImage`, `Audio`, or `Video` values. A
+`B: MultimodalPreparationBackend` client calls
+`LoadedModel::prepare_multimodal_input` (or the exact-placeholder chat helper)
+and receives `B::Prompt`; the same caller code works for MLX and another
+backend. MLX keeps resizing, normalization, feature extraction, framing,
+tensor construction, and placement behind that capability and returns
+`MlxModelInput`. Raw MLX processor inputs and processor handles are not public
+alternatives. Backend-native controls do not appear as specialized methods on
+`LoadedModel`; applications reach intentional native session controls through
+`model.runtime()` only. This keeps ordinary caller code identical across
+backends while making native operations visibly backend-specific.
 
 Raw generation remains available for completion workloads. It deliberately
 bypasses chat-template and native-tool guarantees.

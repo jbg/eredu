@@ -5,21 +5,22 @@ use std::{
 
 use safemlx_lm::{
     api::{
-        ChatTemplateRequest, ChatTokenizer, LoadedModel, LoadedTextModelConfig, ModelChatTemplate,
-        PreparedChat, PreparedChatDraft, PreparedChatError, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
-        PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
+        ChatTemplateRequest, ChatTokenizer, LoadedModel, LoadedTextModelConfig, Media,
+        ModelChatTemplate, MultimodalRequest, MultimodalSegment, PreparedChat, PreparedChatDraft,
+        PreparedChatError, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
+        PreparedChatInput, PreparedChatMtpBatchLane, PreparedChatMtpBatchOutput,
+        PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
         PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest,
-        PreparedChatSpeculativeBackend,
+        PreparedChatSpeculativeBackend, RgbImage,
     },
     core::{MtpSchedulerStats, MtpStats},
     AdmissionRequest, AdmissionResult, Backend, BackendCapabilities, BackendDescriptor,
     BackendSession, CacheStateStrategy, CapabilityError, DeviceDescriptor, EstimationCompleteness,
     FinishReason, GenerationConfigOverrides, GrowingState, InputModalities, InputTokenCount,
     ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend, ModelRuntime, MtpCapability,
-    MtpCheckpointKind, Observed, PhysicalMemorySemantics, PreparedModel, RuntimeStateEstimate,
-    SemanticEvent, StateLayout, StaticMemoryReport, Submission, TextGenerationBackend,
-    TextGenerationConfig, TokenFilter, TokenOutput,
+    MtpCheckpointKind, MultimodalPreparationBackend, Observed, PhysicalMemorySemantics,
+    PreparedModel, RuntimeStateEstimate, SemanticEvent, StateLayout, StaticMemoryReport,
+    Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
 };
 use safemlx_lm_core::Completion;
 use tokenizers::{
@@ -175,6 +176,31 @@ impl TextGenerationBackend for MockBackend {
     }
 }
 
+impl MultimodalPreparationBackend for MockBackend {
+    fn prepare_multimodal_input<E>(
+        _: &ModelRuntime<Self>,
+        request: &safemlx_lm::TokenizedMultimodalRequest,
+        encode_backend_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<Self::Prompt, safemlx_lm::MultimodalPreparationFailure<Self::Error, E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let mut prompt = Vec::new();
+        for segment in request.segments() {
+            match segment {
+                safemlx_lm::TokenizedMultimodalSegment::TokenIds(ids) => {
+                    prompt.extend_from_slice(ids);
+                }
+                safemlx_lm::TokenizedMultimodalSegment::Media(_) => prompt.push(2_001),
+            }
+        }
+        prompt.extend(
+            encode_backend_text("hello").map_err(safemlx_lm::MultimodalPreparationFailure::Text)?,
+        );
+        Ok(prompt)
+    }
+}
+
 impl ModelCapabilityBackend for MockBackend {
     fn model_capabilities(_: &ModelRuntime<Self>) -> Result<ModelCapabilities, CapabilityError> {
         Ok(ModelCapabilities {
@@ -182,7 +208,10 @@ impl ModelCapabilityBackend for MockBackend {
             native_max_context: Observed::exact(32, "mock configuration"),
             effective_max_context: Observed::exact(32, "mock configuration"),
             state_strategy: CacheStateStrategy::FullKv,
-            modalities: InputModalities::TEXT,
+            modalities: InputModalities {
+                image: true,
+                ..InputModalities::TEXT
+            },
             estimation: EstimationCompleteness::Complete,
         })
     }
@@ -348,6 +377,16 @@ fn client_code<B: TextGenerationBackend>(model: &mut LoadedModel<B>) -> Vec<u32>
         .collect()
 }
 
+fn multimodal_client_code<B: MultimodalPreparationBackend>(model: &LoadedModel<B>) -> B::Prompt {
+    let request = MultimodalRequest::new(vec![
+        MultimodalSegment::Text("hello".into()),
+        MultimodalSegment::Media(Media::Image(RgbImage::new(vec![10, 20, 30], 1, 1).unwrap())),
+        MultimodalSegment::TokenIds(vec![7]),
+    ])
+    .unwrap();
+    model.prepare_multimodal_input(&request).unwrap()
+}
+
 fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, prepared: &B::Prompt) {
     let capabilities = model.capabilities().unwrap();
     assert_eq!(capabilities.model_type, model.model_type());
@@ -495,6 +534,7 @@ fn downstream_text_client_is_generic_over_the_selected_backend() {
     );
 
     assert_eq!(client_code(&mut model), vec![1, 2, 3]);
+    assert_eq!(multimodal_client_code(&model), vec![1, 2_001, 7, 1]);
     assert_eq!(model.model_type(), "mock_text");
 }
 

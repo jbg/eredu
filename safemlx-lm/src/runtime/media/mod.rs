@@ -6,6 +6,11 @@ pub mod input;
 use std::{fs, path::Path};
 
 use safemlx::{Array, Dtype};
+#[cfg(feature = "image-processing")]
+use safemlx_lm_core::VideoSampling as PortableVideoSampling;
+use safemlx_lm_core::{
+    Media as PortableMedia, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
+};
 
 use crate::{
     error::Error,
@@ -29,38 +34,32 @@ use crate::architectures::qwen::vl::processor as qwen;
 pub mod video;
 
 #[cfg(feature = "audio-processing")]
-pub use audio::AudioWaveform;
+pub(crate) use audio::AudioWaveform;
 #[cfg(feature = "image-processing")]
-pub use image::RgbImageView;
+pub(crate) use image::RgbImageView;
 
 /// One decoded media item supplied to a model processor.
 #[derive(Debug, Clone, Copy)]
-pub struct MediaInput<'a> {
+pub(crate) struct MediaInput<'a> {
     /// Declared modality of the item.
-    pub modality: Modality,
+    pub(crate) modality: Modality,
     /// Decoded media payload.
-    pub payload: MediaPayload<'a>,
+    pub(crate) payload: MediaPayload<'a>,
 }
 
 impl<'a> MediaInput<'a> {
     /// Creates an RGB8 image input.
     #[cfg(feature = "image-processing")]
-    pub fn image_rgb8(image: RgbImageView<'a>) -> Self {
+    pub(crate) fn image_rgb8(image: RgbImageView<'a>) -> Self {
         Self {
             modality: Modality::Image,
             payload: MediaPayload::Rgb8(image),
         }
     }
 
-    /// Creates a decoded RGB8 video input using processor-default sampling.
-    #[cfg(feature = "image-processing")]
-    pub fn video_rgb8(frames: &'a [RgbImageView<'a>], source_fps: Option<f64>) -> Self {
-        Self::video_rgb8_with_sampling(frames, source_fps, VideoSampling::ProcessorDefault)
-    }
-
     /// Creates a decoded RGB8 video input with an explicit sampling policy.
     #[cfg(feature = "image-processing")]
-    pub fn video_rgb8_with_sampling(
+    pub(crate) fn video_rgb8_with_sampling(
         frames: &'a [RgbImageView<'a>],
         source_fps: Option<f64>,
         sampling: VideoSampling,
@@ -77,7 +76,7 @@ impl<'a> MediaInput<'a> {
 
     /// Creates a mono floating-point PCM audio input.
     #[cfg(feature = "audio-processing")]
-    pub fn audio_f32(samples: &'a [f32], sample_rate: u32) -> Result<Self, Error> {
+    pub(crate) fn audio_f32(samples: &'a [f32], sample_rate: u32) -> Result<Self, Error> {
         Ok(Self {
             modality: Modality::Audio,
             payload: MediaPayload::AudioF32(AudioWaveform::new(samples, sample_rate)?),
@@ -85,32 +84,9 @@ impl<'a> MediaInput<'a> {
     }
 }
 
-/// One exact rendered-prompt placeholder bound to decoded media.
-///
-/// Chat templates remain checkpoint-owned, so callers identify the complete
-/// placeholder spelling emitted by the selected template. The chat composer
-/// validates occurrence counts and ordering before replacing each placeholder
-/// with architecture-native processed media.
-#[derive(Debug, Clone, Copy)]
-pub struct ChatMediaBinding<'a> {
-    /// Complete placeholder text to replace in the rendered chat prompt.
-    pub placeholder: &'a str,
-    /// Decoded media inserted at the placeholder's exact position.
-    pub media: MediaInput<'a>,
-}
-
-impl<'a> ChatMediaBinding<'a> {
-    /// Creates one rendered-placeholder media binding.
-    pub const fn new(placeholder: &'a str, media: MediaInput<'a>) -> Self {
-        Self { placeholder, media }
-    }
-}
-
 /// One ordered input segment supplied to a model processor.
 #[derive(Debug, Clone, Copy)]
-pub enum ProcessorInput<'a> {
-    /// Text that should be tokenized by the caller-provided encoder.
-    Text(&'a str),
+pub(crate) enum ProcessorInput<'a> {
     /// Already-tokenized text IDs.
     TokenIds(&'a [u32]),
     /// Decoded media to preprocess and insert at this exact position.
@@ -120,7 +96,7 @@ pub enum ProcessorInput<'a> {
 /// Frame-selection policy for decoded video input.
 #[cfg(feature = "image-processing")]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub enum VideoSampling {
+pub(crate) enum VideoSampling {
     /// Uses the model processor's default frame rate and limits.
     #[default]
     ProcessorDefault,
@@ -135,18 +111,18 @@ pub enum VideoSampling {
 /// Borrowed sequence of decoded RGB8 video frames.
 #[cfg(feature = "image-processing")]
 #[derive(Debug, Clone, Copy)]
-pub struct VideoFrames<'a> {
+pub(crate) struct VideoFrames<'a> {
     /// Frames in source order.
-    pub frames: &'a [RgbImageView<'a>],
+    pub(crate) frames: &'a [RgbImageView<'a>],
     /// Source frame rate used for sampling and timestamp generation.
-    pub source_fps: Option<f64>,
+    pub(crate) source_fps: Option<f64>,
     /// Frame-selection policy.
-    pub sampling: VideoSampling,
+    pub(crate) sampling: VideoSampling,
 }
 
 /// Decoded data accepted by media processors.
 #[derive(Debug, Clone, Copy)]
-pub enum MediaPayload<'a> {
+pub(crate) enum MediaPayload<'a> {
     /// Decoded RGB8 image pixels.
     #[cfg(feature = "image-processing")]
     Rgb8(RgbImageView<'a>),
@@ -665,7 +641,7 @@ impl PreparedModelInput {
 
 /// Architecture-dispatched media processor loaded from a model directory.
 #[derive(Debug, Clone)]
-pub struct ModelProcessor {
+pub(crate) struct ModelProcessor {
     kind: ProcessorKind,
 }
 
@@ -677,6 +653,132 @@ enum ProcessorKind {
     MuseGlimmer(muse_glimmer::MuseGlimmerProcessor),
     #[cfg(feature = "image-processing")]
     Qwen(qwen::QwenProcessor),
+}
+
+#[derive(Debug)]
+pub(crate) enum ProcessorPreparationError<E> {
+    Backend(Error),
+    #[cfg_attr(not(feature = "image-processing"), allow(dead_code))]
+    Text(E),
+}
+
+impl<E> From<Error> for ProcessorPreparationError<E> {
+    fn from(error: Error) -> Self {
+        Self::Backend(error)
+    }
+}
+
+enum PortableMediaView<'a> {
+    #[cfg(feature = "image-processing")]
+    Image(RgbImageView<'a>),
+    #[cfg(feature = "image-processing")]
+    Video {
+        frames: Vec<RgbImageView<'a>>,
+        source_fps: Option<f64>,
+        sampling: VideoSampling,
+    },
+    #[cfg(feature = "audio-processing")]
+    Audio {
+        samples: &'a [f32],
+        sample_rate: u32,
+    },
+    #[allow(dead_code)]
+    Unavailable(std::marker::PhantomData<&'a ()>),
+}
+
+impl<'a> PortableMediaView<'a> {
+    fn new(media: &'a PortableMedia) -> Result<Self, Error> {
+        match media {
+            PortableMedia::Image(image) => {
+                #[cfg(feature = "image-processing")]
+                {
+                    Ok(Self::Image(RgbImageView::packed(
+                        image.pixels(),
+                        image.width(),
+                        image.height(),
+                    )?))
+                }
+                #[cfg(not(feature = "image-processing"))]
+                {
+                    let _ = image;
+                    Err(Error::Processor(
+                        "MLX image preparation requires the image-processing feature".into(),
+                    ))
+                }
+            }
+            PortableMedia::Video(video) => {
+                #[cfg(feature = "image-processing")]
+                {
+                    let frames = video
+                        .frames()
+                        .iter()
+                        .map(|frame| {
+                            RgbImageView::packed(frame.pixels(), frame.width(), frame.height())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let sampling = match video.sampling() {
+                        PortableVideoSampling::ProcessorDefault => VideoSampling::ProcessorDefault,
+                        PortableVideoSampling::Fps(fps) => VideoSampling::Fps(fps),
+                        PortableVideoSampling::FrameCount(count) => {
+                            VideoSampling::FrameCount(count)
+                        }
+                        PortableVideoSampling::All => VideoSampling::All,
+                    };
+                    Ok(Self::Video {
+                        frames,
+                        source_fps: video.source_fps(),
+                        sampling,
+                    })
+                }
+                #[cfg(not(feature = "image-processing"))]
+                {
+                    let _ = video;
+                    Err(Error::Processor(
+                        "MLX video preparation requires the image-processing feature".into(),
+                    ))
+                }
+            }
+            PortableMedia::Audio(audio) => {
+                #[cfg(feature = "audio-processing")]
+                {
+                    Ok(Self::Audio {
+                        samples: audio.samples(),
+                        sample_rate: audio.sample_rate(),
+                    })
+                }
+                #[cfg(not(feature = "audio-processing"))]
+                {
+                    let _ = audio;
+                    Err(Error::Processor(
+                        "MLX audio preparation requires the audio-processing feature".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn as_input(&self) -> Result<MediaInput<'_>, Error> {
+        match self {
+            #[cfg(feature = "image-processing")]
+            Self::Image(image) => Ok(MediaInput::image_rgb8(*image)),
+            #[cfg(feature = "image-processing")]
+            Self::Video {
+                frames,
+                source_fps,
+                sampling,
+            } => Ok(MediaInput::video_rgb8_with_sampling(
+                frames,
+                *source_fps,
+                *sampling,
+            )),
+            #[cfg(feature = "audio-processing")]
+            Self::Audio {
+                samples,
+                sample_rate,
+            } => MediaInput::audio_f32(samples, *sample_rate),
+            Self::Unavailable(_) => unreachable!("unsupported media is rejected during mapping"),
+        }
+    }
 }
 
 impl ModelProcessor {
@@ -748,11 +850,11 @@ impl ModelProcessor {
     }
 
     /// Converts ordered text and decoded media segments into owned runtime input.
-    pub fn prepare_input(
+    pub(crate) fn prepare_input<E>(
         &self,
         input: &[ProcessorInput<'_>],
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<PreparedModelInput, Error> {
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<PreparedModelInput, ProcessorPreparationError<E>> {
         #[cfg(not(feature = "image-processing"))]
         let _ = &encode_text;
         match &self.kind {
@@ -765,126 +867,40 @@ impl ModelProcessor {
         }
     }
 
-    /// Replaces checked rendered-chat placeholders with processed media.
-    pub fn prepare_chat_input<'a>(
+    pub(crate) fn prepare_portable_input<E>(
         &self,
-        rendered_prompt: &'a str,
-        bindings: &[ChatMediaBinding<'a>],
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<PreparedModelInput, Error> {
-        let segments = chat_processor_segments(rendered_prompt, bindings)?;
-        self.prepare_input(&segments, encode_text)
-    }
-}
-
-fn chat_processor_segments<'a>(
-    rendered_prompt: &'a str,
-    bindings: &[ChatMediaBinding<'a>],
-) -> Result<Vec<ProcessorInput<'a>>, Error> {
-    for (index, binding) in bindings.iter().enumerate() {
-        if binding.placeholder.is_empty() {
-            return Err(Error::Processor(format!(
-                "chat media binding {index} has an empty placeholder"
-            )));
-        }
-        if bindings[..index]
+        request: &TokenizedMultimodalRequest,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<PreparedModelInput, ProcessorPreparationError<E>> {
+        let media = request
+            .segments()
             .iter()
-            .any(|earlier| earlier.placeholder == binding.placeholder)
-        {
-            continue;
-        }
-        let expected = bindings
+            .filter_map(|segment| match segment {
+                TokenizedMultimodalSegment::Media(media) => Some(PortableMediaView::new(media)),
+                TokenizedMultimodalSegment::TokenIds(_) => None,
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut media = media.iter();
+        let input = request
+            .segments()
             .iter()
-            .filter(|candidate| candidate.placeholder == binding.placeholder)
-            .count();
-        let actual = rendered_prompt.matches(binding.placeholder).count();
-        if actual != expected {
-            let placeholder = binding.placeholder;
-            return Err(Error::Processor(format!(
-                "rendered chat contains {actual} occurrence(s) of media placeholder \
-                 {placeholder:?}, but {expected} binding(s) were supplied"
-            )));
-        }
-    }
-
-    let mut segments = Vec::with_capacity(bindings.len().saturating_mul(2) + 1);
-    let mut cursor = 0;
-    for (index, binding) in bindings.iter().enumerate() {
-        let remainder = &rendered_prompt[cursor..];
-        let relative = remainder.find(binding.placeholder).ok_or_else(|| {
-            Error::Processor(format!(
-                "chat media binding {index} placeholder {:?} does not occur after the preceding binding",
-                binding.placeholder
-            ))
-        })?;
-        let start = cursor + relative;
-        if start > cursor {
-            segments.push(ProcessorInput::Text(&rendered_prompt[cursor..start]));
-        }
-        segments.push(ProcessorInput::Media(binding.media));
-        cursor = start + binding.placeholder.len();
-    }
-    if cursor < rendered_prompt.len() {
-        segments.push(ProcessorInput::Text(&rendered_prompt[cursor..]));
-    }
-    if segments.is_empty() {
-        segments.push(ProcessorInput::Text(rendered_prompt));
-    }
-    Ok(segments)
-}
-
-#[cfg(all(test, feature = "image-processing"))]
-mod chat_input_tests {
-    use super::{
-        chat_processor_segments, ChatMediaBinding, MediaInput, ProcessorInput, RgbImageView,
-    };
-
-    fn image<'a>(pixels: &'a [u8]) -> MediaInput<'a> {
-        MediaInput::image_rgb8(RgbImageView::packed(pixels, 1, 1).unwrap())
-    }
-
-    #[test]
-    fn chat_composer_replaces_repeated_placeholders_in_order() {
-        let pixels = [0_u8; 3];
-        let bindings = [
-            ChatMediaBinding::new("<image>", image(&pixels)),
-            ChatMediaBinding::new("<image>", image(&pixels)),
-        ];
-        let segments =
-            chat_processor_segments("before<image>middle<image>after", &bindings).unwrap();
-
-        assert_eq!(segments.len(), 5);
-        assert!(matches!(segments[0], ProcessorInput::Text("before")));
-        assert!(matches!(segments[1], ProcessorInput::Media(_)));
-        assert!(matches!(segments[2], ProcessorInput::Text("middle")));
-        assert!(matches!(segments[3], ProcessorInput::Media(_)));
-        assert!(matches!(segments[4], ProcessorInput::Text("after")));
-    }
-
-    #[test]
-    fn chat_composer_rejects_count_and_order_mismatches() {
-        let pixels = [0_u8; 3];
-        let count_error = chat_processor_segments(
-            "before<image><image>after",
-            &[ChatMediaBinding::new("<image>", image(&pixels))],
-        )
-        .unwrap_err();
-        assert!(count_error.to_string().contains("2 occurrence"));
-
-        let order_error = chat_processor_segments(
-            "<second><first>",
-            &[
-                ChatMediaBinding::new("<first>", image(&pixels)),
-                ChatMediaBinding::new("<second>", image(&pixels)),
-            ],
-        )
-        .unwrap_err();
-        assert!(order_error.to_string().contains("does not occur after"));
+            .map(|segment| match segment {
+                TokenizedMultimodalSegment::TokenIds(ids) => Ok(ProcessorInput::TokenIds(ids)),
+                TokenizedMultimodalSegment::Media(_) => Ok(ProcessorInput::Media(
+                    media
+                        .next()
+                        .expect("one prepared view exists for every media segment")
+                        .as_input()?,
+                )),
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        debug_assert!(media.next().is_none());
+        self.prepare_input(&input, encode_text)
     }
 }
 
 /// Loads a supported media processor without loading model weights.
-pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcessor>, Error> {
+pub(crate) fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcessor>, Error> {
     #[derive(serde::Deserialize)]
     struct Metadata {
         model_type: String,
@@ -949,6 +965,56 @@ pub(crate) fn prepared_model_input(
 pub(crate) fn push_text_token_ids(parts: &mut Vec<PreparedInputPart>, token_ids: &[u32]) {
     if !token_ids.is_empty() {
         parts.push(PreparedInputPart::text_token_ids(token_ids));
+    }
+}
+
+#[cfg(all(test, feature = "image-processing"))]
+mod portable_input_tests {
+    use std::{collections::HashMap, convert::Infallible};
+
+    use safemlx::ops::GgufMetadataValue;
+    use safemlx_lm_core::{Media, MultimodalRequest, MultimodalSegment, RgbImage};
+
+    use super::{input::Modality, ModelProcessor};
+
+    #[test]
+    fn mlx_processor_materializes_the_portable_ordered_request() {
+        let model = HashMap::from([
+            ("gemma4.boi_token_id".into(), GgufMetadataValue::Uint32(43)),
+            ("gemma4.eoi_token_id".into(), GgufMetadataValue::Uint32(44)),
+        ]);
+        let projector = HashMap::from([
+            (
+                "clip.vision.patch_size".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "clip.vision.pooling_kernel_size".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "clip.vision.max_soft_tokens".into(),
+                GgufMetadataValue::Uint32(70),
+            ),
+        ]);
+        let processor = ModelProcessor::load_gemma4_gguf(&model, &projector).unwrap();
+        let request = MultimodalRequest::new(vec![
+            MultimodalSegment::TokenIds(vec![7]),
+            MultimodalSegment::Media(Media::Image(
+                RgbImage::new(vec![128; 4 * 4 * 3], 4, 4).unwrap(),
+            )),
+            MultimodalSegment::TokenIds(vec![8]),
+        ])
+        .unwrap()
+        .tokenize::<Infallible>(|_| unreachable!("request contains token ids"))
+        .unwrap();
+
+        let prepared = processor
+            .prepare_portable_input(&request, &mut |_| Ok::<_, Infallible>(Vec::new()))
+            .unwrap();
+        let parts = prepared.input_parts();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[2].modality, Modality::Image);
     }
 }
 

@@ -14,6 +14,7 @@ use crate::{
     },
     checkpoint::TensorDtype,
     generation::ResolvedGenerationConfig,
+    media::TokenizedMultimodalRequest,
     topology::{ParallelAxis, ParallelTopology},
 };
 
@@ -629,6 +630,38 @@ pub trait TextGenerationBackend: Backend {
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error>;
 }
 
+/// Failure from backend preprocessing or backend-requested text encoding.
+#[derive(Debug, thiserror::Error)]
+pub enum MultimodalPreparationFailure<B, T>
+where
+    B: std::error::Error + 'static,
+    T: std::error::Error + 'static,
+{
+    /// The selected backend rejected or failed media preprocessing.
+    #[error("backend multimodal preparation failed: {0}")]
+    Backend(#[source] B),
+    /// The facade tokenizer failed on backend-required framing text.
+    #[error("multimodal framing text encoding failed: {0}")]
+    Text(#[source] T),
+}
+
+/// Backend preparation of portable decoded media for one selected session.
+///
+/// Caller text is tokenized before this boundary. Some processors introduce
+/// checkpoint-defined framing text or video timestamps, so the callback keeps
+/// that work on the facade's tokenizer. The selected backend returns its
+/// existing opaque prompt type; core never observes tensors or streams.
+pub trait MultimodalPreparationBackend: TextGenerationBackend {
+    /// Converts ordered token and decoded-media segments into a backend prompt.
+    fn prepare_multimodal_input<E>(
+        runtime: &ModelRuntime<Self>,
+        request: &TokenizedMultimodalRequest,
+        encode_backend_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<Self::Prompt, MultimodalPreparationFailure<Self::Error, E>>
+    where
+        E: std::error::Error + Send + Sync + 'static;
+}
+
 /// Capability and resource observations for one selected text-model session.
 ///
 /// Implementations inspect the opaque model and cache already owned by
@@ -1238,6 +1271,36 @@ mod tests {
         }
     }
 
+    impl MultimodalPreparationBackend for Mock {
+        fn prepare_multimodal_input<E>(
+            _: &ModelRuntime<Self>,
+            request: &TokenizedMultimodalRequest,
+            _: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+        ) -> Result<Self::Prompt, MultimodalPreparationFailure<Self::Error, E>>
+        where
+            E: std::error::Error + Send + Sync + 'static,
+        {
+            let mut prompt = Vec::new();
+            for segment in request.segments() {
+                match segment {
+                    crate::TokenizedMultimodalSegment::TokenIds(ids) => {
+                        prompt.extend_from_slice(ids);
+                    }
+                    crate::TokenizedMultimodalSegment::Media(crate::Media::Image(_)) => {
+                        prompt.push(1_001);
+                    }
+                    crate::TokenizedMultimodalSegment::Media(crate::Media::Video(_)) => {
+                        prompt.push(1_002);
+                    }
+                    crate::TokenizedMultimodalSegment::Media(crate::Media::Audio(_)) => {
+                        prompt.push(1_003);
+                    }
+                }
+            }
+            Ok(prompt)
+        }
+    }
+
     impl ModelCapabilityBackend for Mock {
         fn model_capabilities(
             _: &ModelRuntime<Self>,
@@ -1395,6 +1458,41 @@ mod tests {
         assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 55);
         assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 13);
         assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 14);
+        assert!(generation.next().is_none());
+    }
+
+    #[test]
+    fn portable_media_preparation_feeds_the_existing_generation_contract() {
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let request = crate::MultimodalRequest::new(vec![
+            crate::MultimodalSegment::TokenIds(vec![7, 8]),
+            crate::MultimodalSegment::Media(crate::Media::Image(
+                crate::RgbImage::new(vec![5, 6, 7], 1, 1).unwrap(),
+            )),
+            crate::MultimodalSegment::TokenIds(vec![9]),
+        ])
+        .unwrap()
+        .tokenize::<Infallible>(|_| unreachable!("request is already tokenized"))
+        .unwrap();
+        let prompt = Mock::prepare_multimodal_input(&runtime, &request, &mut |_| {
+            Ok::<_, Infallible>(Vec::new())
+        })
+        .unwrap();
+        assert_eq!(prompt, vec![7, 8, 1_001, 9]);
+
+        let sampling = crate::resolve_generation_config(
+            None,
+            crate::GenerationConfigOverrides {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut generation =
+            TextGeneration::from_prompt(&mut runtime, prompt, TextGenerationConfig::new(sampling))
+                .unwrap();
+        assert!(generation.next().unwrap().is_ok());
+        assert!(generation.next().unwrap().is_ok());
         assert!(generation.next().is_none());
     }
 

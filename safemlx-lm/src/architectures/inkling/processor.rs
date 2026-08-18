@@ -15,7 +15,7 @@ use crate::runtime::media::input::Modality;
 
 use crate::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
-    ProcessorInput,
+    ProcessorInput, ProcessorPreparationError,
 };
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
 use crate::runtime::media::{MediaPayload, OwnedInputMetadata};
@@ -108,22 +108,19 @@ impl InklingProcessor {
         })
     }
 
-    pub(crate) fn prepare_input(
+    pub(crate) fn prepare_input<E>(
         &self,
         input: &[ProcessorInput<'_>],
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
-    ) -> Result<PreparedModelInput, Error> {
+        _: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<PreparedModelInput, ProcessorPreparationError<E>> {
         let mut parts = Vec::new();
         for item in input {
             match *item {
-                ProcessorInput::Text(text) => {
-                    push_text_token_ids(&mut parts, &encode_text(text)?);
-                }
                 ProcessorInput::TokenIds(ids) => push_text_token_ids(&mut parts, ids),
                 ProcessorInput::Media(media) => self.push_media(&mut parts, media)?,
             }
         }
-        prepared_model_input(parts)
+        Ok(prepared_model_input(parts)?)
     }
 
     fn push_media(
