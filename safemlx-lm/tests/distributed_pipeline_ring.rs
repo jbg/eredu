@@ -30,6 +30,7 @@ use safemlx_lm::{
         nemotron_h::model as nemotron_model,
         qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen_hybrid},
     },
+    backend::mlx::ModelLoadOptions,
     core::{residency::OffloadConfig, Backend as _, BackendSession as _},
     load_model,
     runtime::generation::sampler::DefaultSampler,
@@ -39,8 +40,8 @@ use safemlx_lm::{
         media::{input::InputPayload, PreparedModelInput},
     },
     CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
-    LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
-    MtpCapability, MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PagedCacheOptions,
+    LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, MlxParallelContext, MtpCapability,
+    MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PagedCacheOptions,
     PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};

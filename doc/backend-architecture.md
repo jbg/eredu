@@ -180,8 +180,8 @@ and cache. There is no post-construction processor injection path.
 `MlxBackend` maps session creation to `MlxModelSession`. The opaque `MlxModel`
 contains exactly one private MLX executable form: complete, pipeline stage, or
 expert partition. `MlxModelSession` allocates and owns the matching
-`ModelCache`, `PipelineCache`, or `ExpertParallelCache` plus the optional
-`MlxDistributedSession`. It is the sole architecture-erased prefill/decode
+`backend::mlx::ModelCache`, `PipelineCache`, or `ExpertParallelCache` plus the
+optional `MlxDistributedSession`. It is the sole architecture-erased prefill/decode
 implementation for replicated, TP, PP, EP, and Cartesian combinations.
 Complete and expert submissions are wrapped by `async_eval_with_event`;
 pipeline submissions preserve the stage completion that retains transfers and
@@ -292,10 +292,10 @@ The public core `load_model` route performs format, architecture, catalog, and
 policy planning before calling the selected backend's `prepare_model`. Its
 return type is `PreparedModel<B::Model>`; `Backend::create_session` consumes
 that marker and the opaque model it proves was prepared by the chosen backend.
-`ModelLoadOptions::with_parallel` selects TP, PP, EP, or a supported Cartesian
-materialization through this same entry point. Architecture-specific
-distributed loaders and rank-local model types are private materializers, not
-public alternatives. `MlxBackend::with_distributed_world` supplies the world;
+`backend::mlx::ModelLoadOptions::with_parallel` selects TP, PP, EP, or a
+supported Cartesian materialization through this same entry point.
+Architecture-specific distributed loaders and rank-local model types are
+private materializers, not public alternatives. `MlxBackend::with_distributed_world` supplies the world;
 `Backend::create_session` derives the topology-scoped communication and binds
 it to the selected model and cache state. There is no standalone public
 communication-session constructor.

@@ -23,8 +23,8 @@ use crate::{
     api::{
         common,
         gemma4::{self, Gemma4Embedding, KeyValuePolicy, ModelArgs, TransformerBlock},
-        ModelLoadOptions,
     },
+    backend::mlx::ModelLoadOptions,
     error::Error,
     nn::tensor::rope::FloatOrString,
     runtime::attention::{AttentionPolicy, LayerSchedule},
@@ -904,7 +904,7 @@ mod tests {
     };
 
     use crate::{
-        api::ModelLoadOptions,
+        backend::mlx::ModelLoadOptions,
         runtime::attention::AttentionPolicy,
         runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     };

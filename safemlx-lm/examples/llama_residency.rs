@@ -6,13 +6,14 @@ use clap::Parser;
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     architectures::llama::model as llama,
+    backend::mlx::ModelLoadOptions,
     core::residency::{MemoryTier, OffloadConfig, TransferDirection},
     core::{Backend as _, BackendSession as _},
     load_model,
     runtime::execution::layerwise::LayerwiseLoadOptions,
     runtime::media::input,
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    MlxBackend, ModelLoadOptions, WeightResidency,
+    MlxBackend, WeightResidency,
 };
 
 #[derive(Debug, Parser)]

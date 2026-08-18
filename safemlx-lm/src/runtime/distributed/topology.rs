@@ -1066,14 +1066,14 @@ mod tests {
 
     #[test]
     fn replicated_facades_reject_distributed_session_topologies() {
-        let default = crate::api::ModelLoadOptions::default();
+        let default = crate::backend::mlx::ModelLoadOptions::default();
         assert_eq!(default.quantization, None);
         assert_eq!(default.parallel, None);
-        crate::api::ensure_replicated_load_options(default).unwrap();
+        crate::backend::mlx::ensure_replicated_load_options(default).unwrap();
 
-        let singleton = crate::api::ModelLoadOptions::with_parallel(topology(0, 1, 1, 1));
-        crate::api::ensure_replicated_load_options(singleton).unwrap();
-        let combined = crate::api::ModelLoadOptions::with_quantization(
+        let singleton = crate::backend::mlx::ModelLoadOptions::with_parallel(topology(0, 1, 1, 1));
+        crate::backend::mlx::ensure_replicated_load_options(singleton).unwrap();
+        let combined = crate::backend::mlx::ModelLoadOptions::with_quantization(
             crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4,
         )
         .with_parallel_topology(topology(0, 1, 1, 1));
@@ -1083,15 +1083,17 @@ mod tests {
         );
         assert!(combined.parallel.unwrap().is_replicated());
 
-        let tensor_parallel = crate::api::ModelLoadOptions::with_parallel(topology(0, 2, 1, 1));
-        assert!(crate::api::ensure_replicated_load_options(tensor_parallel).is_err());
+        let tensor_parallel =
+            crate::backend::mlx::ModelLoadOptions::with_parallel(topology(0, 2, 1, 1));
+        assert!(crate::backend::mlx::ensure_replicated_load_options(tensor_parallel).is_err());
 
         let pipeline_partitioned =
-            crate::api::ModelLoadOptions::with_parallel(topology(0, 1, 2, 1));
-        assert!(crate::api::ensure_replicated_load_options(pipeline_partitioned).is_err());
+            crate::backend::mlx::ModelLoadOptions::with_parallel(topology(0, 1, 2, 1));
+        assert!(crate::backend::mlx::ensure_replicated_load_options(pipeline_partitioned).is_err());
 
-        let expert_partitioned = crate::api::ModelLoadOptions::with_parallel(topology(0, 1, 1, 2));
-        assert!(crate::api::ensure_replicated_load_options(expert_partitioned).is_err());
+        let expert_partitioned =
+            crate::backend::mlx::ModelLoadOptions::with_parallel(topology(0, 1, 1, 2));
+        assert!(crate::backend::mlx::ensure_replicated_load_options(expert_partitioned).is_err());
     }
 
     #[test]

@@ -2289,7 +2289,7 @@ pub fn load_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Lfm2,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let args = get_model_args(model_dir)?;
     let mut model = Model::new(args.clone(), stream)?;
@@ -2322,7 +2322,7 @@ pub fn load_model_quantized(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Lfm2,
         model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
+        crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let mut args = get_model_args(model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -2399,7 +2399,7 @@ pub(crate) fn load_gguf_checkpoint(
         gguf_architecture,
         checkpoint,
         &metadata,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
     let mut args = args_from_gguf_catalog(checkpoint, &metadata, &architecture, is_moe)?;
@@ -2535,7 +2535,7 @@ pub(crate) fn prepare_gguf_checkpoint(
         gguf_architecture,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
     let mut args = args_from_gguf_catalog(checkpoint, metadata, &architecture, is_moe)?;

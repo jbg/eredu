@@ -444,7 +444,7 @@ pub fn load_qwen3_vl_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     Ok(Qwen3VlLayerwiseModel {
@@ -516,7 +516,7 @@ pub(crate) fn load_qwen3_vl_tensor_parallel_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     Ok(Qwen3VlLayerwiseModel {
@@ -702,7 +702,7 @@ pub fn load_qwen3_vl_expert_cache_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3VlMoe,
         model_dir,
-        crate::api::ModelLoadOptions::default()
+        crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_qwen3_vl_model_args(model_dir)?;

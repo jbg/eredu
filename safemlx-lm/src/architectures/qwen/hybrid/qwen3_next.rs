@@ -96,7 +96,7 @@ fn load_qwen3_next_model_with_quantization(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3Next,
         model_dir,
-        crate::api::ModelLoadOptions {
+        crate::backend::mlx::ModelLoadOptions {
             quantization,
             ..Default::default()
         },

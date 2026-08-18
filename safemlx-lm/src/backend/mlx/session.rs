@@ -15,7 +15,7 @@ use crate::core::generation::MtpConfig;
 #[cfg(feature = "media-processing")]
 use crate::runtime::media::{ModelProcessor, PreparedModelInput};
 use crate::{
-    api::{input, Model, ModelCache},
+    api::input,
     architectures::distributed::{
         expert::ExpertParallelCache,
         pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
@@ -29,7 +29,9 @@ use crate::{
 };
 use safemlx_lm_core::MtpStats;
 
-use super::{MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, MlxModelKind};
+use super::{
+    MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, MlxModelKind, Model, ModelCache,
+};
 
 /// Backend-owned output of one MLX model-session submission.
 ///

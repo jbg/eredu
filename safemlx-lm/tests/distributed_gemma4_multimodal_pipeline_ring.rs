@@ -21,6 +21,7 @@ use safemlx_lm::{
         distributed::pipeline::{load_pipeline_model_with_options, PipelineStep},
         gemma4::model::{self as gemma4, Cache, Model},
     },
+    backend::mlx::ModelLoadOptions,
     core::residency::OffloadConfig,
     nn::generation::CausalLm,
     runtime::media::{
@@ -28,8 +29,8 @@ use safemlx_lm::{
         PreparedModelInput,
     },
     DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions, MlxBackend,
-    MlxParallelContext, ModelLoadOptions, PagedCacheOptions, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology, WeightResidency,
+    MlxParallelContext, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
+    PromptCacheTopology, WeightResidency,
 };
 
 const WORKER: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_WORKER";

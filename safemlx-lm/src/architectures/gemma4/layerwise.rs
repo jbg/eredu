@@ -933,7 +933,7 @@ pub fn load_gemma4_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Gemma4,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
         resident::get_gemma4_model_config(model_dir)?;
@@ -1027,7 +1027,7 @@ pub(crate) fn load_gemma4_tensor_parallel_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Gemma4,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
         resident::get_gemma4_model_config(model_dir)?;
@@ -1066,7 +1066,7 @@ pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
         crate::api::GgufArchitecture::Gemma4,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, mmproj, None)?;
@@ -1103,7 +1103,7 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
         crate::api::GgufArchitecture::Gemma4,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, mmproj, None)?;

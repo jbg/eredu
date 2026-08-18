@@ -1009,7 +1009,7 @@ pub fn load_deepseek_v3_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV3,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
@@ -1073,7 +1073,7 @@ pub(crate) fn load_deepseek_v3_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV3,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
@@ -1103,7 +1103,7 @@ pub(crate) fn load_deepseek_v3_gguf_tensor_parallel_model(
         crate::api::GgufArchitecture::DeepSeek2,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
@@ -1139,7 +1139,7 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
         crate::api::GgufArchitecture::DeepSeek2,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
@@ -1268,7 +1268,7 @@ pub fn load_deepseek_v3_expert_cache_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV3,
         model_dir,
-        crate::api::ModelLoadOptions::default()
+        crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_model_args(model_dir)?;

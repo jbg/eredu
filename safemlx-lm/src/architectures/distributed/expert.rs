@@ -29,13 +29,13 @@ use crate::core::cache::{
 use crate::{
     api::{
         deepseek_v3, deepseek_v4, gemma4, gpt_oss, inkling, input as runtime_input, kimi_linear,
-        lfm2, nemotron_h, qwen3_5, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
+        lfm2, nemotron_h, qwen3_5, qwen3_next, qwen3_vl, ModelKind,
     },
     architectures::distributed::pipeline::{assign_module, load_deepseek_experts},
     backend::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
-    backend::mlx::MlxParallelContext,
+    backend::mlx::{MlxParallelContext, ModelLoadOptions},
     core::cache::CacheRankIdentity,
     core::generation::MtpConfig,
     core::{MtpCapability, MtpCheckpointKind, MtpStats},

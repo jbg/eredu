@@ -8686,7 +8686,7 @@ mod tests {
             .into_inner()
             .into_complete()
             .unwrap();
-        let crate::api::Model::Gemma4(model) = &loaded else {
+        let crate::backend::mlx::Model::Gemma4(model) = &loaded else {
             panic!("expected Gemma 4 model");
         };
         let ordinary = model.metadata().materialization().unwrap();

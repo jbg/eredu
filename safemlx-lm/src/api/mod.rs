@@ -3,6 +3,8 @@
 //! This module is available without an execution backend. Enabling the
 //! default `mlx` feature adds the concrete MLX loader, model implementations,
 //! prepared-chat execution, and native runtime diagnostics.
+//! MLX executable, cache, load-policy, and generation types live under
+//! `backend::mlx`, not in this namespace.
 
 mod portable;
 

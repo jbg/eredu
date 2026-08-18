@@ -5,7 +5,7 @@ use safemlx::{
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    api::ModelLoadOptions,
+    backend::mlx::ModelLoadOptions,
     core::{Backend as _, BackendSession as _},
     load_model,
     runtime::residency::expert_cache::ExpertCacheLoadOptions,

@@ -15,7 +15,6 @@ use safemlx_lm_core::{
 };
 
 use crate::{
-    api::ModelCache,
     architectures::muse_glimmer::{
         assistant::{DFlashContextCache, MuseGlimmerDFlash},
         layerwise::{DFlashTargetOutput, LayerwiseDecoder, MuseGlimmerLayerwiseCache},
@@ -26,7 +25,7 @@ use crate::{
             scheduler::{MtpComponentTimingEvaluations, MtpComponentTimings},
             MlxSpeculativeCompletion, MtpExecutionStreams,
         },
-        MlxModelInput,
+        MlxModelInput, ModelCache,
     },
     runtime::cache::KeyValueCache,
 };

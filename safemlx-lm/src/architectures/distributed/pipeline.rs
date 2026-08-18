@@ -44,7 +44,7 @@ use crate::{
     api::{
         common::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
         deepseek_v3, deepseek_v4, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, muse_glimmer,
-        nemotron_h, qwen3_vl, ModelKind, ModelLoadOptions,
+        nemotron_h, qwen3_vl, ModelKind,
     },
     architectures::{
         deepseek_v4::layerwise::DeepSeekV4LayerwiseAdapter,
@@ -67,6 +67,7 @@ use crate::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
     backend::mlx::MlxParallelContext,
+    backend::mlx::ModelLoadOptions,
     core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
     core::generation::MtpConfig,
     core::residency::{

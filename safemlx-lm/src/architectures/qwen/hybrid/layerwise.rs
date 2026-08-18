@@ -1066,7 +1066,7 @@ pub fn load_qwen3_next_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3Next,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
@@ -1118,7 +1118,7 @@ pub(crate) fn load_qwen3_next_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3Next,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
@@ -1148,7 +1148,7 @@ pub fn load_qwen35_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let (args, image_token_id, video_token_id, vision) =
         resident::get_qwen3_5_model_args(model_dir)?;
@@ -1235,7 +1235,7 @@ pub(crate) fn load_qwen35_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let (args, _, _, vision) = resident::get_qwen3_5_model_args(model_dir)?;
     if vision.is_some() {
@@ -1291,7 +1291,7 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
         architecture,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     let is_next = prepared.architecture == "qwen3next";
@@ -1344,7 +1344,7 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
         architecture,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     let args = prepared.args;
@@ -1502,7 +1502,7 @@ pub fn load_qwen3_next_expert_cache_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3Next,
         model_dir,
-        crate::api::ModelLoadOptions::default()
+        crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
@@ -1542,7 +1542,7 @@ pub fn load_qwen35_expert_cache_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
-        crate::api::ModelLoadOptions::default()
+        crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let (args, image_token_id, video_token_id, vision) =

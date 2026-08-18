@@ -148,7 +148,7 @@ pub fn load_native_model(
 ) -> Result<Model, Error> {
     load_native_model_with_options(
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
         stream,
         weights_stream,
     )
@@ -157,7 +157,7 @@ pub fn load_native_model(
 /// Loads a native-layout PersonaPlex checkpoint using shared model-load options.
 pub fn load_native_model_with_options(
     model_dir: impl AsRef<Path>,
-    options: crate::api::ModelLoadOptions,
+    options: crate::backend::mlx::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
@@ -237,7 +237,7 @@ pub fn load_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::PersonaPlex,
         model_dir.as_ref(),
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let metadata = get_model_metadata(&model_dir)?;
     let mut args = model_args_7b_v1();
@@ -273,7 +273,7 @@ pub fn load_model_quantized(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::PersonaPlex,
         model_dir.as_ref(),
-        crate::api::ModelLoadOptions::with_quantization(quantization),
+        crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let metadata = get_model_metadata(&model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -540,7 +540,7 @@ mod tests {
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let model = crate::api::realtime::load_model_with_options(
             &model_dir,
-            crate::api::ModelLoadOptions::with_quantization(
+            crate::backend::mlx::ModelLoadOptions::with_quantization(
                 crate::runtime::checkpoint::quantization::AffineQuantization::default(),
             ),
             gpu.stream(),

@@ -29,8 +29,7 @@ use crate::{
     runtime::media::{load_processor, ModelProcessor},
 };
 use crate::{
-    api::{Model, ModelLoadOptions},
-    backend::mlx::{structural, MlxModel},
+    backend::mlx::{structural, MlxModel, Model, ModelLoadOptions},
     error::Error,
     runtime::checkpoint::quantization::WeightQuantization,
 };

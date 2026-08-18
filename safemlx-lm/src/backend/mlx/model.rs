@@ -1,6 +1,45 @@
 //! Architecture-erased model, cache, and generation dispatch.
 
-use super::*;
+use std::path::Path;
+
+use safemlx::{error::Exception, Array, Stream};
+use safemlx_lm_core::cache::{
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions,
+};
+use safemlx_lm_core::generation::{
+    FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
+};
+use safemlx_lm_core::{MtpCapability, MtpCheckpointKind, MtpStats, SpeculativeSemanticState};
+
+use crate::architectures::{
+    deepseek_v3::model as deepseek_v3,
+    deepseek_v4::model as deepseek_v4,
+    gemma4::assistant as gemma4_assistant,
+    gemma4::model as gemma4,
+    gpt_oss::model as gpt_oss,
+    inkling::model as inkling,
+    kimi_linear::model as kimi_linear,
+    lfm2::model as lfm2,
+    llama::model as llama,
+    muse_glimmer,
+    nemotron_h::model as nemotron_h,
+    qwen::{
+        dense as dense_qwen,
+        hybrid::{qwen3_5, qwen3_next},
+        vl::{model as qwen3_vl, moe as qwen3_vl_moe},
+    },
+};
+use crate::backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
+use crate::error::Error;
+use crate::runtime::cache::residency::{
+    CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+};
+use crate::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache};
+use crate::runtime::execution::inspection::ActivationObserver;
+use crate::runtime::generation::sampler::{DefaultSampler, SpeculativeSampler};
+use crate::runtime::media::input;
+use crate::{LayerCachePolicy, LayerSchedule};
 
 /// Loaded model value for any architecture supported by this crate.
 pub enum Model {
@@ -138,7 +177,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn generate_mtp_input_with_sampler_callback_and_streams<S, F>(
+    pub(crate) fn generate_mtp_input_with_sampler_callback_and_streams<S, F>(
         &mut self,
         drafter: &mut MlxDrafter,
         cache: &mut ModelCache,
@@ -167,7 +206,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn generate_mtp_input_with_sampler_callback_and_streams_and_options<S, F>(
+    pub(crate) fn generate_mtp_input_with_sampler_callback_and_streams_and_options<S, F>(
         &mut self,
         drafter: &mut MlxDrafter,
         cache: &mut ModelCache,
@@ -231,7 +270,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn generate_mtp_input_with_semantics_and_options<S, F>(
+    pub(crate) fn generate_mtp_input_with_semantics_and_options<S, F>(
         &mut self,
         drafter: &mut MlxDrafter,
         cache: &mut ModelCache,
@@ -489,7 +528,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn generate_embedded_mtp_input_with_sampler_callback<S, F>(
+    pub(crate) fn generate_embedded_mtp_input_with_sampler_callback<S, F>(
         &mut self,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
@@ -608,7 +647,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn generate_embedded_mtp_input_with_semantics_and_options<S, F>(
+    pub(crate) fn generate_embedded_mtp_input_with_semantics_and_options<S, F>(
         &mut self,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
@@ -1399,7 +1438,7 @@ pub enum ModelCache {
     Qwen3Next(qwen3_next::Cache),
 }
 
-pub(super) fn validate_gemma4_drafter(
+pub(crate) fn validate_gemma4_drafter(
     target: &gemma4::ModelArgs,
     assistant: &gemma4_assistant::Gemma4AssistantDraftModel,
 ) -> Result<(), Exception> {

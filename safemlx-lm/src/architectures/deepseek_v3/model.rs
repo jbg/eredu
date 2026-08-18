@@ -3675,8 +3675,8 @@ fn load_model_impl(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let options = quantize_on_load.map_or_else(
-        crate::api::ModelLoadOptions::default,
-        crate::api::ModelLoadOptions::with_quantization,
+        crate::backend::mlx::ModelLoadOptions::default,
+        crate::backend::mlx::ModelLoadOptions::with_quantization,
     );
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV3,
@@ -3866,8 +3866,8 @@ pub(crate) fn load_gguf_checkpoint(
     weights_stream: &Stream,
 ) -> Result<LoadedDeepSeekGguf, Error> {
     let options = quantization.map_or_else(
-        crate::api::ModelLoadOptions::default,
-        crate::api::ModelLoadOptions::with_quantization,
+        crate::backend::mlx::ModelLoadOptions::default,
+        crate::backend::mlx::ModelLoadOptions::with_quantization,
     );
     crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::DeepSeek2,
@@ -4878,7 +4878,7 @@ mod tests {
                 weights.stream(),
             )
             .unwrap();
-        let mut observed = crate::api::Model::DeepSeekV3(generalized);
+        let mut observed = crate::backend::mlx::Model::DeepSeekV3(generalized);
         let input = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
         let mut plain_cache = plain.new_cache();
         let mut observed_cache = observed.new_cache();
@@ -4910,7 +4910,7 @@ mod tests {
             max_error < 1e-5,
             "observed forward changed logits by {max_error}"
         );
-        let crate::api::ModelCache::DeepSeekV3(observed_cache) = observed_cache else {
+        let crate::backend::mlx::ModelCache::DeepSeekV3(observed_cache) = observed_cache else {
             panic!("DeepSeek model returned the wrong cache type")
         };
         assert_eq!(plain_cache.offset(), observed_cache.offset());
@@ -5211,7 +5211,7 @@ mod tests {
         let loaded = LoadedModel::load(
             crate::backend::mlx::MlxBackend::new(stream, weights_stream),
             &dir,
-            crate::api::ModelLoadOptions::default(),
+            crate::backend::mlx::ModelLoadOptions::default(),
         )
         .unwrap();
         assert_eq!(loaded.model_type(), "deepseek_v3");

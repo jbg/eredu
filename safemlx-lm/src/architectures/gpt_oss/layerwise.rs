@@ -403,7 +403,7 @@ pub fn load_gpt_oss_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::GptOss,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = resident::get_model_args(model_dir)?;
     let adapter = GptOssLayerwiseAdapter::new(args, stream)?;
@@ -466,7 +466,7 @@ pub(crate) fn load_gpt_oss_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::GptOss,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let adapter = GptOssLayerwiseAdapter::new(resident::get_model_args(model_dir)?, stream)?;
     Ok(GptOssLayerwiseModel {
@@ -605,7 +605,7 @@ pub fn load_gpt_oss_expert_cache_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::GptOss,
         model_dir,
-        crate::api::ModelLoadOptions::default()
+        crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_model_args(model_dir)?;

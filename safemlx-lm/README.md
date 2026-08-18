@@ -119,9 +119,15 @@ standalone communication-session constructors.
 The tokenizer-aware entry point is generic too:
 
 ```rust,ignore
+use safemlx_lm::{api::LoadedModel, backend::mlx::{MlxBackend, ModelLoadOptions}};
+
 let backend = MlxBackend::new(execution_stream, weights_stream);
 let model = LoadedModel::load(backend, artifact, ModelLoadOptions::default())?;
 ```
+
+MLX-owned executable, cache, load-policy, and generation types are exposed only
+from `backend::mlx`: `Model`, `ModelCache`, `ModelLoadOptions`, and
+`MlxGeneration`. The backend-neutral `api` namespace does not alias them.
 
 `LoadedModel<B>` has no default backend type. The same call accepts another
 `ModelLoadingBackend + TextGenerationBackend`; only backend construction and

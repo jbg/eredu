@@ -23,15 +23,16 @@ use safemlx_lm::{
         kimi_linear::model as kimi_model, lfm2::model as lfm2_model, llama::model as llama_model,
         nemotron_h::model as nemotron_model, qwen::dense as dense_qwen,
     },
+    backend::mlx::ModelLoadOptions,
     core::BackendSession,
     nn::generation::CausalLm,
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::canonical_checkpoint_name,
     runtime::generation::sampler::DefaultSampler,
     CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, LayerCachePolicy,
-    LayerWeightResidency, LayerwiseLoadOptions, MlxBackend, MlxParallelContext, ModelLoadOptions,
-    PagedCacheOptions, ParallelModelInfo, PromptCacheDescriptor, PromptCacheOptions,
-    PromptCacheTopology, WeightResidency,
+    LayerWeightResidency, LayerwiseLoadOptions, MlxBackend, MlxParallelContext, PagedCacheOptions,
+    ParallelModelInfo, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+    WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -342,7 +343,7 @@ impl GeneralizedTensorModel {
         checkpoint_diagnostics(self.complete())
     }
 
-    fn complete(&self) -> &safemlx_lm::api::Model {
+    fn complete(&self) -> &safemlx_lm::backend::mlx::Model {
         match &self.0.inner {
             safemlx_lm::backend::mlx::MlxModelKind::Complete(model) => model,
             _ => panic!("tensor-parallel fixture did not load a complete model"),
@@ -351,20 +352,30 @@ impl GeneralizedTensorModel {
 }
 
 fn checkpoint_diagnostics(
-    model: &safemlx_lm::api::Model,
+    model: &safemlx_lm::backend::mlx::Model,
 ) -> safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
     match model {
-        safemlx_lm::api::Model::Llama(model) => model.checkpoint_store().diagnostics().unwrap(),
-        safemlx_lm::api::Model::DeepSeekV3(model) => {
+        safemlx_lm::backend::mlx::Model::Llama(model) => {
             model.checkpoint_store().diagnostics().unwrap()
         }
-        safemlx_lm::api::Model::DenseQwen(model) => model.checkpoint_store().diagnostics().unwrap(),
-        safemlx_lm::api::Model::Lfm2(model) => model.checkpoint_store().diagnostics().unwrap(),
-        safemlx_lm::api::Model::GptOss(model) => model.checkpoint_store().diagnostics().unwrap(),
-        safemlx_lm::api::Model::KimiLinear(model) => {
+        safemlx_lm::backend::mlx::Model::DeepSeekV3(model) => {
             model.checkpoint_store().diagnostics().unwrap()
         }
-        safemlx_lm::api::Model::NemotronH(model) => model.checkpoint_store().diagnostics().unwrap(),
+        safemlx_lm::backend::mlx::Model::DenseQwen(model) => {
+            model.checkpoint_store().diagnostics().unwrap()
+        }
+        safemlx_lm::backend::mlx::Model::Lfm2(model) => {
+            model.checkpoint_store().diagnostics().unwrap()
+        }
+        safemlx_lm::backend::mlx::Model::GptOss(model) => {
+            model.checkpoint_store().diagnostics().unwrap()
+        }
+        safemlx_lm::backend::mlx::Model::KimiLinear(model) => {
+            model.checkpoint_store().diagnostics().unwrap()
+        }
+        safemlx_lm::backend::mlx::Model::NemotronH(model) => {
+            model.checkpoint_store().diagnostics().unwrap()
+        }
         model => panic!(
             "checkpoint diagnostics unavailable for {}",
             model.model_type()
@@ -399,7 +410,7 @@ trait GeneralizedTensorCacheExt {
     );
 }
 
-impl GeneralizedTensorCacheExt for safemlx_lm::api::ModelCache {
+impl GeneralizedTensorCacheExt for safemlx_lm::backend::mlx::ModelCache {
     fn offset(&self) -> i32 {
         match self {
             Self::Llama(cache) => cache.offset(),

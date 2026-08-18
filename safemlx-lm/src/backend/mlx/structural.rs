@@ -7,7 +7,7 @@ use safemlx::ops::{GgufCheckpoint, GgufMetadataValue, GgufType};
 use safemlx_lm_core::{GgufArchitecture, ModelKind};
 use serde_json::Value;
 
-use crate::api::ModelLoadOptions;
+use crate::backend::mlx::ModelLoadOptions;
 use crate::{
     architectures::{
         deepseek_v3::model as deepseek_v3,

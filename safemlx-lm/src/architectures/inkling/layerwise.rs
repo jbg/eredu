@@ -1076,7 +1076,7 @@ pub fn load_inkling_layerwise_model(
     let options = options.into();
     let residency = options.weight_residency();
     let load_options = quantization
-        .map(crate::api::ModelLoadOptions::with_quantization)
+        .map(crate::backend::mlx::ModelLoadOptions::with_quantization)
         .unwrap_or_default()
         .with_weight_residency(residency);
     crate::backend::mlx::structural::validate_safetensors_load_path(
@@ -1142,7 +1142,7 @@ pub(crate) fn load_inkling_tensor_parallel_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = resident::get_model_args(model_dir)?;
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
@@ -1172,7 +1172,7 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
         crate::api::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint_with_mmproj(checkpoint, metadata, mmproj)?;
@@ -1198,7 +1198,7 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
     let load_options = quantization
-        .map(crate::api::ModelLoadOptions::with_quantization)
+        .map(crate::backend::mlx::ModelLoadOptions::with_quantization)
         .unwrap_or_default()
         .with_weight_residency(residency);
     crate::backend::mlx::structural::validate_gguf(
@@ -1307,7 +1307,7 @@ pub fn load_inkling_expert_cache_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
-        crate::api::ModelLoadOptions::default()
+        crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_model_args(model_dir)?;
@@ -4381,13 +4381,13 @@ mod tests {
             let loaded = crate::load_model(
                 &backend,
                 dir.path(),
-                crate::api::ModelLoadOptions::with_quantization(quantization),
+                crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
             )
             .unwrap()
             .into_inner()
             .into_complete()
             .unwrap();
-            let crate::api::Model::Inkling(mut quantized) = loaded else {
+            let crate::backend::mlx::Model::Inkling(mut quantized) = loaded else {
                 panic!("high-level dispatch did not return an Inkling model")
             };
             assert_eq!(

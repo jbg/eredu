@@ -2866,8 +2866,8 @@ fn load_model_impl(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let inspection_options = quantization.map_or_else(
-        crate::api::ModelLoadOptions::default,
-        crate::api::ModelLoadOptions::with_quantization,
+        crate::backend::mlx::ModelLoadOptions::default,
+        crate::backend::mlx::ModelLoadOptions::with_quantization,
     );
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::KimiLinear,
@@ -2946,8 +2946,8 @@ pub(crate) fn load_gguf_checkpoint(
     weights_stream: &Stream,
 ) -> Result<LoadedKimiLinearGguf, Error> {
     let options = quantization.map_or_else(
-        crate::api::ModelLoadOptions::default,
-        crate::api::ModelLoadOptions::with_quantization,
+        crate::backend::mlx::ModelLoadOptions::default,
+        crate::backend::mlx::ModelLoadOptions::with_quantization,
     );
     crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::KimiLinear,

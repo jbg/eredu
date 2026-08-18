@@ -2,9 +2,11 @@
 
 /// Prompt-cache topology conversion for MLX distributed execution.
 pub(crate) mod cache;
+mod config;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
 mod loading;
+mod model;
 /// Realtime Moshi/PersonaPlex session execution.
 pub mod realtime;
 /// MLX allocator observations for neutral residency telemetry.
@@ -19,8 +21,12 @@ pub(crate) use loading::validate_gguf_quantization_source;
 /// Architecture-erased model/session execution.
 mod session;
 
+pub(crate) use config::ensure_replicated_load_options;
+pub use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
 pub use distributed::MlxDistributedSession;
+pub(crate) use model::validate_gemma4_drafter;
+pub use model::{Model, ModelCache};
 pub(crate) use session::{submit_decode_with_cache, submit_prefill_with_cache};
 pub use session::{
     MlxGeneration, MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion,
@@ -37,7 +43,6 @@ use safemlx_lm_core::backend::{
 #[cfg(feature = "media-processing")]
 use crate::runtime::media::ModelProcessor;
 use crate::{
-    api::{Model, ModelLoadOptions},
     architectures::distributed::{expert::ExpertParallelModel, pipeline::PipelineModel},
     error::Error,
 };

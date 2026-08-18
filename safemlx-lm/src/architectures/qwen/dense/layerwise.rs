@@ -692,7 +692,7 @@ pub fn load_safetensors(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         args.model_kind(),
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
@@ -809,7 +809,7 @@ pub(crate) fn load_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         args.model_kind(),
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
@@ -3008,8 +3008,8 @@ mod tests {
         )
         .unwrap();
         for mut model in [
-            crate::api::Model::DenseQwen(fully_resident),
-            crate::api::Model::DenseQwen(layerwise),
+            crate::backend::mlx::Model::DenseQwen(fully_resident),
+            crate::backend::mlx::Model::DenseQwen(layerwise),
         ] {
             let options = PagedCacheOptions::new(1, 16 * 1024, 16 * 1024, 1)
                 .unwrap()

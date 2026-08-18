@@ -4522,7 +4522,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
     let options = quantization
-        .map(crate::api::ModelLoadOptions::with_quantization)
+        .map(crate::backend::mlx::ModelLoadOptions::with_quantization)
         .unwrap_or_default();
     crate::backend::mlx::structural::validate_gguf(
         crate::api::GgufArchitecture::Gemma4,
@@ -5983,7 +5983,7 @@ pub fn load_gemma4_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Gemma4,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let (model_args, vision_config, image_token_id, video_token_id, audio_config, audio_token_id) =
         get_gemma4_model_config(model_dir)?;
@@ -6027,7 +6027,7 @@ pub fn load_gemma4_model_quantized(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Gemma4,
         model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
+        crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let (
         mut model_args,

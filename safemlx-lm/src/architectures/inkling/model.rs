@@ -3845,7 +3845,7 @@ pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
         crate::api::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
     if let Some(mmproj) = mmproj {
@@ -4854,7 +4854,7 @@ pub fn load_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let args = get_model_args(model_dir)?;
     let mut model = Model::new(args, stream)?;

@@ -4017,7 +4017,7 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
         gguf_architecture,
         checkpoint,
         &metadata,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
     let mut args = model_args_from_gguf_catalog(checkpoint, &metadata, &architecture)?;
@@ -4067,7 +4067,7 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
         gguf_architecture,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
     let mut args = model_args_from_gguf_catalog(checkpoint, metadata, &architecture)?;
@@ -4564,7 +4564,7 @@ pub fn load_nemotron_h_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::NemotronH,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let args = get_nemotron_h_model_args(model_dir)?;
     let mut model = Model::new(args.clone(), stream)?;

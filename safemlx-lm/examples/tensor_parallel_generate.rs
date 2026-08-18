@@ -5,10 +5,11 @@ use safemlx::{
     DeviceType, Stream,
 };
 use safemlx_lm::{
+    backend::mlx::ModelLoadOptions,
     core::{Backend as _, BackendSession},
     load_model,
     runtime::{generation::sampler::DefaultSampler, media::input},
-    DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions,
+    DeviceAssignment, MlxBackend, MlxParallelContext,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

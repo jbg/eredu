@@ -20,7 +20,6 @@ use safemlx::{
 };
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
-    api::ModelLoadOptions,
     architectures::distributed::expert::{
         load_expert_parallel_model_with_options,
         load_expert_parallel_model_with_options_and_assignment, profile_expert_parallel_timings,
@@ -37,6 +36,7 @@ use safemlx_lm::{
         nemotron_h::model as nemotron_h,
         qwen::{dense as dense_qwen, hybrid::qwen3_5, vl::model as qwen3_vl},
     },
+    backend::mlx::ModelLoadOptions,
     load_model,
     runtime::cache::{ConcatKeyValueCache, SlidingKeyValueCache},
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},

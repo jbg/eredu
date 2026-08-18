@@ -12,12 +12,14 @@ residency policy, topology, tokenizer, processor, and companion files without
 materializing weights. It is the cheapest place to reject an incompatible
 request.
 
-The `ModelLoadOptions` passed to the loader contain two independent choices:
+The MLX backend's `safemlx_lm::backend::mlx::ModelLoadOptions` contain two
+independent choices:
 
 - `quantization`: an optional transformation for eligible dense weights; and
 - `weight_residency`: the static parameter placement policy.
 
-Non-replicated distributed topologies require the matching distributed loader.
+Non-replicated distributed topologies use the same architecture-erased loader
+with an MLX parallel context.
 
 ## Weight residency
 

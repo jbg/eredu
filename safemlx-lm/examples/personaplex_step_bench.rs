@@ -3,8 +3,8 @@ use std::{path::PathBuf, time::Instant};
 use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_lm::{
     api::realtime::{RealtimeSampling, RealtimeScheduler},
-    api::ModelLoadOptions,
     architectures::moshi::personaplex,
+    backend::mlx::ModelLoadOptions,
     load_realtime_model, load_realtime_model_with_options,
     runtime::checkpoint::quantization::AffineQuantization,
     MlxRealtimeBackend, MlxRealtimeInput, RealtimeModel, RequestId, SchedulerLimits,

@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    api::ModelLoadOptions,
+    backend::mlx::ModelLoadOptions,
     error::Error,
     nn::{
         layers::silu,

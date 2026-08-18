@@ -1398,7 +1398,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
         gguf_architecture,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
 
@@ -1663,7 +1663,7 @@ pub fn load_resident_llama_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let model_args = get_llama_model_args(model_dir)?;
     let mut model = ResidentModel::new(model_args, stream)?;
@@ -1685,7 +1685,7 @@ pub fn load_resident_llama_model_quantized(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
+        crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let mut model_args = get_llama_model_args(model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(

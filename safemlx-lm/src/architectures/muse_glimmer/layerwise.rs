@@ -629,7 +629,7 @@ pub fn load_safetensors(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         args.model_kind(),
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
@@ -728,7 +728,7 @@ pub(crate) fn load_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         args.model_kind(),
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {

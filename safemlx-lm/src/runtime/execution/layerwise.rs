@@ -113,7 +113,7 @@ pub(crate) fn validate_gguf_layerwise_source(
         architecture,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     Ok(architecture)

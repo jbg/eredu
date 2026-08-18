@@ -656,7 +656,7 @@ pub fn load_kimi_linear_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::KimiLinear,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
@@ -720,7 +720,7 @@ pub(crate) fn load_kimi_linear_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::KimiLinear,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
@@ -826,7 +826,7 @@ pub fn load_kimi_linear_expert_cache_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::KimiLinear,
         model_dir,
-        crate::api::ModelLoadOptions::default()
+        crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_model_args(model_dir)?;
@@ -2616,8 +2616,8 @@ mod tests {
         .unwrap();
 
         for mut model in [
-            crate::api::Model::KimiLinear(fully_resident),
-            crate::api::Model::KimiLinear(layerwise),
+            crate::backend::mlx::Model::KimiLinear(fully_resident),
+            crate::backend::mlx::Model::KimiLinear(layerwise),
         ] {
             let options = crate::PagedCacheOptions::new(1, 16 * 1024, 16 * 1024, 1)
                 .unwrap()

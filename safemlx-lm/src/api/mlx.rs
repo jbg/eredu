@@ -30,21 +30,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
-use crate::core::cache::{
-    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
-    PromptCacheModelIdentity, PromptCacheOptions,
-};
+use crate::core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
 use crate::core::generation::{
     resolve_generation_config, CheckpointGenerationConfig, FinishReason,
     GenerationCancellationToken, GenerationConfigOverrides, MtpConfig, MtpSchedulerOptions,
     SemanticEvent,
 };
 use crate::core::{
-    MtpBatchOutput, MtpCapability, MtpCheckpointKind, MtpSchedulerStats, MtpStats,
-    SpeculativeOutputError, SpeculativeSemanticState,
+    MtpBatchOutput, MtpCapability, MtpSchedulerStats, MtpStats, SpeculativeOutputError,
+    SpeculativeSemanticState,
 };
 
-use crate::backend::mlx::MlxParallelContext;
+use crate::backend::mlx::MlxGeneration;
 pub(crate) use crate::nn as common;
 use crate::runtime::chat::constraints::ConstraintCompiler;
 use crate::runtime::chat::{
@@ -55,7 +52,6 @@ pub use crate::runtime::chat::{
     NativeToolSupport, ParallelToolCallPolicy, PreparedChat, SemanticSupport, ToolChoice,
 };
 use crate::runtime::checkpoint::gguf::{self as gguf_tokenizer, GgufTokenizer};
-use crate::runtime::checkpoint::quantization::WeightQuantization;
 use crate::runtime::execution::inspection::ActivationObserver;
 pub use crate::runtime::generation::sampler::ConstraintError;
 use crate::runtime::generation::sampler::{
@@ -77,7 +73,6 @@ use crate::{
     error::Error,
     runtime::attention::LayerSchedule,
     runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
-    runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
 };
 
 /// DeepSeek-V3 and DeepSeek-R1 decoder support.
@@ -273,10 +268,10 @@ pub(crate) fn gguf_eos_token_ids(
 
 #[path = "config.rs"]
 mod config;
-pub(crate) use config::ensure_replicated_load_options;
+use crate::backend::mlx::ModelLoadOptions;
+pub use config::ModelKind;
 #[cfg(test)]
 pub(crate) use config::{resolve_model_config, ResolvedModelConfig};
-pub use config::{ModelKind, ModelLoadOptions};
 pub use safemlx_lm_core::GgufArchitecture;
 
 #[path = "automatic.rs"]
@@ -303,11 +298,7 @@ pub use capability::{
     RuntimeStateEstimate, SlidingWindowLayerCount, StateMemoryAssumptions, StaticMemoryReport,
 };
 
-#[path = "dispatch.rs"]
-mod dispatch;
-pub use crate::backend::mlx::MlxGeneration;
-use dispatch::validate_gemma4_drafter;
-pub use dispatch::{Model, ModelCache};
+use crate::backend::mlx::{validate_gemma4_drafter, Model, ModelCache};
 
 #[path = "request.rs"]
 mod request;

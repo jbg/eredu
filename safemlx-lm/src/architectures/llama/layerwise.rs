@@ -470,7 +470,7 @@ pub(crate) fn load_llama_safetensors_mlx(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(weight_residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(weight_residency),
     )?;
     if weight_residency.expert_cache().is_some() {
         return Err(Error::UnsupportedArchitecture(
@@ -539,7 +539,7 @@ pub(crate) fn load_llama_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = resident::get_llama_model_args(model_dir)?;
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;

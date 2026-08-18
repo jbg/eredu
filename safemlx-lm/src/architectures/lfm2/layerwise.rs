@@ -550,7 +550,7 @@ pub fn load_lfm2_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Lfm2,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     let args = resident::get_model_args(model_dir)?;
     let adapter = Lfm2LayerwiseAdapter::new(args, stream)?;
@@ -613,7 +613,7 @@ pub(crate) fn load_lfm2_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Lfm2,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
     Ok(Lfm2LayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(

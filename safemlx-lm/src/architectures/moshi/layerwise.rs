@@ -957,7 +957,7 @@ pub fn load_personaplex_layerwise_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::PersonaPlex,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let metadata = crate::architectures::moshi::personaplex::get_model_metadata(model_dir)?;
     let mut args = crate::architectures::moshi::personaplex::model_args_7b_v1();
@@ -2083,9 +2083,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        api::moshi as eager,
         api::realtime::{generate_encoded_greedy, RealtimeSampling, RealtimeScheduler},
-        api::{moshi as eager, ModelLoadOptions},
         backend::mlx::realtime::MlxRealtimeModel,
+        backend::mlx::ModelLoadOptions,
         core::residency::{MemoryTier, OffloadConfig},
         runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
         runtime::execution::layerwise::{
@@ -2474,7 +2475,7 @@ mod tests {
 
         let loaded = crate::api::realtime::load_model_with_options(
             dir.path(),
-            crate::api::ModelLoadOptions::default().with_weight_residency(
+            crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(
                 crate::runtime::execution::layerwise::WeightResidency::layerwise_host(
                     LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
                 ),
@@ -2595,7 +2596,7 @@ mod tests {
 
         let loaded = crate::api::realtime::load_model_with_options(
             dir.path(),
-            crate::api::ModelLoadOptions::default().with_weight_residency(
+            crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(
                 crate::runtime::execution::layerwise::WeightResidency::dense_disk_stream(dense),
             ),
             gpu.stream(),

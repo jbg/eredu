@@ -5618,7 +5618,7 @@ pub(crate) fn load_qwen3_5_gguf_checkpoint(
         resolved,
         checkpoint,
         &metadata,
-        crate::api::ModelLoadOptions {
+        crate::backend::mlx::ModelLoadOptions {
             quantization,
             ..Default::default()
         },
@@ -6712,7 +6712,7 @@ pub fn load_qwen3_5_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let (args, image_token_id, video_token_id, vision_config) = get_qwen3_5_model_args(model_dir)?;
     if let Some(quantization_config) = &args.quantization_config {
@@ -6789,7 +6789,7 @@ pub fn load_qwen3_5_model_quantized(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35,
         model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
+        crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let load_visual = vision_config.is_some();
     let mut model = Model::new_with_affine(
@@ -7416,7 +7416,8 @@ mod tests {
     #[cfg(feature = "image-processing")]
     use crate::runtime::media::{load_processor, MediaInput, ProcessorInput, RgbImageView};
     use crate::{
-        api::{common::generation::CausalLm, input as runtime_input, Model as AnyModel},
+        api::{common::generation::CausalLm, input as runtime_input},
+        backend::mlx::Model as AnyModel,
         error::Error,
         runtime::checkpoint::quantization::AffineQuantization,
         runtime::execution::inspection::ActivationRecorder,
@@ -8821,11 +8822,15 @@ mod tests {
         .unwrap();
 
         let backend = crate::MlxBackend::new(stream, weights_ctx.stream());
-        let model = crate::load_model(&backend, &dir, crate::ModelLoadOptions::default())
-            .unwrap()
-            .into_inner()
-            .into_complete()
-            .unwrap();
+        let model = crate::load_model(
+            &backend,
+            &dir,
+            crate::backend::mlx::ModelLoadOptions::default(),
+        )
+        .unwrap()
+        .into_inner()
+        .into_complete()
+        .unwrap();
         let AnyModel::Qwen35(mut model) = model else {
             panic!("qwen3_5 must dispatch to the Qwen3.5 loader");
         };
@@ -8873,7 +8878,7 @@ mod tests {
         let quantized = crate::load_model(
             &backend,
             &dir,
-            crate::api::ModelLoadOptions::with_quantization(
+            crate::backend::mlx::ModelLoadOptions::with_quantization(
                 AffineQuantization::new(32, 4).unwrap(),
             ),
         )

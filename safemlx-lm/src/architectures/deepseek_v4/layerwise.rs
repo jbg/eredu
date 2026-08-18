@@ -1518,7 +1518,7 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
         crate::api::GgufArchitecture::DeepSeek4,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     let prepared = super::model::prepare_gguf_checkpoint(checkpoint, metadata)?;
@@ -1584,7 +1584,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
         crate::api::GgufArchitecture::DeepSeek4,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
     let prepared = super::model::prepare_gguf_checkpoint(checkpoint, metadata)?;
@@ -1644,7 +1644,8 @@ pub(crate) fn load_deepseek_v4_tensor_parallel_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV4,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency()),
+        crate::backend::mlx::ModelLoadOptions::default()
+            .with_weight_residency(options.weight_residency()),
     )?;
     let args = super::model::get_model_args(model_dir)?;
     let quantization =

@@ -2405,7 +2405,7 @@ pub(crate) fn load_gguf_checkpoint(
         gguf_architecture,
         checkpoint,
         &metadata,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
     let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
@@ -2520,7 +2520,7 @@ pub(crate) fn prepare_gguf_checkpoint(
         gguf_architecture,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
     let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
@@ -3431,7 +3431,7 @@ pub fn load_safetensors(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         model_args.model_kind(),
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let mut model = Model::new(model_args, stream)?;
     let config = safetensors_strict_load_config();
@@ -3455,7 +3455,7 @@ pub fn load_safetensors_quantized(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         model_args.model_kind(),
         model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
+        crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "Muse-Glimmer",

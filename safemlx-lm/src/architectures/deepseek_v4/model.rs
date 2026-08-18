@@ -2235,7 +2235,7 @@ pub fn load_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         crate::api::ModelKind::DeepSeekV4,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let mut model = Model::new(args.clone(), stream)?;
     let config = StrictLoadConfig::default();

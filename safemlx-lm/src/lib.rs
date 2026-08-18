@@ -88,10 +88,9 @@ pub use api::{
     ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
     HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InspectionIssue,
     InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
-    ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions, ModelResourceProfile,
-    ObservationKind, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
-    ResidencyPlan, ResidencyTelemetry, TimingTelemetry, TransferTelemetry,
-    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    ModelInspectionOptions, ModelInspectionReport, ModelResourceProfile, ObservationKind, Observed,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
+    TimingTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 #[cfg(feature = "mlx")]
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};

@@ -22,12 +22,13 @@ use safemlx_lm::{
         distributed::pipeline::{load_pipeline_model_with_options, PipelineStep},
         qwen::vl::model as qwen3_vl,
     },
+    backend::mlx::ModelLoadOptions,
     nn::generation::CausalLm,
     runtime::generation::sampler::DefaultSampler,
     runtime::media::input::{InputMetadata, InputPart, ModelInput},
     runtime::media::PreparedModelInput,
     DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions, LayerwiseLoadOptions,
-    MlxBackend, MlxParallelContext, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions,
+    MlxBackend, MlxParallelContext, NonExpertWeightResidency, PagedCacheOptions,
     PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 

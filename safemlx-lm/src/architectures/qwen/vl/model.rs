@@ -855,7 +855,7 @@ pub fn load_qwen3_vl_model(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::backend::mlx::ModelLoadOptions::default(),
     )?;
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default();
@@ -884,7 +884,7 @@ pub fn load_qwen3_vl_model_quantized(
     crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
         model_dir,
-        crate::api::ModelLoadOptions::with_quantization(quantization),
+        crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let existing = args
         .text_config
@@ -2097,7 +2097,7 @@ mod tests {
         let mut first =
             crate::architectures::distributed::pipeline::load_pipeline_model_with_options(
                 &model_path,
-                crate::ModelLoadOptions::with_parallel(topology(0)),
+                crate::backend::mlx::ModelLoadOptions::with_parallel(topology(0)),
                 stream,
                 stream,
             )
@@ -2105,7 +2105,7 @@ mod tests {
         let mut second =
             crate::architectures::distributed::pipeline::load_pipeline_model_with_options(
                 &model_path,
-                crate::ModelLoadOptions::with_parallel(topology(1)),
+                crate::backend::mlx::ModelLoadOptions::with_parallel(topology(1)),
                 stream,
                 stream,
             )

@@ -25,10 +25,11 @@ use serde::Deserialize;
 use std::path::Path;
 
 use crate::{
-    api::{ensure_replicated_load_options, moshi, personaplex, ModelLoadOptions},
+    api::{moshi, personaplex},
     backend::mlx::realtime::{
         MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel,
     },
+    backend::mlx::{ensure_replicated_load_options, ModelLoadOptions},
     error::Error,
     runtime::checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
 };
