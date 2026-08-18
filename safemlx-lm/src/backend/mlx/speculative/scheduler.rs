@@ -4,9 +4,9 @@ use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 
 #[cfg(test)]
 use crate::core::generation::MtpRequestPhase;
-use safemlx::{error::Exception, Array, Stream, TimedEvaluation};
+use safemlx::{error::Exception, Array, TimedEvaluation};
 #[cfg(test)]
-use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event};
+use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Stream};
 #[cfg(test)]
 use safemlx_lm_core::{
     resolve_optimistic_branch, SpeculativeDraftBlock, SpeculativeExecutionTopology,
@@ -470,65 +470,7 @@ where
     B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler + Clone + 'runtime,
 {
-    generate_with_streams_and_callback(
-        backend,
-        cache,
-        input,
-        config,
-        prng_key,
-        sampler,
-        streams,
-        |_| Ok(()),
-    )
-}
-
-/// Runs one scheduled request and reports committed tokens.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_callback<'runtime, B, S, F>(
-    backend: &'runtime mut B,
-    cache: &'runtime mut B::Cache,
-    input: ModelInput<'_>,
-    config: &MtpConfig,
-    prng_key: Option<Array>,
-    sampler: &mut S,
-    stream: &'runtime Stream,
-    on_token: F,
-) -> Result<(Vec<u32>, MtpStats), Exception>
-where
-    B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone + 'runtime,
-    F: FnMut(u32) -> Result<(), Exception> + 'runtime,
-{
-    generate_with_streams_and_callback(
-        backend,
-        cache,
-        input,
-        config,
-        prng_key,
-        sampler,
-        MtpExecutionStreams::single(stream),
-        on_token,
-    )
-}
-
-/// Runs one scheduled request with explicit streams and a commit callback.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_streams_and_callback<'runtime, B, S, F>(
-    backend: &'runtime mut B,
-    cache: &'runtime mut B::Cache,
-    input: ModelInput<'_>,
-    config: &MtpConfig,
-    prng_key: Option<Array>,
-    sampler: &mut S,
-    streams: MtpExecutionStreams<'runtime>,
-    on_token: F,
-) -> Result<(Vec<u32>, MtpStats), Exception>
-where
-    B: MlxSpeculativeRuntime<'runtime>,
-    S: SpeculativeSampler + Clone + 'runtime,
-    F: FnMut(u32) -> Result<(), Exception> + 'runtime,
-{
-    generate_with_streams_and_callback_and_options(
+    generate_tokens(
         backend,
         cache,
         input,
@@ -537,14 +479,14 @@ where
         sampler,
         streams,
         MtpSchedulerOptions::default(),
-        on_token,
+        |_| Ok(()),
     )
 }
 
 /// Runs one scheduled request with explicit streams, scheduler options, and a
 /// commit callback.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_streams_and_callback_and_options<'runtime, B, S, F>(
+pub(crate) fn generate_tokens<'runtime, B, S, F>(
     backend: &'runtime mut B,
     cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
@@ -586,7 +528,7 @@ where
 
 /// Runs one request with transactional semantic output.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_semantics_and_options<'runtime, B, S, F>(
+pub(crate) fn generate_semantic<'runtime, B, S, F>(
     backend: &'runtime mut B,
     cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
@@ -1717,7 +1659,7 @@ mod tests {
         };
         let mut cache = 0;
         let mut emitted = Vec::new();
-        let (tokens, stats) = generate_with_callback(
+        let (tokens, stats) = generate_tokens(
             &mut ScriptedBackend {
                 first_token: 1,
                 rejection_token: 1,
@@ -1733,7 +1675,8 @@ mod tests {
             &config,
             None,
             &mut DefaultSampler,
-            stream,
+            MtpExecutionStreams::single(stream),
+            MtpSchedulerOptions::default(),
             |token| {
                 emitted.push(token);
                 Ok(())

@@ -190,9 +190,10 @@ impl Model {
                 };
                 let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
-                crate::architectures::gemma4::mtp::generate_with_streams_and_callback_and_options(
-                    target,
-                    assistant,
+                let mut executor =
+                    crate::architectures::gemma4::mtp::Gemma4MtpExecutor::new(target, assistant);
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
                     cache,
                     input,
                     config,
@@ -206,10 +207,10 @@ impl Model {
             Self::MuseGlimmer(target) => {
                 let assistant = drafter.muse_glimmer_mut();
                 let mut backend =
-                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
+                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
                         target, assistant,
                     );
-                crate::backend::mlx::speculative::scheduler::generate_with_streams_and_callback_and_options(
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
                     &mut backend,
                     cache,
                     input,
@@ -255,9 +256,10 @@ impl Model {
                 };
                 let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
-                crate::architectures::gemma4::mtp::generate_with_semantics_and_options(
-                    target,
-                    assistant,
+                let mut executor =
+                    crate::architectures::gemma4::mtp::Gemma4MtpExecutor::new(target, assistant);
+                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    &mut executor,
                     cache,
                     input,
                     config,
@@ -273,10 +275,10 @@ impl Model {
             Self::MuseGlimmer(target) => {
                 let assistant = drafter.muse_glimmer_mut();
                 let mut backend =
-                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
+                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
                         target, assistant,
                     );
-                crate::backend::mlx::speculative::scheduler::generate_with_semantics_and_options(
+                crate::backend::mlx::speculative::scheduler::generate_semantic(
                     &mut backend,
                     cache,
                     input,
@@ -357,7 +359,7 @@ impl Model {
             })
             .map_err(|error| Exception::custom(error.to_string()))?;
         let mut synchronized =
-            crate::runtime::generation::embedded_mtp::DistributedEmbeddedMtpSampler::new(
+            crate::backend::mlx::speculative::embedded::DistributedEmbeddedMtpSampler::new(
                 sampler.clone(),
                 sampling_rank,
                 execution.world(),
@@ -370,14 +372,19 @@ impl Model {
                         model,
                         tensor_group,
                     );
-                crate::runtime::generation::embedded_mtp::generate_with_callback(
-                    &mut target,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        &mut target,
+                    );
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
                     cache,
                     input,
                     config,
                     prng_key,
                     &mut synchronized,
-                    stream,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
                     |_| Ok(()),
                 )
             }
@@ -387,14 +394,19 @@ impl Model {
                         model,
                         tensor_group,
                     );
-                crate::runtime::generation::embedded_mtp::generate_with_callback(
-                    &mut target,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        &mut target,
+                    );
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
                     cache,
                     input,
                     config,
                     prng_key,
                     &mut synchronized,
-                    stream,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
                     |_| Ok(()),
                 )
             }
@@ -404,14 +416,19 @@ impl Model {
                         model,
                         tensor_group,
                     );
-                crate::runtime::generation::embedded_mtp::generate_with_callback(
-                    &mut target,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        &mut target,
+                    );
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
                     cache,
                     input,
                     config,
                     prng_key,
                     &mut synchronized,
-                    stream,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
                     |_| Ok(()),
                 )
             }
@@ -422,14 +439,19 @@ impl Model {
                         model,
                         tensor_group,
                     );
-                crate::architectures::qwen::hybrid::mtp::generate_with_callback(
-                    &mut target,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        &mut target,
+                    );
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
                     cache,
                     input,
                     config,
                     prng_key,
                     &mut synchronized,
-                    stream,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
                     |_| Ok(()),
                 )
             }
@@ -482,48 +504,98 @@ impl Model {
     {
         match (self, cache) {
             (Self::DeepSeekV3(target), ModelCache::DeepSeekV3(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_callback(
-                    target, cache, input, config, prng_key, sampler, stream, on_token,
-                )
-            }
-            (Self::DeepSeekV4(target), ModelCache::DeepSeekV4(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_callback(
-                    target.as_mut(),
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
                     cache,
                     input,
                     config,
                     prng_key,
                     sampler,
-                    stream,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
+                    on_token,
+                )
+            }
+            (Self::DeepSeekV4(target), ModelCache::DeepSeekV4(cache)) => {
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target.as_mut(),
+                    );
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
                     on_token,
                 )
             }
             (Self::DeepSeekV4Layerwise(target), ModelCache::DeepSeekV4(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_callback(
-                    target.as_mut(),
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target.as_mut(),
+                    );
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
                     cache,
                     input,
                     config,
                     prng_key,
                     sampler,
-                    stream,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
                     on_token,
                 )
             }
             (Self::Inkling(target), ModelCache::Inkling(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_callback(
-                    target, cache, input, config, prng_key, sampler, stream, on_token,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
+                    on_token,
                 )
             }
             (Self::NemotronH(target), ModelCache::NemotronH(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_callback(
-                    target, cache, input, config, prng_key, sampler, stream, on_token,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
+                    on_token,
                 )
             }
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35(target), ModelCache::Qwen35(cache)) => {
-                crate::architectures::qwen::hybrid::mtp::generate_with_callback(
-                    target, cache, input, config, prng_key, sampler, stream, on_token,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    &mut executor,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    MtpExecutionStreams::single(stream),
+                    MtpSchedulerOptions::default(),
+                    on_token,
                 )
             }
             (model, _) => Err(Exception::custom(format!(
@@ -554,8 +626,10 @@ impl Model {
     {
         match (self, cache) {
             (Self::DeepSeekV3(target), ModelCache::DeepSeekV3(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
-                    target,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    &mut executor,
                     cache,
                     input,
                     config,
@@ -563,14 +637,18 @@ impl Model {
                     sampler,
                     semantic,
                     cancellation,
-                    stream,
+                    MtpExecutionStreams::single(stream),
                     scheduler_options,
                     on_event,
                 )
             }
             (Self::DeepSeekV4(target), ModelCache::DeepSeekV4(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
-                    target.as_mut(),
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target.as_mut(),
+                    );
+                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    &mut executor,
                     cache,
                     input,
                     config,
@@ -578,14 +656,18 @@ impl Model {
                     sampler,
                     semantic,
                     cancellation,
-                    stream,
+                    MtpExecutionStreams::single(stream),
                     scheduler_options,
                     on_event,
                 )
             }
             (Self::DeepSeekV4Layerwise(target), ModelCache::DeepSeekV4(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
-                    target.as_mut(),
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target.as_mut(),
+                    );
+                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    &mut executor,
                     cache,
                     input,
                     config,
@@ -593,14 +675,16 @@ impl Model {
                     sampler,
                     semantic,
                     cancellation,
-                    stream,
+                    MtpExecutionStreams::single(stream),
                     scheduler_options,
                     on_event,
                 )
             }
             (Self::Inkling(target), ModelCache::Inkling(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
-                    target,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    &mut executor,
                     cache,
                     input,
                     config,
@@ -608,14 +692,16 @@ impl Model {
                     sampler,
                     semantic,
                     cancellation,
-                    stream,
+                    MtpExecutionStreams::single(stream),
                     scheduler_options,
                     on_event,
                 )
             }
             (Self::NemotronH(target), ModelCache::NemotronH(cache)) => {
-                crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
-                    target,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    &mut executor,
                     cache,
                     input,
                     config,
@@ -623,15 +709,17 @@ impl Model {
                     sampler,
                     semantic,
                     cancellation,
-                    stream,
+                    MtpExecutionStreams::single(stream),
                     scheduler_options,
                     on_event,
                 )
             }
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35(target), ModelCache::Qwen35(cache)) => {
-                crate::architectures::qwen::hybrid::mtp::generate_with_semantics_and_options(
-                    target,
+                let mut executor =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    &mut executor,
                     cache,
                     input,
                     config,
@@ -639,7 +727,7 @@ impl Model {
                     sampler,
                     semantic,
                     cancellation,
-                    stream,
+                    MtpExecutionStreams::single(stream),
                     scheduler_options,
                     on_event,
                 )

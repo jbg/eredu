@@ -625,7 +625,7 @@ impl NemotronHLayerwiseModel {
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let (logits, context) = self
             .execution
             .forward_with_context_hook(tokens, cache, stream, |_, _, _| Ok(()))
@@ -634,7 +634,7 @@ impl NemotronHLayerwiseModel {
             Exception::custom("Nemotron-H layerwise pass did not retain MTP hidden state")
         })?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),
@@ -649,7 +649,7 @@ impl NemotronHLayerwiseModel {
         depth: usize,
         cache: &mut [LayerCache],
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let adapter = self.execution.adapter_mut();
         let embeddings = adapter.embeddings.forward(tokens, stream)?;
         let expert_cache = adapter.expert_cache.as_ref();
@@ -676,7 +676,7 @@ impl NemotronHLayerwiseModel {
             stream,
         )?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),
@@ -690,13 +690,13 @@ impl NemotronHLayerwiseModel {
         cache: &mut Cache,
         group: &safemlx::distributed::Group,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let (logits, context) = self
             .execution
             .forward_tensor_parallel_with_context(tokens, cache, group, stream)
             .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden: context.draft_hidden.ok_or_else(|| {
                     Exception::custom("Nemotron-H tensor pass did not retain MTP hidden state")
@@ -714,7 +714,7 @@ impl NemotronHLayerwiseModel {
         cache: &mut [LayerCache],
         group: &safemlx::distributed::Group,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let topology = self
             .parallel_info()
             .ok_or_else(|| Exception::custom("Nemotron-H MTP target has no parallel topology"))?
@@ -764,7 +764,7 @@ impl NemotronHLayerwiseModel {
         }
         .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),
@@ -964,7 +964,7 @@ impl NemotronHLayerwiseModel {
         tensor_group: Option<&safemlx::distributed::Group>,
         mut execute: F,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
@@ -1014,7 +1014,7 @@ impl NemotronHLayerwiseModel {
         }
         .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden: context.draft_hidden.ok_or_else(|| {
                     Exception::custom("Nemotron-H EP pass did not retain MTP hidden state")
@@ -1034,7 +1034,7 @@ impl NemotronHLayerwiseModel {
         tensor_group: Option<&safemlx::distributed::Group>,
         mut execute: F,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
@@ -1100,7 +1100,7 @@ impl NemotronHLayerwiseModel {
             )?,
         };
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),
@@ -1139,7 +1139,7 @@ impl CausalLm<Cache> for NemotronHLayerwiseModel {
     }
 }
 
-impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHLayerwiseModel {
+impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for NemotronHLayerwiseModel {
     type Cache = Cache;
     type DraftCache = Vec<LayerCache>;
 
@@ -1148,7 +1148,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHLa
         input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let tokens = input::text_token_ids(input, stream)?;
         cache.reset()?;
         self.forward_mtp_target(&tokens, cache, stream)
@@ -1158,12 +1158,12 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHLa
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         self.forward_mtp_target(tokens, cache, stream)
     }
     fn prefill_draft_cache(
         &mut self,
-        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        output: &crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput,
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
@@ -1223,7 +1223,9 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHLa
     }
 }
 
-impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHTensorMtpTarget<'_> {
+impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget
+    for NemotronHTensorMtpTarget<'_>
+{
     type Cache = Cache;
     type DraftCache = Vec<LayerCache>;
 
@@ -1232,7 +1234,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHTe
         input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let tokens = input::text_token_ids(input, stream)?;
         cache.reset()?;
         self.model
@@ -1244,14 +1246,14 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHTe
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         self.model
             .forward_mtp_target_tensor(tokens, cache, self.group, stream)
     }
 
     fn prefill_draft_cache(
         &mut self,
-        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        output: &crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput,
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
@@ -1812,7 +1814,7 @@ impl NemotronHLayerwiseAdapter {
         execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         external_expert: Option<&mut F>,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
@@ -1867,7 +1869,7 @@ impl NemotronHLayerwiseAdapter {
             )?,
         };
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),

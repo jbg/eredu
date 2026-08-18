@@ -211,7 +211,7 @@ impl DeepSeekV4LayerwiseModel {
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let (logits, context) = self
             .execution
             .forward_with_context_hook(tokens, cache, stream, |_, _, _| Ok(()))
@@ -220,7 +220,7 @@ impl DeepSeekV4LayerwiseModel {
             Exception::custom("DeepSeek V4 layerwise pass did not retain draft hidden state")
         })?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),
@@ -235,7 +235,7 @@ impl DeepSeekV4LayerwiseModel {
         tensor_group: Option<&safemlx::distributed::Group>,
         mut execute: F,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
@@ -294,7 +294,7 @@ impl DeepSeekV4LayerwiseModel {
         }
         .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden: context.draft_hidden.ok_or_else(|| {
                     Exception::custom("DeepSeek V4 EP pass did not retain MTP/DSpark hidden state")
@@ -400,7 +400,7 @@ impl CausalLm<Cache> for DeepSeekV4LayerwiseModel {
     }
 }
 
-impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4LayerwiseModel {
+impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekV4LayerwiseModel {
     type Cache = Cache;
     type DraftCache = super::model::DraftCache;
 
@@ -409,7 +409,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4L
         input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let tokens = input::text_token_ids(input, stream)?;
         cache.reset()?;
         self.forward_mtp_target(&tokens, cache, stream)
@@ -420,18 +420,18 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4L
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         self.forward_mtp_target(tokens, cache, stream)
     }
 
     fn prefill_draft_cache(
         &mut self,
-        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        output: &crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput,
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::prefill_draft_cache(
+        <ResidentModel as crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget>::prefill_draft_cache(
             &mut self.execution.adapter_mut().static_model,
             output,
             tokens,
@@ -464,7 +464,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4L
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
-        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::draft_logits(
+        <ResidentModel as crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget>::draft_logits(
             &mut self.execution.adapter_mut().static_model,
             hidden,
             last_token,
@@ -482,7 +482,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4L
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::fused_draft_logits(
+        <ResidentModel as crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget>::fused_draft_logits(
             &mut self.execution.adapter_mut().static_model,
             hidden,
             last_token,
@@ -498,7 +498,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4L
         last_token: u32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::adjust_fused_draft_logits(
+        <ResidentModel as crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget>::adjust_fused_draft_logits(
             &mut self.execution.adapter_mut().static_model,
             logits,
             last_token,
@@ -513,7 +513,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV4L
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::advance_draft_cache(
+        <ResidentModel as crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget>::advance_draft_cache(
             &mut self.execution.adapter_mut().static_model,
             hidden,
             tokens,
@@ -722,7 +722,7 @@ impl DeepSeekV4LayerwiseAdapter {
 
     pub(crate) fn prefill_pipeline_draft_cache(
         &mut self,
-        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        output: &crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput,
         tokens: &Array,
         cache: &mut super::model::DraftCache,
         stream: &Stream,
@@ -731,7 +731,7 @@ impl DeepSeekV4LayerwiseAdapter {
         target_cache.mtp_layers.clone_from(cache);
         let pipeline_output;
         let output = if self.args.dspark.is_none() && output.hidden.ndim() == 3 {
-            pipeline_output = crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            pipeline_output = crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits: output.logits.clone(),
                 hidden: output.hidden.reshape(
                     &[
@@ -748,7 +748,7 @@ impl DeepSeekV4LayerwiseAdapter {
         } else {
             output
         };
-        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::prefill_draft_cache(
+        <ResidentModel as crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget>::prefill_draft_cache(
             &mut self.static_model,
             output,
             tokens,
@@ -766,7 +766,7 @@ impl DeepSeekV4LayerwiseAdapter {
         depth: usize,
         cache: &mut super::model::DraftCache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let hidden = if hidden.ndim() == 3 {
             hidden.reshape(
                 &[
@@ -792,7 +792,7 @@ impl DeepSeekV4LayerwiseAdapter {
             stream,
         )?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),
@@ -808,7 +808,7 @@ impl DeepSeekV4LayerwiseAdapter {
         cache: &mut super::model::DraftCache,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::fused_draft_logits(
+        <ResidentModel as crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget>::fused_draft_logits(
             &mut self.static_model,
             hidden,
             last_token,
@@ -824,7 +824,7 @@ impl DeepSeekV4LayerwiseAdapter {
         last_token: u32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::adjust_fused_draft_logits(
+        <ResidentModel as crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget>::adjust_fused_draft_logits(
             &mut self.static_model,
             logits,
             last_token,
@@ -852,7 +852,7 @@ impl DeepSeekV4LayerwiseAdapter {
         } else {
             hidden.clone()
         };
-        <ResidentModel as crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget>::advance_draft_cache(
+        <ResidentModel as crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget>::advance_draft_cache(
             &mut self.static_model,
             &hidden,
             tokens,

@@ -170,17 +170,20 @@ completion is one core-owned transaction. Core waits, commits the MLX cache,
 resolves branch promotion/discard and telemetry, and only then authorizes token
 and semantic-event publication. Core owns the transactional semantic-state
 wrapper, callback publisher, cancellation delivery, and output error; none use
-MLX exceptions. The generic core `SpeculativeRequestTable` also owns the production
-request collection, cancellation scan, fair action application, resource-slot
-invariants, aggregate accounting, and ordered finalization. The facade supplies
-only the MLX executor and sampling adapter used to instantiate it. Prepared-chat MTP
-requests contain portable sampling and scheduler settings; target and drafter
-execution placement is fixed when those models are loaded, and MLX cache lanes
-are adapter-owned. `PreparedChatSpeculativeBackend` makes the same capability,
-single-request, and batch methods available on `LoadedModel<B>`; its associated
-drafter type prevents mixing backend families. MLX retains the actual logits
-transforms, probability/residual arithmetic, random arrays, cross-stream
-transfers, component timing probes, and tensor execution.
+MLX exceptions. The generic core `SpeculativeRequestTable` also owns the
+production request collection, cancellation scan, fair action application,
+resource-slot invariants, aggregate accounting, and ordered finalization. The
+facade supplies only the MLX executor and sampling adapter used to instantiate
+it. Embedded prediction heads and external assistants enter the same
+`MlxMtpScheduler`; architecture adapters do not define parallel generation
+loops or forwarding wrappers. Prepared-chat MTP requests contain portable
+sampling and scheduler settings; target and drafter execution placement is
+fixed when those models are loaded, and MLX cache lanes are adapter-owned.
+`PreparedChatSpeculativeBackend` makes the same capability, single-request, and
+batch methods available on `LoadedModel<B>`; its associated drafter type
+prevents mixing backend families. MLX retains the actual logits transforms,
+probability/residual arithmetic, random arrays, cross-stream transfers,
+component timing probes, and tensor execution.
 
 ## Inputs and generation
 

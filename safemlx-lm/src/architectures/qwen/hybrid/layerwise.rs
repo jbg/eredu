@@ -5078,25 +5078,34 @@ mod tests {
             eos_token_ids: Vec::new(),
         };
         let mut resident_cache = resident.new_cache();
-        let (expected, expected_stats) = crate::architectures::qwen::hybrid::mtp::generate(
-            &mut resident,
-            &mut resident_cache,
-            runtime_input::ModelInput::new(&parts),
-            &mtp_config,
-            None,
-            &mut crate::runtime::generation::sampler::DefaultSampler,
-            gpu.stream(),
-        )
-        .unwrap();
+        let mut resident_executor =
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut resident);
+        let (expected, expected_stats) =
+            crate::backend::mlx::speculative::scheduler::generate_tokens(
+                &mut resident_executor,
+                &mut resident_cache,
+                runtime_input::ModelInput::new(&parts),
+                &mtp_config,
+                None,
+                &mut crate::runtime::generation::sampler::DefaultSampler,
+                crate::backend::mlx::speculative::MtpExecutionStreams::single(gpu.stream()),
+                crate::core::generation::MtpSchedulerOptions::default(),
+                |_| Ok(()),
+            )
+            .unwrap();
         let mut layerwise_cache = layerwise.new_cache();
-        let (actual, actual_stats) = crate::architectures::qwen::hybrid::mtp::generate(
-            &mut layerwise,
+        let mut layerwise_executor =
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut layerwise);
+        let (actual, actual_stats) = crate::backend::mlx::speculative::scheduler::generate_tokens(
+            &mut layerwise_executor,
             &mut layerwise_cache,
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
             &mut crate::runtime::generation::sampler::DefaultSampler,
-            gpu.stream(),
+            crate::backend::mlx::speculative::MtpExecutionStreams::single(gpu.stream()),
+            crate::core::generation::MtpSchedulerOptions::default(),
+            |_| Ok(()),
         )
         .unwrap();
         assert_eq!(actual, expected);

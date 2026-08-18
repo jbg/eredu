@@ -32,6 +32,9 @@ use crate::{
         lfm2, nemotron_h, qwen3_5, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
     },
     architectures::distributed::pipeline::{assign_module, load_deepseek_experts},
+    backend::mlx::speculative::embedded::{
+        DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
+    },
     core::cache::CacheRankIdentity,
     core::generation::MtpConfig,
     core::{MtpCapability, MtpCheckpointKind, MtpStats},
@@ -49,9 +52,6 @@ use crate::{
         load_partition_from_store_on_streams, ParallelTopology, PlacementPlan, TensorPlacement,
     },
     runtime::execution::inspection::ActivationObserver,
-    runtime::generation::embedded_mtp::{
-        DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
-    },
     runtime::generation::sampler::SpeculativeSampler,
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -2541,14 +2541,17 @@ impl ExpertParallelModel {
                 tensor_group,
                 group: expert_group,
             };
-            let result = crate::architectures::qwen::hybrid::mtp::generate_with_callback(
-                &mut target,
+            let mut executor =
+                crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
+            let result = crate::backend::mlx::speculative::scheduler::generate_tokens(
+                &mut executor,
                 cache,
                 input,
                 config,
                 prng_key,
                 &mut synchronized,
-                stream,
+                crate::backend::mlx::speculative::MtpExecutionStreams::single(stream),
+                crate::core::generation::MtpSchedulerOptions::default(),
                 |_| Ok(()),
             );
             *sampler = synchronized.into_inner();
@@ -2559,14 +2562,17 @@ impl ExpertParallelModel {
             tensor_group,
             expert_group,
         };
-        let result = crate::runtime::generation::embedded_mtp::generate_with_callback(
-            &mut target,
+        let mut executor =
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
+        let result = crate::backend::mlx::speculative::scheduler::generate_tokens(
+            &mut executor,
             cache,
             input,
             config,
             prng_key,
             &mut synchronized,
-            stream,
+            crate::backend::mlx::speculative::MtpExecutionStreams::single(stream),
+            crate::core::generation::MtpSchedulerOptions::default(),
             |_| Ok(()),
         );
         *sampler = synchronized.into_inner();

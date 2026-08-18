@@ -890,7 +890,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut backend =
-                    crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
+                    crate::architectures::gemma4::mtp::Gemma4MtpExecutor::new(target, assistant);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -904,7 +904,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             Model::MuseGlimmer(target) => {
                 let assistant = drafter.muse_glimmer_mut();
                 let mut backend =
-                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
+                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
                         target, assistant,
                     );
                 run_prepared_chat_mtp_batch(
@@ -937,7 +937,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         match self.model_and_cache().0 {
             Model::DeepSeekV3(target) => {
                 let mut backend =
-                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -950,7 +950,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             }
             Model::Inkling(target) => {
                 let mut backend =
-                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -963,7 +963,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             }
             Model::NemotronH(target) => {
                 let mut backend =
-                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -975,7 +975,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
             }
             Model::Qwen3Next(target) => {
-                let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
+                let mut backend = crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -987,7 +987,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
             }
             Model::Qwen35(target) => {
-                let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
+                let mut backend = crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -1548,7 +1548,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut backend =
-                    crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
+                    crate::architectures::gemma4::mtp::Gemma4MtpExecutor::new(target, assistant);
                 run_external_mtp_batch(
                     &mut backend,
                     ExternalMtpBatch {
@@ -1566,7 +1566,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             Model::MuseGlimmer(target) => {
                 let assistant = drafter.muse_glimmer_mut();
                 let mut backend =
-                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
+                    crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
                         target, assistant,
                     );
                 run_external_mtp_batch(
@@ -1652,7 +1652,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         match self.model_and_cache().0 {
             Model::DeepSeekV3(target) => {
                 let mut backend =
-                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_embedded_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1666,7 +1666,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             }
             Model::Inkling(target) => {
                 let mut backend =
-                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_embedded_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1680,7 +1680,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             }
             Model::NemotronH(target) => {
                 let mut backend =
-                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_embedded_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1694,7 +1694,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             }
             Model::Qwen3Next(target) => {
                 let mut backend =
-                    crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_embedded_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1708,7 +1708,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             }
             Model::Qwen35(target) => {
                 let mut backend =
-                    crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_embedded_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,

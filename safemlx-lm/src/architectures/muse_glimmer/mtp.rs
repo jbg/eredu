@@ -52,7 +52,7 @@ pub(crate) struct MuseVerification {
     input_len: usize,
 }
 
-pub(crate) struct MuseGlimmerMtpBackend<'a> {
+pub(crate) struct MuseGlimmerMtpExecutor<'a> {
     target: &'a mut LayerwiseDecoder,
     assistant: &'a mut MuseGlimmerDFlash,
     draft_embedding: Option<MaybeQuantized<nn::Embedding>>,
@@ -61,7 +61,7 @@ pub(crate) struct MuseGlimmerMtpBackend<'a> {
     component_timings: MtpComponentTimingEvaluations,
 }
 
-impl<'a> MuseGlimmerMtpBackend<'a> {
+impl<'a> MuseGlimmerMtpExecutor<'a> {
     pub(crate) fn new(
         target: &'a mut LayerwiseDecoder,
         assistant: &'a mut MuseGlimmerDFlash,
@@ -305,7 +305,7 @@ fn dflash_block_token_ids(anchor: u32, mask_token: u32, proposal_capacity: usize
     ids
 }
 
-impl SpeculativeExecutor for MuseGlimmerMtpBackend<'_> {
+impl SpeculativeExecutor for MuseGlimmerMtpExecutor<'_> {
     type Input = MlxModelInput;
     type Cache = ModelCache;
     type TargetState = MuseTargetState;

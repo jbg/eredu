@@ -24,6 +24,12 @@ usable proposal depth is capped by the checkpoint's validated capability.
 Applications should query `mtp_capability` or run model inspection instead of
 assuming support from a family name.
 
+Embedded and external assistants use one MLX scheduling path. Each model form
+provides a `SpeculativeExecutor`; the shared adapter owns token or semantic
+publication, request scheduling, sampling, verification resolution, and final
+statistics. Embedded heads do not maintain a second acceptance loop or a
+parallel set of generation wrappers.
+
 The prepared-chat client surface is backend-generic. A backend implements
 `PreparedChatSpeculativeBackend`, supplies its own associated drafter type, and
 then uses the same `LoadedModel<B>::generate_prepared_chat_mtp` and batch APIs.

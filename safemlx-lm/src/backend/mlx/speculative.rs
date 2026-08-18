@@ -1,5 +1,7 @@
 //! MLX execution primitives for speculative model sessions.
 
+/// MLX executor for checkpoint-embedded prediction heads.
+pub(crate) mod embedded;
 /// MLX scheduler and semantic-generation adapter over the portable core engine.
 pub(crate) mod scheduler;
 

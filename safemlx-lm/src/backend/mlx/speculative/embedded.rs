@@ -1,4 +1,4 @@
-//! Shared speculative backend for checkpoint-embedded prediction heads.
+//! MLX executor adapter for checkpoint-embedded prediction heads.
 
 use safemlx::{
     distributed::{self, Group},
@@ -9,22 +9,15 @@ use safemlx::{
     quantization::MaybeQuantized,
     Array, Stream,
 };
-use safemlx_lm_core::{
-    MtpStats, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, SpeculativeSemanticState,
-    Submission,
-};
+use safemlx_lm_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
 
 use crate::{
     api::input::ModelInput,
     backend::mlx::{
         speculative::{
-            scheduler::{self as speculative, MtpComponentTimings},
-            MlxSpeculativeCompletion, MtpExecutionStreams,
+            scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
         },
         MlxModelInput,
-    },
-    core::generation::{
-        FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
     },
     runtime::generation::sampler::SpeculativeSampler,
 };
@@ -357,11 +350,11 @@ pub(crate) struct EmbeddedVerification {
     inputs: Array,
 }
 
-pub(crate) struct EmbeddedMtpBackend<'a, T> {
+pub(crate) struct EmbeddedMtpExecutor<'a, T> {
     target: &'a mut T,
 }
 
-impl<'a, T: EmbeddedMtpTarget> EmbeddedMtpBackend<'a, T> {
+impl<'a, T: EmbeddedMtpTarget> EmbeddedMtpExecutor<'a, T> {
     pub(crate) fn new(target: &'a mut T) -> Self {
         Self { target }
     }
@@ -381,7 +374,7 @@ impl<'a, T: EmbeddedMtpTarget> EmbeddedMtpBackend<'a, T> {
     }
 }
 
-impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpBackend<'_, T> {
+impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
     type Input = MlxModelInput;
     type Cache = T::Cache;
     type TargetState = EmbeddedTargetState<T::DraftCache>;
@@ -582,66 +575,4 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpBackend<'_, T> {
             replayed_tokens,
         })
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_callback<T, S, F>(
-    target: &mut T,
-    cache: &mut T::Cache,
-    input: ModelInput<'_>,
-    config: &MtpConfig,
-    prng_key: Option<Array>,
-    sampler: &mut S,
-    stream: &Stream,
-    on_token: F,
-) -> Result<(Vec<u32>, MtpStats), Exception>
-where
-    T: EmbeddedMtpTarget,
-    S: SpeculativeSampler + Clone,
-    F: FnMut(u32) -> Result<(), Exception>,
-{
-    speculative::generate_with_callback(
-        &mut EmbeddedMtpBackend::new(target),
-        cache,
-        input,
-        config,
-        prng_key,
-        sampler,
-        stream,
-        on_token,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_semantics_and_options<T, S, F>(
-    target: &mut T,
-    cache: &mut T::Cache,
-    input: ModelInput<'_>,
-    config: &MtpConfig,
-    prng_key: Option<Array>,
-    sampler: &mut S,
-    semantic: Box<dyn SpeculativeSemanticState>,
-    cancellation: GenerationCancellationToken,
-    stream: &Stream,
-    options: MtpSchedulerOptions,
-    on_event: F,
-) -> Result<(Vec<u32>, MtpStats, FinishReason), Exception>
-where
-    T: EmbeddedMtpTarget,
-    S: SpeculativeSampler + Clone,
-    F: FnMut(SemanticEvent),
-{
-    speculative::generate_with_semantics_and_options(
-        &mut EmbeddedMtpBackend::new(target),
-        cache,
-        input,
-        config,
-        prng_key,
-        sampler,
-        semantic,
-        cancellation,
-        MtpExecutionStreams::single(stream),
-        options,
-        on_event,
-    )
 }

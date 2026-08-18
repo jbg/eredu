@@ -8851,14 +8851,18 @@ mod tests {
             eos_token_ids: Vec::new(),
         };
         let mut mtp_cache = model.new_cache();
-        let (generated, stats) = crate::architectures::qwen::hybrid::mtp::generate(
-            &mut model,
+        let mut executor =
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut model);
+        let (generated, stats) = crate::backend::mlx::speculative::scheduler::generate_tokens(
+            &mut executor,
             &mut mtp_cache,
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
             &mut crate::runtime::generation::sampler::DefaultSampler,
-            stream,
+            crate::backend::mlx::speculative::MtpExecutionStreams::single(stream),
+            crate::core::generation::MtpSchedulerOptions::default(),
+            |_| Ok(()),
         )
         .unwrap();
         assert_eq!(generated, vec![0, 0, 0]);
@@ -8895,14 +8899,18 @@ mod tests {
         assert_eq!(logits.shape(), &[1, 32]);
 
         let mut mtp_cache = quantized.new_cache();
-        let (generated, stats) = crate::architectures::qwen::hybrid::mtp::generate(
-            &mut quantized,
+        let mut executor =
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut quantized);
+        let (generated, stats) = crate::backend::mlx::speculative::scheduler::generate_tokens(
+            &mut executor,
             &mut mtp_cache,
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
             &mut crate::runtime::generation::sampler::DefaultSampler,
-            stream,
+            crate::backend::mlx::speculative::MtpExecutionStreams::single(stream),
+            crate::core::generation::MtpSchedulerOptions::default(),
+            |_| Ok(()),
         )
         .unwrap();
         assert_eq!(generated, vec![0, 0, 0]);

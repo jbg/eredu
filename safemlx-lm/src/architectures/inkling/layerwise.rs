@@ -225,7 +225,7 @@ impl InklingMtpModule {
         cache: &mut [resident::LayerCache],
         execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         if self.layers.is_empty() || cache.len() != self.layers.len() {
             return Err(Exception::custom(
                 "Inkling MTP cache does not match prediction layers",
@@ -254,7 +254,7 @@ impl InklingMtpModule {
             hidden = norm.forward(&hidden, stream)?;
         }
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits: hidden.clone(),
                 hidden,
                 tokens: tokens.clone(),
@@ -310,7 +310,7 @@ impl InklingLayerwiseModel {
         input: InklingInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let (logits, context) = self
             .execution
             .forward_with_context_hook(
@@ -330,7 +330,7 @@ impl InklingLayerwiseModel {
             Exception::custom("Inkling layerwise pass did not retain MTP token identity")
         })?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens,
@@ -345,7 +345,7 @@ impl InklingLayerwiseModel {
         depth: usize,
         cache: &mut [resident::LayerCache],
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let adapter = self.execution.adapter_mut();
         let embeddings = adapter.embedding.forward(tokens, stream)?;
         let embeddings = adapter.embed_norm.forward(&embeddings, stream)?;
@@ -370,7 +370,7 @@ impl InklingLayerwiseModel {
         cache: &mut Cache,
         group: &safemlx::distributed::Group,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let (logits, context) = self
             .execution
             .forward_tensor_parallel_with_context(
@@ -384,7 +384,7 @@ impl InklingLayerwiseModel {
             )
             .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden: context.draft_hidden.ok_or_else(|| {
                     Exception::custom("Inkling tensor pass did not retain MTP hidden state")
@@ -404,7 +404,7 @@ impl InklingLayerwiseModel {
         cache: &mut [resident::LayerCache],
         group: &safemlx::distributed::Group,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let topology = self
             .parallel_info()
             .ok_or_else(|| Exception::custom("Inkling MTP target has no parallel topology"))?
@@ -688,7 +688,7 @@ impl InklingLayerwiseModel {
         tensor_group: Option<&safemlx::distributed::Group>,
         mut execute: F,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
@@ -747,7 +747,7 @@ impl InklingLayerwiseModel {
         }
         .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden: context.draft_hidden.ok_or_else(|| {
                     Exception::custom("Inkling EP pass did not retain MTP hidden state")
@@ -767,7 +767,7 @@ impl InklingLayerwiseModel {
         cache: &mut [resident::LayerCache],
         tensor_group: Option<&safemlx::distributed::Group>,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let topology = self
             .parallel_info()
             .ok_or_else(|| Exception::custom("Inkling EP MTP target has no topology"))?
@@ -861,7 +861,7 @@ impl CausalLm<Cache> for InklingLayerwiseModel {
     }
 }
 
-impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingLayerwiseModel {
+impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for InklingLayerwiseModel {
     type Cache = Cache;
     type DraftCache = Vec<resident::LayerCache>;
 
@@ -870,7 +870,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingLaye
         input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         cache.reset()?;
         self.forward_mtp_target(InklingInput::Prefill(input), cache, stream)
     }
@@ -880,13 +880,13 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingLaye
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         self.forward_mtp_target(InklingInput::Decode(tokens), cache, stream)
     }
 
     fn prefill_draft_cache(
         &mut self,
-        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        output: &crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput,
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
@@ -947,7 +947,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingLaye
     }
 }
 
-impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingTensorMtpTarget<'_> {
+impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for InklingTensorMtpTarget<'_> {
     type Cache = Cache;
     type DraftCache = Vec<resident::LayerCache>;
 
@@ -956,7 +956,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingTens
         input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         cache.reset()?;
         self.model.forward_mtp_target_tensor(
             InklingInput::Prefill(input),
@@ -971,7 +971,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingTens
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         self.model.forward_mtp_target_tensor(
             InklingInput::Decode(tokens),
             cache,
@@ -982,7 +982,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingTens
 
     fn prefill_draft_cache(
         &mut self,
-        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        output: &crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput,
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
@@ -1971,7 +1971,7 @@ impl InklingLayerwiseAdapter {
         cache: &mut [resident::LayerCache],
         execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let embeddings = match execution.filter(|execution| execution.is_tensor_parallel()) {
             Some(execution) => self
                 .parallel_embedding

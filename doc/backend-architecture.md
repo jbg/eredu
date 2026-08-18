@@ -237,6 +237,17 @@ are returned as opaque executor telemetry and folded into the core-owned
 in-flight transaction, optimistic promotion, cache-commit, callback ordering,
 or telemetry state machine.
 
+The MLX adapter has one scheduler implementation in
+`backend/mlx/speculative/scheduler.rs`. Its `generate_tokens` and
+`generate_semantic` entry points accept every MLX `SpeculativeExecutor`.
+Checkpoint-embedded heads are adapted by
+`backend/mlx/speculative/embedded.rs`; external Gemma and Muse assistants and
+Qwen's model-specific head math all use that same embedded executor. There are
+no embedded-only or architecture-specific generation loops, forwarding
+`generate_*` wrappers, or duplicate Qwen executor. The remaining executor
+implementations differ only in model math, cache checkpoints, verification
+materialization, and exact completion ownership.
+
 The public `api::load_model_with_options` route performs format, architecture,
 catalog, and policy planning in core before calling `Backend::prepare_model`.
 It returns the resulting `PreparedModel<MlxModel>` rather than discarding the
@@ -505,11 +516,11 @@ the request table, opaque per-request resources, action application, retained
 verification resources, optimistic branch promotion/discard,
 cache-commit-before-publication ordering, cancellation at an exact safe
 boundary, stable output ordering, and speculative request/scheduler telemetry.
-The former facade `ScheduledRequest`, request vector, acceptance loop, fair
-selector, action methods, probability helpers, request transaction, optimistic
-transition, callback coordinator, telemetry definitions, `MtpBackend`,
-`MtpPrefill`, and `MtpCommit` definitions were deleted rather than retained as
-wrappers.
+The former facade scheduled-request types, request vector, acceptance loop,
+fair selector, action methods, probability helpers, request transaction,
+optimistic transition, callback coordinator, telemetry definitions, and closed
+executor-specific prefill and commit records were deleted rather than retained
+as wrappers.
 
 Checkpoint sampling recommendations, request overrides, resolved sampler
 settings, MTP configuration, scheduler limits, request identity, and request

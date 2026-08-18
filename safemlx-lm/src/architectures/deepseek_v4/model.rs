@@ -1318,7 +1318,7 @@ impl Model {
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let capture_layers = self
             .args
             .dspark
@@ -1330,7 +1330,7 @@ impl Model {
         let collapsed = self.model.collapse(&hidden, stream)?;
         let logits = self.lm_head.forward(&collapsed, stream)?;
         Ok(
-            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden: captures.unwrap_or(hidden),
                 tokens: tokens.clone(),
@@ -2397,7 +2397,7 @@ impl CausalLm<Cache> for Model {
     }
 }
 
-impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for Model {
+impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for Model {
     type Cache = Cache;
     type DraftCache = Vec<AttentionCache>;
 
@@ -2406,7 +2406,7 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for Model {
         input: runtime_input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let tokens = runtime_input::text_token_ids(input, stream)?;
         cache.reset()?;
         self.forward_mtp_target(&tokens, cache, stream)
@@ -2417,13 +2417,13 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for Model {
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         self.forward_mtp_target(tokens, cache, stream)
     }
 
     fn prefill_draft_cache(
         &mut self,
-        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        output: &crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput,
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,

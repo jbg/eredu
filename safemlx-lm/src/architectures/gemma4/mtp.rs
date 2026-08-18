@@ -6,8 +6,8 @@ use safemlx::{
     error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
 };
 use safemlx_lm_core::{
-    MtpStats, SpeculativeCommit, SpeculativeExecutionTopology, SpeculativeExecutor,
-    SpeculativePrefill, SpeculativeSemanticState, Submission,
+    SpeculativeCommit, SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativePrefill,
+    Submission,
 };
 
 use crate::{
@@ -19,16 +19,11 @@ use crate::{
     architectures::gemma4::layerwise::Gemma4LayerwiseModel,
     backend::mlx::{
         speculative::{
-            scheduler::{self as mtp, MtpComponentTimings},
-            MlxSpeculativeCompletion, MtpExecutionStreams,
+            scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
         },
         MlxModelInput,
     },
-    core::generation::{
-        FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
-    },
     runtime::attention::AttentionPolicy,
-    runtime::generation::sampler::SpeculativeSampler,
 };
 
 #[derive(Clone)]
@@ -148,13 +143,13 @@ impl Gemma4MtpTarget for Gemma4LayerwiseModel {
 }
 
 /// Gemma 4 target plus an external Gemma assistant.
-pub(crate) struct Gemma4MtpBackend<'a, T> {
+pub(crate) struct Gemma4MtpExecutor<'a, T> {
     target: &'a mut T,
     assistant: &'a mut Gemma4AssistantDraftModel,
     draft_embedding: Option<Gemma4Embedding>,
 }
 
-impl<'a, T> Gemma4MtpBackend<'a, T> {
+impl<'a, T> Gemma4MtpExecutor<'a, T> {
     pub(crate) fn new(target: &'a mut T, assistant: &'a mut Gemma4AssistantDraftModel) -> Self {
         Self {
             target,
@@ -247,7 +242,7 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
     }
 }
 
-impl<T: Gemma4MtpTarget> SpeculativeExecutor for Gemma4MtpBackend<'_, T> {
+impl<T: Gemma4MtpTarget> SpeculativeExecutor for Gemma4MtpExecutor<'_, T> {
     type Input = MlxModelInput;
     type Cache = Cache;
     type TargetState = Gemma4TargetState;
@@ -440,74 +435,6 @@ impl<T: Gemma4MtpTarget> SpeculativeExecutor for Gemma4MtpBackend<'_, T> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_streams_and_callback_and_options<T, S, F>(
-    target: &mut T,
-    assistant: &mut Gemma4AssistantDraftModel,
-    cache: &mut Cache,
-    input: RuntimeInput<'_>,
-    config: &MtpConfig,
-    prng_key: Option<Array>,
-    sampler: &mut S,
-    streams: MtpExecutionStreams<'_>,
-    options: MtpSchedulerOptions,
-    on_token: F,
-) -> Result<(Vec<u32>, MtpStats), Exception>
-where
-    T: Gemma4MtpTarget,
-    S: SpeculativeSampler + Clone,
-    F: FnMut(u32) -> Result<(), Exception>,
-{
-    let mut backend = Gemma4MtpBackend::new(target, assistant);
-    mtp::generate_with_streams_and_callback_and_options(
-        &mut backend,
-        cache,
-        input,
-        config,
-        prng_key,
-        sampler,
-        streams,
-        options,
-        on_token,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_semantics_and_options<T, S, F>(
-    target: &mut T,
-    assistant: &mut Gemma4AssistantDraftModel,
-    cache: &mut Cache,
-    input: RuntimeInput<'_>,
-    config: &MtpConfig,
-    prng_key: Option<Array>,
-    sampler: &mut S,
-    semantic: Box<dyn SpeculativeSemanticState>,
-    cancellation: GenerationCancellationToken,
-    streams: MtpExecutionStreams<'_>,
-    options: MtpSchedulerOptions,
-    on_event: F,
-) -> Result<(Vec<u32>, MtpStats, FinishReason), Exception>
-where
-    T: Gemma4MtpTarget,
-    S: SpeculativeSampler + Clone,
-    F: FnMut(SemanticEvent),
-{
-    let mut backend = Gemma4MtpBackend::new(target, assistant);
-    mtp::generate_with_semantics_and_options(
-        &mut backend,
-        cache,
-        input,
-        config,
-        prng_key,
-        sampler,
-        semantic,
-        cancellation,
-        streams,
-        options,
-        on_event,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use safemlx::{Device, DeviceType, ExecutionContext};
@@ -534,7 +461,7 @@ mod tests {
             cache_len: 9,
         };
 
-        let copied = Gemma4MtpBackend::<Gemma4Model>::state_on_draft_stream(
+        let copied = Gemma4MtpExecutor::<Gemma4Model>::state_on_draft_stream(
             &state,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
         )
@@ -578,7 +505,7 @@ mod tests {
             cache_len: 9,
         };
 
-        let shared = Gemma4MtpBackend::<Gemma4Model>::state_on_draft_stream(
+        let shared = Gemma4MtpExecutor::<Gemma4Model>::state_on_draft_stream(
             &state,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
         )
