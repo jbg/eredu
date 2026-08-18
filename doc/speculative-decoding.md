@@ -31,7 +31,7 @@ statistics. Embedded heads do not maintain a second acceptance loop or a
 parallel set of generation wrappers.
 
 The prepared-chat client surface is backend-generic. A backend implements
-`PreparedChatSpeculativeBackend`, supplies its own associated drafter type, and
+`SpeculativeGenerationBackend`, supplies its own associated drafter type, and
 then uses the same `LoadedModel<B>::generate_prepared_chat_mtp` and batch APIs.
 `MtpCapability` and `MtpCheckpointKind` are portable core values; absence of the
 capability implementation fails at the type boundary rather than silently

@@ -4,15 +4,14 @@ use std::num::NonZeroUsize;
 
 use safemlx_lm_core::{
     generation::{
-        FinishReason, GenerationCancellationToken, GenerationConfigOverrides, MtpConfig,
-        SemanticEvent,
+        FinishReason, GenerationCancellationToken, GenerationConfigOverrides, SemanticEvent,
     },
-    MtpCapability, MtpSchedulerOptions, MtpSchedulerStats, MtpStats, SpeculativeOutputError,
-    SpeculativeSemanticState, TextGenerationConfig, TokenFilter, TokenFilterController,
+    MtpSchedulerOptions, SpeculativeDraft, SpeculativeOutputError, SpeculativeSemanticState,
+    TokenFilter, TokenFilterController,
 };
 use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
-use super::{LoadedModel, TextDecoderError, TextModelError};
+use super::{TextDecoderError, TextModelError};
 use crate::api::TextDecoder;
 use crate::runtime::chat::constraints::{
     ConstraintCompiler, ConstraintController, ConstraintError,
@@ -168,33 +167,6 @@ impl Default for PreparedChatMtpGenerationOptions {
     }
 }
 
-/// High-level speculative-generation capability of a selected backend.
-///
-/// Implementations own draft models, target and draft placement, tensor caches,
-/// sampling execution, and exact completion. Callers use the same prepared-chat
-/// requests for every backend and cannot mix a drafter from one backend with a
-/// target session from another.
-pub trait PreparedChatSpeculativeBackend: safemlx_lm_core::TextGenerationBackend {
-    /// Backend-owned separately prepared draft model.
-    type Drafter;
-    /// Reports fail-closed speculative support for the selected model session.
-    fn mtp_capability(model: &LoadedModel<Self>) -> MtpCapability;
-
-    /// Executes one prepared-chat speculative request.
-    fn execute_prepared_chat_mtp<'a, F>(
-        model: &mut LoadedModel<Self>,
-        request: PreparedChatMtpExecutionRequest<'a, Self, Self::Drafter, F>,
-    ) -> Result<PreparedChatMtpGenerationOutput, Self::Error>
-    where
-        F: FnMut(SemanticEvent);
-
-    /// Executes independent prepared-chat lanes through one fair scheduler.
-    fn execute_prepared_chat_mtp_batch<'a>(
-        model: &mut LoadedModel<Self>,
-        request: PreparedChatMtpBatchExecutionRequest<'a, Self, Self::Drafter>,
-    ) -> Result<PreparedChatMtpBatchOutput, Self::Error>;
-}
-
 /// Failure while the facade prepares or a backend executes speculative chat.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedChatMtpError<E: std::error::Error + Send + Sync + 'static> {
@@ -215,20 +187,12 @@ pub enum PreparedChatMtpError<E: std::error::Error + Send + Sync + 'static> {
     Semantic(String),
 }
 
-/// Draft-model source selected for one speculative request.
-pub enum PreparedChatDraft<'a, D> {
-    /// Separately loaded assistant with its own backend-owned placement.
-    External(&'a mut D),
-    /// Draft heads embedded in the selected target model.
-    Embedded,
-}
-
 /// One speculative MTP response from a [`PreparedChat`].
 pub struct PreparedChatMtpGenerationRequest<'a, B: safemlx_lm_core::TextGenerationBackend, D, F> {
     /// Explicit prompt source and embedded format/runtime plan.
     pub input: PreparedChatInput<'a, B>,
     /// Embedded or separately loaded draft-model selection.
-    pub drafting: PreparedChatDraft<'a, D>,
+    pub drafting: SpeculativeDraft<'a, D>,
     /// Portable sampling configuration, token limit, and random seed.
     pub settings: PreparedChatGenerationSettings,
     /// Proposal-block and scheduler controls.
@@ -239,17 +203,6 @@ pub struct PreparedChatMtpGenerationRequest<'a, B: safemlx_lm_core::TextGenerati
     pub cancellation: GenerationCancellationToken,
     /// Called synchronously for each event after its cache transaction commits.
     pub on_event: F,
-}
-
-/// Terminal metadata and speculative statistics for prepared-chat MTP.
-#[derive(Debug, Clone)]
-pub struct PreparedChatMtpGenerationOutput {
-    /// Every committed generated tokenizer id; cancellation returns only its prefix.
-    pub token_ids: Vec<u32>,
-    /// Deterministically selected terminal condition.
-    pub finish_reason: FinishReason,
-    /// Per-request speculative decoding statistics.
-    pub stats: MtpStats,
 }
 
 /// One independently executable lane in a prepared-chat MTP batch.
@@ -277,20 +230,11 @@ pub struct PreparedChatMtpBatchLane<'a, B: safemlx_lm_core::TextGenerationBacken
 /// Cohesive fair-scheduler request for independent prepared-chat MTP lanes.
 pub struct PreparedChatMtpBatchRequest<'a, B: safemlx_lm_core::TextGenerationBackend, D> {
     /// Embedded or separately loaded draft-model selection.
-    pub drafting: PreparedChatDraft<'a, D>,
+    pub drafting: SpeculativeDraft<'a, D>,
     /// Independently executable prepared-chat lanes.
     pub lanes: Vec<PreparedChatMtpBatchLane<'a, B>>,
     /// Bounded scheduler and optimistic-lookahead controls.
     pub scheduler: MtpSchedulerOptions,
-}
-
-/// Completed prepared-chat requests plus aggregate fair-scheduler telemetry.
-#[derive(Debug, Clone)]
-pub struct PreparedChatMtpBatchOutput {
-    /// Per-request results in submission order.
-    pub requests: Vec<PreparedChatMtpGenerationOutput>,
-    /// Aggregate scheduler telemetry.
-    pub scheduler: MtpSchedulerStats,
 }
 
 /// Facade-prepared speculative grammar state consumed by a backend sampler.
@@ -340,60 +284,6 @@ impl safemlx_lm_core::SpeculativeTokenFilterController for PreparedChatSpeculati
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {
         self.controller.prefix_is_complete(history)
     }
-}
-
-/// Execution-ready speculative request assembled by the portable facade.
-///
-/// Backend implementations receive resolved settings, an opaque prepared
-/// prompt, and canonical grammar/parser state. They do not inspect chat plans,
-/// tokenize rendered prompts, or construct semantic state themselves.
-pub struct PreparedChatMtpExecutionRequest<'a, B: safemlx_lm_core::TextGenerationBackend, D, F> {
-    /// Backend-owned prompt prepared by the selected session backend.
-    pub prompt: B::Prompt,
-    /// Embedded or separately loaded draft-model selection.
-    pub drafting: PreparedChatDraft<'a, D>,
-    /// Fully resolved portable sampling configuration and random seed.
-    pub generation: TextGenerationConfig,
-    /// Resolved token budget, proposal width, temperature, and EOS ids.
-    pub config: MtpConfig,
-    /// Canonical facade-owned grammar state.
-    pub constraint: PreparedChatSpeculativeConstraint,
-    /// Transactional decoded semantic parser state.
-    pub semantic: Box<dyn SpeculativeSemanticState>,
-    /// Fair-scheduler controls.
-    pub scheduler: MtpSchedulerOptions,
-    /// One-shot cooperative-cancellation token.
-    pub cancellation: GenerationCancellationToken,
-    /// Called synchronously for each event after its cache transaction commits.
-    pub on_event: F,
-}
-
-/// One facade-prepared lane for backend speculative batch execution.
-pub struct PreparedChatMtpExecutionLane<'a, B: safemlx_lm_core::TextGenerationBackend> {
-    /// Backend-owned prompt prepared by the selected session backend.
-    pub prompt: B::Prompt,
-    /// Fully resolved portable sampling configuration and random seed.
-    pub generation: TextGenerationConfig,
-    /// Resolved token budget, proposal width, temperature, and EOS ids.
-    pub config: MtpConfig,
-    /// Canonical facade-owned grammar state.
-    pub constraint: PreparedChatSpeculativeConstraint,
-    /// Transactional decoded semantic parser state.
-    pub semantic: Box<dyn SpeculativeSemanticState>,
-    /// One-shot cooperative-cancellation token owned only by this lane.
-    pub cancellation: GenerationCancellationToken,
-    /// Called synchronously for canonical events from only this lane.
-    pub on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
-}
-
-/// Execution-ready fair-scheduler request assembled by the portable facade.
-pub struct PreparedChatMtpBatchExecutionRequest<'a, B: safemlx_lm_core::TextGenerationBackend, D> {
-    /// Embedded or separately loaded draft-model selection.
-    pub drafting: PreparedChatDraft<'a, D>,
-    /// Independently prepared speculative lanes.
-    pub lanes: Vec<PreparedChatMtpExecutionLane<'a, B>>,
-    /// Bounded scheduler and optimistic-lookahead controls.
-    pub scheduler: MtpSchedulerOptions,
 }
 
 #[derive(Clone)]

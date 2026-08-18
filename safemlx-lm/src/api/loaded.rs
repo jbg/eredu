@@ -5,7 +5,9 @@ use std::{num::NonZeroUsize, path::Path};
 use safemlx_gguf::MetadataValue as GgufMetadataValue;
 use safemlx_lm_core::{
     generation::{resolve_generation_config, FinishReason, SemanticEvent},
-    ModelKind, MtpCapability,
+    ModelKind, MtpCapability, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeGenerationOutput,
+    SpeculativeGenerationRequest,
 };
 use safemlx_lm_utils::{
     gguf::GgufTokenizer,
@@ -19,11 +21,9 @@ use serde::Serialize;
 use super::{
     LoadedModel, LoadedTextModelConfig, PreparedChat, PreparedChatError,
     PreparedChatGenerationOutput, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-    PreparedChatInput, PreparedChatMtpBatchExecutionRequest, PreparedChatMtpBatchOutput,
-    PreparedChatMtpBatchRequest, PreparedChatMtpError, PreparedChatMtpExecutionLane,
-    PreparedChatMtpExecutionRequest, PreparedChatMtpGenerationOutput,
-    PreparedChatMtpGenerationRequest, PreparedChatSpeculativeBackend,
-    PreparedChatSpeculativeConstraint, TextDecoderError, TextMetadataError, TextModelError,
+    PreparedChatInput, PreparedChatMtpBatchRequest, PreparedChatMtpError,
+    PreparedChatMtpGenerationRequest, PreparedChatSpeculativeConstraint, TextDecoderError,
+    TextMetadataError, TextModelError,
 };
 use crate::{
     api::{
@@ -218,18 +218,23 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     /// Reports fail-closed speculative support for this backend model session.
     pub fn mtp_capability(&self) -> MtpCapability
     where
-        B: PreparedChatSpeculativeBackend,
+        B: SpeculativeGenerationBackend,
     {
-        B::mtp_capability(self)
+        B::mtp_capability(&self.runtime)
     }
 
     /// Generates one structured response using embedded or external drafting.
     pub fn generate_prepared_chat_mtp<'a, F>(
         &mut self,
-        request: PreparedChatMtpGenerationRequest<'a, B, B::Drafter, F>,
-    ) -> Result<PreparedChatMtpGenerationOutput, PreparedChatMtpError<B::Error>>
+        request: PreparedChatMtpGenerationRequest<
+            'a,
+            B,
+            <B as SpeculativeGenerationBackend>::Drafter,
+            F,
+        >,
+    ) -> Result<SpeculativeGenerationOutput, PreparedChatMtpError<B::Error>>
     where
-        B: PreparedChatSpeculativeBackend,
+        B: SpeculativeGenerationBackend,
         F: FnMut(SemanticEvent),
     {
         let PreparedChatMtpGenerationRequest {
@@ -247,9 +252,9 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
             options.max_draft_tokens,
             caller_stop_sequences,
         )?;
-        B::execute_prepared_chat_mtp(
-            self,
-            PreparedChatMtpExecutionRequest {
+        B::execute_speculative(
+            &mut self.runtime,
+            SpeculativeGenerationRequest {
                 prompt,
                 drafting,
                 generation,
@@ -258,6 +263,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
                 semantic,
                 scheduler: options.scheduler,
                 cancellation,
+                tokenizer_fingerprint: self.tokenizer_fingerprint,
                 on_event,
             },
         )
@@ -267,10 +273,10 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     /// Generates independent prepared chats through one fair speculative scheduler.
     pub fn generate_prepared_chat_mtp_batch<'a>(
         &mut self,
-        request: PreparedChatMtpBatchRequest<'a, B, B::Drafter>,
-    ) -> Result<PreparedChatMtpBatchOutput, PreparedChatMtpError<B::Error>>
+        request: PreparedChatMtpBatchRequest<'a, B, <B as SpeculativeGenerationBackend>::Drafter>,
+    ) -> Result<SpeculativeGenerationBatchOutput, PreparedChatMtpError<B::Error>>
     where
-        B: PreparedChatSpeculativeBackend,
+        B: SpeculativeGenerationBackend,
     {
         let PreparedChatMtpBatchRequest {
             drafting,
@@ -286,7 +292,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
                     lane.max_draft_tokens,
                     lane.caller_stop_sequences,
                 )?;
-            prepared_lanes.push(PreparedChatMtpExecutionLane {
+            prepared_lanes.push(SpeculativeGenerationLane {
                 prompt,
                 generation,
                 config,
@@ -296,11 +302,12 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
                 on_event: lane.on_event,
             });
         }
-        B::execute_prepared_chat_mtp_batch(
-            self,
-            PreparedChatMtpBatchExecutionRequest {
+        B::execute_speculative_batch(
+            &mut self.runtime,
+            SpeculativeGenerationBatchRequest {
                 drafting,
                 lanes: prepared_lanes,
+                tokenizer_fingerprint: self.tokenizer_fingerprint,
                 scheduler,
             },
         )

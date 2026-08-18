@@ -105,7 +105,12 @@ fn backend_and_example_dependencies_have_the_correct_manifest_ownership() {
 
 #[test]
 fn backend_implementation_does_not_import_facade_orchestration() {
-    let backend = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend");
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !manifest.join("src/api/mlx.rs").exists(),
+        "MLX speculative execution must not live in the facade source tree"
+    );
+    let backend = manifest.join("src/backend");
     let mut sources = Vec::new();
     rust_sources(&backend, &mut sources);
     let offenders = sources

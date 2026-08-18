@@ -20,9 +20,9 @@ use safemlx::{
 };
 use safemlx_lm::{
     api::{
-        LoadedModel, PreparedChatDraft, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
-        PreparedChatMtpGenerationRequest, ResidencyPlan, TextDecoder, TextModelError,
+        LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
+        PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
+        ResidencyPlan, SpeculativeDraft, TextDecoder, TextModelError,
     },
     backend::mlx::automatic::{
         discover_hardware, execution_plan_load_options, expert_cache_telemetry, mtp_telemetry,
@@ -2398,7 +2398,7 @@ fn main() -> Result<()> {
             let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
-                drafting: PreparedChatDraft::External(drafter),
+                drafting: SpeculativeDraft::External(drafter),
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)
@@ -2437,7 +2437,7 @@ fn main() -> Result<()> {
             let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
-                drafting: PreparedChatDraft::Embedded,
+                drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)

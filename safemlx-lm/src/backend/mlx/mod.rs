@@ -22,6 +22,7 @@ mod media;
 mod model;
 /// Reusable MLX neural-network building blocks.
 pub mod nn;
+mod prepared_speculative;
 /// Realtime Moshi/PersonaPlex session execution.
 pub mod realtime;
 /// MLX allocator observations for neutral residency telemetry.

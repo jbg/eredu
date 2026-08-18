@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::api::{LoadedModel, PreparedChatDraft, PreparedChatInput, PreparedChatMtpBatchRequest};
+use crate::api::{LoadedModel, PreparedChatInput, PreparedChatMtpBatchRequest, SpeculativeDraft};
 use crate::backend::mlx::architectures::gemma4::model as gemma4;
 use crate::{
     backend::mlx::architectures::{
@@ -301,7 +301,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
 
     let output = model
         .generate_prepared_chat_mtp_batch(PreparedChatMtpBatchRequest {
-            drafting: PreparedChatDraft::Embedded,
+            drafting: SpeculativeDraft::Embedded,
             lanes: Vec::new(),
             scheduler: MtpSchedulerOptions::default(),
         })

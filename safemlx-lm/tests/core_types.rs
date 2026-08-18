@@ -73,6 +73,14 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::core::speculative::MtpBatchOutput>(),
     );
     assert_eq!(
+        TypeId::of::<safemlx_lm::SpeculativeGenerationOutput>(),
+        TypeId::of::<safemlx_lm::core::speculative::SpeculativeGenerationOutput>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::api::SpeculativeGenerationBatchOutput>(),
+        TypeId::of::<safemlx_lm::core::speculative::SpeculativeGenerationBatchOutput>(),
+    );
+    assert_eq!(
         TypeId::of::<safemlx_lm::OffloadConfig>(),
         TypeId::of::<safemlx_lm::core::residency::OffloadConfig>(),
     );

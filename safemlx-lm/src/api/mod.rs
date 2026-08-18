@@ -18,13 +18,10 @@ pub use crate::runtime::chat::{
     NativeToolSupport, ParallelToolCallPolicy, PreparedChat, SemanticSupport, ToolChoice,
 };
 pub use request::{
-    PreparedChatDraft, PreparedChatError, PreparedChatGenerationOutput,
-    PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-    PreparedChatMtpBatchExecutionRequest, PreparedChatMtpBatchLane, PreparedChatMtpBatchOutput,
-    PreparedChatMtpBatchRequest, PreparedChatMtpError, PreparedChatMtpExecutionLane,
-    PreparedChatMtpExecutionRequest, PreparedChatMtpGenerationOptions,
-    PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest,
-    PreparedChatSpeculativeBackend, PreparedChatSpeculativeConstraint,
+    PreparedChatError, PreparedChatGenerationOutput, PreparedChatGenerationRequest,
+    PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
+    PreparedChatMtpBatchRequest, PreparedChatMtpError, PreparedChatMtpGenerationOptions,
+    PreparedChatMtpGenerationRequest, PreparedChatSpeculativeConstraint,
 };
 pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 
@@ -52,15 +49,13 @@ pub use safemlx_lm_core::{
     ModelResourceProfile, MtpTelemetry, MultimodalPreparationBackend, MultimodalPreparationFailure,
     MultimodalRequest, MultimodalSegment, ObservationKind, Observed, PhysicalMemorySemantics,
     PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
-    RgbImage, RuntimeStateEstimate, SlidingWindowLayerCount, StateMemoryAssumptions,
-    StaticMemoryReport, TimingTelemetry, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
-    TransferTelemetry, Video, VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    RgbImage, RuntimeStateEstimate, SlidingWindowLayerCount, SpeculativeDraft,
+    SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput,
+    StateMemoryAssumptions, StaticMemoryReport, TimingTelemetry, TokenizedMultimodalRequest,
+    TokenizedMultimodalSegment, TransferTelemetry, Video, VideoSampling, WeightTransformationPlan,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 pub use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
-
-#[cfg(feature = "mlx")]
-#[path = "mlx.rs"]
-pub(crate) mod mlx;
 
 #[cfg(test)]
 mod tests;

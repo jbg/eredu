@@ -254,7 +254,7 @@ Embedded prediction heads and external assistants enter the same
 loops or forwarding wrappers. Prepared-chat MTP requests contain portable
 sampling and scheduler settings; target and drafter execution placement is
 fixed when those models are loaded, and MLX cache lanes are adapter-owned.
-`PreparedChatSpeculativeBackend` makes the same capability, single-request, and
+`SpeculativeGenerationBackend` makes the same capability, single-request, and
 batch methods available on `LoadedModel<B>`; its associated drafter type
 prevents mixing backend families. Before backend dispatch, the facade resolves
 checkpoint sampling defaults, prepares the opaque backend prompt, and constructs

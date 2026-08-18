@@ -3,9 +3,9 @@ use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
 use safemlx::{ExecutionContext, Stream};
 use safemlx_lm::{
     api::{
-        ChatTemplateRequest, LoadedModel, PreparedChat, PreparedChatDraft,
-        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
-        PreparedChatMtpGenerationRequest,
+        ChatTemplateRequest, LoadedModel, PreparedChat, PreparedChatGenerationSettings,
+        PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
+        SpeculativeDraft,
     },
     backend::mlx::speculative::MlxDrafter,
     GenerationCancellationToken, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
@@ -172,7 +172,7 @@ fn run_mtp(
         MlxDrafter::load(assistant_dir, &assistant_tokenizer, stream, weights_stream)?;
     let output = target.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
         input: PreparedChatInput::rendered_prompt(prepared),
-        drafting: PreparedChatDraft::External(&mut assistant),
+        drafting: SpeculativeDraft::External(&mut assistant),
         settings: PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 temperature: Some(0.0),

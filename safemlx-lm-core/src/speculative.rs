@@ -1,15 +1,140 @@
 //! High-level contracts and orchestration for speculative execution backends.
 
 use crate::{
-    backend::{Completion, Submission},
+    backend::{
+        Completion, ModelRuntime, SpeculativeTokenFilterController, Submission,
+        TextGenerationBackend, TextGenerationConfig,
+    },
     generation::{
         FinishReason, GenerationCancellationToken, GenerationError, GenerationSequence,
         MtpCancellationDisposition, MtpConfig, MtpRequestId, MtpRequestLifecycle, MtpRequestPhase,
-        MtpSchedulerOptions, SpeculativeRound, TokenTerminalSignals,
+        MtpSchedulerOptions, SemanticEvent, SpeculativeRound, TokenTerminalSignals,
     },
 };
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
+
+/// Draft-model source selected for one speculative-generation request.
+pub enum SpeculativeDraft<'a, D> {
+    /// Separately prepared assistant owned by the selected backend.
+    External(&'a mut D),
+    /// Draft heads embedded in the selected target model.
+    Embedded,
+}
+
+/// One backend-independent speculative-generation result.
+pub struct SpeculativeGenerationOutput {
+    /// Canonical emitted token ids, including terminal EOS when emitted.
+    pub token_ids: Vec<u32>,
+    /// Portable terminal reason selected by the generation lifecycle.
+    pub finish_reason: FinishReason,
+    /// Portable speculative execution telemetry.
+    pub stats: MtpStats,
+}
+
+/// Completed speculative requests plus aggregate fair-scheduler telemetry.
+pub struct SpeculativeGenerationBatchOutput {
+    /// Per-request results in submission order.
+    pub requests: Vec<SpeculativeGenerationOutput>,
+    /// Aggregate scheduler telemetry.
+    pub scheduler: MtpSchedulerStats,
+}
+
+/// Execution-ready speculative request prepared above a selected backend.
+pub struct SpeculativeGenerationRequest<'a, B, D, C, F>
+where
+    B: TextGenerationBackend,
+    C: SpeculativeTokenFilterController,
+{
+    /// Backend-owned prompt prepared by the selected session backend.
+    pub prompt: B::Prompt,
+    /// Embedded or separately prepared draft-model selection.
+    pub drafting: SpeculativeDraft<'a, D>,
+    /// Fully resolved portable sampling configuration and random seed.
+    pub generation: TextGenerationConfig,
+    /// Resolved token budget, proposal width, temperature, and EOS ids.
+    pub config: MtpConfig,
+    /// Portable canonical grammar state.
+    pub constraint: C,
+    /// Transactional decoded semantic parser state.
+    pub semantic: Box<dyn SpeculativeSemanticState>,
+    /// Fair-scheduler and optimistic-lookahead controls.
+    pub scheduler: MtpSchedulerOptions,
+    /// Cooperative cancellation observed between exact submissions.
+    pub cancellation: GenerationCancellationToken,
+    /// Target tokenizer vocabulary identity used for drafter compatibility.
+    pub tokenizer_fingerprint: [u8; 32],
+    /// Called synchronously after each semantic event commits.
+    pub on_event: F,
+}
+
+/// One independently executable lane in a speculative batch.
+pub struct SpeculativeGenerationLane<'a, B, C>
+where
+    B: TextGenerationBackend,
+    C: SpeculativeTokenFilterController,
+{
+    /// Backend-owned prompt prepared by the selected session backend.
+    pub prompt: B::Prompt,
+    /// Fully resolved portable sampling configuration and random seed.
+    pub generation: TextGenerationConfig,
+    /// Resolved token budget, proposal width, temperature, and EOS ids.
+    pub config: MtpConfig,
+    /// Portable canonical grammar state.
+    pub constraint: C,
+    /// Transactional decoded semantic parser state.
+    pub semantic: Box<dyn SpeculativeSemanticState>,
+    /// Cooperative cancellation owned by this lane.
+    pub cancellation: GenerationCancellationToken,
+    /// Called synchronously for canonical events from this lane.
+    pub on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
+}
+
+/// Execution-ready fair-scheduler speculative batch.
+pub struct SpeculativeGenerationBatchRequest<'a, B, D, C>
+where
+    B: TextGenerationBackend,
+    C: SpeculativeTokenFilterController,
+{
+    /// Embedded or separately prepared draft-model selection.
+    pub drafting: SpeculativeDraft<'a, D>,
+    /// Independently prepared speculative lanes.
+    pub lanes: Vec<SpeculativeGenerationLane<'a, B, C>>,
+    /// Target tokenizer vocabulary identity used for drafter compatibility.
+    pub tokenizer_fingerprint: [u8; 32],
+    /// Bounded scheduler and optimistic-lookahead controls.
+    pub scheduler: MtpSchedulerOptions,
+}
+
+/// Optional whole-session speculative-generation capability.
+///
+/// Implementations own draft models, target and draft placement, tensor
+/// caches, sampling execution, and exact completion. A backend is selected for
+/// the complete model session; requests cannot mix runtime implementations.
+pub trait SpeculativeGenerationBackend: TextGenerationBackend {
+    /// Backend-owned separately prepared draft model.
+    type Drafter;
+
+    /// Reports fail-closed speculative support for the selected model session.
+    fn mtp_capability(runtime: &ModelRuntime<Self>) -> MtpCapability;
+
+    /// Executes one prepared speculative request.
+    fn execute_speculative<C, F>(
+        runtime: &mut ModelRuntime<Self>,
+        request: SpeculativeGenerationRequest<'_, Self, Self::Drafter, C, F>,
+    ) -> Result<SpeculativeGenerationOutput, Self::Error>
+    where
+        C: SpeculativeTokenFilterController,
+        F: FnMut(SemanticEvent);
+
+    /// Executes independent lanes through one fair speculative scheduler.
+    fn execute_speculative_batch<C>(
+        runtime: &mut ModelRuntime<Self>,
+        request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
+    ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
+    where
+        C: SpeculativeTokenFilterController;
+}
 
 /// Relationship between target and assistant execution placements.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]

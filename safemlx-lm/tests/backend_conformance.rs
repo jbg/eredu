@@ -14,12 +14,10 @@ use std::{
 use safemlx_lm::{
     api::{
         ChatTemplateRequest, ChatTokenizer, LoadedModel, LoadedTextModelConfig, Media,
-        ModelChatTemplate, MultimodalRequest, MultimodalSegment, PreparedChat, PreparedChatDraft,
-        PreparedChatError, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-        PreparedChatInput, PreparedChatMtpBatchExecutionRequest, PreparedChatMtpBatchLane,
-        PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest, PreparedChatMtpExecutionRequest,
-        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationOutput,
-        PreparedChatMtpGenerationRequest, PreparedChatSpeculativeBackend, RgbImage,
+        ModelChatTemplate, MultimodalRequest, MultimodalSegment, PreparedChat, PreparedChatError,
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+        PreparedChatMtpBatchLane, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
+        PreparedChatMtpGenerationRequest, RgbImage,
     },
     core::{MtpSchedulerStats, MtpStats},
     load_realtime_model_with_options, AdmissionRequest, AdmissionResult, Backend,
@@ -30,9 +28,11 @@ use safemlx_lm::{
     MultimodalPreparationBackend, Observed, PhysicalMemorySemantics, PreparedModel,
     RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler,
     RealtimeSpeechConfig, RequestId, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
-    SemanticStateTransaction, SpeculativeTokenFilterController, StateLayout, StaticMemoryReport,
-    Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
-    WorkDescriptor,
+    SemanticStateTransaction, SpeculativeDraft, SpeculativeGenerationBackend,
+    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
+    SpeculativeGenerationOutput, SpeculativeGenerationRequest, SpeculativeTokenFilterController,
+    StateLayout, StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig,
+    TokenFilter, TokenOutput, WorkDescriptor,
 };
 use safemlx_lm_core::Completion;
 use tokenizers::{
@@ -300,23 +300,24 @@ impl ModelLoadingBackend for MockBackend {
 
 struct MockDrafter;
 
-impl PreparedChatSpeculativeBackend for MockBackend {
+impl SpeculativeGenerationBackend for MockBackend {
     type Drafter = MockDrafter;
 
-    fn mtp_capability(_: &LoadedModel<Self>) -> MtpCapability {
+    fn mtp_capability(_: &ModelRuntime<Self>) -> MtpCapability {
         MtpCapability::Ready {
             checkpoint: MtpCheckpointKind::Embedded,
         }
     }
 
-    fn execute_prepared_chat_mtp<'a, F>(
-        _: &mut LoadedModel<Self>,
-        request: PreparedChatMtpExecutionRequest<'a, Self, Self::Drafter, F>,
-    ) -> Result<PreparedChatMtpGenerationOutput, MockError>
+    fn execute_speculative<C, F>(
+        _: &mut ModelRuntime<Self>,
+        request: SpeculativeGenerationRequest<'_, Self, Self::Drafter, C, F>,
+    ) -> Result<SpeculativeGenerationOutput, MockError>
     where
+        C: SpeculativeTokenFilterController,
         F: FnMut(SemanticEvent),
     {
-        assert!(matches!(request.drafting, PreparedChatDraft::Embedded));
+        assert!(matches!(request.drafting, SpeculativeDraft::Embedded));
         assert!(!request.prompt.is_empty());
         assert_eq!(request.config.max_draft_tokens, 4);
         assert_eq!(request.generation.seed(), 0);
@@ -328,18 +329,21 @@ impl PreparedChatSpeculativeBackend for MockBackend {
         for event in semantic.take_events() {
             on_event(event);
         }
-        Ok(PreparedChatMtpGenerationOutput {
+        Ok(SpeculativeGenerationOutput {
             token_ids: vec![7, 11],
             finish_reason: FinishReason::MaxTokens,
             stats: MtpStats::default(),
         })
     }
 
-    fn execute_prepared_chat_mtp_batch<'a>(
-        _: &mut LoadedModel<Self>,
-        request: PreparedChatMtpBatchExecutionRequest<'a, Self, Self::Drafter>,
-    ) -> Result<PreparedChatMtpBatchOutput, MockError> {
-        assert!(matches!(request.drafting, PreparedChatDraft::Embedded));
+    fn execute_speculative_batch<C>(
+        _: &mut ModelRuntime<Self>,
+        request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
+    ) -> Result<SpeculativeGenerationBatchOutput, MockError>
+    where
+        C: SpeculativeTokenFilterController,
+    {
+        assert!(matches!(request.drafting, SpeculativeDraft::Embedded));
         let requests = request
             .lanes
             .into_iter()
@@ -350,14 +354,14 @@ impl PreparedChatSpeculativeBackend for MockBackend {
                 for event in lane.semantic.take_events() {
                     (lane.on_event)(event);
                 }
-                PreparedChatMtpGenerationOutput {
+                SpeculativeGenerationOutput {
                     token_ids: vec![13],
                     finish_reason: FinishReason::MaxTokens,
                     stats: MtpStats::default(),
                 }
             })
             .collect();
-        Ok(PreparedChatMtpBatchOutput {
+        Ok(SpeculativeGenerationBatchOutput {
             requests,
             scheduler: MtpSchedulerStats::default(),
         })
@@ -444,10 +448,10 @@ fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, pre
     ));
 }
 
-fn speculative_client_code<B: PreparedChatSpeculativeBackend>(
+fn speculative_client_code<B: SpeculativeGenerationBackend>(
     model: &mut LoadedModel<B>,
     prepared: &PreparedChat,
-) -> (PreparedChatMtpGenerationOutput, Vec<SemanticEvent>) {
+) -> (SpeculativeGenerationOutput, Vec<SemanticEvent>) {
     assert!(matches!(
         model.mtp_capability(),
         MtpCapability::Ready { .. }
@@ -456,7 +460,7 @@ fn speculative_client_code<B: PreparedChatSpeculativeBackend>(
     let output = model
         .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
             input: PreparedChatInput::rendered_prompt(prepared),
-            drafting: PreparedChatDraft::Embedded,
+            drafting: SpeculativeDraft::Embedded,
             settings: PreparedChatGenerationSettings::default(),
             options: PreparedChatMtpGenerationOptions::default(),
             caller_stop_sequences: &[],
@@ -467,14 +471,14 @@ fn speculative_client_code<B: PreparedChatSpeculativeBackend>(
     (output, events)
 }
 
-fn speculative_batch_client_code<B: PreparedChatSpeculativeBackend>(
+fn speculative_batch_client_code<B: SpeculativeGenerationBackend>(
     model: &mut LoadedModel<B>,
     prepared: &PreparedChat,
-) -> (PreparedChatMtpBatchOutput, Vec<SemanticEvent>) {
+) -> (SpeculativeGenerationBatchOutput, Vec<SemanticEvent>) {
     let mut events = Vec::new();
     let output = model
         .generate_prepared_chat_mtp_batch(PreparedChatMtpBatchRequest {
-            drafting: PreparedChatDraft::Embedded,
+            drafting: SpeculativeDraft::Embedded,
             lanes: vec![PreparedChatMtpBatchLane {
                 input: PreparedChatInput::rendered_prompt(prepared),
                 settings: PreparedChatGenerationSettings::default(),

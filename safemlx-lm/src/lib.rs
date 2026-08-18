@@ -47,12 +47,14 @@ pub use safemlx_lm_core::{
     RealtimeCompletedStep, RealtimeConfigError, RealtimeError, RealtimeModel,
     RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler, RealtimeSession,
     RealtimeSpeechConfig, ResidencyPlan, ResidencyTelemetry, RgbImage, RuntimeStateEstimate,
-    SlidingWindowLayerCount, SpeculativeTokenFilterController, StateLayout, StateMemoryAssumptions,
-    StaticMemoryReport, SubgroupMembership, Submission, TextGeneration, TextGenerationBackend,
-    TextGenerationConfig, TimingTelemetry, TokenFilter, TokenFilterController, TokenFilterError,
-    TokenOutput, TokenizedMultimodalRequest, TokenizedMultimodalSegment, TopologyPreflightReport,
-    TransferTelemetry, ValueDescriptor, Video, VideoSampling, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    SlidingWindowLayerCount, SpeculativeDraft, SpeculativeGenerationBackend,
+    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
+    SpeculativeGenerationOutput, SpeculativeGenerationRequest, SpeculativeTokenFilterController,
+    StateLayout, StateMemoryAssumptions, StaticMemoryReport, SubgroupMembership, Submission,
+    TextGeneration, TextGenerationBackend, TextGenerationConfig, TimingTelemetry, TokenFilter,
+    TokenFilterController, TokenFilterError, TokenOutput, TokenizedMultimodalRequest,
+    TokenizedMultimodalSegment, TopologyPreflightReport, TransferTelemetry, ValueDescriptor, Video,
+    VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 #[cfg(all(test, feature = "mlx"))]
 mod test_utils;

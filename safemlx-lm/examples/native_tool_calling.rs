@@ -8,9 +8,9 @@ use std::{env, num::NonZeroUsize};
 use safemlx::{Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::{
-        LoadedModel, PreparedChatDraft, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
-        PreparedChatMtpGenerationRequest,
+        LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
+        PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
+        SpeculativeDraft,
     },
     backend::mlx::speculative::MlxDrafter,
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model
             .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),
-                drafting: PreparedChatDraft::External(&mut drafter),
+                drafting: SpeculativeDraft::External(&mut drafter),
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(3).unwrap(),
@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model
             .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),
-                drafting: PreparedChatDraft::Embedded,
+                drafting: SpeculativeDraft::Embedded,
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(3).unwrap(),

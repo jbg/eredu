@@ -368,15 +368,19 @@ Prepared-chat speculative setup is facade orchestration, not backend work.
 prompt through `B::prepare_text_prompt` (or accepts an already prepared opaque
 prompt), validates semantic support, and constructs both
 `PreparedChatSpeculativeConstraint` and the transactional
-`SpeculativeSemanticState`. `PreparedChatSpeculativeBackend` receives only the
+`SpeculativeSemanticState`. `SpeculativeGenerationBackend` receives only the
 resulting execution-ready single request or batch lanes. A second backend can
 apply the portable constraint's filters around its own logits math and pass the
 semantic state to the core output runtime without reproducing dialect, stop,
 parser-fork, or replay semantics. MLX converts the resolved sampling policy to
 its array sampler and owns only execution, PRNG arrays, streams, and caches.
 
-The MLX adapter has one scheduler implementation in
-`backend/mlx/speculative/scheduler.rs`. Its `generate_tokens` and
+The MLX whole-session capability lives in
+`backend/mlx/prepared_speculative.rs` and has no dependency on the facade.
+It consumes the core execution-ready request, validates target/drafter
+vocabulary identity, creates backend-owned sampling and cache state, and
+dispatches one scheduler implementation in
+`backend/mlx/speculative/scheduler.rs`. The scheduler's `generate_tokens` and
 `generate_semantic` entry points accept every MLX `SpeculativeExecutor`.
 Checkpoint-embedded heads are adapted by
 `backend/mlx/speculative/embedded.rs`; external Gemma and Muse assistants and
@@ -406,7 +410,7 @@ Ordinary generation, prepared-chat generation, speculative single-request
 generation, cache-policy selection, and prompt-cache persistence all use the
 session-owned cache and selected execution placement. Prepared-chat MTP requests
 contain only portable sampling settings, scheduler policy, cancellation, and
-semantic callbacks. `PreparedChatSpeculativeBackend` makes capability discovery,
+semantic callbacks. `SpeculativeGenerationBackend` makes capability discovery,
 single-request execution, and fair batch execution operations on generic
 `LoadedModel<B>`; its associated drafter type prevents cross-backend pairing.
 The facade turns those caller requests into execution-ready requests with an
@@ -594,7 +598,7 @@ The current boundary leaves these components MLX-coupled:
   MLX adapter types. Prepared-chat speculative requests no longer expose samplers, random
   arrays, streams, or cache objects, and their drafter field is generic. The
   public methods live on `LoadedModel<B>` behind the production-used
-  `PreparedChatSpeculativeBackend` capability. `MtpCapability` and
+  `SpeculativeGenerationBackend` capability. `MtpCapability` and
   `MtpCheckpointKind` are canonical core schemas. Raw tensor-oriented MTP APIs
   remain explicitly MLX adapter APIs; the remaining coupling is the concrete
   logits/sampler/executor implementation beneath the capability.
