@@ -2,9 +2,11 @@
 //!
 //! The client probes are generic over the facade contracts so new backend
 //! implementations can reuse the same loading, generation, capability, media,
-//! speculative, and realtime call shapes.
+//! speculative, realtime, distributed, automatic-planning, and residency
+//! realization call shapes.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     io::Write,
     num::{NonZeroU8, NonZeroUsize},
@@ -20,20 +22,29 @@ use safemlx_lm::{
         PreparedChatMtpBatchLane, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
         PreparedChatMtpGenerationRequest, RgbImage,
     },
-    core::{MtpSchedulerStats, MtpStats},
-    load_realtime_model_with_options, AdmissionRequest, AdmissionResult, Backend,
-    BackendCapabilities, BackendDescriptor, BackendSession, CacheStateStrategy, CapabilityError,
-    DeviceDescriptor, EstimationCompleteness, FinishReason, GenerationConfigOverrides,
-    GrowingState, InputModalities, InputTokenCount, ModelCapabilities, ModelCapabilityBackend,
-    ModelLoadingBackend, ModelRuntime, MtpCapability, MtpCheckpointKind,
-    MultimodalPreparationBackend, Observed, PhysicalMemorySemantics, PreparedModel,
-    RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler,
-    RealtimeSpeechConfig, RequestId, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
+    core::{
+        checkpoint::TensorDtype, BoundedResidencyRequirement, CandidateAdmission,
+        MtpSchedulerStats, MtpStats,
+    },
+    load_realtime_model_with_options, AdmissionRequest, AdmissionResult, ArtifactFormat,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningBackend, AutomaticPlanningError,
+    Backend, BackendCapabilities, BackendDescriptor, BackendId, BackendSession, CacheStateStrategy,
+    CapabilityError, CollectiveScope, DeviceDescriptor, DevicePlan, DistributedBackend,
+    DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
+    EstimationCompleteness, ExecutionPlan, FinishReason, GenerationConfigOverrides, GrowingState,
+    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
+    InputModalities, InputTokenCount, MemoryTier, ModelCapabilities, ModelCapabilityBackend,
+    ModelKind, ModelLoadingBackend, ModelResourceProfile, ModelRuntime, MtpCapability,
+    MtpCheckpointKind, MultimodalPreparationBackend, Observed, OffloadConfig, OffloadPlan,
+    OffloadUnitId, OffloadUnitSpec, ParallelAxis, ParallelTopology, PhysicalMemorySemantics,
+    PreparedModel, RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling,
+    RealtimeScheduler, RealtimeSpeechConfig, RequestId, ResidencyLedger, ResidencyPlan,
+    ResidencyPolicy, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
     SemanticStateTransaction, SpeculativeDraft, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
     SpeculativeGenerationOutput, SpeculativeGenerationRequest, SpeculativeTokenFilterController,
     StateLayout, StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig,
-    TokenFilter, TokenOutput, WorkDescriptor,
+    TokenFilter, TokenOutput, ValueDescriptor, WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx_lm_core::Completion;
 use tokenizers::{
@@ -70,7 +81,9 @@ impl Drop for TestDirectory {
 }
 
 struct MockBackend;
-struct MockSession;
+struct MockSession {
+    distributed: MockDistributedSession,
+}
 struct Done;
 #[derive(Clone)]
 struct MockToken(u32);
@@ -130,7 +143,15 @@ impl Backend for MockBackend {
     }
 
     fn create_session(&self, _: PreparedModel<Self::Model>) -> Result<Self::Session, Self::Error> {
-        Ok(MockSession)
+        Ok(MockSession {
+            distributed: MockDistributedSession {
+                descriptor: DistributedSessionDescriptor::new(
+                    ParallelTopology::new(2, 1, 1, 1).unwrap(),
+                    0,
+                )
+                .unwrap(),
+            },
+        })
     }
 }
 
@@ -160,6 +181,119 @@ impl BackendSession<MockBackend> for MockSession {
             output: input + 1,
             completion: Done,
         })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct MockDistributedValue(Vec<u32>);
+
+#[derive(Clone, Copy)]
+struct MockDistributedSession {
+    descriptor: DistributedSessionDescriptor,
+}
+
+impl DistributedSession for MockDistributedSession {
+    type Value = MockDistributedValue;
+    type Completion = Done;
+    type Error = MockError;
+
+    fn descriptor(&self) -> DistributedSessionDescriptor {
+        self.descriptor
+    }
+
+    fn capabilities(&self) -> DistributedCapabilities {
+        DistributedCapabilities {
+            world_collectives: true,
+            collective_axes: vec![ParallelAxis::Tensor],
+            point_to_point: true,
+            variable_all_to_all: true,
+            exact_completion: true,
+        }
+    }
+
+    fn all_reduce_sum(
+        &self,
+        scope: CollectiveScope,
+        input: &Self::Value,
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error> {
+        assert_eq!(scope, CollectiveScope::Axis(ParallelAxis::Tensor));
+        Ok(Submission {
+            output: MockDistributedValue(input.0.iter().map(|value| value * 2).collect()),
+            completion: Done,
+        })
+    }
+
+    fn all_gather(
+        &self,
+        scope: CollectiveScope,
+        input: &Self::Value,
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error> {
+        assert_eq!(scope, CollectiveScope::World);
+        let mut output = input.0.clone();
+        output.extend_from_slice(&input.0);
+        Ok(Submission {
+            output: MockDistributedValue(output),
+            completion: Done,
+        })
+    }
+
+    fn all_to_all_v(
+        &self,
+        scope: CollectiveScope,
+        input: &Self::Value,
+        send_counts: &[usize],
+        receive_counts: &[usize],
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error> {
+        assert_eq!(scope, CollectiveScope::World);
+        assert_eq!(send_counts, [1, 1]);
+        assert_eq!(receive_counts, [1, 1]);
+        Ok(Submission {
+            output: input.clone(),
+            completion: Done,
+        })
+    }
+
+    fn send(
+        &self,
+        scope: CollectiveScope,
+        peer: usize,
+        input: &Self::Value,
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error> {
+        assert_eq!(scope, CollectiveScope::World);
+        assert_eq!(peer, 1);
+        Ok(Submission {
+            output: input.clone(),
+            completion: Done,
+        })
+    }
+
+    fn receive(
+        &self,
+        scope: CollectiveScope,
+        peer: usize,
+        value: &ValueDescriptor,
+    ) -> Result<Submission<Self::Value, Self::Completion>, Self::Error> {
+        assert_eq!(scope, CollectiveScope::World);
+        assert_eq!(peer, 1);
+        assert_eq!(value.dtype, TensorDtype::U32);
+        Ok(Submission {
+            output: MockDistributedValue(vec![peer as u32; value.shape.iter().product()]),
+            completion: Done,
+        })
+    }
+
+    fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Self::Error> {
+        let mut gathered = local.to_vec();
+        gathered.extend_from_slice(local);
+        Ok(gathered)
+    }
+}
+
+impl DistributedBackend for MockBackend {
+    type DistributedSession = MockDistributedSession;
+
+    fn distributed_session<'a>(session: &'a Self::Session) -> Option<&'a Self::DistributedSession> {
+        Some(&session.distributed)
     }
 }
 
@@ -324,6 +458,92 @@ impl ModelLoadingBackend for MockBackend {
     }
 }
 
+impl AutomaticPlanningBackend for MockBackend {
+    fn backend_id(&self) -> BackendId {
+        BackendId::new("mock").unwrap()
+    }
+
+    fn discover_hardware(&self) -> Result<HardwareProfile, AutomaticPlanningError> {
+        Ok(HardwareProfile {
+            schema_version: AUTOMATIC_SCHEMA_VERSION,
+            operating_system: "portable-test".into(),
+            architecture: "mock".into(),
+            logical_cpu_count: Observed::exact(4, "conformance fixture"),
+            physical_memory_bytes: Observed::exact(64 * 1024, "conformance fixture"),
+            available_memory_bytes: Observed::exact(64 * 1024, "conformance fixture"),
+            physical_memory_semantics: HardwareMemorySemantics::SeparateTiers,
+            backends: vec![HardwareBackendProfile {
+                backend: self.backend_id(),
+                available: true,
+                detail: None,
+                devices: vec![HardwareDeviceProfile {
+                    id: "gpu:0".into(),
+                    family: "mock-accelerator".into(),
+                    index: 0,
+                    total_memory_bytes: Observed::exact(8 * 1024, "conformance fixture"),
+                    available_memory_bytes: Observed::exact(8 * 1024, "conformance fixture"),
+                }],
+            }],
+        })
+    }
+
+    fn inspect_resources(
+        &self,
+        model_path: &Path,
+    ) -> Result<ModelResourceProfile, AutomaticPlanningError> {
+        assert!(model_path.join("model.safetensors").is_file());
+        let mut profile =
+            ModelResourceProfile::unmeasured(model_path.into(), ArtifactFormat::SafeTensors);
+        profile.model_kind = Some(ModelKind::Llama);
+        profile.architecture = Some("llama".into());
+        profile.tensor_count = Some(1);
+        profile.checkpoint_shards = Some(1);
+        profile.stored_tensor_bytes = Observed::exact(4, "conformance fixture");
+        profile.largest_stored_tensor_bytes = Observed::exact(4, "conformance fixture");
+        profile.materialized_parameter_bytes = Observed::exact(16 * 1024, "conformance fixture");
+        Ok(profile)
+    }
+
+    fn admit_candidate(
+        &self,
+        _: &Path,
+        plan: &ExecutionPlan,
+    ) -> Result<CandidateAdmission, AutomaticPlanningError> {
+        assert_eq!(plan.device.backend, self.backend_id());
+        let supported = plan.expert_cache.is_none();
+        Ok(CandidateAdmission {
+            supported,
+            rejection: (!supported).then(|| "mock model has no routed experts".into()),
+        })
+    }
+
+    fn bounded_residency_requirement(
+        &self,
+        _: &Path,
+        plan: &ExecutionPlan,
+    ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
+        assert!(matches!(
+            plan.residency,
+            ResidencyPlan::LayerwiseHost { .. } | ResidencyPlan::DenseDiskStream { .. }
+        ));
+        Ok(BoundedResidencyRequirement {
+            static_bytes: 1024,
+            window_bytes: 2048,
+            required_bytes: 3072,
+            depth: 1,
+        })
+    }
+
+    fn embedded_draft_layers(
+        &self,
+        _: &Path,
+        model_kind: Option<ModelKind>,
+    ) -> Result<Option<usize>, AutomaticPlanningError> {
+        assert_eq!(model_kind, Some(ModelKind::Llama));
+        Ok(Some(0))
+    }
+}
+
 struct MockDrafter;
 
 impl SpeculativeGenerationBackend for MockBackend {
@@ -410,6 +630,71 @@ fn apply_filter(candidate: u32, filter: &TokenFilter) -> u32 {
                 .map(|token| token as u32)
         })
         .unwrap()
+}
+
+type DistributedValue<B> =
+    <<B as DistributedBackend>::DistributedSession as DistributedSession>::Value;
+
+struct DistributedProbe<V> {
+    reduced: V,
+    gathered: V,
+    exchanged: V,
+    sent: V,
+    received: V,
+    scheduler_words: Vec<u32>,
+}
+
+fn distributed_client_code<B: DistributedBackend>(
+    runtime: &ModelRuntime<B>,
+    input: &DistributedValue<B>,
+) -> DistributedProbe<DistributedValue<B>> {
+    let session = B::distributed_session(runtime.session())
+        .expect("the conformance backend must expose its selected distributed session");
+    let descriptor = session.descriptor();
+    assert_eq!(descriptor.topology.world_size(), 2);
+    assert_eq!(descriptor.rank, 0);
+    let capabilities = session.capabilities();
+    assert!(capabilities.world_collectives);
+    assert_eq!(capabilities.collective_axes, vec![ParallelAxis::Tensor]);
+    assert!(capabilities.point_to_point);
+    assert!(capabilities.variable_all_to_all);
+    assert!(capabilities.exact_completion);
+
+    DistributedProbe {
+        reduced: session
+            .all_reduce_sum(CollectiveScope::Axis(ParallelAxis::Tensor), input)
+            .unwrap()
+            .wait()
+            .unwrap(),
+        gathered: session
+            .all_gather(CollectiveScope::World, input)
+            .unwrap()
+            .wait()
+            .unwrap(),
+        exchanged: session
+            .all_to_all_v(CollectiveScope::World, input, &[1, 1], &[1, 1])
+            .unwrap()
+            .wait()
+            .unwrap(),
+        sent: session
+            .send(CollectiveScope::World, 1, input)
+            .unwrap()
+            .wait()
+            .unwrap(),
+        received: session
+            .receive(
+                CollectiveScope::World,
+                1,
+                &ValueDescriptor {
+                    shape: vec![2],
+                    dtype: TensorDtype::U32,
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap(),
+        scheduler_words: session.all_gather_words(&[7, 9]).unwrap(),
+    }
 }
 
 fn client_code<B: TextGenerationBackend>(model: &mut LoadedModel<B>) -> Vec<u32> {
@@ -546,6 +831,183 @@ fn write_loadable_text_artifact(root: &std::path::Path) {
         .unwrap();
 }
 
+fn automatic_planning_client_code<B: AutomaticPlanningBackend>(
+    backend: &B,
+    model_path: &Path,
+    device: &str,
+) -> safemlx_lm::ExecutionPlanReport {
+    let request = AutomaticPlanRequest::new(
+        model_path,
+        DevicePlan::new(backend.backend_id().as_str(), device).unwrap(),
+    );
+    let report = AutomaticPlanner::default().plan(backend, &request).unwrap();
+    assert_eq!(report.schema_version, AUTOMATIC_SCHEMA_VERSION);
+    assert_eq!(report.plan.device.backend, backend.backend_id());
+    assert_eq!(report.plan.device.device, device);
+    report
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MockResidentCopy {
+    id: OffloadUnitId,
+    tier: MemoryTier,
+    bytes: u64,
+}
+
+fn realize_residency_copy<R, E>(
+    ledger: &mut ResidencyLedger,
+    resources: &mut BTreeMap<(OffloadUnitId, MemoryTier), R>,
+    id: &OffloadUnitId,
+    tier: MemoryTier,
+    materialize: impl FnOnce(&OffloadUnitSpec, MemoryTier) -> Result<R, E>,
+    mut release: impl FnMut(R),
+) -> Result<(), E> {
+    let spec = ledger.spec(id).unwrap().clone();
+    let evicted = ledger
+        .reserve_copy(id, tier, spec.bytes(), &BTreeSet::new())
+        .unwrap();
+    for evicted in evicted {
+        let resource = resources
+            .remove(&(evicted.id, evicted.tier))
+            .expect("every ledger copy must have one backend resource");
+        release(resource);
+    }
+
+    let generation = ledger.next_transfer_generation().unwrap();
+    let resource = match materialize(&spec, tier) {
+        Ok(resource) => resource,
+        Err(error) => {
+            ledger.rollback_reserved(id, tier).unwrap();
+            return Err(error);
+        }
+    };
+    ledger
+        .publish_reserved(id, tier, spec.bytes(), Some(generation))
+        .unwrap();
+    assert!(resources.insert((id.clone(), tier), resource).is_none());
+    assert!(ledger
+        .resolve_transfer(&[id.clone()], tier, generation, true)
+        .unwrap()
+        .is_empty());
+    Ok(())
+}
+
+fn assert_automatic_planning_conformance() {
+    let artifact = TestDirectory::new();
+    write_loadable_text_artifact(artifact.path());
+    let backend = MockBackend;
+    let report = automatic_planning_client_code(&backend, artifact.path(), "gpu:0");
+    assert!(matches!(
+        &report.plan.residency,
+        ResidencyPlan::LayerwiseHost { .. }
+    ));
+    assert_eq!(report.resources.pinned_parameter_bytes.value(), Some(&1024));
+    assert_eq!(
+        report.resources.largest_execution_group_bytes.value(),
+        Some(&2048)
+    );
+
+    let requirement = backend
+        .bounded_residency_requirement(artifact.path(), &report.plan)
+        .unwrap();
+    assert_eq!(requirement.required_bytes, 3072);
+    assert_eq!(
+        requirement.required_bytes,
+        requirement.static_bytes + requirement.window_bytes
+    );
+}
+
+fn assert_residency_realization_conformance() {
+    let first = OffloadUnitId::new("layer.0").unwrap();
+    let second = OffloadUnitId::new("layer.1").unwrap();
+    let plan = OffloadPlan::new(
+        OffloadConfig::new(Some(4), Some(8), 1).unwrap(),
+        [
+            OffloadUnitSpec::new(
+                first.clone(),
+                4,
+                ResidencyPolicy::Cacheable,
+                MemoryTier::Disk,
+            )
+            .unwrap(),
+            OffloadUnitSpec::new(
+                second.clone(),
+                4,
+                ResidencyPolicy::Cacheable,
+                MemoryTier::Disk,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut ledger = ResidencyLedger::new(plan);
+    let mut resources = BTreeMap::new();
+    let mut released = Vec::new();
+    for id in [&first, &second] {
+        realize_residency_copy(
+            &mut ledger,
+            &mut resources,
+            id,
+            MemoryTier::Host,
+            |spec, tier| {
+                Ok::<_, &'static str>(MockResidentCopy {
+                    id: spec.id().clone(),
+                    tier,
+                    bytes: spec.bytes(),
+                })
+            },
+            |resource| released.push(resource),
+        )
+        .unwrap();
+    }
+    ledger.mark_initialized();
+    ledger.require_initialized().unwrap();
+
+    let error = realize_residency_copy(
+        &mut ledger,
+        &mut resources,
+        &first,
+        MemoryTier::Device,
+        |_, _| Err("synthetic materialization failure"),
+        |resource| released.push(resource),
+    )
+    .unwrap_err();
+    assert_eq!(error, "synthetic materialization failure");
+    assert!(!ledger.is_resident(&first, MemoryTier::Device).unwrap());
+
+    for id in [&first, &second] {
+        realize_residency_copy(
+            &mut ledger,
+            &mut resources,
+            id,
+            MemoryTier::Device,
+            |spec, tier| {
+                Ok::<_, &'static str>(MockResidentCopy {
+                    id: spec.id().clone(),
+                    tier,
+                    bytes: spec.bytes(),
+                })
+            },
+            |resource| released.push(resource),
+        )
+        .unwrap();
+    }
+
+    assert!(ledger.is_resident(&first, MemoryTier::Host).unwrap());
+    assert!(ledger.is_resident(&second, MemoryTier::Host).unwrap());
+    assert!(!ledger.is_resident(&first, MemoryTier::Device).unwrap());
+    assert!(ledger.is_resident(&second, MemoryTier::Device).unwrap());
+    assert_eq!(resources.len(), 3);
+    assert_eq!(
+        released,
+        vec![MockResidentCopy {
+            id: first,
+            tier: MemoryTier::Device,
+            bytes: 4,
+        }]
+    );
+}
+
 fn assert_loading_generation_capability_and_multimodal_conformance() {
     let artifact = TestDirectory::new();
     write_loadable_text_artifact(artifact.path());
@@ -558,6 +1020,17 @@ fn assert_loading_generation_capability_and_multimodal_conformance() {
     assert_eq!(prepared, vec![1, 2_001, 7, 1]);
     capability_client_code(&model, &prepared);
     assert_eq!(client_code(&mut model), vec![1, 2, 3]);
+}
+
+fn assert_distributed_conformance() {
+    let runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+    let distributed = distributed_client_code(&runtime, &MockDistributedValue(vec![2, 3]));
+    assert_eq!(distributed.reduced, MockDistributedValue(vec![4, 6]));
+    assert_eq!(distributed.gathered, MockDistributedValue(vec![2, 3, 2, 3]));
+    assert_eq!(distributed.exchanged, MockDistributedValue(vec![2, 3]));
+    assert_eq!(distributed.sent, MockDistributedValue(vec![2, 3]));
+    assert_eq!(distributed.received, MockDistributedValue(vec![1, 1]));
+    assert_eq!(distributed.scheduler_words, vec![7, 9, 7, 9]);
 }
 
 fn assert_prepared_generation_and_speculative_conformance() {
@@ -832,4 +1305,19 @@ fn non_mlx_backend_conforms_to_the_complete_generic_facade() {
     assert_loading_generation_capability_and_multimodal_conformance();
     assert_prepared_generation_and_speculative_conformance();
     assert_realtime_conformance();
+}
+
+#[test]
+fn non_mlx_backend_conforms_to_distributed_sessions() {
+    assert_distributed_conformance();
+}
+
+#[test]
+fn non_mlx_backend_conforms_to_automatic_planning() {
+    assert_automatic_planning_conformance();
+}
+
+#[test]
+fn non_mlx_backend_conforms_to_residency_realization() {
+    assert_residency_realization_conformance();
 }

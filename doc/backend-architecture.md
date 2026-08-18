@@ -796,8 +796,9 @@ after that transaction reaches its exact safe boundary.
    transfer or persistence transition that owns it.
 9. Reuse the generic client probes in `tests/backend_conformance.rs` for model
    loading, generation, capabilities and admission, multimodal preparation,
-   speculative execution, and realtime scheduling. Run that suite without
-   default features, then add backend-specific model load,
+   speculative execution, realtime scheduling, distributed session operations,
+   automatic planning, and opaque-resource residency realization. Run that
+   suite without default features, then add backend-specific model load,
    architecture-erased prefill, multi-step decode, cancellation, checkpoint,
    and parity tests.
 10. Add backend selection at the facade/application boundary. Do not dispatch
