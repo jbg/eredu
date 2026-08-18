@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use crate::backend::mlx::resolve_model_config;
 use crate::backend::mlx::structural::{self, GgufArchitectureValidation};
 use safemlx::ops::GgufCheckpoint;
 use safemlx_gguf::MetadataValue as GgufMetadataValue;
@@ -370,7 +372,7 @@ fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelIns
     };
 
     if let Some(config) = &config {
-        match super::config::resolve_model_config(config) {
+        match crate::backend::mlx::resolve_model_config(config) {
             Ok(supported) => {
                 resolved_kind = Some(supported.kind);
                 report.model_kind = Some(supported.kind);
@@ -388,7 +390,7 @@ fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelIns
             }
             Err(error) => {
                 report.architecture_support = match &error {
-                    super::config::ModelConfigResolutionError::Loader(
+                    crate::backend::mlx::ModelConfigResolutionError::Loader(
                         Error::UnsupportedModelType(_),
                     ) => InspectionReadiness::Unsupported,
                     _ => InspectionReadiness::Invalid,
@@ -398,7 +400,7 @@ fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelIns
                 report.requested_load = report.model_loadability;
                 report.issue(
                     match &error {
-                        super::config::ModelConfigResolutionError::Loader(
+                        crate::backend::mlx::ModelConfigResolutionError::Loader(
                             Error::UnsupportedModelType(_),
                         ) => InspectionIssueCode::UnsupportedArchitecture,
                         _ => InspectionIssueCode::InvalidConfiguration,
@@ -1557,7 +1559,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{NonExpertWeightResidency, WeightResidency};
+    use crate::{
+        architectures::deepseek_v4::model as deepseek_v4, NonExpertWeightResidency, WeightResidency,
+    };
 
     fn llama_config() -> Value {
         json!({
@@ -8700,11 +8704,13 @@ mod tests {
         assert_eq!(experts.transformed_weights, 18);
         assert!(experts.output_bytes < experts.source_bytes_read);
         let tokens = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
-        let parts = [crate::api::input::InputPart::text_token_ids(&tokens)];
+        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+            &tokens,
+        )];
         let mut cache = loaded.new_cache();
         let logits = loaded
             .submit_prefill(
-                crate::api::input::ModelInput::new(&parts),
+                crate::runtime::media::input::ModelInput::new(&parts),
                 &mut cache,
                 execution.stream(),
             )

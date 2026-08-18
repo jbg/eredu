@@ -44,13 +44,6 @@ use crate::architectures::qwen::vl::{model as qwen_vl, vision::grid_thw_from_arr
 pub use crate::nn::generation::sample;
 
 use crate::{
-    api::{
-        common::{
-            self, attention::attention_probabilities, generation::CausalLm, layers::silu,
-            linear::project_logits_maybe_quantized, moe::TopKRouterScoreFunction,
-        },
-        input as runtime_input,
-    },
     backend::mlx::structural::GgufArchitectureValidation,
     core::cache::{
         CacheRankIdentity, CacheResidencyPool, LayerCachePolicy, StateTensorDimension,
@@ -61,6 +54,10 @@ use crate::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
+    },
+    nn::{
+        self as common, attention::attention_probabilities, generation::CausalLm, layers::silu,
+        linear::project_logits_maybe_quantized, moe::TopKRouterScoreFunction,
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
@@ -79,6 +76,7 @@ use crate::{
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    runtime::media::input as runtime_input,
 };
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -5612,7 +5610,7 @@ pub(crate) fn load_qwen3_5_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports qwen35, qwen35moe, and qwen3next"
         )));
     }
-    let resolved = crate::api::GgufArchitecture::resolve(&architecture)?;
+    let resolved = crate::core::GgufArchitecture::resolve(&architecture)?;
     resolved.validate_catalog(checkpoint, &metadata)?;
     crate::backend::mlx::structural::validate_gguf(
         resolved,
@@ -5791,7 +5789,7 @@ pub(crate) fn load_qwen3_5_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
+    let eos_token_ids = crate::backend::mlx::gguf_eos_token_ids(&metadata)?;
     Ok(LoadedQwen35Gguf {
         model,
         eos_token_ids,
@@ -5810,7 +5808,8 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports qwen35, qwen35moe, and qwen3next"
         )));
     }
-    crate::api::GgufArchitecture::resolve(&architecture)?.validate_catalog(checkpoint, metadata)?;
+    crate::core::GgufArchitecture::resolve(&architecture)?
+        .validate_catalog(checkpoint, metadata)?;
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let block_count = qwen35_gguf_i32(metadata, &key("block_count"), weights_stream)?;
     let nextn_layers =
@@ -5856,7 +5855,7 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
     args.quantized_weight_configs = Some(configs);
     let modalities =
         qwen35_gguf_multimodal_geometry(checkpoint, &args, &architecture, metadata, mmproj)?;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
     Ok(PreparedQwen35Gguf {
         args,
         eos_token_ids,
@@ -6710,7 +6709,7 @@ pub fn load_qwen3_5_model(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
+        crate::core::ModelKind::Qwen35,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;
@@ -6787,7 +6786,7 @@ pub fn load_qwen3_5_model_quantized(
         return load_qwen3_5_model(model_dir, stream, weights_stream);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
+        crate::core::ModelKind::Qwen35,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
@@ -7416,14 +7415,15 @@ mod tests {
     #[cfg(feature = "image-processing")]
     use crate::runtime::media::{load_processor, MediaInput, ProcessorInput, RgbImageView};
     use crate::{
-        api::{common::generation::CausalLm, input as runtime_input},
         backend::mlx::Model as AnyModel,
         error::Error,
+        nn::generation::CausalLm,
         runtime::checkpoint::quantization::AffineQuantization,
         runtime::execution::inspection::ActivationRecorder,
         runtime::{
             attention::{AttentionPolicy, LayerSchedule},
             checkpoint::load::{load_safetensors_strict, StrictLoadReport},
+            media::input as runtime_input,
         },
     };
     use safemlx::{

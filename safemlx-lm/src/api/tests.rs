@@ -2,11 +2,11 @@ use super::{
     chat_template_kwargs, eos_token_ids_from_sidecar_dir, gguf_eos_token_ids,
     inspect_chat_template_kwargs, load_chat_template, load_tokenizer,
     load_tokenizer_template_kwargs, merge_eos_token_id_sources, prepare_chat_from_parts,
-    resolve_model_config, validate_gguf_quantization_source, with_prepared_chat_runtime,
-    LoadedModel, ModelLoadOptions, PreparedChatDraft, PreparedChatInput,
-    PreparedChatMtpBatchRequest, TextModelError,
+    with_prepared_chat_runtime, LoadedModel, ModelLoadOptions, PreparedChatDraft,
+    PreparedChatInput, PreparedChatMtpBatchRequest, TextModelError,
 };
 use crate::{
+    backend::mlx::{resolve_model_config, validate_gguf_quantization_source, ResolvedModelConfig},
     core::generation::{FinishReason, MtpSchedulerOptions, SemanticEvent},
     core::SpeculativeExecutionTopology,
     error::Error,
@@ -5133,8 +5133,8 @@ fn load_policy_admits_fully_resident_inkling_and_nemotron_materialization() {
     ] {
         let options = ModelLoadOptions::with_quantization(quantization);
         for kind in [
-            super::config::ModelKind::Inkling,
-            super::config::ModelKind::NemotronH,
+            crate::core::ModelKind::Inkling,
+            crate::core::ModelKind::NemotronH,
         ] {
             options
                 .validate_preparation(kind, None, safemlx_lm_core::ArtifactFormat::SafeTensors)
@@ -5398,7 +5398,7 @@ fn resolve_model_config_recognizes_exact_qwen2_identity() {
     });
     assert_eq!(
         resolve_model_config(&config).ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Qwen2,
             model_type: "qwen2".into(),
             effective_model_type: "qwen2".into(),
@@ -5504,7 +5504,7 @@ fn resolve_model_config_reports_supported_kimi_linear() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::KimiLinear,
             model_type: "kimi_linear".into(),
             effective_model_type: "kimi_linear".into(),
@@ -5532,7 +5532,7 @@ fn resolve_model_config_reports_supported_dense_mistral() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Llama,
             model_type: "mistral".to_string(),
             effective_model_type: "mistral".to_string(),
@@ -5555,7 +5555,7 @@ fn resolve_model_config_reports_supported_lfm2_families() {
     });
     assert_eq!(
         resolve_model_config(&dense).ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Lfm2,
             model_type: "lfm2".into(),
             effective_model_type: "lfm2".into(),
@@ -5599,7 +5599,7 @@ fn resolve_model_config_reports_supported_gpt_oss() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::GptOss,
             model_type: "gpt_oss".to_string(),
             effective_model_type: "gpt_oss".to_string(),
@@ -5674,7 +5674,7 @@ fn resolve_model_config_reports_supported_qwen3_5_moe() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Qwen35,
             model_type: "qwen3_5_moe".to_string(),
             effective_model_type: "qwen3_5_moe_text".to_string(),
@@ -5695,7 +5695,7 @@ fn resolve_model_config_reports_supported_qwen3_next() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Qwen3Next,
             model_type: "qwen3_next".to_string(),
             effective_model_type: "qwen3_next".to_string(),
@@ -5727,7 +5727,7 @@ fn resolve_model_config_reports_supported_qwen3_vl_moe() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Qwen3VlMoe,
             model_type: "qwen3_vl_moe".to_string(),
             effective_model_type: "qwen3_vl_moe_text".to_string(),
@@ -5754,7 +5754,7 @@ fn resolve_model_config_reports_supported_dense_qwen3_5() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Qwen35,
             model_type: "qwen3_5".to_string(),
             effective_model_type: "qwen3_5_text".to_string(),
@@ -5778,7 +5778,7 @@ fn resolve_model_config_reports_supported_dense_qwen3_5_text() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Qwen35,
             model_type: "qwen3_5_text".to_string(),
             effective_model_type: "qwen3_5_text".to_string(),
@@ -5828,7 +5828,7 @@ fn resolve_model_config_reports_supported_qwen3_vl() {
     }));
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Qwen3Vl,
             model_type: "qwen3_vl".to_string(),
             effective_model_type: "qwen3_vl_text".to_string(),
@@ -5865,7 +5865,7 @@ fn resolve_model_config_reports_supported_nemotron_h() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::NemotronH,
             model_type: "nemotron_h".to_string(),
             effective_model_type: "nemotron_h".to_string(),
@@ -5897,7 +5897,7 @@ fn resolve_model_config_reports_supported_gemma4_moe() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Gemma4,
             model_type: "gemma4".to_string(),
             effective_model_type: "gemma4_text".to_string(),
@@ -5926,7 +5926,7 @@ fn resolve_model_config_reports_supported_gemma4_unified_text() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Gemma4,
             model_type: "gemma4_unified".to_string(),
             effective_model_type: "gemma4_unified_text".to_string(),
@@ -5958,7 +5958,7 @@ fn resolve_model_config_reports_supported_gemma4_unified_moe() {
 
     assert_eq!(
         support.ok(),
-        Some(super::ResolvedModelConfig {
+        Some(ResolvedModelConfig {
             kind: super::ModelKind::Gemma4,
             model_type: "gemma4_unified".to_string(),
             effective_model_type: "gemma4_unified_text".to_string(),

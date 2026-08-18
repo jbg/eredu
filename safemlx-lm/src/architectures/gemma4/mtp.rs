@@ -11,12 +11,11 @@ use safemlx_lm_core::{
 };
 
 use crate::{
-    api::{
-        gemma4::{Cache, Gemma4Embedding, Gemma4StepOutput, Model as Gemma4Model},
-        gemma4_assistant::{Gemma4AssistantDraftModel, Gemma4AssistantDraftState},
-        input::ModelInput as RuntimeInput,
-    },
     architectures::gemma4::layerwise::Gemma4LayerwiseModel,
+    architectures::gemma4::{
+        assistant::{Gemma4AssistantDraftModel, Gemma4AssistantDraftState},
+        model::{Cache, Gemma4Embedding, Gemma4StepOutput, Model as Gemma4Model},
+    },
     backend::mlx::{
         speculative::{
             scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
@@ -24,6 +23,7 @@ use crate::{
         MlxModelInput,
     },
     runtime::attention::AttentionPolicy,
+    runtime::media::input::ModelInput as RuntimeInput,
 };
 
 #[derive(Clone)]

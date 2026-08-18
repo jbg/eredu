@@ -35,22 +35,19 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{
-            self,
-            convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
-            generation::CausalLm,
-            layers::SwiGluMlp,
-            moe::PackedSwiGluExperts,
-        },
-        input,
-    },
     architectures::qwen::dense::{gguf_i32_catalog, gguf_string},
     core::cache::{
         CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
         StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
     error::Error,
+    nn::{
+        self as common,
+        convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
+        generation::CausalLm,
+        layers::SwiGluMlp,
+        moe::PackedSwiGluExperts,
+    },
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::residency::{
         open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
@@ -65,6 +62,7 @@ use crate::{
         load_named_array_strict, safetensors_files, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
+    runtime::media::input,
 };
 
 fn default_model_type() -> String {
@@ -3842,7 +3840,7 @@ pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::Inkling,
+        crate::core::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
         crate::backend::mlx::ModelLoadOptions::default(),
@@ -3889,7 +3887,7 @@ pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
     validate_args(&args)?;
     Ok(PreparedInklingGguf {
         args,
-        eos_token_ids: crate::api::gguf_eos_token_ids(metadata)?,
+        eos_token_ids: crate::backend::mlx::gguf_eos_token_ids(metadata)?,
     })
 }
 
@@ -4210,7 +4208,9 @@ pub(crate) fn args_from_gguf_catalog(
         vision_config: None,
         image_token_id: default_image_token_id(),
         audio_token_id: default_audio_token_id(),
-        eos_token_id: crate::api::gguf_eos_token_ids(metadata)?.first().copied(),
+        eos_token_id: crate::backend::mlx::gguf_eos_token_ids(metadata)?
+            .first()
+            .copied(),
     };
     validate_args(&args)?;
     Ok(args)
@@ -4852,7 +4852,7 @@ pub fn load_model(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Inkling,
+        crate::core::ModelKind::Inkling,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;
@@ -5773,11 +5773,11 @@ mod tests {
             }
         });
         super::validate_model_config_value(&config).unwrap();
-        let support = crate::api::resolve_model_config(&config);
+        let support = crate::backend::mlx::resolve_model_config(&config);
         let Ok(support) = support else {
             panic!("released Inkling metadata did not dispatch")
         };
-        assert_eq!(support.kind, crate::api::ModelKind::Inkling);
+        assert_eq!(support.kind, crate::core::ModelKind::Inkling);
         assert_eq!(support.effective_model_type, "inkling_mm_model");
     }
 

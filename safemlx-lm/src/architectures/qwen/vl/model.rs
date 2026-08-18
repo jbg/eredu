@@ -31,18 +31,18 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{self, attention::AttentionInput, generation::CausalLm},
-        input as runtime_input,
-        qwen_vl::grid_thw_from_array,
-    },
-    architectures::qwen::dense as dense_qwen,
+    architectures::qwen::{dense as dense_qwen, vl::vision::grid_thw_from_array},
     core::cache::{
         LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorOwner,
         StateTensorPolicy, StateTensorRole,
     },
     error::Error,
-    nn::tensor::{create_attention_mask, AttentionMask},
+    nn::{
+        self as common,
+        attention::AttentionInput,
+        generation::CausalLm,
+        tensor::{create_attention_mask, AttentionMask},
+    },
     runtime::attention::LayerSchedule,
     runtime::cache::{
         residency::{
@@ -57,6 +57,7 @@ use crate::{
         load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
+    runtime::media::input as runtime_input,
 };
 
 #[derive(Debug, Clone)]
@@ -848,9 +849,9 @@ pub fn load_qwen3_vl_model(
     let model_dir = model_dir.as_ref();
     let args = get_qwen3_vl_model_args(model_dir)?;
     let kind = if args.text_config.is_moe() {
-        crate::api::ModelKind::Qwen3VlMoe
+        crate::core::ModelKind::Qwen3VlMoe
     } else {
-        crate::api::ModelKind::Qwen3Vl
+        crate::core::ModelKind::Qwen3Vl
     };
     crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
@@ -877,9 +878,9 @@ pub fn load_qwen3_vl_model_quantized(
     let model_dir = model_dir.as_ref();
     let mut args = get_qwen3_vl_model_args(model_dir)?;
     let kind = if args.text_config.is_moe() {
-        crate::api::ModelKind::Qwen3VlMoe
+        crate::core::ModelKind::Qwen3VlMoe
     } else {
-        crate::api::ModelKind::Qwen3Vl
+        crate::core::ModelKind::Qwen3Vl
     };
     crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
@@ -1567,7 +1568,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use crate::api::{common::generation::CausalLm, input as runtime_input};
+    use crate::{nn::generation::CausalLm, runtime::media::input as runtime_input};
 
     fn tiny_args() -> super::ModelArgs {
         let text_config = crate::architectures::qwen::dense::DecoderConfig {

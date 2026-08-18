@@ -1,12 +1,31 @@
-//! Portable model-family detection and configuration validation.
+//! MLX architecture validation for portable model configurations.
 
-use super::*;
-pub use safemlx_lm_core::artifact::ModelKind;
+use serde_json::Value;
 
-/// Canonical resolution of a validated model config.
+use crate::architectures::{
+    deepseek_v3::model as deepseek_v3,
+    deepseek_v4::model as deepseek_v4,
+    gemma4::model as gemma4,
+    gpt_oss::model as gpt_oss,
+    inkling::model as inkling,
+    kimi_linear::model as kimi_linear,
+    lfm2::model as lfm2,
+    llama::model as llama,
+    moshi::personaplex,
+    muse_glimmer,
+    nemotron_h::model as nemotron_h,
+    qwen::{
+        dense as dense_qwen,
+        hybrid::{qwen3_5, qwen3_next},
+        vl::{model as qwen3_vl, moe as qwen3_vl_moe},
+    },
+};
+use crate::error::Error;
+
+/// Canonical resolution of a model configuration supported by MLX.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ResolvedModelConfig {
-    pub(crate) kind: ModelKind,
+    pub(crate) kind: safemlx_lm_core::ModelKind,
     pub(crate) model_type: String,
     pub(crate) effective_model_type: String,
 }
@@ -31,23 +50,27 @@ impl std::fmt::Display for ModelConfigResolutionError {
 pub(crate) fn resolve_model_config(
     config: &Value,
 ) -> Result<ResolvedModelConfig, ModelConfigResolutionError> {
-    let metadata = serde_json::from_value::<ModelMetadata>(config.clone())
-        .map_err(ModelConfigResolutionError::InvalidMetadata)?;
-    let effective_model_type = effective_model_type(&metadata);
-    let kind = ModelKind::from_model_type(&effective_model_type).map_err(|_| {
-        ModelConfigResolutionError::Loader(Error::UnsupportedModelType(
-            effective_model_type.clone(),
-        ))
-    })?;
-    validate_model_config(kind, config).map_err(ModelConfigResolutionError::Loader)?;
+    let resolved =
+        safemlx_lm_core::resolve_model_configuration(config).map_err(|error| match error {
+            safemlx_lm_core::artifact::ArtifactError::Json(error) => {
+                ModelConfigResolutionError::InvalidMetadata(error)
+            }
+            safemlx_lm_core::artifact::ArtifactError::UnsupportedModelType(model_type) => {
+                ModelConfigResolutionError::Loader(Error::UnsupportedModelType(model_type))
+            }
+            error => ModelConfigResolutionError::Loader(Error::Artifact(error)),
+        })?;
+    validate_model_config(resolved.kind, config).map_err(ModelConfigResolutionError::Loader)?;
     Ok(ResolvedModelConfig {
-        kind,
-        model_type: metadata.model_type,
-        effective_model_type,
+        kind: resolved.kind,
+        model_type: resolved.declared_model_type,
+        effective_model_type: resolved.effective_model_type,
     })
 }
 
-fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
+fn validate_model_config(kind: safemlx_lm_core::ModelKind, config: &Value) -> Result<(), Error> {
+    use safemlx_lm_core::ModelKind;
+
     match kind {
         ModelKind::DeepSeekV3 => deepseek_v3::validate_model_config_value(config),
         ModelKind::DeepSeekV4 => deepseek_v4::validate_model_config_value(config),
@@ -60,8 +83,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
         ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
         ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
-        ModelKind::Qwen2 => dense_qwen::config_from_hf_value(config).map(|_| ()),
-        ModelKind::Qwen3 => dense_qwen::config_from_hf_value(config).map(|_| ()),
+        ModelKind::Qwen2 | ModelKind::Qwen3 => dense_qwen::config_from_hf_value(config).map(|_| ()),
         ModelKind::Qwen3Next => qwen3_next::validate_model_config_value(config),
         ModelKind::Qwen3Vl => qwen3_vl::validate_model_config_value(config),
         ModelKind::Qwen3VlMoe => qwen3_vl_moe::validate_model_config_value(config),

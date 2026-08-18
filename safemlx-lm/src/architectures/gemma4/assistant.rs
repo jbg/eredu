@@ -20,12 +20,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    api::{
-        common,
-        gemma4::{self, Gemma4Embedding, KeyValuePolicy, ModelArgs, TransformerBlock},
+    architectures::gemma4::model::{
+        self as gemma4, Gemma4Embedding, KeyValuePolicy, ModelArgs, TransformerBlock,
     },
     backend::mlx::ModelLoadOptions,
     error::Error,
+    nn as common,
     nn::tensor::rope::FloatOrString,
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::checkpoint::load::{
@@ -641,7 +641,11 @@ pub(crate) fn load_gemma4_assistant_gguf_with_options(
             gemma4_assistant_config_from_value(&value)?
         }
     };
-    crate::api::validate_gguf_quantization_source(&checkpoint, &metadata, options.quantization)?;
+    crate::backend::mlx::validate_gguf_quantization_source(
+        &checkpoint,
+        &metadata,
+        options.quantization,
+    )?;
     let packed = gguf_affine_configs(&checkpoint, translate_gguf_weight_name)?;
     if let Some(first) = packed.values().next().copied() {
         if packed.values().any(|config| *config != first) {

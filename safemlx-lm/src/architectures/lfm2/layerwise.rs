@@ -22,17 +22,16 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::moe::PackedSwiGluExperts,
-        common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
-        input,
-        lfm2::{
-            self as resident, Cache, DecoderLayer, FeedForwardPolicy, LayerCache, ModelArgs,
-            OperatorPolicy,
-        },
+    architectures::lfm2::model::{
+        self as resident, Cache, DecoderLayer, FeedForwardPolicy, LayerCache, ModelArgs,
+        OperatorPolicy,
     },
     error::Error,
     nn::{
+        self as common,
+        generation::CausalLm,
+        linear::project_logits_maybe_quantized,
+        moe::PackedSwiGluExperts,
         parallel::{
             planned_optional_kv_head_layout, planned_optional_partition_widths,
             register_gated_depthwise_conv_group, register_gqa_projection_group,
@@ -65,6 +64,7 @@ use crate::{
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
         ExpertPass, ExpertRouteBatch,
@@ -548,7 +548,7 @@ pub fn load_lfm2_layerwise_model(
     let options = options.into();
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Lfm2,
+        crate::core::ModelKind::Lfm2,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -611,7 +611,7 @@ pub(crate) fn load_lfm2_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Lfm2,
+        crate::core::ModelKind::Lfm2,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -2692,7 +2692,7 @@ mod tests {
         crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::api::ModelKind::Lfm2,
+            crate::core::ModelKind::Lfm2,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),

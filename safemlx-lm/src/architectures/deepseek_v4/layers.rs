@@ -6,7 +6,9 @@ use safemlx::{
 };
 
 use crate::{
-    api::qwen3_5::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
+    architectures::qwen::hybrid::qwen3_5::{
+        QwenLinear as Linear, QwenWeightFormat as WeightFormat,
+    },
     nn::{
         layers::silu,
         moe::{PackedSwiGluExperts, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},

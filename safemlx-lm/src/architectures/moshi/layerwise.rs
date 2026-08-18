@@ -11,12 +11,12 @@ use safemlx::{
 };
 
 use crate::{
-    api::realtime::RealtimeSpeechConfig,
     architectures::moshi::model::{
         self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
         MoshiTransformerLayer, SampleStepOutput, TokenStepOutput,
     },
     backend::mlx::realtime::MlxRealtimeOutput,
+    core::realtime::RealtimeSpeechConfig,
     error::Error,
     runtime::cache::KeyValueCache,
     runtime::checkpoint::artifact::LoadedArtifactIdentity,
@@ -955,7 +955,7 @@ pub fn load_personaplex_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::PersonaPlex,
+        crate::core::ModelKind::PersonaPlex,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;
@@ -2083,8 +2083,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        api::moshi as eager,
         api::realtime::{generate_encoded_greedy, RealtimeSampling, RealtimeScheduler},
+        architectures::moshi::model as eager,
         backend::mlx::realtime::MlxRealtimeModel,
         backend::mlx::ModelLoadOptions,
         core::residency::{MemoryTier, OffloadConfig},

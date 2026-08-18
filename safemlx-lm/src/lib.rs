@@ -76,8 +76,8 @@ mod distributed_tensor_parallel_ring;
 #[cfg(feature = "mlx")]
 pub use api::realtime::{
     load_model as load_realtime_model, load_model_with_options as load_realtime_model_with_options,
-    RealtimeCompletedStep, RealtimeModelKind, RealtimeSampling, RealtimeScheduler,
-    RealtimeSchedulerCapabilities, RealtimeSchedulerReport, RealtimeSession, RealtimeSpeechConfig,
+    RealtimeCompletedStep, RealtimeSampling, RealtimeScheduler, RealtimeSchedulerCapabilities,
+    RealtimeSchedulerReport, RealtimeSession, RealtimeSpeechConfig,
 };
 #[cfg(feature = "mlx")]
 pub use api::{
@@ -98,6 +98,7 @@ pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
 pub use backend::mlx::realtime::{
     MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput,
     MlxRealtimeModel, MlxRealtimeModelIdentity, MlxRealtimeOutput, MlxRealtimeSession,
+    RealtimeModelKind,
 };
 #[cfg(feature = "mlx")]
 pub use backend::mlx::{DeviceAssignment, MlxParallelContext};

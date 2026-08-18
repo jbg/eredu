@@ -23,13 +23,13 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{self, generation::CausalLm},
-        deepseek_v3::{self as resident, Cache, DecoderLayer, LayerPolicy, ModelArgs},
-        input,
+    architectures::deepseek_v3::model::{
+        self as resident, Cache, DecoderLayer, LayerPolicy, ModelArgs,
     },
     error::Error,
     nn::{
+        self as common,
+        generation::CausalLm,
         parallel::{VocabParallelEmbedding, VocabParallelLmHead},
         tensor::create_causal_mask,
     },
@@ -57,6 +57,7 @@ use crate::{
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
@@ -1007,7 +1008,7 @@ pub fn load_deepseek_v3_layerwise_model(
     let options = options.into();
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV3,
+        crate::core::ModelKind::DeepSeekV3,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1071,7 +1072,7 @@ pub(crate) fn load_deepseek_v3_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV3,
+        crate::core::ModelKind::DeepSeekV3,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1100,7 +1101,7 @@ pub(crate) fn load_deepseek_v3_gguf_tensor_parallel_model(
 ) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::DeepSeek2,
+        crate::core::GgufArchitecture::DeepSeek2,
         checkpoint,
         metadata,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1136,7 +1137,7 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::DeepSeek2,
+        crate::core::GgufArchitecture::DeepSeek2,
         checkpoint,
         metadata,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1266,7 +1267,7 @@ pub fn load_deepseek_v3_expert_cache_model(
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV3,
+        crate::core::ModelKind::DeepSeekV3,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
@@ -3381,8 +3382,10 @@ mod tests {
         write_fixture(directory.path(), &fixture, false, true, true, gpu.stream());
 
         let prompt = Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-        let parts = [crate::api::input::InputPart::text_token_ids(&prompt)];
-        let input = crate::api::input::ModelInput::new(&parts);
+        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+            &prompt,
+        )];
+        let input = crate::runtime::media::input::ModelInput::new(&parts);
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
         let mut ordinary =
             load_deepseek_v3_layerwise_model(directory.path(), options, gpu.stream(), cpu.stream())

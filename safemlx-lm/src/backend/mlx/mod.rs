@@ -5,6 +5,7 @@ pub(crate) mod cache;
 mod config;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
+mod family;
 mod loading;
 mod model;
 /// Realtime Moshi/PersonaPlex session execution.
@@ -17,7 +18,7 @@ pub mod speculative;
 pub(crate) mod structural;
 /// MLX process-local device binding for a canonical core rank topology.
 pub mod topology;
-pub(crate) use loading::validate_gguf_quantization_source;
+pub(crate) use loading::{gguf_eos_token_ids, validate_gguf_quantization_source};
 /// Architecture-erased model/session execution.
 mod session;
 
@@ -25,6 +26,9 @@ pub(crate) use config::ensure_replicated_load_options;
 pub use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
 pub use distributed::MlxDistributedSession;
+#[cfg(test)]
+pub(crate) use family::ResolvedModelConfig;
+pub(crate) use family::{resolve_model_config, ModelConfigResolutionError};
 pub(crate) use model::validate_gemma4_drafter;
 pub use model::{Model, ModelCache};
 pub(crate) use session::{submit_decode_with_cache, submit_prefill_with_cache};

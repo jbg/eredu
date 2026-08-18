@@ -21,15 +21,15 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
-        input,
-        qwen3_5::{
-            self as resident, BlockInput, Cache, Experts, LayerCache, LayerPolicy, ModelArgs,
-            MtpModule, Qwen3NextRmsNorm, QwenMtpStepOutput, QwenWeightFormat, TransformerBlock,
+    architectures::qwen::{
+        hybrid::{
+            qwen3_5::{
+                self as resident, BlockInput, Cache, Experts, LayerCache, LayerPolicy, ModelArgs,
+                MtpModule, Qwen3NextRmsNorm, QwenMtpStepOutput, QwenWeightFormat, TransformerBlock,
+            },
+            qwen3_next,
         },
-        qwen3_next,
-        qwen_vl::{
+        vl::vision::{
             configure_vision_parallel_static, grid_thw_from_array, new_parallel_vision_block,
             vision_parallel_parameter_groups, QwenVisionBlock, QwenVisionLayerwiseState,
             QwenVisionLayerwiseStatic, QwenVisionTransformer, VisionConfig,
@@ -37,6 +37,9 @@ use crate::{
     },
     error::Error,
     nn::{
+        self as common,
+        generation::CausalLm,
+        linear::project_logits_maybe_quantized,
         parallel::{VocabParallelEmbedding, VocabParallelLmHead},
         tensor::{create_attention_mask, AttentionMask},
     },
@@ -66,6 +69,7 @@ use crate::{
         ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
         LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
         ExpertPass, ExpertRouteBatch,
@@ -1064,7 +1068,7 @@ pub fn load_qwen3_next_layerwise_model(
     let options = options.into();
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3Next,
+        crate::core::ModelKind::Qwen3Next,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1116,7 +1120,7 @@ pub(crate) fn load_qwen3_next_tensor_parallel_model(
         return Ok(model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3Next,
+        crate::core::ModelKind::Qwen3Next,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1146,7 +1150,7 @@ pub fn load_qwen35_layerwise_model(
     let options = options.into();
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
+        crate::core::ModelKind::Qwen35,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1233,7 +1237,7 @@ pub(crate) fn load_qwen35_tensor_parallel_model(
         return Ok(model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
+        crate::core::ModelKind::Qwen35,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1285,7 +1289,7 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
 ) -> Result<(QwenHybridLayerwiseModel, Vec<u32>, bool), Error> {
     let prepared =
         resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, mmproj, weights_stream)?;
-    let architecture = crate::api::GgufArchitecture::resolve(&prepared.architecture)?;
+    let architecture = crate::core::GgufArchitecture::resolve(&prepared.architecture)?;
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_gguf(
         architecture,
@@ -1339,7 +1343,7 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
 ) -> Result<(QwenHybridLayerwiseModel, Vec<u32>, bool), Error> {
     let prepared =
         resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, mmproj, weights_stream)?;
-    let architecture = crate::api::GgufArchitecture::resolve(&prepared.architecture)?;
+    let architecture = crate::core::GgufArchitecture::resolve(&prepared.architecture)?;
     crate::backend::mlx::structural::validate_gguf(
         architecture,
         checkpoint,
@@ -1500,7 +1504,7 @@ pub fn load_qwen3_next_expert_cache_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3Next,
+        crate::core::ModelKind::Qwen3Next,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
@@ -1540,7 +1544,7 @@ pub fn load_qwen35_expert_cache_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
+        crate::core::ModelKind::Qwen35,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
@@ -4589,16 +4593,18 @@ mod tests {
         QwenHybridLayer, QwenHybridLayerwiseAdapter,
     };
     use crate::{
-        api::{
-            common::generation::CausalLm,
-            input as runtime_input,
-            qwen3_5::{self as resident, Cache, LayerCache, Model, ModelArgs, ModelInput},
-            qwen3_next,
-            qwen_vl::VisionConfig,
+        architectures::qwen::{
+            hybrid::{
+                qwen3_5::{self as resident, Cache, LayerCache, Model, ModelArgs, ModelInput},
+                qwen3_next,
+            },
+            vl::vision::VisionConfig,
         },
         core::residency::{OffloadConfig, ResidencyPolicy},
+        nn::generation::CausalLm,
         runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
         runtime::execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
+        runtime::media::input as runtime_input,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         CacheResidencyPolicy, PagedCacheOptions,
     };
@@ -5197,9 +5203,9 @@ mod tests {
             dir.path(),
             options,
             if next {
-                crate::api::ModelKind::Qwen3Next
+                crate::core::ModelKind::Qwen3Next
             } else {
-                crate::api::ModelKind::Qwen35
+                crate::core::ModelKind::Qwen35
             },
             report.owned_experts / 2,
             gpu.stream(),

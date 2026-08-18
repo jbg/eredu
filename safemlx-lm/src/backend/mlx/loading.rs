@@ -24,10 +24,17 @@ use safemlx::{
 use safemlx_lm_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
 
 #[cfg(feature = "media-processing")]
-use crate::{
-    api::gguf_sidecar_dir,
-    runtime::media::{load_processor, ModelProcessor},
-};
+use crate::runtime::media::{load_processor, ModelProcessor};
+
+pub(crate) fn gguf_eos_token_ids(
+    metadata: &std::collections::HashMap<String, safemlx_gguf::MetadataValue>,
+) -> Result<Vec<u32>, Error> {
+    const KEY: &str = "tokenizer.ggml.eos_token_id";
+    Ok(safemlx_lm_core::gguf_u32_metadata_values(
+        KEY,
+        metadata.get(KEY),
+    )?)
+}
 use crate::{
     backend::mlx::{structural, MlxModel, Model, ModelLoadOptions},
     error::Error,
@@ -241,7 +248,9 @@ fn materialize_gguf_model(
                 };
                 #[cfg(feature = "image-processing")]
                 if mmproj.is_some() {
-                    processor = ModelProcessor::load_qwen(gguf_sidecar_dir(gguf_file))?;
+                    processor = ModelProcessor::load_qwen(
+                        gguf_file.parent().unwrap_or_else(|| Path::new(".")),
+                    )?;
                 }
                 let loaded = qwen3_5::load_qwen3_5_gguf_checkpoint(
                     &checkpoint,
@@ -481,7 +490,9 @@ fn materialize_gguf_model(
                 };
                 #[cfg(feature = "image-processing")]
                 if mmproj.is_some() {
-                    processor = ModelProcessor::load_qwen(gguf_sidecar_dir(gguf_file))?;
+                    processor = ModelProcessor::load_qwen(
+                        gguf_file.parent().unwrap_or_else(|| Path::new(".")),
+                    )?;
                 }
                 let (loaded, eos_token_ids, is_next) =
                         crate::architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_layerwise_model(
@@ -850,7 +861,7 @@ fn materialize_gguf_artifact(
             GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe
                 if qwen3_5::open_sibling_mmproj(&path)?.is_some() =>
             {
-                ModelProcessor::load_qwen(gguf_sidecar_dir(&path))?
+                ModelProcessor::load_qwen(path.parent().unwrap_or_else(|| Path::new(".")))?
             }
             _ => None,
         };

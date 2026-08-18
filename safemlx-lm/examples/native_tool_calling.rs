@@ -86,7 +86,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Draft on CPU while the target verifies on GPU. The loaded target and
         // drafter retain their respective execution placements.
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut drafter = MlxDrafter::load(&drafter_path, draft.stream(), draft.stream())?;
+        let drafter_tokenizer = safemlx_lm::api::load_tokenizer(&drafter_path)?;
+        let mut drafter = MlxDrafter::load(
+            &drafter_path,
+            &drafter_tokenizer,
+            draft.stream(),
+            draft.stream(),
+        )?;
         model
             .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),

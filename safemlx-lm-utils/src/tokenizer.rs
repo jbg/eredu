@@ -78,12 +78,32 @@ use minijinja::{
     Environment, Template,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokenizers::Encoding;
 
 use crate::error::Error;
 
 const DEFAULT_CHAT_TEMPLATE_NAME: &str = "default";
 const TOOL_USE_CHAT_TEMPLATE_NAME: &str = "tool_use";
+
+/// Computes a stable fingerprint of the complete token-id vocabulary mapping.
+pub fn vocabulary_fingerprint(tokenizer: &tokenizers::Tokenizer) -> [u8; 32] {
+    let vocabulary_size = tokenizer.get_vocab_size(true);
+    let mut hasher = Sha256::new();
+    hasher.update(b"safemlx-token-id-vocabulary-v1");
+    hasher.update((vocabulary_size as u64).to_le_bytes());
+    for token_id in 0..vocabulary_size {
+        hasher.update((token_id as u64).to_le_bytes());
+        match tokenizer.id_to_token(token_id as u32) {
+            Some(token) => {
+                hasher.update((token.len() as u64).to_le_bytes());
+                hasher.update(token.as_bytes());
+            }
+            None => hasher.update(u64::MAX.to_le_bytes()),
+        }
+    }
+    hasher.finalize().into()
+}
 
 /// A single chat template or a Hugging Face named-template collection.
 #[derive(Debug, Clone, PartialEq, Eq)]

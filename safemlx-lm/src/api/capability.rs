@@ -3150,7 +3150,7 @@ pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::llama;
+    use crate::architectures::llama::model as llama;
     use safemlx::{Device, DeviceType};
     use serde_json::json;
 

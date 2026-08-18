@@ -41,7 +41,9 @@ falling back to ordinary generation.
 
 Prepared-chat requests do not accept streams. The target retains the execution
 placement selected when it was loaded; an external `MlxDrafter` independently
-retains its load-time placement. The MLX adapter classifies that pair as:
+retains its load-time placement. Drafter loading requires its tokenizer as an
+explicit portable input; the backend fingerprints it but never discovers or
+parses tokenizer sidecars. The MLX adapter classifies that pair as:
 
 | Placement | Behavior |
 | --- | --- |

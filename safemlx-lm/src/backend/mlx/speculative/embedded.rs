@@ -12,7 +12,6 @@ use safemlx::{
 use safemlx_lm_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
 
 use crate::{
-    api::input::ModelInput,
     backend::mlx::{
         speculative::{
             scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
@@ -20,6 +19,7 @@ use crate::{
         MlxModelInput,
     },
     runtime::generation::sampler::SpeculativeSampler,
+    runtime::media::input::ModelInput,
 };
 
 /// Sampler wrapper that keeps PRNG and grammar state identical on every rank
@@ -135,7 +135,7 @@ impl EmbeddedMtpVocabHead {
         stream: &Stream,
     ) -> Result<Self, Error> {
         Ok(Self {
-            ordinary: crate::api::common::linear::unloaded_maybe_quantized_linear(
+            ordinary: crate::nn::linear::unloaded_maybe_quantized_linear(
                 input_dims,
                 i32::try_from(vocabulary)
                     .map_err(|_| Error::Parallel("MTP vocabulary exceeds i32".into()))?,

@@ -28,30 +28,12 @@ use crate::{
     api::{moshi, personaplex},
     backend::mlx::realtime::{
         MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel,
+        RealtimeModelKind,
     },
     backend::mlx::{ensure_replicated_load_options, ModelLoadOptions},
     error::Error,
     runtime::checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
 };
-
-/// Supported realtime speech-to-speech model-family dispatch target.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum RealtimeModelKind {
-    /// Moshi-family realtime token model with a native Moshi/MLX checkpoint layout.
-    Moshi,
-    /// NVIDIA PersonaPlex realtime token model with its released PyTorch safetensors layout.
-    PersonaPlex,
-}
-
-impl RealtimeModelKind {
-    /// Returns the model type string used for user-facing dispatch messages.
-    pub fn model_type(self) -> &'static str {
-        match self {
-            Self::Moshi => "moshi",
-            Self::PersonaPlex => "personaplex",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Deserialize)]
 struct RealtimeModelMetadata {

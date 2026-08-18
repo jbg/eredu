@@ -27,17 +27,18 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{self, generation::CausalLm, moe::PackedSwiGluExperts},
-        inkling::{
-            self as resident, AudioModel, Cache, DecoderLayer, ModelArgs, VisionLayer, VisionModel,
-        },
-        input,
+    architectures::inkling::model::{
+        self as resident, AudioModel, Cache, DecoderLayer, ModelArgs, VisionLayer, VisionModel,
     },
     error::Error,
-    nn::parallel::{
-        vocab_embedding_parameter_group, vocab_lm_head_parameter_group, VocabParallelEmbedding,
-        VocabParallelLmHead,
+    nn::{
+        self as common,
+        generation::CausalLm,
+        moe::PackedSwiGluExperts,
+        parallel::{
+            vocab_embedding_parameter_group, vocab_lm_head_parameter_group, VocabParallelEmbedding,
+            VocabParallelLmHead,
+        },
     },
     runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
     runtime::cache::KeyValueCache,
@@ -57,6 +58,7 @@ use crate::{
         ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
         LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
@@ -1080,7 +1082,7 @@ pub fn load_inkling_layerwise_model(
         .unwrap_or_default()
         .with_weight_residency(residency);
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Inkling,
+        crate::core::ModelKind::Inkling,
         model_dir,
         load_options,
     )?;
@@ -1140,7 +1142,7 @@ pub(crate) fn load_inkling_tensor_parallel_layerwise_model(
         .map(|(model, _)| model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Inkling,
+        crate::core::ModelKind::Inkling,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1169,7 +1171,7 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
 ) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::Inkling,
+        crate::core::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1202,7 +1204,7 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
         .unwrap_or_default()
         .with_weight_residency(residency);
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::Inkling,
+        crate::core::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
         load_options,
@@ -1305,7 +1307,7 @@ pub fn load_inkling_expert_cache_model(
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Inkling,
+        crate::core::ModelKind::Inkling,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
@@ -4062,15 +4064,12 @@ mod tests {
         InklingLayerwiseModel,
     };
     use crate::{
-        api::{
-            common::generation::CausalLm,
-            inkling::{self as resident, Model, ModelArgs},
-            input as runtime_input,
-        },
+        architectures::inkling::model::{self as resident, Model, ModelArgs},
         core::{
             cache::{PromptCacheDescriptor, PromptCacheOptions},
             residency::{OffloadConfig, ResidencyPolicy},
         },
+        nn::generation::CausalLm,
         runtime::cache::{residency::CacheResidencyPolicy, KeyValueCache},
         runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
         runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
@@ -4079,6 +4078,7 @@ mod tests {
             ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
             LoadTimeQuantizableAdapter,
         },
+        runtime::media::input as runtime_input,
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch},
         PagedCacheOptions,
@@ -5101,7 +5101,7 @@ mod tests {
         crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::api::ModelKind::Inkling,
+            crate::core::ModelKind::Inkling,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),
@@ -5262,7 +5262,7 @@ mod tests {
             dir.path(),
             expert_options,
             quantization,
-            crate::api::ModelKind::Inkling,
+            crate::core::ModelKind::Inkling,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),

@@ -2310,7 +2310,8 @@ fn main() -> Result<()> {
                 ModelLoadOptions::default,
                 ModelLoadOptions::with_quantization,
             );
-            MlxDrafter::load_with_options(path, options, draft_stream, weights.stream())
+            let tokenizer = safemlx_lm::api::load_tokenizer(path)?;
+            MlxDrafter::load_with_options(path, &tokenizer, options, draft_stream, weights.stream())
                 .with_context(|| format!("failed to load draft model from {}", path.display()))
         })
         .transpose()?;

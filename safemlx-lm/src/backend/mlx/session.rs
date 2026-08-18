@@ -15,7 +15,6 @@ use crate::core::generation::MtpConfig;
 #[cfg(feature = "media-processing")]
 use crate::runtime::media::{ModelProcessor, PreparedModelInput};
 use crate::{
-    api::input,
     architectures::distributed::{
         expert::ExpertParallelCache,
         pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
@@ -24,6 +23,7 @@ use crate::{
     nn::generation::CausalLm,
     runtime::execution::inspection::ActivationObserver,
     runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
+    runtime::media::input,
     CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
     PromptCacheOptions,
 };

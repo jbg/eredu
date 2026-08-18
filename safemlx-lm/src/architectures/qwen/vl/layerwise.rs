@@ -26,22 +26,23 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{self, attention::AttentionInput, generation::CausalLm},
-        input,
-        qwen3_vl::{self as resident, Cache, ModelArgs},
-        qwen_vl::{
+    architectures::qwen::dense::{
+        layerwise::{qwen_text_layer_bindings, register_qwen_layer_parallel_plan},
+        Decoder, Experts as QwenExperts, FeedForward, TransformerBlock,
+    },
+    architectures::qwen::{
+        vl::model::{self as resident, Cache, ModelArgs},
+        vl::vision::{
             configure_vision_parallel_static, grid_thw_from_array, new_parallel_vision_block,
             vision_parallel_parameter_groups, QwenVisionBlock, QwenVisionLayerwiseState,
             QwenVisionLayerwiseStatic, QwenVisionTransformer,
         },
     },
-    architectures::qwen::dense::{
-        layerwise::{qwen_text_layer_bindings, register_qwen_layer_parallel_plan},
-        Decoder, Experts as QwenExperts, FeedForward, TransformerBlock,
-    },
     error::Error,
     nn::{
+        self as common,
+        attention::AttentionInput,
+        generation::CausalLm,
         parallel::{
             planned_kv_head_layout, vocab_embedding_parameter_group, vocab_lm_head_parameter_group,
             VocabParallelEmbedding, VocabParallelLmHead,
@@ -65,6 +66,7 @@ use crate::{
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass, ExpertRouteBatch,
     },
@@ -437,9 +439,9 @@ pub fn load_qwen3_vl_layerwise_model(
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
     let residency = options.weight_residency();
     let kind = if args.text_config.is_moe() {
-        crate::api::ModelKind::Qwen3VlMoe
+        crate::core::ModelKind::Qwen3VlMoe
     } else {
-        crate::api::ModelKind::Qwen3Vl
+        crate::core::ModelKind::Qwen3Vl
     };
     crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
@@ -509,9 +511,9 @@ pub(crate) fn load_qwen3_vl_tensor_parallel_layerwise_model(
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
     let residency = options.weight_residency();
     let kind = if args.text_config.is_moe() {
-        crate::api::ModelKind::Qwen3VlMoe
+        crate::core::ModelKind::Qwen3VlMoe
     } else {
-        crate::api::ModelKind::Qwen3Vl
+        crate::core::ModelKind::Qwen3Vl
     };
     crate::backend::mlx::structural::validate_safetensors_load_path(
         kind,
@@ -700,7 +702,7 @@ pub fn load_qwen3_vl_expert_cache_model(
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3VlMoe,
+        crate::core::ModelKind::Qwen3VlMoe,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
@@ -2603,7 +2605,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        api::qwen3_vl as eager,
+        architectures::qwen::vl::model as eager,
         core::residency::{MemoryTier, OffloadConfig},
         runtime::{
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
@@ -3218,7 +3220,7 @@ mod tests {
         crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::api::ModelKind::Qwen3VlMoe,
+            crate::core::ModelKind::Qwen3VlMoe,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),

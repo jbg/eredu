@@ -855,7 +855,11 @@ pub(crate) fn load_with_options(
         config.quantized_weights =
             gguf_quantization_configs(&checkpoint, translate_gguf_weight_name)?;
         if let Some(requested) = options.quantization {
-            crate::api::validate_gguf_quantization_source(&checkpoint, &metadata, Some(requested))?;
+            crate::backend::mlx::validate_gguf_quantization_source(
+                &checkpoint,
+                &metadata,
+                Some(requested),
+            )?;
         }
         let mut model = MuseGlimmerDFlash::new(config, stream)?;
         let load_config = StrictLoadConfig::default();

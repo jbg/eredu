@@ -24,19 +24,16 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{
-            attention::AttentionInput,
-            generation::CausalLm,
-            linear::{
-                build_unloaded_maybe_quantized_lm_head_with_quantization,
-                project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
-            },
-        },
-        input,
-    },
     core::cache::LayerCachePolicy,
     error::Error,
+    nn::{
+        attention::AttentionInput,
+        generation::CausalLm,
+        linear::{
+            build_unloaded_maybe_quantized_lm_head_with_quantization,
+            project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
+        },
+    },
     nn::{
         parallel::{
             planned_kv_head_layout, register_gqa_projection_group,
@@ -69,6 +66,7 @@ use crate::{
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,

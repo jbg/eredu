@@ -17,7 +17,6 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::input,
     error::Error,
     nn::{
         generation::CausalLm,
@@ -31,6 +30,7 @@ use crate::{
         },
         tensor::create_causal_mask,
     },
+    runtime::media::input,
     runtime::{
         cache::residency::PagedCacheOptions,
         checkpoint::{
@@ -654,7 +654,7 @@ pub fn load_kimi_linear_layerwise_model(
     let options = options.into();
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::KimiLinear,
+        crate::core::ModelKind::KimiLinear,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -718,7 +718,7 @@ pub(crate) fn load_kimi_linear_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::KimiLinear,
+        crate::core::ModelKind::KimiLinear,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -824,7 +824,7 @@ pub fn load_kimi_linear_expert_cache_model(
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::KimiLinear,
+        crate::core::ModelKind::KimiLinear,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
@@ -2187,11 +2187,11 @@ mod tests {
         optional_expert_component_recipe, KimiLinearLayerwiseAdapter,
     };
     use crate::{
-        api::ModelKind,
         architectures::kimi_linear::model::{
             load_model, model_args_from_config_value, Model, ModelInput,
         },
         core::residency::OffloadConfig,
+        core::ModelKind,
         runtime::{
             checkpoint::store::{SafetensorsWeightStore, WeightStore},
             distributed::parallel::{ParallelBuildContext, ShardingPolicy},

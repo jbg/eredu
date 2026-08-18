@@ -25,13 +25,16 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{common, common::generation::CausalLm, input},
     architectures::qwen::dense::gguf_string,
     core::cache::CacheRankIdentity,
     error::Error,
-    nn::tensor::{
-        create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
+    nn::{
+        self as common,
+        generation::CausalLm,
+        tensor::{
+            create_causal_mask,
+            rope::{initialize_rope, FloatOrString, RopeVariant},
+        },
     },
     runtime::cache::residency::{
         open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
@@ -43,6 +46,7 @@ use crate::{
         StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
+    runtime::media::input,
     runtime::{
         attention::{AttentionPolicy, LayerSchedule},
         cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
@@ -1773,7 +1777,7 @@ pub(crate) fn prepare_gguf_checkpoint(
         )));
     }
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::GptOss,
+        crate::core::GgufArchitecture::GptOss,
         checkpoint,
         metadata,
         crate::backend::mlx::ModelLoadOptions::default(),
@@ -1790,7 +1794,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     args.validate()?;
     Ok(PreparedGptOssGguf {
         args,
-        eos_token_ids: crate::api::gguf_eos_token_ids(metadata)?,
+        eos_token_ids: crate::backend::mlx::gguf_eos_token_ids(metadata)?,
     })
 }
 
@@ -2032,7 +2036,7 @@ pub fn load_model(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
+        crate::core::ModelKind::GptOss,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;
@@ -2064,7 +2068,7 @@ pub fn load_model_quantized(
     }
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
+        crate::core::ModelKind::GptOss,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;

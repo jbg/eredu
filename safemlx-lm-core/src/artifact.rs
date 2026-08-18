@@ -300,6 +300,35 @@ pub struct ModelConfiguration {
     pub gguf_architecture: Option<GgufArchitecture>,
 }
 
+/// Resolves portable Hugging Face model identity from a raw `config.json` value.
+pub fn resolve_model_configuration(json: &Value) -> Result<ModelConfiguration, ArtifactError> {
+    let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
+    let effective_model_type = effective_model_type(&metadata);
+    let kind = ModelKind::from_model_type(&effective_model_type)?;
+    Ok(ModelConfiguration {
+        declared_model_type: metadata.model_type,
+        effective_model_type,
+        kind,
+        json: Some(json.clone()),
+        gguf_architecture: None,
+    })
+}
+
+/// Parses an optional GGUF integer metadata value as lossless `u32` values.
+pub fn gguf_u32_metadata_values(
+    key: &str,
+    value: Option<&MetadataValue>,
+) -> Result<Vec<u32>, ArtifactError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    value.to_u32_vec().ok_or_else(|| {
+        ArtifactError::InvalidArtifact(format!(
+            "GGUF metadata key {key:?} must contain an integer or integer array whose values fit in u32"
+        ))
+    })
+}
+
 /// Header-only artifact inspection result.
 #[derive(Debug, Clone)]
 pub struct ArtifactInspection {
@@ -680,9 +709,7 @@ fn effective_model_type(metadata: &ConfigMetadata) -> String {
 fn inspect_safetensors(path: &Path) -> Result<ArtifactInspection, ArtifactError> {
     let config_path = path.join("config.json");
     let json: Value = serde_json::from_reader(File::open(&config_path)?)?;
-    let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
-    let effective = effective_model_type(&metadata);
-    let kind = ModelKind::from_model_type(&effective)?;
+    let configuration = resolve_model_configuration(&json)?;
     let shards = safetensors_shards(path)?;
     let mut descriptors = Vec::new();
     let mut names = BTreeSet::new();
@@ -703,13 +730,7 @@ fn inspect_safetensors(path: &Path) -> Result<ArtifactInspection, ArtifactError>
     Ok(ArtifactInspection {
         path: path.to_path_buf(),
         format: ArtifactFormat::SafeTensors,
-        configuration: ModelConfiguration {
-            declared_model_type: metadata.model_type,
-            effective_model_type: effective,
-            kind,
-            json: Some(json),
-            gguf_architecture: None,
-        },
+        configuration,
         tensors,
         gguf_checkpoint: None,
     })
@@ -898,7 +919,7 @@ pub enum ArtifactError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use safemlx_gguf::{GgmlType, TensorInput, Writer};
+    use safemlx_gguf::{GgmlType, MetadataArray, TensorInput, Writer};
     use std::io::Write;
 
     fn write_safetensors_fixture(root: &Path, model_type: &str) {
@@ -914,6 +935,44 @@ mod tests {
             .unwrap();
         file.write_all(header).unwrap();
         file.write_all(&[0_u8; 16]).unwrap();
+    }
+
+    #[test]
+    fn model_configuration_resolution_is_portable_and_nested() {
+        let json = serde_json::json!({
+            "model_type": "qwen3_5",
+            "text_config": { "model_type": "qwen3_5_moe" }
+        });
+        let resolved = resolve_model_configuration(&json).unwrap();
+        assert_eq!(resolved.kind, ModelKind::Qwen35);
+        assert_eq!(resolved.declared_model_type, "qwen3_5");
+        assert_eq!(resolved.effective_model_type, "qwen3_5_moe");
+        assert_eq!(resolved.json.as_ref(), Some(&json));
+    }
+
+    #[test]
+    fn gguf_u32_metadata_is_lossless_and_fail_closed() {
+        let values = MetadataValue::Array(MetadataArray::Uint64(vec![0, u32::MAX.into()]));
+        assert_eq!(
+            gguf_u32_metadata_values("tokenizer.ids", Some(&values)).unwrap(),
+            vec![0, u32::MAX]
+        );
+        assert!(gguf_u32_metadata_values(
+            "tokenizer.ids",
+            Some(&MetadataValue::Uint64(u64::from(u32::MAX) + 1))
+        )
+        .is_err());
+        assert!(
+            gguf_u32_metadata_values("tokenizer.ids", Some(&MetadataValue::Int32(-1))).is_err()
+        );
+        assert!(gguf_u32_metadata_values(
+            "tokenizer.ids",
+            Some(&MetadataValue::String("1".into()))
+        )
+        .is_err());
+        assert!(gguf_u32_metadata_values("tokenizer.ids", None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

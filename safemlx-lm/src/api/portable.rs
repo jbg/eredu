@@ -1,7 +1,5 @@
 //! Backend-neutral loaded-model ownership and text generation.
 
-use sha2::{Digest, Sha256};
-
 use safemlx_lm_core::generation::{
     resolve_generation_config, CheckpointGenerationConfig, GenerationConfigOverrides,
     ResolvedGenerationConfig,
@@ -101,7 +99,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         tokenizer: ChatTokenizer,
         config: LoadedTextModelConfig,
     ) -> Self {
-        let tokenizer_fingerprint = tokenizer_vocabulary_fingerprint(&tokenizer);
+        let tokenizer_fingerprint = safemlx_lm_utils::tokenizer::vocabulary_fingerprint(&tokenizer);
         Self {
             runtime,
             tokenizer,
@@ -207,22 +205,4 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     pub fn is_eos_token(&self, id: u32) -> bool {
         self.eos_token_ids.contains(&id)
     }
-}
-
-pub(crate) fn tokenizer_vocabulary_fingerprint(tokenizer: &ChatTokenizer) -> [u8; 32] {
-    let vocabulary_size = tokenizer.get_vocab_size(true);
-    let mut hasher = Sha256::new();
-    hasher.update(b"safemlx-token-id-vocabulary-v1");
-    hasher.update((vocabulary_size as u64).to_le_bytes());
-    for token_id in 0..vocabulary_size {
-        hasher.update((token_id as u64).to_le_bytes());
-        match tokenizer.id_to_token(token_id as u32) {
-            Some(token) => {
-                hasher.update((token.len() as u64).to_le_bytes());
-                hasher.update(token.as_bytes());
-            }
-            None => hasher.update(u64::MAX.to_le_bytes()),
-        }
-    }
-    hasher.finalize().into()
 }

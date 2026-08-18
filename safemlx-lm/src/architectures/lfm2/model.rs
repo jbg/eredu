@@ -24,26 +24,22 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{
-            self,
-            attention::{
-                apply_rope_and_update_cache, batch_seq, finish_attention,
-                reshape_attention_projection,
-            },
-            convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
-            generation::CausalLm,
-            linear::project_logits_maybe_quantized,
-            moe::{PackedSwiGluExperts, TopKRouterScoreFunction},
-        },
-        input,
-    },
     architectures::qwen::dense::gguf_string,
     core::cache::{
         CacheRankIdentity, CacheResidencyPool, LayerCachePolicy, StateTensorDimension,
         StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
     error::Error,
+    nn::{
+        self as common,
+        attention::{
+            apply_rope_and_update_cache, batch_seq, finish_attention, reshape_attention_projection,
+        },
+        convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
+        generation::CausalLm,
+        linear::project_logits_maybe_quantized,
+        moe::{PackedSwiGluExperts, TopKRouterScoreFunction},
+    },
     nn::{
         parallel::forward_row_parallel,
         tensor::{
@@ -67,6 +63,7 @@ use crate::{
         StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
+    runtime::media::input,
 };
 
 fn default_true() -> bool {
@@ -2287,7 +2284,7 @@ pub fn load_model(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Lfm2,
+        crate::core::ModelKind::Lfm2,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;
@@ -2320,7 +2317,7 @@ pub fn load_model_quantized(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Lfm2,
+        crate::core::ModelKind::Lfm2,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
@@ -2394,7 +2391,7 @@ pub(crate) fn load_gguf_checkpoint(
         )));
     }
     let is_moe = architecture == "lfm2moe";
-    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
+    let gguf_architecture = crate::core::GgufArchitecture::resolve(&architecture)?;
     crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
@@ -2511,7 +2508,7 @@ pub(crate) fn load_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
+    let eos_token_ids = crate::backend::mlx::gguf_eos_token_ids(&metadata)?;
     Ok(LoadedLfm2Gguf {
         model,
         eos_token_ids,
@@ -2530,7 +2527,7 @@ pub(crate) fn prepare_gguf_checkpoint(
         )));
     }
     let is_moe = architecture == "lfm2moe";
-    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
+    let gguf_architecture = crate::core::GgufArchitecture::resolve(&architecture)?;
     crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
@@ -2562,7 +2559,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     validate_args(&args)?;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
     Ok(PreparedLfm2Gguf {
         args,
         eos_token_ids,
@@ -3128,7 +3125,7 @@ mod tests {
         let loading = model_args_from_config_value(&config)
             .unwrap_err()
             .to_string();
-        let inspection = crate::api::resolve_model_config(&config)
+        let inspection = crate::backend::mlx::resolve_model_config(&config)
             .unwrap_err()
             .to_string();
         assert_eq!(inspection, loading);

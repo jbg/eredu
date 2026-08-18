@@ -22,9 +22,9 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::input,
     error::Error,
     nn::generation::CausalLm,
+    runtime::media::input,
     runtime::{
         cache::residency::PagedCacheOptions,
         checkpoint::{
@@ -1515,7 +1515,7 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::DeepSeek4,
+        crate::core::GgufArchitecture::DeepSeek4,
         checkpoint,
         metadata,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1581,7 +1581,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
 ) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::DeepSeek4,
+        crate::core::GgufArchitecture::DeepSeek4,
         checkpoint,
         metadata,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1642,7 +1642,7 @@ pub(crate) fn load_deepseek_v4_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV4,
+        crate::core::ModelKind::DeepSeekV4,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(options.weight_residency()),
@@ -1995,7 +1995,7 @@ fn expert_bank_recipe(
 
 fn qwen_linear_recipes(
     raw_prefix: &str,
-    linear: &crate::api::qwen3_5::QwenLinear,
+    linear: &crate::architectures::qwen::hybrid::qwen3_5::QwenLinear,
 ) -> BTreeMap<String, DerivedWeightRecipe> {
     let mut recipes = BTreeMap::new();
     if linear.weight_scale_inv.as_ref().is_some() {

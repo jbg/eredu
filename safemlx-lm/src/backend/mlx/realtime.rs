@@ -12,14 +12,32 @@ use safemlx_lm_core::{
 };
 
 use crate::{
-    api::{moshi, realtime::RealtimeModelKind},
-    architectures::moshi::layerwise::MoshiLayerwiseModel,
+    architectures::moshi::{layerwise::MoshiLayerwiseModel, model as moshi},
     error::Error,
     runtime::{
         checkpoint::{artifact::LoadedArtifactIdentity, quantization::WeightQuantization},
         generation::sampler::DefaultSampler,
     },
 };
+
+/// Supported MLX realtime speech-to-speech model-family dispatch target.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RealtimeModelKind {
+    /// Moshi-family realtime token model with a native Moshi/MLX checkpoint layout.
+    Moshi,
+    /// NVIDIA PersonaPlex realtime token model with its released PyTorch safetensors layout.
+    PersonaPlex,
+}
+
+impl RealtimeModelKind {
+    /// Returns the model type string used for user-facing dispatch messages.
+    pub fn model_type(self) -> &'static str {
+        match self {
+            Self::Moshi => "moshi",
+            Self::PersonaPlex => "personaplex",
+        }
+    }
+}
 
 /// Loaded MLX realtime speech-to-speech token model.
 ///

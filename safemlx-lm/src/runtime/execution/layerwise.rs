@@ -93,7 +93,7 @@ pub(crate) fn validate_gguf_layerwise_source(
     checkpoint: &safemlx::ops::GgufCheckpoint,
     metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
     options: LayerWeightResidency,
-) -> Result<crate::api::GgufArchitecture, Error> {
+) -> Result<crate::core::GgufArchitecture, Error> {
     let architecture_name = match metadata.get("general.architecture") {
         Some(safemlx::ops::GgufMetadataValue::String(name)) => name,
         Some(_) => {
@@ -107,7 +107,7 @@ pub(crate) fn validate_gguf_layerwise_source(
             ));
         }
     };
-    let architecture = crate::api::GgufArchitecture::resolve(architecture_name)?;
+    let architecture = crate::core::GgufArchitecture::resolve(architecture_name)?;
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_gguf(
         architecture,

@@ -17,7 +17,7 @@ use safemlx::{
 };
 
 use crate::{
-    api::qwen3_5::QwenLinear as Linear,
+    architectures::qwen::hybrid::qwen3_5::QwenLinear as Linear,
     core::cache::{CacheRankIdentity, PoolingStateComponent, StateTensorOwner, StateTensorRole},
     nn::attention::indexed_sparse_attention,
     runtime::cache::{

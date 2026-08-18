@@ -6447,7 +6447,7 @@ mod tests {
 
         let manager = manager_with_leased_block();
         let mut pipeline = PipelineCache::new(
-            crate::api::ModelKind::Llama,
+            crate::core::ModelKind::Llama,
             vec![PipelineLayerCache::KeyValue {
                 global_layer: 0,
                 cache: PipelineKeyValueCache::Paged(

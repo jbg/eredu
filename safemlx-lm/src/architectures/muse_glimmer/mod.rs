@@ -37,25 +37,22 @@ pub use crate::core::cache::{
 pub use crate::nn::generation::sample;
 
 use crate::{
-    api::{
-        common::{
-            self,
-            attention::{
-                apply_rope_and_update_cache, attention_probabilities, batch_seq, finish_attention,
-                reshape_attention_projection, AttentionInput,
-            },
-            generation::CausalLm,
-            layers::SwiGluMlp,
-            linear::project_logits_maybe_quantized,
-            moe::TopKRouterScoreFunction,
-        },
-        input,
-    },
     core::cache::CacheRankIdentity,
     error::Error,
     nn::tensor::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
+    },
+    nn::{
+        self as common,
+        attention::{
+            apply_rope_and_update_cache, attention_probabilities, batch_seq, finish_attention,
+            reshape_attention_projection, AttentionInput,
+        },
+        generation::CausalLm,
+        layers::SwiGluMlp,
+        linear::project_logits_maybe_quantized,
+        moe::TopKRouterScoreFunction,
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
@@ -72,6 +69,7 @@ use crate::{
     },
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    runtime::media::input,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -316,8 +314,8 @@ impl DecoderConfigSource {
 }
 
 impl DecoderConfig {
-    pub(crate) fn model_kind(&self) -> crate::api::ModelKind {
-        crate::api::ModelKind::MuseGlimmer
+    pub(crate) fn model_kind(&self) -> crate::core::ModelKind {
+        crate::core::ModelKind::MuseGlimmer
     }
 
     /// Whether this architecture carries learned Q/K/V projection biases.
@@ -2400,7 +2398,7 @@ pub(crate) fn load_gguf_checkpoint(
         )));
     }
     let is_moe = false;
-    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
+    let gguf_architecture = crate::core::GgufArchitecture::resolve(&architecture)?;
     crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
@@ -2515,7 +2513,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     architecture: &str,
     is_moe: bool,
 ) -> Result<(DecoderConfig, Vec<u32>), Error> {
-    let gguf_architecture = crate::api::GgufArchitecture::resolve(architecture)?;
+    let gguf_architecture = crate::core::GgufArchitecture::resolve(architecture)?;
     crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
@@ -2542,7 +2540,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
     Ok((args, eos_token_ids))
 }
 

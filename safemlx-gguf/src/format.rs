@@ -123,6 +123,20 @@ impl MetadataArray {
             _ => None,
         }
     }
+    /// Converts an integer array to `u32` without truncation.
+    pub fn to_u32_vec(&self) -> Option<Vec<u32>> {
+        match self {
+            Self::Uint8(v) => Some(v.iter().map(|&x| x.into()).collect()),
+            Self::Int8(v) => v.iter().map(|&x| x.try_into().ok()).collect(),
+            Self::Uint16(v) => Some(v.iter().map(|&x| x.into()).collect()),
+            Self::Int16(v) => v.iter().map(|&x| x.try_into().ok()).collect(),
+            Self::Uint32(v) => Some(v.clone()),
+            Self::Int32(v) => v.iter().map(|&x| x.try_into().ok()).collect(),
+            Self::Uint64(v) => v.iter().map(|&x| x.try_into().ok()).collect(),
+            Self::Int64(v) => v.iter().map(|&x| x.try_into().ok()).collect(),
+            _ => None,
+        }
+    }
     pub fn to_f32_vec(&self) -> Option<Vec<f32>> {
         match self {
             Self::Float32(v) => Some(v.clone()),
@@ -191,6 +205,21 @@ impl MetadataValue {
         match self {
             Self::Array(v) => v.to_i64_vec(),
             v => v.as_i64().map(|x| vec![x]),
+        }
+    }
+    /// Converts an integer value or array to `u32` without truncation.
+    pub fn to_u32_vec(&self) -> Option<Vec<u32>> {
+        match self {
+            Self::Array(v) => v.to_u32_vec(),
+            Self::Uint8(v) => Some(vec![(*v).into()]),
+            Self::Int8(v) => Some(vec![(*v).try_into().ok()?]),
+            Self::Uint16(v) => Some(vec![(*v).into()]),
+            Self::Int16(v) => Some(vec![(*v).try_into().ok()?]),
+            Self::Uint32(v) => Some(vec![*v]),
+            Self::Int32(v) => Some(vec![(*v).try_into().ok()?]),
+            Self::Uint64(v) => Some(vec![(*v).try_into().ok()?]),
+            Self::Int64(v) => Some(vec![(*v).try_into().ok()?]),
+            _ => None,
         }
     }
     pub fn as_f32(&self) -> Option<f32> {

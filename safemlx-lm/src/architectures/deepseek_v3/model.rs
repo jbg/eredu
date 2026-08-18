@@ -36,15 +36,15 @@ use crate::core::cache::{
 
 use crate::nn as common;
 use crate::{
-    api::{
-        input as runtime_input,
-        qwen3_5::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
+    architectures::qwen::hybrid::qwen3_5::{
+        QwenLinear as Linear, QwenWeightFormat as WeightFormat,
     },
     nn::{
         generation::CausalLm,
         layers::silu,
         moe::{weighted_route_sum, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
     },
+    runtime::media::input as runtime_input,
 };
 use crate::{
     core::cache::CacheRankIdentity,
@@ -3679,7 +3679,7 @@ fn load_model_impl(
         crate::backend::mlx::ModelLoadOptions::with_quantization,
     );
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV3,
+        crate::core::ModelKind::DeepSeekV3,
         model_dir,
         options,
     )?;
@@ -3870,7 +3870,7 @@ pub(crate) fn load_gguf_checkpoint(
         crate::backend::mlx::ModelLoadOptions::with_quantization,
     );
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::DeepSeek2,
+        crate::core::GgufArchitecture::DeepSeek2,
         checkpoint,
         &metadata,
         options,
@@ -3964,7 +3964,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     }
     args.validate()?;
 
-    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
     Ok(PreparedDeepSeekGguf {
         args,
         eos_token_ids,
@@ -4251,7 +4251,8 @@ mod tests {
         ModelInput,
     };
     use crate::{
-        api::{LoadedModel, ModelKind},
+        api::LoadedModel,
+        core::ModelKind,
         error::Error,
         runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
         runtime::cache::CompressedLatentCache,
@@ -4724,8 +4725,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            crate::api::resolve_model_config(&value).ok(),
-            Some(crate::api::ResolvedModelConfig {
+            crate::backend::mlx::resolve_model_config(&value).ok(),
+            Some(crate::backend::mlx::ResolvedModelConfig {
                 kind: ModelKind::DeepSeekV3,
                 model_type: "deepseek_v3".into(),
                 effective_model_type: "deepseek_v3".into(),
@@ -4794,7 +4795,7 @@ mod tests {
         let mut value = tiny_config_value(Some(4));
         value["moe_layer_freq"] = json!(0);
         let loading = parse_config_value(value.clone()).unwrap_err().to_string();
-        let inspection = crate::api::resolve_model_config(&value)
+        let inspection = crate::backend::mlx::resolve_model_config(&value)
             .unwrap_err()
             .to_string();
         assert_eq!(inspection, loading);

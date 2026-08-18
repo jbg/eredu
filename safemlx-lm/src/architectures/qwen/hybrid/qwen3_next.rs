@@ -94,7 +94,7 @@ fn load_qwen3_next_model_with_quantization(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3Next,
+        crate::core::ModelKind::Qwen3Next,
         model_dir,
         crate::backend::mlx::ModelLoadOptions {
             quantization,

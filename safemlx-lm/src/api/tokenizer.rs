@@ -1,7 +1,6 @@
 //! Tokenizer, chat-template, and GGUF metadata loading.
 
 use super::*;
-use sha2::{Digest, Sha256};
 
 /// Backend-independent tokenizer, chat-template, and text-sidecar failure.
 #[derive(Debug, thiserror::Error)]
@@ -35,24 +34,6 @@ pub enum TextMetadataError {
     TokenizerConfiguration(String),
 }
 
-pub(crate) fn tokenizer_vocabulary_fingerprint(tokenizer: &Tokenizer) -> [u8; 32] {
-    let vocabulary_size = tokenizer.get_vocab_size(true);
-    let mut hasher = Sha256::new();
-    hasher.update(b"safemlx-token-id-vocabulary-v1");
-    hasher.update((vocabulary_size as u64).to_le_bytes());
-    for token_id in 0..vocabulary_size {
-        hasher.update((token_id as u64).to_le_bytes());
-        match tokenizer.id_to_token(token_id as u32) {
-            Some(token) => {
-                hasher.update((token.len() as u64).to_le_bytes());
-                hasher.update(token.as_bytes());
-            }
-            None => hasher.update(u64::MAX.to_le_bytes()),
-        }
-    }
-    hasher.finalize().into()
-}
-
 /// Loads only the tokenizer from a supported model directory or GGUF file.
 ///
 /// Loading from GGUF parses embedded tokenizer metadata without creating an
@@ -63,11 +44,8 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, TextMeta
     if is_gguf_file(model_dir) {
         return Ok(load_gguf_tokenizer(model_dir)?.tokenizer);
     }
-    let metadata = read_model_metadata(model_dir)?;
-    load_tokenizer_for_kind(
-        ModelKind::from_model_type(&effective_model_type(&metadata))?,
-        model_dir,
-    )
+    let configuration = read_model_configuration(model_dir)?;
+    load_tokenizer_for_kind(configuration.kind, model_dir)
 }
 
 pub(super) fn load_tokenizer_for_kind(
@@ -137,10 +115,13 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
     )
 }
 
-pub(super) fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, TextMetadataError> {
+pub(super) fn read_model_configuration(
+    model_dir: &Path,
+) -> Result<safemlx_lm_core::ModelConfiguration, TextMetadataError> {
     let config_path = model_dir.join("config.json");
     let file = std::fs::File::open(config_path)?;
-    Ok(serde_json::from_reader(file)?)
+    let json = serde_json::from_reader(file)?;
+    Ok(safemlx_lm_core::resolve_model_configuration(&json)?)
 }
 
 pub(super) fn is_gguf_file(path: &Path) -> bool {
@@ -187,30 +168,6 @@ pub(super) fn load_gguf_tokenizer_from_metadata(
     })
 }
 
-pub(super) fn effective_model_type(metadata: &ModelMetadata) -> String {
-    if metadata.model_type == "inkling_mm_model" {
-        return metadata.model_type.clone();
-    }
-    if matches!(
-        metadata.model_type.as_str(),
-        "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_vl_moe" | "qwen3_5" | "qwen3_5_moe"
-    ) {
-        metadata
-            .text_config
-            .as_ref()
-            .and_then(|text_config| text_config.model_type.clone())
-            .unwrap_or_else(|| metadata.model_type.clone())
-    } else if ModelKind::from_model_type(&metadata.model_type).is_ok() {
-        metadata.model_type.clone()
-    } else {
-        metadata
-            .text_config
-            .as_ref()
-            .and_then(|text_config| text_config.model_type.clone())
-            .unwrap_or_else(|| metadata.model_type.clone())
-    }
-}
-
 pub(super) fn load_chat_template(
     model_dir: &Path,
 ) -> Result<Option<ModelChatTemplate>, TextMetadataError> {
@@ -232,15 +189,14 @@ pub(super) fn load_chat_template(
         return Ok(None);
     }
 
-    let metadata = read_model_metadata(model_dir)?;
-    if matches!(metadata.model_type.as_str(), "gemma4" | "gemma4_unified")
-        || metadata.text_config.as_ref().is_some_and(|text_config| {
-            matches!(
-                text_config.model_type.as_deref(),
-                Some("gemma4_text" | "gemma4_unified_text")
-            )
-        })
-    {
+    let configuration = read_model_configuration(model_dir)?;
+    if matches!(
+        configuration.declared_model_type.as_str(),
+        "gemma4" | "gemma4_unified"
+    ) || matches!(
+        configuration.effective_model_type.as_str(),
+        "gemma4_text" | "gemma4_unified_text"
+    ) {
         return Ok(Some(ModelChatTemplate::Single(
             GEMMA4_TEXT_TEMPLATE.to_string(),
         )));
@@ -279,7 +235,8 @@ mod vocabulary_fingerprint_tests {
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::AddedToken;
 
-    use super::{tokenizer_vocabulary_fingerprint, Tokenizer};
+    use super::Tokenizer;
+    use safemlx_lm_utils::tokenizer::vocabulary_fingerprint;
 
     fn tokenizer(tokens: &[&str]) -> Tokenizer {
         let mut tokenizer = Tokenizer::new(WordLevel::default());
@@ -301,12 +258,12 @@ mod vocabulary_fingerprint_tests {
         let remapped = tokenizer(&["<unk>", "beta", "alpha"]);
 
         assert_eq!(
-            tokenizer_vocabulary_fingerprint(&first),
-            tokenizer_vocabulary_fingerprint(&identical)
+            vocabulary_fingerprint(&first),
+            vocabulary_fingerprint(&identical)
         );
         assert_ne!(
-            tokenizer_vocabulary_fingerprint(&first),
-            tokenizer_vocabulary_fingerprint(&remapped)
+            vocabulary_fingerprint(&first),
+            vocabulary_fingerprint(&remapped)
         );
     }
 }

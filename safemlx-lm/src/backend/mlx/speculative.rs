@@ -17,19 +17,14 @@ use safemlx::{
     Array, Event, Stream,
 };
 use safemlx_lm_core::{
-    Completion, MtpCapability, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
+    Completion, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
     SpeculativeRandomness, SpeculativeSampling,
 };
 
 use crate::{
-    api::{
-        gemma4_assistant::{
-            load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
-            Gemma4AssistantDraftModel,
-        },
-        LoadedModel, PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest,
-        PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest,
-        PreparedChatSpeculativeBackend,
+    architectures::gemma4::assistant::{
+        load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
+        Gemma4AssistantDraftModel,
     },
     architectures::muse_glimmer::assistant::{self as muse_dflash, MuseGlimmerDFlash},
     backend::mlx::{ModelCache, ModelLoadOptions},
@@ -40,7 +35,7 @@ use crate::{
 /// Architecture-dispatched MLX draft model with its fixed execution placement.
 pub struct MlxDrafter {
     model: MlxDrafterModel,
-    tokenizer_fingerprint: Option<[u8; 32]>,
+    tokenizer_fingerprint: [u8; 32],
     stream: Stream,
 }
 
@@ -83,39 +78,29 @@ impl MlxDrafter {
     /// Loads a drafter from an explicit checkpoint path and fixes its execution stream.
     pub fn load(
         source: impl AsRef<Path>,
+        tokenizer: &tokenizers::Tokenizer,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
-        Self::load_with_options(source, ModelLoadOptions::default(), stream, weights_stream)
+        Self::load_with_options(
+            source,
+            tokenizer,
+            ModelLoadOptions::default(),
+            stream,
+            weights_stream,
+        )
     }
 
     /// Loads a drafter using architecture-independent weight options.
     pub fn load_with_options(
         source: impl AsRef<Path>,
+        tokenizer: &tokenizers::Tokenizer,
         options: ModelLoadOptions,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
         let source = source.as_ref();
-        let tokenizer_fingerprint = if source
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-        {
-            Some(crate::api::tokenizer_vocabulary_fingerprint(
-                &crate::api::load_tokenizer(source)?,
-            ))
-        } else {
-            let tokenizer_path = source.join("tokenizer.json");
-            tokenizer_path
-                .exists()
-                .then(|| {
-                    tokenizers::Tokenizer::from_file(tokenizer_path)
-                        .map(safemlx_lm_utils::tokenizer::Tokenizer::from_tokenizer)
-                        .map(|tokenizer| crate::api::tokenizer_vocabulary_fingerprint(&tokenizer))
-                })
-                .transpose()?
-        };
+        let tokenizer_fingerprint = safemlx_lm_utils::tokenizer::vocabulary_fingerprint(tokenizer);
         let is_gguf = source
             .extension()
             .and_then(|extension| extension.to_str())
@@ -226,39 +211,13 @@ impl MlxDrafter {
         }
     }
 
-    pub(crate) fn tokenizer_fingerprint(&self) -> Option<[u8; 32]> {
+    pub(crate) const fn tokenizer_fingerprint(&self) -> [u8; 32] {
         self.tokenizer_fingerprint
     }
 
     /// Execution stream selected when this drafter was loaded.
     pub const fn stream(&self) -> &Stream {
         &self.stream
-    }
-}
-
-impl PreparedChatSpeculativeBackend for super::MlxBackend<'static> {
-    type Drafter = MlxDrafter;
-    type SpeculativeError = Error;
-
-    fn mtp_capability(model: &LoadedModel<Self>) -> MtpCapability {
-        model.mlx_mtp_capability()
-    }
-
-    fn execute_prepared_chat_mtp<'a, F>(
-        model: &mut LoadedModel<Self>,
-        request: PreparedChatMtpGenerationRequest<'a, Self, Self::Drafter, F>,
-    ) -> Result<PreparedChatMtpGenerationOutput, Error>
-    where
-        F: FnMut(safemlx_lm_core::SemanticEvent),
-    {
-        model.execute_prepared_chat_mtp_mlx(request)
-    }
-
-    fn execute_prepared_chat_mtp_batch<'a>(
-        model: &mut LoadedModel<Self>,
-        request: PreparedChatMtpBatchRequest<'a, Self, Self::Drafter>,
-    ) -> Result<PreparedChatMtpBatchOutput, Error> {
-        model.execute_prepared_chat_mtp_batch_mlx(request)
     }
 }
 

@@ -161,7 +161,9 @@ fn run_mtp(
         target_dir,
         Default::default(),
     )?;
-    let mut assistant = MlxDrafter::load(assistant_dir, stream, weights_stream)?;
+    let assistant_tokenizer = safemlx_lm::api::load_tokenizer(assistant_dir)?;
+    let mut assistant =
+        MlxDrafter::load(assistant_dir, &assistant_tokenizer, stream, weights_stream)?;
     let prompt_tokens = target.encode_to_array(prompt, false, stream)?;
     let parts = [InputPart::text_token_ids(&prompt_tokens)];
     let input = ModelInput::new(&parts);

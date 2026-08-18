@@ -27,17 +27,28 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        deepseek_v3, deepseek_v4, gemma4, gpt_oss, inkling, input as runtime_input, kimi_linear,
-        lfm2, nemotron_h, qwen3_5, qwen3_next, qwen3_vl, ModelKind,
-    },
     architectures::distributed::pipeline::{assign_module, load_deepseek_experts},
+    architectures::{
+        deepseek_v3::model as deepseek_v3,
+        deepseek_v4::model as deepseek_v4,
+        gemma4::model as gemma4,
+        gpt_oss::model as gpt_oss,
+        inkling::model as inkling,
+        kimi_linear::model as kimi_linear,
+        lfm2::model as lfm2,
+        nemotron_h::model as nemotron_h,
+        qwen::{
+            hybrid::{qwen3_5, qwen3_next},
+            vl::model as qwen3_vl,
+        },
+    },
     backend::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
     backend::mlx::{MlxParallelContext, ModelLoadOptions},
     core::cache::CacheRankIdentity,
     core::generation::MtpConfig,
+    core::ModelKind,
     core::{MtpCapability, MtpCheckpointKind, MtpStats},
     error::Error,
     runtime::cache::residency::{
@@ -54,6 +65,7 @@ use crate::{
     },
     runtime::execution::inspection::ActivationObserver,
     runtime::generation::sampler::SpeculativeSampler,
+    runtime::media::input as runtime_input,
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertPass, ExpertRouteBatch,
@@ -3745,14 +3757,18 @@ fn load_gguf_ep(
             options.weight_residency
         )));
     }
-    crate::api::validate_gguf_quantization_source(checkpoint, &metadata, options.quantization)?;
+    crate::backend::mlx::validate_gguf_quantization_source(
+        checkpoint,
+        &metadata,
+        options.quantization,
+    )?;
     if architecture == "deepseek4" {
         let mut structural_options = options;
         structural_options.parallel = None;
         structural_options.weight_residency =
             crate::runtime::execution::layerwise::WeightResidency::fully_resident();
         crate::backend::mlx::structural::validate_gguf(
-            crate::api::GgufArchitecture::DeepSeek4,
+            crate::core::GgufArchitecture::DeepSeek4,
             checkpoint,
             &metadata,
             structural_options,

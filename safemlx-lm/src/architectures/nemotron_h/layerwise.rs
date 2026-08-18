@@ -23,16 +23,15 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
-        input,
-        nemotron_h::{
-            self as resident, BlockInput, Cache, Experts, LayerCache, LayerPolicy, ModelArgs,
-            TransformerBlock,
-        },
+    architectures::nemotron_h::model::{
+        self as resident, BlockInput, Cache, Experts, LayerCache, LayerPolicy, ModelArgs,
+        TransformerBlock,
     },
     error::Error,
     nn::{
+        self as common,
+        generation::CausalLm,
+        linear::project_logits_maybe_quantized,
         parallel::{
             register_gqa_projection_group, GqaProjectionNames, VocabParallelEmbedding,
             VocabParallelLmHead,
@@ -65,6 +64,7 @@ use crate::{
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
         ExpertPass, ExpertRouteBatch,
@@ -1351,7 +1351,7 @@ pub fn load_nemotron_h_layerwise_model(
         .unwrap_or_default()
         .with_weight_residency(residency);
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::NemotronH,
+        crate::core::ModelKind::NemotronH,
         model_dir,
         load_options,
     )?;
@@ -1404,7 +1404,7 @@ pub(crate) fn load_nemotron_h_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::NemotronH,
+        crate::core::ModelKind::NemotronH,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1466,10 +1466,10 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
 ) -> Result<(NemotronHLayerwiseModel, Vec<u32>), Error> {
     let architecture = match metadata.get("general.architecture") {
         Some(GgufMetadataValue::String(name)) if name == "nemotron_h" => {
-            crate::api::GgufArchitecture::NemotronH
+            crate::core::GgufArchitecture::NemotronH
         }
         Some(GgufMetadataValue::String(name)) if name == "nemotron_h_moe" => {
-            crate::api::GgufArchitecture::NemotronHMoe
+            crate::core::GgufArchitecture::NemotronHMoe
         }
         Some(GgufMetadataValue::String(name)) => {
             return Err(Error::UnsupportedArchitecture(format!(
@@ -1632,7 +1632,7 @@ pub fn load_nemotron_h_expert_cache_model(
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::NemotronH,
+        crate::core::ModelKind::NemotronH,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
@@ -4075,7 +4075,7 @@ mod tests {
         crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::api::ModelKind::NemotronH,
+            crate::core::ModelKind::NemotronH,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),
@@ -4236,7 +4236,7 @@ mod tests {
             dir.path(),
             expert_options,
             quantization,
-            crate::api::ModelKind::NemotronH,
+            crate::core::ModelKind::NemotronH,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),

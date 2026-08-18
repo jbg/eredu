@@ -26,24 +26,21 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::generation::CausalLm,
-        gemma4::{
+    architectures::gemma4::{
+        audio::{AudioLayer, Gemma4AudioConfig, Gemma4AudioLayerwiseStatic, Gemma4AudioTower},
+        model::{
             self as resident, AttentionInput, Cache, Gemma4Embedding, Gemma4TextModel, ModelArgs,
             TransformerBlock,
         },
-        gemma4_audio::{
-            AudioLayer, Gemma4AudioConfig, Gemma4AudioLayerwiseStatic, Gemma4AudioTower,
-        },
-        gemma4_multimodal::{Gemma4ClippedLinear, Gemma4ModalityEmbedder},
-        gemma4_vision::{
+        multimodal::{Gemma4ClippedLinear, Gemma4ModalityEmbedder},
+        vision::{
             Gemma4VisionConfig, Gemma4VisionLayerwiseState, Gemma4VisionLayerwiseStatic,
             Gemma4VisionTower, VisionLayer,
         },
-        input,
     },
     error::Error,
     nn::{
+        generation::CausalLm,
         parallel::{LinearParallelism, ParallelLinear, VocabParallelLmHead},
         tensor::create_causal_mask,
     },
@@ -71,6 +68,7 @@ use crate::{
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
         ExpertIdentity, ExpertPass, ExpertRouteBatch,
@@ -931,7 +929,7 @@ pub fn load_gemma4_layerwise_model(
     let options = options.into();
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Gemma4,
+        crate::core::ModelKind::Gemma4,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1025,7 +1023,7 @@ pub(crate) fn load_gemma4_tensor_parallel_layerwise_model(
         .map(|(model, _)| model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Gemma4,
+        crate::core::ModelKind::Gemma4,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -1063,7 +1061,7 @@ pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
 ) -> Result<(Gemma4LayerwiseModel, Vec<u32>), Error> {
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::Gemma4,
+        crate::core::GgufArchitecture::Gemma4,
         checkpoint,
         metadata,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
@@ -1100,7 +1098,7 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<(Gemma4LayerwiseModel, Vec<u32>), Error> {
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::Gemma4,
+        crate::core::GgufArchitecture::Gemma4,
         checkpoint,
         metadata,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
@@ -3749,7 +3747,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
             let target = "model.vision_tower.patch_embedder.input_proj.weight";
             let range = semantic_range(&[target], vision.config.hidden_size)?;
             vision.patch_embedder =
-                crate::api::gemma4_vision::VisionPatchEmbedder::new_tensor_parallel(
+                crate::architectures::gemma4::vision::VisionPatchEmbedder::new_tensor_parallel(
                     &vision.config,
                     range.len() as i32,
                     semantic_widths(&[target], vision.config.hidden_size)?,
@@ -4634,14 +4632,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        api::{
-            common::generation::CausalLm,
-            gemma4::{self as resident, Model, ModelInput},
-            gemma4_audio::Gemma4AudioConfig,
-            gemma4_vision::Gemma4VisionConfig,
-            input as runtime_input,
+        architectures::gemma4::{
+            audio::Gemma4AudioConfig,
+            model::{self as resident, Model, ModelInput},
+            vision::Gemma4VisionConfig,
         },
         core::residency::{MemoryTier, OffloadConfig},
+        nn::generation::CausalLm,
         runtime::{
             cache::ConcatKeyValueCache,
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
@@ -4651,6 +4648,7 @@ mod tests {
                 ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
                 LoadTimeQuantizableAdapter,
             },
+            media::input as runtime_input,
             residency::dense_stream::DenseDiskStreamLoadOptions,
         },
     };

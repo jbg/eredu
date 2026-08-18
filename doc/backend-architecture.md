@@ -159,6 +159,11 @@ validated load-policy route, and—when applicable—the already-opened
 `safemlx_gguf::Checkpoint`. Only then is the plan passed to the selected
 backend's `prepare_model` implementation.
 
+Nested `config.json` model identity and lossless GGUF integer metadata are
+resolved once in core. The MLX `family` module validates the resulting raw
+configuration against concrete MLX architecture implementations; architecture
+and runtime modules do not reach back through the public `api` namespace.
+
 The MLX adapter's `loading` module is the sole materializer. It consumes the
 plan, performs exact architecture/module binding, creates MLX arrays and
 modules, and applies MLX quantization, residency, stream, mapping, and transfer
@@ -313,7 +318,9 @@ single-request execution, and fair batch execution operations on generic
 `LoadedModel<B>`; its associated drafter type prevents cross-backend pairing.
 The MLX implementation is the production path. The target and `MlxDrafter`
 retain the MLX streams selected when each was loaded; batch cache lanes are
-allocated inside the MLX adapter.
+allocated inside the MLX adapter. The caller supplies the drafter tokenizer to
+the MLX loader, so vocabulary compatibility is exact without making the
+backend call into facade metadata loading.
 The lower-level `MlxMtpCache` remains an explicitly MLX resource for raw tensor
 APIs. Starting an unrelated sequence is an explicit `reset_session`
 transition; loading a prompt cache deliberately replaces the same session

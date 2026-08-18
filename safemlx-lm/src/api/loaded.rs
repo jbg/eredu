@@ -806,12 +806,10 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 )))
             }
         }
-        if let Some(draft_fingerprint) = drafter.tokenizer_fingerprint() {
-            if draft_fingerprint != self.tokenizer_fingerprint {
-                return Err(Error::UnsupportedArchitecture(
-                    "assistant token-id vocabulary mapping does not match the target".into(),
-                ));
-            }
+        if drafter.tokenizer_fingerprint() != self.tokenizer_fingerprint {
+            return Err(Error::UnsupportedArchitecture(
+                "assistant token-id vocabulary mapping does not match the target".into(),
+            ));
         }
         Ok(())
     }

@@ -48,17 +48,6 @@ pub use crate::core::cache::{
 pub use crate::nn::generation::sample;
 
 use crate::{
-    api::{
-        common::{
-            self,
-            attention::{
-                attention_probabilities, batch_seq, finish_attention, reshape_attention_projection,
-            },
-            generation::CausalLm,
-            moe::{packed_grouped_linear_with_options, top_k_softmax_routing, weighted_route_sum},
-        },
-        input,
-    },
     core::cache::{
         LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorOwner,
         StateTensorPolicy, StateTensorRole,
@@ -67,6 +56,14 @@ use crate::{
     nn::tensor::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
+    },
+    nn::{
+        self as common,
+        attention::{
+            attention_probabilities, batch_seq, finish_attention, reshape_attention_projection,
+        },
+        generation::CausalLm,
+        moe::{packed_grouped_linear_with_options, top_k_softmax_routing, weighted_route_sum},
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
@@ -83,6 +80,7 @@ use crate::{
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::ActivationObserver,
+    runtime::media::input,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -4525,7 +4523,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
         .map(crate::backend::mlx::ModelLoadOptions::with_quantization)
         .unwrap_or_default();
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::Gemma4,
+        crate::core::GgufArchitecture::Gemma4,
         checkpoint,
         metadata,
         options,
@@ -4576,7 +4574,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
         } else {
             (None, None, None, None, None)
         };
-    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
     Ok(PreparedGemma4Gguf {
         args,
         vision_config,
@@ -5981,7 +5979,7 @@ pub fn load_gemma4_model(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Gemma4,
+        crate::core::ModelKind::Gemma4,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;
@@ -6025,7 +6023,7 @@ pub fn load_gemma4_model_quantized(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Gemma4,
+        crate::core::ModelKind::Gemma4,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
@@ -6745,15 +6743,13 @@ mod tests {
         partial_rotary_dims, Attention, Cache, FeedForwardPolicy, FloatOrString, KeyValuePolicy,
         LayerPolicy, ModelArgs, ValuePolicy,
     };
-    use crate::api::{
-        common::generation::CausalLm,
-        input::{InputMetadata, InputPart, ModelInput},
-    };
+    use crate::nn::generation::CausalLm;
     use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
     use crate::runtime::checkpoint::load::{
         load_arrays_strict, StrictLoadConfig, StrictLoadReport,
     };
     use crate::runtime::checkpoint::quantization::WeightQuantization;
+    use crate::runtime::media::input::{InputMetadata, InputPart, ModelInput};
 
     #[test]
     fn native_gguf_embedding_layout_never_enters_affine_mode() {

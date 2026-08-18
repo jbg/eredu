@@ -22,19 +22,6 @@ use tokenizers::Tokenizer;
 pub use crate::nn::generation::sample;
 
 use crate::{
-    api::{
-        common::{
-            self,
-            attention::{
-                apply_rope_and_update_cache, attention_probabilities, batch_seq, finish_attention,
-                reshape_attention_projection,
-            },
-            generation::CausalLm,
-            layers::SwiGluMlp,
-            linear::project_logits_maybe_quantized,
-        },
-        input,
-    },
     core::cache::derive_prompt_cache_architecture_fingerprint,
     error::Error,
     nn::tensor::{
@@ -42,12 +29,23 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
+    nn::{
+        self as common,
+        attention::{
+            apply_rope_and_update_cache, attention_probabilities, batch_seq, finish_attention,
+            reshape_attention_projection,
+        },
+        generation::CausalLm,
+        layers::SwiGluMlp,
+        linear::project_logits_maybe_quantized,
+    },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_safetensors_dir_lenient,
         load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::ActivationObserver,
+    runtime::media::input,
     runtime::{
         attention::{AttentionPolicy, LayerSchedule},
         cache::{ConcatKeyValueCache, KeyValueCache},
@@ -1393,7 +1391,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports llama and mistral"
         )));
     }
-    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
+    let gguf_architecture = crate::core::GgufArchitecture::resolve(&architecture)?;
     crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
@@ -1419,7 +1417,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
         args.quantized_weight_configs = Some(quantized_weight_configs);
     }
 
-    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
     Ok(PreparedLlamaGguf {
         args,
         eos_token_ids,
@@ -1661,7 +1659,7 @@ pub fn load_resident_llama_model(
 ) -> Result<ResidentModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Llama,
+        crate::core::ModelKind::Llama,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;
@@ -1683,7 +1681,7 @@ pub fn load_resident_llama_model_quantized(
 ) -> Result<ResidentModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Llama,
+        crate::core::ModelKind::Llama,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;

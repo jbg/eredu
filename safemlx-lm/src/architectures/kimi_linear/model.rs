@@ -27,14 +27,11 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        input as runtime_input,
-        qwen3_5::{QwenLinear, QwenWeightFormat},
-    },
     architectures::deepseek_v3::model::{
         DeepSeekQuantizationConfig, LayerPolicy as DeepSeekLayerPolicy, ModelArgs as DeepSeekArgs,
         MultiHeadLatentAttention,
     },
+    architectures::qwen::hybrid::qwen3_5::{QwenLinear, QwenWeightFormat},
     core::cache::{
         CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
         StateTensorOwner, StateTensorPolicy, StateTensorRole,
@@ -72,6 +69,7 @@ use crate::{
             quantization::WeightQuantization,
         },
         execution::inspection::{ActivationObserver, MoeRoutingObservation},
+        media::input as runtime_input,
     },
 };
 
@@ -2870,7 +2868,7 @@ fn load_model_impl(
         crate::backend::mlx::ModelLoadOptions::with_quantization,
     );
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::KimiLinear,
+        crate::core::ModelKind::KimiLinear,
         model_dir,
         inspection_options,
     )?;
@@ -2950,7 +2948,7 @@ pub(crate) fn load_gguf_checkpoint(
         crate::backend::mlx::ModelLoadOptions::with_quantization,
     );
     crate::backend::mlx::structural::validate_gguf(
-        crate::api::GgufArchitecture::KimiLinear,
+        crate::core::GgufArchitecture::KimiLinear,
         checkpoint,
         &metadata,
         options,
@@ -3060,7 +3058,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     args.validate()?;
     Ok(PreparedKimiLinearGguf {
         args,
-        eos_token_ids: crate::api::gguf_eos_token_ids(metadata)?,
+        eos_token_ids: crate::backend::mlx::gguf_eos_token_ids(metadata)?,
     })
 }
 

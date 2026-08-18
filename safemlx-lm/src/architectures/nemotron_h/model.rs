@@ -31,24 +31,21 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{
-            self,
-            attention::{batch_seq, finish_attention, reshape_attention_projection},
-            convolution::DepthwiseConv1d,
-            generation::CausalLm,
-            layers::relu2,
-            linear::project_logits_maybe_quantized,
-            moe::{packed_grouped_linear, weighted_route_sum, TopKRouterScoreFunction},
-        },
-        input,
-    },
     core::cache::{
         CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
         StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
+    nn::{
+        self as common,
+        attention::{batch_seq, finish_attention, reshape_attention_projection},
+        convolution::DepthwiseConv1d,
+        generation::CausalLm,
+        layers::relu2,
+        linear::project_logits_maybe_quantized,
+        moe::{packed_grouped_linear, weighted_route_sum, TopKRouterScoreFunction},
+    },
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
         residency::{
@@ -64,6 +61,7 @@ use crate::{
         GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    runtime::media::input,
 };
 
 /// Executable operator and state policy for one Nemotron-H decoder layer.
@@ -4009,9 +4007,9 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
 
     let gguf_architecture = if architecture == "nemotron_h_moe" {
-        crate::api::GgufArchitecture::NemotronHMoe
+        crate::core::GgufArchitecture::NemotronHMoe
     } else {
-        crate::api::GgufArchitecture::NemotronH
+        crate::core::GgufArchitecture::NemotronH
     };
     crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
@@ -4059,9 +4057,9 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
     let gguf_architecture = if architecture == "nemotron_h_moe" {
-        crate::api::GgufArchitecture::NemotronHMoe
+        crate::core::GgufArchitecture::NemotronHMoe
     } else {
-        crate::api::GgufArchitecture::NemotronH
+        crate::core::GgufArchitecture::NemotronH
     };
     crate::backend::mlx::structural::validate_gguf(
         gguf_architecture,
@@ -4075,7 +4073,7 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
     Ok(PreparedNemotronHGguf {
         args,
         eos_token_ids,
@@ -4562,7 +4560,7 @@ pub fn load_nemotron_h_model(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::NemotronH,
+        crate::core::ModelKind::NemotronH,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;

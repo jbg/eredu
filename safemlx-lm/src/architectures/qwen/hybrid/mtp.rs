@@ -3,11 +3,9 @@
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
-    api::{
-        input::{self, ModelInput},
-        qwen3_5::{Cache, LayerCache, Model, QwenMtpStepOutput},
-    },
+    architectures::qwen::hybrid::qwen3_5::{Cache, LayerCache, Model, QwenMtpStepOutput},
     backend::mlx::speculative::embedded::{EmbeddedMtpOutput, EmbeddedMtpTarget},
+    runtime::media::input::{self, ModelInput},
 };
 
 pub(crate) trait QwenMtpTarget {

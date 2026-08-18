@@ -41,19 +41,24 @@ use safemlx::{
 };
 
 use crate::{
-    api::{
-        common::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
-        deepseek_v3, deepseek_v4, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, muse_glimmer,
-        nemotron_h, qwen3_vl, ModelKind,
-    },
     architectures::{
+        deepseek_v3::model as deepseek_v3,
         deepseek_v4::layerwise::DeepSeekV4LayerwiseAdapter,
+        deepseek_v4::model as deepseek_v4,
         gemma4::layerwise::{Gemma4Layer, Gemma4LayerwiseAdapter},
+        gemma4::model as gemma4,
+        gpt_oss::model as gpt_oss,
         inkling::layerwise::{InklingLayer, InklingLayerwiseAdapter},
+        inkling::model as inkling,
         kimi_linear::layerwise::KimiLinearLayerwiseAdapter,
+        kimi_linear::model as kimi_linear,
         lfm2::layerwise::Lfm2LayerwiseAdapter,
+        lfm2::model as lfm2,
+        llama::model as llama,
+        muse_glimmer,
         muse_glimmer::layerwise::{MuseGlimmerLayer, MuseGlimmerLayerwiseAdapter},
         nemotron_h::layerwise::NemotronHLayerwiseAdapter,
+        nemotron_h::model as nemotron_h,
         qwen::{
             dense as dense_qwen,
             hybrid::{
@@ -61,6 +66,7 @@ use crate::{
                 qwen3_5 as qwen_hybrid,
             },
             vl::layerwise::{Qwen3VlLayer, Qwen3VlLayerwiseAdapter, Qwen3VlPipelinePrepared},
+            vl::model as qwen3_vl,
         },
     },
     backend::mlx::speculative::embedded::{
@@ -73,9 +79,11 @@ use crate::{
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
+    core::ModelKind,
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
     error::Error,
+    nn::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
     nn::{
         parallel::{
             planned_kv_head_layout, planned_optional_kv_head_layout,
@@ -664,7 +672,7 @@ pub enum PipelineStageInput<'a> {
 #[derive(Clone, Copy)]
 enum PipelineIngress<'a> {
     Tokens(&'a Array),
-    ModelInput(crate::api::input::ModelInput<'a>),
+    ModelInput(crate::runtime::media::input::ModelInput<'a>),
 }
 
 /// Result of one stage-local forward operation.
@@ -1213,13 +1221,13 @@ trait PipelineStageAdapter {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error>;
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error>;
@@ -1310,7 +1318,7 @@ trait PipelineStageAdapter {
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -1342,7 +1350,7 @@ trait PipelineStageSemantics {
     }
     fn begin_placed_ingress(
         &mut self,
-        _input: crate::api::input::ModelInput<'_>,
+        _input: crate::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         _stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -1350,7 +1358,7 @@ trait PipelineStageSemantics {
     }
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -1493,7 +1501,7 @@ trait PipelineStageSemantics {
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &mut self,
-        _input: crate::api::input::ModelInput<'_>,
+        _input: crate::runtime::media::input::ModelInput<'_>,
         _step: PipelineStep,
         _mask: Option<&Array>,
         _cache: &mut [PipelineLayerCache],
@@ -1572,7 +1580,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -1581,7 +1589,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -1729,7 +1737,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -2789,7 +2797,7 @@ impl PipelineStageSemantics for GemmaStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -2804,7 +2812,7 @@ impl PipelineStageSemantics for GemmaStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -2961,7 +2969,7 @@ impl PipelineStageSemantics for GemmaStage {
 
     fn prefill(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -3133,7 +3141,7 @@ impl PipelineStageSemantics for MuseGlimmerStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -3144,7 +3152,7 @@ impl PipelineStageSemantics for MuseGlimmerStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -3284,7 +3292,7 @@ impl PipelineStageSemantics for MuseGlimmerStage {
 
     fn prefill(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -3347,7 +3355,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -3358,7 +3366,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -3587,7 +3595,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
 
     fn prefill(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -3635,7 +3643,7 @@ impl Qwen3VlStage {
     fn forward_decoder(
         &mut self,
         input: Option<PipelineStageInput<'_>>,
-        typed: Option<crate::api::input::ModelInput<'_>>,
+        typed: Option<crate::runtime::media::input::ModelInput<'_>>,
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
@@ -4470,7 +4478,7 @@ impl PipelineStageSemantics for QwenHybridStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -4485,7 +4493,7 @@ impl PipelineStageSemantics for QwenHybridStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -4707,7 +4715,7 @@ impl PipelineStageSemantics for QwenHybridStage {
 
     fn prefill(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -4876,7 +4884,7 @@ impl PipelineStageSemantics for InklingStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -4891,7 +4899,7 @@ impl PipelineStageSemantics for InklingStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         _stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -5089,7 +5097,7 @@ impl PipelineStageSemantics for InklingStage {
 
     fn prefill(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -5167,19 +5175,19 @@ struct PipelineEmbeddedMtpTarget<'a> {
 }
 
 fn pipeline_mtp_token_identity(
-    input: crate::api::input::ModelInput<'_>,
+    input: crate::runtime::media::input::ModelInput<'_>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    crate::api::input::validate(input)?;
+    crate::runtime::media::input::validate(input)?;
     let tokens = input
         .parts
         .iter()
         .filter_map(|part| match (part.modality, part.payload) {
             (
-                crate::api::input::Modality::Text,
-                crate::api::input::InputPayload::TokenIds(tokens),
+                crate::runtime::media::input::Modality::Text,
+                crate::runtime::media::input::InputPayload::TokenIds(tokens),
             ) => Some(Ok(tokens.clone())),
-            (crate::api::input::Modality::Text, _) => Some(Err(Exception::custom(
+            (crate::runtime::media::input::Modality::Text, _) => Some(Err(Exception::custom(
                 "pipeline embedded MTP requires token-id text ingress",
             ))),
             _ => None,
@@ -5697,7 +5705,7 @@ impl PipelineModel {
     /// Runs typed multimodal prefill through the selected distributed session.
     pub fn prefill_distributed(
         &mut self,
-        input: Option<crate::api::input::ModelInput<'_>>,
+        input: Option<crate::runtime::media::input::ModelInput<'_>>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
@@ -5855,7 +5863,7 @@ impl PipelineModel {
     #[allow(clippy::too_many_arguments)]
     fn execute_placed_ingress_dag(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         group: &Group,
         tensor: Option<&ParallelExecutionContext<'_>>,
@@ -6195,7 +6203,7 @@ impl PipelineModel {
     pub fn generate_embedded_mtp_distributed<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut PipelineCache,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
@@ -6291,14 +6299,19 @@ impl PipelineModel {
             .map(PreparedModelInput::input_parts);
         let ingress = routed_parts
             .as_ref()
-            .map(|parts| PipelineIngress::ModelInput(crate::api::input::ModelInput::new(parts)))
+            .map(|parts| {
+                PipelineIngress::ModelInput(crate::runtime::media::input::ModelInput::new(parts))
+            })
             .or(ingress);
         let mut placed_payload = None;
         if let Some(PipelineIngress::ModelInput(input)) = ingress {
             if self.info.placement.groups().len() > 1 {
                 let has_media_tensor = input.parts.iter().any(|part| {
-                    part.modality != crate::api::input::Modality::Text
-                        && matches!(part.payload, crate::api::input::InputPayload::Tensor(_))
+                    part.modality != crate::runtime::media::input::Modality::Text
+                        && matches!(
+                            part.payload,
+                            crate::runtime::media::input::InputPayload::Tensor(_)
+                        )
                 });
                 if has_media_tensor {
                     placed_payload = self.execute_placed_ingress_dag(
@@ -6396,7 +6409,7 @@ impl PipelineModel {
                     )?
                 }
                 PipelineIngress::ModelInput(input) => {
-                    crate::api::input::validate(input)?;
+                    crate::runtime::media::input::validate(input)?;
                     if let Some(payload) = placed_payload.as_ref() {
                         self.stage.forward_with_execution(
                             PipelineStageInput::Hidden(payload),
@@ -6566,7 +6579,7 @@ impl PipelineModel {
 
     pub(crate) fn prefill_stage(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
@@ -6578,7 +6591,7 @@ impl PipelineModel {
                 self.info.pipeline_stage
             )));
         }
-        crate::api::input::validate(input)?;
+        crate::runtime::media::input::validate(input)?;
         self.topology.validate_execution_stream(stream)?;
         if cache.model_kind != self.info.model_kind {
             return Err(Error::Parallel(format!(
@@ -6597,7 +6610,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
 
     fn prefill_target(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
@@ -6605,7 +6618,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
         let multimodal = input
             .parts
             .iter()
-            .any(|part| part.modality != crate::api::input::Modality::Text);
+            .any(|part| part.modality != crate::runtime::media::input::Modality::Text);
         cache
             .reset()
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -7987,18 +8000,18 @@ pub(crate) fn load_pipeline_model_with_options(
         if expert_cache.is_some()
             && !matches!(
                 architecture,
-                crate::api::GgufArchitecture::DeepSeek2
-                    | crate::api::GgufArchitecture::DeepSeek4
-                    | crate::api::GgufArchitecture::Qwen3Moe
-                    | crate::api::GgufArchitecture::Qwen3VlMoe
-                    | crate::api::GgufArchitecture::KimiLinear
-                    | crate::api::GgufArchitecture::Inkling
-                    | crate::api::GgufArchitecture::GptOss
-                    | crate::api::GgufArchitecture::Gemma4
-                    | crate::api::GgufArchitecture::Lfm2Moe
-                    | crate::api::GgufArchitecture::NemotronHMoe
-                    | crate::api::GgufArchitecture::Qwen35Moe
-                    | crate::api::GgufArchitecture::Qwen3Next
+                crate::core::GgufArchitecture::DeepSeek2
+                    | crate::core::GgufArchitecture::DeepSeek4
+                    | crate::core::GgufArchitecture::Qwen3Moe
+                    | crate::core::GgufArchitecture::Qwen3VlMoe
+                    | crate::core::GgufArchitecture::KimiLinear
+                    | crate::core::GgufArchitecture::Inkling
+                    | crate::core::GgufArchitecture::GptOss
+                    | crate::core::GgufArchitecture::Gemma4
+                    | crate::core::GgufArchitecture::Lfm2Moe
+                    | crate::core::GgufArchitecture::NemotronHMoe
+                    | crate::core::GgufArchitecture::Qwen35Moe
+                    | crate::core::GgufArchitecture::Qwen3Next
             )
         {
             return Err(Error::Parallel(format!(
@@ -8011,18 +8024,18 @@ pub(crate) fn load_pipeline_model_with_options(
             && topology.expert_parallel_size > 1
             && !matches!(
                 architecture,
-                crate::api::GgufArchitecture::DeepSeek2
-                    | crate::api::GgufArchitecture::DeepSeek4
-                    | crate::api::GgufArchitecture::Qwen3Moe
-                    | crate::api::GgufArchitecture::Qwen3VlMoe
-                    | crate::api::GgufArchitecture::KimiLinear
-                    | crate::api::GgufArchitecture::Inkling
-                    | crate::api::GgufArchitecture::GptOss
-                    | crate::api::GgufArchitecture::Gemma4
-                    | crate::api::GgufArchitecture::Lfm2Moe
-                    | crate::api::GgufArchitecture::NemotronHMoe
-                    | crate::api::GgufArchitecture::Qwen35Moe
-                    | crate::api::GgufArchitecture::Qwen3Next
+                crate::core::GgufArchitecture::DeepSeek2
+                    | crate::core::GgufArchitecture::DeepSeek4
+                    | crate::core::GgufArchitecture::Qwen3Moe
+                    | crate::core::GgufArchitecture::Qwen3VlMoe
+                    | crate::core::GgufArchitecture::KimiLinear
+                    | crate::core::GgufArchitecture::Inkling
+                    | crate::core::GgufArchitecture::GptOss
+                    | crate::core::GgufArchitecture::Gemma4
+                    | crate::core::GgufArchitecture::Lfm2Moe
+                    | crate::core::GgufArchitecture::NemotronHMoe
+                    | crate::core::GgufArchitecture::Qwen35Moe
+                    | crate::core::GgufArchitecture::Qwen3Next
             )
         {
             return Err(Error::Parallel(format!(
@@ -8033,19 +8046,19 @@ pub(crate) fn load_pipeline_model_with_options(
         if topology.expert_parallel_size > 1
             && !matches!(
                 architecture,
-                crate::api::GgufArchitecture::KimiLinear
-                    | crate::api::GgufArchitecture::Inkling
-                    | crate::api::GgufArchitecture::DeepSeek2
-                    | crate::api::GgufArchitecture::DeepSeek4
-                    | crate::api::GgufArchitecture::Qwen3Moe
-                    | crate::api::GgufArchitecture::Qwen3Vl
-                    | crate::api::GgufArchitecture::Qwen3VlMoe
-                    | crate::api::GgufArchitecture::GptOss
-                    | crate::api::GgufArchitecture::Gemma4
-                    | crate::api::GgufArchitecture::Lfm2Moe
-                    | crate::api::GgufArchitecture::NemotronHMoe
-                    | crate::api::GgufArchitecture::Qwen35Moe
-                    | crate::api::GgufArchitecture::Qwen3Next
+                crate::core::GgufArchitecture::KimiLinear
+                    | crate::core::GgufArchitecture::Inkling
+                    | crate::core::GgufArchitecture::DeepSeek2
+                    | crate::core::GgufArchitecture::DeepSeek4
+                    | crate::core::GgufArchitecture::Qwen3Moe
+                    | crate::core::GgufArchitecture::Qwen3Vl
+                    | crate::core::GgufArchitecture::Qwen3VlMoe
+                    | crate::core::GgufArchitecture::GptOss
+                    | crate::core::GgufArchitecture::Gemma4
+                    | crate::core::GgufArchitecture::Lfm2Moe
+                    | crate::core::GgufArchitecture::NemotronHMoe
+                    | crate::core::GgufArchitecture::Qwen35Moe
+                    | crate::core::GgufArchitecture::Qwen3Next
             )
         {
             return Err(Error::Parallel(format!(
@@ -8056,27 +8069,27 @@ pub(crate) fn load_pipeline_model_with_options(
         if topology.tensor_parallel_size > 1
             && !matches!(
                 architecture,
-                crate::api::GgufArchitecture::KimiLinear
-                    | crate::api::GgufArchitecture::Inkling
-                    | crate::api::GgufArchitecture::DeepSeek2
-                    | crate::api::GgufArchitecture::DeepSeek4
-                    | crate::api::GgufArchitecture::Llama
-                    | crate::api::GgufArchitecture::Mistral
-                    | crate::api::GgufArchitecture::Qwen2
-                    | crate::api::GgufArchitecture::Qwen3
-                    | crate::api::GgufArchitecture::Qwen3Moe
-                    | crate::api::GgufArchitecture::Qwen3Vl
-                    | crate::api::GgufArchitecture::Qwen3VlMoe
-                    | crate::api::GgufArchitecture::GptOss
-                    | crate::api::GgufArchitecture::Gemma4
-                    | crate::api::GgufArchitecture::Lfm2
-                    | crate::api::GgufArchitecture::Lfm2Moe
-                    | crate::api::GgufArchitecture::NemotronH
-                    | crate::api::GgufArchitecture::NemotronHMoe
-                    | crate::api::GgufArchitecture::Qwen35
-                    | crate::api::GgufArchitecture::Qwen35Moe
-                    | crate::api::GgufArchitecture::Qwen3Next
-                    | crate::api::GgufArchitecture::MuseGlimmer
+                crate::core::GgufArchitecture::KimiLinear
+                    | crate::core::GgufArchitecture::Inkling
+                    | crate::core::GgufArchitecture::DeepSeek2
+                    | crate::core::GgufArchitecture::DeepSeek4
+                    | crate::core::GgufArchitecture::Llama
+                    | crate::core::GgufArchitecture::Mistral
+                    | crate::core::GgufArchitecture::Qwen2
+                    | crate::core::GgufArchitecture::Qwen3
+                    | crate::core::GgufArchitecture::Qwen3Moe
+                    | crate::core::GgufArchitecture::Qwen3Vl
+                    | crate::core::GgufArchitecture::Qwen3VlMoe
+                    | crate::core::GgufArchitecture::GptOss
+                    | crate::core::GgufArchitecture::Gemma4
+                    | crate::core::GgufArchitecture::Lfm2
+                    | crate::core::GgufArchitecture::Lfm2Moe
+                    | crate::core::GgufArchitecture::NemotronH
+                    | crate::core::GgufArchitecture::NemotronHMoe
+                    | crate::core::GgufArchitecture::Qwen35
+                    | crate::core::GgufArchitecture::Qwen35Moe
+                    | crate::core::GgufArchitecture::Qwen3Next
+                    | crate::core::GgufArchitecture::MuseGlimmer
             )
         {
             return Err(Error::Parallel(format!(
@@ -8102,7 +8115,7 @@ pub(crate) fn load_pipeline_model_with_options(
         )
         .into_loader_result()?;
         return match architecture {
-            crate::api::GgufArchitecture::DeepSeek4 => {
+            crate::core::GgufArchitecture::DeepSeek4 => {
                 let prepared = deepseek_v4::prepare_gguf_checkpoint(&checkpoint, &metadata)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
@@ -8121,7 +8134,7 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            crate::api::GgufArchitecture::Llama | crate::api::GgufArchitecture::Mistral => {
+            crate::core::GgufArchitecture::Llama | crate::core::GgufArchitecture::Mistral => {
                 let prepared = llama::prepare_llama_gguf_checkpoint(
                     &checkpoint,
                     &metadata,
@@ -8144,7 +8157,7 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            crate::api::GgufArchitecture::MuseGlimmer => {
+            crate::core::GgufArchitecture::MuseGlimmer => {
                 if expert_cache.is_some() {
                     return Err(Error::Parallel(
                         "Muse-Glimmer is dense and does not support expert-cache residency".into(),
@@ -8165,7 +8178,7 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            crate::api::GgufArchitecture::DeepSeek2 => {
+            crate::core::GgufArchitecture::DeepSeek2 => {
                 let prepared = deepseek_v3::prepare_gguf_checkpoint(
                     &checkpoint,
                     &metadata,
@@ -8189,7 +8202,7 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            crate::api::GgufArchitecture::Gemma4 => {
+            crate::core::GgufArchitecture::Gemma4 => {
                 let mmproj = gemma4::open_sibling_mmproj(model_dir)?;
                 let prepared = gemma4::prepare_gemma4_gguf_checkpoint(
                     &checkpoint,
@@ -8220,11 +8233,11 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            architecture @ (crate::api::GgufArchitecture::Qwen2
-            | crate::api::GgufArchitecture::Qwen3
-            | crate::api::GgufArchitecture::Qwen3Moe) => {
+            architecture @ (crate::core::GgufArchitecture::Qwen2
+            | crate::core::GgufArchitecture::Qwen3
+            | crate::core::GgufArchitecture::Qwen3Moe) => {
                 let architecture_name = architecture.metadata_name();
-                let is_moe = architecture == crate::api::GgufArchitecture::Qwen3Moe;
+                let is_moe = architecture == crate::core::GgufArchitecture::Qwen3Moe;
                 let (args, _) = dense_qwen::prepare_gguf_checkpoint(
                     &checkpoint,
                     &metadata,
@@ -8248,7 +8261,7 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            crate::api::GgufArchitecture::Qwen3Vl | crate::api::GgufArchitecture::Qwen3VlMoe => {
+            crate::core::GgufArchitecture::Qwen3Vl | crate::core::GgufArchitecture::Qwen3VlMoe => {
                 let vision_path = qwen3_vl::find_qwen3_vl_mmproj(model_dir)?;
                 let vision_checkpoint = GgufCheckpoint::open(vision_path)?;
                 let vision_metadata =
@@ -8276,7 +8289,7 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            crate::api::GgufArchitecture::GptOss => {
+            crate::core::GgufArchitecture::GptOss => {
                 let prepared =
                     gpt_oss::prepare_gguf_checkpoint(&checkpoint, &metadata, weights_stream)?;
                 let store: SharedWeightStore =
@@ -8296,11 +8309,11 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            architecture @ (crate::api::GgufArchitecture::Lfm2
-            | crate::api::GgufArchitecture::Lfm2Moe) => {
+            architecture @ (crate::core::GgufArchitecture::Lfm2
+            | crate::core::GgufArchitecture::Lfm2Moe) => {
                 let prepared =
                     lfm2::prepare_gguf_checkpoint(&checkpoint, &metadata, weights_stream)?;
-                let is_moe = architecture == crate::api::GgufArchitecture::Lfm2Moe;
+                let is_moe = architecture == crate::core::GgufArchitecture::Lfm2Moe;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
@@ -8318,8 +8331,8 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            architecture @ (crate::api::GgufArchitecture::NemotronH
-            | crate::api::GgufArchitecture::NemotronHMoe) => {
+            architecture @ (crate::core::GgufArchitecture::NemotronH
+            | crate::core::GgufArchitecture::NemotronHMoe) => {
                 let prepared = nemotron_h::prepare_nemotron_h_gguf_checkpoint(
                     &checkpoint,
                     &metadata,
@@ -8343,10 +8356,10 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            crate::api::GgufArchitecture::Qwen35
-            | crate::api::GgufArchitecture::Qwen35Moe
-            | crate::api::GgufArchitecture::Qwen3Next => {
-                let mmproj = if architecture == crate::api::GgufArchitecture::Qwen3Next {
+            crate::core::GgufArchitecture::Qwen35
+            | crate::core::GgufArchitecture::Qwen35Moe
+            | crate::core::GgufArchitecture::Qwen3Next => {
+                let mmproj = if architecture == crate::core::GgufArchitecture::Qwen3Next {
                     None
                 } else {
                     qwen_hybrid::open_sibling_mmproj(model_dir)?
@@ -8377,7 +8390,7 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            crate::api::GgufArchitecture::KimiLinear => {
+            crate::core::GgufArchitecture::KimiLinear => {
                 let prepared = kimi_linear::prepare_gguf_checkpoint(
                     &checkpoint,
                     &metadata,
@@ -8401,7 +8414,7 @@ pub(crate) fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            crate::api::GgufArchitecture::Inkling => {
+            crate::core::GgufArchitecture::Inkling => {
                 let mmproj = inkling::open_sibling_mmproj(model_dir)?;
                 let prepared = inkling::prepare_gguf_checkpoint_with_mmproj(
                     &checkpoint,
@@ -8839,7 +8852,7 @@ pub(crate) fn load_pipeline_model_with_options(
 
 fn pipeline_gguf_architecture(
     metadata: &HashMap<String, GgufMetadataValue>,
-) -> Result<crate::api::GgufArchitecture, Error> {
+) -> Result<crate::core::GgufArchitecture, Error> {
     let architecture = match metadata.get("general.architecture") {
         Some(GgufMetadataValue::String(architecture)) => architecture,
         Some(_) => {
@@ -8853,7 +8866,7 @@ fn pipeline_gguf_architecture(
             ));
         }
     };
-    Ok(crate::api::GgufArchitecture::resolve(architecture)?)
+    Ok(crate::core::GgufArchitecture::resolve(architecture)?)
 }
 
 fn load_llama_pipeline(
@@ -14906,9 +14919,11 @@ impl GemmaStage {
         let stream = execution.stream();
         let prepared_ingress = match input {
             PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => {
-                let parts = [crate::api::input::InputPart::text_token_ids(tokens)];
+                let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+                    tokens,
+                )];
                 Some(self.prepare_multimodal_ingress(
-                    crate::api::input::ModelInput::new(&parts),
+                    crate::runtime::media::input::ModelInput::new(&parts),
                     step,
                     Some(execution),
                     stream,
@@ -16496,7 +16511,7 @@ fn load_qwen_hybrid_pipeline(
     source_args: qwen_hybrid::ModelArgs,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
-    vision_config: Option<crate::api::qwen_vl::VisionConfig>,
+    vision_config: Option<crate::architectures::qwen::vl::vision::VisionConfig>,
     store: SharedWeightStore,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -17366,7 +17381,7 @@ fn forward_qwen_hybrid_external_expert_layer(
 impl QwenHybridStage {
     fn prepare_multimodal_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
@@ -17508,7 +17523,7 @@ impl QwenHybridStage {
         args: qwen_hybrid::ModelArgs,
         image_token_id: Option<i32>,
         video_token_id: Option<i32>,
-        vision_config: Option<crate::api::qwen_vl::VisionConfig>,
+        vision_config: Option<crate::architectures::qwen::vl::vision::VisionConfig>,
         range: Range<usize>,
         info: &PipelineStageInfo,
         external_experts: bool,
@@ -19847,7 +19862,7 @@ fn forward_inkling_cartesian_layer(
 impl InklingStage {
     fn prepare_multimodal_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
@@ -20648,10 +20663,10 @@ impl InklingStage {
 
 struct GemmaPipelineConfig {
     args: gemma4::ModelArgs,
-    vision_config: Option<crate::api::gemma4_vision::Gemma4VisionConfig>,
+    vision_config: Option<crate::architectures::gemma4::vision::Gemma4VisionConfig>,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
-    audio_config: Option<crate::api::gemma4_audio::Gemma4AudioConfig>,
+    audio_config: Option<crate::architectures::gemma4::audio::Gemma4AudioConfig>,
     audio_token_id: Option<i32>,
 }
 
@@ -21423,10 +21438,10 @@ impl GemmaStage {
     #[allow(clippy::too_many_arguments)]
     fn new(
         args: gemma4::ModelArgs,
-        vision_config: Option<crate::api::gemma4_vision::Gemma4VisionConfig>,
+        vision_config: Option<crate::architectures::gemma4::vision::Gemma4VisionConfig>,
         image_token_id: Option<i32>,
         video_token_id: Option<i32>,
-        audio_config: Option<crate::api::gemma4_audio::Gemma4AudioConfig>,
+        audio_config: Option<crate::architectures::gemma4::audio::Gemma4AudioConfig>,
         audio_token_id: Option<i32>,
         range: Range<usize>,
         info: &PipelineStageInfo,
@@ -21597,7 +21612,7 @@ impl GemmaStage {
 
     fn prepare_multimodal_ingress(
         &mut self,
-        input: crate::api::input::ModelInput<'_>,
+        input: crate::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
@@ -22101,9 +22116,11 @@ impl GemmaStage {
         }
         let prepared_ingress = match input {
             PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => {
-                let parts = [crate::api::input::InputPart::text_token_ids(tokens)];
+                let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+                    tokens,
+                )];
                 Some(self.prepare_multimodal_ingress(
-                    crate::api::input::ModelInput::new(&parts),
+                    crate::runtime::media::input::ModelInput::new(&parts),
                     step,
                     None,
                     stream,

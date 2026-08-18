@@ -18,19 +18,16 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{
-            generation::CausalLm,
-            linear::{
-                build_unloaded_maybe_quantized_lm_head_with_quantization,
-                project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
-            },
-        },
-        input,
-        llama::{self as resident, AttentionInput, ModelArgs, TransformerBlock},
-    },
+    architectures::llama::model::{self as resident, AttentionInput, ModelArgs, TransformerBlock},
     core::cache::LayerCachePolicy,
     error::Error,
+    nn::{
+        generation::CausalLm,
+        linear::{
+            build_unloaded_maybe_quantized_lm_head_with_quantization,
+            project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
+        },
+    },
     nn::{
         parallel::{
             planned_kv_head_layout, register_gqa_projection_group,
@@ -58,6 +55,7 @@ use crate::{
         LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings,
         WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
@@ -468,7 +466,7 @@ pub(crate) fn load_llama_safetensors_mlx(
 ) -> Result<LlamaModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Llama,
+        crate::core::ModelKind::Llama,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(weight_residency),
     )?;
@@ -537,7 +535,7 @@ pub(crate) fn load_llama_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Llama,
+        crate::core::ModelKind::Llama,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;

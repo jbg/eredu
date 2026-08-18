@@ -30,8 +30,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    api::realtime::RealtimeSpeechConfig,
     backend::mlx::realtime,
+    core::realtime::RealtimeSpeechConfig,
     error::Error,
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{

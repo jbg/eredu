@@ -32,9 +32,8 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        input as runtime_input,
-        qwen3_5::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
+    architectures::qwen::hybrid::qwen3_5::{
+        QwenLinear as Linear, QwenWeightFormat as WeightFormat,
     },
     core::cache::{
         CacheRankIdentity, LayerCachePolicy, MutableStateResidency, PoolingStateComponent,
@@ -57,6 +56,7 @@ use crate::{
         StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
+    runtime::media::input as runtime_input,
 };
 
 use super::{
@@ -2004,7 +2004,7 @@ pub(crate) fn prepare_gguf_checkpoint(
 ) -> Result<PreparedDeepSeekV4Gguf, Error> {
     Ok(PreparedDeepSeekV4Gguf {
         args: model_args_from_gguf_catalog(checkpoint, metadata)?,
-        eos_token_ids: crate::api::gguf_eos_token_ids(metadata)?,
+        eos_token_ids: crate::backend::mlx::gguf_eos_token_ids(metadata)?,
     })
 }
 
@@ -2233,7 +2233,7 @@ pub fn load_model(
     let model_dir = model_dir.as_ref();
     let args = get_model_args(model_dir)?;
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::DeepSeekV4,
+        crate::core::ModelKind::DeepSeekV4,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;

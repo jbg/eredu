@@ -20,7 +20,6 @@ use safemlx_lm_core::{
 };
 
 use crate::{
-    api::input::{InputPayload, Modality, ModelInput},
     backend::mlx::{
         speculative::{MlxSpeculativeCompletion, MlxSpeculativeSampling, MtpExecutionStreams},
         MlxModelInput,
@@ -30,6 +29,7 @@ use crate::{
         MtpSchedulerOptions, SemanticEvent,
     },
     runtime::generation::sampler::SpeculativeSampler,
+    runtime::media::input::{InputPayload, Modality, ModelInput},
 };
 
 /// Component timings accumulated by an architecture-specific MTP backend.

@@ -15,11 +15,9 @@ use safemlx::{
 use serde::Deserialize;
 
 use crate::{
-    api::{
-        moshi,
-        realtime::{RealtimeError, RealtimeScheduler},
-    },
+    architectures::moshi::model as moshi,
     backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
+    core::realtime::{RealtimeError, RealtimeScheduler},
     error::Error,
     runtime::checkpoint::quantization::WeightQuantization,
     RealtimeModel, RequestId, WorkId,
@@ -235,7 +233,7 @@ pub fn load_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::PersonaPlex,
+        crate::core::ModelKind::PersonaPlex,
         model_dir.as_ref(),
         crate::backend::mlx::ModelLoadOptions::default(),
     )?;
@@ -271,7 +269,7 @@ pub fn load_model_quantized(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::PersonaPlex,
+        crate::core::ModelKind::PersonaPlex,
         model_dir.as_ref(),
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
@@ -491,8 +489,8 @@ mod tests {
         model_args_7b_v1, validate_model_config_value, AUDIO_TOKENS_PER_STREAM, TEXT_PADDING_TOKEN,
     };
     use crate::{
-        api::realtime::{RealtimeModelKind, RealtimeSampling, RealtimeScheduler},
-        backend::mlx::realtime::MlxRealtimeInput,
+        backend::mlx::realtime::{MlxRealtimeInput, RealtimeModelKind},
+        core::realtime::{RealtimeSampling, RealtimeScheduler},
         RequestId, SchedulerLimits,
     };
     use safemlx::{Array, Device, DeviceType, ExecutionContext};

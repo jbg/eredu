@@ -20,7 +20,7 @@ use safemlx::{
     random::RandomState,
     Array, Stream,
 };
-use safemlx_gguf::{MetadataArray as GgufMetadataArray, MetadataValue as GgufMetadataValue};
+use safemlx_gguf::MetadataValue as GgufMetadataValue;
 use safemlx_lm_utils::tokenizer::{
     chat_template_kwargs as inspect_chat_template_kwargs, load_model_chat_template_from_file,
     ApplyChatTemplateArgs, Chat,
@@ -42,7 +42,6 @@ use crate::core::{
 };
 
 use crate::backend::mlx::MlxGeneration;
-pub(crate) use crate::nn as common;
 use crate::runtime::chat::constraints::ConstraintCompiler;
 use crate::runtime::chat::{
     prepare_format_profile, resolve_structural_tokens, SemanticRuntimePlan,
@@ -77,14 +76,8 @@ use crate::{
 
 /// DeepSeek-V3 and DeepSeek-R1 decoder support.
 pub(crate) use crate::architectures::deepseek_v3::model as deepseek_v3;
-/// DeepSeek-V4 compressed sparse-attention decoder support.
-pub(crate) use crate::architectures::deepseek_v4::model as deepseek_v4;
-pub(crate) use crate::architectures::gemma4::assistant as gemma4_assistant;
-pub(crate) use crate::architectures::gemma4::audio as gemma4_audio;
 /// Gemma 4 text model support.
 pub(crate) use crate::architectures::gemma4::model as gemma4;
-pub(crate) use crate::architectures::gemma4::multimodal as gemma4_multimodal;
-pub(crate) use crate::architectures::gemma4::vision as gemma4_vision;
 /// OpenAI GPT-OSS sparse decoder architecture.
 pub(crate) use crate::architectures::gpt_oss::model as gpt_oss;
 /// Thinking Machines Lab Inkling multimodal decoder support.
@@ -114,26 +107,8 @@ pub(crate) use crate::architectures::nemotron_h::model as nemotron_h;
 use crate::architectures::qwen::dense as dense_qwen;
 /// Qwen3.5 dense and MoE text model support.
 pub(crate) use crate::architectures::qwen::hybrid::qwen3_5;
-/// Qwen3-Next hybrid attention/MoE text model support.
-pub(crate) use crate::architectures::qwen::hybrid::qwen3_next;
 /// Qwen3-VL multimodal conditional-generation support.
 pub(crate) use crate::architectures::qwen::vl::model as qwen3_vl;
-/// Qwen3-VL-MoE multimodal conditional-generation support.
-pub(crate) use crate::architectures::qwen::vl::moe as qwen3_vl_moe;
-pub(crate) use crate::architectures::qwen::vl::vision as qwen_vl;
-
-#[derive(Debug, Clone, Deserialize)]
-struct ModelMetadata {
-    model_type: String,
-    #[serde(default)]
-    text_config: Option<TextModelMetadata>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct TextModelMetadata {
-    #[serde(default)]
-    model_type: Option<String>,
-}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct EosTokenMetadata {
@@ -231,48 +206,13 @@ pub(crate) fn gguf_eos_token_ids(
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
 ) -> Result<Vec<u32>, tokenizer::TextMetadataError> {
     const KEY: &str = "tokenizer.ggml.eos_token_id";
-    let Some(value) = metadata.get(KEY) else {
-        return Ok(Vec::new());
-    };
-
-    fn invalid(value: impl std::fmt::Display) -> tokenizer::TextMetadataError {
-        tokenizer::TextMetadataError::UnsupportedArchitecture(format!(
-            "GGUF metadata key \"tokenizer.ggml.eos_token_id\" contains invalid EOS token id {value}; expected an integer from 0 through {}",
-            u32::MAX
-        ))
-    }
-
-    let values = match value {
-        GgufMetadataValue::Uint64(value) => {
-            return u32::try_from(*value)
-                .map(|value| vec![value])
-                .map_err(|_| invalid(value));
-        }
-        GgufMetadataValue::Array(GgufMetadataArray::Uint64(values)) => {
-            return values
-                .iter()
-                .map(|&value| u32::try_from(value).map_err(|_| invalid(value)))
-                .collect();
-        }
-        value => value.to_i64_vec().ok_or_else(|| {
-            tokenizer::TextMetadataError::UnsupportedArchitecture(format!(
-                "GGUF metadata key {KEY:?} must be an integer or integer array"
-            ))
-        })?,
-    };
-    values
-        .into_iter()
-        .map(|value| u32::try_from(value).map_err(|_| invalid(value)))
-        .collect()
+    safemlx_lm_core::gguf_u32_metadata_values(KEY, metadata.get(KEY))
+        .map_err(|error| tokenizer::TextMetadataError::UnsupportedArchitecture(error.to_string()))
 }
 
-#[path = "config.rs"]
-mod config;
 use crate::backend::mlx::ModelLoadOptions;
-pub use config::ModelKind;
-#[cfg(test)]
-pub(crate) use config::{resolve_model_config, ResolvedModelConfig};
 pub use safemlx_lm_core::GgufArchitecture;
+pub use safemlx_lm_core::ModelKind;
 
 #[path = "automatic.rs"]
 mod automatic;
@@ -314,6 +254,33 @@ pub use request::{
     PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationOutput,
     PreparedChatMtpGenerationRequest, PreparedChatSpeculativeBackend,
 };
+
+impl PreparedChatSpeculativeBackend for crate::backend::mlx::MlxBackend<'static> {
+    type Drafter = MlxDrafter;
+    type SpeculativeError = Error;
+
+    fn mtp_capability(model: &LoadedModel<Self>) -> MtpCapability {
+        model.mlx_mtp_capability()
+    }
+
+    fn execute_prepared_chat_mtp<'a, F>(
+        model: &mut LoadedModel<Self>,
+        request: PreparedChatMtpGenerationRequest<'a, Self, Self::Drafter, F>,
+    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    where
+        F: FnMut(SemanticEvent),
+    {
+        model.execute_prepared_chat_mtp_mlx(request)
+    }
+
+    fn execute_prepared_chat_mtp_batch<'a>(
+        model: &mut LoadedModel<Self>,
+        request: PreparedChatMtpBatchRequest<'a, Self, Self::Drafter>,
+    ) -> Result<PreparedChatMtpBatchOutput, Error> {
+        model.execute_prepared_chat_mtp_batch_mlx(request)
+    }
+}
+
 /// Codec-free realtime speech-to-speech token APIs.
 #[path = "realtime.rs"]
 pub mod realtime;
@@ -333,12 +300,12 @@ pub use inspection::{
 
 #[path = "tokenizer.rs"]
 mod tokenizer;
+pub(crate) use tokenizer::gguf_sidecar_dir;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 use tokenizer::{
-    effective_model_type, is_gguf_file, load_chat_template, load_gguf_tokenizer_from_metadata,
-    load_tokenizer_for_kind, load_tokenizer_template_kwargs,
+    is_gguf_file, load_chat_template, load_gguf_tokenizer_from_metadata, load_tokenizer_for_kind,
+    load_tokenizer_template_kwargs,
 };
-pub(crate) use tokenizer::{gguf_sidecar_dir, tokenizer_vocabulary_fingerprint};
 
 #[cfg(test)]
 #[path = "tests.rs"]

@@ -22,16 +22,15 @@ use crate::core::cache::{
 };
 
 use crate::{
-    api::{
-        common::{self, generation::CausalLm},
-        gpt_oss::{self as resident, Cache, Experts, LayerCache, ModelArgs, TransformerBlock},
-        input,
+    architectures::gpt_oss::model::{
+        self as resident, Cache, Experts, LayerCache, ModelArgs, TransformerBlock,
     },
     error::Error,
     nn::parallel::{
         gqa_projection_members, planned_kv_head_layout, GqaProjectionNames, VocabParallelEmbedding,
         VocabParallelLmHead,
     },
+    nn::{self as common, generation::CausalLm},
     runtime::cache::residency::{
         open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
     },
@@ -56,6 +55,7 @@ use crate::{
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
+    runtime::media::input,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
         ExpertPass, ExpertRouteBatch,
@@ -401,7 +401,7 @@ pub fn load_gpt_oss_layerwise_model(
     let options = options.into();
     let residency = options.weight_residency();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
+        crate::core::ModelKind::GptOss,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -464,7 +464,7 @@ pub(crate) fn load_gpt_oss_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
+        crate::core::ModelKind::GptOss,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
@@ -603,7 +603,7 @@ pub fn load_gpt_oss_expert_cache_model(
 ) -> Result<GptOssLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     crate::backend::mlx::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::GptOss,
+        crate::core::ModelKind::GptOss,
         model_dir,
         crate::backend::mlx::ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
@@ -2151,7 +2151,7 @@ mod tests {
         crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::api::ModelKind::GptOss,
+            crate::core::ModelKind::GptOss,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),
