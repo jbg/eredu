@@ -548,7 +548,7 @@ fn inspect_gguf_projector(
                         apply_structural_validation(report, validation, &projector);
                         report.multimodal = if !exact {
                             InspectionReadiness::Invalid
-                        } else if cfg!(feature = "image-processing") {
+                        } else if cfg!(feature = "mlx-image") {
                             InspectionReadiness::Ready
                         } else {
                             InspectionReadiness::Unsupported
@@ -595,7 +595,7 @@ fn inspect_gguf_projector(
                     apply_structural_validation(report, validation, &projector_path);
                     report.multimodal = if !exact {
                         InspectionReadiness::Invalid
-                    } else if cfg!(feature = "image-processing") {
+                    } else if cfg!(feature = "mlx-image") {
                         InspectionReadiness::Ready
                     } else {
                         InspectionReadiness::Unsupported
@@ -647,10 +647,7 @@ fn inspect_gguf_projector(
                 apply_structural_validation(report, validation, &projector_path);
                 report.multimodal = if !exact {
                     InspectionReadiness::Invalid
-                } else if cfg!(all(
-                    feature = "image-processing",
-                    feature = "audio-processing"
-                )) {
+                } else if cfg!(all(feature = "mlx-image", feature = "mlx-audio")) {
                     InspectionReadiness::Ready
                 } else {
                     InspectionReadiness::Unsupported
@@ -691,10 +688,7 @@ fn inspect_gguf_projector(
                 apply_structural_validation(report, validation, &projector_path);
                 report.multimodal = if !exact {
                     InspectionReadiness::Invalid
-                } else if cfg!(any(
-                    feature = "image-processing",
-                    feature = "audio-processing"
-                )) {
+                } else if cfg!(any(feature = "mlx-image", feature = "mlx-audio")) {
                     InspectionReadiness::Ready
                 } else {
                     InspectionReadiness::Unsupported
@@ -743,7 +737,7 @@ fn inspect_gguf_projector(
                 apply_structural_validation(report, validation, &mmproj.path);
                 report.multimodal = if !exact {
                     InspectionReadiness::Invalid
-                } else if cfg!(feature = "image-processing") {
+                } else if cfg!(feature = "mlx-image") {
                     InspectionReadiness::Ready
                 } else {
                     InspectionReadiness::Unsupported
@@ -829,9 +823,9 @@ fn inspect_safetensors_media(report: &mut ModelInspectionReport, path: &Path) {
             .all(|modality| match modality {
                 ArtifactModality::Text => true,
                 ArtifactModality::Image | ArtifactModality::Video => {
-                    cfg!(feature = "image-processing")
+                    cfg!(feature = "mlx-image")
                 }
-                ArtifactModality::Audio => cfg!(feature = "audio-processing"),
+                ArtifactModality::Audio => cfg!(feature = "mlx-audio"),
             });
         report.multimodal = if features_available {
             InspectionReadiness::Ready
@@ -8512,7 +8506,7 @@ mod tests {
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(
             report.multimodal,
-            if cfg!(feature = "image-processing") {
+            if cfg!(feature = "mlx-image") {
                 InspectionReadiness::Ready
             } else {
                 InspectionReadiness::Unsupported

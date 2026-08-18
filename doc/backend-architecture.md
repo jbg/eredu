@@ -49,10 +49,10 @@ a `runtime::attention` alias.
 The generic `api::loaded` module owns tokenizer-aware loading, ordinary text
 generation, prepared-chat construction, and backend-generic speculative
 request assembly. It does not name MLX or architecture tensor types. The
-feature-gated `api::mlx` integration module alone binds those prepared requests
-to MLX samplers, exact streams, model caches, and embedded or external MTP
-executors. This is an implementation bridge, not a second public facade or a
-compatibility namespace.
+feature-gated `backend::mlx::prepared_speculative` implementation binds those
+prepared requests to MLX samplers, exact streams, model caches, and embedded or
+external MTP executors. The backend depends only on core contracts; it does not
+import facade API or runtime orchestration.
 
 The same ownership rule applies to tests. Portable tokenizer, chat, EOS,
 metadata, and request-orchestration tests compile in `api::tests` with no
@@ -297,15 +297,19 @@ specific.
 `TextGenerationBackend::Prompt` is also the multimodal boundary. Generic
 clients construct `MultimodalRequest` from decoded `RgbImage`, `Audio`, or
 `Video` values and call the same `LoadedModel` method for every backend. The
+portable decoded-media values, validation, ordering, and placeholder binding
+are always compiled and require no media or execution feature. The
 MLX `MultimodalPreparationBackend` adapter locates the processor owned by the
 selected `MlxModelSession`, performs architecture-specific resizing,
 normalization, feature extraction, framing, tensor construction, and placement,
 then returns an opaque `MlxModelInput`. It fails closed when the selected model
-has no processor or a required media feature is disabled. The resulting prompt
-enters `PreparedChatInput::PreparedBackendInput` and the ordinary generic
-generation loop. Raw `MediaInput`, `ProcessorInput`, processor access, and the
-former duplicate MLX chat-placeholder composer are private implementation
-details rather than a second caller API.
+has no processor or a required MLX materialization feature is disabled.
+`mlx-media` selects the base adapter; `mlx-image` and `mlx-audio` select its
+image and audio preprocessing dependencies. The resulting prompt enters
+`PreparedChatInput::PreparedBackendInput` and the ordinary generic generation
+loop. Raw `MediaInput`, `ProcessorInput`, processor access, and the former
+duplicate MLX chat-placeholder composer are private implementation details
+rather than a second caller API.
 
 `MlxRealtimeBackend` maps the realtime contract to `MlxRealtimeModel`, MLX
 codec-token arrays, Moshi temporal/depth cache state, `DefaultSampler`, MLX
@@ -592,10 +596,11 @@ The current boundary leaves these components MLX-coupled:
   portable grammar filtering, prefill, decode, semantic events, cancellation,
   stop/EOS precedence, and decoding now have one backend-generic client
   surface. Multimodal request orchestration is generic through the opaque
-  backend prompt, while concrete media decoding and tensor preprocessing remain
-  backend implementations. Realtime loading and request/session orchestration
-  are generic, while codec-token arrays and Moshi/PersonaPlex model math remain
-  MLX adapter types. Prepared-chat speculative requests no longer expose samplers, random
+  backend prompt. Decoded media descriptions and validation are portable,
+  while tensor preprocessing and materialization remain backend
+  implementations. Realtime loading and request/session orchestration are
+  generic, while codec-token arrays and Moshi/PersonaPlex model math remain MLX
+  adapter types. Prepared-chat speculative requests no longer expose samplers, random
   arrays, streams, or cache objects, and their drafter field is generic. The
   public methods live on `LoadedModel<B>` behind the production-used
   `SpeculativeGenerationBackend` capability. `MtpCapability` and

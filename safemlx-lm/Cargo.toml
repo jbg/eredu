@@ -117,7 +117,7 @@ path = "tests/portable_facade.rs"
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
 no-default-features = true
-features = ["image-processing", "audio-processing"]
+features = ["mlx-image", "mlx-audio"]
 
 [features]
 default = ["mlx", "onig", "esaxx_fast"]
@@ -126,16 +126,18 @@ mlx = [
     "dep:safemlx",
     "dep:safetensors",
     "dep:memmap2",
+    "dep:tempfile",
     "dep:half",
     "dep:libc",
+    "dep:windows-sys",
 ]
 cuda = ["mlx", "safemlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "safemlx-lm-utils/esaxx_fast"]
 onig = ["tokenizers/onig", "safemlx-lm-utils/onig"]
 nccl = ["cuda", "safemlx/nccl"]
-media-processing = ["mlx"]
-image-processing = ["media-processing", "dep:image"]
-audio-processing = ["media-processing", "dep:rustfft"]
+mlx-media = ["mlx"]
+mlx-image = ["mlx-media", "dep:image"]
+mlx-audio = ["mlx-media", "dep:rustfft"]
 
 [dependencies]
 # Local dependencies
@@ -154,7 +156,7 @@ serde_json = "1"
 minijinja = "2"
 safetensors = { version = "0.8", optional = true }
 memmap2 = { version = "0.9", optional = true }
-tempfile.workspace = true
+tempfile = { workspace = true, optional = true }
 half = { workspace = true, optional = true }
 sha2.workspace = true
 llguidance = { version = "=1.7.6", default-features = false, features = ["ahash", "lark"] }
@@ -164,7 +166,7 @@ image = { version = "0.25", default-features = false, optional = true }
 rustfft = { version = "6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"], optional = true }
 
 [dev-dependencies]
 anyhow = "1"

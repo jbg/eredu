@@ -8,7 +8,8 @@ use std::{
     convert::Infallible,
     io::Write,
     num::{NonZeroU8, NonZeroUsize},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use safemlx_lm::{
@@ -42,6 +43,31 @@ use tokenizers::{
 
 const QWEN_TEMPLATE: &str =
     include_str!("fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "safemlx-lm-backend-conformance-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 struct MockBackend;
 struct MockSession;
@@ -521,7 +547,7 @@ fn write_loadable_text_artifact(root: &std::path::Path) {
 }
 
 fn assert_loading_generation_capability_and_multimodal_conformance() {
-    let artifact = tempfile::tempdir().unwrap();
+    let artifact = TestDirectory::new();
     write_loadable_text_artifact(artifact.path());
 
     let mut model = LoadedModel::load(MockBackend, artifact.path(), ()).unwrap();

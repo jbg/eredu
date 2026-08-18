@@ -17,7 +17,7 @@ mod family;
 /// MLX artifact admission and structural compatibility inspection.
 pub mod inspection;
 mod loading;
-#[cfg(feature = "media-processing")]
+#[cfg(feature = "mlx-media")]
 mod media;
 mod model;
 /// Reusable MLX neural-network building blocks.
@@ -71,7 +71,7 @@ use safemlx_lm_core::backend::{
     ModelLoadingBackend, PreparedModel, Submission,
 };
 
-#[cfg(feature = "media-processing")]
+#[cfg(feature = "mlx-media")]
 use crate::backend::mlx::runtime::media::ModelProcessor;
 use crate::{
     backend::mlx::architectures::distributed::{
@@ -87,7 +87,7 @@ use crate::{
 /// not exposed through the public loading API.
 pub struct MlxModel {
     pub(crate) inner: MlxModelKind,
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     processor: Option<ModelProcessor>,
 }
 
@@ -101,7 +101,7 @@ impl MlxModel {
     pub(crate) const fn complete(model: Model) -> Self {
         Self {
             inner: MlxModelKind::Complete(model),
-            #[cfg(feature = "media-processing")]
+            #[cfg(feature = "mlx-media")]
             processor: None,
         }
     }
@@ -109,7 +109,7 @@ impl MlxModel {
     pub(super) const fn pipeline(model: PipelineModel) -> Self {
         Self {
             inner: MlxModelKind::Pipeline(model),
-            #[cfg(feature = "media-processing")]
+            #[cfg(feature = "mlx-media")]
             processor: None,
         }
     }
@@ -117,12 +117,12 @@ impl MlxModel {
     pub(super) const fn expert(model: ExpertParallelModel) -> Self {
         Self {
             inner: MlxModelKind::Expert(model),
-            #[cfg(feature = "media-processing")]
+            #[cfg(feature = "mlx-media")]
             processor: None,
         }
     }
 
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     fn with_processor(mut self, processor: Option<ModelProcessor>) -> Self {
         self.processor = processor;
         self

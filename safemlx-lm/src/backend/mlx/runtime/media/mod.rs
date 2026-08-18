@@ -6,7 +6,7 @@ pub mod input;
 use std::{fs, path::Path};
 
 use safemlx::{Array, Dtype};
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 use safemlx_lm_core::VideoSampling as PortableVideoSampling;
 use safemlx_lm_core::{
     Media as PortableMedia, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
@@ -20,24 +20,24 @@ use crate::{
 };
 
 /// Shared PCM waveform validation and spectral operations.
-#[cfg(feature = "audio-processing")]
+#[cfg(feature = "mlx-audio")]
 pub mod audio;
 use crate::backend::mlx::architectures::gemma4::processor as gemma4;
 /// Shared decoded-image operations.
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 pub mod image;
 use crate::backend::mlx::architectures::inkling::processor as inkling;
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 use crate::backend::mlx::architectures::muse_glimmer::processor as muse_glimmer;
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 use crate::backend::mlx::architectures::qwen::vl::processor as qwen;
 /// Shared decoded-video validation, sampling, and timing operations.
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 pub mod video;
 
-#[cfg(feature = "audio-processing")]
+#[cfg(feature = "mlx-audio")]
 pub(crate) use audio::AudioWaveform;
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 pub(crate) use image::RgbImageView;
 
 /// One decoded media item supplied to a model processor.
@@ -51,7 +51,7 @@ pub(crate) struct MediaInput<'a> {
 
 impl<'a> MediaInput<'a> {
     /// Creates an RGB8 image input.
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     pub(crate) fn image_rgb8(image: RgbImageView<'a>) -> Self {
         Self {
             modality: Modality::Image,
@@ -60,7 +60,7 @@ impl<'a> MediaInput<'a> {
     }
 
     /// Creates a decoded RGB8 video input with an explicit sampling policy.
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     pub(crate) fn video_rgb8_with_sampling(
         frames: &'a [RgbImageView<'a>],
         source_fps: Option<f64>,
@@ -77,7 +77,7 @@ impl<'a> MediaInput<'a> {
     }
 
     /// Creates a mono floating-point PCM audio input.
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     pub(crate) fn audio_f32(samples: &'a [f32], sample_rate: u32) -> Result<Self, Error> {
         Ok(Self {
             modality: Modality::Audio,
@@ -96,7 +96,7 @@ pub(crate) enum ProcessorInput<'a> {
 }
 
 /// Frame-selection policy for decoded video input.
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) enum VideoSampling {
     /// Uses the model processor's default frame rate and limits.
@@ -111,7 +111,7 @@ pub(crate) enum VideoSampling {
 }
 
 /// Borrowed sequence of decoded RGB8 video frames.
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VideoFrames<'a> {
     /// Frames in source order.
@@ -126,15 +126,15 @@ pub(crate) struct VideoFrames<'a> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MediaPayload<'a> {
     /// Decoded RGB8 image pixels.
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     Rgb8(RgbImageView<'a>),
     /// Decoded RGB8 video frames and timing metadata.
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     VideoFrames(VideoFrames<'a>),
     /// Mono floating-point PCM samples and their sampling rate.
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     AudioF32(AudioWaveform<'a>),
-    #[cfg(not(any(feature = "image-processing", feature = "audio-processing")))]
+    #[cfg(not(any(feature = "mlx-image", feature = "mlx-audio")))]
     #[doc(hidden)]
     _Lifetime(std::marker::PhantomData<&'a ()>),
 }
@@ -155,7 +155,7 @@ pub(crate) struct OwnedInputMetadata {
 }
 
 impl OwnedInputMetadata {
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     pub(crate) fn qwen_grid_thw(value: Array) -> Self {
         Self {
             qwen_grid_thw: Some(value),
@@ -163,7 +163,7 @@ impl OwnedInputMetadata {
         }
     }
 
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     pub(crate) fn vision_grid_thw(value: Array) -> Self {
         Self {
             vision_grid_thw: Some(value),
@@ -171,7 +171,7 @@ impl OwnedInputMetadata {
         }
     }
 
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     pub(crate) fn patch_position_ids(value: Array) -> Self {
         Self {
             patch_position_ids: Some(value),
@@ -179,7 +179,7 @@ impl OwnedInputMetadata {
         }
     }
 
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     pub(crate) fn audio_mask(value: Array) -> Self {
         Self {
             audio_mask: Some(value),
@@ -214,7 +214,7 @@ impl PreparedInputPart {
         }
     }
 
-    #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+    #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
     pub(crate) fn media_tensor(
         modality: Modality,
         tensor: Array,
@@ -651,16 +651,16 @@ pub(crate) struct ModelProcessor {
 enum ProcessorKind {
     Gemma4(gemma4::Gemma4Processor),
     Inkling(inkling::InklingProcessor),
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     MuseGlimmer(muse_glimmer::MuseGlimmerProcessor),
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     Qwen(qwen::QwenProcessor),
 }
 
 #[derive(Debug)]
 pub(crate) enum ProcessorPreparationError<E> {
     Backend(Error),
-    #[cfg_attr(not(feature = "image-processing"), allow(dead_code))]
+    #[cfg_attr(not(feature = "mlx-image"), allow(dead_code))]
     Text(E),
 }
 
@@ -671,15 +671,15 @@ impl<E> From<Error> for ProcessorPreparationError<E> {
 }
 
 enum PortableMediaView<'a> {
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     Image(RgbImageView<'a>),
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     Video {
         frames: Vec<RgbImageView<'a>>,
         source_fps: Option<f64>,
         sampling: VideoSampling,
     },
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     Audio {
         samples: &'a [f32],
         sample_rate: u32,
@@ -692,7 +692,7 @@ impl<'a> PortableMediaView<'a> {
     fn new(media: &'a PortableMedia) -> Result<Self, Error> {
         match media {
             PortableMedia::Image(image) => {
-                #[cfg(feature = "image-processing")]
+                #[cfg(feature = "mlx-image")]
                 {
                     Ok(Self::Image(RgbImageView::packed(
                         image.pixels(),
@@ -700,16 +700,16 @@ impl<'a> PortableMediaView<'a> {
                         image.height(),
                     )?))
                 }
-                #[cfg(not(feature = "image-processing"))]
+                #[cfg(not(feature = "mlx-image"))]
                 {
                     let _ = image;
                     Err(Error::Processor(
-                        "MLX image preparation requires the image-processing feature".into(),
+                        "MLX image preparation requires the mlx-image feature".into(),
                     ))
                 }
             }
             PortableMedia::Video(video) => {
-                #[cfg(feature = "image-processing")]
+                #[cfg(feature = "mlx-image")]
                 {
                     let frames = video
                         .frames()
@@ -732,27 +732,27 @@ impl<'a> PortableMediaView<'a> {
                         sampling,
                     })
                 }
-                #[cfg(not(feature = "image-processing"))]
+                #[cfg(not(feature = "mlx-image"))]
                 {
                     let _ = video;
                     Err(Error::Processor(
-                        "MLX video preparation requires the image-processing feature".into(),
+                        "MLX video preparation requires the mlx-image feature".into(),
                     ))
                 }
             }
             PortableMedia::Audio(audio) => {
-                #[cfg(feature = "audio-processing")]
+                #[cfg(feature = "mlx-audio")]
                 {
                     Ok(Self::Audio {
                         samples: audio.samples(),
                         sample_rate: audio.sample_rate(),
                     })
                 }
-                #[cfg(not(feature = "audio-processing"))]
+                #[cfg(not(feature = "mlx-audio"))]
                 {
                     let _ = audio;
                     Err(Error::Processor(
-                        "MLX audio preparation requires the audio-processing feature".into(),
+                        "MLX audio preparation requires the mlx-audio feature".into(),
                     ))
                 }
             }
@@ -761,9 +761,9 @@ impl<'a> PortableMediaView<'a> {
 
     fn as_input(&self) -> Result<MediaInput<'_>, Error> {
         match self {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             Self::Image(image) => Ok(MediaInput::image_rgb8(*image)),
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             Self::Video {
                 frames,
                 source_fps,
@@ -773,7 +773,7 @@ impl<'a> PortableMediaView<'a> {
                 *source_fps,
                 *sampling,
             )),
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             Self::Audio {
                 samples,
                 sample_rate,
@@ -792,7 +792,7 @@ impl ModelProcessor {
         })
     }
 
-    #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+    #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
     pub(crate) fn load_gemma4_gguf(
         model_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
         projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
@@ -813,7 +813,7 @@ impl ModelProcessor {
         })
     }
 
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     pub(crate) fn load_muse_glimmer(model_dir: &Path) -> Result<Option<Self>, Error> {
         muse_glimmer::MuseGlimmerProcessor::load(model_dir).map(|processor| {
             processor.map(|processor| Self {
@@ -822,7 +822,7 @@ impl ModelProcessor {
         })
     }
 
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     pub(crate) fn load_muse_glimmer_gguf(
         projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
     ) -> Result<Self, Error> {
@@ -833,7 +833,7 @@ impl ModelProcessor {
         })
     }
 
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     pub(crate) fn load_inkling_gguf(
         metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
     ) -> Result<Self, Error> {
@@ -842,7 +842,7 @@ impl ModelProcessor {
         })
     }
 
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     pub(crate) fn load_qwen(model_dir: &Path) -> Result<Option<Self>, Error> {
         qwen::QwenProcessor::load(model_dir).map(|processor| {
             processor.map(|processor| Self {
@@ -857,14 +857,14 @@ impl ModelProcessor {
         input: &[ProcessorInput<'_>],
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<PreparedModelInput, ProcessorPreparationError<E>> {
-        #[cfg(not(feature = "image-processing"))]
+        #[cfg(not(feature = "mlx-image"))]
         let _ = &encode_text;
         match &self.kind {
             ProcessorKind::Gemma4(processor) => processor.prepare_input(input, encode_text),
             ProcessorKind::Inkling(processor) => processor.prepare_input(input, encode_text),
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             ProcessorKind::MuseGlimmer(processor) => processor.prepare_input(input, encode_text),
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             ProcessorKind::Qwen(processor) => processor.prepare_input(input, encode_text),
         }
     }
@@ -929,22 +929,22 @@ pub(crate) fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<Model
             ModelProcessor::load_gemma4(model_dir)
         }
         "muse_glimmer" | "muse_glimmer_text" => {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             {
                 ModelProcessor::load_muse_glimmer(model_dir)
             }
-            #[cfg(not(feature = "image-processing"))]
+            #[cfg(not(feature = "mlx-image"))]
             {
                 Ok(None)
             }
         }
         "qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text" | "qwen3_5"
         | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             {
                 ModelProcessor::load_qwen(model_dir)
             }
-            #[cfg(not(feature = "image-processing"))]
+            #[cfg(not(feature = "mlx-image"))]
             {
                 Ok(None)
             }
@@ -970,7 +970,7 @@ pub(crate) fn push_text_token_ids(parts: &mut Vec<PreparedInputPart>, token_ids:
     }
 }
 
-#[cfg(all(test, feature = "image-processing"))]
+#[cfg(all(test, feature = "mlx-image"))]
 mod portable_input_tests {
     use std::{collections::HashMap, convert::Infallible};
 

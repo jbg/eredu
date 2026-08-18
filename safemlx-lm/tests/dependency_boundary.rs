@@ -33,7 +33,14 @@ fn portable_facade_graph_has_no_accelerator_runtime() {
         String::from_utf8_lossy(&output.stderr)
     );
     let tree = String::from_utf8(output.stdout).unwrap();
-    for forbidden in ["safemlx ", "safemlx-sys "] {
+    for forbidden in [
+        "safemlx ",
+        "safemlx-sys ",
+        "tempfile ",
+        "windows-sys ",
+        "image ",
+        "rustfft ",
+    ] {
         assert!(
             !tree.lines().any(|line| line.starts_with(forbidden)),
             "forbidden dependency {forbidden:?} in:\n{tree}"
@@ -70,7 +77,14 @@ fn backend_and_example_dependencies_have_the_correct_manifest_ownership() {
     let dependencies = package["dependencies"].as_array().unwrap();
     let mlx_features = package["features"]["mlx"].as_array().unwrap();
 
-    for name in ["safetensors", "memmap2", "half", "libc"] {
+    for name in [
+        "safetensors",
+        "memmap2",
+        "tempfile",
+        "half",
+        "libc",
+        "windows-sys",
+    ] {
         let dependency = dependencies
             .iter()
             .find(|dependency| dependency["name"] == name && dependency["kind"].is_null())
@@ -85,6 +99,29 @@ fn backend_and_example_dependencies_have_the_correct_manifest_ownership() {
                 .any(|feature| feature == &format!("dep:{name}")),
             "MLX feature must enable backend dependency {name}"
         );
+    }
+
+    let features = package["features"].as_object().unwrap();
+    for removed in ["media-processing", "image-processing", "audio-processing"] {
+        assert!(
+            !features.contains_key(removed),
+            "backend-agnostic feature name {removed} must not hide MLX materialization"
+        );
+    }
+    for (feature, required) in [
+        ("mlx-media", &["mlx"][..]),
+        ("mlx-image", &["mlx-media", "dep:image"][..]),
+        ("mlx-audio", &["mlx-media", "dep:rustfft"][..]),
+    ] {
+        let enabled = features[feature]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing feature {feature}"));
+        for required in required {
+            assert!(
+                enabled.iter().any(|entry| entry == required),
+                "feature {feature} must enable {required}"
+            );
+        }
     }
 
     for name in ["anyhow", "clap"] {
@@ -252,6 +289,7 @@ fn backend_conformance_suite_remains_backend_independent() {
         "safemlx_sys::",
         "backend::mlx",
         "cfg(feature = \"mlx\")",
+        "tempfile",
     ] {
         assert!(
             !source.contains(forbidden),

@@ -6,6 +6,6 @@ pub mod layerwise;
 pub mod model;
 /// Qwen3-VL-MoE specialization.
 pub mod moe;
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 pub(crate) mod processor;
 pub(crate) mod vision;

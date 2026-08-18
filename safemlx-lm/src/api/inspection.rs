@@ -389,9 +389,38 @@ fn finalize_text_readiness(report: &mut ModelInspectionReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
     use tokenizers::{
         decoders::byte_level::ByteLevel, models::wordlevel::WordLevel, AddedToken, Tokenizer,
     };
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "safemlx-lm-inspection-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn save_wordlevel_tokenizer(path: &Path) {
         std::fs::write(
@@ -410,7 +439,7 @@ mod tests {
 
     #[test]
     fn gguf_tokenizer_sidecar_is_an_explicit_fallback() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = TestDirectory::new();
         let path = directory.path().join("model.gguf");
         let metadata = std::collections::HashMap::new();
 
@@ -429,7 +458,7 @@ mod tests {
 
     #[test]
     fn template_presence_does_not_imply_semantic_or_tool_support() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = TestDirectory::new();
         save_wordlevel_tokenizer(&directory.path().join("tokenizer.json"));
         std::fs::write(
             directory.path().join("config.json"),
@@ -478,7 +507,7 @@ mod tests {
             .unwrap();
         tokenizer.with_decoder(Some(ByteLevel::default()));
         let eos_token_id = tokenizer.token_to_id("<eos>").unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let directory = TestDirectory::new();
         let mut report =
             ModelInspectionReport::unverified(directory.path(), ArtifactFormat::SafeTensors);
         inspect_chat_behavior(

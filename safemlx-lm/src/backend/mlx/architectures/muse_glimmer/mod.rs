@@ -5,7 +5,7 @@ pub mod assistant;
 /// Bounded and unified residency execution for Muse-Glimmer.
 pub mod layerwise;
 pub(crate) mod mtp;
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 pub(crate) mod processor;
 pub(crate) mod vision;
 

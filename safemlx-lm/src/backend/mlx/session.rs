@@ -11,7 +11,7 @@ use safemlx_lm_core::{
 };
 use std::path::Path;
 
-#[cfg(feature = "media-processing")]
+#[cfg(feature = "mlx-media")]
 use crate::backend::mlx::runtime::media::{ModelProcessor, PreparedModelInput};
 use crate::core::generation::MtpConfig;
 use crate::{
@@ -193,7 +193,7 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
 
 impl MlxModelInput {
     /// Converts processor-owned MLX values into an opaque backend prompt.
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     pub(crate) fn from_prepared(input: &PreparedModelInput) -> Self {
         input.with_model_input(|input| Self::from(input))
     }
@@ -229,7 +229,7 @@ impl MlxModelInput {
 pub struct MlxModelSession<'a> {
     inner: MlxSessionKind,
     distributed: Option<MlxDistributedSession<'a>>,
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     processor: Option<ModelProcessor>,
 }
 
@@ -271,7 +271,7 @@ impl<'a> MlxModelSession<'a> {
                 )))
             }
         }
-        #[cfg(feature = "media-processing")]
+        #[cfg(feature = "mlx-media")]
         let processor = model.processor;
         let inner = match model.inner {
             MlxModelKind::Complete(model) => {
@@ -290,12 +290,12 @@ impl<'a> MlxModelSession<'a> {
         Ok(Self {
             inner,
             distributed,
-            #[cfg(feature = "media-processing")]
+            #[cfg(feature = "mlx-media")]
             processor,
         })
     }
 
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     pub(crate) fn processor(&self) -> Option<&ModelProcessor> {
         self.processor.as_ref()
     }

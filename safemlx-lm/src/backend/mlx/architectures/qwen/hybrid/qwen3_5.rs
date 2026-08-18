@@ -7417,7 +7417,7 @@ mod tests {
         FullAttentionInput, LayerPolicy, LinearAttention, LinearAttentionInput, Model, ModelArgs,
         SparseMoeBlock, VisionConfig,
     };
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     use crate::backend::mlx::runtime::media::{
         load_processor, MediaInput, ProcessorInput, RgbImageView,
     };
@@ -9591,7 +9591,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     #[ignore = "requires MLX runtime execution"]
     fn raw_rgb_processor_output_prefills_through_visual_encoder() {
         let _guard = mlx_runtime_test_guard();
@@ -9654,7 +9654,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     #[ignore = "requires MLX runtime execution"]
     fn raw_rgb_video_processor_output_prefills_and_decodes() {
         let _guard = mlx_runtime_test_guard();
@@ -9731,7 +9731,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     #[ignore = "requires local Qwen3.5-MoE model files and MLX runtime execution"]
     fn local_qwen35_processor_config_produces_checkpoint_native_tensors() {
         let _guard = mlx_runtime_test_guard();

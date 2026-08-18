@@ -1,19 +1,19 @@
 use std::{fs, path::Path};
 
-#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+#[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
 use safemlx::Array;
 use serde::Deserialize;
 
 use crate::backend::mlx::error::Error;
-#[cfg(feature = "audio-processing")]
+#[cfg(feature = "mlx-audio")]
 use crate::backend::mlx::runtime::media::audio::{extract_log_mel, LogMelConfig};
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 use crate::backend::mlx::runtime::media::image::{
     rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage,
 };
-#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+#[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
 use crate::backend::mlx::runtime::media::input::Modality;
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 use crate::backend::mlx::runtime::media::video::{
     format_mm_ss, frame_timestamps, sampled_frame_count, uniform_sample_indices,
     validate_rgb_frames,
@@ -22,31 +22,31 @@ use crate::backend::mlx::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
     ProcessorInput, ProcessorPreparationError,
 };
-#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+#[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
 use crate::backend::mlx::runtime::media::{MediaPayload, OwnedInputMetadata};
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 use crate::backend::mlx::runtime::media::{VideoFrames, VideoSampling};
 
 #[derive(Debug, Clone, Deserialize)]
 struct Gemma4ModelConfig {
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     boi_token_id: Option<u32>,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     eoi_token_id: Option<u32>,
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     boa_token_id: Option<u32>,
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     eoa_token_id: Option<u32>,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     #[serde(default = "default_soft_tokens")]
     vision_soft_tokens_per_image: usize,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     vision_config: Option<Gemma4VisionProcessorConfig>,
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     audio_config: Option<serde_json::Value>,
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 #[derive(Debug, Clone, Deserialize)]
 struct Gemma4VisionProcessorConfig {
     #[serde(default = "default_patch_size")]
@@ -55,7 +55,7 @@ struct Gemma4VisionProcessorConfig {
     pooling_kernel_size: usize,
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Gemma4PreprocessorConfig {
     #[serde(default)]
@@ -66,7 +66,7 @@ struct Gemma4PreprocessorConfig {
     max_soft_tokens: Option<usize>,
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 #[derive(Debug, Clone, Deserialize)]
 struct Gemma4VideoPreprocessorConfig {
     #[serde(default = "default_patch_size")]
@@ -79,7 +79,7 @@ struct Gemma4VideoPreprocessorConfig {
     num_frames: usize,
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 impl Default for Gemma4VideoPreprocessorConfig {
     fn default() -> Self {
         Self {
@@ -91,54 +91,54 @@ impl Default for Gemma4VideoPreprocessorConfig {
     }
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn default_patch_size() -> usize {
     16
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn default_pooling_kernel_size() -> usize {
     3
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn default_soft_tokens() -> usize {
     280
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn default_video_soft_tokens() -> usize {
     70
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn default_video_frames() -> usize {
     32
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Gemma4Processor {
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     patch_size: usize,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     pooling_kernel_size: usize,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     max_soft_tokens: usize,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     boi_token_id: Option<u32>,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     eoi_token_id: Option<u32>,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     video_patch_size: usize,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     video_pooling_kernel_size: usize,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     video_max_soft_tokens: usize,
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     video_num_frames: usize,
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     boa_token_id: Option<u32>,
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     eoa_token_id: Option<u32>,
 }
 
@@ -146,48 +146,48 @@ impl Gemma4Processor {
     pub(crate) fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
         let config: Gemma4ModelConfig =
             serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
-        #[cfg(not(any(feature = "image-processing", feature = "audio-processing")))]
+        #[cfg(not(any(feature = "mlx-image", feature = "mlx-audio")))]
         let _ = &config;
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let has_image_processor = config.vision_config.is_some();
-        #[cfg(not(feature = "image-processing"))]
+        #[cfg(not(feature = "mlx-image"))]
         let has_image_processor = false;
-        #[cfg(feature = "audio-processing")]
+        #[cfg(feature = "mlx-audio")]
         let has_audio_processor = config.audio_config.is_some();
-        #[cfg(not(feature = "audio-processing"))]
+        #[cfg(not(feature = "mlx-audio"))]
         let has_audio_processor = false;
         let has_supported_processor = has_image_processor || has_audio_processor;
         if !has_supported_processor {
             return Ok(None);
         }
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let processor_path = model_dir.join("preprocessor_config.json");
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let processor = if processor_path.exists() {
             serde_json::from_slice(&fs::read(processor_path)?)?
         } else {
             Gemma4PreprocessorConfig::default()
         };
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let video_processor_path = model_dir.join("video_preprocessor_config.json");
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let video_processor = if video_processor_path.exists() {
             serde_json::from_slice(&fs::read(video_processor_path)?)?
         } else {
             Gemma4VideoPreprocessorConfig::default()
         };
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let max_soft_tokens = processor
             .max_soft_tokens
             .unwrap_or(config.vision_soft_tokens_per_image);
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         if config.vision_config.is_some() && !matches!(max_soft_tokens, 70 | 140 | 280 | 560 | 1120)
         {
             return Err(Error::Processor(format!(
                 "Gemma 4 max_soft_tokens must be one of 70, 140, 280, 560, or 1120, got {max_soft_tokens}"
             )));
         }
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         if !matches!(video_processor.max_soft_tokens, 70 | 140 | 280 | 560 | 1120)
             || video_processor.num_frames == 0
         {
@@ -197,14 +197,14 @@ impl Gemma4Processor {
             )));
         }
         Ok(Some(Self {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             patch_size: processor.patch_size.unwrap_or_else(|| {
                 config
                     .vision_config
                     .as_ref()
                     .map_or(default_patch_size(), |vision| vision.patch_size)
             }),
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             pooling_kernel_size: processor.pooling_kernel_size.unwrap_or_else(|| {
                 config
                     .vision_config
@@ -213,34 +213,34 @@ impl Gemma4Processor {
                         vision.pooling_kernel_size
                     })
             }),
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             max_soft_tokens,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             boi_token_id: config.boi_token_id,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             eoi_token_id: config.eoi_token_id,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_patch_size: video_processor.patch_size,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_pooling_kernel_size: video_processor.pooling_kernel_size,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_max_soft_tokens: video_processor.max_soft_tokens,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_num_frames: video_processor.num_frames,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             boa_token_id: config.boa_token_id,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             eoa_token_id: config.eoa_token_id,
         }))
     }
 
-    #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+    #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
     pub(crate) fn from_gguf(
         model_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
         projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
     ) -> Result<Self, Error> {
         use safemlx::ops::GgufMetadataValue;
-        #[cfg(not(feature = "image-processing"))]
+        #[cfg(not(feature = "mlx-image"))]
         let _ = projector_metadata;
 
         let optional_u32 = |metadata: &std::collections::HashMap<String, GgufMetadataValue>,
@@ -254,62 +254,62 @@ impl Gemma4Processor {
                 })
                 .transpose()
         };
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let patch_size = optional_u32(projector_metadata, "clip.vision.patch_size")?
             .unwrap_or(default_patch_size() as u32) as usize;
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let pooling_kernel_size =
             optional_u32(projector_metadata, "clip.vision.pooling_kernel_size")?
                 .unwrap_or(default_pooling_kernel_size() as u32) as usize;
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let max_soft_tokens = optional_u32(projector_metadata, "clip.vision.max_soft_tokens")?
             .unwrap_or(default_soft_tokens() as u32) as usize;
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         if !matches!(max_soft_tokens, 70 | 140 | 280 | 560 | 1120) {
             return Err(Error::Processor(format!(
                 "Gemma 4 GGUF max_soft_tokens must be one of 70, 140, 280, 560, or 1120, got {max_soft_tokens}"
             )));
         }
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let video_max_soft_tokens =
             optional_u32(projector_metadata, "clip.vision.video.max_soft_tokens")?
                 .unwrap_or(default_video_soft_tokens() as u32) as usize;
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         let video_num_frames = optional_u32(projector_metadata, "clip.vision.video.frame_count")?
             .unwrap_or(default_video_frames() as u32) as usize;
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         if !matches!(video_max_soft_tokens, 70 | 140 | 280 | 560 | 1120) || video_num_frames == 0 {
             return Err(Error::Processor(format!(
                 "Gemma 4 GGUF video processor requires a supported soft-token budget and positive frame count, got {video_max_soft_tokens} tokens and {video_num_frames} frames"
             )));
         }
         Ok(Self {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             patch_size,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             pooling_kernel_size,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             max_soft_tokens,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             boi_token_id: optional_u32(model_metadata, "gemma4.boi_token_id")?,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             eoi_token_id: optional_u32(model_metadata, "gemma4.eoi_token_id")?,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_patch_size: optional_u32(projector_metadata, "clip.vision.video.patch_size")?
                 .unwrap_or(patch_size as u32) as usize,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_pooling_kernel_size: optional_u32(
                 projector_metadata,
                 "clip.vision.video.pooling_kernel_size",
             )?
             .unwrap_or(pooling_kernel_size as u32) as usize,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_max_soft_tokens,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_num_frames,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             boa_token_id: optional_u32(model_metadata, "gemma4.boa_token_id")?,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             eoa_token_id: optional_u32(model_metadata, "gemma4.eoa_token_id")?,
         })
     }
@@ -339,12 +339,12 @@ impl Gemma4Processor {
         item: MediaInput<'_>,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<(), ProcessorPreparationError<E>> {
-        #[cfg(not(feature = "image-processing"))]
+        #[cfg(not(feature = "mlx-image"))]
         let _ = &encode_text;
-        #[cfg(not(any(feature = "image-processing", feature = "audio-processing")))]
+        #[cfg(not(any(feature = "mlx-image", feature = "mlx-audio")))]
         let _ = &parts;
         match (item.modality, item.payload) {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             (Modality::Image, MediaPayload::Rgb8(image)) => {
                 push_text_token_ids(
                     parts,
@@ -361,12 +361,12 @@ impl Gemma4Processor {
                 );
                 Ok(())
             }
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             (Modality::Video, MediaPayload::VideoFrames(video)) => {
                 parts.extend(self.process_video(video, encode_text)?);
                 Ok(())
             }
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
                 push_text_token_ids(
                     parts,
@@ -391,7 +391,7 @@ impl Gemma4Processor {
         }
     }
 
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     fn process_image(
         &self,
         image: crate::backend::mlx::runtime::media::image::RgbImageView<'_>,
@@ -418,7 +418,7 @@ impl Gemma4Processor {
         ))
     }
 
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     fn process_video<E>(
         &self,
         video: VideoFrames<'_>,
@@ -492,7 +492,7 @@ impl Gemma4Processor {
         Ok(replacement)
     }
 
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     fn process_audio(
         &self,
         waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
@@ -525,7 +525,7 @@ impl Gemma4Processor {
     }
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn aspect_ratio_preserving_size(
     height: usize,
     width: usize,
@@ -566,7 +566,7 @@ fn aspect_ratio_preserving_size(
     Ok((target_height, target_width))
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn pack_patches(
     image: &NormalizedImage,
     patch_size: usize,
@@ -616,7 +616,7 @@ fn pack_patches(
     ))
 }
 
-#[cfg(all(test, feature = "image-processing"))]
+#[cfg(all(test, feature = "mlx-image"))]
 mod tests {
     use std::collections::HashMap;
 
@@ -677,9 +677,9 @@ mod tests {
             video_pooling_kernel_size: 1,
             video_max_soft_tokens: 70,
             video_num_frames: 32,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             boa_token_id: None,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             eoa_token_id: None,
         };
         let pixels = vec![128u8; 4 * 4 * 3];
@@ -713,9 +713,9 @@ mod tests {
             video_pooling_kernel_size: 1,
             video_max_soft_tokens: 70,
             video_num_frames: 32,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             boa_token_id: None,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             eoa_token_id: None,
         };
         let pixels = vec![128u8; 4 * 4 * 3];
@@ -754,7 +754,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "audio-processing"))]
+#[cfg(all(test, feature = "mlx-audio"))]
 mod audio_tests {
     use super::Gemma4Processor;
     use crate::{
@@ -765,23 +765,23 @@ mod audio_tests {
     #[test]
     fn processor_wraps_ordered_audio_with_boundary_tokens() {
         let processor = Gemma4Processor {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             patch_size: 16,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             pooling_kernel_size: 3,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             max_soft_tokens: 280,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             boi_token_id: None,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             eoi_token_id: None,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_patch_size: 16,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_pooling_kernel_size: 3,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_max_soft_tokens: 70,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             video_num_frames: 32,
             boa_token_id: Some(43),
             eoa_token_id: Some(44),

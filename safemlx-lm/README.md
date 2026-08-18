@@ -48,16 +48,19 @@ safemlx-lm = { version = "0.4", default-features = false }
 That build exposes the canonical `LoadedModel<B>`, `ModelRuntime<B>`, portable
 artifact and generation contracts, tokenizer loading, EOS and chat-template
 discovery, semantic chat inspection, `LoadedModel::load`, chat preparation, and
-ordinary constrained prepared-chat generation. The `mlx` feature adds architecture implementations, native model
-loading, prepared MLX inputs, sampling, residency, distributed execution, and
-runtime diagnostics. `cuda`, `nccl`, and media-processing features imply
-`mlx`; they are capabilities of that backend rather than facade features.
+ordinary constrained prepared-chat generation. Portable decoded image, audio,
+and video descriptions and multimodal request composition are always
+available; they do not select an execution backend.
 
-Enable `image-processing` when the application wants the built-in image
-preprocessing path. Enable `cuda` for an MLX CUDA build on a supported Linux or
-Windows host. Tokenization always has the portable pure-Rust `fancy-regex`
-engine available, including under `--no-default-features`; default builds also
-enable Oniguruma and select it as the faster tokenizer regex implementation.
+The `mlx` feature adds architecture implementations, native model loading,
+prepared MLX inputs, sampling, residency, distributed execution, and runtime
+diagnostics. `mlx-media` enables MLX media materialization, while `mlx-image`
+and `mlx-audio` add the corresponding MLX preprocessing dependencies. These
+features, `cuda`, and `nccl` imply `mlx`; none are facade media features. Enable
+`cuda` for an MLX CUDA build on a supported Linux or Windows host. Tokenization
+always has the portable pure-Rust `fancy-regex` engine available, including
+under `--no-default-features`; default builds also enable Oniguruma and select
+it as the faster tokenizer regex implementation.
 
 ## Inspect before loading
 

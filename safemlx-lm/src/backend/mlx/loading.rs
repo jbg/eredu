@@ -23,7 +23,7 @@ use safemlx::{
 };
 use safemlx_lm_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
 
-#[cfg(feature = "media-processing")]
+#[cfg(feature = "mlx-media")]
 use crate::backend::mlx::runtime::media::{load_processor, ModelProcessor};
 
 pub(crate) fn gguf_eos_token_ids(
@@ -44,7 +44,7 @@ use crate::{
 /// MLX arrays/modules plus backend-owned preprocessing from one GGUF artifact.
 struct MaterializedGgufModel {
     model: Model,
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     processor: Option<crate::backend::mlx::runtime::media::ModelProcessor>,
 }
 
@@ -57,7 +57,7 @@ fn materialize_gguf_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MaterializedGgufModel, Error> {
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     let mut processor = None;
 
     let (model, _architecture_eos_token_ids) = if let Some(quantization) = options
@@ -120,7 +120,7 @@ fn materialize_gguf_model(
             }
             GgufArchitecture::Gemma4 => {
                 let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
-                #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+                #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
                 if let Some(mmproj) = &mmproj {
                     processor = Some(ModelProcessor::load_gemma4_gguf(
                         &metadata,
@@ -162,7 +162,7 @@ fn materialize_gguf_model(
                 (Model::Llama(model), loaded.eos_token_ids)
             }
             GgufArchitecture::MuseGlimmer => {
-                #[cfg(feature = "image-processing")]
+                #[cfg(feature = "mlx-image")]
                 if let Some(mmproj) =
                     crate::backend::mlx::architectures::muse_glimmer::open_sibling_mmproj(
                         gguf_file,
@@ -249,7 +249,7 @@ fn materialize_gguf_model(
                 } else {
                     qwen3_5::open_sibling_mmproj(gguf_file)?
                 };
-                #[cfg(feature = "image-processing")]
+                #[cfg(feature = "mlx-image")]
                 if mmproj.is_some() {
                     processor = ModelProcessor::load_qwen(
                         gguf_file.parent().unwrap_or_else(|| Path::new(".")),
@@ -276,7 +276,7 @@ fn materialize_gguf_model(
             }
             GgufArchitecture::Inkling => {
                 let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
-                #[cfg(feature = "media-processing")]
+                #[cfg(feature = "mlx-media")]
                 if mmproj.is_some() {
                     processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
                 }
@@ -355,7 +355,7 @@ fn materialize_gguf_model(
             }
             GgufArchitecture::Inkling => {
                 let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
-                #[cfg(feature = "media-processing")]
+                #[cfg(feature = "mlx-media")]
                 if mmproj.is_some() {
                     processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
                 }
@@ -373,7 +373,7 @@ fn materialize_gguf_model(
             }
             GgufArchitecture::Gemma4 => {
                 let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
-                #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+                #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
                 if let Some(mmproj) = &mmproj {
                     processor = Some(ModelProcessor::load_gemma4_gguf(
                         &metadata,
@@ -405,7 +405,7 @@ fn materialize_gguf_model(
                 (Model::Llama(loaded), eos_token_ids)
             }
             GgufArchitecture::MuseGlimmer => {
-                #[cfg(feature = "image-processing")]
+                #[cfg(feature = "mlx-image")]
                 if let Some(mmproj) =
                     crate::backend::mlx::architectures::muse_glimmer::open_sibling_mmproj(
                         gguf_file,
@@ -494,7 +494,7 @@ fn materialize_gguf_model(
                 } else {
                     qwen3_5::open_sibling_mmproj(gguf_file)?
                 };
-                #[cfg(feature = "image-processing")]
+                #[cfg(feature = "mlx-image")]
                 if mmproj.is_some() {
                     processor = ModelProcessor::load_qwen(
                         gguf_file.parent().unwrap_or_else(|| Path::new(".")),
@@ -521,7 +521,7 @@ fn materialize_gguf_model(
     };
     Ok(MaterializedGgufModel {
         model,
-        #[cfg(feature = "media-processing")]
+        #[cfg(feature = "mlx-media")]
         processor,
     })
 }
@@ -606,11 +606,11 @@ fn attach_artifact_processor(model: MlxModel, artifact: &ModelArtifact) -> Resul
 }
 
 fn attach_safetensors_processor(model: MlxModel, path: &Path) -> Result<MlxModel, Error> {
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     {
         Ok(model.with_processor(load_processor(path)?))
     }
-    #[cfg(not(feature = "media-processing"))]
+    #[cfg(not(feature = "mlx-media"))]
     {
         let _ = path;
         Ok(model)
@@ -619,7 +619,7 @@ fn attach_safetensors_processor(model: MlxModel, path: &Path) -> Result<MlxModel
 
 fn complete_gguf_model(materialized: MaterializedGgufModel) -> MlxModel {
     let model = MlxModel::complete(materialized.model);
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     let model = model.with_processor(materialized.processor);
     model
 }
@@ -849,24 +849,24 @@ fn materialize_gguf_artifact(
             stream,
             weights_stream,
         )?;
-        #[cfg(feature = "media-processing")]
+        #[cfg(feature = "mlx-media")]
         let processor = match architecture {
             GgufArchitecture::Inkling if inkling::open_sibling_mmproj(&path)?.is_some() => {
                 Some(ModelProcessor::load_inkling_gguf(&metadata)?)
             }
-            #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+            #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
             GgufArchitecture::Gemma4 => gemma4::open_sibling_mmproj(&path)?
                 .as_ref()
                 .map(|mmproj| ModelProcessor::load_gemma4_gguf(&metadata, &mmproj.metadata))
                 .transpose()?,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             GgufArchitecture::MuseGlimmer => {
                 crate::backend::mlx::architectures::muse_glimmer::open_sibling_mmproj(&path)?
                     .as_ref()
                     .map(|mmproj| ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata))
                     .transpose()?
             }
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe
                 if qwen3_5::open_sibling_mmproj(&path)?.is_some() =>
             {
@@ -876,7 +876,7 @@ fn materialize_gguf_artifact(
         };
         return Ok(MaterializedGgufModel {
             model,
-            #[cfg(feature = "media-processing")]
+            #[cfg(feature = "mlx-media")]
             processor,
         });
     }

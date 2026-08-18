@@ -2,35 +2,35 @@
 
 use std::path::Path;
 
-#[cfg(feature = "media-processing")]
+#[cfg(feature = "mlx-media")]
 use std::collections::HashMap;
 
-#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+#[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
 use safemlx::{ops::GgufMetadataValue, Array};
 use serde::Deserialize;
 
 use crate::backend::mlx::error::Error;
-#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+#[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
 use crate::backend::mlx::runtime::media::input::Modality;
 
 use crate::backend::mlx::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
     ProcessorInput, ProcessorPreparationError,
 };
-#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+#[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
 use crate::backend::mlx::runtime::media::{MediaPayload, OwnedInputMetadata};
 
 #[derive(Debug, Clone)]
 pub(crate) struct InklingProcessor {
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     image_bos_token_id: u32,
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     audio_bos_token_id: u32,
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     dmel_bins: usize,
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     dmel_min: f32,
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     dmel_max: f32,
 }
 
@@ -39,17 +39,17 @@ impl InklingProcessor {
         #[derive(Deserialize)]
         struct Config {
             model_type: String,
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             #[serde(default = "default_image_bos")]
             image_bos_token_id: u32,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             #[serde(default = "default_audio_bos")]
             audio_bos_token_id: u32,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             #[serde(default)]
             audio_config: Option<AudioConfig>,
         }
-        #[cfg(feature = "audio-processing")]
+        #[cfg(feature = "mlx-audio")]
         #[derive(Deserialize)]
         struct AudioConfig {
             #[serde(default = "default_dmel_bins")]
@@ -64,46 +64,46 @@ impl InklingProcessor {
         if config.model_type != "inkling_mm_model" {
             return Ok(None);
         }
-        #[cfg(feature = "audio-processing")]
+        #[cfg(feature = "mlx-audio")]
         let audio = config.audio_config.unwrap_or(AudioConfig {
             mel_vocab_size: default_dmel_bins(),
             dmel_min_value: default_dmel_min(),
             dmel_max_value: default_dmel_max(),
         });
         Ok(Some(Self {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             image_bos_token_id: config.image_bos_token_id,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             audio_bos_token_id: config.audio_bos_token_id,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             dmel_bins: audio.mel_vocab_size,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             dmel_min: audio.dmel_min_value,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             dmel_max: audio.dmel_max_value,
         }))
     }
 
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     pub(crate) fn from_gguf(
         metadata: &HashMap<String, safemlx::ops::GgufMetadataValue>,
     ) -> Result<Self, Error> {
-        #[cfg(not(any(feature = "image-processing", feature = "audio-processing")))]
+        #[cfg(not(any(feature = "mlx-image", feature = "mlx-audio")))]
         let _ = metadata;
         Ok(Self {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             image_bos_token_id: gguf_token_id(metadata, "<|content_image|>", default_image_bos())?,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             audio_bos_token_id: gguf_token_id(
                 metadata,
                 "<|content_audio_input|>",
                 default_audio_bos(),
             )?,
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             dmel_bins: default_dmel_bins(),
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             dmel_min: default_dmel_min(),
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             dmel_max: default_dmel_max(),
         })
     }
@@ -129,13 +129,13 @@ impl InklingProcessor {
         media: MediaInput<'_>,
     ) -> Result<(), Error> {
         match (media.modality, media.payload) {
-            #[cfg(feature = "image-processing")]
+            #[cfg(feature = "mlx-image")]
             (Modality::Image, MediaPayload::Rgb8(image)) => {
                 push_text_token_ids(_parts, &[self.image_bos_token_id]);
                 _parts.push(process_image(image)?);
                 Ok(())
             }
-            #[cfg(feature = "audio-processing")]
+            #[cfg(feature = "mlx-audio")]
             (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
                 push_text_token_ids(_parts, &[self.audio_bos_token_id]);
                 _parts.push(self.process_audio(waveform)?);
@@ -148,7 +148,7 @@ impl InklingProcessor {
         }
     }
 
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     fn process_audio(
         &self,
         waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
@@ -188,7 +188,7 @@ impl InklingProcessor {
     }
 }
 
-#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+#[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
 fn gguf_token_id(
     metadata: &HashMap<String, GgufMetadataValue>,
     token: &str,
@@ -208,32 +208,32 @@ fn gguf_token_id(
     u32::try_from(index).map_err(|_| Error::Processor("Inkling media token id exceeds u32".into()))
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn default_image_bos() -> u32 {
     200_005
 }
 
-#[cfg(feature = "audio-processing")]
+#[cfg(feature = "mlx-audio")]
 fn default_audio_bos() -> u32 {
     200_020
 }
 
-#[cfg(feature = "audio-processing")]
+#[cfg(feature = "mlx-audio")]
 fn default_dmel_bins() -> usize {
     16
 }
 
-#[cfg(feature = "audio-processing")]
+#[cfg(feature = "mlx-audio")]
 fn default_dmel_min() -> f32 {
     -7.0
 }
 
-#[cfg(feature = "audio-processing")]
+#[cfg(feature = "mlx-audio")]
 fn default_dmel_max() -> f32 {
     2.0
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn process_image(
     image: crate::backend::mlx::runtime::media::image::RgbImageView<'_>,
 ) -> Result<PreparedInputPart, Error> {
@@ -275,14 +275,14 @@ fn process_image(
     ))
 }
 
-#[cfg(feature = "image-processing")]
+#[cfg(feature = "mlx-image")]
 fn image_patch_grid(height: usize, width: usize) -> (usize, usize) {
     // The reference deliberately includes a final partial/empty column when
     // width is an exact multiple of the patch size.
     (height.div_ceil(40), width / 40 + 1)
 }
 
-#[cfg(feature = "audio-processing")]
+#[cfg(feature = "mlx-audio")]
 fn inkling_log_mel(
     waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
 ) -> Result<Vec<f32>, Error> {
@@ -326,7 +326,7 @@ fn inkling_log_mel(
     Ok(output)
 }
 
-#[cfg(feature = "audio-processing")]
+#[cfg(feature = "mlx-audio")]
 fn slaney_mel_filters(fft: usize, sample_rate: usize, mel_bins: usize) -> Vec<f32> {
     let hz_to_mel = |hz: f64| {
         if hz < 1_000.0 {
@@ -363,7 +363,7 @@ fn slaney_mel_filters(fft: usize, sample_rate: usize, mel_bins: usize) -> Vec<f3
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "media-processing")]
+    #[cfg(feature = "mlx-media")]
     #[test]
     fn gguf_processor_resolves_media_markers_from_embedded_tokenizer() {
         use std::collections::HashMap;
@@ -378,20 +378,20 @@ mod tests {
             ])),
         )]);
         let processor = super::InklingProcessor::from_gguf(&metadata).unwrap();
-        #[cfg(feature = "image-processing")]
+        #[cfg(feature = "mlx-image")]
         assert_eq!(processor.image_bos_token_id, 1);
-        #[cfg(feature = "audio-processing")]
+        #[cfg(feature = "mlx-audio")]
         assert_eq!(processor.audio_bos_token_id, 0);
     }
 
-    #[cfg(feature = "image-processing")]
+    #[cfg(feature = "mlx-image")]
     #[test]
     fn exact_patch_width_keeps_reference_extra_column() {
         assert_eq!(super::image_patch_grid(40, 40), (1, 2));
         assert_eq!(super::image_patch_grid(41, 39), (2, 1));
     }
 
-    #[cfg(feature = "audio-processing")]
+    #[cfg(feature = "mlx-audio")]
     #[test]
     fn dmel_frontend_uses_fifty_millisecond_frames() {
         let samples = vec![0.0f32; 801];

@@ -136,7 +136,7 @@ jobs:
       - name: Build the linked CUDA smoke executable
         run: cargo build -j 1 -p safemlx --features cuda --example cuda_smoke --no-default-features
       - name: Build and final-link safemlx-lm configurations
-        run: cargo test -j 1 -p safemlx-lm --no-default-features --features "cuda,fancy-regex,image-processing,audio-processing" --no-run
+        run: cargo test -j 1 -p safemlx-lm --no-default-features --features "cuda,mlx-image,mlx-audio" --no-run
       - name: Build the linked safemlx-lm CLI
         run: cargo build -j 1 -p safemlx-lm-cli --features cuda
       - name: Compile CUDA codec and integration tests
