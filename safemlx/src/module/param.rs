@@ -41,7 +41,7 @@ pub struct Param<T> {
 
     /// Whether the parameter is frozen.
     ///
-    /// This is no longer public because it should be accessed through the `Parameter` trait.
+    /// Access this state through the [`Parameter`] trait.
     is_frozen: bool,
 }
 

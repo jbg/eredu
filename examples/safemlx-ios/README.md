@@ -62,6 +62,4 @@ and decode throughput in tokens per second.
 The Hugging Face cache is under the application's `Library/Application Support`
 directory and is excluded from device backups. The app discovers complete model
 snapshots from that cache at launch rather than relying on persisted absolute
-sandbox paths. Existing downloads made by earlier demo builds are migrated from
-`Library/Caches` on first launch. Deleting a model in the UI removes its
-repository cache.
+sandbox paths. Deleting a model in the UI removes its repository cache.

@@ -120,9 +120,8 @@ pub fn reset_host_transfer_peak_memory(kind: HostTransferStorageKind) -> Result<
 /// Returns a conservative physical capacity to reserve before allocation.
 ///
 /// CPU and Metal return their page-rounded owned backing extent. CUDA returns
-/// the conservative 64 KiB-granular extent it requests from the runtime. A
-/// future backend may return a larger conservative value, but an allocation
-/// must never exceed it.
+/// the conservative 64 KiB-granular extent requested from the runtime. The
+/// physical allocation never exceeds the returned value.
 pub fn host_transfer_capacity_upper_bound(
     nbytes: usize,
     policy: HostTransferPolicy,

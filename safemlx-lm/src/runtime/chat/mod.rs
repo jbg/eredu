@@ -93,8 +93,8 @@ pub struct ChatTemplateRequest {
 
 /// An opaque generation constraint owned by a native tool runtime plan.
 ///
-/// The representation is intentionally private so future constraint engines
-/// can evolve without exposing a dialect-specific implementation as public API.
+/// The private representation keeps dialect-specific implementation details
+/// out of the public API.
 #[derive(Clone)]
 pub(crate) struct GenerationConstraint {
     pub(crate) fingerprint: [u8; 32],

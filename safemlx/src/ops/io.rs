@@ -74,10 +74,10 @@ impl Array {
 
     /// Save dense arrays and typed metadata as a deterministic GGUF v3 file.
     ///
-    /// This preserves the former MLX writer's dense F32/F16/I8/I16/I32
-    /// support and additionally accepts BF16, I64, and F64. Affine arrays are
-    /// deliberately rejected because their three-array MLX representation does
-    /// not contain enough information for a lossless inverse to GGML blocks.
+    /// Supported dtypes are F32, F16, BF16, I8, I16, I32, I64, and F64.
+    /// Affine arrays are rejected because their three-array MLX representation
+    /// does not contain enough information for a lossless inverse to GGML
+    /// blocks.
     pub fn save_gguf<'a, I, S, V>(
         arrays: I,
         metadata: impl Into<Option<&'a HashMap<String, GgufMetadataValue>>>,

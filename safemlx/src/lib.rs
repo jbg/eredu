@@ -87,9 +87,8 @@
 //! computations. This is useful for function transformations like
 //! [`transforms::grad`] and graph optimizations.
 //!
-//! Currently, MLX does not compile and rerun compute graphs. They are all
-//! generated dynamically. However, lazy evaluation makes it much easier to
-//! integrate compilation for future performance enhancements.
+//! Lazy graphs support function transformations and explicit compilation
+//! through the [`transforms`] module.
 //!
 //! ## Only Compute What You Use
 //!

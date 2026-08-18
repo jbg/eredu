@@ -8,14 +8,10 @@
 //! weight row at a time into bounded scratch space; it never materializes the
 //! complete dense matrix or a second persistent affine copy.
 //!
-//! The bundled MLX C API exposes managed host buffers, but its public contract
-//! still describes their input as copied and it exposes no API that wraps an
-//! mmap region as a guaranteed Metal shared buffer. `Array::from_slice` also
-//! documents and performs a copy. Native loading therefore makes one
-//! persistent MLX-owned raw-byte copy today. [`NativeStorageKind`] is the seam
-//! for a future mmap/external-buffer owner once the C API can guarantee buffer
-//! identity and device accessibility; logical views already share ownership
-//! through `Arc` and will not need to change.
+//! The bundled MLX C API does not wrap an mmap region as a guaranteed
+//! device-accessible buffer. Native loading therefore stores raw bytes in one
+//! persistent MLX-owned allocation. [`NativeStorageKind`] reports that physical
+//! ownership, while logical views share it through `Arc`.
 
 use std::{cell::RefCell, collections::HashMap, fmt::Write, sync::Arc};
 

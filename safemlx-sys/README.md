@@ -8,7 +8,7 @@ The crate vendors MLX C, the compatible MLX source archive, and its common CPU
 and Metal build dependencies, and exposes checked-in bindings. CMake verifies
 each vendored archive's SHA-256 before extracting and patching it in the build
 directory. Source provenance is recorded in
-[`vendor/README.md`](vendor/README.md). The native surface includes SafeMLX's
+[`vendor/SOURCES.md`](vendor/SOURCES.md). The native surface includes SafeMLX's
 completion events, typed host-transfer storage, variable-count all-to-all, and
 packed-quantization support.
 

@@ -572,9 +572,8 @@ pub fn build_quantized_linear(
 
 /// Applies an affine transformation to the input using a quantized weight matrix.
 ///
-/// It is the quantized equivalent of [`Linear`].  For now its
-/// parameters are frozen and will not be included in any gradient computation
-/// but this will probably change in the future.
+/// It is the quantized equivalent of [`Linear`]. Its parameters are frozen and
+/// excluded from gradient computation.
 ///
 /// QuantizedLinear also provides several useful static to convert linear
 /// layers to QuantizedLinear layers.

@@ -1905,8 +1905,8 @@ impl<'a> ExecutionGroupReadySet<'a> {
     }
 }
 
-/// Canonical architecture contract for resident, bounded-residency, and future
-/// distributed execution.
+/// Architecture contract for resident, bounded-residency, and distributed
+/// execution.
 ///
 /// Heterogeneous caches, architecture-specific inputs, multiple execution
 /// groups, and retained recurrent state are represented directly rather than

@@ -13,9 +13,9 @@
 //! Automatic differentiation in MLX works on functions rather than on implicit
 //! graphs.
 //!
-//! **NOTE**: If you are coming to MLX from PyTorch, you no longer need
-//! functions like backward, zero_grad, and detach, or properties like
-//! requires_grad.
+//! MLX function transformations replace graph-mutation APIs such as
+//! `backward`, `zero_grad`, and `detach`, and do not use a `requires_grad`
+//! property.
 //!
 //! You can use the [`grad()`] and [`value_and_grad()`] function to compute
 //! gradients of more complex functions. These functions compute the gradient

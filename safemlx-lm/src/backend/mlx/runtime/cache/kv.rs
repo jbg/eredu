@@ -2916,9 +2916,6 @@ impl KeyValueCache for ConcatKeyValueCache {
     }
 }
 
-/// Placeholder for a future generic key/value cache implementation.
-pub struct DefaultKeyValueCache {}
-
 #[cfg(test)]
 mod tests {
     use std::fs;

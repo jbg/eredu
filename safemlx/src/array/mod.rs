@@ -798,8 +798,8 @@ impl FromScalar<complex64> for Array {
 /// instead of directly implementing `From` for `Array` to avoid conflicts with other `From`
 /// implementations.
 ///
-/// Beware that this is subject to change in the future should we find a better way to implement
-/// the macro without creating conflicts.
+/// This trait is an implementation detail of [`crate::array!`]; applications
+/// should construct values through the macro rather than implementing it.
 pub trait FromNested<T> {
     /// Create an array from nested arrays or slices.
     fn from_nested(data: T) -> Array;

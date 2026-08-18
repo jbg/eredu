@@ -29,7 +29,7 @@ pub struct AffineQuantization {
     pub group_size: i32,
     /// Packed bit width for each weight value.
     pub bits: i32,
-    /// Quantization mode. Safemlx currently supports `affine` checkpoints.
+    /// Quantization mode. SafeMLX supports `affine` checkpoints.
     #[serde(default = "default_affine_mode")]
     pub mode: AffineQuantizationMode,
 }
