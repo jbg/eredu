@@ -10187,11 +10187,15 @@ mod tests {
                     "<|\"|>",
                     "<|tool_response>",
                     "<turn|>",
+                    "<eos>",
                 ]
                 .map(|token| AddedToken::from(token, true).normalized(false)),
             )
             .unwrap();
         tokenizer.with_decoder(Some(ByteLevel::default()));
+        let eos_token_id = tokenizer
+            .token_to_id("<eos>")
+            .expect("the inspection fixture registers its EOS token");
         let directory = tempfile::tempdir().unwrap();
         let mut report =
             ModelInspectionReport::new(directory.path(), ArtifactKind::SafeTensorsDirectory);
@@ -10205,7 +10209,7 @@ mod tests {
                 ("bos_token".into(), json!("<bos>")),
                 ("eos_token".into(), json!("<eos>")),
             ]),
-            Vec::new(),
+            vec![eos_token_id],
             None,
         );
         assert_eq!(
