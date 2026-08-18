@@ -2,7 +2,6 @@
 
 use crate::{backend::BackendCapabilities, topology::ParallelTopology};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// Schema version shared by execution-plan documents.
 pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -282,23 +281,6 @@ impl ExecutionPlan {
         }
         Ok(())
     }
-}
-
-/// Portable observations for one complete model/session run.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ExecutionTelemetry {
-    /// Prompt tokens consumed.
-    pub prompt_tokens: u64,
-    /// Decode tokens committed.
-    pub decode_tokens: u64,
-    /// Time to first committed token in microseconds.
-    pub time_to_first_token_us: Option<u64>,
-    /// Total elapsed microseconds.
-    pub elapsed_us: u64,
-    /// Peak logical resource bytes by stable resource name.
-    pub peak_resource_bytes: BTreeMap<String, u64>,
-    /// Backend-specific numeric observations with stable explicit keys.
-    pub backend_counters: BTreeMap<String, u64>,
 }
 
 /// Execution plan validation error.

@@ -396,9 +396,22 @@ capacity, coalescing, cancellation phase, or result publication.
 document used by the automatic planner and CLI. It selects an extensible
 backend/device identifier for the whole session, embeds the canonical core
 topology, and contains only portable residency, transformation, drafting, and
-required-capability policy. MLX hardware discovery translates its concrete
-CPU, Metal, and CUDA devices into `mlx` device identifiers. Process-global MLX
-allocator cache configuration is deliberately not part of the neutral plan.
+required-capability policy. `safemlx-lm-core::automatic::AutomaticPlanner`
+owns policy validation, budgeting, candidate selection, feedback matching,
+explanations, and the planning/telemetry schemas. Its high-level
+`AutomaticPlanningBackend` receives whole candidate plans and supplies only
+hardware/resource observations, admission, bounded-window requirements, and
+embedded-drafting metadata. The MLX implementation lives in
+`backend::mlx::automatic`; it translates CPU, Metal, and CUDA devices into
+`mlx` identifiers, validates candidates with MLX checkpoint inspection, probes
+bounded loads, and realizes a selected plan as `ModelLoadOptions`.
+Process-global MLX allocator cache configuration is deliberately not part of
+the neutral plan.
+
+Automatic planning documents now use schema version 2. This deliberately
+breaks the former facade-owned schema: resource profiles use the canonical
+core `ArtifactFormat`, and backend allocator fields are described generically.
+No version-1 compatibility decoder or duplicate facade schema is retained.
 
 The current boundary leaves these components MLX-coupled:
 

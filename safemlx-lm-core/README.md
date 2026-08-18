@@ -92,6 +92,15 @@ resolves the canonical `ModelKind` without a tensor runtime.
 residency, and topology policy. A selected backend consumes the resulting
 `ModelPreparationPlan`; core never constructs arrays or executable modules.
 
+Automatic execution planning is backend-neutral. `AutomaticPlanner` owns
+policy validation, memory budgeting, residency selection, speculative-drafting
+selection, historical-feedback matching, explanations, and every serialized
+planning/telemetry schema. `AutomaticPlanningBackend` is deliberately
+high-level: an adapter reports hardware and model resources, admits complete
+execution-plan candidates, and establishes a bounded residency window. It does
+not expose tensors, devices, streams, or allocator objects. The MLX adapter is
+one production implementation; core tests the same planner with a mock backend.
+
 Core also owns the process-wide live-cache admission boundary.
 `CacheResidencyPool` registers independent cache managers, publishes their
 concrete occupancy, and issues exact RAII reservations for device, host,

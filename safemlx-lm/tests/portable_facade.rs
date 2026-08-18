@@ -1,4 +1,7 @@
-use safemlx_lm::api::{ChatTokenizer, LoadedModel, LoadedTextModelConfig};
+use safemlx_lm::api::{
+    AutomaticPlanRequest, AutomaticPlanner, ChatTokenizer, DevicePlan, LoadedModel,
+    LoadedTextModelConfig, AUTOMATIC_SCHEMA_VERSION,
+};
 use safemlx_lm::{
     Backend, BackendCapabilities, BackendDescriptor, BackendSession, Completion, DeviceDescriptor,
     GenerationConfigOverrides, ModelRuntime, PreparedModel, Submission, TextGenerationBackend,
@@ -176,4 +179,19 @@ fn loaded_model_generates_without_an_mlx_dependency() {
 
     assert_eq!(tokens, vec![1, 2, 3]);
     assert_eq!(model.model_type(), "mock");
+}
+
+#[test]
+fn automatic_planning_documents_are_available_without_mlx() {
+    let request = AutomaticPlanRequest::new(
+        "model",
+        DevicePlan::new("mock", "gpu:0").expect("portable device identity is valid"),
+    );
+    assert_eq!(request.schema_version, AUTOMATIC_SCHEMA_VERSION);
+    assert_eq!(AutomaticPlanner::default().policy().max_mapped_shards, 4);
+    assert_eq!(
+        serde_json::from_slice::<AutomaticPlanRequest>(&serde_json::to_vec(&request).unwrap())
+            .unwrap(),
+        request
+    );
 }

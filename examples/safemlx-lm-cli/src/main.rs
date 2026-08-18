@@ -21,15 +21,14 @@ use safemlx::{
 };
 use safemlx_lm::{
     api::{
-        discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
-        AllocatorTelemetry, AutomaticPlanRequest, DevicePlan, DraftPlacementPlan, DraftingPlan,
-        ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
-        ExpertCacheTelemetry, HardwareMemorySemantics, HardwareProfile, LoadedModel,
-        ModelInspectionOptions, ModelResourceProfile, Observed, PlanExplanation,
-        PlanExplanationEntry, PlanExplanationLevel, PreparedChatDraft,
+        inspect_model, LoadedModel, ModelInspectionOptions, PreparedChatDraft,
         PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
-        ResidencyTelemetry, TextDecoder, TextModelError, TimingTelemetry, WeightTransformationPlan,
+        TextDecoder, TextModelError,
+    },
+    backend::mlx::automatic::{
+        collect_expert_cache_telemetry, collect_residency_telemetry, discover_hardware,
+        execution_plan_load_options, mtp_telemetry, plan_automatic_execution,
     },
     backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams},
     backend::mlx::{speculative::MtpComponentTimingGuard, MlxBackend, ModelLoadOptions},
@@ -50,8 +49,12 @@ use safemlx_lm::{
     runtime::residency::expert_cache::{
         ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
     },
-    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, MtpConfig,
-    MtpSchedulerOptions, SemanticEvent,
+    AllocatorTelemetry, AutomaticPlanRequest, DevicePlan, DraftPlacementPlan, DraftingPlan,
+    ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
+    GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
+    HardwareProfile, ModelResourceProfile, MtpConfig, MtpSchedulerOptions, Observed,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, SemanticEvent, TimingTelemetry,
+    WeightTransformationPlan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2984,9 +2987,9 @@ fn main() -> Result<()> {
                 total_elapsed,
             ),
             allocator: allocator_telemetry,
-            residency: ResidencyTelemetry::collect(&model)?,
-            expert_cache: ExpertCacheTelemetry::collect(&model)?,
-            mtp: mtp_stats.as_ref().map(Into::into),
+            residency: collect_residency_telemetry(&model)?,
+            expert_cache: collect_expert_cache_telemetry(&model)?,
+            mtp: mtp_stats.as_ref().map(mtp_telemetry),
         };
         let json = serde_json::to_vec_pretty(&telemetry)
             .context("failed to serialize execution telemetry")?;
@@ -3874,7 +3877,7 @@ mod tests {
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        embedded_mtp_count, eval, execution_contexts, format_bytes,
+        discover_hardware, embedded_mtp_count, eval, execution_contexts, format_bytes,
         format_weight_store_diagnostics, median, model_advertises_embedded_mtp,
         read_automatic_feedback, requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
@@ -3978,11 +3981,11 @@ mod tests {
         let model_path = directory.path().join("model.gguf");
         std::fs::write(&model_path, b"fixture").unwrap();
         let device = device_plan(CliDevice::Cpu);
-        let hardware = safemlx_lm::discover_hardware();
+        let hardware = discover_hardware();
         let resources = safemlx_lm::ModelResourceProfile {
             schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
             path: model_path.clone(),
-            artifact_kind: safemlx_lm::ArtifactKind::GgufCheckpoint,
+            artifact_format: safemlx_lm::ArtifactFormat::Gguf,
             model_kind: None,
             architecture: Some("fixture".into()),
             tensor_count: Some(1),

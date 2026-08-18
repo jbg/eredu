@@ -11,6 +11,8 @@
 pub mod artifact;
 /// Validated decoder attention schedules.
 pub mod attention;
+/// Backend-neutral automatic execution planning.
+pub mod automatic;
 /// High-level execution-backend contract.
 pub mod backend;
 /// Aggregate ownership and admission for backend-managed live caches.
@@ -43,6 +45,15 @@ pub use artifact::{
     ModelPreparationPlan, PreparationPolicy, QuantizationRequest, ResidencyRequest,
 };
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
+pub use automatic::{
+    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
+    AutomaticPlanningBackend, AutomaticPlanningError, BoundedResidencyRequirement,
+    CandidateAdmission, DurationSeconds, ExecutionPlanReport, ExecutionTelemetry,
+    ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
+    HardwareProfile, ModelResourceProfile, MtpTelemetry, ObservationKind, Observed,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyTelemetry,
+    TimingTelemetry, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
+};
 pub use backend::{
     load_model, prepare_inspected_model, Backend, BackendCapabilities, BackendDescriptor,
     BackendError, BackendSession, CollectiveScope, Completion, ControlledTextGeneration,

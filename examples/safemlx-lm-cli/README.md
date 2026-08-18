@@ -94,9 +94,10 @@ cargo run --release -q -p safemlx-lm-cli -- \
   "Explain automatic model placement."
 ```
 
-The plan and telemetry schemas are public `safemlx-lm` API types. Hardware
-discovery is available through `discover_hardware`, and `inspect_model` reports
-header-only model resource accounting in `ModelInspectionReport::resources`.
+The plan and telemetry schemas are backend-neutral `safemlx-lm` types. MLX
+hardware discovery is available through `backend::mlx::automatic`, and
+`inspect_model` reports header-only model resource accounting in
+`ModelInspectionReport::resources`.
 Unknown materialized, per-layer, expert, or device-memory values are represented
 as unavailable rather than zero.
 

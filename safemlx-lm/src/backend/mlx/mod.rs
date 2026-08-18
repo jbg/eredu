@@ -1,5 +1,7 @@
 //! MLX backend adapter.
 
+/// MLX hardware discovery, planning admission, and plan realization.
+pub mod automatic;
 /// Prompt-cache topology conversion for MLX distributed execution.
 pub(crate) mod cache;
 mod config;

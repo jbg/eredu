@@ -203,20 +203,7 @@ use crate::backend::mlx::ModelLoadOptions;
 pub use safemlx_lm_core::GgufArchitecture;
 pub use safemlx_lm_core::ModelKind;
 
-#[path = "automatic.rs"]
-mod automatic;
-pub use automatic::{
-    discover_hardware, execution_plan_load_options, plan_automatic_execution, AllocatorTelemetry,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, DurationSeconds,
-    ExecutionPlanReport, ExecutionTelemetry, ExpertCacheTelemetry, HardwareBackendProfile,
-    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, ModelResourceProfile,
-    ObservationKind, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
-    ResidencyTelemetry, TimingTelemetry, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
-};
-pub use safemlx_lm_core::{
-    BackendId, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExpertCachePlan,
-    ResidencyPlan, WeightTransformationPlan,
-};
+pub use safemlx_lm_core::ArtifactFormat;
 
 #[path = "capability.rs"]
 mod capability;
@@ -278,9 +265,9 @@ pub use loaded::LoadedModelLoadError;
 #[path = "inspection.rs"]
 mod inspection;
 pub use inspection::{
-    inspect_model, ArtifactKind, ArtifactModality, ArtifactTensorEncoding, InspectionIssue,
-    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
-    ModelInspectionOptions, ModelInspectionReport,
+    inspect_model, ArtifactModality, ArtifactTensorEncoding, InspectionIssue, InspectionIssueCode,
+    InspectionReadiness, InspectionRequirement, InspectionSeverity, ModelInspectionOptions,
+    ModelInspectionReport,
 };
 
 #[path = "tokenizer.rs"]

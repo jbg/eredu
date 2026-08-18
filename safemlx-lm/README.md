@@ -181,7 +181,8 @@ telemetry all implement Serde serialization:
 
 ```rust,no_run
 use safemlx_lm::{
-    plan_automatic_execution, AutomaticPlanRequest, DevicePlan, ExecutionTelemetry,
+    backend::mlx::automatic::plan_automatic_execution,
+    AutomaticPlanRequest, DevicePlan, ExecutionTelemetry,
 };
 
 let prior_runs: Vec<ExecutionTelemetry> = load_prior_runs();
@@ -193,7 +194,7 @@ let request = AutomaticPlanRequest::new(
 let report = plan_automatic_execution(&request)?;
 
 # fn load_prior_runs() -> Vec<ExecutionTelemetry> { Vec::new() }
-# Ok::<(), safemlx_lm::error::Error>(())
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Matching prior runs are grouped by exact plan and ranked by median decode
@@ -201,9 +202,12 @@ throughput. Telemetry from a different model, artifact layout, device, stable
 hardware profile, or schema is ignored. Historical plans are also rechecked
 against current available memory and header-only loader admission. Use
 `AutomaticPlanner::new` with an `AutomaticPlannerPolicy` for explicit policy
-bounds, and `execution_plan_load_options` to apply a returned plan to model
-loading. Backend and device identifiers are adapter-defined rather than a
-closed core enumeration; device creation remains owned by the selected backend.
+bounds. Its `plan` method accepts an `AutomaticPlanningBackend`, so the same
+selection policy works with another backend's discovery and admission adapter.
+MLX discovery, bounded-load probing, telemetry collection, and
+`execution_plan_load_options` live under `backend::mlx::automatic`. Backend and
+device identifiers are adapter-defined rather than a closed core enumeration;
+device creation and plan realization remain owned by the selected backend.
 Speculative generation uses the same core-owned committed-token and terminal
 lifecycle as ordinary generation. Its prefill/proposal/verification/commit
 executor contract is also core-owned; the MLX implementations supply opaque

@@ -1,10 +1,10 @@
 use safemlx_lm::{
-    execution_plan_load_options, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
-    DevicePlan, ExecutionPlan, AUTOMATIC_SCHEMA_VERSION,
+    backend::mlx::automatic::execution_plan_load_options, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlannerPolicy, DevicePlan, ExecutionPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 
 #[test]
-fn automatic_planner_surface_is_available_from_the_crate_root() {
+fn portable_planner_and_mlx_realization_have_distinct_surfaces() {
     let device = DevicePlan::new("mlx", "cpu:0").unwrap();
     let request = AutomaticPlanRequest::new("model", device.clone());
     assert_eq!(request.schema_version, AUTOMATIC_SCHEMA_VERSION);

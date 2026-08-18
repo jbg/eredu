@@ -11,6 +11,16 @@ mod portable;
 pub use portable::{
     LoadedModel, LoadedTextModelConfig, TextDecoder, TextDecoderError, TextModelError,
 };
+pub use safemlx_lm_core::{
+    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
+    AutomaticPlanningBackend, AutomaticPlanningError, BackendId, DevicePlan, DraftPlacementPlan,
+    DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
+    ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, MtpTelemetry, ObservationKind,
+    Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan,
+    ResidencyTelemetry, TimingTelemetry, TransferTelemetry, WeightTransformationPlan,
+    AUTOMATIC_SCHEMA_VERSION,
+};
 pub use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
 #[cfg(feature = "mlx")]

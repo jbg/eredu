@@ -10,6 +10,7 @@ use crate::backend::mlx::resolve_model_config;
 use crate::backend::mlx::structural::{self, GgufArchitectureValidation};
 use safemlx::ops::GgufCheckpoint;
 use safemlx_gguf::MetadataValue as GgufMetadataValue;
+use safemlx_lm_core::{ModelResourceProfile, Observed};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
@@ -27,16 +28,6 @@ pub struct ModelInspectionOptions {
     /// semantic protocol and native-tool envelope. Real tool schemas and
     /// request-specific template kwargs still require per-request validation.
     pub chat_request: Option<ChatTemplateRequest>,
-}
-
-/// Physical artifact selected for inspection.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactKind {
-    /// Hugging Face-style directory containing SafeTensors weights.
-    SafeTensorsDirectory,
-    /// Single-file or canonically sharded GGUF checkpoint.
-    GgufCheckpoint,
 }
 
 /// A readiness result that does not collapse distinct failure modes to a bool.
@@ -191,7 +182,7 @@ pub struct ModelInspectionReport {
     /// Submitted local artifact path.
     pub path: PathBuf,
     /// Detected artifact container.
-    pub artifact_kind: ArtifactKind,
+    pub artifact_format: ArtifactFormat,
     /// Resolved high-level SafeMLX model family, when architecture dispatch succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_kind: Option<ModelKind>,
@@ -255,16 +246,16 @@ impl ModelInspectionReport {
                 .any(|issue| issue.code == InspectionIssueCode::ValidationUnavailableUntilLoad)
     }
 
-    fn new(path: &Path, artifact_kind: ArtifactKind) -> Self {
+    fn new(path: &Path, artifact_format: ArtifactFormat) -> Self {
         Self {
             path: path.to_path_buf(),
-            artifact_kind,
+            artifact_format,
             model_kind: None,
             architecture: None,
             gguf_versions: None,
             checkpoint_shards: None,
             tensor_count: None,
-            resources: ModelResourceProfile::empty(path.to_path_buf(), artifact_kind),
+            resources: ModelResourceProfile::unmeasured(path.to_path_buf(), artifact_format),
             tensor_encodings: Vec::new(),
             expected_modalities: Vec::new(),
             container: InspectionReadiness::Unverified,
@@ -334,7 +325,7 @@ pub fn inspect_model(
 }
 
 fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelInspectionReport {
-    let mut report = ModelInspectionReport::new(path, ArtifactKind::SafeTensorsDirectory);
+    let mut report = ModelInspectionReport::new(path, ArtifactFormat::SafeTensors);
     let mut resolved_kind = None;
     let config_path = path.join("config.json");
     let config: Option<Value> = match std::fs::read_to_string(&config_path) {
@@ -531,7 +522,7 @@ fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelIns
 }
 
 fn inspect_gguf(path: &Path, options: ModelInspectionOptions) -> ModelInspectionReport {
-    let mut report = ModelInspectionReport::new(path, ArtifactKind::GgufCheckpoint);
+    let mut report = ModelInspectionReport::new(path, ArtifactFormat::Gguf);
     let checkpoint = match GgufCheckpoint::open(path) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
@@ -8137,8 +8128,7 @@ mod tests {
     #[test]
     fn validation_unavailable_warning_is_always_fail_closed() {
         let directory = tempfile::tempdir().unwrap();
-        let mut report =
-            ModelInspectionReport::new(directory.path(), ArtifactKind::SafeTensorsDirectory);
+        let mut report = ModelInspectionReport::new(directory.path(), ArtifactFormat::SafeTensors);
         report.container = InspectionReadiness::Ready;
         report.architecture_support = InspectionReadiness::Ready;
         report.structural_binding = InspectionReadiness::Ready;
@@ -10204,8 +10194,7 @@ mod tests {
             .token_to_id("<eos>")
             .expect("the inspection fixture registers its EOS token");
         let directory = tempfile::tempdir().unwrap();
-        let mut report =
-            ModelInspectionReport::new(directory.path(), ArtifactKind::SafeTensorsDirectory);
+        let mut report = ModelInspectionReport::new(directory.path(), ArtifactFormat::SafeTensors);
         inspect_chat_behavior(
             &mut report,
             tokenizer,
