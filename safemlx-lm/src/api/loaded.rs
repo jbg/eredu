@@ -357,12 +357,12 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     }
 }
 
-struct PreparedChatMtpLaneRuntime<'a, S> {
+struct PreparedChatMtpLaneRuntime<'a> {
     input: PreparedChatModelInput,
     cache: &'a mut ModelCache,
     config: MtpConfig,
     prng_key: Option<Array>,
-    sampler: ConstrainedSampler<CheckpointConfiguredSampler<S>>,
+    sampler: ConstrainedSampler<crate::runtime::generation::sampler::GenerationSampler>,
     semantic: Box<dyn MtpSemanticState>,
     cancellation: GenerationCancellationToken,
     on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
@@ -417,9 +417,9 @@ mod prepared_chat_model_input_tests {
     }
 }
 
-fn run_prepared_chat_mtp_batch<'a, B, S>(
+fn run_prepared_chat_mtp_batch<'a, B>(
     backend: &'a mut B,
-    lanes: Vec<PreparedChatMtpLaneRuntime<'a, S>>,
+    lanes: Vec<PreparedChatMtpLaneRuntime<'a>>,
     cache_for_lane: fn(&mut ModelCache) -> Option<&mut B::Cache>,
     cache_kind: &str,
     streams: MtpExecutionStreams<'a>,
@@ -427,7 +427,6 @@ fn run_prepared_chat_mtp_batch<'a, B, S>(
 ) -> Result<PreparedChatMtpBatchOutput, Exception>
 where
     B: crate::runtime::generation::speculative::MlxSpeculativeRuntime<'a>,
-    S: SpeculativeSampler + Clone + 'a,
 {
     let mut scheduler = MtpScheduler::new(backend, streams, options)?;
     for (lane_index, lane) in lanes.into_iter().enumerate() {
@@ -688,12 +687,12 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     /// The validation covers the target architecture, shared tensor geometry,
     /// and the token-id vocabulary mapping when the drafter carries tokenizer
     /// metadata.
-    pub fn validate_drafter_compatibility(&self, drafter: &LoadedDrafter) -> Result<(), Error> {
+    pub fn validate_drafter_compatibility(&self, drafter: &MlxDrafter) -> Result<(), Error> {
         match (self.model(), drafter.kind()) {
-            (Model::Gemma4(target), DrafterKind::Gemma4Assistant) => {
+            (Model::Gemma4(target), MlxDrafterKind::Gemma4Assistant) => {
                 validate_gemma4_drafter(target.args(), drafter.gemma4())?
             }
-            (Model::MuseGlimmer(target), DrafterKind::MuseGlimmerDFlash) => {
+            (Model::MuseGlimmer(target), MlxDrafterKind::MuseGlimmerDFlash) => {
                 let assistant = drafter.muse_glimmer();
                 let target_args = target.args();
                 if assistant.config.hidden_size != target_args.hidden_size
@@ -746,15 +745,12 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         }
     }
 
-    fn prepare_chat_mtp_batch_lanes<'a, S>(
+    fn prepare_chat_mtp_batch_lanes<'a>(
         &self,
-        lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
-        cache: &'a mut MtpCache,
+        lanes: Vec<PreparedChatMtpBatchLane<'a, crate::backend::mlx::MlxBackend<'static>>>,
+        cache: &'a mut MlxMtpCache,
         stream: &Stream,
-    ) -> Result<Vec<PreparedChatMtpLaneRuntime<'a, S>>, Error>
-    where
-        S: SpeculativeSampler + Clone,
-    {
+    ) -> Result<Vec<PreparedChatMtpLaneRuntime<'a>>, Error> {
         if cache.len() != lanes.len() {
             return Err(Error::PreparedChatGeneration(format!(
                 "MTP cache has {} lanes but the request has {} lanes",
@@ -767,7 +763,6 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         {
             let PreparedChatMtpBatchLane {
                 input,
-                sampling_policy,
                 settings,
                 max_draft_tokens,
                 caller_stop_sequences,
@@ -789,17 +784,12 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             let generation_plan = prepared_chat
                 .generation_runtime_plan()
                 .expect("supported prepared chats carry a generation runtime plan");
-            let use_checkpoint_sampler =
-                SpeculativeSampler::uses_checkpoint_defaults(&sampling_policy);
             let settings = self.resolve_prepared_chat_generation_settings(settings)?;
-            let sampling_policy = CheckpointConfiguredSampler::for_sampler(
-                sampling_policy,
+            let sampler = ConstrainedSampler::from_generation_plan(
                 settings.checkpoint_sampler,
-                use_checkpoint_sampler,
-            );
-            let sampler =
-                ConstrainedSampler::from_generation_plan(sampling_policy, generation_plan)
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                generation_plan,
+            )
+            .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
             let decoder = PreparedChatTokenDecoder {
                 decoder: self.text_decoder(true),
             };
@@ -826,30 +816,43 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         Ok(prepared_lanes)
     }
 
-    /// Generates multiple independent prepared chats through one fair MTP
-    /// scheduler using an external assistant.
-    ///
-    /// Model parameters and execution streams are shared. Every submitted lane
-    /// receives a fresh executable constraint/parser runtime, cache, callback,
-    /// and target/draft PRNG roots. Events are published only after the
-    /// corresponding target cache transaction commits. Each lane's cancellation
-    /// token is observed independently.
-    pub fn generate_prepared_chat_mtp_batch<S>(
+    /// Generates multiple independent prepared chats through one fair MTP scheduler.
+    pub fn generate_prepared_chat_mtp_batch(
         &mut self,
-        request: PreparedChatMtpBatchRequest<'_, S>,
-    ) -> Result<PreparedChatMtpBatchOutput, Error>
-    where
-        S: SpeculativeSampler + Clone,
-    {
+        request: PreparedChatMtpBatchRequest<
+            '_,
+            crate::backend::mlx::MlxBackend<'static>,
+            MlxDrafter,
+        >,
+    ) -> Result<PreparedChatMtpBatchOutput, Error> {
         let PreparedChatMtpBatchRequest {
-            drafter,
-            cache,
+            drafting,
             lanes,
-            streams,
             scheduler,
         } = request;
+        match drafting {
+            PreparedChatDraft::External(drafter) => {
+                self.generate_prepared_chat_mtp_batch_with_external_draft(drafter, lanes, scheduler)
+            }
+            PreparedChatDraft::Embedded => {
+                self.generate_prepared_chat_mtp_batch_with_embedded_draft(lanes, scheduler)
+            }
+        }
+    }
+
+    fn generate_prepared_chat_mtp_batch_with_external_draft(
+        &mut self,
+        drafter: &mut MlxDrafter,
+        lanes: Vec<PreparedChatMtpBatchLane<'_, crate::backend::mlx::MlxBackend<'static>>>,
+        scheduler: MtpSchedulerOptions,
+    ) -> Result<PreparedChatMtpBatchOutput, Error> {
         self.validate_drafter_compatibility(drafter)?;
-        let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, cache, streams.target())?;
+        let target_stream = self.runtime.backend().stream().clone();
+        let draft_stream = drafter.stream().clone();
+        let streams = MtpExecutionStreams::new(&target_stream, &draft_stream)?;
+        let mut cache = self.new_mtp_cache(lanes.len());
+        let prepared_lanes =
+            self.prepare_chat_mtp_batch_lanes(lanes, &mut cache, &target_stream)?;
 
         match self.model_and_cache().0 {
             Model::Gemma4(target) => {
@@ -891,29 +894,15 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         }
     }
 
-    /// Generates multiple independent prepared chats through one fair scheduler
-    /// using checkpoint-embedded Qwen MTP heads.
-    ///
-    /// Model parameters and the execution stream are shared. Every submitted
-    /// lane receives a fresh executable constraint/parser runtime, cache,
-    /// callback, and PRNG root. Events are published only after the
-    /// corresponding target cache transaction commits. Each lane's cancellation
-    /// token is observed independently.
-    pub fn generate_prepared_chat_embedded_mtp_batch<S>(
+    fn generate_prepared_chat_mtp_batch_with_embedded_draft(
         &mut self,
-        request: PreparedChatEmbeddedMtpBatchRequest<'_, S>,
-    ) -> Result<PreparedChatMtpBatchOutput, Error>
-    where
-        S: SpeculativeSampler + Clone,
-    {
-        let PreparedChatEmbeddedMtpBatchRequest {
-            cache,
-            lanes,
-            stream,
-            scheduler,
-        } = request;
-        let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, cache, stream)?;
-        let streams = MtpExecutionStreams::single(stream);
+        lanes: Vec<PreparedChatMtpBatchLane<'_, crate::backend::mlx::MlxBackend<'static>>>,
+        scheduler: MtpSchedulerOptions,
+    ) -> Result<PreparedChatMtpBatchOutput, Error> {
+        let stream = self.runtime.backend().stream().clone();
+        let mut cache = self.new_mtp_cache(lanes.len());
+        let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, &mut cache, &stream)?;
+        let streams = MtpExecutionStreams::single(&stream);
         match self.model_and_cache().0 {
             Model::DeepSeekV3(target) => {
                 let mut backend =
@@ -986,114 +975,68 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         }
     }
 
-    /// Generates one structured response with an external MTP assistant.
-    ///
-    /// Target verification, constrained-sampler state, decoded stop matching,
-    /// protocol parsing, and event publication share one committed prefix.
-    /// Cancellation waits for any in-flight verification to reach its safe
-    /// cache boundary before publishing `Finished(Cancelled)`.
-    pub fn generate_prepared_chat_mtp<S, F>(
+    /// Generates one structured response using embedded or external drafting.
+    pub fn generate_prepared_chat_mtp<'a, F>(
         &mut self,
-        request: PreparedChatMtpGenerationRequest<'_, S, F>,
+        request: PreparedChatMtpGenerationRequest<
+            'a,
+            crate::backend::mlx::MlxBackend<'static>,
+            MlxDrafter,
+            F,
+        >,
     ) -> Result<PreparedChatMtpGenerationOutput, Error>
     where
-        S: SpeculativeSampler + Clone,
         F: FnMut(SemanticEvent),
     {
         let PreparedChatMtpGenerationRequest {
             input,
-            drafter,
-            sampling_policy,
+            drafting,
             settings,
             options,
             caller_stop_sequences,
-            streams,
             cancellation,
             on_event,
         } = request;
-        self.validate_drafter_compatibility(drafter)?;
-        let prepared_chat = input.prepared_chat();
-        let semantic_plan = match prepared_chat.semantic_support() {
-            SemanticSupport::Supported => prepared_chat
-                .semantic_runtime_plan()
-                .expect("supported prepared chats carry a semantic runtime plan")
-                .clone(),
-            SemanticSupport::Unsupported { reason } => {
-                return Err(Error::PreparedChatGeneration(format!(
-                    "prepared chat does not have an executable semantic plan: {reason}"
-                )));
-            }
-        };
-        let use_checkpoint_sampler = SpeculativeSampler::uses_checkpoint_defaults(&sampling_policy);
-        let settings = self.resolve_prepared_chat_generation_settings(settings)?;
-        with_prepared_chat_runtime(
-            prepared_chat,
-            sampling_policy,
-            settings.checkpoint_sampler,
-            use_checkpoint_sampler,
-            |runtime| {
-                let decoder = PreparedChatTokenDecoder {
-                    decoder: self.text_decoder(true),
-                };
-                let semantic =
-                    PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
-                        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-                let config = MtpConfig {
-                    max_tokens: settings.max_tokens.get(),
-                    max_draft_tokens: options.max_draft_tokens.get(),
-                    temperature: settings.temperature,
-                    eos_token_ids: prepared_chat.eos_token_ids().to_vec(),
-                };
-                let mut sampler = runtime.sampler;
-                let model_input = self.prepare_chat_model_input(input, streams.target())?;
-                model_input.with_model_input(|model_input| {
-                    let (model, cache) = self.model_and_cache();
-                    let (token_ids, stats, finish_reason) = model
-                        .generate_mtp_input_with_semantics_and_options(
-                            drafter,
-                            cache,
-                            model_input,
-                            &config,
-                            settings.prng_key,
-                            &mut sampler,
-                            Box::new(semantic),
-                            cancellation,
-                            streams,
-                            options.scheduler,
-                            on_event,
-                        )
-                        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-                    Ok(PreparedChatMtpGenerationOutput {
-                        token_ids,
-                        finish_reason,
-                        stats,
-                    })
-                })
-            },
-        )
+        match drafting {
+            PreparedChatDraft::External(drafter) => self
+                .generate_prepared_chat_mtp_with_external_draft(
+                    input,
+                    drafter,
+                    settings,
+                    options,
+                    caller_stop_sequences,
+                    cancellation,
+                    on_event,
+                ),
+            PreparedChatDraft::Embedded => self.generate_prepared_chat_mtp_with_embedded_draft(
+                input,
+                settings,
+                options,
+                caller_stop_sequences,
+                cancellation,
+                on_event,
+            ),
+        }
     }
 
-    /// Generates one structured response with checkpoint-embedded MTP heads.
-    /// Cancellation waits for any in-flight verification to reach its safe
-    /// cache boundary before publishing `Finished(Cancelled)`.
-    pub fn generate_prepared_chat_embedded_mtp<S, F>(
+    #[allow(clippy::too_many_arguments)]
+    fn generate_prepared_chat_mtp_with_external_draft<F>(
         &mut self,
-        request: PreparedChatEmbeddedMtpGenerationRequest<'_, S, F>,
+        input: PreparedChatInput<'_, crate::backend::mlx::MlxBackend<'static>>,
+        drafter: &mut MlxDrafter,
+        settings: PreparedChatGenerationSettings,
+        options: PreparedChatMtpGenerationOptions,
+        caller_stop_sequences: &[String],
+        cancellation: GenerationCancellationToken,
+        on_event: F,
     ) -> Result<PreparedChatMtpGenerationOutput, Error>
     where
-        S: SpeculativeSampler + Clone,
         F: FnMut(SemanticEvent),
     {
-        let PreparedChatEmbeddedMtpGenerationRequest {
-            input,
-            sampling_policy,
-            settings,
-            options,
-            caller_stop_sequences,
-            stream,
-            cancellation,
-            on_event,
-        } = request;
+        self.validate_drafter_compatibility(drafter)?;
+        let target_stream = self.runtime.backend().stream().clone();
+        let draft_stream = drafter.stream().clone();
+        let streams = MtpExecutionStreams::new(&target_stream, &draft_stream)?;
         let prepared_chat = input.prepared_chat();
         let semantic_plan = match prepared_chat.semantic_support() {
             SemanticSupport::Supported => prepared_chat
@@ -1106,52 +1049,113 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 )));
             }
         };
-        let use_checkpoint_sampler = SpeculativeSampler::uses_checkpoint_defaults(&sampling_policy);
         let settings = self.resolve_prepared_chat_generation_settings(settings)?;
-        with_prepared_chat_runtime(
-            prepared_chat,
-            sampling_policy,
-            settings.checkpoint_sampler,
-            use_checkpoint_sampler,
-            |runtime| {
-                let decoder = PreparedChatTokenDecoder {
-                    decoder: self.text_decoder(true),
-                };
-                let semantic =
-                    PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
-                        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-                let config = MtpConfig {
-                    max_tokens: settings.max_tokens.get(),
-                    max_draft_tokens: options.max_draft_tokens.get(),
-                    temperature: settings.temperature,
-                    eos_token_ids: prepared_chat.eos_token_ids().to_vec(),
-                };
-                let mut sampler = runtime.sampler;
-                let model_input = self.prepare_chat_model_input(input, stream)?;
-                model_input.with_model_input(|model_input| {
-                    let (model, cache) = self.model_and_cache();
-                    let (token_ids, stats, finish_reason) = model
-                        .generate_embedded_mtp_input_with_semantics_and_options(
-                            cache,
-                            model_input,
-                            &config,
-                            settings.prng_key,
-                            &mut sampler,
-                            Box::new(semantic),
-                            cancellation,
-                            stream,
-                            options.scheduler,
-                            on_event,
-                        )
-                        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-                    Ok(PreparedChatMtpGenerationOutput {
-                        token_ids,
-                        finish_reason,
-                        stats,
-                    })
+        with_prepared_chat_runtime(prepared_chat, settings.checkpoint_sampler, |runtime| {
+            let decoder = PreparedChatTokenDecoder {
+                decoder: self.text_decoder(true),
+            };
+            let semantic =
+                PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+            let config = MtpConfig {
+                max_tokens: settings.max_tokens.get(),
+                max_draft_tokens: options.max_draft_tokens.get(),
+                temperature: settings.temperature,
+                eos_token_ids: prepared_chat.eos_token_ids().to_vec(),
+            };
+            let mut sampler = runtime.sampler;
+            let model_input = self.prepare_chat_model_input(input, streams.target())?;
+            model_input.with_model_input(|model_input| {
+                let (model, cache) = self.model_and_cache();
+                let (token_ids, stats, finish_reason) = model
+                    .generate_mtp_input_with_semantics_and_options(
+                        drafter,
+                        cache,
+                        model_input,
+                        &config,
+                        settings.prng_key,
+                        &mut sampler,
+                        Box::new(semantic),
+                        cancellation,
+                        streams,
+                        options.scheduler,
+                        on_event,
+                    )
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                Ok(PreparedChatMtpGenerationOutput {
+                    token_ids,
+                    finish_reason,
+                    stats,
                 })
-            },
-        )
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_prepared_chat_mtp_with_embedded_draft<F>(
+        &mut self,
+        input: PreparedChatInput<'_, crate::backend::mlx::MlxBackend<'static>>,
+        settings: PreparedChatGenerationSettings,
+        options: PreparedChatMtpGenerationOptions,
+        caller_stop_sequences: &[String],
+        cancellation: GenerationCancellationToken,
+        on_event: F,
+    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    where
+        F: FnMut(SemanticEvent),
+    {
+        let stream = self.runtime.backend().stream().clone();
+        let prepared_chat = input.prepared_chat();
+        let semantic_plan = match prepared_chat.semantic_support() {
+            SemanticSupport::Supported => prepared_chat
+                .semantic_runtime_plan()
+                .expect("supported prepared chats carry a semantic runtime plan")
+                .clone(),
+            SemanticSupport::Unsupported { reason } => {
+                return Err(Error::PreparedChatGeneration(format!(
+                    "prepared chat does not have an executable semantic plan: {reason}"
+                )));
+            }
+        };
+        let settings = self.resolve_prepared_chat_generation_settings(settings)?;
+        with_prepared_chat_runtime(prepared_chat, settings.checkpoint_sampler, |runtime| {
+            let decoder = PreparedChatTokenDecoder {
+                decoder: self.text_decoder(true),
+            };
+            let semantic =
+                PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+            let config = MtpConfig {
+                max_tokens: settings.max_tokens.get(),
+                max_draft_tokens: options.max_draft_tokens.get(),
+                temperature: settings.temperature,
+                eos_token_ids: prepared_chat.eos_token_ids().to_vec(),
+            };
+            let mut sampler = runtime.sampler;
+            let model_input = self.prepare_chat_model_input(input, &stream)?;
+            model_input.with_model_input(|model_input| {
+                let (model, cache) = self.model_and_cache();
+                let (token_ids, stats, finish_reason) = model
+                    .generate_embedded_mtp_input_with_semantics_and_options(
+                        cache,
+                        model_input,
+                        &config,
+                        settings.prng_key,
+                        &mut sampler,
+                        Box::new(semantic),
+                        cancellation,
+                        &stream,
+                        options.scheduler,
+                        on_event,
+                    )
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                Ok(PreparedChatMtpGenerationOutput {
+                    token_ids,
+                    finish_reason,
+                    stats,
+                })
+            })
+        })
     }
 
     /// Reports whether and how this target can perform MTP generation.
@@ -1160,8 +1164,8 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     }
 
     /// Creates independent target caches for an MTP text batch.
-    pub fn new_mtp_cache(&self, batch_size: usize) -> MtpCache {
-        MtpCache::new(
+    pub fn new_mtp_cache(&self, batch_size: usize) -> MlxMtpCache {
+        MlxMtpCache::new(
             (0..batch_size)
                 .map(|_| self.runtime.session().new_complete_cache())
                 .collect(),
@@ -1171,7 +1175,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     /// Generates through the architecture-independent MTP path.
     pub fn generate_mtp_input(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1190,7 +1194,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     /// Generates through MTP with separate target and draft streams.
     pub fn generate_mtp_input_with_streams(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1210,7 +1214,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1232,7 +1236,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_input_with_sampler_and_streams<S: SpeculativeSampler + Clone>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1261,7 +1265,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_input_with_sampler_callback_and_streams<S, F>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1292,7 +1296,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_input_with_sampler_callback_and_streams_and_options<S, F>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1329,7 +1333,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_input_with_sampler_callback<S, F>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1420,7 +1424,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     /// may diverge without padding rejected state back into another sequence.
     pub fn generate_mtp_text_batch<S: SpeculativeSampler + Clone>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         prompt_tokens: &Array,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1448,8 +1452,8 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_text_batch_with_cache<S: SpeculativeSampler + Clone>(
         &mut self,
-        drafter: &mut LoadedDrafter,
-        cache: &mut MtpCache,
+        drafter: &mut MlxDrafter,
+        cache: &mut MlxMtpCache,
         prompt_tokens: &Array,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1476,8 +1480,8 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_text_batch_with_cache_and_streams<S: SpeculativeSampler + Clone>(
         &mut self,
-        drafter: &mut LoadedDrafter,
-        cache: &mut MtpCache,
+        drafter: &mut MlxDrafter,
+        cache: &mut MlxMtpCache,
         prompt_tokens: &Array,
         config: &MtpConfig,
         prng_key: Option<Array>,
@@ -1585,7 +1589,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_embedded_mtp_text_batch_with_cache<S: SpeculativeSampler + Clone>(
         &mut self,
-        cache: &mut MtpCache,
+        cache: &mut MlxMtpCache,
         prompt_tokens: &Array,
         config: &MtpConfig,
         prng_key: Option<Array>,

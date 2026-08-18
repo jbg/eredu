@@ -53,9 +53,9 @@ different tools without sharing mutable parser state.
 Choose one cohesive generation call:
 
 - `generate_prepared_chat` for ordinary constrained generation;
-- `generate_prepared_chat_mtp` for an external assistant;
-- `generate_prepared_chat_embedded_mtp` for checkpoint prediction heads; or
-- the corresponding batch methods for independently scheduled requests.
+- `generate_prepared_chat_mtp` with `PreparedChatDraft::External` or
+  `PreparedChatDraft::Embedded`; or
+- `generate_prepared_chat_mtp_batch` for independently scheduled requests.
 
 All paths use the same tokenizer-aware byte decoder, stop matcher, constraint
 engine, and semantic event pipeline. Speculation and scheduler interleaving can

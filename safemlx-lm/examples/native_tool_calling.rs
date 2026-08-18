@@ -8,14 +8,13 @@ use std::{env, num::NonZeroUsize};
 use safemlx::{Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::{
-        LoadedModel, PreparedChatEmbeddedMtpGenerationRequest, PreparedChatGenerationRequest,
+        LoadedModel, PreparedChatDraft, PreparedChatGenerationRequest,
         PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
         PreparedChatMtpGenerationRequest,
     },
-    backend::mlx::speculative::MtpExecutionStreams,
+    backend::mlx::speculative::MlxDrafter,
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
-    runtime::generation::sampler::DefaultSampler,
-    runtime::generation::speculative::{LoadedDrafter, MtpCapability, MtpCheckpointKind},
+    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind},
     MtpSchedulerOptions, SemanticEvent,
 };
 use serde_json::json;
@@ -81,22 +80,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events = Vec::<SemanticEvent>::new();
 
     let finish_reason = if let Some(drafter_path) = drafter_path {
-        // Draft on CPU while the target verifies on GPU. Selecting a second
-        // GPU execution context instead creates a same-GPU split stream.
+        // Draft on CPU while the target verifies on GPU. The loaded target and
+        // drafter retain their respective execution placements.
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut drafter = LoadedDrafter::load(&drafter_path, draft.stream(), draft.stream())?;
+        let mut drafter = MlxDrafter::load(&drafter_path, draft.stream(), draft.stream())?;
         model
             .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),
-                drafter: &mut drafter,
-                sampling_policy: DefaultSampler,
+                drafting: PreparedChatDraft::External(&mut drafter),
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(3).unwrap(),
                     scheduler,
                 },
                 caller_stop_sequences: &[],
-                streams: MtpExecutionStreams::new(target.stream(), draft.stream())?,
                 cancellation: safemlx_lm::GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
@@ -108,16 +105,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     ) {
         model
-            .generate_prepared_chat_embedded_mtp(PreparedChatEmbeddedMtpGenerationRequest {
+            .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),
-                sampling_policy: DefaultSampler,
+                drafting: PreparedChatDraft::Embedded,
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(3).unwrap(),
                     scheduler,
                 },
                 caller_stop_sequences: &[],
-                stream: target.stream(),
                 cancellation: safemlx_lm::GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?

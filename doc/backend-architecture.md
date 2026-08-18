@@ -252,9 +252,12 @@ executor, raw facade cache pairing, and borrowing backend-session trait were
 deleted. `LoadedModel` owns a `ModelRuntime<MlxBackend>` rather than a raw model.
 Ordinary generation, prepared-chat generation, speculative single-request
 generation, cache-policy selection, and prompt-cache persistence all use the
-session-owned cache and selected stream. Opaque multi-lane `MtpCache` remains
-an MLX adapter resource because each speculative lane needs independent tensor
-state. Starting an unrelated sequence is an explicit `reset_session`
+session-owned cache and selected execution placement. Prepared-chat MTP requests
+contain only portable sampling settings, scheduler policy, cancellation, and
+semantic callbacks. The target and `MlxDrafter` retain the MLX streams selected
+when each was loaded; batch cache lanes are allocated inside the MLX adapter.
+The lower-level `MlxMtpCache` remains an explicitly MLX resource for raw tensor
+APIs. Starting an unrelated sequence is an explicit `reset_session`
 transition; loading a prompt cache deliberately replaces the same session
 state so the next prefill/decode continues that prefix.
 
@@ -365,9 +368,11 @@ The current boundary leaves these components MLX-coupled:
   backend prompt, while concrete media decoding and tensor preprocessing remain
   backend implementations. Realtime request/session orchestration is generic,
   while codec-token arrays and Moshi/PersonaPlex model math remain MLX adapter
-  types. Arbitrary custom samplers and speculative MTP request surfaces still
-  expose MLX adapter types; they require their own high-level portable contracts
-  rather than tensor escape hatches.
+  types. Prepared-chat speculative requests no longer expose samplers, random
+  arrays, streams, or cache objects, and their drafter field is generic. Their
+  execution methods still live on `LoadedModel<MlxBackend>`; moving those methods
+  behind a backend capability trait is the remaining high-level boundary. Raw
+  tensor-oriented MTP APIs intentionally remain MLX adapter APIs.
 
 The former facade `runtime::residency::policy` module was deleted. It was not
 retained as a forwarding namespace. The earlier placeholder core

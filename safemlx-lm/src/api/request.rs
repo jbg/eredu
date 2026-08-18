@@ -145,42 +145,26 @@ impl Default for PreparedChatMtpGenerationOptions {
     }
 }
 
-/// One external-assistant MTP response from a [`PreparedChat`].
-pub struct PreparedChatMtpGenerationRequest<'a, S, F> {
-    /// Explicit prompt source and embedded format/runtime plan.
-    pub input: PreparedChatInput<'a>,
-    /// Separate target-compatible draft model.
-    pub drafter: &'a mut LoadedDrafter,
-    /// Caller-selected base sampling policy.
-    pub sampling_policy: S,
-    /// Temperature, token limit, and optional random state.
-    pub settings: PreparedChatGenerationSettings,
-    /// Proposal-block and scheduler controls.
-    pub options: PreparedChatMtpGenerationOptions,
-    /// Additional decoded text sequences that terminate generation.
-    pub caller_stop_sequences: &'a [String],
-    /// Target and draft execution streams.
-    pub streams: MtpExecutionStreams<'a>,
-    /// One-shot cooperative-cancellation token for this request.
-    pub cancellation: GenerationCancellationToken,
-    /// Called synchronously for each event after its cache transaction commits.
-    pub on_event: F,
+/// Draft-model source selected for one speculative request.
+pub enum PreparedChatDraft<'a, D> {
+    /// Separately loaded assistant with its own backend-owned placement.
+    External(&'a mut D),
+    /// Draft heads embedded in the selected target model.
+    Embedded,
 }
 
-/// One embedded-head MTP response from a [`PreparedChat`].
-pub struct PreparedChatEmbeddedMtpGenerationRequest<'a, S, F> {
+/// One speculative MTP response from a [`PreparedChat`].
+pub struct PreparedChatMtpGenerationRequest<'a, B: safemlx_lm_core::TextGenerationBackend, D, F> {
     /// Explicit prompt source and embedded format/runtime plan.
-    pub input: PreparedChatInput<'a>,
-    /// Caller-selected base sampling policy.
-    pub sampling_policy: S,
-    /// Temperature, token limit, and optional random state.
+    pub input: PreparedChatInput<'a, B>,
+    /// Embedded or separately loaded draft-model selection.
+    pub drafting: PreparedChatDraft<'a, D>,
+    /// Portable sampling configuration, token limit, and random seed.
     pub settings: PreparedChatGenerationSettings,
     /// Proposal-block and scheduler controls.
     pub options: PreparedChatMtpGenerationOptions,
     /// Additional decoded text sequences that terminate generation.
     pub caller_stop_sequences: &'a [String],
-    /// MLX stream used for target and embedded-head work.
-    pub stream: &'a Stream,
     /// One-shot cooperative-cancellation token for this request.
     pub cancellation: GenerationCancellationToken,
     /// Called synchronously for each event after its cache transaction commits.
@@ -200,16 +184,15 @@ pub struct PreparedChatMtpGenerationOutput {
 
 /// One independently executable lane in a prepared-chat MTP batch.
 ///
-/// Every lane owns its cache, sampling policy, random root, stop configuration,
-/// and callback. The runtime constructs a fresh constrained sampler and
-/// decoder/parser pipeline from `input` before submitting the lane.
-/// Lanes are shared by the external-assistant and embedded-head batch APIs.
-pub struct PreparedChatMtpBatchLane<'a, S> {
+/// Every lane owns portable sampling, a random root, stop configuration, and
+/// callback. The backend allocates its cache while the runtime constructs a
+/// constrained sampler and decoder/parser pipeline from `input` before
+/// submitting the lane. Lanes are shared by the external-assistant and
+/// embedded-head drafting strategies.
+pub struct PreparedChatMtpBatchLane<'a, B: safemlx_lm_core::TextGenerationBackend> {
     /// Explicit prompt source and embedded format/runtime plan.
-    pub input: PreparedChatInput<'a>,
-    /// Caller-selected base sampling policy used only by this lane.
-    pub sampling_policy: S,
-    /// Temperature, token limit, and independent random root.
+    pub input: PreparedChatInput<'a, B>,
+    /// Portable sampling configuration, token limit, and independent random root.
     pub settings: PreparedChatGenerationSettings,
     /// Maximum assistant proposals verified in one target block.
     pub max_draft_tokens: NonZeroUsize,
@@ -222,27 +205,11 @@ pub struct PreparedChatMtpBatchLane<'a, S> {
 }
 
 /// Cohesive fair-scheduler request for independent prepared-chat MTP lanes.
-pub struct PreparedChatMtpBatchRequest<'a, S> {
-    /// Separate target-compatible draft model shared read/write by the scheduler.
-    pub drafter: &'a mut LoadedDrafter,
-    /// Opaque independent target-cache lanes owned by the MLX backend.
-    pub cache: &'a mut MtpCache,
+pub struct PreparedChatMtpBatchRequest<'a, B: safemlx_lm_core::TextGenerationBackend, D> {
+    /// Embedded or separately loaded draft-model selection.
+    pub drafting: PreparedChatDraft<'a, D>,
     /// Independently executable prepared-chat lanes.
-    pub lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
-    /// Target and draft execution streams shared by scheduler submissions.
-    pub streams: MtpExecutionStreams<'a>,
-    /// Bounded scheduler and optimistic-lookahead controls.
-    pub scheduler: MtpSchedulerOptions,
-}
-
-/// Cohesive fair-scheduler request for embedded-head prepared-chat MTP lanes.
-pub struct PreparedChatEmbeddedMtpBatchRequest<'a, S> {
-    /// Opaque independent target-cache lanes owned by the MLX backend.
-    pub cache: &'a mut MtpCache,
-    /// Independently executable prepared-chat lanes.
-    pub lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
-    /// MLX stream shared by target and embedded-head scheduler submissions.
-    pub stream: &'a Stream,
+    pub lanes: Vec<PreparedChatMtpBatchLane<'a, B>>,
     /// Bounded scheduler and optimistic-lookahead controls.
     pub scheduler: MtpSchedulerOptions,
 }
@@ -390,13 +357,11 @@ impl MtpSemanticState for PreparedChatSemanticState {
     }
 }
 
-pub(super) fn with_prepared_chat_runtime<S, R>(
+pub(super) fn with_prepared_chat_runtime<R>(
     prepared_chat: &PreparedChat,
-    sampling_policy: S,
-    checkpoint_sampler: crate::runtime::generation::sampler::GenerationSampler,
-    use_checkpoint_sampler: bool,
+    sampling: crate::runtime::generation::sampler::GenerationSampler,
     execute: impl FnOnce(
-        PreparedChatRuntime<crate::runtime::generation::sampler::CheckpointConfiguredSampler<S>>,
+        PreparedChatRuntime<crate::runtime::generation::sampler::GenerationSampler>,
     ) -> Result<R, Error>,
 ) -> Result<R, Error> {
     let _semantic_plan = match prepared_chat.semantic_support() {
@@ -412,13 +377,7 @@ pub(super) fn with_prepared_chat_runtime<S, R>(
     let generation_plan = prepared_chat
         .generation_runtime_plan()
         .expect("supported prepared chats carry a generation runtime plan");
-    let sampling_policy =
-        crate::runtime::generation::sampler::CheckpointConfiguredSampler::for_sampler(
-            sampling_policy,
-            checkpoint_sampler,
-            use_checkpoint_sampler,
-        );
-    let sampler = ConstrainedSampler::from_generation_plan(sampling_policy, generation_plan)
+    let sampler = ConstrainedSampler::from_generation_plan(sampling, generation_plan)
         .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
     execute(PreparedChatRuntime { sampler })
 }

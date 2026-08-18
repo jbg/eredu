@@ -26,12 +26,12 @@ use safemlx_lm::{
         DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
         ExpertCacheTelemetry, HardwareMemorySemantics, HardwareProfile, LoadedModel,
         ModelInspectionOptions, ModelLoadOptions, ModelResourceProfile, Observed, PlanExplanation,
-        PlanExplanationEntry, PlanExplanationLevel, PreparedChatEmbeddedMtpGenerationRequest,
+        PlanExplanationEntry, PlanExplanationLevel, PreparedChatDraft,
         PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
         ResidencyTelemetry, TextDecoder, TimingTelemetry, WeightTransformationPlan,
     },
-    backend::mlx::speculative::MtpExecutionStreams,
+    backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams},
     core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     core::speculative::MtpStats,
     error::Error as LmError,
@@ -45,7 +45,7 @@ use safemlx_lm::{
     runtime::generation::sampler::{
         DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
     },
-    runtime::generation::speculative::{LoadedDrafter, MtpComponentTimingGuard},
+    runtime::generation::speculative::MtpComponentTimingGuard,
     runtime::media::input::{InputPart, ModelInput},
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     runtime::residency::expert_cache::{
@@ -2299,7 +2299,7 @@ fn main() -> Result<()> {
                 ModelLoadOptions::default,
                 ModelLoadOptions::with_quantization,
             );
-            LoadedDrafter::load_with_options(path, options, draft_stream, weights.stream())
+            MlxDrafter::load_with_options(path, options, draft_stream, weights.stream())
                 .with_context(|| format!("failed to load draft model from {}", path.display()))
         })
         .transpose()?;
@@ -2465,10 +2465,20 @@ fn main() -> Result<()> {
     }
     .with_lookahead(!args.disable_mtp_lookahead);
     let mut prepared_finish_reason = None;
+    if prepared_chat.is_some() && args.mirostat_v2 {
+        bail!("Mirostat V2 is not represented by the portable prepared-chat sampling contract");
+    }
     if let Some(prepared) = &prepared_chat {
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 temperature: Some(temperature),
+                top_k: Some(top_k),
+                top_p: Some(top_p),
+                min_p: Some(min_p),
+                repetition_penalty: Some(args.repeat_penalty),
+                repeat_last_n: Some(args.repeat_last_n),
+                frequency_penalty: Some(args.frequency_penalty),
+                presence_penalty: Some(args.presence_penalty),
                 max_new_tokens: Some(max_tokens),
                 ..GenerationConfigOverrides::default()
             },
@@ -2480,8 +2490,7 @@ fn main() -> Result<()> {
             let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
-                drafter,
-                sampling_policy: sampler,
+                drafting: PreparedChatDraft::External(drafter),
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)
@@ -2489,7 +2498,6 @@ fn main() -> Result<()> {
                     scheduler: scheduler_options,
                 },
                 caller_stop_sequences: &args.stop_sequences,
-                streams: MtpExecutionStreams::new(stream, draft_stream)?,
                 cancellation,
                 on_event: |event| {
                     if time_to_first_token.is_none()
@@ -2519,42 +2527,39 @@ fn main() -> Result<()> {
         } else if embedded_mtp {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
-            let output = model.generate_prepared_chat_embedded_mtp(
-                PreparedChatEmbeddedMtpGenerationRequest {
-                    input: PreparedChatInput::rendered_prompt(prepared),
-                    sampling_policy: sampler,
-                    settings,
-                    options: PreparedChatMtpGenerationOptions {
-                        max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)
-                            .expect("embedded MTP validates non-zero draft tokens"),
-                        scheduler: scheduler_options,
-                    },
-                    caller_stop_sequences: &args.stop_sequences,
-                    stream,
-                    cancellation,
-                    on_event: |event| {
-                        if time_to_first_token.is_none()
-                            && !matches!(event, SemanticEvent::Finished { .. })
-                        {
-                            time_to_first_token = Some(generation_started.elapsed());
-                        }
-                        if semantic_error.is_none() {
-                            semantic_error = write_semantic_event(
-                                &event,
-                                &mut stdout,
-                                &mut stderr,
-                                &mut streamed_text,
-                                &mut reasoning_stream,
-                                reasoning_output,
-                            )
-                            .err();
-                            if semantic_error.is_some() {
-                                cancel_on_error.cancel();
-                            }
-                        }
-                    },
+            let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
+                input: PreparedChatInput::rendered_prompt(prepared),
+                drafting: PreparedChatDraft::Embedded,
+                settings,
+                options: PreparedChatMtpGenerationOptions {
+                    max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)
+                        .expect("embedded MTP validates non-zero draft tokens"),
+                    scheduler: scheduler_options,
                 },
-            )?;
+                caller_stop_sequences: &args.stop_sequences,
+                cancellation,
+                on_event: |event| {
+                    if time_to_first_token.is_none()
+                        && !matches!(event, SemanticEvent::Finished { .. })
+                    {
+                        time_to_first_token = Some(generation_started.elapsed());
+                    }
+                    if semantic_error.is_none() {
+                        semantic_error = write_semantic_event(
+                            &event,
+                            &mut stdout,
+                            &mut stderr,
+                            &mut streamed_text,
+                            &mut reasoning_stream,
+                            reasoning_output,
+                        )
+                        .err();
+                        if semantic_error.is_some() {
+                            cancel_on_error.cancel();
+                        }
+                    }
+                },
+            })?;
             output_ids = output.token_ids;
             mtp_stats = Some(output.stats);
             prepared_finish_reason = Some(output.finish_reason);
@@ -2758,7 +2763,7 @@ fn main() -> Result<()> {
             total_elapsed,
         )?;
         if let Some(stats) = &mtp_stats {
-            eprintln!("mtp_stream_topology: {}", stats.stream_topology);
+            eprintln!("mtp_execution_topology: {}", stats.execution_topology);
             eprintln!(
                 "mtp_rounds: {}, mtp_draft_tokens: {}, mtp_accepted_tokens: {}, mtp_accept_rate: {:.3}, mtp_optimistic_blocks: {}, mtp_optimistic_bonus_tokens: {}, mtp_optimistic_bonus_matches: {}, mtp_optimistic_bonus_mismatches: {}, mtp_consumed_optimistic_tokens: {}, mtp_reused_optimistic_blocks: {}, mtp_reused_optimistic_tokens: {}, mtp_discarded_optimistic_blocks: {}, mtp_discarded_optimistic_tokens: {}, mtp_adaptive_lookahead_disabled: {}, mtp_cross_request_draft_opportunities: {}",
                 stats.rounds,

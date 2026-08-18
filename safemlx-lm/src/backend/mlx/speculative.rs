@@ -1,5 +1,7 @@
 //! MLX execution primitives for speculative model sessions.
 
+use std::path::Path;
+
 use safemlx::{
     error::Exception,
     ops::{indexing::TryIndexOp, maximum, softmax_axis},
@@ -12,7 +14,217 @@ use safemlx_lm_core::{
     SpeculativeRandomness, SpeculativeSampling,
 };
 
-use crate::runtime::generation::sampler::SpeculativeSampler;
+use crate::{
+    api::{
+        gemma4_assistant::{
+            load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
+            Gemma4AssistantDraftModel,
+        },
+        ModelCache, ModelLoadOptions,
+    },
+    architectures::muse_glimmer::assistant::{self as muse_dflash, MuseGlimmerDFlash},
+    error::Error,
+    runtime::generation::sampler::SpeculativeSampler,
+};
+
+/// Architecture-dispatched MLX draft model with its fixed execution placement.
+pub struct MlxDrafter {
+    model: MlxDrafterModel,
+    tokenizer_fingerprint: Option<[u8; 32]>,
+    stream: Stream,
+}
+
+enum MlxDrafterModel {
+    Gemma4(Box<Gemma4AssistantDraftModel>),
+    MuseGlimmerDFlash(Box<MuseGlimmerDFlash>),
+}
+
+/// Stable architecture identity for an independently loaded MLX draft model.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MlxDrafterKind {
+    /// Gemma 4 external assistant.
+    Gemma4Assistant,
+    /// Muse-Glimmer anchor-plus-15-mask DFlash assistant.
+    MuseGlimmerDFlash,
+}
+
+/// MLX target caches for independently progressing speculative text lanes.
+pub struct MlxMtpCache {
+    pub(crate) lanes: Vec<ModelCache>,
+}
+
+impl MlxMtpCache {
+    pub(crate) fn new(lanes: Vec<ModelCache>) -> Self {
+        Self { lanes }
+    }
+
+    /// Number of independent sequence lanes.
+    pub fn len(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Whether this cache contains no sequence lanes.
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+}
+
+impl MlxDrafter {
+    /// Loads a drafter from an explicit checkpoint path and fixes its execution stream.
+    pub fn load(
+        source: impl AsRef<Path>,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<Self, Error> {
+        Self::load_with_options(source, ModelLoadOptions::default(), stream, weights_stream)
+    }
+
+    /// Loads a drafter using architecture-independent weight options.
+    pub fn load_with_options(
+        source: impl AsRef<Path>,
+        options: ModelLoadOptions,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<Self, Error> {
+        let source = source.as_ref();
+        let tokenizer_fingerprint = if source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            Some(crate::api::tokenizer_vocabulary_fingerprint(
+                &crate::api::load_tokenizer(source)?,
+            ))
+        } else {
+            let tokenizer_path = source.join("tokenizer.json");
+            tokenizer_path
+                .exists()
+                .then(|| {
+                    tokenizers::Tokenizer::from_file(tokenizer_path)
+                        .map(safemlx_lm_utils::tokenizer::Tokenizer::from_tokenizer)
+                        .map(|tokenizer| crate::api::tokenizer_vocabulary_fingerprint(&tokenizer))
+                })
+                .transpose()?
+        };
+        let is_gguf = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
+        let model = if is_gguf {
+            let checkpoint = safemlx::ops::GgufCheckpoint::open(source)?;
+            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let architecture = metadata
+                .get("general.architecture")
+                .and_then(safemlx::ops::GgufMetadataValue::as_str)
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(
+                        "drafter GGUF requires string general.architecture".into(),
+                    )
+                })?;
+            match architecture {
+                "dflash" => MlxDrafterModel::MuseGlimmerDFlash(Box::new(
+                    muse_dflash::load_with_options(source, options, stream, weights_stream)?,
+                )),
+                "gemma4_assistant" | "gemma4-assistant" => {
+                    MlxDrafterModel::Gemma4(Box::new(load_gemma4_assistant_gguf_with_options(
+                        source,
+                        options,
+                        stream,
+                        weights_stream,
+                    )?))
+                }
+                other => {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "unsupported drafter GGUF architecture {other:?}"
+                    )))
+                }
+            }
+        } else {
+            let config: serde_json::Value =
+                serde_json::from_reader(std::fs::File::open(source.join("config.json"))?)?;
+            match config
+                .get("model_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+            {
+                "muse_glimmer_assistant" => MlxDrafterModel::MuseGlimmerDFlash(Box::new(
+                    muse_dflash::load_with_options(source, options, stream, weights_stream)?,
+                )),
+                "gemma4_assistant" => {
+                    MlxDrafterModel::Gemma4(Box::new(load_gemma4_assistant_model_with_options(
+                        source,
+                        options,
+                        stream,
+                        weights_stream,
+                    )?))
+                }
+                other => {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "unsupported safetensors drafter model_type {other:?}"
+                    )))
+                }
+            }
+        };
+        Ok(Self {
+            model,
+            tokenizer_fingerprint,
+            stream: stream.clone(),
+        })
+    }
+
+    /// Architecture detected from the checkpoint itself.
+    pub const fn kind(&self) -> MlxDrafterKind {
+        match self.model {
+            MlxDrafterModel::Gemma4(_) => MlxDrafterKind::Gemma4Assistant,
+            MlxDrafterModel::MuseGlimmerDFlash(_) => MlxDrafterKind::MuseGlimmerDFlash,
+        }
+    }
+
+    pub(crate) fn gemma4(&self) -> &Gemma4AssistantDraftModel {
+        match &self.model {
+            MlxDrafterModel::Gemma4(model) => model,
+            MlxDrafterModel::MuseGlimmerDFlash(_) => {
+                panic!("requested Gemma 4 assistant from Muse-Glimmer DFlash drafter")
+            }
+        }
+    }
+
+    pub(crate) fn gemma4_mut(&mut self) -> &mut Gemma4AssistantDraftModel {
+        match &mut self.model {
+            MlxDrafterModel::Gemma4(model) => model,
+            MlxDrafterModel::MuseGlimmerDFlash(_) => {
+                panic!("requested Gemma 4 assistant from Muse-Glimmer DFlash drafter")
+            }
+        }
+    }
+
+    pub(crate) fn muse_glimmer(&self) -> &MuseGlimmerDFlash {
+        match &self.model {
+            MlxDrafterModel::MuseGlimmerDFlash(model) => model,
+            MlxDrafterModel::Gemma4(_) => {
+                panic!("requested Muse-Glimmer DFlash from Gemma 4 assistant")
+            }
+        }
+    }
+
+    pub(crate) fn muse_glimmer_mut(&mut self) -> &mut MuseGlimmerDFlash {
+        match &mut self.model {
+            MlxDrafterModel::MuseGlimmerDFlash(model) => model,
+            MlxDrafterModel::Gemma4(_) => {
+                panic!("requested Muse-Glimmer DFlash from Gemma 4 assistant")
+            }
+        }
+    }
+
+    pub(crate) fn tokenizer_fingerprint(&self) -> Option<[u8; 32]> {
+        self.tokenizer_fingerprint
+    }
+
+    /// Execution stream selected when this drafter was loaded.
+    pub const fn stream(&self) -> &Stream {
+        &self.stream
+    }
+}
 
 /// Target and assistant streams assigned to one speculative session.
 #[derive(Debug, Clone, Copy)]

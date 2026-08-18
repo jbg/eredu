@@ -95,7 +95,7 @@ impl Model {
     /// Generates with MTP using the default lossless sampling policy.
     pub fn generate_mtp_input(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
@@ -117,7 +117,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_input_with_sampler<S: SpeculativeSampler + Clone>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
@@ -140,7 +140,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn generate_mtp_input_with_sampler_callback_and_streams<S, F>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
@@ -169,7 +169,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn generate_mtp_input_with_sampler_callback_and_streams_and_options<S, F>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,
@@ -232,7 +232,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn generate_mtp_input_with_semantics_and_options<S, F>(
         &mut self,
-        drafter: &mut LoadedDrafter,
+        drafter: &mut MlxDrafter,
         cache: &mut ModelCache,
         input: input::ModelInput<'_>,
         config: &MtpConfig,

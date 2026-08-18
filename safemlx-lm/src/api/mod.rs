@@ -47,7 +47,7 @@ use crate::runtime::checkpoint::quantization::WeightQuantization;
 use crate::runtime::distributed::topology::ParallelTopology;
 use crate::runtime::execution::inspection::ActivationObserver;
 use crate::runtime::generation::sampler::{
-    CheckpointConfiguredSampler, ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler,
+    ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler,
 };
 use crate::runtime::generation::streaming::{
     drive_committed_generation_cancellable, CommittedTokenPipeline, CommittedTokenSource,
@@ -58,15 +58,15 @@ use crate::runtime::media::PreparedModelInput;
 #[cfg(feature = "media-processing")]
 use crate::runtime::media::{load_processor, ChatMediaBinding, ModelProcessor, ProcessorInput};
 use crate::{
-    backend::mlx::speculative::MtpExecutionStreams,
+    backend::mlx::speculative::{MlxDrafter, MlxDrafterKind, MlxMtpCache, MtpExecutionStreams},
     core::cache::{CacheResidencyPool, LayerCachePolicy},
     error::Error,
     runtime::attention::LayerSchedule,
     runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::generation::speculative::{
-        DrafterKind, LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind,
-        MtpScheduler, MtpSchedulerStats, MtpSemanticState, MtpStats,
+        MtpBatchOutput, MtpCapability, MtpCheckpointKind, MtpScheduler, MtpSchedulerStats,
+        MtpSemanticState, MtpStats,
     },
 };
 
@@ -296,11 +296,10 @@ use request::{
     ResolvedPreparedChatGenerationSettings,
 };
 pub use request::{
-    PreparedChatEmbeddedMtpBatchRequest, PreparedChatEmbeddedMtpGenerationRequest,
-    PreparedChatGenerationOutput, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-    PreparedChatInput, PreparedChatMtpBatchLane, PreparedChatMtpBatchOutput,
-    PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationOutput,
-    PreparedChatMtpGenerationRequest, TextDecoder,
+    PreparedChatDraft, PreparedChatGenerationOutput, PreparedChatGenerationRequest,
+    PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
+    PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
+    PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest, TextDecoder,
 };
 /// Codec-free realtime speech-to-speech token APIs.
 pub mod realtime;

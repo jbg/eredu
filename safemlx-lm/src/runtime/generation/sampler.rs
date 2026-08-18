@@ -947,89 +947,6 @@ pub struct GenerationSampler {
     generated_tokens: Vec<u32>,
 }
 
-/// Resolves the built-in default policy to checkpoint filters while preserving
-/// explicitly supplied custom samplers unchanged.
-#[derive(Clone)]
-pub(crate) struct CheckpointConfiguredSampler<S> {
-    custom: S,
-    checkpoint: Option<GenerationSampler>,
-}
-
-impl<S> CheckpointConfiguredSampler<S> {
-    pub(crate) fn for_sampler(custom: S, checkpoint: GenerationSampler, enabled: bool) -> Self {
-        Self {
-            custom,
-            checkpoint: enabled.then_some(checkpoint),
-        }
-    }
-}
-
-impl<S: Sampler> Sampler for CheckpointConfiguredSampler<S> {
-    fn sample(
-        &mut self,
-        logits: &Array,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        match &mut self.checkpoint {
-            Some(sampler) => sampler.sample(logits, temp, prng_state, stream),
-            None => self.custom.sample(logits, temp, prng_state, stream),
-        }
-    }
-}
-
-impl<S: SpeculativeSampler> SpeculativeSampler for CheckpointConfiguredSampler<S> {
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        match &self.checkpoint {
-            Some(sampler) => sampler.supports_exact_optimistic_promotion(),
-            None => self.custom.supports_exact_optimistic_promotion(),
-        }
-    }
-
-    fn process_logits(
-        &mut self,
-        logits: &Array,
-        temperature: f32,
-        history: &[u32],
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        match &mut self.checkpoint {
-            Some(sampler) => sampler.process_logits(logits, temperature, history, stream),
-            None => self
-                .custom
-                .process_logits(logits, temperature, history, stream),
-        }
-    }
-
-    fn sample_processed(
-        &self,
-        logits: &Array,
-        temperature: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        match &self.checkpoint {
-            Some(sampler) => sampler.sample_processed(logits, temperature, prng_state, stream),
-            None => self
-                .custom
-                .sample_processed(logits, temperature, prng_state, stream),
-        }
-    }
-
-    fn commit_token(
-        &mut self,
-        processed_logits: &Array,
-        token: u32,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        match &mut self.checkpoint {
-            Some(sampler) => sampler.commit_token(processed_logits, token, stream),
-            None => self.custom.commit_token(processed_logits, token, stream),
-        }
-    }
-}
-
 impl Default for GenerationSampler {
     fn default() -> Self {
         Self {
@@ -1057,6 +974,12 @@ impl GenerationSampler {
             .top_k(config.top_k)
             .top_p(config.top_p)
             .min_p(config.min_p)
+            .penalties(
+                config.repetition_penalty,
+                config.repeat_last_n,
+                config.frequency_penalty,
+                config.presence_penalty,
+            )
     }
 
     /// Creates a sampler with an initial accepted-token history.

@@ -1,6 +1,6 @@
 //! MLX speculative sampling and scheduling over the portable executor contract.
 
-use std::{cell::Cell, marker::PhantomData, path::Path, rc::Rc, time::Duration};
+use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 
 #[cfg(test)]
 use crate::core::generation::MtpRequestPhase;
@@ -19,15 +19,7 @@ use safemlx_lm_core::{
 };
 
 use crate::{
-    api::{
-        gemma4_assistant::{
-            load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
-            Gemma4AssistantDraftModel,
-        },
-        input::{InputPayload, Modality, ModelInput},
-        ModelCache, ModelLoadOptions,
-    },
-    architectures::muse_glimmer::assistant::{self as muse_dflash, MuseGlimmerDFlash},
+    api::input::{InputPayload, Modality, ModelInput},
     backend::mlx::{
         speculative::{MlxSpeculativeCompletion, MlxSpeculativeSampling, MtpExecutionStreams},
         MlxModelInput,
@@ -36,199 +28,8 @@ use crate::{
         FinishReason, GenerationCancellationToken, GenerationSequence, MtpConfig, MtpRequestId,
         MtpSchedulerOptions, SemanticEvent,
     },
-    error::Error,
     runtime::generation::sampler::SpeculativeSampler,
 };
-
-/// Architecture-dispatched draft model loaded independently of a target.
-pub struct LoadedDrafter {
-    model: DrafterModel,
-    tokenizer_fingerprint: Option<[u8; 32]>,
-}
-
-enum DrafterModel {
-    Gemma4(Box<Gemma4AssistantDraftModel>),
-    MuseGlimmerDFlash(Box<MuseGlimmerDFlash>),
-}
-
-/// Stable architecture identity for an independently loaded draft model.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum DrafterKind {
-    /// Gemma 4 external assistant.
-    Gemma4Assistant,
-    /// Muse-Glimmer anchor-plus-15-mask DFlash assistant.
-    MuseGlimmerDFlash,
-}
-
-/// Per-lane target caches for independently progressing MTP text batches.
-pub struct MtpCache {
-    pub(crate) lanes: Vec<ModelCache>,
-}
-
-impl MtpCache {
-    pub(crate) fn new(lanes: Vec<ModelCache>) -> Self {
-        Self { lanes }
-    }
-
-    /// Returns the number of independent sequence lanes.
-    pub fn len(&self) -> usize {
-        self.lanes.len()
-    }
-
-    /// Returns whether this cache contains no sequence lanes.
-    pub fn is_empty(&self) -> bool {
-        self.lanes.is_empty()
-    }
-}
-
-impl LoadedDrafter {
-    /// Loads a drafter from an explicit checkpoint path.
-    pub fn load(
-        source: impl AsRef<Path>,
-        stream: &Stream,
-        weights_stream: &Stream,
-    ) -> Result<Self, Error> {
-        Self::load_with_options(source, ModelLoadOptions::default(), stream, weights_stream)
-    }
-
-    /// Loads a drafter using architecture-independent weight options.
-    pub fn load_with_options(
-        source: impl AsRef<Path>,
-        options: ModelLoadOptions,
-        stream: &Stream,
-        weights_stream: &Stream,
-    ) -> Result<Self, Error> {
-        let source = source.as_ref();
-        let tokenizer_fingerprint = if source
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-        {
-            Some(crate::api::tokenizer_vocabulary_fingerprint(
-                &crate::api::load_tokenizer(source)?,
-            ))
-        } else {
-            let tokenizer_path = source.join("tokenizer.json");
-            tokenizer_path
-                .exists()
-                .then(|| {
-                    tokenizers::Tokenizer::from_file(tokenizer_path)
-                        .map(safemlx_lm_utils::tokenizer::Tokenizer::from_tokenizer)
-                        .map(|tokenizer| crate::api::tokenizer_vocabulary_fingerprint(&tokenizer))
-                })
-                .transpose()?
-        };
-        let is_gguf = source
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
-        if is_gguf {
-            let checkpoint = safemlx::ops::GgufCheckpoint::open(source)?;
-            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-            let architecture = metadata
-                .get("general.architecture")
-                .and_then(safemlx::ops::GgufMetadataValue::as_str)
-                .ok_or_else(|| {
-                    Error::UnsupportedArchitecture(
-                        "drafter GGUF requires string general.architecture".into(),
-                    )
-                })?;
-            let model = match architecture {
-                "dflash" => DrafterModel::MuseGlimmerDFlash(Box::new(
-                    muse_dflash::load_with_options(source, options, stream, weights_stream)?,
-                )),
-                "gemma4_assistant" | "gemma4-assistant" => {
-                    DrafterModel::Gemma4(Box::new(load_gemma4_assistant_gguf_with_options(
-                        source,
-                        options,
-                        stream,
-                        weights_stream,
-                    )?))
-                }
-                other => {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "unsupported drafter GGUF architecture {other:?}"
-                    )))
-                }
-            };
-            return Ok(Self {
-                model,
-                tokenizer_fingerprint,
-            });
-        }
-        let config: serde_json::Value =
-            serde_json::from_reader(std::fs::File::open(source.join("config.json"))?)?;
-        let model_type = config
-            .get("model_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let model = match model_type {
-            "muse_glimmer_assistant" => DrafterModel::MuseGlimmerDFlash(Box::new(
-                muse_dflash::load_with_options(source, options, stream, weights_stream)?,
-            )),
-            "gemma4_assistant" => DrafterModel::Gemma4(Box::new(
-                load_gemma4_assistant_model_with_options(source, options, stream, weights_stream)?,
-            )),
-            other => {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "unsupported safetensors drafter model_type {other:?}"
-                )))
-            }
-        };
-        Ok(Self {
-            model,
-            tokenizer_fingerprint,
-        })
-    }
-
-    /// Returns the architecture detected from the checkpoint itself.
-    pub const fn kind(&self) -> DrafterKind {
-        match self.model {
-            DrafterModel::Gemma4(_) => DrafterKind::Gemma4Assistant,
-            DrafterModel::MuseGlimmerDFlash(_) => DrafterKind::MuseGlimmerDFlash,
-        }
-    }
-
-    pub(crate) fn gemma4(&self) -> &Gemma4AssistantDraftModel {
-        match &self.model {
-            DrafterModel::Gemma4(model) => model,
-            DrafterModel::MuseGlimmerDFlash(_) => {
-                panic!("requested Gemma 4 assistant from Muse-Glimmer DFlash drafter")
-            }
-        }
-    }
-
-    pub(crate) fn gemma4_mut(&mut self) -> &mut Gemma4AssistantDraftModel {
-        match &mut self.model {
-            DrafterModel::Gemma4(model) => model,
-            DrafterModel::MuseGlimmerDFlash(_) => {
-                panic!("requested Gemma 4 assistant from Muse-Glimmer DFlash drafter")
-            }
-        }
-    }
-
-    pub(crate) fn muse_glimmer(&self) -> &MuseGlimmerDFlash {
-        match &self.model {
-            DrafterModel::MuseGlimmerDFlash(model) => model,
-            DrafterModel::Gemma4(_) => {
-                panic!("requested Muse-Glimmer DFlash from Gemma 4 assistant")
-            }
-        }
-    }
-
-    pub(crate) fn muse_glimmer_mut(&mut self) -> &mut MuseGlimmerDFlash {
-        match &mut self.model {
-            DrafterModel::MuseGlimmerDFlash(model) => model,
-            DrafterModel::Gemma4(_) => {
-                panic!("requested Muse-Glimmer DFlash from Gemma 4 assistant")
-            }
-        }
-    }
-
-    pub(crate) fn tokenizer_fingerprint(&self) -> Option<[u8; 32]> {
-        self.tokenizer_fingerprint
-    }
-}
 
 /// How an architecture exposes draft-token weights.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2387,11 +2188,11 @@ mod tests {
         let stats = &output.requests[0].stats;
 
         assert_eq!(
-            output.scheduler.stream_topology,
+            output.scheduler.execution_topology,
             SpeculativeExecutionTopology::SameDeviceSplit
         );
         assert_eq!(
-            stats.stream_topology,
+            stats.execution_topology,
             SpeculativeExecutionTopology::SameDeviceSplit
         );
         assert!(stats.optimistic_draft_blocks > 0);
@@ -2498,7 +2299,7 @@ mod tests {
         let canonical = run(false);
 
         assert_eq!(
-            request.stats.stream_topology,
+            request.stats.execution_topology,
             SpeculativeExecutionTopology::SameDeviceSplit
         );
         assert_eq!(request.token_ids, canonical.token_ids);

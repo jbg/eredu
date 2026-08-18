@@ -24,9 +24,11 @@ usable proposal depth is capped by the checkpoint's validated capability.
 Applications should query `mtp_capability` or run model inspection instead of
 assuming support from a family name.
 
-## Stream placement
+## Execution placement
 
-`MtpExecutionStreams` distinguishes three placements:
+Prepared-chat requests do not accept streams. The target retains the execution
+placement selected when it was loaded; an external `MlxDrafter` independently
+retains its load-time placement. The MLX adapter classifies that pair as:
 
 | Placement | Behavior |
 | --- | --- |
@@ -74,10 +76,11 @@ Promotion requires:
 - draft sampling that is a pure function of logits, explicit history,
   immutable settings, and the supplied position-addressed PRNG state.
 
-External Gemma assistants and the default history-derived samplers satisfy
-these rules. Embedded predictors whose commit advances target-owned state, and
-adaptive samplers such as Mirostat V2, still use MTP but do not use same-request
-optimistic lookahead.
+External Gemma assistants and the portable history-derived sampler satisfy
+these rules. Embedded predictors whose commit advances target-owned state do
+not use same-request optimistic lookahead. Mirostat V2 remains available only
+on the explicit low-level MLX sampling API; it is not part of the portable
+prepared-chat sampling schema.
 
 `MtpSchedulerOptions::with_lookahead(false)` disables only the optional branch;
 the same drafting, verification, acceptance, cache commit, callback, and

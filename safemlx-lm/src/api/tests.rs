@@ -3,13 +3,11 @@ use super::{
     inspect_chat_template_kwargs, load_chat_template, load_model_with_options, load_tokenizer,
     load_tokenizer_template_kwargs, merge_eos_token_id_sources, prepare_chat_from_parts,
     resolve_model_config, validate_gguf_quantization_source, with_prepared_chat_runtime,
-    LoadedModel, ModelLoadOptions, PreparedChatEmbeddedMtpBatchRequest,
-    PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
+    LoadedModel, ModelLoadOptions, PreparedChatDraft, PreparedChatInput,
+    PreparedChatMtpBatchRequest,
 };
 use crate::{
-    core::generation::{
-        FinishReason, GenerationCancellationToken, MtpSchedulerOptions, SemanticEvent,
-    },
+    core::generation::{FinishReason, MtpSchedulerOptions, SemanticEvent},
     core::SpeculativeExecutionTopology,
     error::Error,
     runtime::chat::constraints::ConstraintCompiler,
@@ -699,16 +697,10 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(input.backend_prompt().is_some());
 
-    let error = with_prepared_chat_runtime(
-        &prepared,
-        DefaultSampler,
-        GenerationSampler::default(),
-        true,
-        |_| {
-            execution_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        },
-    )
+    let error = with_prepared_chat_runtime(&prepared, GenerationSampler::default(), |_| {
+        execution_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })
     .unwrap_err();
 
     assert!(matches!(
@@ -788,52 +780,21 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         constraint_compiler: compiler,
     };
 
-    let mut empty_cache = model.new_mtp_cache(0);
     let output = model
-        .generate_prepared_chat_embedded_mtp_batch::<DefaultSampler>(
-            PreparedChatEmbeddedMtpBatchRequest {
-                cache: &mut empty_cache,
-                lanes: Vec::new(),
-                stream,
-                scheduler: MtpSchedulerOptions::default(),
-            },
-        )
+        .generate_prepared_chat_mtp_batch(PreparedChatMtpBatchRequest {
+            drafting: PreparedChatDraft::Embedded,
+            lanes: Vec::new(),
+            scheduler: MtpSchedulerOptions::default(),
+        })
         .unwrap();
     fs::remove_dir_all(directory).unwrap();
 
     assert!(output.requests.is_empty());
     assert_eq!(
-        output.scheduler.stream_topology,
+        output.scheduler.execution_topology,
         SpeculativeExecutionTopology::Single
     );
     assert_eq!(output.scheduler.turns, 0);
-
-    let wrong_cache = super::ModelCache::KeyValue(Vec::new());
-    let mut wrong_cache = crate::runtime::generation::speculative::MtpCache::new(vec![wrong_cache]);
-    let error = model
-        .generate_prepared_chat_embedded_mtp_batch(PreparedChatEmbeddedMtpBatchRequest {
-            cache: &mut wrong_cache,
-            lanes: vec![PreparedChatMtpBatchLane {
-                input: PreparedChatInput::rendered_prompt(&prepared),
-                sampling_policy: DefaultSampler,
-                settings: PreparedChatGenerationSettings::default(),
-                max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
-                caller_stop_sequences: &[],
-                cancellation: GenerationCancellationToken::new(),
-                on_event: Box::new(|_| {}),
-            }],
-            stream,
-            scheduler: MtpSchedulerOptions::default(),
-        })
-        .unwrap_err();
-    assert!(
-        matches!(
-            &error,
-            Error::PreparedChatGeneration(message)
-                if message.contains("prepared-chat Qwen3.5 embedded MTP cache type mismatch at lane 0")
-        ),
-        "unexpected error: {error:?}"
-    );
 }
 
 #[test]

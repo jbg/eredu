@@ -937,8 +937,8 @@ pub struct ExpertCacheTelemetry {
 /// Speculative-decoding observations for one request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MtpTelemetry {
-    /// Stable stream-topology label.
-    pub stream_topology: String,
+    /// Stable target/assistant execution-placement topology label.
+    pub execution_topology: String,
     /// Target tokens evaluated.
     pub target_tokens: usize,
     /// Assistant proposals.
@@ -970,7 +970,7 @@ pub struct MtpTelemetry {
 impl From<&MtpStats> for MtpTelemetry {
     fn from(stats: &MtpStats) -> Self {
         Self {
-            stream_topology: stats.stream_topology.to_string(),
+            execution_topology: stats.execution_topology.to_string(),
             target_tokens: stats.target_tokens,
             draft_tokens: stats.draft_tokens,
             accepted_tokens: stats.accepted_tokens,

@@ -635,6 +635,18 @@ pub struct CheckpointGenerationConfig {
     /// Recommended minimum-probability filter.
     #[serde(default)]
     pub min_p: Option<f32>,
+    /// Recommended multiplicative repetition penalty.
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    /// Recommended generated-history window for repetition penalties.
+    #[serde(default)]
+    pub repeat_last_n: Option<i32>,
+    /// Recommended additive frequency penalty.
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// Recommended additive presence penalty.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
     /// Recommended maximum number of new tokens.
     #[serde(default)]
     pub max_new_tokens: Option<usize>,
@@ -653,6 +665,14 @@ pub struct GenerationConfigOverrides {
     pub top_p: Option<f32>,
     /// Overrides min-p filtering.
     pub min_p: Option<f32>,
+    /// Overrides the multiplicative repetition penalty.
+    pub repetition_penalty: Option<f32>,
+    /// Overrides the generated-history window used by repetition penalties.
+    pub repeat_last_n: Option<i32>,
+    /// Overrides the additive frequency penalty.
+    pub frequency_penalty: Option<f32>,
+    /// Overrides the additive presence penalty.
+    pub presence_penalty: Option<f32>,
     /// Overrides the output-token budget.
     pub max_new_tokens: Option<usize>,
 }
@@ -670,6 +690,14 @@ pub struct ResolvedGenerationConfig {
     pub top_p: f32,
     /// Effective min-p probability.
     pub min_p: f32,
+    /// Effective multiplicative repetition penalty.
+    pub repetition_penalty: f32,
+    /// Effective generated-history window for repetition penalties.
+    pub repeat_last_n: i32,
+    /// Effective additive frequency penalty.
+    pub frequency_penalty: f32,
+    /// Effective additive presence penalty.
+    pub presence_penalty: f32,
     /// Effective token budget, when declared.
     pub max_new_tokens: Option<usize>,
 }
@@ -715,6 +743,22 @@ pub fn resolve_generation_config(
             .min_p
             .or(checkpoint.min_p)
             .unwrap_or(if checkpoint_present { 0.0 } else { 0.05 }),
+        repetition_penalty: overrides
+            .repetition_penalty
+            .or(checkpoint.repetition_penalty)
+            .unwrap_or(1.0),
+        repeat_last_n: overrides
+            .repeat_last_n
+            .or(checkpoint.repeat_last_n)
+            .unwrap_or(64),
+        frequency_penalty: overrides
+            .frequency_penalty
+            .or(checkpoint.frequency_penalty)
+            .unwrap_or(0.0),
+        presence_penalty: overrides
+            .presence_penalty
+            .or(checkpoint.presence_penalty)
+            .unwrap_or(0.0),
         max_new_tokens: overrides.max_new_tokens.or(checkpoint.max_new_tokens),
     };
     if !resolved.temperature.is_finite() || resolved.temperature < 0.0 {
@@ -731,6 +775,21 @@ pub fn resolve_generation_config(
     }
     if !resolved.min_p.is_finite() || !(0.0..=1.0).contains(&resolved.min_p) {
         return Err(GenerationError::InvalidMinP(resolved.min_p));
+    }
+    if !resolved.repetition_penalty.is_finite() || resolved.repetition_penalty <= 0.0 {
+        return Err(GenerationError::InvalidRepetitionPenalty(
+            resolved.repetition_penalty,
+        ));
+    }
+    if !resolved.frequency_penalty.is_finite() {
+        return Err(GenerationError::InvalidFrequencyPenalty(
+            resolved.frequency_penalty,
+        ));
+    }
+    if !resolved.presence_penalty.is_finite() {
+        return Err(GenerationError::InvalidPresencePenalty(
+            resolved.presence_penalty,
+        ));
     }
     if resolved.max_new_tokens == Some(0) {
         return Err(GenerationError::ZeroTokenBudget);
@@ -832,6 +891,15 @@ pub enum GenerationError {
     /// Min-p lies outside zero through one.
     #[error("min_p must be between zero and one, got {0}")]
     InvalidMinP(f32),
+    /// Repetition penalty is non-finite or non-positive.
+    #[error("repetition_penalty must be finite and positive, got {0}")]
+    InvalidRepetitionPenalty(f32),
+    /// Frequency penalty is non-finite.
+    #[error("frequency_penalty must be finite, got {0}")]
+    InvalidFrequencyPenalty(f32),
+    /// Presence penalty is non-finite.
+    #[error("presence_penalty must be finite, got {0}")]
+    InvalidPresencePenalty(f32),
     /// An explicit token budget was zero.
     #[error("max_new_tokens must be positive when supplied")]
     ZeroTokenBudget,
@@ -947,6 +1015,7 @@ mod tests {
             do_sample: Some(true),
             temperature: Some(0.8),
             top_k: Some(64),
+            repetition_penalty: Some(1.1),
             ..CheckpointGenerationConfig::default()
         };
         let resolved =
@@ -954,6 +1023,18 @@ mod tests {
                 .unwrap();
         assert!(resolved.do_sample);
         assert_eq!(resolved.top_k, 64);
+        assert_eq!(resolved.repetition_penalty, 1.1);
+        assert_eq!(resolved.repeat_last_n, 64);
+        assert!(matches!(
+            resolve_generation_config(
+                None,
+                GenerationConfigOverrides {
+                    frequency_penalty: Some(f32::NAN),
+                    ..GenerationConfigOverrides::default()
+                }
+            ),
+            Err(GenerationError::InvalidFrequencyPenalty(value)) if value.is_nan()
+        ));
         assert!(MtpConfig::default().validate().is_ok());
         assert!(MtpSchedulerOptions::default().validate().is_ok());
         assert!(matches!(

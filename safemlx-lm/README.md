@@ -172,8 +172,10 @@ and semantic-event publication. The MLX publisher is a thin concrete callback
 sink. The generic core `SpeculativeRequestTable` also owns the production
 request collection, cancellation scan, fair action application, resource-slot
 invariants, aggregate accounting, and ordered finalization. The facade supplies
-only the MLX executor, streams, caches, randomness representation, sampler, and
-publisher types used to instantiate it. MLX retains the actual logits transforms, probability/residual
+only the MLX executor and publisher used to instantiate it. Prepared-chat MTP
+requests contain portable sampling and scheduler settings; target and drafter
+execution placement is fixed when those models are loaded, and MLX cache lanes
+are adapter-owned. MLX retains the actual logits transforms, probability/residual
 arithmetic, random arrays, cross-stream transfers, component timing probes, and
 tensor execution.
 

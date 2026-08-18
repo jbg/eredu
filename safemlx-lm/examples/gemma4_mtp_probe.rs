@@ -3,7 +3,7 @@ use std::{path::PathBuf, time::Instant};
 use safemlx::{transforms::eval, ExecutionContext, Stream};
 use safemlx_lm::{
     api::LoadedModel,
-    runtime::generation::speculative::LoadedDrafter,
+    backend::mlx::speculative::MlxDrafter,
     runtime::media::input::{InputPart, ModelInput},
     GenerationConfigOverrides, MtpConfig,
 };
@@ -149,7 +149,7 @@ fn run_mtp(
     weights_stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
     let mut target = LoadedModel::load(target_dir, stream, weights_stream)?;
-    let mut assistant = LoadedDrafter::load(assistant_dir, stream, weights_stream)?;
+    let mut assistant = MlxDrafter::load(assistant_dir, stream, weights_stream)?;
     let prompt_tokens = target.encode_to_array(prompt, false, stream)?;
     let parts = [InputPart::text_token_ids(&prompt_tokens)];
     let input = ModelInput::new(&parts);

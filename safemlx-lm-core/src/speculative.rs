@@ -38,7 +38,7 @@ impl std::fmt::Display for SpeculativeExecutionTopology {
 #[derive(Debug, Clone, Default)]
 pub struct MtpStats {
     /// Relationship between the request's target and draft execution placements.
-    pub stream_topology: SpeculativeExecutionTopology,
+    pub execution_topology: SpeculativeExecutionTopology,
     /// Target tokens evaluated during prefill and verification.
     pub target_tokens: usize,
     /// Assistant tokens proposed.
@@ -122,7 +122,7 @@ impl MtpStats {
 #[derive(Debug, Clone, Default)]
 pub struct MtpSchedulerStats {
     /// Relationship between scheduler target and draft placements.
-    pub stream_topology: SpeculativeExecutionTopology,
+    pub execution_topology: SpeculativeExecutionTopology,
     /// Total scheduler operations.
     pub turns: usize,
     /// Draft turns performed while another request was being verified.
@@ -1666,7 +1666,7 @@ where
             schedule: SpeculativeSchedule::new(options)?,
             requests: Vec::new(),
             stats: MtpSchedulerStats {
-                stream_topology: topology,
+                execution_topology: topology,
                 ..MtpSchedulerStats::default()
             },
         })
@@ -1726,7 +1726,7 @@ where
         let id = MtpRequestId::new(self.requests.len());
         let started = Instant::now();
         let mut stats = MtpStats {
-            stream_topology: self.stats.stream_topology,
+            execution_topology: self.stats.execution_topology,
             component_timings_collected,
             ..MtpStats::default()
         };
