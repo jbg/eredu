@@ -6,12 +6,7 @@ use safemlx::{
     Array, Stream,
 };
 
-#[cfg(test)]
-use crate::runtime::chat::GenerationRuntimePlan;
-use crate::{
-    core::{TokenFilter, TokenFilterController},
-    runtime::chat::constraints::{ConstraintController, ConstraintError},
-};
+use crate::core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController};
 
 /// Sampling policy suitable for lossless speculative decoding.
 ///
@@ -141,17 +136,17 @@ pub trait Sampler {
 ///
 /// The standard policies in this module implement [`Clone`], which lets the
 /// MTP scheduler fork delegated adaptive state together with grammar state.
-pub(crate) struct ConstrainedSampler<S> {
+pub(crate) struct ConstrainedSampler<S, C> {
     policy: S,
-    controller: ConstraintController,
+    controller: C,
 }
 
-struct ConstraintCheckpoint<S> {
+struct ConstraintCheckpoint<S, C> {
     policy: S,
-    controller: ConstraintController,
+    controller: C,
 }
 
-impl<S: Clone> Clone for ConstrainedSampler<S> {
+impl<S: Clone, C: Clone> Clone for ConstrainedSampler<S, C> {
     fn clone(&self) -> Self {
         Self {
             policy: self.policy.clone(),
@@ -160,30 +155,10 @@ impl<S: Clone> Clone for ConstrainedSampler<S> {
     }
 }
 
-impl<S> ConstrainedSampler<S> {
-    /// Wraps `policy` with facade-prepared canonical constraint state.
-    pub(crate) fn with_controller(policy: S, controller: ConstraintController) -> Self {
+impl<S, C> ConstrainedSampler<S, C> {
+    /// Wraps `policy` with a portable canonical constraint controller.
+    pub(crate) fn new(policy: S, controller: C) -> Self {
         Self { policy, controller }
-    }
-
-    /// Wraps `policy` with the constraint and activation semantics in `plan`.
-    #[cfg(test)]
-    pub(crate) fn from_generation_plan(
-        policy: S,
-        plan: &GenerationRuntimePlan,
-    ) -> Result<Self, ConstraintError> {
-        Ok(Self::with_controller(
-            policy,
-            ConstraintController::from_generation_plan(plan)?,
-        ))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_tool_plan(
-        policy: S,
-        plan: &GenerationRuntimePlan,
-    ) -> Result<Self, ConstraintError> {
-        Self::from_generation_plan(policy, plan)
     }
 
     /// Returns the wrapped sampling policy.
@@ -192,31 +167,21 @@ impl<S> ConstrainedSampler<S> {
         &self.policy
     }
 
-    /// Returns whether grammar masking is currently active.
+    /// Returns the portable constraint controller.
     #[cfg(test)]
-    pub(crate) fn constraint_is_active(&self) -> bool {
-        self.controller.constraint_is_active()
+    pub(crate) fn controller(&self) -> &C {
+        &self.controller
     }
 
-    /// Returns whether the active grammar can complete at the current prefix.
-    ///
-    /// An inactive automatic constraint and a forbidden tool-call trigger both
-    /// report `false`.
-    pub fn grammar_is_complete(&mut self) -> Result<bool, ConstraintError> {
-        self.controller.grammar_is_complete()
-    }
-
-    /// Returns the valid token IDs at the durable logical prefix.
-    ///
-    /// `None` means grammar masking is not active.
+    /// Returns the portable constraint controller mutably.
     #[cfg(test)]
-    pub(crate) fn valid_token_ids(&mut self) -> Result<Option<Vec<u32>>, ConstraintError> {
-        self.controller.valid_token_ids()
+    pub(crate) fn controller_mut(&mut self) -> &mut C {
+        &mut self.controller
     }
 }
 
-impl<S: Clone> ConstrainedSampler<S> {
-    fn checkpoint(&self) -> ConstraintCheckpoint<S> {
+impl<S: Clone, C: Clone> ConstrainedSampler<S, C> {
+    fn checkpoint(&self) -> ConstraintCheckpoint<S, C> {
         ConstraintCheckpoint {
             policy: self.policy.clone(),
             controller: self.controller.clone(),
@@ -224,7 +189,11 @@ impl<S: Clone> ConstrainedSampler<S> {
     }
 }
 
-impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S> {
+impl<S, C> SpeculativeSampler for ConstrainedSampler<S, C>
+where
+    S: SpeculativeSampler + Clone,
+    C: SpeculativeTokenFilterController,
+{
     fn supports_exact_optimistic_promotion(&self) -> bool {
         // Constraint processing below reconstructs a private runtime from the
         // durable prefix and supplied history. That fork is pure and
@@ -234,7 +203,7 @@ impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S>
     }
 
     fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
-        ConstrainedSampler::grammar_is_complete(self).map_err(constraint_exception)
+        self.controller.is_complete().map_err(constraint_exception)
     }
 
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
@@ -280,7 +249,11 @@ impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S>
         if let Err(error) = self
             .policy
             .commit_token(processed_logits, token, stream)
-            .and_then(|()| self.controller.commit(token).map_err(constraint_exception))
+            .and_then(|()| {
+                self.controller
+                    .commit_token(token)
+                    .map_err(constraint_exception)
+            })
         {
             self.policy = checkpoint.policy;
             self.controller = checkpoint.controller;
@@ -290,7 +263,11 @@ impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S>
     }
 }
 
-impl<S: Sampler + Clone> Sampler for ConstrainedSampler<S> {
+impl<S, C> Sampler for ConstrainedSampler<S, C>
+where
+    S: Sampler + Clone,
+    C: TokenFilterController + Clone,
+{
     fn sample(
         &mut self,
         logits: &Array,
@@ -306,7 +283,7 @@ impl<S: Sampler + Clone> Sampler for ConstrainedSampler<S> {
         let masked = apply_token_filter(logits, &filter, stream)?;
         let token = self.policy.sample(&masked, temp, prng_state, stream)?;
         let token_id = token.clone().item::<u32>(stream);
-        if let Err(error) = self.controller.commit(token_id) {
+        if let Err(error) = self.controller.commit_token(token_id) {
             self.policy = checkpoint.policy;
             self.controller = checkpoint.controller;
             return Err(constraint_exception(error));
@@ -315,7 +292,7 @@ impl<S: Sampler + Clone> Sampler for ConstrainedSampler<S> {
     }
 }
 
-fn constraint_exception(error: ConstraintError) -> Exception {
+fn constraint_exception(error: impl std::fmt::Display) -> Exception {
     Exception::custom(error.to_string())
 }
 
@@ -995,7 +972,9 @@ mod tests {
         ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler,
         SpeculativeSampler,
     };
-    use crate::runtime::chat::constraints::{advance_trigger_prefix, completes_trigger};
+    use crate::runtime::chat::constraints::{
+        advance_trigger_prefix, completes_trigger, ConstraintController, ConstraintError,
+    };
     use crate::{
         core::generation::{FinishReason, SemanticEvent},
         runtime::chat::constraints::ConstraintCompiler,
@@ -1083,6 +1062,16 @@ mod tests {
             self.commits += 1;
             Ok(())
         }
+    }
+
+    fn constrained_sampler<S>(
+        policy: S,
+        plan: &GenerationRuntimePlan,
+    ) -> Result<ConstrainedSampler<S, ConstraintController>, ConstraintError> {
+        Ok(ConstrainedSampler::new(
+            policy,
+            ConstraintController::from_generation_plan(plan)?,
+        ))
     }
 
     fn synthetic_plan(tool_choice: ToolChoice) -> GenerationRuntimePlan {
@@ -1176,7 +1165,7 @@ mod tests {
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::Required);
         let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
-        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
+        let mut sampler = constrained_sampler(policy, &plan).unwrap();
         let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
         values[b'x' as usize] = 100.0;
         values[b'{' as usize] = 10.0;
@@ -1205,22 +1194,20 @@ mod tests {
         let plan = synthetic_plan(ToolChoice::Auto);
         let logits = placeholder_logits();
 
-        let mut partial =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+        let mut partial = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
         commit_bytes(
             &mut partial,
             &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
             &logits,
             stream,
         );
-        assert!(!partial.constraint_is_active());
-        assert_eq!(partial.valid_token_ids().unwrap(), None);
+        assert!(!partial.controller().constraint_is_active());
+        assert_eq!(partial.controller_mut().valid_token_ids().unwrap(), None);
 
-        let mut near =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+        let mut near = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
         commit_bytes(&mut near, br#"{"callx":"#, &logits, stream);
-        assert!(!near.constraint_is_active());
-        assert_eq!(near.valid_token_ids().unwrap(), None);
+        assert!(!near.controller().constraint_is_active());
+        assert_eq!(near.controller_mut().valid_token_ids().unwrap(), None);
     }
 
     #[test]
@@ -1229,15 +1216,14 @@ mod tests {
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::Auto);
         let logits = placeholder_logits();
-        let mut sampler =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+        let mut sampler = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
 
         for (index, &byte) in AUTO_TRIGGER.iter().enumerate() {
             sampler
                 .commit_token(&logits, u32::from(byte), stream)
                 .unwrap();
             assert_eq!(
-                sampler.constraint_is_active(),
+                sampler.controller().constraint_is_active(),
                 index + 1 == AUTO_TRIGGER.len()
             );
         }
@@ -1264,13 +1250,13 @@ mod tests {
         values[QUOTED_OPEN_TOKEN as usize] = 10.0;
         let logits = Array::from_slice(&values, &[1, vocab_size as i32]);
         let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
-        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
+        let mut sampler = constrained_sampler(policy, &plan).unwrap();
 
         let selected = Sampler::sample(&mut sampler, &logits, 0.0, None, stream).unwrap();
         eval([&selected]).unwrap();
 
         assert_eq!(selected.item::<u32>(stream), QUOTED_OPEN_TOKEN);
-        assert!(sampler.constraint_is_active());
+        assert!(sampler.controller().constraint_is_active());
 
         let mut continuation_values = vec![-100.0f32; vocab_size];
         continuation_values[b'x' as usize] = 100.0;
@@ -1292,7 +1278,7 @@ mod tests {
         values[b'c' as usize] = 10.0;
         let logits = Array::from_slice(&values, &[1, vocab_size as i32]);
         let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
-        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
+        let mut sampler = constrained_sampler(policy, &plan).unwrap();
 
         let processed = sampler
             .process_logits(&logits, 0.0, &[PREFIXED_QUOTED_OPEN_TOKEN], stream)
@@ -1303,14 +1289,14 @@ mod tests {
         eval([&selected]).unwrap();
 
         assert_eq!(selected.item::<u32>(stream), u32::from(b'c'));
-        assert!(!sampler.constraint_is_active());
+        assert!(!sampler.controller().constraint_is_active());
         sampler
             .commit_token(&logits, PREFIXED_QUOTED_OPEN_TOKEN, stream)
             .unwrap();
         sampler
             .commit_token(&processed, u32::from(b'c'), stream)
             .unwrap();
-        assert!(sampler.constraint_is_active());
+        assert!(sampler.controller().constraint_is_active());
     }
 
     #[test]
@@ -1323,7 +1309,7 @@ mod tests {
         values[b'x' as usize] = 100.0;
         values[b'{' as usize] = 10.0;
         let logits = Array::from_slice(&values, &[1, vocab_size as i32]);
-        let mut sampler = ConstrainedSampler::from_tool_plan(DefaultSampler, &plan).unwrap();
+        let mut sampler = constrained_sampler(DefaultSampler, &plan).unwrap();
         let mut optimistic = sampler.clone();
 
         let processed = optimistic
@@ -1335,14 +1321,14 @@ mod tests {
         eval([&selected]).unwrap();
 
         assert_eq!(selected.item::<u32>(stream), u32::from(b'{'));
-        assert!(!sampler.constraint_is_active());
+        assert!(!sampler.controller().constraint_is_active());
         sampler
             .commit_token(&logits, TRIGGER_AND_ARGUMENT_TOKEN, stream)
             .unwrap();
         sampler
             .commit_token(&processed, u32::from(b'{'), stream)
             .unwrap();
-        assert!(sampler.constraint_is_active());
+        assert!(sampler.controller().constraint_is_active());
     }
 
     #[test]
@@ -1351,16 +1337,14 @@ mod tests {
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::Auto);
         let logits = placeholder_logits();
-        let mut first =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
-        let mut second =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+        let mut first = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
+        let mut second = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
 
         commit_bytes(&mut first, AUTO_TRIGGER, &logits, stream);
 
-        assert!(first.constraint_is_active());
-        assert!(!second.constraint_is_active());
-        assert_eq!(second.valid_token_ids().unwrap(), None);
+        assert!(first.controller().constraint_is_active());
+        assert!(!second.controller().constraint_is_active());
+        assert_eq!(second.controller_mut().valid_token_ids().unwrap(), None);
         assert_eq!(first.policy().commits, AUTO_TRIGGER.len());
         assert_eq!(second.policy().commits, 0);
     }
@@ -1368,9 +1352,8 @@ mod tests {
     #[test]
     fn constrained_sampler_advertises_only_wrapped_exact_promotion() {
         let plan = synthetic_plan(ToolChoice::Required);
-        let exact = ConstrainedSampler::from_tool_plan(DefaultSampler, &plan).unwrap();
-        let adaptive =
-            ConstrainedSampler::from_tool_plan(MirostatV2Sampler::default(), &plan).unwrap();
+        let exact = constrained_sampler(DefaultSampler, &plan).unwrap();
+        let adaptive = constrained_sampler(MirostatV2Sampler::default(), &plan).unwrap();
 
         assert!(exact.supports_exact_optimistic_promotion());
         assert!(!adaptive.supports_exact_optimistic_promotion());
@@ -1383,10 +1366,10 @@ mod tests {
         let plan = synthetic_plan(ToolChoice::None);
         let logits = placeholder_logits();
         let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
-        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
+        let mut sampler = constrained_sampler(policy, &plan).unwrap();
 
-        assert!(!sampler.constraint_is_active());
-        assert_eq!(sampler.valid_token_ids().unwrap(), None);
+        assert!(!sampler.controller().constraint_is_active());
+        assert_eq!(sampler.controller_mut().valid_token_ids().unwrap(), None);
         commit_bytes(
             &mut sampler,
             &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
@@ -1403,8 +1386,7 @@ mod tests {
         eval([&selected]).unwrap();
         assert_eq!(selected.item::<u32>(stream), u32::from(b'x'));
 
-        let mut rejecting =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+        let mut rejecting = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
         commit_bytes(
             &mut rejecting,
             &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
@@ -1428,7 +1410,7 @@ mod tests {
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::None);
         let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
-        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
+        let mut sampler = constrained_sampler(policy, &plan).unwrap();
         let final_trigger_byte = *AUTO_TRIGGER.last().unwrap();
         let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
         values[final_trigger_byte as usize] = 100.0;
@@ -1483,24 +1465,29 @@ mod tests {
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::Required);
         let logits = placeholder_logits();
-        let mut sampler =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+        let mut sampler = constrained_sampler(CountingPolicy::default(), &plan).unwrap();
 
-        assert!(sampler.constraint_is_active());
-        let initial = sampler.valid_token_ids().unwrap().unwrap();
+        assert!(sampler.controller().constraint_is_active());
+        let initial = sampler.controller_mut().valid_token_ids().unwrap().unwrap();
         assert!(initial.contains(&u32::from(b'{')));
         sampler
             .commit_token(&logits, u32::from(b'{'), stream)
             .unwrap();
-        let after_open = sampler.valid_token_ids().unwrap().unwrap();
+        let after_open = sampler.controller_mut().valid_token_ids().unwrap().unwrap();
         let mut fork = sampler.clone();
-        assert_eq!(fork.valid_token_ids().unwrap().unwrap(), after_open);
+        assert_eq!(
+            fork.controller_mut().valid_token_ids().unwrap().unwrap(),
+            after_open
+        );
 
         sampler
             .commit_token(&logits, u32::from(b'"'), stream)
             .unwrap();
 
-        assert_eq!(fork.valid_token_ids().unwrap().unwrap(), after_open);
+        assert_eq!(
+            fork.controller_mut().valid_token_ids().unwrap().unwrap(),
+            after_open
+        );
         assert_eq!(fork.policy().commits, 1);
         assert_eq!(sampler.policy().commits, 2);
     }
@@ -1511,7 +1498,7 @@ mod tests {
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::Auto);
         let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
-        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
+        let mut sampler = constrained_sampler(policy, &plan).unwrap();
         let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
         values[b'x' as usize] = 100.0;
         values[b'[' as usize] = 10.0;
@@ -1529,7 +1516,7 @@ mod tests {
         eval([&selected]).unwrap();
 
         assert_eq!(selected.item::<u32>(stream), u32::from(b'['));
-        assert!(!sampler.constraint_is_active());
+        assert!(!sampler.controller().constraint_is_active());
         assert!(!sampler
             .prefix_is_complete(
                 &COMPLETE_CALL[..COMPLETE_CALL.len() - 1]
@@ -1549,7 +1536,7 @@ mod tests {
             )
             .unwrap());
         assert!(
-            !sampler.constraint_is_active(),
+            !sampler.controller().constraint_is_active(),
             "history-relative queries must not activate canonical grammar state"
         );
         assert!(sampler.policy().generated_tokens().is_empty());

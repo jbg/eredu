@@ -8,7 +8,7 @@ use safemlx_lm_core::{
         SemanticEvent,
     },
     MtpCapability, MtpSchedulerOptions, MtpSchedulerStats, MtpStats, SpeculativeOutputError,
-    SpeculativeSemanticState, TextGenerationConfig, TokenFilter,
+    SpeculativeSemanticState, TextGenerationConfig, TokenFilter, TokenFilterController,
 };
 use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
@@ -314,25 +314,31 @@ impl PreparedChatSpeculativeConstraint {
             controller: ConstraintController::from_generation_plan(generation_plan)?,
         })
     }
+}
 
-    /// Returns the vocabulary filter at a speculative logical history.
-    pub fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, ConstraintError> {
+impl TokenFilterController for PreparedChatSpeculativeConstraint {
+    type Error = ConstraintError;
+
+    fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+        self.controller.current_filter()
+    }
+
+    fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
+        self.controller.commit_token(token_id)
+    }
+
+    fn is_complete(&mut self) -> Result<bool, Self::Error> {
+        self.controller.is_complete()
+    }
+}
+
+impl safemlx_lm_core::SpeculativeTokenFilterController for PreparedChatSpeculativeConstraint {
+    fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
         self.controller.filter_at(history)
     }
 
-    /// Returns whether the grammar accepts a speculative logical history.
-    pub fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, ConstraintError> {
+    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {
         self.controller.prefix_is_complete(history)
-    }
-
-    /// Commits one target-accepted token to the durable grammar state.
-    pub fn commit(&mut self, token: u32) -> Result<(), ConstraintError> {
-        self.controller.commit(token)
-    }
-
-    #[cfg(feature = "mlx")]
-    pub(crate) fn into_controller(self) -> ConstraintController {
-        self.controller
     }
 }
 

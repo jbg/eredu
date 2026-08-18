@@ -567,6 +567,23 @@ pub trait TokenFilterController {
     fn is_complete(&mut self) -> Result<bool, Self::Error>;
 }
 
+/// Portable constraint controller that can evaluate speculative token histories.
+///
+/// Speculative backends use these queries for discardable draft branches. The
+/// durable controller state must not change until [`TokenFilterController::commit_token`]
+/// is called for a target-accepted token.
+pub trait SpeculativeTokenFilterController: TokenFilterController + Clone {
+    /// Returns the filter at `history` without committing its uncommitted suffix.
+    ///
+    /// `history` contains the controller's durable prefix followed by zero or
+    /// more speculative tokens. Implementations must reject histories that do
+    /// not begin with the durable prefix.
+    fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error>;
+
+    /// Returns whether `history` completes the constraint without committing it.
+    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error>;
+}
+
 #[derive(Debug, Clone, Copy)]
 struct UnconstrainedTokens;
 

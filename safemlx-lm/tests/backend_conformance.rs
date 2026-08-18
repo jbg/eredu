@@ -30,8 +30,9 @@ use safemlx_lm::{
     MultimodalPreparationBackend, Observed, PhysicalMemorySemantics, PreparedModel,
     RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler,
     RealtimeSpeechConfig, RequestId, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
-    SemanticStateTransaction, StateLayout, StaticMemoryReport, Submission, TextGenerationBackend,
-    TextGenerationConfig, TokenFilter, TokenOutput, WorkDescriptor,
+    SemanticStateTransaction, SpeculativeTokenFilterController, StateLayout, StaticMemoryReport,
+    Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
+    WorkDescriptor,
 };
 use safemlx_lm_core::Completion;
 use tokenizers::{

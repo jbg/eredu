@@ -107,10 +107,6 @@ pub enum Error {
     #[error(transparent)]
     Gguf(#[from] safemlx_gguf::Error),
 
-    /// Portable prepared-chat constraint construction or advancement failed.
-    #[error(transparent)]
-    Constraint(#[from] crate::runtime::chat::constraints::ConstraintError),
-
     /// MLX speculative execution failed.
     #[error("MLX speculative generation failed: {0}")]
     Speculative(String),

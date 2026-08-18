@@ -104,21 +104,25 @@ fn backend_and_example_dependencies_have_the_correct_manifest_ownership() {
 }
 
 #[test]
-fn backend_implementation_does_not_import_the_facade() {
+fn backend_implementation_does_not_import_facade_orchestration() {
     let backend = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend");
     let mut sources = Vec::new();
     rust_sources(&backend, &mut sources);
     let offenders = sources
         .into_iter()
         .filter(|path| {
-            std::fs::read_to_string(path)
-                .expect("backend source must be readable")
-                .contains("crate::api")
+            let source = std::fs::read_to_string(path).expect("backend source must be readable");
+            let production = source
+                .split_once("#[cfg(test)]\nmod tests")
+                .map_or(source.as_str(), |(production, _)| production);
+            ["crate::api", "crate::runtime"]
+                .iter()
+                .any(|forbidden| production.contains(forbidden))
         })
         .collect::<Vec<_>>();
     assert!(
         offenders.is_empty(),
-        "backend implementations must not depend upward on the facade: {offenders:#?}"
+        "backend implementations must not depend upward on facade orchestration: {offenders:#?}"
     );
 }
 

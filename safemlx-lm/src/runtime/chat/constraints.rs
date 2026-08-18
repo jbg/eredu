@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
 use crate::{
-    core::{TokenFilter, TokenFilterController},
+    core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController},
     runtime::chat::dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
     runtime::chat::{
         GenerationConstraint, GenerationRuntimePlan, GenerationRuntimePlanParts,
@@ -212,6 +212,16 @@ impl TokenFilterController for ConstraintController {
 
     fn is_complete(&mut self) -> Result<bool, Self::Error> {
         self.grammar_is_complete()
+    }
+}
+
+impl SpeculativeTokenFilterController for ConstraintController {
+    fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
+        ConstraintController::filter_at(self, history)
+    }
+
+    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {
+        ConstraintController::prefix_is_complete(self, history)
     }
 }
 

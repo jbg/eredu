@@ -22,6 +22,7 @@ use crate::{
     },
     core::generation::MtpSchedulerOptions,
     core::{ModelKind, SpeculativeExecutionTopology},
+    runtime::chat::constraints::{ConstraintController, ConstraintError},
     runtime::chat::PreparedChat,
 };
 use safemlx::{
@@ -34,6 +35,16 @@ use safemlx_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, W
 
 const GEMMA4_LARGE_FIXTURE: &str =
     include_str!("../../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
+
+fn constrained_sampler<S>(
+    policy: S,
+    plan: &crate::runtime::chat::GenerationRuntimePlan,
+) -> Result<ConstrainedSampler<S, ConstraintController>, ConstraintError> {
+    Ok(ConstrainedSampler::new(
+        policy,
+        ConstraintController::from_generation_plan(plan)?,
+    ))
+}
 
 fn load_test_model(
     path: impl AsRef<std::path::Path>,
@@ -373,11 +384,10 @@ fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally(
         &format!("Need 東京 🦀{one_v31}")
     ));
     assert!(!plan_accepts(required_plan, two_v31));
-    assert!(
-        ConstrainedSampler::from_tool_plan(DefaultSampler, required_plan)
-            .unwrap()
-            .constraint_is_active()
-    );
+    assert!(constrained_sampler(DefaultSampler, required_plan)
+        .unwrap()
+        .controller()
+        .constraint_is_active());
 
     let parallel = prepare(
         DEEPSEEK_V31_TOOL_FIXTURE,
@@ -410,11 +420,10 @@ fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally(
         auto_plan.auto_activation_trigger(),
         Some("<｜tool▁calls▁begin｜>")
     );
-    assert!(
-        !ConstrainedSampler::from_tool_plan(DefaultSampler, auto_plan)
-            .unwrap()
-            .constraint_is_active()
-    );
+    assert!(!constrained_sampler(DefaultSampler, auto_plan)
+        .unwrap()
+        .controller()
+        .constraint_is_active());
     assert!(plan_accepts(auto_plan, one_v31));
 
     let old_surface = prepare(
@@ -709,11 +718,10 @@ fn inkling_template_recognition_routes_reasoning_and_visible_text() {
         .generation_runtime_plan()
         .expect("recognized Inkling chat must compile its generation grammar");
     assert!(!generation_plan.has_tool_surface());
-    assert!(
-        ConstrainedSampler::from_generation_plan(DefaultSampler, generation_plan)
-            .unwrap()
-            .constraint_is_active()
-    );
+    assert!(constrained_sampler(DefaultSampler, generation_plan)
+        .unwrap()
+        .controller()
+        .constraint_is_active());
 
     let plan = prepared
         .semantic_runtime_plan()
@@ -920,8 +928,9 @@ fn production_gemma4_templates_render_exact_thinking_tool_history_and_prompts() 
                             .tool_runtime_plan()
                             .expect("recognized Gemma tool protocol must be supported");
                         assert_eq!(plan.auto_activation_trigger(), None);
-                        assert!(ConstrainedSampler::from_tool_plan(DefaultSampler, plan)
+                        assert!(constrained_sampler(DefaultSampler, plan)
                             .unwrap()
+                            .controller()
                             .constraint_is_active());
                     }
                 }

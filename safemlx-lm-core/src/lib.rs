@@ -66,9 +66,10 @@ pub use backend::{
     ControlledTextGenerationError, ControlledToken, DeviceDescriptor, DistributedBackend,
     DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
     ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend, ModelRuntime,
-    MultimodalPreparationBackend, MultimodalPreparationFailure, PreparedModel, Submission,
-    TextGeneration, TextGenerationBackend, TextGenerationConfig, TokenFilter,
-    TokenFilterController, TokenFilterError, TokenOutput, ValueDescriptor,
+    MultimodalPreparationBackend, MultimodalPreparationFailure, PreparedModel,
+    SpeculativeTokenFilterController, Submission, TextGeneration, TextGenerationBackend,
+    TextGenerationConfig, TokenFilter, TokenFilterController, TokenFilterError, TokenOutput,
+    ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,

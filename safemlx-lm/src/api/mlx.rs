@@ -69,12 +69,16 @@ struct PreparedChatMtpLaneRuntime<'a> {
     cache: &'a mut ModelCache,
     config: MtpConfig,
     prng_key: Option<Array>,
-    sampler:
-        ConstrainedSampler<crate::backend::mlx::runtime::generation::sampler::GenerationSampler>,
+    sampler: PreparedChatMlxSampler,
     semantic: Box<dyn SpeculativeSemanticState>,
     cancellation: GenerationCancellationToken,
     on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
+
+type PreparedChatMlxSampler = ConstrainedSampler<
+    crate::backend::mlx::runtime::generation::sampler::GenerationSampler,
+    PreparedChatSpeculativeConstraint,
+>;
 
 fn run_prepared_chat_mtp_batch<'a, B>(
     backend: &'a mut B,
@@ -200,26 +204,18 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     fn prepare_mlx_speculative_sampling(
         generation: safemlx_lm_core::TextGenerationConfig,
         constraint: PreparedChatSpeculativeConstraint,
-    ) -> Result<
-        (
-            Option<Array>,
-            ConstrainedSampler<
-                crate::backend::mlx::runtime::generation::sampler::GenerationSampler,
-            >,
-        ),
-        Error,
-    > {
+    ) -> Result<(Option<Array>, PreparedChatMlxSampler), Error> {
         let resolved = generation.sampling();
         let prng_key = (resolved.temperature != 0.0)
             .then(|| safemlx::random::key(generation.seed()))
             .transpose()?;
         Ok((
             prng_key,
-            ConstrainedSampler::with_controller(
+            ConstrainedSampler::new(
                 crate::backend::mlx::runtime::generation::sampler::GenerationSampler::from_resolved(
                     resolved,
                 ),
-                constraint.into_controller(),
+                constraint,
             ),
         ))
     }
@@ -528,9 +524,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         drafter: &mut MlxDrafter,
         config: MtpConfig,
         prng_key: Option<Array>,
-        mut sampler: ConstrainedSampler<
-            crate::backend::mlx::runtime::generation::sampler::GenerationSampler,
-        >,
+        mut sampler: PreparedChatMlxSampler,
         semantic: Box<dyn SpeculativeSemanticState>,
         scheduler: MtpSchedulerOptions,
         cancellation: GenerationCancellationToken,
@@ -574,9 +568,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         input: crate::backend::mlx::MlxModelInput,
         config: MtpConfig,
         prng_key: Option<Array>,
-        mut sampler: ConstrainedSampler<
-            crate::backend::mlx::runtime::generation::sampler::GenerationSampler,
-        >,
+        mut sampler: PreparedChatMlxSampler,
         semantic: Box<dyn SpeculativeSemanticState>,
         scheduler: MtpSchedulerOptions,
         cancellation: GenerationCancellationToken,
