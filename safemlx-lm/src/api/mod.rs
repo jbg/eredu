@@ -8,6 +8,13 @@
 
 mod portable;
 
+#[cfg(feature = "mlx")]
+mod capability;
+#[cfg(feature = "mlx")]
+mod inspection;
+#[cfg(feature = "mlx")]
+pub use inspection::{inspect_text_model, TextInspectionOptions};
+
 pub use portable::{
     LoadedModel, LoadedTextModelConfig, TextDecoder, TextDecoderError, TextModelError,
 };

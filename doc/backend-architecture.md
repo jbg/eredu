@@ -420,12 +420,21 @@ Capability and inspection follow the same direction. Core owns `Observed`,
 and `ModelInspectionReport`. `backend::mlx::capability` maps validated MLX model
 configuration and prepared MLX media shapes into those values, fixes the
 current MLX cache scalar width, and supplies native allocator/memory
-observations. `backend::mlx::inspection` performs MLX loader binding, tensor
-catalog validation, quantization/residency admission, and companion-artifact
-checks. `MlxInspectionOptions` and `inspect_model` therefore live only under
-the selected backend; the generic `api` namespace contains no MLX inspection
-entry point. A second backend reuses the core reports and policies while
-providing its own derivation and admission implementation.
+observations. The facade composes portable token counting and admission policy
+over those adapter functions; the backend never implements methods on or
+imports the facade `LoadedModel` type. `backend::mlx::inspection` performs MLX
+loader binding, tensor-catalog validation, quantization/residency admission,
+and MLX media-companion checks. `MlxInspectionOptions` and structural
+`inspect_model` therefore live under the selected backend. The facade's
+`inspect_text_model` step enriches the same core report with tokenizer,
+chat-template, EOS, semantic-streaming, and native-tool readiness. A second
+backend reuses that text step and the core reports and policies while providing
+its own structural derivation and admission implementation.
+
+Telemetry follows the same layering: MLX converts concrete residency and
+expert-cache snapshots into core telemetry documents, while the caller or
+facade obtains those snapshots from its loaded session. The adapter no longer
+accepts a facade model merely to reach backend state.
 
 Automatic planning documents now use schema version 2. This deliberately
 breaks the former facade-owned schema: resource profiles use the canonical

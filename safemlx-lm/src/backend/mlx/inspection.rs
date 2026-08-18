@@ -15,33 +15,15 @@ use safemlx_lm_core::{
     InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
     ModelInspectionReport, ModelKind, Observed,
 };
-use serde_json::{json, Map, Value};
+use serde_json::Value;
 
 use super::*;
 use crate::{
-    api::{
-        load_tokenizer,
-        mlx::{
-            eos_token_ids_from_sidecar_dir, merge_eos_token_id_sources,
-            request::prepare_chat_from_parts,
-            tokenizer::{
-                gguf_sidecar_dir, is_gguf_file, load_chat_template,
-                load_gguf_tokenizer_from_metadata, load_tokenizer_template_kwargs,
-            },
-            ChatTokenizer, ModelChatTemplate,
-        },
-    },
     architectures::{
         gemma4::model as gemma4, inkling::model as inkling, muse_glimmer,
         qwen::vl::model as qwen3_vl,
     },
-    runtime::{
-        chat::{
-            constraints::ConstraintCompiler, ChatTemplateRequest, NativeToolSupport, PreparedChat,
-            SemanticSupport, ToolChoice,
-        },
-        checkpoint::store::{SafetensorsWeightStore, WeightStore},
-    },
+    runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
 };
 
 /// Options applied while inspecting a model artifact.
@@ -49,12 +31,6 @@ use crate::{
 pub struct MlxInspectionOptions {
     /// The exact loading policy that admission should validate.
     pub load: ModelLoadOptions,
-    /// Optional concrete chat request to render and behaviorally probe.
-    ///
-    /// When omitted, inspection uses bounded synthetic probes to recognize a
-    /// semantic protocol and native-tool envelope. Real tool schemas and
-    /// request-specific template kwargs still require per-request validation.
-    pub chat_request: Option<ChatTemplateRequest>,
 }
 
 /// Inspects a local SafeTensors model directory or GGUF checkpoint without
@@ -86,6 +62,12 @@ pub fn inspect_model(
     report.resources.tensor_count = report.tensor_count;
     report.resources.checkpoint_shards = report.checkpoint_shards;
     Ok(report)
+}
+
+fn is_gguf_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
 }
 
 fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
@@ -280,8 +262,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
         }
     }
 
-    inspect_safetensors_sidecars(&mut report, path, options.chat_request);
-    finalize_text_readiness(&mut report);
+    inspect_safetensors_media(&mut report, path);
     report
 }
 
@@ -384,8 +365,6 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
                 tensor_name: None,
                 tensor_type_code: None,
             });
-            inspect_gguf_sidecars(&mut report, path, &metadata, options.chat_request);
-            finalize_text_readiness(&mut report);
             return report;
         }
         None => {
@@ -400,8 +379,6 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
                 tensor_name: None,
                 tensor_type_code: None,
             });
-            inspect_gguf_sidecars(&mut report, path, &metadata, options.chat_request);
-            finalize_text_readiness(&mut report);
             return report;
         }
     };
@@ -471,8 +448,6 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         report.model_loadability = InspectionReadiness::Invalid;
         report.requested_load = InspectionReadiness::Invalid;
     }
-    inspect_gguf_sidecars(&mut report, path, &metadata, options.chat_request);
-    finalize_text_readiness(&mut report);
     report
 }
 
@@ -545,298 +520,6 @@ fn apply_structural_validation(
             push(report, issue, InspectionSeverity::Warning);
         }
     }
-}
-
-fn inspect_safetensors_sidecars(
-    report: &mut ModelInspectionReport,
-    path: &Path,
-    request: Option<ChatTemplateRequest>,
-) {
-    let tokenizer = match load_tokenizer(path) {
-        Ok(tokenizer) => {
-            report.tokenizer = InspectionReadiness::Ready;
-            Some(tokenizer)
-        }
-        Err(error) => {
-            report.tokenizer = InspectionReadiness::Missing;
-            report.issue(
-                InspectionIssueCode::MissingTokenizer,
-                InspectionSeverity::Error,
-                error.to_string(),
-                Some(path.join("tokenizer.json")),
-            );
-            None
-        }
-    };
-    let template = match load_chat_template(path) {
-        Ok(Some(template)) => {
-            report.chat_template = InspectionReadiness::Ready;
-            Some(template)
-        }
-        Ok(None) => {
-            report.chat_template = InspectionReadiness::Missing;
-            report.issue(
-                InspectionIssueCode::MissingChatTemplate,
-                InspectionSeverity::Warning,
-                "no tokenizer_config.json chat_template or chat_template.jinja is available",
-                Some(path.to_path_buf()),
-            );
-            None
-        }
-        Err(error) => {
-            report.chat_template = InspectionReadiness::Invalid;
-            report.issue(
-                InspectionIssueCode::MissingChatTemplate,
-                InspectionSeverity::Warning,
-                error.to_string(),
-                Some(path.to_path_buf()),
-            );
-            None
-        }
-    };
-    if let (Some(tokenizer), Some(template)) = (tokenizer, template) {
-        let kwargs = load_tokenizer_template_kwargs(path).unwrap_or_default();
-        let eos = eos_token_ids_from_sidecar_dir(path).unwrap_or_default();
-        inspect_chat_behavior(report, tokenizer, template, kwargs, eos, request);
-    } else {
-        report.semantic_streaming = InspectionReadiness::Missing;
-        report.native_tools = InspectionReadiness::Missing;
-    }
-    inspect_safetensors_media(report, path);
-}
-
-fn inspect_gguf_sidecars(
-    report: &mut ModelInspectionReport,
-    path: &Path,
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-    request: Option<ChatTemplateRequest>,
-) {
-    let tokenizer = match load_gguf_tokenizer_from_metadata(path, metadata) {
-        Ok(tokenizer) => {
-            report.tokenizer = InspectionReadiness::Ready;
-            Some(tokenizer)
-        }
-        Err(error) => {
-            report.tokenizer = InspectionReadiness::Missing;
-            report.issue(
-                InspectionIssueCode::MissingTokenizer,
-                InspectionSeverity::Error,
-                format!(
-                    "GGUF tokenizer metadata is unusable and no acceptable sibling tokenizer.json was loaded: {error}"
-                ),
-                Some(gguf_sidecar_dir(path).join("tokenizer.json")),
-            );
-            None
-        }
-    };
-    let embedded = match metadata.get("tokenizer.chat_template") {
-        Some(GgufMetadataValue::String(template)) => {
-            Some(ModelChatTemplate::Single(template.clone()))
-        }
-        Some(_) => {
-            report.chat_template = InspectionReadiness::Invalid;
-            report.issues.push(InspectionIssue {
-                code: InspectionIssueCode::MissingChatTemplate,
-                severity: InspectionSeverity::Warning,
-                detail: "GGUF tokenizer.chat_template must be a string".into(),
-                path: Some(path.to_path_buf()),
-                metadata_key: Some("tokenizer.chat_template".into()),
-                tensor_name: None,
-                tensor_type_code: None,
-            });
-            None
-        }
-        None => None,
-    };
-    let template = embedded.or_else(|| load_chat_template(gguf_sidecar_dir(path)).ok().flatten());
-    if template.is_some() {
-        report.chat_template = InspectionReadiness::Ready;
-    } else if report.chat_template != InspectionReadiness::Invalid {
-        report.chat_template = InspectionReadiness::Missing;
-        report.issue(
-            InspectionIssueCode::MissingChatTemplate,
-            InspectionSeverity::Warning,
-            "GGUF has no embedded chat template and no acceptable sidecar template",
-            Some(path.to_path_buf()),
-        );
-    }
-    if let (Some(tokenizer), Some(template)) = (tokenizer, template) {
-        let eos = merge_eos_token_id_sources([
-            eos_token_ids_from_sidecar_dir(gguf_sidecar_dir(path)).unwrap_or_default(),
-            gguf_eos_token_ids(metadata).unwrap_or_default(),
-        ]);
-        inspect_chat_behavior(
-            report,
-            tokenizer.tokenizer,
-            template,
-            tokenizer.template_kwargs,
-            eos,
-            request,
-        );
-    } else {
-        report.semantic_streaming = InspectionReadiness::Missing;
-        report.native_tools = InspectionReadiness::Missing;
-    }
-}
-
-fn inspect_chat_behavior(
-    report: &mut ModelInspectionReport,
-    tokenizer: tokenizers::Tokenizer,
-    template: ModelChatTemplate,
-    kwargs: Map<String, Value>,
-    eos_token_ids: Vec<u32>,
-    request: Option<ChatTemplateRequest>,
-) {
-    let mut tokenizer = ChatTokenizer::from_tokenizer(tokenizer);
-    tokenizer.set_template_kwargs(kwargs);
-    let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
-    let model_id = report.path.display().to_string();
-    if let Some(request) = request {
-        match prepare_chat_from_parts(
-            &mut tokenizer,
-            template,
-            &model_id,
-            &eos_token_ids,
-            Some(&compiler),
-            request,
-        ) {
-            Ok(prepared) => apply_prepared_chat(report, &prepared),
-            Err(error) => {
-                report.semantic_streaming = InspectionReadiness::Unsupported;
-                report.native_tools = InspectionReadiness::Unsupported;
-                report.issue(
-                    InspectionIssueCode::UnsupportedSemanticProtocol,
-                    InspectionSeverity::Error,
-                    error.to_string(),
-                    Some(report.path.clone()),
-                );
-            }
-        }
-        return;
-    }
-
-    let semantic_request = ChatTemplateRequest {
-        messages: vec![json!({"role": "user", "content": "__safemlx_inspection_probe__"})],
-        tool_choice: ToolChoice::None,
-        add_generation_prompt: true,
-        ..ChatTemplateRequest::default()
-    };
-    match prepare_chat_from_parts(
-        &mut tokenizer,
-        template.clone(),
-        &model_id,
-        &eos_token_ids,
-        Some(&compiler),
-        semantic_request,
-    ) {
-        Ok(prepared) => {
-            report.semantic_streaming = match prepared.semantic_support() {
-                SemanticSupport::Supported => InspectionReadiness::Ready,
-                SemanticSupport::Unsupported { reason } => {
-                    report.issue(
-                        InspectionIssueCode::UnsupportedSemanticProtocol,
-                        InspectionSeverity::Warning,
-                        reason.clone(),
-                        Some(report.path.clone()),
-                    );
-                    InspectionReadiness::Unsupported
-                }
-            };
-        }
-        Err(error) => {
-            report.semantic_streaming = InspectionReadiness::Unsupported;
-            report.issue(
-                InspectionIssueCode::UnsupportedSemanticProtocol,
-                InspectionSeverity::Warning,
-                error.to_string(),
-                Some(report.path.clone()),
-            );
-        }
-    }
-
-    let tool_request = ChatTemplateRequest {
-        messages: vec![json!({"role": "user", "content": "__safemlx_tool_probe__"})],
-        tools: vec![json!({
-            "type": "function",
-            "function": {
-                "name": "safemlx_probe",
-                "description": "inspection probe",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"value": {"type": "string"}},
-                    "required": ["value"]
-                }
-            }
-        })],
-        tool_choice: ToolChoice::Required,
-        add_generation_prompt: true,
-        ..ChatTemplateRequest::default()
-    };
-    match prepare_chat_from_parts(
-        &mut tokenizer,
-        template,
-        &model_id,
-        &eos_token_ids,
-        Some(&compiler),
-        tool_request,
-    ) {
-        Ok(prepared) => {
-            report.native_tools = match prepared.native_tool_support() {
-                NativeToolSupport::Supported => InspectionReadiness::Ready,
-                NativeToolSupport::Unsupported { reason } => {
-                    report.issue(
-                        InspectionIssueCode::UnsupportedToolProtocol,
-                        InspectionSeverity::Warning,
-                        reason.clone(),
-                        Some(report.path.clone()),
-                    );
-                    InspectionReadiness::Unsupported
-                }
-            };
-        }
-        Err(error) => {
-            report.native_tools = InspectionReadiness::Unsupported;
-            report.issue(
-                InspectionIssueCode::UnsupportedToolProtocol,
-                InspectionSeverity::Warning,
-                error.to_string(),
-                Some(report.path.clone()),
-            );
-        }
-    }
-    report.issue(
-        InspectionIssueCode::RequestSpecificValidation,
-        InspectionSeverity::Info,
-        "native-tool readiness used a bounded behavioral probe; validate real messages, tool schemas, choices, parallel-call policy, and template kwargs with chat_request",
-        Some(report.path.clone()),
-    );
-}
-
-fn apply_prepared_chat(report: &mut ModelInspectionReport, prepared: &PreparedChat) {
-    report.semantic_streaming = match prepared.semantic_support() {
-        SemanticSupport::Supported => InspectionReadiness::Ready,
-        SemanticSupport::Unsupported { reason } => {
-            report.issue(
-                InspectionIssueCode::UnsupportedSemanticProtocol,
-                InspectionSeverity::Warning,
-                reason.clone(),
-                Some(report.path.clone()),
-            );
-            InspectionReadiness::Unsupported
-        }
-    };
-    report.native_tools = match prepared.native_tool_support() {
-        NativeToolSupport::Supported => InspectionReadiness::Ready,
-        NativeToolSupport::Unsupported { reason } => {
-            report.issue(
-                InspectionIssueCode::UnsupportedToolProtocol,
-                InspectionSeverity::Warning,
-                reason.clone(),
-                Some(report.path.clone()),
-            );
-            InspectionReadiness::Unsupported
-        }
-    };
 }
 
 fn inspect_gguf_projector(
@@ -1269,29 +952,6 @@ fn reject_load_policy(report: &mut ModelInspectionReport, error: &Error) {
     );
 }
 
-fn finalize_text_readiness(report: &mut ModelInspectionReport) {
-    report.text_generation = if report.model_loadability == InspectionReadiness::Ready
-        && report.requested_load == InspectionReadiness::Ready
-        && report.tokenizer == InspectionReadiness::Ready
-    {
-        InspectionReadiness::Ready
-    } else if report.model_loadability == InspectionReadiness::Invalid
-        || report.container == InspectionReadiness::Invalid
-    {
-        InspectionReadiness::Invalid
-    } else if report.model_loadability == InspectionReadiness::Unsupported
-        || report.requested_load == InspectionReadiness::Unsupported
-    {
-        InspectionReadiness::Unsupported
-    } else if report.tokenizer == InspectionReadiness::Missing
-        || report.model_loadability == InspectionReadiness::Missing
-    {
-        InspectionReadiness::Missing
-    } else {
-        InspectionReadiness::Unverified
-    };
-}
-
 fn parse_unsupported_type_code(detail: &str) -> Option<u32> {
     let marker = "unsupported GGML type ";
     let start = detail.find(marker)? + marker.len();
@@ -1309,9 +969,7 @@ mod tests {
     use safemlx::module::ModuleParameters;
     use safemlx_gguf::{GgmlType, MetadataArray, MetadataValue, TensorInput, Writer};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
-    use tokenizers::{
-        decoders::byte_level::ByteLevel, models::wordlevel::WordLevel, AddedToken, Tokenizer,
-    };
+    use serde_json::json;
 
     use super::*;
     use crate::{
@@ -3840,14 +3498,6 @@ mod tests {
             .collect::<Vec<_>>();
         serialize_to_file(views, None, &directory.path().join("model.safetensors")).unwrap();
         directory
-    }
-
-    fn save_wordlevel_tokenizer(path: &Path) {
-        std::fs::write(
-            path,
-            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1,"__safemlx_inspection_probe__":2,"__safemlx_tool_probe__":3},"unk_token":"<unk>"}}"#,
-        )
-        .unwrap();
     }
 
     fn write_gguf(
@@ -6615,14 +6265,7 @@ mod tests {
 
         let load = ModelLoadOptions::default()
             .with_weight_residency(WeightResidency::layerwise_host(Default::default()));
-        let bounded = inspect_model(
-            directory.path(),
-            MlxInspectionOptions {
-                load,
-                chat_request: None,
-            },
-        )
-        .unwrap();
+        let bounded = inspect_model(directory.path(), MlxInspectionOptions { load }).unwrap();
         assert!(bounded.is_loadable(), "{:#?}", bounded.issues);
         structural::validate_safetensors_load_path(ModelKind::Qwen3VlMoe, directory.path(), load)
             .unwrap();
@@ -7496,14 +7139,7 @@ mod tests {
             ModelLoadOptions::default().with_weight_residency(WeightResidency::layerwise_host(
                 crate::runtime::execution::layerwise::LayerwiseLoadOptions::default(),
             ));
-        let bounded = inspect_model(
-            directory.path(),
-            MlxInspectionOptions {
-                load,
-                chat_request: None,
-            },
-        )
-        .unwrap();
+        let bounded = inspect_model(directory.path(), MlxInspectionOptions { load }).unwrap();
         assert_eq!(bounded.structural_binding, InspectionReadiness::Ready);
         assert!(bounded.is_loadable(), "{:#?}", bounded.issues);
         structural::validate_safetensors_load_path(ModelKind::Gemma4, directory.path(), load)
@@ -7619,14 +7255,8 @@ mod tests {
                 ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
             ] {
-                let report = inspect_model(
-                    directory.path(),
-                    MlxInspectionOptions {
-                        load,
-                        chat_request: None,
-                    },
-                )
-                .unwrap();
+                let report =
+                    inspect_model(directory.path(), MlxInspectionOptions { load }).unwrap();
                 assert_eq!(report.structural_binding, InspectionReadiness::Ready);
                 assert_eq!(report.model_loadability, InspectionReadiness::Ready);
                 assert!(
@@ -7770,14 +7400,7 @@ mod tests {
                 NonExpertWeightResidency::LayerwiseHost(Default::default()),
                 Default::default(),
             ));
-        let report = inspect_model(
-            dense.path(),
-            MlxInspectionOptions {
-                load,
-                chat_request: None,
-            },
-        )
-        .unwrap();
+        let report = inspect_model(dense.path(), MlxInspectionOptions { load }).unwrap();
         assert!(!report.is_loadable());
         assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
     }
@@ -7918,7 +7541,6 @@ mod tests {
             MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
-                chat_request: None,
             },
         )
         .unwrap();
@@ -7949,7 +7571,6 @@ mod tests {
             MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
-                chat_request: None,
             },
         )
         .unwrap();
@@ -8090,7 +7711,6 @@ mod tests {
         let options = MlxInspectionOptions {
             load: ModelLoadOptions::default()
                 .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
-            chat_request: None,
         };
         let complete = write_complete_deepseek_v3_mtp_safetensors_dir(|_| {});
         let report = inspect_model(complete.path(), options.clone()).unwrap();
@@ -8187,7 +7807,6 @@ mod tests {
             MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
-                chat_request: None,
             },
         )
         .unwrap();
@@ -8212,7 +7831,6 @@ mod tests {
             MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
-                chat_request: None,
             },
         )
         .unwrap();
@@ -8245,7 +7863,6 @@ mod tests {
             MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
-                chat_request: None,
             },
         )
         .unwrap();
@@ -9679,20 +9296,6 @@ mod tests {
     }
 
     #[test]
-    fn gguf_tokenizer_sidecar_is_an_explicit_fallback() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("model.gguf");
-        write_complete_gguf(&path, |_| {});
-        let missing = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
-        assert_eq!(missing.tokenizer, InspectionReadiness::Missing);
-
-        save_wordlevel_tokenizer(&directory.path().join("tokenizer.json"));
-        let available = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
-        assert_eq!(available.tokenizer, InspectionReadiness::Ready);
-        assert_eq!(available.text_generation, InspectionReadiness::Ready);
-    }
-
-    #[test]
     fn missing_required_qwen_projector_blocks_model_admission() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("qwen.gguf");
@@ -9845,7 +9448,6 @@ mod tests {
             &gguf,
             MlxInspectionOptions {
                 load: ModelLoadOptions::with_quantization(WeightQuantization::MxFp4),
-                chat_request: None,
             },
         )
         .unwrap();
@@ -9865,7 +9467,6 @@ mod tests {
                         ExpertCacheLoadOptions::default(),
                     ),
                 ),
-                chat_request: None,
             },
         )
         .unwrap();
@@ -9884,7 +9485,6 @@ mod tests {
                         ExpertCacheLoadOptions::default(),
                     ),
                 ),
-                chat_request: None,
             },
         )
         .unwrap();
@@ -9893,81 +9493,5 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == InspectionIssueCode::UnsupportedResidencyPolicy));
-    }
-
-    #[test]
-    fn template_presence_does_not_imply_semantic_or_tool_support() {
-        let directory = write_safetensors_dir(&llama_config());
-        save_wordlevel_tokenizer(&directory.path().join("tokenizer.json"));
-        std::fs::write(
-            directory.path().join("tokenizer_config.json"),
-            r#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}"}"#,
-        )
-        .unwrap();
-        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
-        assert_eq!(report.chat_template, InspectionReadiness::Ready);
-        assert_eq!(report.semantic_streaming, InspectionReadiness::Unsupported);
-        assert_eq!(report.native_tools, InspectionReadiness::Unsupported);
-    }
-
-    #[test]
-    fn chat_protocol_is_recognized_from_rendered_behavior_after_source_refactor() {
-        const TEMPLATE: &str =
-            include_str!("../../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
-        let mut tokenizer = Tokenizer::new(WordLevel::default());
-        tokenizer
-            .add_tokens(
-                (0..50)
-                    .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-        tokenizer
-            .add_special_tokens(
-                [
-                    "<|channel>",
-                    "<channel|>",
-                    "<|tool_call>",
-                    "<tool_call|>",
-                    "<|\"|>",
-                    "<|tool_response>",
-                    "<turn|>",
-                    "<eos>",
-                ]
-                .map(|token| AddedToken::from(token, true).normalized(false)),
-            )
-            .unwrap();
-        tokenizer.with_decoder(Some(ByteLevel::default()));
-        let eos_token_id = tokenizer
-            .token_to_id("<eos>")
-            .expect("the inspection fixture registers its EOS token");
-        let directory = tempfile::tempdir().unwrap();
-        let mut report =
-            ModelInspectionReport::unverified(directory.path(), ArtifactFormat::SafeTensors);
-        inspect_chat_behavior(
-            &mut report,
-            tokenizer,
-            ModelChatTemplate::Single(format!(
-                "{TEMPLATE}\n{{# source-only inspection refactor #}}"
-            )),
-            Map::from_iter([
-                ("bos_token".into(), json!("<bos>")),
-                ("eos_token".into(), json!("<eos>")),
-            ]),
-            vec![eos_token_id],
-            None,
-        );
-        assert_eq!(
-            report.semantic_streaming,
-            InspectionReadiness::Ready,
-            "{:#?}",
-            report.issues
-        );
-        assert_eq!(
-            report.native_tools,
-            InspectionReadiness::Ready,
-            "{:#?}",
-            report.issues
-        );
     }
 }

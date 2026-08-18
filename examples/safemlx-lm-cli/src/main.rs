@@ -26,8 +26,8 @@ use safemlx_lm::{
         PreparedChatMtpGenerationRequest, ResidencyPlan, TextDecoder, TextModelError,
     },
     backend::mlx::automatic::{
-        collect_expert_cache_telemetry, collect_residency_telemetry, discover_hardware,
-        execution_plan_load_options, mtp_telemetry, plan_automatic_execution,
+        discover_hardware, execution_plan_load_options, expert_cache_telemetry, mtp_telemetry,
+        plan_automatic_execution, residency_telemetry,
     },
     backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams},
     backend::mlx::{
@@ -1319,7 +1319,6 @@ fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCand
         model_path,
         MlxInspectionOptions {
             load: candidate_load_options(plan)?,
-            chat_request: None,
         },
     )?;
     Ok(AutoCandidate {
@@ -1822,7 +1821,6 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
         model_path,
         MlxInspectionOptions {
             load: candidate_load_options(&plan)?,
-            chat_request: None,
         },
     )?;
     if !inspection.is_loadable() {
@@ -2248,16 +2246,7 @@ fn main() -> Result<()> {
     let resource_profile = if let Some(report) = &automatic_report {
         Some(report.resources.clone())
     } else if args.telemetry_json.is_some() {
-        Some(
-            inspect_model(
-                &model_path,
-                MlxInspectionOptions {
-                    load: load_options,
-                    chat_request: None,
-                },
-            )?
-            .resources,
-        )
+        Some(inspect_model(&model_path, MlxInspectionOptions { load: load_options })?.resources)
     } else {
         None
     };
@@ -2971,6 +2960,11 @@ fn main() -> Result<()> {
             },
             |report| report.explanation.clone(),
         );
+        let residency = model.residency_report()?.as_ref().map(residency_telemetry);
+        let expert_cache = model
+            .expert_cache_report()?
+            .as_ref()
+            .map(expert_cache_telemetry);
         let telemetry = ExecutionTelemetry {
             schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
             model_type: model.model_type().into(),
@@ -2989,8 +2983,8 @@ fn main() -> Result<()> {
                 total_elapsed,
             ),
             allocator: allocator_telemetry,
-            residency: collect_residency_telemetry(&model)?,
-            expert_cache: collect_expert_cache_telemetry(&model)?,
+            residency,
+            expert_cache,
             mtp: mtp_stats.as_ref().map(mtp_telemetry),
         };
         let json = serde_json::to_vec_pretty(&telemetry)

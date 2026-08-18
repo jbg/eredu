@@ -9,9 +9,11 @@ cache, and paging a cache does not change where model weights live.
 Run `backend::mlx::inspect_model` with the same `MlxInspectionOptions` you
 intend to load on MLX.
 Inspection validates the artifact, architecture, requested quantization,
-residency policy, topology, tokenizer, processor, and companion files without
+residency policy, topology, processor, and media companion files without
 materializing weights. It is the cheapest place to reject an incompatible
-request.
+backend request. Apply `api::inspect_text_model` to that report when admission
+also requires tokenizer, chat-template, EOS, semantic-streaming, or native-tool
+readiness.
 
 The MLX backend's `safemlx_lm::backend::mlx::ModelLoadOptions` contain two
 independent choices:

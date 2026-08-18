@@ -4,15 +4,13 @@ use std::{collections::BTreeMap, num::NonZeroU8};
 
 use safemlx::{Array, Stream};
 use safemlx_lm_core::{
-    apply_admission_policy, estimate_runtime_state, AdmissionRequest, AdmissionResult,
-    AvailableMemory, CacheStateStrategy, CapabilityError, EstimationCompleteness, GrowingState,
-    InputModalities, InputTokenCount, ModelCapabilities, ObservationKind, Observed,
-    PhysicalMemorySemantics, RuntimeStateEstimate, SlidingWindowLayerCount, StateLayout,
-    StaticMemoryReport,
+    estimate_runtime_state, AvailableMemory, CacheStateStrategy, CapabilityError,
+    EstimationCompleteness, GrowingState, InputModalities, InputTokenCount, ModelCapabilities,
+    ObservationKind, Observed, PhysicalMemorySemantics, RuntimeStateEstimate,
+    SlidingWindowLayerCount, StateLayout, StaticMemoryReport,
 };
 
 use super::Model;
-use crate::api::LoadedModel;
 use crate::{
     architectures::{
         deepseek_v3::model as deepseek_v3,
@@ -2086,252 +2084,187 @@ impl Model {
     }
 }
 
-impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
-    /// Returns architecture-independent capabilities derived from validated loaded state.
-    pub fn capabilities(&self) -> Result<ModelCapabilities, CapabilityError> {
-        self.model()
-            .capabilities_and_estimate()
-            .map(|(capabilities, _)| capabilities)
-    }
+pub(crate) fn model_capabilities(model: &Model) -> Result<ModelCapabilities, CapabilityError> {
+    model
+        .capabilities_and_estimate()
+        .map(|(capabilities, _)| capabilities)
+}
 
-    /// Counts an ordinary encoded prompt exactly.
-    pub fn count_token_ids(&self, token_ids: &[u32]) -> Result<InputTokenCount, CapabilityError> {
-        let tokens =
-            u64::try_from(token_ids.len()).map_err(|_| CapabilityError::ArithmeticOverflow {
-                operation: "token-id length",
-            })?;
-        Ok(InputTokenCount::text(tokens))
-    }
-
-    /// Tokenizes and counts a rendered text prompt exactly.
-    pub fn count_text(
-        &self,
-        text: &str,
-        add_special_tokens: bool,
-    ) -> Result<InputTokenCount, CapabilityError> {
-        let ids = self
-            .encode(text, add_special_tokens)
-            .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-        self.count_token_ids(&ids)
-    }
-
-    /// Counts the exact rendered prompt stored in a prepared chat.
-    pub fn count_prepared_chat(
-        &self,
-        chat: &crate::runtime::chat::PreparedChat,
-    ) -> Result<InputTokenCount, CapabilityError> {
-        self.count_text(chat.rendered_prompt(), false)
-    }
-
-    /// Counts text IDs and actual model positions in processor-prepared multimodal input.
-    ///
-    /// Media positions are derived from prepared patch grids, pooling metadata,
-    /// or valid audio masks used by the loaded architecture. Tensor media also
-    /// carries a conservative execution-workspace bound derived from those
-    /// prepared shapes and the loaded tower configuration.
-    pub fn count_prepared_input(
-        &self,
-        prepared: &PreparedModelInput,
-        stream: &Stream,
-    ) -> Result<InputTokenCount, CapabilityError> {
-        let mut text_tokens = 0u64;
-        let mut media_positions = 0u64;
-        let mut media_execution_workspace_bytes = 0u64;
-        let mut media_execution_workspace_kind = ObservationKind::Exact;
-        for part in prepared.input_parts() {
-            match (part.modality, part.payload) {
-                (Modality::Text, InputPayload::TokenIds(tokens)) => {
-                    if tokens.ndim() != 2 || tokens.dim(0) != 1 {
-                        return Err(CapabilityError::UnsupportedInput {
-                            architecture: self.model_type().into(),
-                            reason: format!(
-                                "prepared text token IDs must be [1, sequence], got {:?}",
-                                tokens.shape()
-                            ),
-                        });
-                    }
-                    text_tokens = checked_add(
-                        text_tokens,
-                        positive(tokens.dim(1), "prepared text sequence")?,
-                        "prepared text-token total",
-                    )?;
-                }
-                (Modality::Text, _) => {
+pub(crate) fn count_prepared_input(
+    model: &Model,
+    prepared: &PreparedModelInput,
+    stream: &Stream,
+) -> Result<InputTokenCount, CapabilityError> {
+    let mut text_tokens = 0u64;
+    let mut media_positions = 0u64;
+    let mut media_execution_workspace_bytes = 0u64;
+    let mut media_execution_workspace_kind = ObservationKind::Exact;
+    for part in prepared.input_parts() {
+        match (part.modality, part.payload) {
+            (Modality::Text, InputPayload::TokenIds(tokens)) => {
+                if tokens.ndim() != 2 || tokens.dim(0) != 1 {
                     return Err(CapabilityError::UnsupportedInput {
-                        architecture: self.model_type().into(),
-                        reason: "prepared text is not represented by tokenizer IDs".into(),
+                        architecture: model.model_type().into(),
+                        reason: format!(
+                            "prepared text token IDs must be [1, sequence], got {:?}",
+                            tokens.shape()
+                        ),
                     });
                 }
-                (_modality, InputPayload::Embeddings(embeddings)) => {
-                    if embeddings.ndim() != 3 || embeddings.dim(0) != 1 {
-                        return Err(CapabilityError::UnsupportedInput {
-                            architecture: self.model_type().into(),
-                            reason: format!(
-                                "prepared media embeddings must be [1, sequence, hidden], got {:?}",
-                                embeddings.shape()
-                            ),
-                        });
-                    }
-                    media_positions = checked_add(
-                        media_positions,
-                        positive(embeddings.dim(1), "prepared embedding sequence")?,
-                        "prepared media-position total",
-                    )?;
-                }
-                (modality, InputPayload::Tensor(tensor)) => {
-                    let (positions, workspace_bytes) = self.model().prepared_media_accounting(
-                        modality,
-                        tensor,
-                        part.metadata,
-                        stream,
-                    )?;
-                    media_positions =
-                        checked_add(media_positions, positions, "prepared media-position total")?;
-                    media_execution_workspace_bytes = checked_add(
-                        media_execution_workspace_bytes,
-                        workspace_bytes,
-                        "prepared media-workspace total",
-                    )?;
-                    media_execution_workspace_kind = ObservationKind::Conservative;
-                }
-                (_, InputPayload::TokenIds(_)) => {
+                text_tokens = checked_add(
+                    text_tokens,
+                    positive(tokens.dim(1), "prepared text sequence")?,
+                    "prepared text-token total",
+                )?;
+            }
+            (Modality::Text, _) => {
+                return Err(CapabilityError::UnsupportedInput {
+                    architecture: model.model_type().into(),
+                    reason: "prepared text is not represented by tokenizer IDs".into(),
+                });
+            }
+            (_modality, InputPayload::Embeddings(embeddings)) => {
+                if embeddings.ndim() != 3 || embeddings.dim(0) != 1 {
                     return Err(CapabilityError::UnsupportedInput {
-                        architecture: self.model_type().into(),
-                        reason: "non-text prepared input cannot contain tokenizer IDs".into(),
+                        architecture: model.model_type().into(),
+                        reason: format!(
+                            "prepared media embeddings must be [1, sequence, hidden], got {:?}",
+                            embeddings.shape()
+                        ),
                     });
                 }
+                media_positions = checked_add(
+                    media_positions,
+                    positive(embeddings.dim(1), "prepared embedding sequence")?,
+                    "prepared media-position total",
+                )?;
+            }
+            (modality, InputPayload::Tensor(tensor)) => {
+                let (positions, workspace_bytes) =
+                    model.prepared_media_accounting(modality, tensor, part.metadata, stream)?;
+                media_positions =
+                    checked_add(media_positions, positions, "prepared media-position total")?;
+                media_execution_workspace_bytes = checked_add(
+                    media_execution_workspace_bytes,
+                    workspace_bytes,
+                    "prepared media-workspace total",
+                )?;
+                media_execution_workspace_kind = ObservationKind::Conservative;
+            }
+            (_, InputPayload::TokenIds(_)) => {
+                return Err(CapabilityError::UnsupportedInput {
+                    architecture: model.model_type().into(),
+                    reason: "non-text prepared input cannot contain tokenizer IDs".into(),
+                });
             }
         }
-        Ok(InputTokenCount::prepared(
+    }
+    Ok(InputTokenCount::prepared(
+        text_tokens,
+        media_positions,
+        checked_add(
             text_tokens,
             media_positions,
+            "prepared model-position total",
+        )?,
+        media_execution_workspace_bytes,
+        media_execution_workspace_kind,
+    ))
+}
+
+pub(crate) fn model_runtime_state(
+    model: &Model,
+    input: InputTokenCount,
+    max_output_tokens: u64,
+    batch_size: u64,
+) -> Result<RuntimeStateEstimate, CapabilityError> {
+    let (_, estimate) = model.capabilities_and_estimate()?;
+    estimate_mlx_runtime_state(&estimate, input, max_output_tokens, batch_size)
+}
+
+pub(crate) fn static_model_memory(model: &Model) -> Result<StaticMemoryReport, CapabilityError> {
+    let residency = model
+        .residency_report()
+        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+    let (logical, host, device, disk, mappings) = if let Some(report) = residency {
+        let planned = report.offload().planned_bytes();
+        let resident = report.offload().resident_bytes();
+        let logical = checked_add(
             checked_add(
-                text_tokens,
-                media_positions,
-                "prepared model-position total",
+                planned.get(MemoryTier::Host),
+                planned.get(MemoryTier::Device),
+                "planned host plus device parameters",
             )?,
-            media_execution_workspace_bytes,
-            media_execution_workspace_kind,
-        ))
-    }
-
-    /// Estimates persistent request state and prepared-media execution workspace
-    /// with checked arithmetic.
-    ///
-    /// Cache/state scalars are conservatively modeled as four-byte values.
-    /// This matches current float32 cache construction and avoids understating
-    /// models whose checkpoint weights use a narrower storage dtype.
-    pub fn estimate_runtime_state(
-        &self,
-        input: InputTokenCount,
-        max_output_tokens: u64,
-        batch_size: u64,
-    ) -> Result<RuntimeStateEstimate, CapabilityError> {
-        let (_, estimate) = self.model().capabilities_and_estimate()?;
-        estimate_mlx_runtime_state(&estimate, input, max_output_tokens, batch_size)
-    }
-
-    /// Reports logical checkpoint/residency accounting and MLX allocator observations.
-    pub fn static_memory(&self) -> Result<StaticMemoryReport, CapabilityError> {
-        let residency = self
-            .model()
-            .residency_report()
-            .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-        let (logical, host, device, disk, mappings) = if let Some(report) = residency {
-            let planned = report.offload().planned_bytes();
-            let resident = report.offload().resident_bytes();
-            let logical = checked_add(
-                checked_add(
-                    planned.get(MemoryTier::Host),
-                    planned.get(MemoryTier::Device),
-                    "planned host plus device parameters",
-                )?,
-                planned.get(MemoryTier::Disk),
-                "complete planned parameter bytes",
-            )?;
-            (
-                Observed::Available {
-                    value: logical,
-                    kind: ObservationKind::Exact,
-                    source: "validated bounded-residency plan".into(),
-                },
-                Observed::Available {
-                    value: resident.get(MemoryTier::Host),
-                    kind: ObservationKind::Exact,
-                    source: "bounded-residency manager".into(),
-                },
-                Observed::Available {
-                    value: resident.get(MemoryTier::Device),
-                    kind: ObservationKind::Exact,
-                    source: "bounded-residency manager".into(),
-                },
-                Observed::Available {
-                    value: planned.get(MemoryTier::Disk),
-                    kind: ObservationKind::Exact,
-                    source: "bounded-residency plan".into(),
-                },
-                Observed::Available {
-                    value: report.weight_store().currently_mapped_shards as u64,
-                    kind: ObservationKind::Observational,
-                    source: "checkpoint-store mapping cache".into(),
-                },
-            )
-        } else {
-            (
-                Observed::Unavailable {
-                    reason: "loaded model exposes neither resident parameters nor a residency plan"
-                        .into(),
-                },
-                Observed::Unavailable {
-                    reason: "host residency unavailable".into(),
-                },
-                Observed::Unavailable {
-                    reason: "device residency unavailable".into(),
-                },
-                Observed::Unavailable {
-                    reason: "disk residency unavailable".into(),
-                },
-                Observed::Unavailable {
-                    reason: "mapping information unavailable".into(),
-                },
-            )
-        };
-        Ok(StaticMemoryReport {
-            logical_parameter_bytes: logical,
-            current_host_resident_bytes: host,
-            current_device_resident_bytes: device,
-            planned_disk_backed_bytes: disk,
-            backend_active_allocation_bytes: runtime_counter(
-                safemlx::memory::active_memory,
-                "process-global MLX active allocation counter",
-            ),
-            backend_allocator_cache_bytes: runtime_counter(
-                safemlx::memory::cache_memory,
-                "process-global MLX allocator cache counter",
-            ),
-            physical_semantics: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                PhysicalMemorySemantics::Unified
-            } else {
-                PhysicalMemorySemantics::Unknown
-            },
-            currently_mapped_shards: mappings,
-        })
-    }
-
-    /// Applies context and memory policy without allocating a model cache.
-    pub fn admit(
-        &self,
-        request: AdmissionRequest,
-        available: Option<&AvailableMemory>,
-    ) -> Result<AdmissionResult, CapabilityError> {
-        let capabilities = self.capabilities()?;
-        let state = self.estimate_runtime_state(
-            request.input,
-            request.max_output_tokens,
-            request.batch_size,
+            planned.get(MemoryTier::Disk),
+            "complete planned parameter bytes",
         )?;
-        apply_admission_policy(&capabilities, request, state, available)
-    }
+        (
+            Observed::Available {
+                value: logical,
+                kind: ObservationKind::Exact,
+                source: "validated bounded-residency plan".into(),
+            },
+            Observed::Available {
+                value: resident.get(MemoryTier::Host),
+                kind: ObservationKind::Exact,
+                source: "bounded-residency manager".into(),
+            },
+            Observed::Available {
+                value: resident.get(MemoryTier::Device),
+                kind: ObservationKind::Exact,
+                source: "bounded-residency manager".into(),
+            },
+            Observed::Available {
+                value: planned.get(MemoryTier::Disk),
+                kind: ObservationKind::Exact,
+                source: "bounded-residency plan".into(),
+            },
+            Observed::Available {
+                value: report.weight_store().currently_mapped_shards as u64,
+                kind: ObservationKind::Observational,
+                source: "checkpoint-store mapping cache".into(),
+            },
+        )
+    } else {
+        (
+            Observed::Unavailable {
+                reason: "loaded model exposes neither resident parameters nor a residency plan"
+                    .into(),
+            },
+            Observed::Unavailable {
+                reason: "host residency unavailable".into(),
+            },
+            Observed::Unavailable {
+                reason: "device residency unavailable".into(),
+            },
+            Observed::Unavailable {
+                reason: "disk residency unavailable".into(),
+            },
+            Observed::Unavailable {
+                reason: "mapping information unavailable".into(),
+            },
+        )
+    };
+    Ok(StaticMemoryReport {
+        logical_parameter_bytes: logical,
+        current_host_resident_bytes: host,
+        current_device_resident_bytes: device,
+        planned_disk_backed_bytes: disk,
+        backend_active_allocation_bytes: runtime_counter(
+            safemlx::memory::active_memory,
+            "process-global MLX active allocation counter",
+        ),
+        backend_allocator_cache_bytes: runtime_counter(
+            safemlx::memory::cache_memory,
+            "process-global MLX allocator cache counter",
+        ),
+        physical_semantics: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            PhysicalMemorySemantics::Unified
+        } else {
+            PhysicalMemorySemantics::Unknown
+        },
+        currently_mapped_shards: mappings,
+    })
 }
 
 #[cfg(target_os = "macos")]

@@ -8,15 +8,19 @@ policy produces a structured error.
 
 ## Inspect an artifact
 
-Use `inspect_model` before reserving a device or loading weights:
+Use backend structural inspection before reserving a device or loading
+weights, then apply backend-independent text inspection when tokenizer or chat
+readiness matters:
 
 ```rust,no_run
 use safemlx_lm::{
+    api::{inspect_text_model, TextInspectionOptions},
     backend::mlx::{inspect_model, MlxInspectionOptions},
     InspectionSeverity,
 };
 
-let report = inspect_model("/path/to/model", MlxInspectionOptions::default())?;
+let structural = inspect_model("/path/to/model", MlxInspectionOptions::default())?;
+let report = inspect_text_model(structural, TextInspectionOptions::default());
 if !report.is_loadable() {
     for issue in report
         .issues
@@ -29,11 +33,13 @@ if !report.is_loadable() {
 # Ok::<(), safemlx_lm::error::Error>(())
 ```
 
-Inspection reads configuration and bounded checkpoint headers, reconstructs
-tokenizer and processor metadata, locates required companion artifacts, and
-applies the requested quantization, residency, and topology preflight. It does
-not create an MLX stream or load weight payloads. `is_loadable()` is the
-fail-closed result for the supplied options.
+Structural inspection reads configuration and bounded checkpoint headers,
+validates processor metadata and required media artifacts, and applies the
+requested quantization, residency, and topology preflight. Text inspection
+reconstructs tokenizer, template, and EOS metadata and behaviorally probes
+semantic output and native tools. Neither step creates an MLX stream or loads
+weight payloads. `is_loadable()` is the fail-closed structural result for the
+selected backend options.
 
 ## Family matrix
 

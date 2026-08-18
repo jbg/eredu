@@ -60,14 +60,20 @@ enable Oniguruma and select it as the faster tokenizer regex implementation.
 
 ## Inspect before loading
 
-`inspect_model` performs the same architecture, tensor, quantization,
-residency, and topology preflight used by loading without creating an MLX
-stream or loading weight payloads:
+MLX structural inspection performs the same architecture, tensor,
+quantization, residency, and topology preflight used by loading without
+creating a stream or loading weight payloads. Text inspection is a separate
+facade step because tokenizer, chat-template, EOS, and semantic behavior do not
+belong to an execution backend:
 
 ```rust,no_run
-use safemlx_lm::backend::mlx::{inspect_model, MlxInspectionOptions};
+use safemlx_lm::{
+    api::{inspect_text_model, TextInspectionOptions},
+    backend::mlx::{inspect_model, MlxInspectionOptions},
+};
 
-let report = inspect_model("/path/to/model", MlxInspectionOptions::default())?;
+let structural = inspect_model("/path/to/model", MlxInspectionOptions::default())?;
+let report = inspect_text_model(structural, TextInspectionOptions::default());
 if !report.is_loadable() {
     for issue in &report.issues {
         eprintln!("{:?}: {}", issue.code, issue.detail);
@@ -87,9 +93,9 @@ MLX. The selected backend then consumes that plan. `MlxBackend` owns its
 execution and weight-materialization streams and maps payloads into executable
 MLX arrays/modules; streams are not separate loader arguments.
 Portable inspection and capability report types live in `safemlx-lm-core` and
-are reexported by the facade. The concrete inspector and process-memory probe
-are MLX operations, so callers select them through `backend::mlx`; they are not
-pretended to be backend-generic facade functions.
+are reexported by the facade. Tensor structure and process-memory probes are
+selected-backend operations. Text sidecar and behavioral inspection composes
+above that result and is never called from the MLX adapter.
 Replicated, tensor-, pipeline-, and expert-parallel prefill/decode execution
 crosses the single stateful `MlxModelSession` implementation of the core
 session contract. `load_model(&backend, artifact, options)` returns a

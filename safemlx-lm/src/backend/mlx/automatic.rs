@@ -26,7 +26,9 @@ use crate::{
             LayerwiseLoadOptions, LayerwiseModelError, NonExpertWeightResidency, WeightResidency,
         },
         residency::{
-            dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions,
+            dense_stream::DenseDiskStreamLoadOptions,
+            expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport},
+            manager::ResidencyReport,
         },
     },
 };
@@ -242,14 +244,8 @@ impl AutomaticPlanningBackend for MlxAutomaticPlanningBackend {
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
         let load = execution_plan_load_options(plan)
             .map_err(|error| planning_backend_error("realize_plan", error))?;
-        let report = inspect_model(
-            model_path,
-            MlxInspectionOptions {
-                load,
-                chat_request: None,
-            },
-        )
-        .map_err(|error| planning_backend_error("admit_candidate", error))?;
+        let report = inspect_model(model_path, MlxInspectionOptions { load })
+            .map_err(|error| planning_backend_error("admit_candidate", error))?;
         let supported = report.is_loadable();
         let rejection = (!supported).then(|| {
             report
@@ -354,13 +350,8 @@ impl AutomaticPlanningBackend for MlxAutomaticPlanningBackend {
     }
 }
 
-/// Collects neutral residency telemetry from an MLX loaded model.
-pub fn collect_residency_telemetry(
-    model: &crate::api::LoadedModel<MlxBackend<'static>>,
-) -> Result<Option<ResidencyTelemetry>, Error> {
-    let Some(report) = model.residency_report()? else {
-        return Ok(None);
-    };
+/// Converts an MLX residency snapshot into neutral telemetry.
+pub fn residency_telemetry(report: &ResidencyReport) -> ResidencyTelemetry {
     let offload = report.offload();
     let planned = offload.planned_bytes();
     let current = offload.resident_bytes();
@@ -377,7 +368,7 @@ pub fn collect_residency_telemetry(
             }
         })
         .collect();
-    Ok(Some(ResidencyTelemetry {
+    ResidencyTelemetry {
         planned_disk_bytes: planned.get(MemoryTier::Disk),
         planned_host_bytes: planned.get(MemoryTier::Host),
         planned_device_bytes: planned.get(MemoryTier::Device),
@@ -386,25 +377,21 @@ pub fn collect_residency_telemetry(
         peak_host_bytes: peak.get(MemoryTier::Host),
         peak_device_bytes: peak.get(MemoryTier::Device),
         transfers,
-    }))
+    }
 }
 
-/// Collects neutral routed-expert cache telemetry from an MLX loaded model.
-pub fn collect_expert_cache_telemetry(
-    model: &crate::api::LoadedModel<MlxBackend<'static>>,
-) -> Result<Option<ExpertCacheTelemetry>, Error> {
-    Ok(model
-        .expert_cache_report()?
-        .map(|report| ExpertCacheTelemetry {
-            owned_experts: report.owned_experts,
-            owned_bytes: report.owned_bytes,
-            host_resident_experts: report.host_resident_experts,
-            device_resident_experts: report.device_resident_experts,
-            host_resident_bytes: report.host_resident_bytes,
-            device_resident_bytes: report.device_resident_bytes,
-            peak_host_resident_bytes: report.peak_host_resident_bytes,
-            peak_device_resident_bytes: report.peak_device_resident_bytes,
-        }))
+/// Converts an MLX routed-expert cache snapshot into neutral telemetry.
+pub fn expert_cache_telemetry(report: &ExpertCacheReport) -> ExpertCacheTelemetry {
+    ExpertCacheTelemetry {
+        owned_experts: report.owned_experts,
+        owned_bytes: report.owned_bytes,
+        host_resident_experts: report.host_resident_experts,
+        device_resident_experts: report.device_resident_experts,
+        host_resident_bytes: report.host_resident_bytes,
+        device_resident_bytes: report.device_resident_bytes,
+        peak_host_resident_bytes: report.peak_host_resident_bytes,
+        peak_device_resident_bytes: report.peak_device_resident_bytes,
+    }
 }
 
 /// Converts neutral speculative statistics into the stable telemetry document.
