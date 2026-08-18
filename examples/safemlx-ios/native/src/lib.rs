@@ -12,6 +12,7 @@ use std::{
 use safemlx::{transforms::async_eval, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::LoadedModel,
+    backend::mlx::MlxBackend,
     runtime::{
         chat::ChatTemplateRequest,
         generation::sampler::GenerationSampler,
@@ -87,7 +88,7 @@ fn publish_error(out: *mut *mut c_char, message: String) {
 }
 
 fn generate(
-    model: &mut LoadedModel,
+    model: &mut LoadedModel<MlxBackend<'static>>,
     stream: &safemlx::Stream,
     prompt: &str,
     callback: TextCallback,
@@ -189,8 +190,12 @@ fn worker_main(
         safemlx::metal::set_metallib_path(&metallib_path).map_err(|error| error.to_string())?;
         let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut model = LoadedModel::load(&model_path, execution.stream(), weights.stream())
-            .map_err(|error| error.to_string())?;
+        let mut model = LoadedModel::load(
+            MlxBackend::new(execution.stream(), weights.stream()),
+            &model_path,
+            Default::default(),
+        )
+        .map_err(|error| error.to_string())?;
         execution
             .stream()
             .synchronize()

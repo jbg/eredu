@@ -8,9 +8,7 @@ use super::*;
 /// selected backend runtime, tokenizer, optional chat template, model id
 /// used by the template renderer, and EOS token ids collected from checkpoint
 /// and sidecar metadata.
-pub struct LoadedModel<
-    B: safemlx_lm_core::TextGenerationBackend = crate::backend::mlx::MlxBackend<'static>,
-> {
+pub struct LoadedModel<B: safemlx_lm_core::TextGenerationBackend> {
     pub(super) runtime: safemlx_lm_core::ModelRuntime<B>,
     pub(super) tokenizer: ChatTokenizer,
     pub(super) tokenizer_fingerprint: [u8; 32],
@@ -20,6 +18,17 @@ pub struct LoadedModel<
     pub(super) eos_token_ids: Vec<u32>,
     pub(super) checkpoint_generation_config: Option<CheckpointGenerationConfig>,
     pub(super) constraint_compiler: Result<ConstraintCompiler, String>,
+}
+
+/// Failure while assembling a tokenizer-aware model around a selected backend.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadedModelLoadError<E: std::error::Error + Send + Sync + 'static> {
+    /// Artifact planning, backend materialization, or session creation failed.
+    #[error("selected backend failed to load the model: {0}")]
+    Backend(#[source] E),
+    /// Portable tokenizer, chat-template, or generation sidecar loading failed.
+    #[error(transparent)]
+    Metadata(#[from] Error),
 }
 
 /// Backend-neutral tokenizer and chat metadata attached to a prepared runtime.
@@ -386,6 +395,110 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     pub fn is_eos_token(&self, id: u32) -> bool {
         self.eos_token_ids.contains(&id)
     }
+}
+
+impl<B> LoadedModel<B>
+where
+    B: safemlx_lm_core::TextGenerationBackend + safemlx_lm_core::ModelLoadingBackend,
+    B::Error: From<safemlx_lm_core::artifact::ArtifactError>,
+{
+    /// Loads one artifact, its tokenizer, and its chat metadata on `backend`.
+    ///
+    /// The backend already owns device placement, execution queues, transfer
+    /// queues, and optional communication. Artifact inspection occurs exactly
+    /// once and is shared by portable metadata assembly and backend planning.
+    pub fn load(
+        backend: B,
+        artifact: impl AsRef<Path>,
+        options: B::LoadOptions,
+    ) -> Result<Self, LoadedModelLoadError<B::Error>> {
+        let artifact = artifact.as_ref();
+        let inspection = safemlx_lm_core::inspect_artifact(artifact)
+            .map_err(|error| LoadedModelLoadError::Backend(error.into()))?;
+        let (tokenizer, config) = loaded_text_artifact(&inspection)?;
+        let prepared = safemlx_lm_core::prepare_inspected_model(&backend, inspection, options)
+            .map_err(LoadedModelLoadError::Backend)?;
+        let runtime = safemlx_lm_core::ModelRuntime::from_prepared(backend, prepared)
+            .map_err(LoadedModelLoadError::Backend)?;
+        Ok(Self::from_runtime(runtime, tokenizer, config))
+    }
+}
+
+fn loaded_text_artifact(
+    inspection: &safemlx_lm_core::ArtifactInspection,
+) -> Result<(ChatTokenizer, LoadedTextModelConfig), Error> {
+    let path = inspection.path();
+    let configuration = inspection.configuration();
+    if configuration.kind == ModelKind::PersonaPlex {
+        return Err(Error::UnsupportedArchitecture(
+            "PersonaPlex is a realtime speech-to-speech token model; use the realtime backend contract instead of LoadedModel".into(),
+        ));
+    }
+
+    let sidecar_dir = match inspection.format() {
+        safemlx_lm_core::ArtifactFormat::SafeTensors => path,
+        safemlx_lm_core::ArtifactFormat::Gguf => gguf_sidecar_dir(path),
+    };
+    let checkpoint_generation_config = read_checkpoint_generation_config(sidecar_dir)?;
+    let sidecar_eos_token_ids = eos_token_ids_from_sidecar_dir(sidecar_dir)?;
+
+    let (mut tokenizer, chat_template, eos_token_ids, model_id) = match inspection.format() {
+        safemlx_lm_core::ArtifactFormat::SafeTensors => {
+            let tokenizer = load_tokenizer_for_kind(configuration.kind, path)?;
+            (
+                ChatTokenizer::from_tokenizer(tokenizer),
+                load_chat_template(path)?,
+                sidecar_eos_token_ids,
+                configuration.effective_model_type.clone(),
+            )
+        }
+        safemlx_lm_core::ArtifactFormat::Gguf => {
+            let metadata = inspection
+                .gguf_checkpoint()
+                .expect("GGUF inspection owns a portable checkpoint")
+                .metadata()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<std::collections::HashMap<_, _>>();
+            let embedded_chat_template = match metadata.get("tokenizer.chat_template") {
+                Some(GgufMetadataValue::String(template)) => {
+                    Some(ModelChatTemplate::Single(template.clone()))
+                }
+                Some(_) => {
+                    return Err(Error::GgufTokenizer(
+                        "tokenizer.chat_template must be a string".into(),
+                    ));
+                }
+                None => None,
+            };
+            let GgufTokenizer {
+                tokenizer,
+                template_kwargs,
+            } = load_gguf_tokenizer_from_metadata(path, &metadata)?;
+            let mut tokenizer = ChatTokenizer::from_tokenizer(tokenizer);
+            tokenizer.set_template_kwargs(template_kwargs);
+            (
+                tokenizer,
+                embedded_chat_template.or(load_chat_template(sidecar_dir)?),
+                merge_eos_token_id_sources([sidecar_eos_token_ids, gguf_eos_token_ids(&metadata)?]),
+                path.display().to_string(),
+            )
+        }
+    };
+    if inspection.format() == safemlx_lm_core::ArtifactFormat::SafeTensors {
+        tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(path)?);
+    }
+
+    Ok((
+        tokenizer,
+        LoadedTextModelConfig {
+            model_type: configuration.effective_model_type.clone(),
+            model_id,
+            chat_template,
+            eos_token_ids,
+            checkpoint_generation_config,
+        },
+    ))
 }
 
 struct PreparedChatMtpLaneRuntime<'a> {
@@ -1747,145 +1860,6 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         &self,
     ) -> Result<Option<crate::runtime::residency::expert_cache::ExpertCacheReport>, Error> {
         self.runtime.session().expert_cache_report()
-    }
-
-    /// Loads a supported model directory or GGUF file with its tokenizer.
-    ///
-    /// GGUF tokenizers are reconstructed from embedded metadata. A sibling
-    /// `tokenizer.json` is used only when the embedded tokenizer is absent or
-    /// uses an unsupported tokenizer model.
-    pub fn load(
-        model_dir: impl AsRef<Path>,
-        stream: &Stream,
-        weights_stream: &Stream,
-    ) -> Result<Self, Error> {
-        Self::load_with_options(
-            model_dir,
-            ModelLoadOptions::default(),
-            stream,
-            weights_stream,
-        )
-    }
-
-    /// Loads a supported model using architecture-independent weight options.
-    pub fn load_with_options(
-        model_dir: impl AsRef<Path>,
-        options: ModelLoadOptions,
-        stream: &Stream,
-        weights_stream: &Stream,
-    ) -> Result<Self, Error> {
-        let model_dir = model_dir.as_ref();
-        ensure_replicated_load_options(options)?;
-        if is_gguf_file(model_dir) {
-            let sidecar_dir = gguf_sidecar_dir(model_dir);
-            let checkpoint_generation_config = read_checkpoint_generation_config(sidecar_dir)?;
-            let inspection = safemlx_lm_core::inspect_artifact(model_dir)?;
-            let metadata = inspection
-                .gguf_checkpoint()
-                .expect("GGUF inspection owns a portable checkpoint")
-                .metadata()
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<std::collections::HashMap<_, _>>();
-            let plan =
-                safemlx_lm_core::plan_model_preparation(inspection, options.preparation_policy()?)?;
-            let crate::backend::mlx::MaterializedGgufModel {
-                model,
-                eos_token_ids: architecture_eos_token_ids,
-                #[cfg(feature = "media-processing")]
-                processor,
-            } = crate::backend::mlx::materialize_gguf_plan(plan, options, stream, weights_stream)?;
-            let sidecar_eos_token_ids = eos_token_ids_from_sidecar_dir(sidecar_dir)?;
-            let embedded_eos_token_ids = gguf_eos_token_ids(&metadata)?;
-            let eos_token_ids = merge_eos_token_id_sources([
-                sidecar_eos_token_ids,
-                architecture_eos_token_ids,
-                embedded_eos_token_ids,
-            ]);
-            let chat_template = match metadata.get("tokenizer.chat_template") {
-                Some(GgufMetadataValue::String(template)) => {
-                    Some(ModelChatTemplate::Single(template.clone()))
-                }
-                Some(_) => {
-                    return Err(Error::UnsupportedArchitecture(
-                        "GGUF metadata key \"tokenizer.chat_template\" has the wrong type".into(),
-                    ));
-                }
-                None => None,
-            };
-            let GgufTokenizer {
-                tokenizer,
-                template_kwargs,
-            } = load_gguf_tokenizer_from_metadata(model_dir, &metadata)?;
-            let mut tokenizer = ChatTokenizer::from_tokenizer(tokenizer);
-            tokenizer.set_template_kwargs(template_kwargs);
-            let tokenizer_fingerprint = crate::api::tokenizer_vocabulary_fingerprint(&tokenizer);
-            let chat_template = chat_template.or(load_chat_template(sidecar_dir)?);
-            let constraint_compiler =
-                ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
-            let model_type = model.model_type().to_owned();
-            let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
-                crate::backend::mlx::MlxBackend::new(stream, weights_stream),
-                safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(model)),
-            )?;
-            #[cfg(feature = "media-processing")]
-            let runtime = {
-                let mut runtime = runtime;
-                runtime.session_mut().set_processor(processor);
-                runtime
-            };
-            return Ok(Self {
-                runtime,
-                tokenizer,
-                tokenizer_fingerprint,
-                chat_template,
-                model_type,
-                model_id: model_dir.display().to_string(),
-                eos_token_ids,
-                checkpoint_generation_config,
-                constraint_compiler,
-            });
-        }
-        let metadata = read_model_metadata(model_dir)?;
-        let checkpoint_generation_config = read_checkpoint_generation_config(model_dir)?;
-        let eos_token_ids = eos_token_ids_from_sidecar_dir(model_dir)?;
-        let model_type = effective_model_type(&metadata);
-        let kind = ModelKind::from_model_type(&model_type)?;
-        let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
-        tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(model_dir)?);
-        let tokenizer_fingerprint = crate::api::tokenizer_vocabulary_fingerprint(&tokenizer);
-        let constraint_compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
-        let chat_template = load_chat_template(model_dir)?;
-        #[cfg(feature = "media-processing")]
-        let processor = load_processor(model_dir)?;
-        if kind == ModelKind::PersonaPlex {
-            return Err(Error::UnsupportedArchitecture(
-                "PersonaPlex is a realtime speech-to-speech token model; use architectures::moshi::personaplex instead of LoadedModel".into(),
-            ));
-        }
-        let runtime = safemlx_lm_core::ModelRuntime::load(
-            crate::backend::mlx::MlxBackend::new(stream, weights_stream),
-            model_dir,
-            options,
-        )?;
-        #[cfg(feature = "media-processing")]
-        let runtime = {
-            let mut runtime = runtime;
-            runtime.session_mut().set_processor(processor);
-            runtime
-        };
-
-        Ok(Self {
-            runtime,
-            tokenizer,
-            tokenizer_fingerprint,
-            chat_template,
-            model_type: model_type.clone(),
-            model_id: model_type,
-            eos_token_ids,
-            checkpoint_generation_config,
-            constraint_compiler,
-        })
     }
 
     /// Returns checkpoint-native quantization storage statistics when available.

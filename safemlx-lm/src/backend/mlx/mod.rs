@@ -15,9 +15,7 @@ pub mod speculative;
 pub(crate) mod structural;
 /// MLX process-local device binding for a canonical core rank topology.
 pub mod topology;
-pub(crate) use loading::{
-    materialize_gguf_plan, validate_gguf_quantization_source, MaterializedGgufModel,
-};
+pub(crate) use loading::validate_gguf_quantization_source;
 /// Architecture-erased model/session execution.
 mod session;
 
@@ -36,6 +34,8 @@ use safemlx_lm_core::backend::{
     ModelLoadingBackend, PreparedModel, Submission,
 };
 
+#[cfg(feature = "media-processing")]
+use crate::runtime::media::ModelProcessor;
 use crate::{
     api::{Model, ModelLoadOptions},
     architectures::distributed::{expert::ExpertParallelModel, pipeline::PipelineModel},
@@ -49,6 +49,8 @@ use crate::{
 /// not exposed through the public loading API.
 pub struct MlxModel {
     pub(crate) inner: MlxModelKind,
+    #[cfg(feature = "media-processing")]
+    processor: Option<ModelProcessor>,
 }
 
 pub(crate) enum MlxModelKind {
@@ -61,19 +63,31 @@ impl MlxModel {
     pub(crate) const fn complete(model: Model) -> Self {
         Self {
             inner: MlxModelKind::Complete(model),
+            #[cfg(feature = "media-processing")]
+            processor: None,
         }
     }
 
     pub(super) const fn pipeline(model: PipelineModel) -> Self {
         Self {
             inner: MlxModelKind::Pipeline(model),
+            #[cfg(feature = "media-processing")]
+            processor: None,
         }
     }
 
     pub(super) const fn expert(model: ExpertParallelModel) -> Self {
         Self {
             inner: MlxModelKind::Expert(model),
+            #[cfg(feature = "media-processing")]
+            processor: None,
         }
+    }
+
+    #[cfg(feature = "media-processing")]
+    fn with_processor(mut self, processor: Option<ModelProcessor>) -> Self {
+        self.processor = processor;
+        self
     }
 
     #[cfg(test)]

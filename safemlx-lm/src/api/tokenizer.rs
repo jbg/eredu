@@ -32,7 +32,17 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
         return Ok(load_gguf_tokenizer(model_dir)?.tokenizer);
     }
     let metadata = read_model_metadata(model_dir)?;
-    match ModelKind::from_model_type(&effective_model_type(&metadata))? {
+    load_tokenizer_for_kind(
+        ModelKind::from_model_type(&effective_model_type(&metadata))?,
+        model_dir,
+    )
+}
+
+pub(super) fn load_tokenizer_for_kind(
+    kind: ModelKind,
+    model_dir: &Path,
+) -> Result<Tokenizer, Error> {
+    match kind {
         ModelKind::DeepSeekV3 => deepseek_v3::load_tokenizer(model_dir),
         ModelKind::DeepSeekV4 => deepseek_v3::load_tokenizer(model_dir),
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),

@@ -82,7 +82,11 @@ fn render_prompt(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> anyhow::Result<String> {
-    let mut loaded = LoadedModel::load(target_dir, stream, weights_stream)?;
+    let mut loaded = LoadedModel::load(
+        safemlx_lm::backend::mlx::MlxBackend::new(stream, weights_stream),
+        target_dir,
+        Default::default(),
+    )?;
     Ok(loaded
         .apply_chat_template_json(
             vec![vec![serde_json::json!({
@@ -102,7 +106,11 @@ fn run_greedy(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
-    let mut loaded = LoadedModel::load(target_dir, stream, weights_stream)?;
+    let mut loaded = LoadedModel::load(
+        safemlx_lm::backend::mlx::MlxBackend::new(stream, weights_stream),
+        target_dir,
+        Default::default(),
+    )?;
     let prompt_tokens = loaded.encode_to_array(prompt, false, stream)?;
     let eos = loaded.eos_token_ids().to_vec();
     let mut ids = Vec::new();
@@ -148,7 +156,11 @@ fn run_mtp(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
-    let mut target = LoadedModel::load(target_dir, stream, weights_stream)?;
+    let mut target = LoadedModel::load(
+        safemlx_lm::backend::mlx::MlxBackend::new(stream, weights_stream),
+        target_dir,
+        Default::default(),
+    )?;
     let mut assistant = MlxDrafter::load(assistant_dir, stream, weights_stream)?;
     let prompt_tokens = target.encode_to_array(prompt, false, stream)?;
     let parts = [InputPart::text_token_ids(&prompt_tokens)];

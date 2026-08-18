@@ -20,7 +20,10 @@ point. `ModelLoadingBackend` supplies only policy resolution and conversion of
 the neutral `ModelPreparationPlan` into its associated model configuration.
 The selected backend instance owns devices, queues, and communication state;
 generic caller code never passes a native stream or chooses an architecture
-loader. `ModelRuntime::load` combines this operation with session creation.
+loader. `prepare_inspected_model` is the lower-level form for tokenizer-aware
+facades which must consume portable metadata from the same
+`ArtifactInspection` before transferring it to backend planning.
+`ModelRuntime::load` combines ordinary loading with session creation.
 
 Core owns the production weight-residency policy and ownership state machine,
 not a parallel summary schema. `OffloadPlan` validates stable unit identities,

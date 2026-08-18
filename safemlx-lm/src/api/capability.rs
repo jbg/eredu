@@ -2626,7 +2626,7 @@ fn estimate_architecture_state(
     })
 }
 
-impl super::LoadedModel {
+impl super::LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     /// Returns architecture-independent capabilities derived from validated loaded state.
     pub fn capabilities(&self) -> Result<ModelCapabilities, CapabilityError> {
         self.model()

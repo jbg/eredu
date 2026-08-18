@@ -63,7 +63,7 @@ use crate::runtime::generation::streaming::{
 pub(crate) use crate::runtime::media::input;
 use crate::runtime::media::PreparedModelInput;
 #[cfg(feature = "media-processing")]
-use crate::runtime::media::{load_processor, ChatMediaBinding, ModelProcessor, ProcessorInput};
+use crate::runtime::media::{ChatMediaBinding, ModelProcessor, ProcessorInput};
 use crate::{
     backend::mlx::speculative::{
         scheduler::MlxMtpScheduler, MlxDrafter, MlxDrafterKind, MlxMtpCache, MtpExecutionStreams,
@@ -314,7 +314,7 @@ pub mod realtime;
 
 mod loaded;
 pub(crate) use crate::backend::mlx::validate_gguf_quantization_source;
-pub use loaded::{LoadedModel, LoadedTextModelConfig};
+pub use loaded::{LoadedModel, LoadedModelLoadError, LoadedTextModelConfig};
 
 mod inspection;
 pub use inspection::{
@@ -327,7 +327,7 @@ mod tokenizer;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer};
 use tokenizer::{
     effective_model_type, is_gguf_file, load_chat_template, load_gguf_tokenizer_from_metadata,
-    load_tokenizer_template_kwargs, read_model_metadata,
+    load_tokenizer_for_kind, load_tokenizer_template_kwargs,
 };
 pub(crate) use tokenizer::{gguf_sidecar_dir, tokenizer_vocabulary_fingerprint};
 

@@ -26,7 +26,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let drafter_path = arguments.next();
 
     let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-    let mut model = LoadedModel::load(&target_path, target.stream(), target.stream())?;
+    let mut model = LoadedModel::load(
+        safemlx_lm::backend::mlx::MlxBackend::new(target.stream(), target.stream()),
+        &target_path,
+        Default::default(),
+    )?;
     let prepared = model.prepare_chat(ChatTemplateRequest {
         messages: vec![json!({
             "role": "user",

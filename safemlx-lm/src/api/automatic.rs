@@ -1813,7 +1813,9 @@ fn plan_automatic_execution_with_policy(
 
 impl ResidencyTelemetry {
     /// Collects bounded ordinary-weight residency telemetry from a loaded model.
-    pub fn collect(model: &super::LoadedModel) -> Result<Option<Self>, crate::error::Error> {
+    pub fn collect(
+        model: &super::LoadedModel<crate::backend::mlx::MlxBackend<'static>>,
+    ) -> Result<Option<Self>, crate::error::Error> {
         let Some(report) = model.residency_report()? else {
             return Ok(None);
         };
@@ -1848,7 +1850,9 @@ impl ResidencyTelemetry {
 
 impl ExpertCacheTelemetry {
     /// Collects independent routed-expert cache occupancy from a loaded model.
-    pub fn collect(model: &super::LoadedModel) -> Result<Option<Self>, crate::error::Error> {
+    pub fn collect(
+        model: &super::LoadedModel<crate::backend::mlx::MlxBackend<'static>>,
+    ) -> Result<Option<Self>, crate::error::Error> {
         Ok(model.expert_cache_report()?.map(|report| Self {
             owned_experts: report.owned_experts,
             owned_bytes: report.owned_bytes,

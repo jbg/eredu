@@ -24,7 +24,10 @@ use safemlx::{
 use safemlx_lm_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
 
 #[cfg(feature = "media-processing")]
-use crate::{api::gguf_sidecar_dir, runtime::media::ModelProcessor};
+use crate::{
+    api::gguf_sidecar_dir,
+    runtime::media::{load_processor, ModelProcessor},
+};
 use crate::{
     api::{Model, ModelLoadOptions},
     backend::mlx::{structural, MlxModel},
@@ -32,15 +35,14 @@ use crate::{
     runtime::checkpoint::quantization::WeightQuantization,
 };
 
-/// MLX arrays/modules plus architecture-derived side data from one GGUF artifact.
-pub(crate) struct MaterializedGgufModel {
-    pub(crate) model: Model,
+/// MLX arrays/modules plus backend-owned preprocessing from one GGUF artifact.
+struct MaterializedGgufModel {
+    model: Model,
     #[cfg(feature = "media-processing")]
-    pub(crate) processor: Option<crate::runtime::media::ModelProcessor>,
-    pub(crate) eos_token_ids: Vec<u32>,
+    processor: Option<crate::runtime::media::ModelProcessor>,
 }
 
-pub(crate) fn materialize_gguf_model(
+fn materialize_gguf_model(
     gguf_file: &Path,
     checkpoint: &safemlx::ops::GgufCheckpoint,
     metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
@@ -52,7 +54,7 @@ pub(crate) fn materialize_gguf_model(
     #[cfg(feature = "media-processing")]
     let mut processor = None;
 
-    let (model, architecture_eos_token_ids) = if let Some(quantization) = options
+    let (model, _architecture_eos_token_ids) = if let Some(quantization) = options
         .quantization
         .filter(|_| options.weight_residency.is_fully_resident())
     {
@@ -505,7 +507,6 @@ pub(crate) fn materialize_gguf_model(
         model,
         #[cfg(feature = "media-processing")]
         processor,
-        eos_token_ids: architecture_eos_token_ids,
     })
 }
 
@@ -525,22 +526,26 @@ pub(super) fn materialize_model_plan(
             ModelArtifact::Gguf { path, .. } | ModelArtifact::SafeTensors { path, .. } => path,
         };
         if topology.pipeline_parallel_size > 1 {
-            return crate::architectures::distributed::pipeline::load_pipeline_model_with_options(
-                path,
-                options,
-                stream,
-                weights_stream,
-            )
-            .map(MlxModel::pipeline);
+            let model =
+                crate::architectures::distributed::pipeline::load_pipeline_model_with_options(
+                    path,
+                    options,
+                    stream,
+                    weights_stream,
+                )
+                .map(MlxModel::pipeline)?;
+            return attach_artifact_processor(model, &artifact);
         }
         if topology.expert_parallel_size > 1 {
-            return crate::architectures::distributed::expert::load_expert_parallel_model_with_options(
-                path,
-                options,
-                stream,
-                weights_stream,
-            )
-            .map(MlxModel::expert);
+            let model =
+                crate::architectures::distributed::expert::load_expert_parallel_model_with_options(
+                    path,
+                    options,
+                    stream,
+                    weights_stream,
+                )
+                .map(MlxModel::expert)?;
+            return attach_artifact_processor(model, &artifact);
         }
         if let ModelArtifact::SafeTensors {
             path,
@@ -548,28 +553,59 @@ pub(super) fn materialize_model_plan(
             ..
         } = &artifact
         {
-            return materialize_tensor_parallel(
+            let model = materialize_tensor_parallel(
                 configuration.kind,
                 path,
                 options,
                 stream,
                 weights_stream,
             )
-            .map(MlxModel::complete);
+            .map(MlxModel::complete)?;
+            return attach_artifact_processor(model, &artifact);
         }
     }
     match artifact {
         artifact @ ModelArtifact::Gguf { .. } => {
             materialize_gguf_artifact(artifact, options, stream, weights_stream)
-                .map(|materialized| MlxModel::complete(materialized.model))
+                .map(complete_gguf_model)
         }
         ModelArtifact::SafeTensors {
             path,
             configuration,
             ..
-        } => materialize_safetensors(configuration.kind, &path, options, stream, weights_stream)
-            .map(MlxModel::complete),
+        } => {
+            let model =
+                materialize_safetensors(configuration.kind, &path, options, stream, weights_stream)
+                    .map(MlxModel::complete)?;
+            attach_safetensors_processor(model, &path)
+        }
     }
+}
+
+fn attach_artifact_processor(model: MlxModel, artifact: &ModelArtifact) -> Result<MlxModel, Error> {
+    if let ModelArtifact::SafeTensors { path, .. } = artifact {
+        return attach_safetensors_processor(model, path);
+    }
+    Ok(model)
+}
+
+fn attach_safetensors_processor(model: MlxModel, path: &Path) -> Result<MlxModel, Error> {
+    #[cfg(feature = "media-processing")]
+    {
+        Ok(model.with_processor(load_processor(path)?))
+    }
+    #[cfg(not(feature = "media-processing"))]
+    {
+        let _ = path;
+        Ok(model)
+    }
+}
+
+fn complete_gguf_model(materialized: MaterializedGgufModel) -> MlxModel {
+    let model = MlxModel::complete(materialized.model);
+    #[cfg(feature = "media-processing")]
+    let model = model.with_processor(materialized.processor);
+    model
 }
 
 fn materialize_tensor_parallel(
@@ -747,18 +783,6 @@ fn materialize_tensor_parallel(
     }
 }
 
-/// Materializes a core-owned GGUF plan for the combined model/tokenizer facade.
-pub(crate) fn materialize_gguf_plan(
-    plan: ModelPreparationPlan,
-    options: ModelLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MaterializedGgufModel, Error> {
-    validate_plan_options(&plan, options)?;
-    let (artifact, _policy, _route) = plan.into_parts();
-    materialize_gguf_artifact(artifact, options, stream, weights_stream)
-}
-
 fn validate_plan_options(
     plan: &ModelPreparationPlan,
     options: ModelLoadOptions,
@@ -800,7 +824,7 @@ fn materialize_gguf_artifact(
         .parallel
         .is_some_and(|topology| !topology.is_replicated())
     {
-        let (model, eos_token_ids) = materialize_gguf_tensor_parallel(
+        let (model, _eos_token_ids) = materialize_gguf_tensor_parallel(
             &path,
             &checkpoint,
             &metadata,
@@ -835,7 +859,6 @@ fn materialize_gguf_artifact(
             model,
             #[cfg(feature = "media-processing")]
             processor,
-            eos_token_ids,
         });
     }
     materialize_gguf_model(

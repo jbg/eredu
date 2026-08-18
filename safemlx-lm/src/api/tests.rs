@@ -115,7 +115,12 @@ fn observer_forward_reports_attention_and_residual_hooks() {
     let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     let weights_ctx =
         safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let mut model = LoadedModel::load(model_dir, ctx.stream(), weights_ctx.stream()).unwrap();
+    let mut model = LoadedModel::load(
+        crate::backend::mlx::MlxBackend::new(ctx.stream(), weights_ctx.stream()),
+        model_dir,
+        ModelLoadOptions::default(),
+    )
+    .unwrap();
     let input = model.encode_to_array("hello", true, ctx.stream()).unwrap();
     let mut recorder = ActivationRecorder::new();
     let parts = [crate::runtime::media::input::InputPart::text_token_ids(
@@ -648,8 +653,10 @@ fn chat_preparation_contracts_are_public_and_default_conservatively() {
         request.parallel_tool_calls,
         ParallelToolCallPolicy::Disabled
     );
-    let _: fn(&mut LoadedModel, ChatTemplateRequest) -> Result<PreparedChat, Error> =
-        LoadedModel::prepare_chat;
+    let _: fn(
+        &mut LoadedModel<crate::backend::mlx::MlxBackend<'static>>,
+        ChatTemplateRequest,
+    ) -> Result<PreparedChat, Error> = LoadedModel::prepare_chat;
 }
 
 #[test]

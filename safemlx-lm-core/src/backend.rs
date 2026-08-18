@@ -5,8 +5,8 @@ use std::{fmt::Debug, path::Path};
 
 use crate::{
     artifact::{
-        inspect_artifact, plan_model_preparation, ArtifactError, ModelPreparationPlan,
-        PreparationPolicy,
+        inspect_artifact, plan_model_preparation, ArtifactError, ArtifactInspection,
+        ModelPreparationPlan, PreparationPolicy,
     },
     checkpoint::TensorDtype,
     generation::ResolvedGenerationConfig,
@@ -313,6 +313,22 @@ where
     B::Error: From<ArtifactError>,
 {
     let inspection = inspect_artifact(artifact)?;
+    prepare_inspected_model(backend, inspection, options)
+}
+
+/// Plans and prepares an artifact that the caller has already inspected.
+///
+/// This is the canonical lower-level entry point for facade loaders which
+/// must derive tokenizer, chat, or other portable sidecar state from the same
+/// inspection before transferring ownership to the selected backend.
+pub fn prepare_inspected_model<B: ModelLoadingBackend>(
+    backend: &B,
+    inspection: ArtifactInspection,
+    options: B::LoadOptions,
+) -> Result<PreparedModel<B::Model>, B::Error>
+where
+    B::Error: From<ArtifactError>,
+{
     let policy = backend.preparation_policy(&options)?;
     let plan = plan_model_preparation(inspection, policy)?;
     let config = backend.model_config(plan, options)?;

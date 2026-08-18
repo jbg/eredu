@@ -5208,7 +5208,12 @@ mod tests {
 
         let loaded = load_model(&dir, stream, weights_stream).unwrap();
         assert_eq!(loaded.model_type(), "deepseek_v3");
-        let loaded = LoadedModel::load(&dir, stream, weights_stream).unwrap();
+        let loaded = LoadedModel::load(
+            crate::backend::mlx::MlxBackend::new(stream, weights_stream),
+            &dir,
+            crate::api::ModelLoadOptions::default(),
+        )
+        .unwrap();
         assert_eq!(loaded.model_type(), "deepseek_v3");
         assert_eq!(loaded.eos_token_ids(), &[1]);
         assert!(loaded.has_chat_template());

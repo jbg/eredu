@@ -270,6 +270,8 @@ impl<'a> MlxModelSession<'a> {
                 )))
             }
         }
+        #[cfg(feature = "media-processing")]
+        let processor = model.processor;
         let inner = match model.inner {
             MlxModelKind::Complete(model) => {
                 let cache = model.new_cache();
@@ -288,14 +290,8 @@ impl<'a> MlxModelSession<'a> {
             inner,
             distributed,
             #[cfg(feature = "media-processing")]
-            processor: None,
+            processor,
         })
-    }
-
-    /// Attaches MLX-owned multimodal preprocessing to this selected session.
-    #[cfg(feature = "media-processing")]
-    pub(crate) fn set_processor(&mut self, processor: Option<ModelProcessor>) {
-        self.processor = processor;
     }
 
     /// Returns MLX-owned multimodal preprocessing for this selected session.

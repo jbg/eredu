@@ -62,7 +62,11 @@ fn main() -> anyhow::Result<()> {
     } else {
         ModelLoadOptions::default()
     };
-    let mut model = LoadedModel::load_with_options(&model_dir, options, stream, weights_stream)?;
+    let mut model = LoadedModel::load(
+        safemlx_lm::backend::mlx::MlxBackend::new(stream, weights_stream),
+        &model_dir,
+        options,
+    )?;
     stream.synchronize()?;
     let load_elapsed = load_start.elapsed();
     println!("load_s={:.3}", load_elapsed.as_secs_f64());
@@ -150,7 +154,7 @@ struct BenchResult {
 }
 
 fn run_case(
-    model: &mut LoadedModel,
+    model: &mut LoadedModel<safemlx_lm::backend::mlx::MlxBackend<'static>>,
     prompt: &str,
     decode_tokens: usize,
     profile_components: bool,
@@ -239,7 +243,7 @@ fn print_profile(case: &str, phase: &str, total_s: f64, stats: &qwen3_5::PerfSta
 }
 
 fn prompt_near_token_count(
-    model: &mut LoadedModel,
+    model: &mut LoadedModel<safemlx_lm::backend::mlx::MlxBackend<'static>>,
     target_tokens: usize,
 ) -> anyhow::Result<String> {
     let base = "Discuss hybrid linear attention, sparse mixture-of-experts routing, recurrent cache updates, grouped convolution, and vocabulary projection in a text generation runtime. ";

@@ -94,10 +94,21 @@ currently fails closed for data-parallel model sessions.
 `Backend::create_session` consumes and binds the opaque model, topology-derived TP/PP/EP
 communicators, and the correct cache form into one lifecycle. There are no
 public architecture-specific distributed loaders, rank-local model types, or
-standalone communication-session constructors. `LoadedModel`, which combines
-tokenizer/chat conveniences with generation, is intentionally replicated-only;
-distributed applications use the same generic model loader and
-`MlxModelSession` directly.
+standalone communication-session constructors.
+
+The tokenizer-aware entry point is generic too:
+
+```rust,ignore
+let backend = MlxBackend::new(execution_stream, weights_stream);
+let model = LoadedModel::load(backend, artifact, ModelLoadOptions::default())?;
+```
+
+`LoadedModel<B>` has no default backend type. The same call accepts another
+`ModelLoadingBackend + TextGenerationBackend`; only backend construction and
+its associated options change. It shares one artifact inspection between
+portable tokenizer/chat/EOS assembly and backend materialization. MLX media
+preprocessing is prepared with the opaque `MlxModel` and transferred into the
+session atomically rather than being injected by the facade after loading.
 Cache policy selection, prompt-cache save/load, and embedded MTP generation
 likewise stay on that session; there is no parallel stage-cache or distributed
 request-scheduler API beside it, and no complete-model cache extraction or

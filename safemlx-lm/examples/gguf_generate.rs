@@ -57,7 +57,11 @@ fn main() -> anyhow::Result<()> {
     let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights_ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = ctx.stream();
-    let mut model = LoadedModel::load(&gguf_file, stream, weights_ctx.stream())?;
+    let mut model = LoadedModel::load(
+        safemlx_lm::backend::mlx::MlxBackend::new(stream, weights_ctx.stream()),
+        &gguf_file,
+        Default::default(),
+    )?;
 
     println!("model type: {}", model.model_type());
     println!("chat template: {}", model.has_chat_template());

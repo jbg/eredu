@@ -85,8 +85,12 @@ client actually needs it. The resolved token budget is enforced in core.
 `api::LoadedModel<B>` combines this runtime with backend-independent tokenizer,
 EOS, checkpoint-generation, and chat-template state. Code written over
 `B: TextGenerationBackend` can therefore encode, generate, and decode without
-naming MLX. `LoadedModel::from_runtime` is the constructor used by another
-backend after it prepares its model and creates its session.
+naming MLX. `LoadedModel::load(backend, artifact, options)` is the sole
+tokenizer-aware artifact entry point and has no default backend type. It shares
+one inspection between portable tokenizer/chat/EOS assembly and
+`prepare_inspected_model`; a second backend uses the same call rather than a
+backend-specific facade constructor. `LoadedModel::from_runtime` remains the
+constructor for an already-prepared runtime assembled by an application.
 
 Constrained generation uses the same contract rather than a parallel MLX
 loop. The core `TokenFilterController` contract lets a facade-owned grammar and
@@ -155,12 +159,17 @@ modules, and applies MLX quantization, residency, stream, mapping, and transfer
 semantics. It does not call back into the public facade loader. GGUF headers and
 metadata are not reopened: `GgufCheckpoint::from_portable` wraps the core-owned
 checkpoint for payload conversion. Combined model/tokenizer loading uses the
-same core plan; tokenizer and chat sidecars remain facade concerns.
+same inspection and core plan; tokenizer and chat sidecars remain facade
+concerns. Architecture-derived GGUF EOS metadata is read portably before the
+plan is consumed. The facade never calls an MLX GGUF materializer directly.
 
 `MlxBackend` owns both its execution stream and its weight-materialization
 stream. Callers select MLX by constructing that backend and then use the same
 `load_model(&backend, artifact, options)` function used by another backend.
 There is no MLX-only loader that accepts loose streams alongside the artifact.
+The MLX materializer also prepares any supported media processor and stores it
+inside the opaque `MlxModel`; session creation moves it beside the executable
+and cache. There is no post-construction processor injection path.
 
 `MlxBackend` maps session creation to `MlxModelSession`. The opaque `MlxModel`
 contains exactly one private MLX executable form: complete, pipeline stage, or

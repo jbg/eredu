@@ -53,12 +53,18 @@ struct Args {
     device_cache: bool,
 }
 
-fn prefill_tokens(tokens: &Array, model: &mut LoadedModel) -> anyhow::Result<Array> {
+fn prefill_tokens(
+    tokens: &Array,
+    model: &mut LoadedModel<safemlx_lm::backend::mlx::MlxBackend<'static>>,
+) -> anyhow::Result<Array> {
     let parts = [InputPart::text_token_ids(tokens)];
     Ok(model.submit_prefill(ModelInput::new(&parts))?.wait()?)
 }
 
-fn decode_tokens(tokens: &Array, model: &mut LoadedModel) -> anyhow::Result<Array> {
+fn decode_tokens(
+    tokens: &Array,
+    model: &mut LoadedModel<safemlx_lm::backend::mlx::MlxBackend<'static>>,
+) -> anyhow::Result<Array> {
     Ok(model.submit_decode(tokens.clone())?.wait()?)
 }
 
@@ -67,7 +73,11 @@ fn main() -> anyhow::Result<()> {
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let mut model = LoadedModel::load(&args.model_dir, stream, weights.stream())?;
+    let mut model = LoadedModel::load(
+        safemlx_lm::backend::mlx::MlxBackend::new(stream, weights.stream()),
+        &args.model_dir,
+        Default::default(),
+    )?;
     let prefix_ids = model.encode(&args.prompt, false)?;
     anyhow::ensure!(
         !prefix_ids.is_empty(),

@@ -8,7 +8,7 @@ use safemlx::{
     ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    api::LoadedModel,
+    api::{LoadedModel, LoadedModelLoadError},
     error::Error,
     runtime::media::input::{InputPart, ModelInput},
     GenerationConfigOverrides,
@@ -39,9 +39,13 @@ fn main() -> anyhow::Result<()> {
     let stream = ctx.stream();
     let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let weights_stream = weights_ctx.stream();
-    let mut model = match LoadedModel::load(&model_dir, stream, weights_stream) {
+    let mut model = match LoadedModel::load(
+        safemlx_lm::backend::mlx::MlxBackend::new(stream, weights_stream),
+        &model_dir,
+        Default::default(),
+    ) {
         Ok(model) => model,
-        Err(Error::StrictLoadValidation { missing, unused }) => {
+        Err(LoadedModelLoadError::Backend(Error::StrictLoadValidation { missing, unused })) => {
             print_strict_report(&missing, &unused);
             anyhow::bail!(
                 "strict load failed; implement the missing architecture or key mapping above"
@@ -117,7 +121,7 @@ fn gemma4_message(prompt: &str, model_type: &str) -> serde_json::Value {
 }
 
 fn print_first_token_distribution(
-    model: &mut LoadedModel,
+    model: &mut LoadedModel<safemlx_lm::backend::mlx::MlxBackend<'static>>,
     tokens: &safemlx::Array,
     stream: &Stream,
 ) -> anyhow::Result<()> {

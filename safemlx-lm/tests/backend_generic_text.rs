@@ -1,4 +1,4 @@
-use std::{convert::Infallible, num::NonZeroUsize};
+use std::{io::Write, num::NonZeroUsize};
 
 use safemlx_lm::{
     api::{
@@ -12,9 +12,9 @@ use safemlx_lm::{
     core::{MtpSchedulerStats, MtpStats},
     error::Error,
     Backend, BackendCapabilities, BackendDescriptor, BackendSession, DeviceDescriptor,
-    FinishReason, GenerationConfigOverrides, ModelRuntime, MtpCapability, MtpCheckpointKind,
-    PreparedModel, SemanticEvent, Submission, TextGenerationBackend, TextGenerationConfig,
-    TokenFilter, TokenOutput,
+    FinishReason, GenerationConfigOverrides, ModelLoadingBackend, ModelRuntime, MtpCapability,
+    MtpCheckpointKind, PreparedModel, SemanticEvent, Submission, TextGenerationBackend,
+    TextGenerationConfig, TokenFilter, TokenOutput,
 };
 use safemlx_lm_core::Completion;
 use tokenizers::{
@@ -28,9 +28,25 @@ const QWEN_TEMPLATE: &str =
 struct MockBackend;
 struct MockSession;
 struct Done;
+#[derive(Clone)]
+struct MockToken(u32);
+
+#[derive(Debug, thiserror::Error)]
+enum MockError {
+    #[error(transparent)]
+    Artifact(#[from] safemlx_lm_core::artifact::ArtifactError),
+}
+
+impl TokenOutput for MockToken {
+    type Error = MockError;
+
+    fn token_id(&self) -> Result<u32, Self::Error> {
+        Ok(self.0)
+    }
+}
 
 impl Completion for Done {
-    type Error = Infallible;
+    type Error = MockError;
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
         Ok(true)
@@ -45,7 +61,7 @@ impl Backend for MockBackend {
     type ModelConfig = ();
     type Model = ();
     type Session = MockSession;
-    type Error = Infallible;
+    type Error = MockError;
 
     fn descriptor(&self) -> BackendDescriptor {
         BackendDescriptor {
@@ -80,7 +96,7 @@ impl BackendSession<MockBackend> for MockSession {
         &mut self,
         _: &MockBackend,
         input: Self::PrefillInput,
-    ) -> Result<Submission<Self::Output, Self::Completion>, Infallible> {
+    ) -> Result<Submission<Self::Output, Self::Completion>, MockError> {
         Ok(Submission {
             output: input.len() as u32,
             completion: Done,
@@ -91,7 +107,7 @@ impl BackendSession<MockBackend> for MockSession {
         &mut self,
         _: &MockBackend,
         input: Self::DecodeInput,
-    ) -> Result<Submission<Self::Output, Self::Completion>, Infallible> {
+    ) -> Result<Submission<Self::Output, Self::Completion>, MockError> {
         Ok(Submission {
             output: input + 1,
             completion: Done,
@@ -101,7 +117,7 @@ impl BackendSession<MockBackend> for MockSession {
 
 impl TextGenerationBackend for MockBackend {
     type Prompt = Vec<u32>;
-    type Token = u32;
+    type Token = MockToken;
     type TextGenerationState = ();
     type TextCompletion = Done;
 
@@ -127,7 +143,7 @@ impl TextGenerationBackend for MockBackend {
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
         let submission = runtime.prefill(prompt)?;
         Ok(Submission {
-            output: apply_filter(submission.output, filter),
+            output: MockToken(apply_filter(submission.output, filter)),
             completion: submission.completion,
         })
     }
@@ -138,11 +154,34 @@ impl TextGenerationBackend for MockBackend {
         filter: &TokenFilter,
         _: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-        let submission = runtime.decode(token)?;
+        let submission = runtime.decode(token.0)?;
         Ok(Submission {
-            output: apply_filter(submission.output, filter),
+            output: MockToken(apply_filter(submission.output, filter)),
             completion: submission.completion,
         })
+    }
+}
+
+impl ModelLoadingBackend for MockBackend {
+    type LoadOptions = ();
+
+    fn preparation_policy(
+        &self,
+        _: &Self::LoadOptions,
+    ) -> Result<safemlx_lm_core::PreparationPolicy, Self::Error> {
+        Ok(safemlx_lm_core::PreparationPolicy::default())
+    }
+
+    fn model_config(
+        &self,
+        plan: safemlx_lm_core::ModelPreparationPlan,
+        _: Self::LoadOptions,
+    ) -> Result<Self::ModelConfig, Self::Error> {
+        assert_eq!(
+            plan.inspection().configuration().kind,
+            safemlx_lm_core::ModelKind::Llama
+        );
+        Ok(())
     }
 }
 
@@ -279,6 +318,45 @@ fn speculative_batch_client_code<B: PreparedChatSpeculativeBackend>(
         })
         .unwrap();
     (output, events)
+}
+
+fn write_loadable_text_artifact(root: &std::path::Path) {
+    std::fs::write(
+        root.join("config.json"),
+        r#"{"model_type":"llama","eos_token_id":0}"#,
+    )
+    .unwrap();
+    let header = br#"{"token_embd.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+    let mut weights = std::fs::File::create(root.join("model.safetensors")).unwrap();
+    weights
+        .write_all(&(header.len() as u64).to_le_bytes())
+        .unwrap();
+    weights.write_all(header).unwrap();
+    weights.write_all(&[0; 4]).unwrap();
+
+    let vocabulary = [("[UNK]".to_owned(), 0), ("hello".to_owned(), 1)]
+        .into_iter()
+        .collect();
+    let tokenizer = WordLevel::builder()
+        .vocab(vocabulary)
+        .unk_token("[UNK]".into())
+        .build()
+        .unwrap();
+    Tokenizer::new(tokenizer)
+        .save(root.join("tokenizer.json"), false)
+        .unwrap();
+}
+
+#[test]
+fn downstream_loader_selects_the_backend_without_backend_specific_arguments() {
+    let artifact = tempfile::tempdir().unwrap();
+    write_loadable_text_artifact(artifact.path());
+
+    let mut model = LoadedModel::load(MockBackend, artifact.path(), ()).unwrap();
+
+    assert_eq!(model.model_type(), "llama");
+    assert_eq!(model.eos_token_ids(), &[0]);
+    assert_eq!(client_code(&mut model), vec![1, 2, 3]);
 }
 
 #[test]

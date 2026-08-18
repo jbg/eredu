@@ -27,8 +27,12 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
     let path = std::env::var(environment)
         .unwrap_or_else(|_| panic!("{environment} must name a local checkpoint"));
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-    let mut model = LoadedModel::load(&path, execution.stream(), execution.stream())
-        .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
+    let mut model = LoadedModel::load(
+        safemlx_lm::backend::mlx::MlxBackend::new(execution.stream(), execution.stream()),
+        &path,
+        Default::default(),
+    )
+    .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
     let prepared = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![json!({

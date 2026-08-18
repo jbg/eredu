@@ -31,8 +31,8 @@ use safemlx_lm::{
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
         ResidencyTelemetry, TextDecoder, TimingTelemetry, WeightTransformationPlan,
     },
-    backend::mlx::speculative::MtpComponentTimingGuard,
     backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams},
+    backend::mlx::{speculative::MtpComponentTimingGuard, MlxBackend},
     core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     core::speculative::MtpStats,
     error::Error as LmError,
@@ -2258,9 +2258,12 @@ fn main() -> Result<()> {
         None
     };
     let load_started = Instant::now();
-    let mut model =
-        LoadedModel::load_with_options(&model_path, load_options, stream, weights.stream())
-            .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    let mut model = LoadedModel::load(
+        MlxBackend::new(stream, weights.stream()),
+        &model_path,
+        load_options,
+    )
+    .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: args.temperature,
         top_k: args.top_k,
@@ -3127,7 +3130,9 @@ struct ExpertBenchmarkSnapshot {
     device_bytes: u64,
 }
 
-fn expert_benchmark_snapshot(model: &LoadedModel) -> Result<ExpertBenchmarkSnapshot> {
+fn expert_benchmark_snapshot(
+    model: &LoadedModel<MlxBackend<'static>>,
+) -> Result<ExpertBenchmarkSnapshot> {
     let report = model
         .expert_cache_report()?
         .context("sparse expert cache benchmark requires an expert-cache model")?;
@@ -3186,7 +3191,7 @@ fn print_expert_benchmark_result(
 }
 
 fn run_expert_cache_benchmark(
-    model: &mut LoadedModel,
+    model: &mut LoadedModel<MlxBackend<'static>>,
     tokens: &Array,
     stream: &Stream,
 ) -> Result<()> {
