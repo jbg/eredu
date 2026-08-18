@@ -126,7 +126,13 @@ features = ["image-processing", "audio-processing"]
 [features]
 default = ["mlx", "onig", "esaxx_fast"]
 
-mlx = ["dep:safemlx"]
+mlx = [
+    "dep:safemlx",
+    "dep:safetensors",
+    "dep:memmap2",
+    "dep:half",
+    "dep:libc",
+]
 cuda = ["mlx", "safemlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "safemlx-lm-utils/esaxx_fast"]
 onig = ["tokenizers/onig", "safemlx-lm-utils/onig"]
@@ -144,22 +150,20 @@ safemlx-gguf.workspace = true
 
 # External dependencies
 serde = { version = "1", features = ["derive"] }
-anyhow = "1"
 base64 = "0.22"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-clap = { version = "4", features = ["derive"] }
 idna_adapter = "1" 
 thiserror = "2"
 serde_json = "1"
 minijinja = "2"
-safetensors = "0.8"
-memmap2 = "0.9"
+safetensors = { version = "0.8", optional = true }
+memmap2 = { version = "0.9", optional = true }
 tempfile.workspace = true
-half.workspace = true
+half = { workspace = true, optional = true }
 sha2.workspace = true
 llguidance = { version = "=1.7.6", default-features = false, features = ["ahash", "lark"] }
 toktrie_hf_tokenizers = "=1.7.6"
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 image = { version = "0.25", default-features = false, optional = true }
 rustfft = { version = "6", optional = true }
 
@@ -167,4 +171,6 @@ rustfft = { version = "6", optional = true }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 lazy_static = "1"

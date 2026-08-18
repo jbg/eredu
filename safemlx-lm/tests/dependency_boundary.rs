@@ -42,6 +42,68 @@ fn portable_facade_graph_has_no_accelerator_runtime() {
 }
 
 #[test]
+fn backend_and_example_dependencies_have_the_correct_manifest_ownership() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--manifest-path",
+            manifest.to_str().unwrap(),
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .output()
+        .expect("cargo metadata must run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let package = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == env!("CARGO_PKG_NAME"))
+        .expect("facade package must be present");
+    let dependencies = package["dependencies"].as_array().unwrap();
+    let mlx_features = package["features"]["mlx"].as_array().unwrap();
+
+    for name in ["safetensors", "memmap2", "half", "libc"] {
+        let dependency = dependencies
+            .iter()
+            .find(|dependency| dependency["name"] == name && dependency["kind"].is_null())
+            .unwrap_or_else(|| panic!("missing normal dependency {name}"));
+        assert_eq!(
+            dependency["optional"], true,
+            "backend dependency {name} must be optional"
+        );
+        assert!(
+            mlx_features
+                .iter()
+                .any(|feature| feature == &format!("dep:{name}")),
+            "MLX feature must enable backend dependency {name}"
+        );
+    }
+
+    for name in ["anyhow", "clap"] {
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency["name"] == name && dependency["kind"] == "dev"),
+            "example dependency {name} must be development-only"
+        );
+        assert!(
+            !dependencies
+                .iter()
+                .any(|dependency| dependency["name"] == name && dependency["kind"].is_null()),
+            "example dependency {name} must not be a normal facade dependency"
+        );
+    }
+}
+
+#[test]
 fn backend_implementation_does_not_import_the_facade() {
     let backend = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend");
     let mut sources = Vec::new();
