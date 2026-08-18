@@ -278,10 +278,7 @@ pub trait Backend: Sized {
 /// translate the resulting neutral plan and their associated load options into
 /// the backend's concrete [`Backend::ModelConfig`]. Tensor materialization
 /// remains entirely inside [`Backend::prepare_model`].
-pub trait ModelLoadingBackend: Backend
-where
-    Self::Error: From<ArtifactError>,
-{
+pub trait ModelLoadingBackend: Backend {
     /// Backend load policy exposed to a generic caller.
     type LoadOptions;
 
@@ -299,6 +296,17 @@ where
     ) -> Result<Self::ModelConfig, Self::Error>;
 }
 
+/// Failure while inspecting, planning, or materializing a model artifact.
+#[derive(Debug, thiserror::Error)]
+pub enum ModelLoadError<E: std::error::Error + Send + Sync + 'static> {
+    /// Portable artifact inspection or preparation planning failed.
+    #[error(transparent)]
+    Artifact(#[from] ArtifactError),
+    /// The selected backend failed policy resolution or materialization.
+    #[error("selected backend failed to prepare the model: {0}")]
+    Backend(#[source] E),
+}
+
 /// Inspects, plans, and prepares one artifact on the selected backend.
 ///
 /// This is the sole generic artifact-loading entry point. The backend instance
@@ -308,10 +316,7 @@ pub fn load_model<B: ModelLoadingBackend>(
     backend: &B,
     artifact: impl AsRef<Path>,
     options: B::LoadOptions,
-) -> Result<PreparedModel<B::Model>, B::Error>
-where
-    B::Error: From<ArtifactError>,
-{
+) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
     let inspection = inspect_artifact(artifact)?;
     prepare_inspected_model(backend, inspection, options)
 }
@@ -325,14 +330,17 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
     backend: &B,
     inspection: ArtifactInspection,
     options: B::LoadOptions,
-) -> Result<PreparedModel<B::Model>, B::Error>
-where
-    B::Error: From<ArtifactError>,
-{
-    let policy = backend.preparation_policy(&options)?;
+) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
+    let policy = backend
+        .preparation_policy(&options)
+        .map_err(ModelLoadError::Backend)?;
     let plan = plan_model_preparation(inspection, policy)?;
-    let config = backend.model_config(plan, options)?;
-    backend.prepare_model(config)
+    let config = backend
+        .model_config(plan, options)
+        .map_err(ModelLoadError::Backend)?;
+    backend
+        .prepare_model(config)
+        .map_err(ModelLoadError::Backend)
 }
 
 /// Prefill/decode interface for an already selected backend session.
@@ -439,18 +447,15 @@ impl<B: Backend> ModelRuntime<B> {
     }
 }
 
-impl<B: ModelLoadingBackend> ModelRuntime<B>
-where
-    B::Error: From<ArtifactError>,
-{
+impl<B: ModelLoadingBackend> ModelRuntime<B> {
     /// Loads an artifact and creates its sole session on `backend`.
     pub fn load(
         backend: B,
         artifact: impl AsRef<Path>,
         options: B::LoadOptions,
-    ) -> Result<Self, B::Error> {
+    ) -> Result<Self, ModelLoadError<B::Error>> {
         let model = load_model(&backend, artifact, options)?;
-        Self::from_prepared(backend, model)
+        Self::from_prepared(backend, model).map_err(ModelLoadError::Backend)
     }
 }
 
@@ -1011,12 +1016,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug, thiserror::Error)]
-    enum LoadingMockError {
-        #[error(transparent)]
-        Artifact(#[from] ArtifactError),
-    }
-
     struct LoadingMock;
     struct LoadingMockSession;
 
@@ -1024,7 +1023,7 @@ mod tests {
         type ModelConfig = (ModelPreparationPlan, u32);
         type Model = u32;
         type Session = LoadingMockSession;
-        type Error = LoadingMockError;
+        type Error = std::convert::Infallible;
 
         fn descriptor(&self) -> BackendDescriptor {
             BackendDescriptor {
@@ -1066,7 +1065,7 @@ mod tests {
             &mut self,
             _: &LoadingMock,
             _: (),
-        ) -> Result<Submission<(), LoadingDone>, LoadingMockError> {
+        ) -> Result<Submission<(), LoadingDone>, std::convert::Infallible> {
             Ok(Submission {
                 output: (),
                 completion: LoadingDone,
@@ -1077,7 +1076,7 @@ mod tests {
             &mut self,
             _: &LoadingMock,
             _: (),
-        ) -> Result<Submission<(), LoadingDone>, LoadingMockError> {
+        ) -> Result<Submission<(), LoadingDone>, std::convert::Infallible> {
             Ok(Submission {
                 output: (),
                 completion: LoadingDone,
@@ -1089,7 +1088,7 @@ mod tests {
     struct LoadingDone;
 
     impl Completion for LoadingDone {
-        type Error = LoadingMockError;
+        type Error = std::convert::Infallible;
 
         fn is_complete(&self) -> Result<bool, Self::Error> {
             Ok(true)
@@ -1232,6 +1231,13 @@ mod tests {
 
         let runtime = ModelRuntime::load(LoadingMock, root.path(), 7).unwrap();
         assert_eq!(runtime.backend().descriptor().name, "loading-mock");
+
+        let missing = root.path().join("missing");
+        assert!(matches!(
+            load_model(&LoadingMock, &missing, 1),
+            Err(ModelLoadError::Artifact(ArtifactError::MissingArtifact(path)))
+                if path == missing
+        ));
     }
 
     struct FixedController {

@@ -106,7 +106,7 @@ fn generate(
         })
         .map(|prepared| (prepared.rendered_prompt().to_owned(), false))
         .or_else(|error| {
-            if matches!(error, safemlx_lm::error::Error::MissingChatTemplate) {
+            if matches!(error, safemlx_lm::api::TextModelError::MissingChatTemplate) {
                 Ok((prompt.to_owned(), true))
             } else {
                 Err(error)

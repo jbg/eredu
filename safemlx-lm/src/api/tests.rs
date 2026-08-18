@@ -4,7 +4,7 @@ use super::{
     load_tokenizer_template_kwargs, merge_eos_token_id_sources, prepare_chat_from_parts,
     resolve_model_config, validate_gguf_quantization_source, with_prepared_chat_runtime,
     LoadedModel, ModelLoadOptions, PreparedChatDraft, PreparedChatInput,
-    PreparedChatMtpBatchRequest,
+    PreparedChatMtpBatchRequest, TextModelError,
 };
 use crate::{
     core::generation::{FinishReason, MtpSchedulerOptions, SemanticEvent},
@@ -47,7 +47,7 @@ fn load_test_model(
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<crate::PreparedModel<crate::backend::mlx::MlxModel>, Error> {
+) -> Result<crate::PreparedModel<crate::backend::mlx::MlxModel>, crate::ModelLoadError<Error>> {
     let backend = crate::MlxBackend::new(stream, weights_stream);
     crate::load_model(&backend, path, options)
 }
@@ -656,7 +656,7 @@ fn chat_preparation_contracts_are_public_and_default_conservatively() {
     let _: fn(
         &mut LoadedModel<crate::backend::mlx::MlxBackend<'static>>,
         ChatTemplateRequest,
-    ) -> Result<PreparedChat, Error> = LoadedModel::prepare_chat;
+    ) -> Result<PreparedChat, TextModelError> = LoadedModel::prepare_chat;
 }
 
 #[test]
@@ -701,7 +701,8 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
         profile_stop_sequences: Vec::new(),
     };
     let execution_calls = AtomicUsize::new(0);
-    let input: PreparedChatInput<'_> = PreparedChatInput::rendered_prompt(&prepared);
+    let input: PreparedChatInput<'_, crate::backend::mlx::MlxBackend<'static>> =
+        PreparedChatInput::rendered_prompt(&prepared);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(input.backend_prompt().is_none());
     let model_input = crate::runtime::media::prepared_model_input(vec![
@@ -710,7 +711,7 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
     .unwrap();
     let model_input =
         model_input.with_model_input(|input| crate::backend::mlx::MlxModelInput::from(input));
-    let input: PreparedChatInput<'_> =
+    let input: PreparedChatInput<'_, crate::backend::mlx::MlxBackend<'static>> =
         PreparedChatInput::prepared_backend_input(&prepared, model_input);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(input.backend_prompt().is_some());
@@ -723,7 +724,7 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
 
     assert!(matches!(
         error,
-        Error::PreparedChatGeneration(message)
+        Error::PreparedChatSemantic(message)
             if message.contains("synthetic unsupported profile")
     ));
     assert_eq!(execution_calls.load(Ordering::Relaxed), 0);
@@ -2424,7 +2425,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
             },
         )
         .unwrap_err();
-        assert!(matches!(error, Error::ToolConstraint(_)));
+        assert!(matches!(error, TextModelError::ToolConstraint(_)));
     }
 }
 
@@ -2436,7 +2437,7 @@ fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally(
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         preceding_tokens: usize,
-    ) -> Result<PreparedChat, Error> {
+    ) -> Result<PreparedChat, TextModelError> {
         prepare_chat_from_parts(
             &mut deepseek_chat_tokenizer(preceding_tokens),
             ModelChatTemplate::Single(template.into()),
@@ -2614,7 +2615,7 @@ fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally(
         )
         .unwrap_err();
         assert!(
-            matches!(error, Error::ToolConstraint(_)),
+            matches!(error, TextModelError::ToolConstraint(_)),
             "{invalid_name:?}"
         );
     }
@@ -2637,7 +2638,7 @@ fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally(
             ParallelToolCallPolicy::Disabled,
             141,
         ),
-        Err(Error::ToolConstraint(message)) if message.contains("at most 128 tools")
+        Err(TextModelError::ToolConstraint(message)) if message.contains("at most 128 tools")
     ));
     assert!(matches!(
         prepare(
@@ -2647,7 +2648,7 @@ fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally(
             ParallelToolCallPolicy::Disabled,
             151,
         ),
-        Err(Error::ToolConstraint(_))
+        Err(TextModelError::ToolConstraint(_))
     ));
 
     let streamed = format!("Need 東京 🦀{two_v31}<｜end▁of▁sentence｜>ignored");
@@ -4031,7 +4032,7 @@ fn synthetic_profile_compiles_request_tools_before_rendering() {
     .unwrap_err();
     assert!(matches!(
         error,
-        Error::ToolConstraint(ref message) if message.contains("unsupported schema composition")
+        TextModelError::ToolConstraint(ref message) if message.contains("unsupported schema composition")
     ));
 }
 
@@ -4162,7 +4163,7 @@ fn missing_structural_added_token_fails_before_prompt_rendering() {
 
     assert!(matches!(
         error,
-        Error::ToolConstraint(ref message)
+        TextModelError::ToolConstraint(ref message)
             if message.contains(SYNTHETIC_STRUCTURAL_TOKEN)
                 && message.contains("not registered as an added token")
     ));
@@ -4191,7 +4192,7 @@ fn grammar_compiler_failure_is_reported_before_prompt_rendering() {
 
     assert!(matches!(
         error,
-        Error::ToolConstraint(ref message)
+        TextModelError::ToolConstraint(ref message)
             if message == "failed to compile tool grammar: synthetic compiler failure"
     ));
 }

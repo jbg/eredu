@@ -53,12 +53,13 @@ pub use crate::runtime::chat::{
 use crate::runtime::checkpoint::gguf::{self as gguf_tokenizer, GgufTokenizer};
 use crate::runtime::checkpoint::quantization::WeightQuantization;
 use crate::runtime::execution::inspection::ActivationObserver;
+pub use crate::runtime::generation::sampler::ConstraintError;
 use crate::runtime::generation::sampler::{
     ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler,
 };
 use crate::runtime::generation::streaming::{
-    drive_committed_generation_cancellable, CommittedTokenPipeline, CommittedTokenSource,
-    RawTokenDecoder, TokenDecoderBackend,
+    drive_committed_generation_cancellable, CommittedGenerationError, CommittedTokenPipeline,
+    CommittedTokenPipelineError, CommittedTokenSource, RawTokenDecoder, TokenDecoderBackend,
 };
 pub(crate) use crate::runtime::media::input;
 use crate::runtime::media::PreparedModelInput;
@@ -151,7 +152,7 @@ struct TextEosTokenMetadata {
 
 fn read_checkpoint_generation_config(
     sidecar_dir: &Path,
-) -> Result<Option<CheckpointGenerationConfig>, Error> {
+) -> Result<Option<CheckpointGenerationConfig>, tokenizer::TextMetadataError> {
     let path = sidecar_dir.join("generation_config.json");
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -195,7 +196,9 @@ fn merge_eos_token_id_sources(
     output
 }
 
-fn read_optional_eos_token_metadata(path: &Path) -> Result<Option<EosTokenMetadata>, Error> {
+fn read_optional_eos_token_metadata(
+    path: &Path,
+) -> Result<Option<EosTokenMetadata>, tokenizer::TextMetadataError> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -204,7 +207,9 @@ fn read_optional_eos_token_metadata(path: &Path) -> Result<Option<EosTokenMetada
     Ok(Some(serde_json::from_reader(file)?))
 }
 
-fn eos_token_ids_from_sidecar_dir(sidecar_dir: &Path) -> Result<Vec<u32>, Error> {
+fn eos_token_ids_from_sidecar_dir(
+    sidecar_dir: &Path,
+) -> Result<Vec<u32>, tokenizer::TextMetadataError> {
     let mut output = Vec::new();
     for filename in ["config.json", "generation_config.json"] {
         let Some(metadata) = read_optional_eos_token_metadata(&sidecar_dir.join(filename))? else {
@@ -225,14 +230,14 @@ fn eos_token_ids_from_sidecar_dir(sidecar_dir: &Path) -> Result<Vec<u32>, Error>
 
 pub(crate) fn gguf_eos_token_ids(
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-) -> Result<Vec<u32>, Error> {
+) -> Result<Vec<u32>, tokenizer::TextMetadataError> {
     const KEY: &str = "tokenizer.ggml.eos_token_id";
     let Some(value) = metadata.get(KEY) else {
         return Ok(Vec::new());
     };
 
-    fn invalid(value: impl std::fmt::Display) -> Error {
-        Error::UnsupportedArchitecture(format!(
+    fn invalid(value: impl std::fmt::Display) -> tokenizer::TextMetadataError {
+        tokenizer::TextMetadataError::UnsupportedArchitecture(format!(
             "GGUF metadata key \"tokenizer.ggml.eos_token_id\" contains invalid EOS token id {value}; expected an integer from 0 through {}",
             u32::MAX
         ))
@@ -251,7 +256,7 @@ pub(crate) fn gguf_eos_token_ids(
                 .collect();
         }
         value => value.to_i64_vec().ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            tokenizer::TextMetadataError::UnsupportedArchitecture(format!(
                 "GGUF metadata key {KEY:?} must be an integer or integer array"
             ))
         })?,
@@ -299,15 +304,16 @@ pub use dispatch::{Model, ModelCache};
 mod request;
 use request::{
     prepare_chat_from_parts, prepared_chat_control_runtime, with_prepared_chat_runtime,
-    BackendGenerationTokenSource, PreparedChatSemanticState, PreparedChatTokenDecoder,
-    ResolvedPreparedChatGenerationSettings,
+    BackendGenerationTokenSource, PreparedChatSemanticState, PreparedChatSetupError,
+    PreparedChatTokenDecoder, ResolvedPreparedChatGenerationSettings,
 };
 pub use request::{
-    PreparedChatDraft, PreparedChatGenerationOutput, PreparedChatGenerationRequest,
-    PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
-    PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
-    PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest,
-    PreparedChatSpeculativeBackend, TextDecoder,
+    PreparedChatDraft, PreparedChatError, PreparedChatGenerationOutput,
+    PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+    PreparedChatMtpBatchLane, PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest,
+    PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationOutput,
+    PreparedChatMtpGenerationRequest, PreparedChatSpeculativeBackend, TextDecoder,
+    TextDecoderError, TextModelError,
 };
 /// Codec-free realtime speech-to-speech token APIs.
 pub mod realtime;
@@ -324,7 +330,7 @@ pub use inspection::{
 };
 
 mod tokenizer;
-pub use tokenizer::{chat_template_kwargs, load_tokenizer};
+pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 use tokenizer::{
     effective_model_type, is_gguf_file, load_chat_template, load_gguf_tokenizer_from_metadata,
     load_tokenizer_for_kind, load_tokenizer_template_kwargs,

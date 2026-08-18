@@ -29,13 +29,12 @@ use safemlx_lm::{
         PlanExplanationEntry, PlanExplanationLevel, PreparedChatDraft,
         PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
-        ResidencyTelemetry, TextDecoder, TimingTelemetry, WeightTransformationPlan,
+        ResidencyTelemetry, TextDecoder, TextModelError, TimingTelemetry, WeightTransformationPlan,
     },
     backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams},
     backend::mlx::{speculative::MtpComponentTimingGuard, MlxBackend},
     core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     core::speculative::MtpStats,
-    error::Error as LmError,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
@@ -2392,7 +2391,7 @@ fn main() -> Result<()> {
                     (None, rendered_prompt, false)
                 }
             }
-            Err(LmError::MissingChatTemplate) if !tools_requested => (None, prompt, true),
+            Err(TextModelError::MissingChatTemplate) if !tools_requested => (None, prompt, true),
             Err(error) => return Err(error.into()),
         }
     };

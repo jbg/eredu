@@ -35,11 +35,11 @@ pub use safemlx_lm_core::{
     load_model, Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession,
     CollectiveScope, Completion, ControlledTextGeneration, ControlledTextGenerationError,
     ControlledToken, DeviceDescriptor, DistributedBackend, DistributedCapabilities,
-    DistributedSession, DistributedSessionDescriptor, ModelLoadingBackend, ModelRuntime,
-    MtpCapability, MtpCheckpointKind, ParallelAxis, ParallelCoordinates, ParallelRankTopology,
-    ParallelTopology, PreparedModel, SubgroupMembership, Submission, TextGeneration,
-    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenFilterController,
-    TokenFilterError, TokenOutput, TopologyPreflightReport, ValueDescriptor,
+    DistributedSession, DistributedSessionDescriptor, ModelLoadError, ModelLoadingBackend,
+    ModelRuntime, MtpCapability, MtpCheckpointKind, ParallelAxis, ParallelCoordinates,
+    ParallelRankTopology, ParallelTopology, PreparedModel, SubgroupMembership, Submission,
+    TextGeneration, TextGenerationBackend, TextGenerationConfig, TokenFilter,
+    TokenFilterController, TokenFilterError, TokenOutput, TopologyPreflightReport, ValueDescriptor,
 };
 #[cfg(test)]
 mod test_utils;

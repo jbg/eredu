@@ -19,6 +19,14 @@ fn format_keys(keys: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 /// Error type used by `safemlx-lm` loaders and tokenizer helpers.
 pub enum Error {
+    /// Backend-independent tokenizer, chat-template, or text-sidecar loading failed.
+    #[error(transparent)]
+    TextMetadata(#[from] crate::api::TextMetadataError),
+
+    /// Backend-independent tokenizer-aware text facade operation failed.
+    #[error(transparent)]
+    TextModel(#[from] crate::api::TextModelError),
+
     /// Backend capability discovery, preparation, execution, or completion failed.
     #[error(transparent)]
     Backend(#[from] safemlx_lm_core::BackendError),
@@ -107,17 +115,17 @@ pub enum Error {
     #[error(transparent)]
     Gguf(#[from] safemlx_gguf::Error),
 
-    /// The loaded checkpoint does not provide a chat template.
-    #[error("the loaded model does not provide a chat template")]
-    MissingChatTemplate,
+    /// Portable prepared-chat constraint construction or advancement failed.
+    #[error(transparent)]
+    Constraint(#[from] crate::runtime::generation::sampler::ConstraintError),
 
-    /// A native tool definition or its generation grammar is invalid.
-    #[error("native tool constraint error: {0}")]
-    ToolConstraint(String),
+    /// A prepared semantic plan or event stream was invalid.
+    #[error("prepared-chat semantic generation failed: {0}")]
+    PreparedChatSemantic(String),
 
-    /// An ordinary prepared-chat generation request or runtime failed.
-    #[error("prepared chat generation error: {0}")]
-    PreparedChatGeneration(String),
+    /// MLX speculative execution failed.
+    #[error("MLX speculative generation failed: {0}")]
+    Speculative(String),
 
     /// Strict weight loading found missing parameters or unused checkpoint tensors.
     #[error("strict weight-load validation failed: {missing_count} missing parameters, {unused_count} unused weights\nmissing:\n{missing}\nunused:\n{unused}", missing_count = .missing.len(), unused_count = .unused.len(), missing = format_keys(.missing), unused = format_keys(.unused))]

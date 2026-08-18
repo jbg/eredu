@@ -17,7 +17,7 @@ pub struct TextDecoder {
 
 impl TextDecoder {
     /// Decodes one token, returning text only when the token completes a chunk.
-    pub fn step(&mut self, id: u32) -> Result<Option<String>, Error> {
+    pub fn step(&mut self, id: u32) -> Result<Option<String>, TextDecoderError> {
         tokenizers::tokenizer::step_decode_stream(
             &self.tokenizer,
             vec![id],
@@ -26,8 +26,39 @@ impl TextDecoder {
             &mut self.prefix,
             &mut self.prefix_index,
         )
-        .map_err(Into::into)
+        .map_err(TextDecoderError::Tokenizer)
     }
+}
+
+/// Failure while incrementally decoding tokenizer output.
+#[derive(Debug, thiserror::Error)]
+pub enum TextDecoderError {
+    /// The checkpoint tokenizer rejected the token stream.
+    #[error(transparent)]
+    Tokenizer(#[from] Box<dyn std::error::Error + Send + Sync>),
+    /// Decoding ended with a partial byte-fallback sequence.
+    #[error("generated token stream ended with an incomplete tokenizer byte sequence")]
+    IncompleteByteSequence,
+}
+
+/// Backend-independent failure from tokenizer-aware text facade operations.
+#[derive(Debug, thiserror::Error)]
+pub enum TextModelError {
+    /// Portable generation configuration was invalid.
+    #[error(transparent)]
+    Generation(#[from] crate::core::generation::GenerationError),
+    /// Chat-template selection, inspection, or rendering failed.
+    #[error(transparent)]
+    Template(#[from] safemlx_lm_utils::error::Error),
+    /// Tokenizer encoding or decoding failed.
+    #[error(transparent)]
+    Tokenizer(#[from] Box<dyn std::error::Error + Send + Sync>),
+    /// The loaded checkpoint does not provide a chat template.
+    #[error("the loaded model does not provide a chat template")]
+    MissingChatTemplate,
+    /// A native tool definition or its generation grammar is invalid.
+    #[error("native tool constraint error: {0}")]
+    ToolConstraint(String),
 }
 
 /// Model sampling and stopping settings for one prepared chat generation.
@@ -50,10 +81,7 @@ pub(super) struct ResolvedPreparedChatGenerationSettings {
 ///
 /// The prepared chat always owns the checkpoint-native generation semantics.
 /// The selected variant determines only how the model prompt is prefetched.
-pub enum PreparedChatInput<
-    'a,
-    B: safemlx_lm_core::TextGenerationBackend = crate::backend::mlx::MlxBackend<'static>,
-> {
+pub enum PreparedChatInput<'a, B: safemlx_lm_core::TextGenerationBackend> {
     /// Tokenize and prefill the rendered prompt stored in the prepared chat.
     RenderedPrompt(&'a PreparedChat),
     /// Prefill an already-tokenized and backend-prepared model input.
@@ -127,6 +155,41 @@ pub struct PreparedChatGenerationOutput {
     pub finish_reason: FinishReason,
 }
 
+/// Failure from ordinary prepared-chat generation on backend `E`.
+///
+/// Backend failures remain strongly typed all the way to the caller. Portable
+/// tokenizer, constraint, semantic-streaming, and generation-lifecycle
+/// failures have distinct variants and never masquerade as backend errors.
+#[derive(Debug, thiserror::Error)]
+pub enum PreparedChatError<E: std::error::Error + Send + Sync + 'static> {
+    /// The selected backend failed submission, completion, or token extraction.
+    #[error("selected backend failed prepared-chat generation: {0}")]
+    Backend(#[source] E),
+    /// Portable constraint construction or advancement failed.
+    #[error(transparent)]
+    Constraint(#[from] crate::runtime::generation::sampler::ConstraintError),
+    /// Portable generation lifecycle state was invalid.
+    #[error(transparent)]
+    Generation(#[from] crate::core::generation::GenerationError),
+    /// Prompt or incremental token decoding failed.
+    #[error(transparent)]
+    Tokenizer(#[from] TextDecoderError),
+    /// The prepared semantic plan or event stream was invalid.
+    #[error("prepared-chat semantic generation failed: {0}")]
+    Semantic(String),
+    /// The backend ended its stream without a terminal token.
+    #[error("backend generation ended without a terminal token")]
+    MissingTerminalToken,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PreparedChatSetupError {
+    #[error(transparent)]
+    Constraint(#[from] crate::runtime::generation::sampler::ConstraintError),
+    #[error("{0}")]
+    Semantic(String),
+}
+
 /// MTP-specific controls for one prepared-chat request.
 #[derive(Debug, Clone, Copy)]
 pub struct PreparedChatMtpGenerationOptions {
@@ -154,6 +217,8 @@ impl Default for PreparedChatMtpGenerationOptions {
 pub trait PreparedChatSpeculativeBackend: safemlx_lm_core::TextGenerationBackend {
     /// Backend-owned separately prepared draft model.
     type Drafter;
+    /// Backend-owned speculative execution failure.
+    type SpeculativeError: std::error::Error + Send + Sync + 'static;
 
     /// Reports fail-closed speculative support for the selected model session.
     fn mtp_capability(model: &LoadedModel<Self>) -> MtpCapability;
@@ -162,7 +227,7 @@ pub trait PreparedChatSpeculativeBackend: safemlx_lm_core::TextGenerationBackend
     fn execute_prepared_chat_mtp<'a, F>(
         model: &mut LoadedModel<Self>,
         request: PreparedChatMtpGenerationRequest<'a, Self, Self::Drafter, F>,
-    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    ) -> Result<PreparedChatMtpGenerationOutput, Self::SpeculativeError>
     where
         F: FnMut(SemanticEvent);
 
@@ -170,7 +235,7 @@ pub trait PreparedChatSpeculativeBackend: safemlx_lm_core::TextGenerationBackend
     fn execute_prepared_chat_mtp_batch<'a>(
         model: &mut LoadedModel<Self>,
         request: PreparedChatMtpBatchRequest<'a, Self, Self::Drafter>,
-    ) -> Result<PreparedChatMtpBatchOutput, Error>;
+    ) -> Result<PreparedChatMtpBatchOutput, Self::SpeculativeError>;
 }
 
 /// Draft-model source selected for one speculative request.
@@ -257,7 +322,7 @@ pub(super) struct PreparedChatTokenDecoder {
 }
 
 impl TokenDecoderBackend for PreparedChatTokenDecoder {
-    type Error = Error;
+    type Error = TextDecoderError;
 
     fn decode_token(
         &mut self,
@@ -273,11 +338,9 @@ impl TokenDecoderBackend for PreparedChatTokenDecoder {
             .decoder
             .tokenizer
             .decode(&self.decoder.ids, self.decoder.skip_special_tokens)
-            .map_err(Error::from)?;
+            .map_err(TextDecoderError::Tokenizer)?;
         if decoded.len() > self.decoder.prefix.len() {
-            return Err(Error::PreparedChatGeneration(
-                "generated token stream ended with an incomplete tokenizer byte sequence".into(),
-            ));
+            return Err(TextDecoderError::IncompleteByteSequence);
         }
         Ok(Vec::new())
     }
@@ -346,9 +409,9 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
             &self.caller_stop_sequences,
         )?;
         for &token in &self.token_ids {
-            pipeline
-                .push(token, &mut |_| {})
-                .map_err(|error| SpeculativeOutputError::semantic("replay token", error))?;
+            pipeline.push(token, &mut |_| {}).map_err(|error| {
+                SpeculativeOutputError::semantic("replay token", error.to_string())
+            })?;
         }
         Ok(Box::new(Self {
             initial_decoder: self.initial_decoder.clone(),
@@ -364,7 +427,7 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
         let matched = self
             .pipeline
             .push(token, &mut |event| self.events.push(event))
-            .map_err(|error| SpeculativeOutputError::semantic("push token", error))?;
+            .map_err(|error| SpeculativeOutputError::semantic("push token", error.to_string()))?;
         self.token_ids.push(token);
         Ok(matched)
     }
@@ -372,7 +435,7 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
     fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError> {
         self.pipeline
             .finish(reason, &mut |event| self.events.push(event))
-            .map_err(|error| SpeculativeOutputError::semantic("finish", error))
+            .map_err(|error| SpeculativeOutputError::semantic("finish", error.to_string()))
     }
 
     fn cancel(&mut self) -> Result<(), SpeculativeOutputError> {
@@ -397,7 +460,7 @@ pub(super) fn with_prepared_chat_runtime<R>(
             .semantic_runtime_plan()
             .expect("supported prepared chats carry a semantic runtime plan"),
         SemanticSupport::Unsupported { reason } => {
-            return Err(Error::PreparedChatGeneration(format!(
+            return Err(Error::PreparedChatSemantic(format!(
                 "prepared chat does not have an executable semantic plan: {reason}"
             )));
         }
@@ -405,21 +468,20 @@ pub(super) fn with_prepared_chat_runtime<R>(
     let generation_plan = prepared_chat
         .generation_runtime_plan()
         .expect("supported prepared chats carry a generation runtime plan");
-    let sampler = ConstrainedSampler::from_generation_plan(sampling, generation_plan)
-        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+    let sampler = ConstrainedSampler::from_generation_plan(sampling, generation_plan)?;
     execute(PreparedChatRuntime { sampler })
 }
 
 pub(super) fn prepared_chat_control_runtime(
     prepared_chat: &PreparedChat,
     caller_stop_sequences: &[String],
-) -> Result<PreparedChatControlRuntime, Error> {
+) -> Result<PreparedChatControlRuntime, PreparedChatSetupError> {
     let semantic_plan = match prepared_chat.semantic_support() {
         SemanticSupport::Supported => prepared_chat
             .semantic_runtime_plan()
             .expect("supported prepared chats carry a semantic runtime plan"),
         SemanticSupport::Unsupported { reason } => {
-            return Err(Error::PreparedChatGeneration(format!(
+            return Err(PreparedChatSetupError::Semantic(format!(
                 "prepared chat does not have an executable semantic plan: {reason}"
             )));
         }
@@ -433,7 +495,7 @@ pub(super) fn prepared_chat_control_runtime(
         )?;
     let parser = semantic_plan
         .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
-        .map_err(Error::PreparedChatGeneration)?;
+        .map_err(PreparedChatSetupError::Semantic)?;
     let structural_tokens = semantic_plan
         .structural_tokens()
         .map(|(id, spelling)| (id, spelling.to_owned()))
@@ -460,7 +522,10 @@ impl<B> CommittedTokenSource for BackendGenerationTokenSource<'_, B>
 where
     B: safemlx_lm_core::TextGenerationBackend,
 {
-    type Error = safemlx_lm_core::ControlledTextGenerationError<B::Error, Exception>;
+    type Error = safemlx_lm_core::ControlledTextGenerationError<
+        B::Error,
+        crate::runtime::generation::sampler::ConstraintError,
+    >;
 
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
         self.generator
@@ -1371,7 +1436,7 @@ pub(super) fn prepare_chat_from_parts(
     eos_token_ids: &[u32],
     constraint_compiler: Option<&Result<ConstraintCompiler, String>>,
     request: ChatTemplateRequest,
-) -> Result<PreparedChat, Error> {
+) -> Result<PreparedChat, TextModelError> {
     let selected = template.select(Some(&request.tools))?;
     let template_identity = selected.identity().clone();
     let selected_template = match &template_identity {
@@ -1393,19 +1458,19 @@ pub(super) fn prepare_chat_from_parts(
     }
     if profile.identity.as_deref() == Some("muse-glimmer.atem.v1") {
         if request.enable_thinking == Some(false) {
-            return Err(Error::ToolConstraint(
+            return Err(TextModelError::ToolConstraint(
                 "Muse-Glimmer does not expose a reasoning-disable control; enable_thinking=false is not supported".into(),
             ));
         }
         if let Some(value) = request.extra_template_kwargs.get("reasoning_strength") {
             let Some(strength) = value.as_str() else {
-                return Err(Error::ToolConstraint(
+                return Err(TextModelError::ToolConstraint(
                     "Muse-Glimmer reasoning_strength must be one of low, medium, high, or xhigh"
                         .into(),
                 ));
             };
             if !matches!(strength, "low" | "medium" | "high" | "xhigh") {
-                return Err(Error::ToolConstraint(format!(
+                return Err(TextModelError::ToolConstraint(format!(
                     "unsupported Muse-Glimmer reasoning_strength {strength:?}; expected low, medium, high, or xhigh"
                 )));
             }
@@ -1416,7 +1481,7 @@ pub(super) fn prepare_chat_from_parts(
         && !request.tools.is_empty()
         && !profile.supports_tool_reasoning
     {
-        return Err(Error::ToolConstraint(format!(
+        return Err(TextModelError::ToolConstraint(format!(
             "format profile {:?} does not preserve reasoning semantics while native tools are active",
             profile.identity.as_deref().unwrap_or("unregistered")
         )));
@@ -1469,15 +1534,15 @@ pub(super) fn prepare_chat_from_parts(
     let generation_runtime_plan = match selected_runtime {
         Some((dialect, parameters, structural_tokens, has_tool_surface)) => {
             let resolved_ids = resolve_structural_tokens(tokenizer, structural_tokens)
-                .map_err(Error::ToolConstraint)?;
+                .map_err(TextModelError::ToolConstraint)?;
             let compiler = constraint_compiler
                 .ok_or_else(|| {
-                    Error::ToolConstraint(
+                    TextModelError::ToolConstraint(
                         "the loaded model does not have tokenizer constraint data".into(),
                     )
                 })?
                 .as_ref()
-                .map_err(|error| Error::ToolConstraint(error.clone()))?;
+                .map_err(|error| TextModelError::ToolConstraint(error.clone()))?;
             Some(
                 compiler
                     .compile_generation_plan(
@@ -1499,7 +1564,7 @@ pub(super) fn prepare_chat_from_parts(
                         profile.stop_sequences.clone(),
                         has_tool_surface,
                     )
-                    .map_err(Error::ToolConstraint)?,
+                    .map_err(TextModelError::ToolConstraint)?,
             )
         }
         None => None,
@@ -1524,7 +1589,7 @@ pub(super) fn prepare_chat_from_parts(
         && (generation_runtime_plan.is_none() || !profile.supports_reasoning_parsing)
         && !request.allow_unparsed_reasoning
     {
-        return Err(Error::ToolConstraint(format!(
+        return Err(TextModelError::ToolConstraint(format!(
             "thinking was explicitly enabled, but no semantic reasoning protocol was recognized: {semantic_failure}; set allow_unparsed_reasoning to opt into raw output"
         )));
     }

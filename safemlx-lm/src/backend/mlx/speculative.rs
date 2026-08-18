@@ -237,6 +237,7 @@ impl MlxDrafter {
 
 impl PreparedChatSpeculativeBackend for super::MlxBackend<'static> {
     type Drafter = MlxDrafter;
+    type SpeculativeError = Error;
 
     fn mtp_capability(model: &LoadedModel<Self>) -> MtpCapability {
         model.mlx_mtp_capability()

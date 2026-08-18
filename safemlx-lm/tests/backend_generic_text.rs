@@ -3,14 +3,13 @@ use std::{io::Write, num::NonZeroUsize};
 use safemlx_lm::{
     api::{
         ChatTemplateRequest, ChatTokenizer, LoadedModel, LoadedTextModelConfig, ModelChatTemplate,
-        PreparedChat, PreparedChatDraft, PreparedChatGenerationRequest,
+        PreparedChat, PreparedChatDraft, PreparedChatError, PreparedChatGenerationRequest,
         PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
         PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions,
         PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest,
         PreparedChatSpeculativeBackend,
     },
     core::{MtpSchedulerStats, MtpStats},
-    error::Error,
     Backend, BackendCapabilities, BackendDescriptor, BackendSession, DeviceDescriptor,
     FinishReason, GenerationConfigOverrides, ModelLoadingBackend, ModelRuntime, MtpCapability,
     MtpCheckpointKind, PreparedModel, SemanticEvent, Submission, TextGenerationBackend,
@@ -33,15 +32,19 @@ struct MockToken(u32);
 
 #[derive(Debug, thiserror::Error)]
 enum MockError {
-    #[error(transparent)]
-    Artifact(#[from] safemlx_lm_core::artifact::ArtifactError),
+    #[error("synthetic token extraction failure for token {0}")]
+    Token(u32),
 }
 
 impl TokenOutput for MockToken {
     type Error = MockError;
 
     fn token_id(&self) -> Result<u32, Self::Error> {
-        Ok(self.0)
+        if self.0 == 999 {
+            Err(MockError::Token(self.0))
+        } else {
+            Ok(self.0)
+        }
     }
 }
 
@@ -143,7 +146,11 @@ impl TextGenerationBackend for MockBackend {
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
         let submission = runtime.prefill(prompt)?;
         Ok(Submission {
-            output: MockToken(apply_filter(submission.output, filter)),
+            output: MockToken(if submission.output == 999 {
+                999
+            } else {
+                apply_filter(submission.output, filter)
+            }),
             completion: submission.completion,
         })
     }
@@ -189,6 +196,7 @@ struct MockDrafter;
 
 impl PreparedChatSpeculativeBackend for MockBackend {
     type Drafter = MockDrafter;
+    type SpeculativeError = MockError;
 
     fn mtp_capability(_: &LoadedModel<Self>) -> MtpCapability {
         MtpCapability::Ready {
@@ -199,7 +207,7 @@ impl PreparedChatSpeculativeBackend for MockBackend {
     fn execute_prepared_chat_mtp<'a, F>(
         _: &mut LoadedModel<Self>,
         request: PreparedChatMtpGenerationRequest<'a, Self, Self::Drafter, F>,
-    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    ) -> Result<PreparedChatMtpGenerationOutput, MockError>
     where
         F: FnMut(SemanticEvent),
     {
@@ -219,7 +227,7 @@ impl PreparedChatSpeculativeBackend for MockBackend {
     fn execute_prepared_chat_mtp_batch<'a>(
         _: &mut LoadedModel<Self>,
         request: PreparedChatMtpBatchRequest<'a, Self, Self::Drafter>,
-    ) -> Result<PreparedChatMtpBatchOutput, Error> {
+    ) -> Result<PreparedChatMtpBatchOutput, MockError> {
         assert!(matches!(request.drafting, PreparedChatDraft::Embedded));
         let requests = request
             .lanes
@@ -454,6 +462,26 @@ fn prepared_chat_constraints_and_semantics_use_the_same_generic_client_api() {
             reason: FinishReason::MaxTokens
         })
     );
+
+    let error = model
+        .generate_prepared_chat(PreparedChatGenerationRequest {
+            input: PreparedChatInput::prepared_backend_input(&prepared, vec![0; 999]),
+            settings: PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(1),
+                    ..Default::default()
+                },
+                seed: 9,
+            },
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PreparedChatError::Backend(MockError::Token(999))
+    ));
 
     let (speculative, speculative_events) = speculative_client_code(&mut model, &prepared);
     assert_eq!(speculative.token_ids, vec![7, 11]);

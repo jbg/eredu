@@ -73,8 +73,10 @@ MLX arrays/modules; streams are not separate loader arguments.
 Replicated, tensor-, pipeline-, and expert-parallel prefill/decode execution
 crosses the single stateful `MlxModelSession` implementation of the core
 session contract. `load_model(&backend, artifact, options)` returns a
-`PreparedModel<B::Model>`; the preparation marker is required when creating a
-session and is consumed by that operation. For MLX, the opaque model selects
+`PreparedModel<B::Model>` under `ModelLoadError<B::Error>`; portable artifact
+inspection/planning failures and selected-backend materialization failures are
+distinct. The preparation marker is required when creating a session and is
+consumed by that operation. For MLX, the opaque model selects
 complete-model, rank-local pipeline, or rank-local expert materialization
 inside the adapter. The session
 owns that model, the matching cache state, and its optional distributed
@@ -108,8 +110,10 @@ let model = LoadedModel::load(backend, artifact, ModelLoadOptions::default())?;
 `LoadedModel<B>` has no default backend type. The same call accepts another
 `ModelLoadingBackend + TextGenerationBackend`; only backend construction and
 its associated options change. It shares one artifact inspection between
-portable tokenizer/chat/EOS assembly and backend materialization. MLX media
-preprocessing is prepared with the opaque `MlxModel` and transferred into the
+portable tokenizer/chat/EOS assembly and backend materialization. Metadata
+assembly returns `TextMetadataError`, while tokenizer-aware operations
+on an assembled model return `TextModelError`; neither type contains an MLX
+exception. MLX media preprocessing is prepared with the opaque `MlxModel` and transferred into the
 session atomically rather than being injected by the facade after loading.
 Cache policy selection, prompt-cache save/load, and embedded MTP generation
 likewise stay on that session; there is no parallel stage-cache or distributed
@@ -201,7 +205,10 @@ sampling and scheduler settings; target and drafter execution placement is
 fixed when those models are loaded, and MLX cache lanes are adapter-owned.
 `PreparedChatSpeculativeBackend` makes the same capability, single-request, and
 batch methods available on `LoadedModel<B>`; its associated drafter type
-prevents mixing backend families. MLX retains the actual logits transforms,
+prevents mixing backend families, and its associated error type preserves the
+selected backend's speculative failure taxonomy. Ordinary prepared-chat
+generation similarly returns `PreparedChatError<B::Error>` rather than the MLX
+facade error. MLX retains the actual logits transforms,
 probability/residual arithmetic, random arrays, cross-stream transfers,
 component timing probes, and tensor execution.
 

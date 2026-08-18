@@ -994,13 +994,15 @@ fn probe_automatic_bounded_requirement(
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let backend = crate::MlxBackend::new(&stream, &weights_stream);
     match crate::load_model(&backend, model_path, execution_plan_load_options(&probe)?) {
-        Err(Error::LayerwiseModel(LayerwiseModelError::DeviceBudgetTooSmall {
-            static_bytes,
-            window_bytes,
-            depth,
-            required,
-            ..
-        })) => Ok(Ok(AutomaticBoundedRequirement {
+        Err(crate::ModelLoadError::Backend(Error::LayerwiseModel(
+            LayerwiseModelError::DeviceBudgetTooSmall {
+                static_bytes,
+                window_bytes,
+                depth,
+                required,
+                ..
+            },
+        ))) => Ok(Ok(AutomaticBoundedRequirement {
             static_bytes,
             window_bytes,
             required_bytes: required,

@@ -3,6 +3,38 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+/// Backend-independent tokenizer, chat-template, and text-sidecar failure.
+#[derive(Debug, thiserror::Error)]
+pub enum TextMetadataError {
+    /// Artifact identity or model-kind normalization failed.
+    #[error(transparent)]
+    Artifact(#[from] safemlx_lm_core::artifact::ArtifactError),
+    /// Filesystem metadata could not be read.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// JSON metadata was invalid.
+    #[error(transparent)]
+    Deserialize(#[from] serde_json::Error),
+    /// The portable tokenizer rejected its configuration or input.
+    #[error(transparent)]
+    Tokenizer(#[from] Box<dyn std::error::Error + Send + Sync>),
+    /// Chat-template parsing or rendering metadata was invalid.
+    #[error(transparent)]
+    Template(#[from] safemlx_lm_utils::error::Error),
+    /// Portable GGUF parsing failed.
+    #[error(transparent)]
+    Gguf(#[from] safemlx_gguf::Error),
+    /// Embedded GGUF tokenizer metadata was invalid.
+    #[error("GGUF tokenizer error: {0}")]
+    GgufTokenizer(String),
+    /// The artifact is valid but not supported by the text facade.
+    #[error("unsupported text architecture: {0}")]
+    UnsupportedArchitecture(String),
+    /// Architecture-specific tokenizer reconstruction failed.
+    #[error("tokenizer configuration error: {0}")]
+    TokenizerConfiguration(String),
+}
+
 pub(crate) fn tokenizer_vocabulary_fingerprint(tokenizer: &Tokenizer) -> [u8; 32] {
     let vocabulary_size = tokenizer.get_vocab_size(true);
     let mut hasher = Sha256::new();
@@ -26,7 +58,7 @@ pub(crate) fn tokenizer_vocabulary_fingerprint(tokenizer: &Tokenizer) -> [u8; 32
 /// Loading from GGUF parses embedded tokenizer metadata without creating an
 /// MLX stream. A sibling `tokenizer.json` remains a fallback for missing or
 /// unsupported embedded tokenizer formats.
-pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
+pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, TextMetadataError> {
     let model_dir = model_dir.as_ref();
     if is_gguf_file(model_dir) {
         return Ok(load_gguf_tokenizer(model_dir)?.tokenizer);
@@ -41,33 +73,28 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 pub(super) fn load_tokenizer_for_kind(
     kind: ModelKind,
     model_dir: &Path,
-) -> Result<Tokenizer, Error> {
+) -> Result<Tokenizer, TextMetadataError> {
     match kind {
-        ModelKind::DeepSeekV3 => deepseek_v3::load_tokenizer(model_dir),
-        ModelKind::DeepSeekV4 => deepseek_v3::load_tokenizer(model_dir),
-        ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
-        ModelKind::GptOss => gpt_oss::load_tokenizer(model_dir),
-        ModelKind::Inkling => inkling::load_tokenizer(model_dir),
-        ModelKind::KimiLinear => kimi_linear::load_tokenizer(model_dir),
-        ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
-        ModelKind::MuseGlimmer => muse_glimmer::load_tokenizer(model_dir),
-        ModelKind::Lfm2 => lfm2::load_tokenizer(model_dir),
-        ModelKind::NemotronH => nemotron_h::load_nemotron_h_tokenizer(model_dir),
-        ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
+        ModelKind::KimiLinear => {
+            let converted = model_dir.join("tokenizer.json");
+            if converted.exists() {
+                Ok(Tokenizer::from_file(converted)?)
+            } else {
+                kimi_linear::load_tokenizer(model_dir)
+                    .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
+            }
+        }
+        ModelKind::PersonaPlex => Err(TextMetadataError::UnsupportedArchitecture(
             "PersonaPlex uses the released SentencePiece tokenizer; load it outside the chat tokenizer API".into(),
         )),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => dense_qwen::load_tokenizer(model_dir),
-        ModelKind::Qwen3Next => qwen3_next::load_qwen3_next_tokenizer(model_dir),
-        ModelKind::Qwen3Vl => dense_qwen::load_tokenizer(model_dir),
-        ModelKind::Qwen3VlMoe => dense_qwen::load_tokenizer(model_dir),
-        ModelKind::Qwen35 => qwen3_5::load_qwen3_5_tokenizer(model_dir),
+        _ => Ok(Tokenizer::from_file(model_dir.join("tokenizer.json"))?),
     }
 }
 
 /// Returns likely user-provided kwargs referenced by a model directory's chat template.
 ///
 /// This reads tokenizer/chat-template metadata only and does not load model weights.
-pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, Error> {
+pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, TextMetadataError> {
     let submitted_path = model_dir.as_ref();
     let (template, model_id, tokenizer_template_kwargs) = if is_gguf_file(submitted_path) {
         let metadata = portable_gguf_metadata(submitted_path)?;
@@ -77,13 +104,14 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
                 Some(ModelChatTemplate::Single(template.clone()))
             }
             Some(_) => {
-                return Err(Error::GgufTokenizer(
+                return Err(TextMetadataError::GgufTokenizer(
                     "tokenizer.chat_template must be a string".into(),
                 ));
             }
             None => load_chat_template(sidecar_dir)?,
         };
-        let mut template_kwargs = gguf_tokenizer::template_kwargs(&metadata)?;
+        let mut template_kwargs = gguf_tokenizer::template_kwargs(&metadata)
+            .map_err(|error| TextMetadataError::GgufTokenizer(error.to_string()))?;
         template_kwargs.extend(load_tokenizer_template_kwargs(sidecar_dir)?);
         (
             template,
@@ -109,7 +137,7 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
     )
 }
 
-pub(super) fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, Error> {
+pub(super) fn read_model_metadata(model_dir: &Path) -> Result<ModelMetadata, TextMetadataError> {
     let config_path = model_dir.join("config.json");
     let file = std::fs::File::open(config_path)?;
     Ok(serde_json::from_reader(file)?)
@@ -125,14 +153,14 @@ pub(crate) fn gguf_sidecar_dir(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new("."))
 }
 
-pub(super) fn load_gguf_tokenizer(gguf_file: &Path) -> Result<GgufTokenizer, Error> {
+pub(super) fn load_gguf_tokenizer(gguf_file: &Path) -> Result<GgufTokenizer, TextMetadataError> {
     let metadata = portable_gguf_metadata(gguf_file)?;
     load_gguf_tokenizer_from_metadata(gguf_file, &metadata)
 }
 
 fn portable_gguf_metadata(
     gguf_file: &Path,
-) -> Result<std::collections::HashMap<String, GgufMetadataValue>, Error> {
+) -> Result<std::collections::HashMap<String, GgufMetadataValue>, TextMetadataError> {
     Ok(safemlx_gguf::Reader::open(gguf_file)?
         .metadata()
         .iter()
@@ -143,9 +171,11 @@ fn portable_gguf_metadata(
 pub(super) fn load_gguf_tokenizer_from_metadata(
     gguf_file: &Path,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-) -> Result<GgufTokenizer, Error> {
+) -> Result<GgufTokenizer, TextMetadataError> {
     let sidecar_dir = gguf_sidecar_dir(gguf_file);
-    if let Some(mut embedded) = gguf_tokenizer::from_metadata(metadata)? {
+    if let Some(mut embedded) = gguf_tokenizer::from_metadata(metadata)
+        .map_err(|error| TextMetadataError::GgufTokenizer(error.to_string()))?
+    {
         embedded
             .template_kwargs
             .extend(load_tokenizer_template_kwargs(sidecar_dir)?);
@@ -181,7 +211,9 @@ pub(super) fn effective_model_type(metadata: &ModelMetadata) -> String {
     }
 }
 
-pub(super) fn load_chat_template(model_dir: &Path) -> Result<Option<ModelChatTemplate>, Error> {
+pub(super) fn load_chat_template(
+    model_dir: &Path,
+) -> Result<Option<ModelChatTemplate>, TextMetadataError> {
     let config_path = model_dir.join("tokenizer_config.json");
     if config_path.exists() {
         if let Some(template) = load_model_chat_template_from_file(config_path)? {
@@ -219,7 +251,7 @@ pub(super) fn load_chat_template(model_dir: &Path) -> Result<Option<ModelChatTem
 
 pub(super) fn load_tokenizer_template_kwargs(
     model_dir: &Path,
-) -> Result<Map<String, Value>, Error> {
+) -> Result<Map<String, Value>, TextMetadataError> {
     let config_path = model_dir.join("tokenizer_config.json");
     if !config_path.exists() {
         return Ok(Map::new());

@@ -23,7 +23,10 @@ generic caller code never passes a native stream or chooses an architecture
 loader. `prepare_inspected_model` is the lower-level form for tokenizer-aware
 facades which must consume portable metadata from the same
 `ArtifactInspection` before transferring it to backend planning.
-`ModelRuntime::load` combines ordinary loading with session creation.
+`ModelLoadError<B::Error>` keeps portable inspection/planning failures separate
+from backend policy and materialization failures; a backend error is not
+required to absorb `ArtifactError`. `ModelRuntime::load` combines ordinary
+loading with session creation under the same typed error boundary.
 
 Core owns the production weight-residency policy and ownership state machine,
 not a parallel summary schema. `OffloadPlan` validates stable unit identities,

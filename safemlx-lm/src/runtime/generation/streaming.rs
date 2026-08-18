@@ -828,10 +828,33 @@ pub(crate) struct CommittedTokenPipeline<D> {
     parser: ToolRuntimeParser,
 }
 
+/// Failure while converting one committed token into semantic output.
+#[derive(Debug)]
+pub(crate) enum CommittedTokenPipelineError<E> {
+    /// The tokenizer-specific decoder rejected the token stream.
+    Decoder(E),
+    /// UTF-8 assembly or semantic protocol parsing failed.
+    Semantic(String),
+}
+
+impl<E> From<String> for CommittedTokenPipelineError<E> {
+    fn from(error: String) -> Self {
+        Self::Semantic(error)
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for CommittedTokenPipelineError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decoder(error) => write!(formatter, "token decoding failed: {error}"),
+            Self::Semantic(error) => formatter.write_str(error),
+        }
+    }
+}
+
 impl<D> CommittedTokenPipeline<D>
 where
     D: TokenDecoderBackend,
-    D::Error: fmt::Display,
 {
     pub(crate) fn new(decoder: RawTokenDecoder<D>, parser: ToolRuntimeParser) -> Self {
         Self {
@@ -846,15 +869,15 @@ where
         &mut self,
         token_id: u32,
         emit: &mut impl FnMut(SemanticEvent),
-    ) -> Result<bool, String> {
+    ) -> Result<bool, CommittedTokenPipelineError<D::Error>> {
         let raw = self
             .decoder
             .push(token_id)
-            .map_err(|error| format!("token decoding failed: {error}"))?;
+            .map_err(CommittedTokenPipelineError::Decoder)?;
         let text = self
             .utf8
             .push(&raw.bytes)
-            .map_err(|error| format!("UTF-8 assembly failed: {error}"))?;
+            .map_err(|error| CommittedTokenPipelineError::Semantic(error.to_string()))?;
         let mut matched = self.parser.push(&text)?;
         if raw.structural {
             if let Some(spelling) = raw.structural_spelling.as_deref() {
@@ -872,15 +895,15 @@ where
         token_id: u32,
         cancellation: &GenerationCancellationToken,
         emit: &mut impl FnMut(SemanticEvent),
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<(bool, bool), CommittedTokenPipelineError<D::Error>> {
         let raw = self
             .decoder
             .push(token_id)
-            .map_err(|error| format!("token decoding failed: {error}"))?;
+            .map_err(CommittedTokenPipelineError::Decoder)?;
         let text = self
             .utf8
             .push(&raw.bytes)
-            .map_err(|error| format!("UTF-8 assembly failed: {error}"))?;
+            .map_err(|error| CommittedTokenPipelineError::Semantic(error.to_string()))?;
         let mut matched = self.parser.push(&text)?;
         if raw.structural {
             if let Some(spelling) = raw.structural_spelling.as_deref() {
@@ -904,19 +927,19 @@ where
         &mut self,
         reason: FinishReason,
         emit: &mut impl FnMut(SemanticEvent),
-    ) -> Result<(), String> {
+    ) -> Result<(), CommittedTokenPipelineError<D::Error>> {
         let trailing = self
             .decoder
             .finish()
-            .map_err(|error| format!("token decoding failed: {error}"))?;
+            .map_err(CommittedTokenPipelineError::Decoder)?;
         let text = self
             .utf8
             .push(&trailing)
-            .map_err(|error| format!("UTF-8 assembly failed: {error}"))?;
+            .map_err(|error| CommittedTokenPipelineError::Semantic(error.to_string()))?;
         self.parser.push(&text)?;
         std::mem::take(&mut self.utf8)
             .finish()
-            .map_err(|error| format!("UTF-8 assembly failed: {error}"))?;
+            .map_err(|error| CommittedTokenPipelineError::Semantic(error.to_string()))?;
         self.parser.finish(reason)?;
         self.drain_into(emit);
         Ok(())
@@ -952,11 +975,27 @@ where
 
 /// Architecture-independent source of sampled, grammar-committed token ids.
 pub(crate) trait CommittedTokenSource {
-    type Error: fmt::Display;
+    type Error;
 
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error>;
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error>;
+}
+
+/// Typed failure at the committed-token orchestration boundary.
+///
+/// In particular, `Source` preserves the selected backend's concrete error;
+/// callers never need to recover backend identity from a formatted message.
+#[derive(Debug)]
+pub(crate) enum CommittedGenerationError<S, D> {
+    /// Model submission, completion, token extraction, or constraint control failed.
+    Source(S),
+    /// Token decoding or semantic event construction failed.
+    Pipeline(CommittedTokenPipelineError<D>),
+    /// Portable generation lifecycle state was invalid.
+    Lifecycle(crate::core::generation::GenerationError),
+    /// The backend stopped without producing a terminal token.
+    MissingTerminalToken,
 }
 
 /// Drives the production committed-token boundary without owning a second
@@ -967,10 +1006,9 @@ pub(crate) fn drive_committed_generation<D, T>(
     eos_token_ids: &[u32],
     max_tokens: NonZeroUsize,
     emit: &mut impl FnMut(SemanticEvent),
-) -> Result<(Vec<u32>, FinishReason), String>
+) -> Result<(Vec<u32>, FinishReason), CommittedGenerationError<T::Error, D::Error>>
 where
     D: TokenDecoderBackend,
-    D::Error: fmt::Display,
     T: CommittedTokenSource,
 {
     drive_committed_generation_cancellable(
@@ -991,10 +1029,9 @@ pub(crate) fn drive_committed_generation_cancellable<D, T>(
     max_tokens: NonZeroUsize,
     cancellation: &GenerationCancellationToken,
     emit: &mut impl FnMut(SemanticEvent),
-) -> Result<(Vec<u32>, FinishReason), String>
+) -> Result<(Vec<u32>, FinishReason), CommittedGenerationError<T::Error, D::Error>>
 where
     D: TokenDecoderBackend,
-    D::Error: fmt::Display,
     T: CommittedTokenSource,
 {
     let mut sequence = GenerationSequence::new(max_tokens.get(), eos_token_ids.iter().copied());
@@ -1006,14 +1043,15 @@ where
 
         let token_id = source
             .next_token()
-            .map_err(|error| format!("model generation failed: {error}"))?
-            .ok_or_else(|| "architecture generation ended without a terminal token".to_owned())?;
-        let (stop_matched, cancelled_during_delivery) =
-            pipeline.push_cancellable(token_id, cancellation, emit)?;
+            .map_err(CommittedGenerationError::Source)?
+            .ok_or(CommittedGenerationError::MissingTerminalToken)?;
+        let (stop_matched, cancelled_during_delivery) = pipeline
+            .push_cancellable(token_id, cancellation, emit)
+            .map_err(CommittedGenerationError::Pipeline)?;
         if cancelled_during_delivery && !stop_matched {
             sequence
                 .commit(token_id, TokenTerminalSignals::default())
-                .map_err(|error| error.to_string())?;
+                .map_err(CommittedGenerationError::Lifecycle)?;
             sequence.cancel();
             pipeline.cancel(emit);
             return Ok((sequence.into_tokens(), FinishReason::Cancelled));
@@ -1023,7 +1061,7 @@ where
         } else {
             source
                 .grammar_is_complete()
-                .map_err(|error| format!("grammar completion check failed: {error}"))?
+                .map_err(CommittedGenerationError::Source)?
         };
         let reason = sequence
             .commit(
@@ -1033,11 +1071,13 @@ where
                     grammar_complete,
                 },
             )
-            .map_err(|error| error.to_string())?
+            .map_err(CommittedGenerationError::Lifecycle)?
             .finish_reason;
 
         if let Some(reason) = reason {
-            pipeline.finish(reason, emit)?;
+            pipeline
+                .finish(reason, emit)
+                .map_err(CommittedGenerationError::Pipeline)?;
             return Ok((sequence.into_tokens(), reason));
         }
     }

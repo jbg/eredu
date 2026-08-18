@@ -538,6 +538,21 @@ sequence, grammar, EOS, token-budget, and cancellation precedence. The MLX
 streaming adapter decodes and publishes each committed token but no longer owns
 a parallel token vector or finish-reason state.
 
+The facade preserves backend identity in its public failures as well as its
+values. `PreparedChatError<B::Error>` carries submission, exact-completion, and
+token-extraction failures as the selected backend's concrete error type;
+constraint, tokenizer, semantic-streaming, and lifecycle failures are separate
+portable variants. The committed-token driver likewise keeps source and decoder
+errors typed instead of formatting them into strings. Speculative capability has
+its own backend-associated error because a backend may expose different failure
+structure for target/drafter coordination. Tokenizer, chat-template, and
+sidecar loading use `TextMetadataError`, so generic `LoadedModel<B>` assembly
+does not mention the MLX facade error. `LoadedModelLoadError<B::Error>` also
+separates portable artifact inspection from backend materialization instead of
+requiring backend errors to absorb artifact failures. MLX converts portable
+constraint failures to native exceptions only where its tensor sampler
+contract requires one.
+
 For speculative decoding, `SpeculativeRound` records proposal acceptance, a
 replacement or bonus tail, and whether the round terminated. Its commit plan
 determines both the tokens that become visible and the exact number of target

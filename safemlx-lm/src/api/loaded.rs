@@ -23,12 +23,15 @@ pub struct LoadedModel<B: safemlx_lm_core::TextGenerationBackend> {
 /// Failure while assembling a tokenizer-aware model around a selected backend.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadedModelLoadError<E: std::error::Error + Send + Sync + 'static> {
-    /// Artifact planning, backend materialization, or session creation failed.
+    /// Portable artifact inspection or preparation planning failed.
+    #[error(transparent)]
+    Artifact(#[from] safemlx_lm_core::artifact::ArtifactError),
+    /// Backend materialization or session creation failed.
     #[error("selected backend failed to load the model: {0}")]
     Backend(#[source] E),
     /// Portable tokenizer, chat-template, or generation sidecar loading failed.
     #[error(transparent)]
-    Metadata(#[from] Error),
+    Metadata(#[from] TextMetadataError),
 }
 
 /// Backend-neutral tokenizer and chat metadata attached to a prepared runtime.
@@ -43,6 +46,60 @@ pub struct LoadedTextModelConfig {
     pub eos_token_ids: Vec<u32>,
     /// Optional checkpoint sampling recommendations.
     pub checkpoint_generation_config: Option<CheckpointGenerationConfig>,
+}
+
+fn map_prepared_chat_setup_error<E>(error: PreparedChatSetupError) -> PreparedChatError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match error {
+        PreparedChatSetupError::Constraint(error) => PreparedChatError::Constraint(error),
+        PreparedChatSetupError::Semantic(error) => PreparedChatError::Semantic(error),
+    }
+}
+
+fn map_controlled_generation_error<E>(
+    error: safemlx_lm_core::ControlledTextGenerationError<
+        E,
+        crate::runtime::generation::sampler::ConstraintError,
+    >,
+) -> PreparedChatError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match error {
+        safemlx_lm_core::ControlledTextGenerationError::Backend(error) => {
+            PreparedChatError::Backend(error)
+        }
+        safemlx_lm_core::ControlledTextGenerationError::Controller(error) => {
+            PreparedChatError::Constraint(error)
+        }
+    }
+}
+
+fn map_committed_generation_error<E>(
+    error: CommittedGenerationError<
+        safemlx_lm_core::ControlledTextGenerationError<
+            E,
+            crate::runtime::generation::sampler::ConstraintError,
+        >,
+        TextDecoderError,
+    >,
+) -> PreparedChatError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match error {
+        CommittedGenerationError::Source(error) => map_controlled_generation_error(error),
+        CommittedGenerationError::Pipeline(CommittedTokenPipelineError::Decoder(error)) => {
+            PreparedChatError::Tokenizer(error)
+        }
+        CommittedGenerationError::Pipeline(CommittedTokenPipelineError::Semantic(error)) => {
+            PreparedChatError::Semantic(error)
+        }
+        CommittedGenerationError::Lifecycle(error) => PreparedChatError::Generation(error),
+        CommittedGenerationError::MissingTerminalToken => PreparedChatError::MissingTerminalToken,
+    }
 }
 
 impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
@@ -92,18 +149,21 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     pub fn resolve_generation_config(
         &self,
         overrides: GenerationConfigOverrides,
-    ) -> Result<ResolvedGenerationConfig, Error> {
-        Ok(resolve_generation_config(
-            self.checkpoint_generation_config.as_ref(),
-            overrides,
-        )?)
+    ) -> Result<ResolvedGenerationConfig, crate::core::generation::GenerationError> {
+        resolve_generation_config(self.checkpoint_generation_config.as_ref(), overrides)
     }
 
     fn resolve_text_generation_settings(
         &self,
         settings: PreparedChatGenerationSettings,
-    ) -> Result<(safemlx_lm_core::TextGenerationConfig, NonZeroUsize), Error> {
-        let resolved = self.resolve_generation_config(settings.overrides)?;
+    ) -> Result<
+        (safemlx_lm_core::TextGenerationConfig, NonZeroUsize),
+        crate::core::generation::GenerationError,
+    > {
+        let resolved = resolve_generation_config(
+            self.checkpoint_generation_config.as_ref(),
+            settings.overrides,
+        )?;
         let max_tokens = resolved
             .max_new_tokens
             .and_then(NonZeroUsize::new)
@@ -127,7 +187,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     pub fn generate_prepared_chat<F>(
         &mut self,
         request: PreparedChatGenerationRequest<'_, B, F>,
-    ) -> Result<PreparedChatGenerationOutput, Error>
+    ) -> Result<PreparedChatGenerationOutput, PreparedChatError<B::Error>>
     where
         F: FnMut(SemanticEvent),
     {
@@ -150,7 +210,8 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
 
         let prepared_chat = input.prepared_chat();
         let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
-        let control = prepared_chat_control_runtime(prepared_chat, caller_stop_sequences)?;
+        let control = prepared_chat_control_runtime(prepared_chat, caller_stop_sequences)
+            .map_err(map_prepared_chat_setup_error)?;
         let decoder = PreparedChatTokenDecoder {
             decoder: self.text_decoder(true),
         };
@@ -159,7 +220,12 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
         let mut pipeline = CommittedTokenPipeline::new(raw_decoder, control.parser);
         let generator = match input {
             PreparedChatInput::RenderedPrompt(prepared_chat) => {
-                let prompt = self.encode(prepared_chat.rendered_prompt(), false)?;
+                let prompt = self
+                    .tokenizer
+                    .encode(prepared_chat.rendered_prompt(), false)
+                    .map_err(TextDecoderError::Tokenizer)?
+                    .get_ids()
+                    .to_vec();
                 safemlx_lm_core::ControlledTextGeneration::new(
                     &mut self.runtime,
                     prompt,
@@ -176,7 +242,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
                 )
             }
         }
-        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+        .map_err(map_controlled_generation_error)?;
         let mut source = BackendGenerationTokenSource { generator };
         let (token_ids, finish_reason) = drive_committed_generation_cancellable(
             &mut source,
@@ -186,7 +252,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
             &cancellation,
             &mut on_event,
         )
-        .map_err(Error::PreparedChatGeneration)?;
+        .map_err(map_committed_generation_error)?;
         Ok(PreparedChatGenerationOutput {
             token_ids,
             finish_reason,
@@ -205,7 +271,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     pub fn generate_prepared_chat_mtp<'a, F>(
         &mut self,
         request: PreparedChatMtpGenerationRequest<'a, B, B::Drafter, F>,
-    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    ) -> Result<PreparedChatMtpGenerationOutput, B::SpeculativeError>
     where
         B: PreparedChatSpeculativeBackend,
         F: FnMut(SemanticEvent),
@@ -217,7 +283,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     pub fn generate_prepared_chat_mtp_batch<'a>(
         &mut self,
         request: PreparedChatMtpBatchRequest<'a, B, B::Drafter>,
-    ) -> Result<PreparedChatMtpBatchOutput, Error>
+    ) -> Result<PreparedChatMtpBatchOutput, B::SpeculativeError>
     where
         B: PreparedChatSpeculativeBackend,
     {
@@ -238,7 +304,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     pub fn selected_chat_template_identity(
         &self,
         tools: Option<&[serde_json::Value]>,
-    ) -> Result<Option<ChatTemplateIdentity>, Error> {
+    ) -> Result<Option<ChatTemplateIdentity>, TextModelError> {
         self.chat_template
             .as_ref()
             .map(|templates| {
@@ -247,11 +313,11 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
                     .map(|selected| selected.identity().clone())
             })
             .transpose()
-            .map_err(Into::into)
+            .map_err(TextModelError::Template)
     }
 
     /// Returns likely user-provided kwargs referenced by the chat template.
-    pub fn chat_template_kwargs(&self) -> Result<Vec<String>, Error> {
+    pub fn chat_template_kwargs(&self) -> Result<Vec<String>, TextModelError> {
         let Some(template) = &self.chat_template else {
             return Ok(Vec::new());
         };
@@ -265,11 +331,14 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Prepares one JSON-valued chat for generation.
-    pub fn prepare_chat(&mut self, request: ChatTemplateRequest) -> Result<PreparedChat, Error> {
+    pub fn prepare_chat(
+        &mut self,
+        request: ChatTemplateRequest,
+    ) -> Result<PreparedChat, TextModelError> {
         let template = self
             .chat_template
             .clone()
-            .ok_or(Error::MissingChatTemplate)?;
+            .ok_or(TextModelError::MissingChatTemplate)?;
         prepare_chat_from_parts(
             &mut self.tokenizer,
             template,
@@ -286,7 +355,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
         conversations: I,
         tools: Option<&'a [serde_json::Value]>,
         add_generation_prompt: bool,
-    ) -> Result<Option<String>, Error>
+    ) -> Result<Option<String>, TextModelError>
     where
         I: IntoIterator<Item = Chat<'a, R, T>>,
         R: Serialize + 'a,
@@ -302,7 +371,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
         tools: Option<&'a [serde_json::Value]>,
         add_generation_prompt: bool,
         template_kwargs: Option<&'a serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Option<String>, Error>
+    ) -> Result<Option<String>, TextModelError>
     where
         I: IntoIterator<Item = Chat<'a, R, T>>,
         R: Serialize + 'a,
@@ -333,7 +402,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
         conversations: impl IntoIterator<Item = Vec<serde_json::Value>>,
         tools: Option<&[serde_json::Value]>,
         add_generation_prompt: bool,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Option<String>, TextModelError> {
         self.apply_chat_template_json_with_kwargs(conversations, tools, add_generation_prompt, None)
     }
 
@@ -344,7 +413,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
         tools: Option<&[serde_json::Value]>,
         add_generation_prompt: bool,
         template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Option<String>, TextModelError> {
         let Some(template) = self.chat_template.clone() else {
             return Ok(None);
         };
@@ -360,7 +429,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Encodes text to tokenizer ids.
-    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, Error> {
+    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, TextModelError> {
         Ok(self
             .tokenizer
             .encode(text, add_special_tokens)?
@@ -369,10 +438,10 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Decodes tokenizer ids back to text.
-    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, TextModelError> {
         self.tokenizer
             .decode(ids, skip_special_tokens)
-            .map_err(Into::into)
+            .map_err(TextModelError::Tokenizer)
     }
 
     /// Creates an independent stateful decoder for streaming generated tokens.
@@ -400,7 +469,6 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
 impl<B> LoadedModel<B>
 where
     B: safemlx_lm_core::TextGenerationBackend + safemlx_lm_core::ModelLoadingBackend,
-    B::Error: From<safemlx_lm_core::artifact::ArtifactError>,
 {
     /// Loads one artifact, its tokenizer, and its chat metadata on `backend`.
     ///
@@ -413,11 +481,18 @@ where
         options: B::LoadOptions,
     ) -> Result<Self, LoadedModelLoadError<B::Error>> {
         let artifact = artifact.as_ref();
-        let inspection = safemlx_lm_core::inspect_artifact(artifact)
-            .map_err(|error| LoadedModelLoadError::Backend(error.into()))?;
+        let inspection = safemlx_lm_core::inspect_artifact(artifact)?;
         let (tokenizer, config) = loaded_text_artifact(&inspection)?;
-        let prepared = safemlx_lm_core::prepare_inspected_model(&backend, inspection, options)
-            .map_err(LoadedModelLoadError::Backend)?;
+        let prepared = match safemlx_lm_core::prepare_inspected_model(&backend, inspection, options)
+        {
+            Ok(prepared) => prepared,
+            Err(safemlx_lm_core::ModelLoadError::Artifact(error)) => {
+                return Err(LoadedModelLoadError::Artifact(error));
+            }
+            Err(safemlx_lm_core::ModelLoadError::Backend(error)) => {
+                return Err(LoadedModelLoadError::Backend(error));
+            }
+        };
         let runtime = safemlx_lm_core::ModelRuntime::from_prepared(backend, prepared)
             .map_err(LoadedModelLoadError::Backend)?;
         Ok(Self::from_runtime(runtime, tokenizer, config))
@@ -426,11 +501,11 @@ where
 
 fn loaded_text_artifact(
     inspection: &safemlx_lm_core::ArtifactInspection,
-) -> Result<(ChatTokenizer, LoadedTextModelConfig), Error> {
+) -> Result<(ChatTokenizer, LoadedTextModelConfig), TextMetadataError> {
     let path = inspection.path();
     let configuration = inspection.configuration();
     if configuration.kind == ModelKind::PersonaPlex {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(TextMetadataError::UnsupportedArchitecture(
             "PersonaPlex is a realtime speech-to-speech token model; use the realtime backend contract instead of LoadedModel".into(),
         ));
     }
@@ -465,7 +540,7 @@ fn loaded_text_artifact(
                     Some(ModelChatTemplate::Single(template.clone()))
                 }
                 Some(_) => {
-                    return Err(Error::GgufTokenizer(
+                    return Err(TextMetadataError::GgufTokenizer(
                         "tokenizer.chat_template must be a string".into(),
                     ));
                 }
@@ -874,7 +949,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
 
     fn prepare_chat_model_input<'a>(
         &self,
-        input: PreparedChatInput<'a>,
+        input: PreparedChatInput<'a, crate::backend::mlx::MlxBackend<'static>>,
         stream: &Stream,
     ) -> Result<PreparedChatModelInput, Error> {
         match input {
@@ -896,7 +971,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         stream: &Stream,
     ) -> Result<Vec<PreparedChatMtpLaneRuntime<'a>>, Error> {
         if cache.len() != lanes.len() {
-            return Err(Error::PreparedChatGeneration(format!(
+            return Err(Error::Speculative(format!(
                 "MTP cache has {} lanes but the request has {} lanes",
                 cache.len(),
                 lanes.len()
@@ -920,7 +995,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     .expect("supported prepared chats carry a semantic runtime plan")
                     .clone(),
                 SemanticSupport::Unsupported { reason } => {
-                    return Err(Error::PreparedChatGeneration(format!(
+                    return Err(Error::PreparedChatSemantic(format!(
                         "prepared chat lane {lane_index} does not have an executable semantic plan: {reason}"
                     )));
                 }
@@ -933,13 +1008,13 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 settings.checkpoint_sampler,
                 generation_plan,
             )
-            .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+            .map_err(|error| Error::Speculative(error.to_string()))?;
             let decoder = PreparedChatTokenDecoder {
                 decoder: self.text_decoder(true),
             };
             let semantic =
                 PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                    .map_err(|error| Error::PreparedChatSemantic(error.to_string()))?;
             let input = self.prepare_chat_model_input(input, stream)?;
             prepared_lanes.push(PreparedChatMtpLaneRuntime {
                 input,
@@ -1012,7 +1087,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     streams,
                     scheduler,
                 )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+                .map_err(|error| Error::Speculative(error.to_string()))
             }
             Model::MuseGlimmer(target) => {
                 let assistant = drafter.muse_glimmer_mut();
@@ -1028,9 +1103,9 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     streams,
                     scheduler,
                 )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+                .map_err(|error| Error::Speculative(error.to_string()))
             }
-            model => Err(Error::PreparedChatGeneration(format!(
+            model => Err(Error::Speculative(format!(
                 "MTP runtime adapter is unavailable for model type {} ({:?})",
                 model.model_type(),
                 model.mtp_capability()
@@ -1059,7 +1134,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     streams,
                     scheduler,
                 )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+                .map_err(|error| Error::Speculative(error.to_string()))
             }
             Model::Inkling(target) => {
                 let mut backend =
@@ -1072,7 +1147,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     streams,
                     scheduler,
                 )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+                .map_err(|error| Error::Speculative(error.to_string()))
             }
             Model::NemotronH(target) => {
                 let mut backend =
@@ -1085,7 +1160,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     streams,
                     scheduler,
                 )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+                .map_err(|error| Error::Speculative(error.to_string()))
             }
             Model::Qwen3Next(target) => {
                 let mut backend = crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
@@ -1097,7 +1172,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     streams,
                     scheduler,
                 )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+                .map_err(|error| Error::Speculative(error.to_string()))
             }
             Model::Qwen35(target) => {
                 let mut backend = crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
@@ -1109,9 +1184,9 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     streams,
                     scheduler,
                 )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+                .map_err(|error| Error::Speculative(error.to_string()))
             }
-            model => Err(Error::PreparedChatGeneration(format!(
+            model => Err(Error::Speculative(format!(
                 "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
                 model.model_type(),
                 model.mtp_capability()
@@ -1188,7 +1263,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 .expect("supported prepared chats carry a semantic runtime plan")
                 .clone(),
             SemanticSupport::Unsupported { reason } => {
-                return Err(Error::PreparedChatGeneration(format!(
+                return Err(Error::PreparedChatSemantic(format!(
                     "prepared chat does not have an executable semantic plan: {reason}"
                 )));
             }
@@ -1200,7 +1275,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             };
             let semantic =
                 PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                    .map_err(|error| Error::PreparedChatSemantic(error.to_string()))?;
             let config = MtpConfig {
                 max_tokens: settings.max_tokens.get(),
                 max_draft_tokens: options.max_draft_tokens.get(),
@@ -1225,7 +1300,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                         options.scheduler,
                         on_event,
                     )
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                    .map_err(|error| Error::Speculative(error.to_string()))?;
                 Ok(PreparedChatMtpGenerationOutput {
                     token_ids,
                     finish_reason,
@@ -1256,7 +1331,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 .expect("supported prepared chats carry a semantic runtime plan")
                 .clone(),
             SemanticSupport::Unsupported { reason } => {
-                return Err(Error::PreparedChatGeneration(format!(
+                return Err(Error::PreparedChatSemantic(format!(
                     "prepared chat does not have an executable semantic plan: {reason}"
                 )));
             }
@@ -1268,7 +1343,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             };
             let semantic =
                 PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                    .map_err(|error| Error::PreparedChatSemantic(error.to_string()))?;
             let config = MtpConfig {
                 max_tokens: settings.max_tokens.get(),
                 max_draft_tokens: options.max_draft_tokens.get(),
@@ -1292,7 +1367,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                         options.scheduler,
                         on_event,
                     )
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                    .map_err(|error| Error::Speculative(error.to_string()))?;
                 Ok(PreparedChatMtpGenerationOutput {
                     token_ids,
                     finish_reason,

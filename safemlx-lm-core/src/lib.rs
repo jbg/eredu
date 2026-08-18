@@ -46,10 +46,10 @@ pub use backend::{
     load_model, prepare_inspected_model, Backend, BackendCapabilities, BackendDescriptor,
     BackendError, BackendSession, CollectiveScope, Completion, ControlledTextGeneration,
     ControlledTextGenerationError, ControlledToken, DeviceDescriptor, DistributedBackend,
-    DistributedCapabilities, DistributedSession, DistributedSessionDescriptor, ModelLoadingBackend,
-    ModelRuntime, PreparedModel, Submission, TextGeneration, TextGenerationBackend,
-    TextGenerationConfig, TokenFilter, TokenFilterController, TokenFilterError, TokenOutput,
-    ValueDescriptor,
+    DistributedCapabilities, DistributedSession, DistributedSessionDescriptor, ModelLoadError,
+    ModelLoadingBackend, ModelRuntime, PreparedModel, Submission, TextGeneration,
+    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenFilterController,
+    TokenFilterError, TokenOutput, ValueDescriptor,
 };
 pub use execution::{
     BackendId, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanError,
