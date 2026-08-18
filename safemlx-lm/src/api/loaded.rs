@@ -63,6 +63,17 @@ pub enum LoadedModelLoadError<E: std::error::Error + Send + Sync + 'static> {
     Metadata(#[from] TextMetadataError),
 }
 
+/// Failure while planning, realizing, or loading a model through a backend factory.
+#[derive(Debug, thiserror::Error)]
+pub enum PlannedModelLoadError<E: std::error::Error + Send + Sync + 'static> {
+    /// Portable planning or backend/device realization failed.
+    #[error(transparent)]
+    Planning(#[from] safemlx_lm_core::AutomaticPlanningError),
+    /// Artifact, metadata, materialization, or session creation failed.
+    #[error(transparent)]
+    Loading(#[from] LoadedModelLoadError<E>),
+}
+
 fn map_prepared_chat_setup_error<E>(error: PreparedChatSetupError) -> PreparedChatError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -516,6 +527,41 @@ impl<B> LoadedModel<B>
 where
     B: safemlx_lm_core::TextGenerationBackend + safemlx_lm_core::ModelLoadingBackend,
 {
+    /// Realizes a portable execution plan and loads its artifact through the selected factory.
+    ///
+    /// The factory owns device and queue construction plus translation to the
+    /// backend's opaque load policy. Generic callers never construct backend
+    /// streams or inspect backend-specific load options.
+    pub fn load_execution_plan<F>(
+        factory: &F,
+        artifact: impl AsRef<Path>,
+        plan: &safemlx_lm_core::ExecutionPlan,
+    ) -> Result<Self, PlannedModelLoadError<B::Error>>
+    where
+        F: safemlx_lm_core::ExecutionPlanBackendFactory<Backend = B>,
+    {
+        let realization = safemlx_lm_core::realize_execution_plan(factory, plan)?;
+        let (backend, options) = realization.into_parts();
+        Self::load(backend, artifact, options).map_err(PlannedModelLoadError::Loading)
+    }
+
+    /// Plans and loads one artifact without exposing backend construction or load policy.
+    ///
+    /// The returned report is the exact portable plan used to realize the
+    /// backend and remains suitable for persistence and execution telemetry.
+    pub fn plan_and_load<F>(
+        factory: &F,
+        planner: &safemlx_lm_core::AutomaticPlanner,
+        request: &safemlx_lm_core::AutomaticPlanRequest,
+    ) -> Result<(Self, safemlx_lm_core::ExecutionPlanReport), PlannedModelLoadError<B::Error>>
+    where
+        F: safemlx_lm_core::ExecutionPlanBackendFactory<Backend = B>,
+    {
+        let report = planner.plan(factory, request)?;
+        let model = Self::load_execution_plan(factory, &request.model_path, &report.plan)?;
+        Ok((model, report))
+    }
+
     /// Loads one artifact, its tokenizer, and its chat metadata on `backend`.
     ///
     /// The backend already owns device placement, execution queues, transfer

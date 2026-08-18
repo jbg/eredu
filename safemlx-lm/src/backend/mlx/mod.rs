@@ -212,6 +212,7 @@ pub struct MlxModelConfig {
 pub struct MlxBackend<'a> {
     stream: Stream,
     weights_stream: Stream,
+    planned_device_id: Option<String>,
     world: Option<&'a safemlx::distributed::Group>,
 }
 
@@ -221,6 +222,20 @@ impl MlxBackend<'static> {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
+            planned_device_id: None,
+            world: None,
+        }
+    }
+
+    pub(super) fn for_execution_plan(
+        stream: &Stream,
+        weights_stream: &Stream,
+        device_id: String,
+    ) -> Self {
+        Self {
+            stream: stream.clone(),
+            weights_stream: weights_stream.clone(),
+            planned_device_id: Some(device_id),
             world: None,
         }
     }
@@ -236,6 +251,7 @@ impl<'a> MlxBackend<'a> {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
+            planned_device_id: None,
             world: Some(world),
         }
     }
@@ -274,15 +290,26 @@ impl<'a> Backend for MlxBackend<'a> {
 
     fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error> {
         let device = self.stream.get_device()?;
-        let family = match device.get_type()? {
+        let index = device.get_index()?;
+        let inferred_family = match device.get_type()? {
             DeviceType::Cpu => "cpu",
+            DeviceType::Gpu if cfg!(feature = "cuda") => "cuda",
+            DeviceType::Gpu if cfg!(target_os = "macos") => "metal",
             DeviceType::Gpu => "gpu",
         };
+        let id = self
+            .planned_device_id
+            .clone()
+            .unwrap_or_else(|| format!("{inferred_family}:{index}"));
+        let family = id.split_once(':').map_or_else(
+            || inferred_family.to_owned(),
+            |(family, _)| family.to_owned(),
+        );
         Ok(vec![(
             DeviceDescriptor {
-                id: format!("{family}:{}", device.get_index()?),
-                name: format!("MLX {family} {}", device.get_index()?),
-                family: family.into(),
+                id,
+                name: format!("MLX {family} {index}"),
+                family,
                 memory_bytes: None,
             },
             BackendCapabilities {

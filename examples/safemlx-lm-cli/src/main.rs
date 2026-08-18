@@ -25,8 +25,8 @@ use safemlx_lm::{
         ResidencyPlan, SpeculativeDraft, TextDecoder, TextModelError,
     },
     backend::mlx::automatic::{
-        discover_hardware, execution_plan_load_options, expert_cache_telemetry, mtp_telemetry,
-        plan_automatic_execution, residency_telemetry,
+        discover_hardware, expert_cache_telemetry, mtp_telemetry, residency_telemetry,
+        MlxBackendFactory,
     },
     backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     backend::mlx::runtime::execution::layerwise::{
@@ -45,15 +45,16 @@ use safemlx_lm::{
     },
     core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     core::speculative::MtpStats,
+    realize_execution_plan,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
-    AllocatorTelemetry, AutomaticPlanRequest, DevicePlan, DraftPlacementPlan, DraftingPlan,
-    ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
-    GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
+    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, DevicePlan, DraftPlacementPlan,
+    DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
+    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
     HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed, PlanExplanation,
     PlanExplanationEntry, PlanExplanationLevel, SemanticEvent, TextGenerationConfig,
-    TimingTelemetry, TokenOutput, WeightTransformationPlan,
+    TimingTelemetry, TokenOutput, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -195,6 +196,15 @@ impl From<ExpertCacheEviction> for CacheEvictionPolicy {
         match value {
             ExpertCacheEviction::Lru => Self::LeastRecentlyUsed,
             ExpertCacheEviction::Lfu => Self::LeastFrequentlyUsed,
+        }
+    }
+}
+
+impl From<CacheEvictionPolicy> for ExpertCacheEviction {
+    fn from(value: CacheEvictionPolicy) -> Self {
+        match value {
+            CacheEvictionPolicy::LeastRecentlyUsed => Self::Lru,
+            CacheEvictionPolicy::LeastFrequentlyUsed => Self::Lfu,
         }
     }
 }
@@ -860,18 +870,6 @@ fn use_semantic_generation(
     }
 }
 
-fn execution_contexts(
-    device: CliDevice,
-    mtp_draft_device: MtpDraftDevice,
-) -> (ExecutionContext, Option<ExecutionContext>) {
-    let execution = ExecutionContext::new(device.mlx());
-    let draft = match mtp_draft_device {
-        MtpDraftDevice::Target => None,
-        MtpDraftDevice::Device(device) => Some(ExecutionContext::new(device.mlx())),
-    };
-    (execution, draft)
-}
-
 fn requested_load_quantization(args: &Cli) -> Result<Option<WeightQuantization>> {
     match (args.quantize, args.quantization_mode) {
         (Some(bits), LoadQuantizationMode::Affine) => Ok(Some(
@@ -1244,7 +1242,9 @@ fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &Exec
 }
 
 fn candidate_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions> {
-    execution_plan_load_options(plan).map_err(Into::into)
+    let realization = realize_execution_plan(&MlxBackendFactory::default(), plan)?;
+    let (_, options) = realization.into_parts();
+    Ok(options)
 }
 
 fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCandidate> {
@@ -1338,6 +1338,7 @@ fn with_expert_cache(mut plan: ExecutionPlan) -> ExecutionPlan {
         host_budget_bytes: Some(split(host_budget, AUTO_EXPERT_SHARE_PERCENT).max(1)),
         scratch_bytes: scratch,
         prefill_bank_bytes: scratch,
+        eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
     });
     plan
 }
@@ -1416,7 +1417,9 @@ fn automatic_plan(
 ) -> Result<ExecutionPlanReport> {
     let request = AutomaticPlanRequest::new(model_path, device_plan(device))
         .with_prior_telemetry(prior_telemetry.iter().cloned());
-    plan_automatic_execution(&request).map_err(Into::into)
+    AutomaticPlanner::default()
+        .plan(&MlxBackendFactory::default(), &request)
+        .map_err(Into::into)
 }
 
 fn push_unique_plan(
@@ -1741,11 +1744,11 @@ fn benchmark_automatic_plans(
 }
 
 fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<ExecutionPlanReport> {
-    if plan.schema_version != safemlx_lm::AUTOMATIC_SCHEMA_VERSION {
+    if plan.schema_version != EXECUTION_PLAN_SCHEMA_VERSION {
         bail!(
             "exact automatic plan schema {} does not match supported schema {}",
             plan.schema_version,
-            safemlx_lm::AUTOMATIC_SCHEMA_VERSION
+            EXECUTION_PLAN_SCHEMA_VERSION
         );
     }
     let hardware = discover_hardware();
@@ -1766,7 +1769,7 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
         bail!("cannot execute exact automatic plan: {detail}");
     }
     Ok(ExecutionPlanReport {
-        schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
+        schema_version: EXECUTION_PLAN_SCHEMA_VERSION,
         hardware,
         resources: inspection.resources,
         plan,
@@ -1832,6 +1835,7 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
         args.expert_cache_host_budget_bytes = expert.host_budget_bytes;
         args.expert_cache_scratch_bytes = expert.scratch_bytes;
         args.expert_cache_prefill_bank_bytes = expert.prefill_bank_bytes;
+        args.expert_cache_eviction = expert.eviction_policy.into();
     }
     match plan.drafting {
         DraftingPlan::Disabled => args.mtp_draft_tokens = 0,
@@ -2095,12 +2099,6 @@ fn main() -> Result<()> {
         writeln!(stderr)?;
     }
 
-    let (execution, draft_execution) = execution_contexts(args.device, args.mtp_draft_device);
-    let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = execution.stream();
-    let draft_stream = draft_execution
-        .as_ref()
-        .map_or(stream, ExecutionContext::stream);
     if args.verbose || args.telemetry_json.is_some() {
         // Capture the complete model-load and generation high-water mark.
         safemlx::memory::reset_peak_memory()?;
@@ -2184,12 +2182,32 @@ fn main() -> Result<()> {
         None
     };
     let load_started = Instant::now();
-    let mut model = LoadedModel::load(
-        MlxBackend::new(stream, weights.stream()),
-        &model_path,
-        load_options,
-    )
+    let mut model = if let Some(report) = &automatic_report {
+        let factory =
+            MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
+        LoadedModel::load_execution_plan(&factory, &model_path, &report.plan)
+    } else {
+        let execution = ExecutionContext::new(args.device.mlx());
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        LoadedModel::load(
+            MlxBackend::new(execution.stream(), weights.stream()),
+            &model_path,
+            load_options,
+        )
+        .map_err(safemlx_lm::PlannedModelLoadError::Loading)
+    }
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    let stream_owner = model.runtime().backend().stream().clone();
+    let weights_stream_owner = model.runtime().backend().weights_stream().clone();
+    let stream = &stream_owner;
+    let weights_stream = &weights_stream_owner;
+    let draft_execution = match args.mtp_draft_device {
+        MtpDraftDevice::Target => None,
+        MtpDraftDevice::Device(device) => Some(ExecutionContext::new(device.mlx())),
+    };
+    let draft_stream = draft_execution
+        .as_ref()
+        .map_or(stream, ExecutionContext::stream);
     let mut resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: args.temperature,
         top_k: args.top_k,
@@ -2243,7 +2261,7 @@ fn main() -> Result<()> {
                 ModelLoadOptions::with_quantization,
             );
             let tokenizer = safemlx_lm::api::load_tokenizer(path)?;
-            MlxDrafter::load_with_options(path, &tokenizer, options, draft_stream, weights.stream())
+            MlxDrafter::load_with_options(path, &tokenizer, options, draft_stream, weights_stream)
                 .with_context(|| format!("failed to load draft model from {}", path.display()))
         })
         .transpose()?;
@@ -2943,6 +2961,7 @@ fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool
             host_budget_bytes: args.expert_cache_host_budget_bytes,
             scratch_bytes: args.expert_cache_scratch_bytes,
             prefill_bank_bytes: args.expert_cache_prefill_bank_bytes,
+            eviction_policy: args.expert_cache_eviction.into(),
         }),
         drafting,
         required_capabilities: safemlx_lm::BackendCapabilities {
@@ -3764,9 +3783,9 @@ mod tests {
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        discover_hardware, embedded_mtp_count, eval, execution_contexts, format_bytes,
-        format_weight_store_diagnostics, median, model_advertises_embedded_mtp,
-        read_automatic_feedback, requested_load_quantization, select_cached_gguf_from_revisions,
+        discover_hardware, embedded_mtp_count, eval, format_bytes, format_weight_store_diagnostics,
+        median, model_advertises_embedded_mtp, read_automatic_feedback,
+        requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
         select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
         use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
@@ -3997,6 +4016,7 @@ mod tests {
             host_budget_bytes: Some(512 << 20),
             scratch_bytes: 128 << 20,
             prefill_bank_bytes: 64 << 20,
+            eviction_policy: super::CacheEvictionPolicy::LeastRecentlyUsed,
         });
         plan.drafting = DraftingPlan::Embedded {
             max_draft_tokens: 3,
@@ -4605,8 +4625,7 @@ mod tests {
 
     #[test]
     fn cpu_execution_device_runs_mlx_work() {
-        let (context, no_draft) = execution_contexts(CliDevice::Cpu, MtpDraftDevice::Target);
-        assert!(no_draft.is_none());
+        let context = super::ExecutionContext::new(CliDevice::Cpu.mlx());
         assert_eq!(context.device().get_type().unwrap(), DeviceType::Cpu);
         let values = Array::from_slice(&[1.0f32, 2.0], &[2])
             .copy(context.stream())
@@ -4615,9 +4634,8 @@ mod tests {
         context.stream().synchronize().unwrap();
         assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), &[1.0, 2.0]);
 
-        let (target, draft) =
-            execution_contexts(CliDevice::Cpu, MtpDraftDevice::Device(CliDevice::Cpu));
-        let draft = draft.unwrap();
+        let target = super::ExecutionContext::new(CliDevice::Cpu.mlx());
+        let draft = super::ExecutionContext::new(CliDevice::Cpu.mlx());
         assert_ne!(target.stream(), draft.stream());
         assert_eq!(
             MtpExecutionStreams::new(target.stream(), draft.stream())
@@ -4630,28 +4648,28 @@ mod tests {
     #[test]
     #[ignore = "requires an MLX Metal device"]
     fn gpu_device_selectors_build_requested_mtp_topologies() {
-        let (target, draft) =
-            execution_contexts(CliDevice::Gpu(0), MtpDraftDevice::Device(CliDevice::Gpu(0)));
+        let target = super::ExecutionContext::new(CliDevice::Gpu(0).mlx());
+        let draft = super::ExecutionContext::new(CliDevice::Gpu(0).mlx());
         assert_eq!(
-            MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
+            MtpExecutionStreams::new(target.stream(), draft.stream())
                 .unwrap()
                 .topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
         );
 
-        let (target, draft) =
-            execution_contexts(CliDevice::Gpu(0), MtpDraftDevice::Device(CliDevice::Cpu));
+        let target = super::ExecutionContext::new(CliDevice::Gpu(0).mlx());
+        let draft = super::ExecutionContext::new(CliDevice::Cpu.mlx());
         assert_eq!(
-            MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
+            MtpExecutionStreams::new(target.stream(), draft.stream())
                 .unwrap()
                 .topology(),
             SpeculativeExecutionTopology::CrossDeviceSplit
         );
 
-        let (target, draft) =
-            execution_contexts(CliDevice::Cpu, MtpDraftDevice::Device(CliDevice::Gpu(0)));
+        let target = super::ExecutionContext::new(CliDevice::Cpu.mlx());
+        let draft = super::ExecutionContext::new(CliDevice::Gpu(0).mlx());
         assert_eq!(
-            MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
+            MtpExecutionStreams::new(target.stream(), draft.stream())
                 .unwrap()
                 .topology(),
             SpeculativeExecutionTopology::CrossDeviceSplit

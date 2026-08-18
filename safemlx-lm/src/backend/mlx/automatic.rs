@@ -4,13 +4,12 @@ use std::{fs, path::Path};
 
 use safemlx::{Device, DeviceType, Stream};
 use safemlx_lm_core::{
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningBackend, AutomaticPlanningError,
-    BackendId, BoundedResidencyRequirement, CandidateAdmission, DevicePlan, DurationSeconds,
-    ExecutionPlan, ExecutionPlanReport, ExpertCacheTelemetry, HardwareBackendProfile,
-    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InspectionSeverity, ModelKind,
-    ModelResourceProfile, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics, ResidencyPlan,
-    ResidencyTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
-    EXECUTION_PLAN_SCHEMA_VERSION,
+    AutomaticPlanningBackend, AutomaticPlanningError, BackendId, BoundedResidencyRequirement,
+    CandidateAdmission, DevicePlan, DurationSeconds, ExecutionPlan, ExecutionPlanBackendFactory,
+    ExecutionPlanRealization, ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, InspectionSeverity, ModelKind, ModelResourceProfile,
+    MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics, ResidencyPlan, ResidencyTelemetry,
+    TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 
 use super::{
@@ -34,9 +33,25 @@ use crate::{
 };
 use safemlx_lm_core::residency::{MemoryTier, OffloadConfig, TransferDirection};
 
-/// MLX implementation of high-level automatic-planning observations.
+/// MLX automatic-planning adapter and whole-session backend factory.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct MlxAutomaticPlanningBackend;
+pub struct MlxBackendFactory {
+    sample_mlx_memory: bool,
+    sample_process_memory: bool,
+}
+
+impl MlxBackendFactory {
+    /// Enables backend allocator and process-memory sampling for bounded residency.
+    pub const fn with_residency_diagnostics(
+        mut self,
+        sample_mlx_memory: bool,
+        sample_process_memory: bool,
+    ) -> Self {
+        self.sample_mlx_memory = sample_mlx_memory;
+        self.sample_process_memory = sample_process_memory;
+        self
+    }
+}
 
 /// Discovers hardware facts visible to the MLX adapter.
 pub fn discover_hardware() -> HardwareProfile {
@@ -135,21 +150,10 @@ pub fn discover_hardware() -> HardwareProfile {
     }
 }
 
-/// Runs the neutral planner with MLX observations and candidate admission.
-pub fn plan_automatic_execution(
-    request: &AutomaticPlanRequest,
-) -> Result<ExecutionPlanReport, AutomaticPlanningError> {
-    AutomaticPlanner::default().plan(&MlxAutomaticPlanningBackend, request)
-}
-
-/// Converts a portable execution plan into MLX loader options.
-pub fn execution_plan_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions, Error> {
-    if plan.schema_version != EXECUTION_PLAN_SCHEMA_VERSION {
-        return Err(Error::AutomaticPlanning(format!(
-            "execution plan schema {} does not match supported schema {}",
-            plan.schema_version, EXECUTION_PLAN_SCHEMA_VERSION
-        )));
-    }
+fn mlx_load_options(
+    factory: &MlxBackendFactory,
+    plan: &ExecutionPlan,
+) -> Result<ModelLoadOptions, Error> {
     if plan.topology.world_size() != 1 {
         return Err(Error::AutomaticPlanning(
             "single-device automatic plans require a 1x1x1 parallel topology".into(),
@@ -177,6 +181,8 @@ pub fn execution_plan_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOpti
                 *device_layer_window,
             )?,
             max_mapped_shards: plan.max_mapped_shards,
+            sample_mlx_memory: factory.sample_mlx_memory,
+            sample_process_memory: factory.sample_process_memory,
             ..LayerwiseLoadOptions::default()
         }),
         ResidencyPlan::DenseDiskStream {
@@ -192,6 +198,8 @@ pub fn execution_plan_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOpti
                 *background_queue,
             )?;
             options.max_mapped_shards = plan.max_mapped_shards;
+            options.sample_mlx_memory = factory.sample_mlx_memory;
+            options.sample_process_memory = factory.sample_process_memory;
             NonExpertWeightResidency::DenseDiskStream(options)
         }
     };
@@ -199,7 +207,8 @@ pub fn execution_plan_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOpti
         WeightResidency::with_expert_cache(
             residency,
             ExpertCacheLoadOptions::new(
-                OffloadConfig::new(expert.device_budget_bytes, expert.host_budget_bytes, 1)?,
+                OffloadConfig::new(expert.device_budget_bytes, expert.host_budget_bytes, 1)?
+                    .with_eviction_policy(expert.eviction_policy),
                 expert.scratch_bytes,
                 expert.prefill_bank_bytes,
             )?,
@@ -219,7 +228,7 @@ pub fn execution_plan_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOpti
     Ok(load)
 }
 
-impl AutomaticPlanningBackend for MlxAutomaticPlanningBackend {
+impl AutomaticPlanningBackend for MlxBackendFactory {
     fn backend_id(&self) -> BackendId {
         BackendId::new("mlx").expect("MLX is a valid backend identifier")
     }
@@ -242,7 +251,7 @@ impl AutomaticPlanningBackend for MlxAutomaticPlanningBackend {
         model_path: &Path,
         plan: &ExecutionPlan,
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
-        let load = execution_plan_load_options(plan)
+        let load = mlx_load_options(self, plan)
             .map_err(|error| planning_backend_error("realize_plan", error))?;
         let report = inspect_model(model_path, MlxInspectionOptions { load })
             .map_err(|error| planning_backend_error("admit_candidate", error))?;
@@ -288,7 +297,7 @@ impl AutomaticPlanningBackend for MlxAutomaticPlanningBackend {
         let stream = Stream::new_with_device(&mlx_device(&probe.device)?);
         let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let backend = MlxBackend::new(&stream, &weights_stream);
-        let options = execution_plan_load_options(&probe)
+        let options = mlx_load_options(self, &probe)
             .map_err(|error| planning_backend_error("realize_probe", error))?;
         match crate::load_model(&backend, model_path, options) {
             Err(crate::ModelLoadError::Backend(Error::LayerwiseModel(
@@ -347,6 +356,24 @@ impl AutomaticPlanningBackend for MlxAutomaticPlanningBackend {
             })
             .transpose()
             .map(|count| Some(count.unwrap_or(0)))
+    }
+}
+
+impl ExecutionPlanBackendFactory for MlxBackendFactory {
+    type Backend = MlxBackend<'static>;
+
+    fn realize(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> Result<ExecutionPlanRealization<Self::Backend>, AutomaticPlanningError> {
+        let stream = Stream::new_with_device(&mlx_device(&plan.device)?);
+        let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let options = mlx_load_options(self, plan)
+            .map_err(|error| planning_backend_error("realize_execution_plan", error))?;
+        Ok(ExecutionPlanRealization::new(
+            MlxBackend::for_execution_plan(&stream, &weights_stream, plan.device.device.clone()),
+            options,
+        ))
     }
 }
 
@@ -505,6 +532,6 @@ mod tests {
     fn plan_realization_rejects_distributed_topology() {
         let mut plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap());
         plan.topology = safemlx_lm_core::ParallelTopology::new(2, 1, 1, 1).unwrap();
-        assert!(execution_plan_load_options(&plan).is_err());
+        assert!(mlx_load_options(&MlxBackendFactory::default(), &plan).is_err());
     }
 }

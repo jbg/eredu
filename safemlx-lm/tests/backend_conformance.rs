@@ -31,20 +31,21 @@ use safemlx_lm::{
     Backend, BackendCapabilities, BackendDescriptor, BackendId, BackendSession, CacheStateStrategy,
     CapabilityError, CollectiveScope, DeviceDescriptor, DevicePlan, DistributedBackend,
     DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
-    EstimationCompleteness, ExecutionPlan, FinishReason, GenerationConfigOverrides, GrowingState,
-    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
-    InputModalities, InputTokenCount, MemoryTier, ModelCapabilities, ModelCapabilityBackend,
-    ModelKind, ModelLoadingBackend, ModelResourceProfile, ModelRuntime, MtpCapability,
-    MtpCheckpointKind, MultimodalPreparationBackend, Observed, OffloadConfig, OffloadPlan,
-    OffloadUnitId, OffloadUnitSpec, ParallelAxis, ParallelTopology, PhysicalMemorySemantics,
-    PreparedModel, RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling,
-    RealtimeScheduler, RealtimeSpeechConfig, RequestId, ResidencyLedger, ResidencyPlan,
-    ResidencyPolicy, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
-    SemanticStateTransaction, SpeculativeDraft, SpeculativeGenerationBackend,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
-    SpeculativeGenerationOutput, SpeculativeGenerationRequest, SpeculativeTokenFilterController,
-    StateLayout, StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig,
-    TokenFilter, TokenOutput, ValueDescriptor, WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
+    EstimationCompleteness, ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanRealization,
+    FinishReason, GenerationConfigOverrides, GrowingState, HardwareBackendProfile,
+    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
+    InputTokenCount, MemoryTier, ModelCapabilities, ModelCapabilityBackend, ModelKind,
+    ModelLoadingBackend, ModelResourceProfile, ModelRuntime, MtpCapability, MtpCheckpointKind,
+    MultimodalPreparationBackend, Observed, OffloadConfig, OffloadPlan, OffloadUnitId,
+    OffloadUnitSpec, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, PreparedModel,
+    RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler,
+    RealtimeSpeechConfig, RequestId, ResidencyLedger, ResidencyPlan, ResidencyPolicy,
+    RuntimeStateEstimate, SchedulerLimits, SemanticEvent, SemanticStateTransaction,
+    SpeculativeDraft, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, SpeculativeGenerationRequest,
+    SpeculativeTokenFilterController, StateLayout, StaticMemoryReport, Submission,
+    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
+    WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx_lm_core::Completion;
 use tokenizers::{
@@ -132,7 +133,20 @@ impl Backend for MockBackend {
     }
 
     fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error> {
-        Ok(Vec::new())
+        Ok(vec![(
+            DeviceDescriptor {
+                id: "gpu:0".into(),
+                name: "mock accelerator".into(),
+                family: "mock-accelerator".into(),
+                memory_bytes: Some(8 * 1024),
+            },
+            BackendCapabilities {
+                exact_completion: true,
+                transfers: true,
+                collectives: true,
+                persistent_cache: true,
+            },
+        )])
     }
 
     fn prepare_model(
@@ -544,6 +558,17 @@ impl AutomaticPlanningBackend for MockBackend {
     }
 }
 
+impl ExecutionPlanBackendFactory for MockBackend {
+    type Backend = Self;
+
+    fn realize(
+        &self,
+        _: &ExecutionPlan,
+    ) -> Result<ExecutionPlanRealization<Self::Backend>, AutomaticPlanningError> {
+        Ok(ExecutionPlanRealization::new(MockBackend, ()))
+    }
+}
+
 struct MockDrafter;
 
 impl SpeculativeGenerationBackend for MockBackend {
@@ -847,6 +872,22 @@ fn automatic_planning_client_code<B: AutomaticPlanningBackend>(
     report
 }
 
+fn planned_loading_client_code<F>(
+    factory: &F,
+    model_path: &Path,
+    device: &str,
+) -> (LoadedModel<F::Backend>, safemlx_lm::ExecutionPlanReport)
+where
+    F: ExecutionPlanBackendFactory,
+    F::Backend: TextGenerationBackend,
+{
+    let request = AutomaticPlanRequest::new(
+        model_path,
+        DevicePlan::new(factory.backend_id().as_str(), device).unwrap(),
+    );
+    LoadedModel::plan_and_load(factory, &AutomaticPlanner::default(), &request).unwrap()
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct MockResidentCopy {
     id: OffloadUnitId,
@@ -915,6 +956,28 @@ fn assert_automatic_planning_conformance() {
         requirement.required_bytes,
         requirement.static_bytes + requirement.window_bytes
     );
+
+    let (mut model, realized_report) =
+        planned_loading_client_code(&backend, artifact.path(), "gpu:0");
+    assert_eq!(realized_report.plan, report.plan);
+    assert_eq!(model.runtime().backend().descriptor().name, "mock");
+    assert_eq!(client_code(&mut model), vec![1, 2, 3]);
+
+    let mut wrong_backend = report.plan.clone();
+    wrong_backend.device = DevicePlan::new("other", "gpu:0").unwrap();
+    assert!(matches!(
+        safemlx_lm::realize_execution_plan(&backend, &wrong_backend),
+        Err(AutomaticPlanningError::Invalid(message))
+            if message.contains("factory owns mock")
+    ));
+
+    let mut missing_device = report.plan.clone();
+    missing_device.device = DevicePlan::new("mock", "gpu:1").unwrap();
+    assert!(matches!(
+        safemlx_lm::realize_execution_plan(&backend, &missing_device),
+        Err(AutomaticPlanningError::Invalid(message))
+            if message.contains("does not expose selected device gpu:1")
+    ));
 }
 
 fn assert_residency_realization_conformance() {

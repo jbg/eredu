@@ -29,7 +29,7 @@ mod capability;
 mod inspection;
 mod loaded;
 pub use inspection::{inspect_text_model, TextInspectionOptions};
-pub use loaded::LoadedModelLoadError;
+pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;
 
 pub use portable::{

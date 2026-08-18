@@ -11,7 +11,7 @@ pub mod api;
 pub mod backend;
 /// Backend-independent chat and committed-generation orchestration.
 pub mod runtime;
-pub use api::{inspect_text_model, TextInspectionOptions};
+pub use api::{inspect_text_model, PlannedModelLoadError, TextInspectionOptions};
 /// Canonical backend-neutral runtime types.
 pub use safemlx_lm_core as core;
 pub use safemlx_lm_core::artifact::{
@@ -24,6 +24,7 @@ pub use safemlx_lm_core::generation::{
     GenerationConfigOverrides, MtpConfig, MtpRequestId, MtpRequestPhase, MtpSchedulerOptions,
     ResolvedGenerationConfig, SemanticEvent,
 };
+pub use safemlx_lm_core::realize_execution_plan;
 pub use safemlx_lm_core::{
     load_model, load_realtime_model, load_realtime_model_with_options, Admission,
     AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry, ArtifactModality,
@@ -34,9 +35,10 @@ pub use safemlx_lm_core::{
     ControlledTextGenerationError, ControlledToken, DeviceDescriptor, DevicePlan,
     DistributedBackend, DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
     DraftPlacementPlan, DraftingPlan, DurationSeconds, EstimationCompleteness, ExecutionPlan,
-    ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, GrowingState,
-    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
-    InputModalities, InputTokenCount, InspectionIssue, InspectionIssueCode, InspectionReadiness,
+    ExecutionPlanBackendFactory, ExecutionPlanRealization, ExecutionPlanReport, ExecutionTelemetry,
+    ExpertCachePlan, ExpertCacheTelemetry, GrowingState, HardwareBackendProfile,
+    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
+    InputTokenCount, InspectionIssue, InspectionIssueCode, InspectionReadiness,
     InspectionRequirement, InspectionSeverity, Media, MediaBinding, MediaRequestError,
     ModelCapabilities, ModelCapabilityBackend, ModelInspectionReport, ModelLoadError,
     ModelLoadingBackend, ModelResourceProfile, ModelRuntime, MtpCapability, MtpCheckpointKind,
@@ -55,6 +57,7 @@ pub use safemlx_lm_core::{
     TokenFilterController, TokenFilterError, TokenOutput, TokenizedMultimodalRequest,
     TokenizedMultimodalSegment, TopologyPreflightReport, TransferTelemetry, ValueDescriptor, Video,
     VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    EXECUTION_PLAN_SCHEMA_VERSION,
 };
 #[cfg(all(test, feature = "mlx"))]
 mod test_utils;

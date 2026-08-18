@@ -52,13 +52,14 @@ pub use artifact::{
 };
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{
-    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
-    AutomaticPlanningBackend, AutomaticPlanningError, BoundedResidencyRequirement,
-    CandidateAdmission, DurationSeconds, ExecutionPlanReport, ExecutionTelemetry,
-    ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
-    HardwareProfile, ModelResourceProfile, MtpTelemetry, ObservationKind, Observed,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyTelemetry,
-    TimingTelemetry, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
+    realize_execution_plan, AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlannerPolicy, AutomaticPlanningBackend, AutomaticPlanningError,
+    BoundedResidencyRequirement, CandidateAdmission, DurationSeconds, ExecutionPlanBackendFactory,
+    ExecutionPlanRealization, ExecutionPlanReport, ExecutionTelemetry, ExpertCacheTelemetry,
+    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
+    ModelResourceProfile, MtpTelemetry, ObservationKind, Observed, PlanExplanation,
+    PlanExplanationEntry, PlanExplanationLevel, ResidencyTelemetry, TimingTelemetry,
+    TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use backend::{
     load_model, prepare_inspected_model, Backend, BackendCapabilities, BackendDescriptor,

@@ -1,10 +1,12 @@
 //! Portable execution-plan and telemetry schemas.
 
-use crate::{backend::BackendCapabilities, topology::ParallelTopology};
+use crate::{
+    backend::BackendCapabilities, residency::CacheEvictionPolicy, topology::ParallelTopology,
+};
 use serde::{Deserialize, Serialize};
 
 /// Schema version shared by execution-plan documents.
-pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 2;
 
 /// Default bound for simultaneously open checkpoint payload sources.
 pub const DEFAULT_MAX_MAPPED_SHARDS: usize = 4;
@@ -133,6 +135,8 @@ pub struct ExpertCachePlan {
     pub scratch_bytes: u64,
     /// Soft prefill compact-bank target.
     pub prefill_bank_bytes: u64,
+    /// Deterministic eviction ordering for independently cached experts.
+    pub eviction_policy: CacheEvictionPolicy,
 }
 
 /// Speculative decoding selected by an execution plan.
@@ -240,19 +244,7 @@ impl ExecutionPlan {
 
     /// Validates portable plan invariants and fail-closed capabilities.
     pub fn validate(&self, available: &BackendCapabilities) -> Result<(), ExecutionPlanError> {
-        if self.schema_version != EXECUTION_PLAN_SCHEMA_VERSION {
-            return Err(ExecutionPlanError::Schema(self.schema_version));
-        }
-        if self.max_mapped_shards == 0 {
-            return Err(ExecutionPlanError::ZeroMappedShards);
-        }
-        ParallelTopology::new(
-            self.topology.tensor,
-            self.topology.pipeline,
-            self.topology.expert,
-            self.topology.data,
-        )
-        .map_err(|error| ExecutionPlanError::Topology(error.to_string()))?;
+        self.validate_structure()?;
         for (required, supported, name) in [
             (
                 self.required_capabilities.exact_completion,
@@ -279,6 +271,24 @@ impl ExecutionPlan {
                 return Err(ExecutionPlanError::Capability(name));
             }
         }
+        Ok(())
+    }
+
+    /// Validates schema, topology, and portable resource invariants without a backend.
+    pub fn validate_structure(&self) -> Result<(), ExecutionPlanError> {
+        if self.schema_version != EXECUTION_PLAN_SCHEMA_VERSION {
+            return Err(ExecutionPlanError::Schema(self.schema_version));
+        }
+        if self.max_mapped_shards == 0 {
+            return Err(ExecutionPlanError::ZeroMappedShards);
+        }
+        ParallelTopology::new(
+            self.topology.tensor,
+            self.topology.pipeline,
+            self.topology.expert,
+            self.topology.data,
+        )
+        .map_err(|error| ExecutionPlanError::Topology(error.to_string()))?;
         Ok(())
     }
 }

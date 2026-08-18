@@ -1,10 +1,11 @@
 use safemlx_lm::{
-    backend::mlx::automatic::execution_plan_load_options, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlannerPolicy, DevicePlan, ExecutionPlan, AUTOMATIC_SCHEMA_VERSION,
+    backend::mlx::automatic::MlxBackendFactory, realize_execution_plan, AutomaticPlanRequest,
+    AutomaticPlanner, AutomaticPlannerPolicy, Backend, DevicePlan, ExecutionPlan,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 
 #[test]
-fn portable_planner_and_mlx_realization_have_distinct_surfaces() {
+fn portable_planner_realizes_an_owned_mlx_backend() {
     let device = DevicePlan::new("mlx", "cpu:0").unwrap();
     let request = AutomaticPlanRequest::new("model", device.clone());
     assert_eq!(request.schema_version, AUTOMATIC_SCHEMA_VERSION);
@@ -20,5 +21,8 @@ fn portable_planner_and_mlx_realization_have_distinct_surfaces() {
     assert_eq!(decoded, request);
 
     let plan = ExecutionPlan::fully_resident(device);
-    assert!(execution_plan_load_options(&plan).is_ok());
+    let realization = realize_execution_plan(&MlxBackendFactory::default(), &plan).unwrap();
+    let (backend, _) = realization.into_parts();
+    assert_eq!(backend.descriptor().name, "mlx");
+    assert_eq!(backend.devices().unwrap()[0].0.id, "cpu:0");
 }

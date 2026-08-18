@@ -208,17 +208,23 @@ telemetry all implement Serde serialization:
 
 ```rust,no_run
 use safemlx_lm::{
-    backend::mlx::automatic::plan_automatic_execution,
-    AutomaticPlanRequest, DevicePlan, ExecutionTelemetry,
+    api::LoadedModel,
+    backend::mlx::automatic::MlxBackendFactory,
+    AutomaticPlanRequest, AutomaticPlanner, DevicePlan, ExecutionTelemetry,
 };
 
 let prior_runs: Vec<ExecutionTelemetry> = load_prior_runs();
+let factory = MlxBackendFactory::default();
 let request = AutomaticPlanRequest::new(
     "/path/to/model",
     DevicePlan::new("mlx", "metal:0")?,
 )
 .with_prior_telemetry(prior_runs);
-let report = plan_automatic_execution(&request)?;
+let (mut model, report) = LoadedModel::plan_and_load(
+    &factory,
+    &AutomaticPlanner::default(),
+    &request,
+)?;
 
 # fn load_prior_runs() -> Vec<ExecutionTelemetry> { Vec::new() }
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -231,10 +237,13 @@ against current available memory and header-only loader admission. Use
 `AutomaticPlanner::new` with an `AutomaticPlannerPolicy` for explicit policy
 bounds. Its `plan` method accepts an `AutomaticPlanningBackend`, so the same
 selection policy works with another backend's discovery and admission adapter.
-MLX discovery, bounded-load probing, telemetry collection, and
-`execution_plan_load_options` live under `backend::mlx::automatic`. Backend and
-device identifiers are adapter-defined rather than a closed core enumeration;
-device creation and plan realization remain owned by the selected backend.
+`ExecutionPlanBackendFactory` turns the selected portable plan into an owned
+backend plus its opaque load policy. `LoadedModel::load_execution_plan` and
+`LoadedModel::plan_and_load` consume that realization without exposing device
+queues or backend load options to generic callers. MLX discovery, bounded-load
+probing, device/stream creation, plan translation, and telemetry collection
+live in `backend::mlx::automatic::MlxBackendFactory`. Backend and device
+identifiers are adapter-defined rather than a closed core enumeration.
 Speculative generation uses the same core-owned committed-token and terminal
 lifecycle as ordinary generation. Its prefill/proposal/verification/commit
 executor contract is also core-owned; the MLX implementations supply opaque

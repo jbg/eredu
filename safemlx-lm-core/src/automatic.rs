@@ -6,6 +6,7 @@
 
 use crate::{
     artifact::{ArtifactFormat, ModelKind},
+    backend::{Backend, ModelLoadingBackend},
     execution::{
         DevicePlan, DraftingPlan, ExecutionPlan, ExpertCachePlan, ResidencyPlan,
         DEFAULT_MAX_MAPPED_SHARDS,
@@ -594,6 +595,107 @@ pub trait AutomaticPlanningBackend {
     ) -> Result<Option<usize>, AutomaticPlanningError>;
 }
 
+/// One backend instance and load policy realized from a portable execution plan.
+///
+/// The backend owns its selected device, execution queues, transfer queues, and
+/// optional communication state. Callers pass this value directly to the
+/// generic model loader instead of reconstructing backend-specific options.
+pub struct ExecutionPlanRealization<B: ModelLoadingBackend> {
+    backend: B,
+    load_options: B::LoadOptions,
+}
+
+impl<B: ModelLoadingBackend> ExecutionPlanRealization<B> {
+    /// Creates one backend-owned realization.
+    ///
+    /// Backend adapters call this from [`ExecutionPlanBackendFactory::realize`].
+    /// Portable identity, device, capability, and plan validation is applied by
+    /// [`realize_execution_plan`] before the value reaches an application.
+    pub fn new(backend: B, load_options: B::LoadOptions) -> Self {
+        Self {
+            backend,
+            load_options,
+        }
+    }
+
+    /// Borrows the selected backend.
+    pub const fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Consumes the realization into the generic loader inputs.
+    pub fn into_parts(self) -> (B, B::LoadOptions) {
+        (self.backend, self.load_options)
+    }
+}
+
+/// Creates an executable whole-model backend from a portable execution plan.
+///
+/// This deliberately operates above tensor primitives. An implementation maps
+/// one complete [`DevicePlan`] and [`ExecutionPlan`] to an owned backend and
+/// its opaque load policy. Core then verifies backend identity, selected-device
+/// identity, structural plan invariants, and fail-closed capabilities.
+pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
+    /// Backend implementation created for the selected model/session.
+    type Backend: ModelLoadingBackend;
+
+    /// Backend hook which owns device/queue construction and plan translation.
+    ///
+    /// Applications should call [`realize_execution_plan`] so portable
+    /// validation cannot be bypassed accidentally.
+    fn realize(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> Result<ExecutionPlanRealization<Self::Backend>, AutomaticPlanningError>;
+}
+
+/// Validates and realizes one portable execution plan through its selected backend factory.
+pub fn realize_execution_plan<F: ExecutionPlanBackendFactory>(
+    factory: &F,
+    plan: &ExecutionPlan,
+) -> Result<ExecutionPlanRealization<F::Backend>, AutomaticPlanningError> {
+    let expected_backend = factory.backend_id();
+    if plan.device.backend != expected_backend {
+        return Err(AutomaticPlanningError::Invalid(format!(
+            "execution plan selects backend {} but factory owns {}",
+            plan.device.backend, expected_backend
+        )));
+    }
+    plan.validate_structure()
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+
+    let realization = factory.realize(plan)?;
+    let descriptor = realization.backend().descriptor();
+    if descriptor.name != expected_backend.as_str() {
+        return Err(AutomaticPlanningError::Invalid(format!(
+            "factory identity {} does not match realized backend {}",
+            expected_backend, descriptor.name
+        )));
+    }
+    let devices =
+        realization
+            .backend()
+            .devices()
+            .map_err(|error| AutomaticPlanningError::Backend {
+                operation: "realize_execution_plan_devices",
+                message: error.to_string(),
+            })?;
+    let capabilities = devices
+        .iter()
+        .find_map(|(device, capabilities)| {
+            (device.id == plan.device.device).then_some(capabilities)
+        })
+        .ok_or_else(|| {
+            AutomaticPlanningError::Invalid(format!(
+                "realized backend {} does not expose selected device {}",
+                expected_backend, plan.device.device
+            ))
+        })?;
+    plan.validate(capabilities)
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+    Ok(realization)
+}
+
 /// Failure produced by portable planning or its selected backend adapter.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum AutomaticPlanningError {
@@ -988,6 +1090,7 @@ fn with_expert_cache(mut plan: ExecutionPlan, policy: &AutomaticPlannerPolicy) -
         host_budget_bytes: Some(split(host_budget, policy.expert_cache_share_percent).max(1)),
         scratch_bytes: scratch,
         prefill_bank_bytes: scratch,
+        eviction_policy: crate::residency::CacheEvictionPolicy::LeastRecentlyUsed,
     });
     plan
 }

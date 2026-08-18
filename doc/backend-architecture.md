@@ -508,12 +508,26 @@ owns policy validation, budgeting, candidate selection, feedback matching,
 explanations, and the planning/telemetry schemas. Its high-level
 `AutomaticPlanningBackend` receives whole candidate plans and supplies only
 hardware/resource observations, admission, bounded-window requirements, and
-embedded-drafting metadata. The MLX implementation lives in
-`backend::mlx::automatic`; it translates CPU, Metal, and CUDA devices into
-`mlx` identifiers, validates candidates with MLX checkpoint inspection, probes
-bounded loads, and realizes a selected plan as `ModelLoadOptions`.
+embedded-drafting metadata. `ExecutionPlanBackendFactory` adds the production
+realization boundary: it returns an owned backend and opaque load policy for
+one complete plan. Core verifies factory/backend identity, selected-device
+identity, plan structure, and required capabilities before the facade loads
+the artifact. `LoadedModel::load_execution_plan` consumes a persisted plan;
+`LoadedModel::plan_and_load` performs selection and realization together.
+
+The MLX implementation is `backend::mlx::automatic::MlxBackendFactory`. It
+translates CPU, Metal, and CUDA device identifiers, validates candidates with
+MLX checkpoint inspection, probes bounded loads, creates the selected target
+and weight streams, and privately maps the plan to `ModelLoadOptions`. Neither
+the conversion nor stream construction is a caller API. The example CLI uses
+the same factory boundary for automatic and exact-plan execution.
 Process-global MLX allocator cache configuration is deliberately not part of
 the neutral plan.
+
+Execution-plan schema version 2 makes routed-expert eviction policy explicit.
+This removes the last hidden factory input that could make the same serialized
+plan realize different residency behavior. Version-1 plans are rejected; no
+compatibility decoder or implicit default is retained.
 
 Capability and inspection follow the same direction. Core owns `Observed`,
 `ModelCapabilities`, `StateLayout`, `RuntimeStateEstimate`, admission policy,
