@@ -1,4 +1,4 @@
-//! MLX speculative sampling and scheduling over the portable executor contract.
+//! MLX speculative scheduling over the portable executor contract.
 
 use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 
@@ -12,10 +12,11 @@ use safemlx_lm_core::{
     resolve_optimistic_branch, SpeculativeDraftBlock, SpeculativeExecutionTopology,
     SpeculativeOptimisticBranch, SpeculativeProposal,
 };
-pub use safemlx_lm_core::{MtpBatchOutput, MtpSchedulerStats, MtpStats};
 use safemlx_lm_core::{
-    SpeculativeConstraint, SpeculativeDriverError, SpeculativeExecutor, SpeculativeOutputRuntime,
-    SpeculativePublisher, SpeculativeRequestTable, SpeculativeSampling, SpeculativeTelemetry,
+    MtpSchedulerStats, MtpStats, SpeculativeCallbackPublisher, SpeculativeDriverError,
+    SpeculativeExecutor, SpeculativeOutputError, SpeculativeOutputRuntime, SpeculativeRequestTable,
+    SpeculativeSampling, SpeculativeSemanticConstraint, SpeculativeSemanticState,
+    SpeculativeTelemetry,
 };
 
 use crate::{
@@ -160,101 +161,16 @@ impl<'a, T> MlxSpeculativeRuntime<'a> for T where
 {
 }
 
-/// Forkable decoded-output state used while resolving a target transaction.
-///
-/// Implementations must keep emitted events private until `take_events` is
-/// called after the scheduler has committed the matching backend boundary.
-pub(crate) trait MtpSemanticState {
-    fn fork_box(&self) -> Result<Box<dyn MtpSemanticState>, Exception>;
-    fn push_token(&mut self, token: u32) -> Result<bool, Exception>;
-    fn finish(&mut self, reason: FinishReason) -> Result<(), Exception>;
-    fn cancel(&mut self) -> Result<(), Exception>;
-    fn take_events(&mut self) -> Vec<SemanticEvent>;
-}
-
-struct MlxSemanticConstraint(Option<Box<dyn MtpSemanticState>>);
-
-impl SpeculativeConstraint for MlxSemanticConstraint {
-    type Error = Exception;
-
-    fn fork(&self) -> Result<Self, Self::Error> {
-        Ok(Self(
-            self.0.as_ref().map(|state| state.fork_box()).transpose()?,
-        ))
-    }
-
-    fn push_token(&mut self, token: u32) -> Result<bool, Self::Error> {
-        self.0
-            .as_mut()
-            .map(|state| state.push_token(token))
-            .transpose()
-            .map(|matched| matched.unwrap_or(false))
-    }
-
-    fn finish(&mut self, reason: FinishReason) -> Result<(), Self::Error> {
-        if let Some(state) = &mut self.0 {
-            state.finish(reason)?;
-        }
-        Ok(())
-    }
-}
-
-struct MlxOutputPublisher<'a> {
-    on_token: Box<dyn FnMut(u32) -> Result<(), Exception> + 'a>,
-    on_event: Option<Box<dyn FnMut(SemanticEvent) + 'a>>,
-}
-
-impl SpeculativePublisher<MlxSemanticConstraint> for MlxOutputPublisher<'_> {
-    type Error = Exception;
-
-    fn publish_committed(
-        &mut self,
-        constraint: &mut MlxSemanticConstraint,
-        tokens: &[u32],
-        cancellation: &GenerationCancellationToken,
-        sequence_finished: bool,
-    ) -> Result<bool, Self::Error> {
-        for &token in tokens {
-            (self.on_token)(token)?;
-        }
-        let mut cancellation_won = false;
-        if let (Some(semantic), Some(on_event)) = (&mut constraint.0, &mut self.on_event) {
-            for event in semantic.take_events() {
-                on_event(event);
-                if cancellation.is_cancelled() && !sequence_finished {
-                    cancellation_won = true;
-                    break;
-                }
-            }
-        }
-        cancellation_won |= cancellation.is_cancelled() && !sequence_finished;
-        Ok(cancellation_won)
-    }
-
-    fn publish_cancelled(
-        &mut self,
-        constraint: &mut MlxSemanticConstraint,
-    ) -> Result<(), Self::Error> {
-        if let (Some(semantic), Some(on_event)) = (&mut constraint.0, &mut self.on_event) {
-            semantic.cancel()?;
-            for event in semantic.take_events() {
-                on_event(event);
-            }
-        }
-        Ok(())
-    }
-}
-
 type CommittedOutputRuntime<'a, S> = SpeculativeOutputRuntime<
     MlxSpeculativeSampling<S>,
-    MlxSemanticConstraint,
-    MlxOutputPublisher<'a>,
+    SpeculativeSemanticConstraint,
+    SpeculativeCallbackPublisher<'a>,
 >;
 
 fn plain_runtime<'a, S, F>(
     sampler: S,
     config: &MtpConfig,
-    on_token: F,
+    mut on_token: F,
 ) -> CommittedOutputRuntime<'a, S>
 where
     S: SpeculativeSampler + Clone,
@@ -263,11 +179,10 @@ where
     SpeculativeOutputRuntime::new(
         MlxSpeculativeSampling::new(sampler),
         GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied()),
-        MlxSemanticConstraint(None),
-        MlxOutputPublisher {
-            on_token: Box::new(on_token),
-            on_event: None,
-        },
+        SpeculativeSemanticConstraint::plain(),
+        SpeculativeCallbackPublisher::tokens(move |token| {
+            on_token(token).map_err(|error| SpeculativeOutputError::publication(error.to_string()))
+        }),
         GenerationCancellationToken::new(),
     )
 }
@@ -275,7 +190,7 @@ where
 fn semantic_runtime<'a, S, F>(
     sampler: S,
     config: &MtpConfig,
-    semantic: Box<dyn MtpSemanticState>,
+    semantic: Box<dyn SpeculativeSemanticState>,
     cancellation: GenerationCancellationToken,
     on_event: F,
 ) -> CommittedOutputRuntime<'a, S>
@@ -286,11 +201,8 @@ where
     SpeculativeOutputRuntime::new(
         MlxSpeculativeSampling::new(sampler),
         GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied()),
-        MlxSemanticConstraint(Some(semantic)),
-        MlxOutputPublisher {
-            on_token: Box::new(|_| Ok(())),
-            on_event: Some(Box::new(on_event)),
-        },
+        SpeculativeSemanticConstraint::semantic(semantic),
+        SpeculativeCallbackPublisher::semantic(on_event),
         cancellation,
     )
 }
@@ -299,8 +211,8 @@ type MlxRequestTable<'a, B, S> = SpeculativeRequestTable<
     'a,
     B,
     MlxSpeculativeSampling<S>,
-    MlxSemanticConstraint,
-    MlxOutputPublisher<'a>,
+    SpeculativeSemanticConstraint,
+    SpeculativeCallbackPublisher<'a>,
 >;
 
 pub(crate) struct MtpRequestOutput<S> {
@@ -325,7 +237,7 @@ pub(crate) struct MtpScheduleOutput<S> {
 /// draft work, and synchronizes only when a verification result is resolved.
 /// Model parameters are shared through the backend; every request owns its
 /// cache, target state, sampler, PRNG substreams, output, and statistics.
-pub(crate) struct MtpScheduler<'a, B, S>
+pub(crate) struct MlxMtpScheduler<'a, B, S>
 where
     B: MlxSpeculativeRuntime<'a>,
     S: SpeculativeSampler + Clone + 'a,
@@ -336,7 +248,7 @@ where
     requests: MlxRequestTable<'a, B, S>,
 }
 
-impl<'a, B, S> MtpScheduler<'a, B, S>
+impl<'a, B, S> MlxMtpScheduler<'a, B, S>
 where
     B: MlxSpeculativeRuntime<'a>,
     S: SpeculativeSampler + Clone + 'a,
@@ -387,7 +299,7 @@ where
         config: MtpConfig,
         prng_key: Option<Array>,
         sampler: S,
-        semantic: Box<dyn MtpSemanticState>,
+        semantic: Box<dyn SpeculativeSemanticState>,
         on_event: F,
     ) -> Result<MtpRequestId, Exception>
     where
@@ -414,7 +326,7 @@ where
         config: MtpConfig,
         prng_key: Option<Array>,
         sampler: S,
-        semantic: Box<dyn MtpSemanticState>,
+        semantic: Box<dyn SpeculativeSemanticState>,
         cancellation: GenerationCancellationToken,
         on_event: F,
     ) -> Result<MtpRequestId, Exception>
@@ -652,7 +564,7 @@ where
     let token_ids;
     let stats;
     {
-        let mut scheduler = MtpScheduler::new(backend, streams, options)?;
+        let mut scheduler = MlxMtpScheduler::new(backend, streams, options)?;
         scheduler.submit(
             cache,
             input,
@@ -681,7 +593,7 @@ pub(crate) fn generate_with_semantics_and_options<'runtime, B, S, F>(
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    semantic: Box<dyn MtpSemanticState>,
+    semantic: Box<dyn SpeculativeSemanticState>,
     cancellation: GenerationCancellationToken,
     streams: MtpExecutionStreams<'runtime>,
     options: MtpSchedulerOptions,
@@ -697,7 +609,7 @@ where
     let stats;
     let finish_reason;
     {
-        let mut scheduler = MtpScheduler::new(backend, streams, options)?;
+        let mut scheduler = MlxMtpScheduler::new(backend, streams, options)?;
         scheduler.submit_with_semantics_cancellable(
             cache,
             input,
@@ -850,26 +762,26 @@ mod tests {
         events: Vec<SemanticEvent>,
     }
 
-    impl MtpSemanticState for TestSemanticState {
-        fn fork_box(&self) -> Result<Box<dyn MtpSemanticState>, Exception> {
+    impl SpeculativeSemanticState for TestSemanticState {
+        fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
             let mut fork = self.clone();
             fork.events.clear();
             Ok(Box::new(fork))
         }
 
-        fn push_token(&mut self, token: u32) -> Result<bool, Exception> {
+        fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
             self.tokens.push(token);
             self.events
                 .push(SemanticEvent::TextDelta(token.to_string()));
             Ok(!self.stop.is_empty() && self.tokens.ends_with(&self.stop))
         }
 
-        fn finish(&mut self, reason: FinishReason) -> Result<(), Exception> {
+        fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError> {
             self.events.push(SemanticEvent::Finished { reason });
             Ok(())
         }
 
-        fn cancel(&mut self) -> Result<(), Exception> {
+        fn cancel(&mut self) -> Result<(), SpeculativeOutputError> {
             self.events.push(SemanticEvent::Finished {
                 reason: FinishReason::Cancelled,
             });
@@ -1194,7 +1106,7 @@ mod tests {
             let parts = [InputPart::text_token_ids(&prompt)];
             let mut cache = 0;
             let mut backend = scripted_backend();
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::single(context.stream()),
                 MtpSchedulerOptions::default().with_lookahead(false),
@@ -1236,7 +1148,7 @@ mod tests {
             let callback = Rc::clone(&events);
             let mut cache = 0;
             let mut backend = scripted_backend();
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 MtpSchedulerOptions::default().with_lookahead(lookahead),
@@ -1297,7 +1209,7 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let callback_events = Rc::clone(&events);
         let mut backend = scripted_backend();
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(stream, draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -1359,7 +1271,7 @@ mod tests {
         let parts = [InputPart::text_token_ids(&prompt)];
         let mut cache = 0;
         let mut backend = scripted_backend();
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::single(stream),
             MtpSchedulerOptions::default().with_lookahead(false),
@@ -1433,7 +1345,7 @@ mod tests {
         let mut cache = 0;
         let mut backend = scripted_backend();
         backend.bonus_token = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -1487,7 +1399,7 @@ mod tests {
         let mut cache_a = 0;
         let mut cache_b = 0;
         let mut backend = scripted_backend();
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -1587,7 +1499,7 @@ mod tests {
         let callback_cancellation = cancellation.clone();
         let mut cache = 0;
         let mut backend = scripted_backend();
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::single(context.stream()),
             MtpSchedulerOptions::default(),
@@ -1653,7 +1565,7 @@ mod tests {
             let parts = [InputPart::text_token_ids(&prompt)];
             let mut cache = 0;
             let mut backend = scripted_backend();
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::single(stream),
                 MtpSchedulerOptions::default().with_lookahead(false),
@@ -1714,7 +1626,7 @@ mod tests {
         let mut cache = 0;
         let mut backend = scripted_backend();
         backend.reject_first = true;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::single(stream),
             MtpSchedulerOptions::default().with_lookahead(false),
@@ -1758,7 +1670,7 @@ mod tests {
         let mut backend = CommitFailBackend {
             inner: scripted_backend(),
         };
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::single(stream),
             MtpSchedulerOptions::default().with_lookahead(false),
@@ -2134,7 +2046,7 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -2243,7 +2155,7 @@ mod tests {
                 draft_capacities: Vec::new(),
             };
             let mut cache = 0;
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 MtpSchedulerOptions::default().with_lookahead(lookahead),
@@ -2298,7 +2210,7 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -2361,7 +2273,7 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -2460,7 +2372,7 @@ mod tests {
             let mut callback_tokens = Vec::new();
             let request;
             {
-                let mut scheduler = MtpScheduler::new(
+                let mut scheduler = MlxMtpScheduler::new(
                     &mut backend,
                     MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                     options,
@@ -2543,7 +2455,7 @@ mod tests {
                 .top_p(1.0)
                 .min_p(0.0)
                 .penalties(1.2, -1, 0.1, 0.1);
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
@@ -2604,7 +2516,7 @@ mod tests {
             };
             let mut cache_a = 0;
             let mut cache_b = 0;
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
@@ -2694,7 +2606,7 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -2748,7 +2660,7 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -2807,7 +2719,7 @@ mod tests {
                 draft_capacities: Vec::new(),
             };
             let mut cache = 0;
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
@@ -2865,7 +2777,7 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -2918,7 +2830,7 @@ mod tests {
         let mut callback_b = Vec::new();
         let output;
         {
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 MtpSchedulerOptions::default(),
@@ -2992,7 +2904,7 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -3047,7 +2959,7 @@ mod tests {
             draft_capacities: Vec::new(),
         };
         let mut cache = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -3133,7 +3045,7 @@ mod tests {
         };
         let mut cache_a = 0;
         let mut cache_b = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
@@ -3213,7 +3125,7 @@ mod tests {
         };
         let mut cache_a = 0;
         let mut cache_b = 0;
-        let mut scheduler = MtpScheduler::new(
+        let mut scheduler = MlxMtpScheduler::new(
             &mut backend,
             MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions {
@@ -3278,7 +3190,7 @@ mod tests {
             let mut cache_b = 0;
             let events = Rc::new(RefCell::new(Vec::new()));
             let callback = Rc::clone(&events);
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 MtpSchedulerOptions::default(),
@@ -3345,7 +3257,7 @@ mod tests {
                 draft_capacities: Vec::new(),
             };
             let mut cache = 0;
-            let mut scheduler = MtpScheduler::new(
+            let mut scheduler = MlxMtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,

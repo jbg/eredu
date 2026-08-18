@@ -22,13 +22,13 @@ use crate::{
         scale_logits,
     },
     backend::mlx::{
-        speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+        speculative::{
+            scheduler::{MtpComponentTimingEvaluations, MtpComponentTimings},
+            MlxSpeculativeCompletion, MtpExecutionStreams,
+        },
         MlxModelInput,
     },
-    runtime::{
-        cache::KeyValueCache,
-        generation::speculative::{MtpComponentTimingEvaluations, MtpComponentTimings},
-    },
+    runtime::cache::KeyValueCache,
 };
 
 #[derive(Clone)]

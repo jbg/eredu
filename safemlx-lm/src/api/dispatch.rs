@@ -209,7 +209,7 @@ impl Model {
                     crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
                         target, assistant,
                     );
-                crate::runtime::generation::speculative::generate_with_streams_and_callback_and_options(
+                crate::backend::mlx::speculative::scheduler::generate_with_streams_and_callback_and_options(
                     &mut backend,
                     cache,
                     input,
@@ -238,7 +238,7 @@ impl Model {
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        semantic: Box<dyn MtpSemanticState>,
+        semantic: Box<dyn SpeculativeSemanticState>,
         cancellation: GenerationCancellationToken,
         streams: MtpExecutionStreams<'_>,
         scheduler_options: MtpSchedulerOptions,
@@ -276,7 +276,7 @@ impl Model {
                     crate::architectures::muse_glimmer::mtp::MuseGlimmerMtpBackend::new(
                         target, assistant,
                     );
-                crate::runtime::generation::speculative::generate_with_semantics_and_options(
+                crate::backend::mlx::speculative::scheduler::generate_with_semantics_and_options(
                     &mut backend,
                     cache,
                     input,
@@ -542,7 +542,7 @@ impl Model {
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        semantic: Box<dyn MtpSemanticState>,
+        semantic: Box<dyn SpeculativeSemanticState>,
         cancellation: GenerationCancellationToken,
         stream: &Stream,
         scheduler_options: MtpSchedulerOptions,

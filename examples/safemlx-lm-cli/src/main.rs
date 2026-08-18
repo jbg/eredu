@@ -31,6 +31,7 @@ use safemlx_lm::{
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
         ResidencyTelemetry, TextDecoder, TimingTelemetry, WeightTransformationPlan,
     },
+    backend::mlx::speculative::MtpComponentTimingGuard,
     backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams},
     core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     core::speculative::MtpStats,
@@ -45,7 +46,6 @@ use safemlx_lm::{
     runtime::generation::sampler::{
         DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
     },
-    runtime::generation::speculative::MtpComponentTimingGuard,
     runtime::media::input::{InputPart, ModelInput},
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     runtime::residency::expert_cache::{

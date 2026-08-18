@@ -35,7 +35,10 @@ use crate::core::generation::{
     GenerationCancellationToken, GenerationConfigOverrides, MtpConfig, MtpSchedulerOptions,
     ResolvedGenerationConfig, SemanticEvent,
 };
-use crate::core::{MtpCapability, MtpCheckpointKind};
+use crate::core::{
+    MtpBatchOutput, MtpCapability, MtpCheckpointKind, MtpSchedulerStats, MtpStats,
+    SpeculativeOutputError, SpeculativeSemanticState,
+};
 
 pub(crate) use crate::nn as common;
 use crate::runtime::chat::constraints::ConstraintCompiler;
@@ -62,15 +65,14 @@ use crate::runtime::media::PreparedModelInput;
 #[cfg(feature = "media-processing")]
 use crate::runtime::media::{load_processor, ChatMediaBinding, ModelProcessor, ProcessorInput};
 use crate::{
-    backend::mlx::speculative::{MlxDrafter, MlxDrafterKind, MlxMtpCache, MtpExecutionStreams},
+    backend::mlx::speculative::{
+        scheduler::MlxMtpScheduler, MlxDrafter, MlxDrafterKind, MlxMtpCache, MtpExecutionStreams,
+    },
     core::cache::{CacheResidencyPool, LayerCachePolicy},
     error::Error,
     runtime::attention::LayerSchedule,
     runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
-    runtime::generation::speculative::{
-        MtpBatchOutput, MtpScheduler, MtpSchedulerStats, MtpSemanticState, MtpStats,
-    },
 };
 
 /// DeepSeek-V3 and DeepSeek-R1 decoder support.

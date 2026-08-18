@@ -6,8 +6,8 @@ use safemlx::{
     error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
 };
 use safemlx_lm_core::{
-    SpeculativeCommit, SpeculativeExecutionTopology, SpeculativeExecutor, SpeculativePrefill,
-    Submission,
+    MtpStats, SpeculativeCommit, SpeculativeExecutionTopology, SpeculativeExecutor,
+    SpeculativePrefill, SpeculativeSemanticState, Submission,
 };
 
 use crate::{
@@ -18,7 +18,10 @@ use crate::{
     },
     architectures::gemma4::layerwise::Gemma4LayerwiseModel,
     backend::mlx::{
-        speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+        speculative::{
+            scheduler::{self as mtp, MtpComponentTimings},
+            MlxSpeculativeCompletion, MtpExecutionStreams,
+        },
         MlxModelInput,
     },
     core::generation::{
@@ -26,7 +29,6 @@ use crate::{
     },
     runtime::attention::AttentionPolicy,
     runtime::generation::sampler::SpeculativeSampler,
-    runtime::generation::speculative::{self as mtp, MtpComponentTimings, MtpSemanticState},
 };
 
 #[derive(Clone)]
@@ -450,7 +452,7 @@ pub(crate) fn generate_with_streams_and_callback_and_options<T, S, F>(
     streams: MtpExecutionStreams<'_>,
     options: MtpSchedulerOptions,
     on_token: F,
-) -> Result<(Vec<u32>, mtp::MtpStats), Exception>
+) -> Result<(Vec<u32>, MtpStats), Exception>
 where
     T: Gemma4MtpTarget,
     S: SpeculativeSampler + Clone,
@@ -479,12 +481,12 @@ pub(crate) fn generate_with_semantics_and_options<T, S, F>(
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    semantic: Box<dyn MtpSemanticState>,
+    semantic: Box<dyn SpeculativeSemanticState>,
     cancellation: GenerationCancellationToken,
     streams: MtpExecutionStreams<'_>,
     options: MtpSchedulerOptions,
     on_event: F,
-) -> Result<(Vec<u32>, mtp::MtpStats, FinishReason), Exception>
+) -> Result<(Vec<u32>, MtpStats, FinishReason), Exception>
 where
     T: Gemma4MtpTarget,
     S: SpeculativeSampler + Clone,

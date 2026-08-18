@@ -61,15 +61,15 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::core::generation::MtpSchedulerOptions>(),
     );
     assert_eq!(
-        TypeId::of::<safemlx_lm::runtime::generation::speculative::MtpStats>(),
+        TypeId::of::<safemlx_lm::core::speculative::MtpStats>(),
         TypeId::of::<safemlx_lm::core::speculative::MtpStats>(),
     );
     assert_eq!(
-        TypeId::of::<safemlx_lm::runtime::generation::speculative::MtpSchedulerStats>(),
+        TypeId::of::<safemlx_lm::core::speculative::MtpSchedulerStats>(),
         TypeId::of::<safemlx_lm::core::speculative::MtpSchedulerStats>(),
     );
     assert_eq!(
-        TypeId::of::<safemlx_lm::runtime::generation::speculative::MtpBatchOutput>(),
+        TypeId::of::<safemlx_lm::core::speculative::MtpBatchOutput>(),
         TypeId::of::<safemlx_lm::core::speculative::MtpBatchOutput>(),
     );
     assert_eq!(

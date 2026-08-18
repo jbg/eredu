@@ -111,7 +111,6 @@ use crate::{
     runtime::generation::{
         embedded_mtp::{DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget},
         sampler::SpeculativeSampler,
-        speculative::MtpStats,
     },
     runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
     runtime::residency::dense_stream::DENSE_TRANSFER_WINDOW,
@@ -123,6 +122,7 @@ use crate::{
         ResidentLayerGroup,
     },
 };
+use safemlx_lm_core::MtpStats;
 
 #[cfg(test)]
 use crate::runtime::execution::layerwise::WeightResidency;

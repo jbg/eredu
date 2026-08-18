@@ -575,17 +575,50 @@ where
     }
 }
 
+/// Structured failure in backend-independent speculative output handling.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum SpeculativeOutputError {
+    /// Transactional semantic parsing, decoding, or stop matching failed.
+    #[error("speculative semantic state failed during {operation}: {message}")]
+    Semantic {
+        /// Logical semantic operation.
+        operation: String,
+        /// Portable diagnostic detail.
+        message: String,
+    },
+    /// A committed-token callback rejected publication.
+    #[error("speculative output publication failed: {message}")]
+    Publication {
+        /// Portable diagnostic detail.
+        message: String,
+    },
+}
+
+impl SpeculativeOutputError {
+    /// Creates a semantic-state failure with operation context.
+    pub fn semantic(operation: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Semantic {
+            operation: operation.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Creates a committed-output publication failure.
+    pub fn publication(message: impl Into<String>) -> Self {
+        Self::Publication {
+            message: message.into(),
+        }
+    }
+}
+
 /// Transactional semantic state paired with committed token sequencing.
 pub trait SpeculativeConstraint: Sized {
-    /// Structured backend error.
-    type Error: std::error::Error + Send + Sync + 'static;
-
     /// Forks state for tentative verification.
-    fn fork(&self) -> Result<Self, Self::Error>;
+    fn fork(&self) -> Result<Self, SpeculativeOutputError>;
     /// Stages one token and reports a matched stop condition.
-    fn push_token(&mut self, token: u32) -> Result<bool, Self::Error>;
+    fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError>;
     /// Stages terminal output.
-    fn finish(&mut self, reason: FinishReason) -> Result<(), Self::Error>;
+    fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError>;
 }
 
 /// Backend adapter that publishes committed output and terminal cancellation.
@@ -593,9 +626,6 @@ pub trait SpeculativeConstraint: Sized {
 /// The adapter may own callbacks and decoded semantic-event buffers, but core
 /// decides when publication is legal relative to exact cache commit.
 pub trait SpeculativePublisher<C> {
-    /// Structured backend error.
-    type Error: std::error::Error + Send + Sync + 'static;
-
     /// Publishes tokens and staged semantic output after cache commit.
     ///
     /// Returns `true` when cancellation was observed during publication.
@@ -605,10 +635,133 @@ pub trait SpeculativePublisher<C> {
         tokens: &[u32],
         cancellation: &GenerationCancellationToken,
         sequence_finished: bool,
-    ) -> Result<bool, Self::Error>;
+    ) -> Result<bool, SpeculativeOutputError>;
 
     /// Publishes the cancellation terminal state.
-    fn publish_cancelled(&mut self, constraint: &mut C) -> Result<(), Self::Error>;
+    fn publish_cancelled(&mut self, constraint: &mut C) -> Result<(), SpeculativeOutputError>;
+}
+
+/// Object-safe forkable semantic state used by speculative transactions.
+///
+/// This interface owns decoded semantic events and never exposes a backend
+/// tensor, stream, completion, or error type.
+pub trait SpeculativeSemanticState {
+    /// Forks the exact committed prefix for tentative verification.
+    fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError>;
+    /// Stages one token and reports whether a stop sequence matched.
+    fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError>;
+    /// Stages normal terminal output.
+    fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError>;
+    /// Stages cancellation output.
+    fn cancel(&mut self) -> Result<(), SpeculativeOutputError>;
+    /// Drains events authorized by the next exact commit boundary.
+    fn take_events(&mut self) -> Vec<crate::generation::SemanticEvent>;
+}
+
+/// Optional transactional semantic state shared by plain and structured MTP.
+pub struct SpeculativeSemanticConstraint {
+    state: Option<Box<dyn SpeculativeSemanticState>>,
+}
+
+impl SpeculativeSemanticConstraint {
+    /// Creates an unconstrained output state for token-only generation.
+    pub const fn plain() -> Self {
+        Self { state: None }
+    }
+
+    /// Creates a transactional structured-output state.
+    pub fn semantic(state: Box<dyn SpeculativeSemanticState>) -> Self {
+        Self { state: Some(state) }
+    }
+}
+
+impl SpeculativeConstraint for SpeculativeSemanticConstraint {
+    fn fork(&self) -> Result<Self, SpeculativeOutputError> {
+        Ok(Self {
+            state: self
+                .state
+                .as_ref()
+                .map(|state| state.fork_box())
+                .transpose()?,
+        })
+    }
+
+    fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
+        self.state
+            .as_mut()
+            .map(|state| state.push_token(token))
+            .transpose()
+            .map(|matched| matched.unwrap_or(false))
+    }
+
+    fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError> {
+        if let Some(state) = &mut self.state {
+            state.finish(reason)?;
+        }
+        Ok(())
+    }
+}
+
+/// Core-owned committed-token and semantic-event publication adapter.
+pub struct SpeculativeCallbackPublisher<'a> {
+    on_token: Box<dyn FnMut(u32) -> Result<(), SpeculativeOutputError> + 'a>,
+    on_event: Option<Box<dyn FnMut(crate::generation::SemanticEvent) + 'a>>,
+}
+
+impl<'a> SpeculativeCallbackPublisher<'a> {
+    /// Publishes committed token ids without decoded semantic events.
+    pub fn tokens(on_token: impl FnMut(u32) -> Result<(), SpeculativeOutputError> + 'a) -> Self {
+        Self {
+            on_token: Box::new(on_token),
+            on_event: None,
+        }
+    }
+
+    /// Publishes transactional semantic events and ignores raw token callbacks.
+    pub fn semantic(on_event: impl FnMut(crate::generation::SemanticEvent) + 'a) -> Self {
+        Self {
+            on_token: Box::new(|_| Ok(())),
+            on_event: Some(Box::new(on_event)),
+        }
+    }
+}
+
+impl SpeculativePublisher<SpeculativeSemanticConstraint> for SpeculativeCallbackPublisher<'_> {
+    fn publish_committed(
+        &mut self,
+        constraint: &mut SpeculativeSemanticConstraint,
+        tokens: &[u32],
+        cancellation: &GenerationCancellationToken,
+        sequence_finished: bool,
+    ) -> Result<bool, SpeculativeOutputError> {
+        for &token in tokens {
+            (self.on_token)(token)?;
+        }
+        let mut cancellation_won = false;
+        if let (Some(state), Some(on_event)) = (&mut constraint.state, &mut self.on_event) {
+            for event in state.take_events() {
+                on_event(event);
+                if cancellation.is_cancelled() && !sequence_finished {
+                    cancellation_won = true;
+                    break;
+                }
+            }
+        }
+        Ok(cancellation_won || (cancellation.is_cancelled() && !sequence_finished))
+    }
+
+    fn publish_cancelled(
+        &mut self,
+        constraint: &mut SpeculativeSemanticConstraint,
+    ) -> Result<(), SpeculativeOutputError> {
+        if let (Some(state), Some(on_event)) = (&mut constraint.state, &mut self.on_event) {
+            state.cancel()?;
+            for event in state.take_events() {
+                on_event(event);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Canonical speculative sampler, sequence, constraint, and output sink.
@@ -623,8 +776,8 @@ pub struct SpeculativeOutputRuntime<S, C, P> {
 impl<S, C, P> SpeculativeOutputRuntime<S, C, P>
 where
     S: SpeculativeSampling,
-    C: SpeculativeConstraint<Error = S::Error>,
-    P: SpeculativePublisher<C, Error = S::Error>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
 {
     /// Creates one canonical output runtime.
     pub fn new(
@@ -679,7 +832,7 @@ where
     }
 
     /// Applies cancellation and publishes its terminal semantic state.
-    pub fn cancel(&mut self) -> Result<(), S::Error> {
+    pub fn cancel(&mut self) -> Result<(), SpeculativeOutputError> {
         if self.sequence.cancel() {
             self.publisher.publish_cancelled(&mut self.constraint)?;
         }
@@ -699,7 +852,7 @@ where
     }
 
     /// Publishes tokens only after their backend cache transaction committed.
-    pub fn publish_committed(&mut self, tokens: &[u32]) -> Result<bool, S::Error> {
+    pub fn publish_committed(&mut self, tokens: &[u32]) -> Result<bool, SpeculativeOutputError> {
         let cancellation_won = self.publisher.publish_committed(
             &mut self.constraint,
             tokens,
@@ -725,6 +878,9 @@ pub enum SpeculativeDriverError<E: std::error::Error + 'static> {
     /// Backend execution or sampling failed.
     #[error(transparent)]
     Backend(#[from] E),
+    /// Transactional semantic output or committed publication failed.
+    #[error(transparent)]
+    Output(SpeculativeOutputError),
     /// Portable lifecycle validation failed.
     #[error(transparent)]
     Generation(GenerationError),
@@ -823,7 +979,7 @@ pub fn resolve_round<'a, E, S, C>(
 where
     E: SpeculativeExecutor + 'a,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
-    C: SpeculativeConstraint<Error = E::Error>,
+    C: SpeculativeConstraint,
 {
     let mut draft_distributions = proposals
         .iter_mut()
@@ -833,7 +989,7 @@ where
     let proposal_count = proposals.len();
     let mut sampler = sampler.clone();
     let mut sequence = sequence.clone();
-    let mut constraint = constraint.fork()?;
+    let mut constraint = constraint.fork().map_err(SpeculativeDriverError::Output)?;
     let mut target_randomness = target_randomness.cloned();
     let mut history = sequence.tokens().to_vec();
     let mut round =
@@ -1020,8 +1176,8 @@ pub fn resolve_commit_and_publish<'a, E, S, C, P>(
 where
     E: SpeculativeExecutor + 'a,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
-    C: SpeculativeConstraint<Error = E::Error>,
-    P: SpeculativePublisher<C, Error = E::Error>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
 {
     let PendingSpeculativeVerification {
         completion,
@@ -1073,7 +1229,9 @@ where
     stats.emitted_tokens += committed_tokens.len();
     let target_randomness = resolved.target_randomness;
     runtime.install_committed_state(resolved.sampler, resolved.constraint, resolved.sequence);
-    let cancelled = runtime.publish_committed(&committed_tokens)?;
+    let cancelled = runtime
+        .publish_committed(&committed_tokens)
+        .map_err(SpeculativeDriverError::Output)?;
     let status = if cancelled {
         discard_continuation(&mut stats, continuation);
         SpeculativePublicationStatus::Cancelled
@@ -1109,8 +1267,8 @@ pub fn cancel_pending_verification<'a, E, S, C, P>(
 where
     E: SpeculativeExecutor + 'a,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
-    C: SpeculativeConstraint<Error = E::Error>,
-    P: SpeculativePublisher<C, Error = E::Error>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
 {
     let PendingSpeculativeVerification {
         completion,
@@ -1128,7 +1286,7 @@ where
     let commit =
         executor.commit_verification(verification, block.state, cache, checkpoint, 1, context)?;
     stats.target_tokens += commit.replayed_tokens;
-    runtime.cancel()?;
+    runtime.cancel().map_err(SpeculativeDriverError::Output)?;
     Ok((stats, telemetry))
 }
 
@@ -1225,9 +1383,11 @@ fn commit_terminal_token<S, C>(
 ) -> Result<Option<FinishReason>, SpeculativeDriverError<S::Error>>
 where
     S: SpeculativeSampling,
-    C: SpeculativeConstraint<Error = S::Error>,
+    C: SpeculativeConstraint,
 {
-    let stop_matched = constraint.push_token(token)?;
+    let stop_matched = constraint
+        .push_token(token)
+        .map_err(SpeculativeDriverError::Output)?;
     let grammar_complete = if stop_matched {
         false
     } else {
@@ -1244,7 +1404,9 @@ where
         .map_err(SpeculativeDriverError::Generation)?
         .finish_reason;
     if let Some(reason) = reason {
-        constraint.finish(reason)?;
+        constraint
+            .finish(reason)
+            .map_err(SpeculativeDriverError::Output)?;
     }
     Ok(reason)
 }
@@ -1259,8 +1421,8 @@ pub struct SpeculativeRequest<'cache, E, S, C, P>
 where
     E: SpeculativeExecutor,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error>,
-    C: SpeculativeConstraint<Error = E::Error>,
-    P: SpeculativePublisher<C, Error = E::Error>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
 {
     id: MtpRequestId,
     cache: &'cache mut E::Cache,
@@ -1280,8 +1442,8 @@ impl<'cache, E, S, C, P> SpeculativeRequest<'cache, E, S, C, P>
 where
     E: SpeculativeExecutor,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error>,
-    C: SpeculativeConstraint<Error = E::Error>,
-    P: SpeculativePublisher<C, Error = E::Error>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
 {
     /// Stable insertion-order identity.
     pub const fn id(&self) -> MtpRequestId {
@@ -1336,7 +1498,9 @@ where
             MtpCancellationDisposition::AlreadyTerminal | MtpCancellationDisposition::Deferred => {}
             MtpCancellationDisposition::CancelNow => {
                 self.block = None;
-                self.runtime.cancel()?;
+                self.runtime
+                    .cancel()
+                    .map_err(SpeculativeDriverError::Output)?;
                 self.stats.elapsed = self.started.elapsed();
             }
         }
@@ -1672,8 +1836,8 @@ pub struct SpeculativeRequestTable<'cache, E, S, C, P>
 where
     E: SpeculativeExecutor,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error>,
-    C: SpeculativeConstraint<Error = E::Error>,
-    P: SpeculativePublisher<C, Error = E::Error>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
 {
     schedule: SpeculativeSchedule,
     requests: Vec<SpeculativeRequest<'cache, E, S, C, P>>,
@@ -1684,8 +1848,8 @@ impl<'cache, E, S, C, P> SpeculativeRequestTable<'cache, E, S, C, P>
 where
     E: SpeculativeExecutor,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error>,
-    C: SpeculativeConstraint<Error = E::Error>,
-    P: SpeculativePublisher<C, Error = E::Error>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
 {
     /// Creates an empty validated request table.
     pub fn new(
@@ -1762,7 +1926,7 @@ where
         };
         let (target_randomness, draft_randomness) = (randomness.target, randomness.draft);
         let (target_state, lifecycle) = if runtime.cancellation().is_cancelled() {
-            runtime.cancel()?;
+            runtime.cancel().map_err(SpeculativeDriverError::Output)?;
             stats.elapsed = started.elapsed();
             (None, MtpRequestLifecycle::cancelled())
         } else if runtime.sequence().is_finished() {
@@ -1773,7 +1937,10 @@ where
             stats.target_tokens = prefill.evaluated_tokens;
             stats.scheduler_turns = 1;
             let mut sampler = runtime.sampler().clone();
-            let mut constraint = runtime.constraint().fork()?;
+            let mut constraint = runtime
+                .constraint()
+                .fork()
+                .map_err(SpeculativeDriverError::Output)?;
             let mut sequence = runtime.sequence().clone();
             let mut target_randomness = target_randomness.clone();
             let first_logits = sampler.process_logits(
@@ -1794,7 +1961,9 @@ where
             let reason =
                 commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, first)?;
             runtime.install_committed_state(sampler, constraint, sequence);
-            let cancelled = runtime.publish_committed(&[first])?;
+            let cancelled = runtime
+                .publish_committed(&[first])
+                .map_err(SpeculativeDriverError::Output)?;
             stats.emitted_tokens = 1;
             let lifecycle = if cancelled {
                 stats.elapsed = started.elapsed();
@@ -2179,6 +2348,106 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct PortableSemanticState {
+        events: Vec<crate::generation::SemanticEvent>,
+    }
+
+    impl SpeculativeSemanticState for PortableSemanticState {
+        fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
+            let mut fork = self.clone();
+            fork.events.clear();
+            Ok(Box::new(fork))
+        }
+
+        fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
+            self.events
+                .push(crate::generation::SemanticEvent::TextDelta(
+                    token.to_string(),
+                ));
+            Ok(false)
+        }
+
+        fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError> {
+            self.events
+                .push(crate::generation::SemanticEvent::Finished { reason });
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<(), SpeculativeOutputError> {
+            self.finish(FinishReason::Cancelled)
+        }
+
+        fn take_events(&mut self) -> Vec<crate::generation::SemanticEvent> {
+            std::mem::take(&mut self.events)
+        }
+    }
+
+    #[test]
+    fn core_semantic_publisher_commits_and_cancels_without_backend_errors() {
+        let published = Rc::new(RefCell::new(Vec::new()));
+        let mut constraint =
+            SpeculativeSemanticConstraint::semantic(Box::new(PortableSemanticState::default()));
+        constraint.push_token(7).unwrap();
+        constraint.finish(FinishReason::MaxTokens).unwrap();
+        {
+            let published = Rc::clone(&published);
+            let mut publisher = SpeculativeCallbackPublisher::semantic(move |event| {
+                published.borrow_mut().push(event)
+            });
+            assert!(!publisher
+                .publish_committed(
+                    &mut constraint,
+                    &[7],
+                    &GenerationCancellationToken::new(),
+                    true,
+                )
+                .unwrap());
+        }
+        assert_eq!(
+            *published.borrow(),
+            vec![
+                crate::generation::SemanticEvent::TextDelta("7".into()),
+                crate::generation::SemanticEvent::Finished {
+                    reason: FinishReason::MaxTokens,
+                },
+            ]
+        );
+
+        let cancelled = Rc::new(RefCell::new(Vec::new()));
+        let mut constraint =
+            SpeculativeSemanticConstraint::semantic(Box::new(PortableSemanticState::default()));
+        {
+            let cancelled = Rc::clone(&cancelled);
+            let mut publisher = SpeculativeCallbackPublisher::semantic(move |event| {
+                cancelled.borrow_mut().push(event)
+            });
+            publisher.publish_cancelled(&mut constraint).unwrap();
+        }
+        assert_eq!(
+            *cancelled.borrow(),
+            vec![crate::generation::SemanticEvent::Finished {
+                reason: FinishReason::Cancelled,
+            }]
+        );
+
+        let mut constraint = SpeculativeSemanticConstraint::plain();
+        let mut publisher = SpeculativeCallbackPublisher::tokens(|_| {
+            Err(SpeculativeOutputError::publication("consumer closed"))
+        });
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut constraint,
+                    &[11],
+                    &GenerationCancellationToken::new(),
+                    false,
+                )
+                .unwrap_err(),
+            SpeculativeOutputError::publication("consumer closed")
+        );
+    }
+
     #[derive(Default)]
     struct MockExecutor {
         trace: Option<TransactionTrace>,
@@ -2458,21 +2727,19 @@ mod tests {
     }
 
     impl SpeculativeConstraint for MockConstraint {
-        type Error = Infallible;
-
-        fn fork(&self) -> Result<Self, Self::Error> {
+        fn fork(&self) -> Result<Self, SpeculativeOutputError> {
             Ok(Self {
                 tokens: self.tokens.clone(),
                 finished: self.finished,
             })
         }
 
-        fn push_token(&mut self, token: u32) -> Result<bool, Self::Error> {
+        fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
             self.tokens.push(token);
             Ok(false)
         }
 
-        fn finish(&mut self, reason: FinishReason) -> Result<(), Self::Error> {
+        fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError> {
             self.finished = Some(reason);
             Ok(())
         }
@@ -2486,15 +2753,13 @@ mod tests {
     }
 
     impl SpeculativePublisher<MockConstraint> for MockPublisher {
-        type Error = Infallible;
-
         fn publish_committed(
             &mut self,
             _: &mut MockConstraint,
             tokens: &[u32],
             _: &GenerationCancellationToken,
             _: bool,
-        ) -> Result<bool, Self::Error> {
+        ) -> Result<bool, SpeculativeOutputError> {
             if let Some(trace) = &self.trace {
                 trace.borrow_mut().push("publish");
             }
@@ -2502,7 +2767,10 @@ mod tests {
             Ok(false)
         }
 
-        fn publish_cancelled(&mut self, _: &mut MockConstraint) -> Result<(), Self::Error> {
+        fn publish_cancelled(
+            &mut self,
+            _: &mut MockConstraint,
+        ) -> Result<(), SpeculativeOutputError> {
             if let Some(trace) = &self.trace {
                 trace.borrow_mut().push("cancel");
             }

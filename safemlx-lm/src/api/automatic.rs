@@ -23,11 +23,13 @@ use crate::runtime::{
     execution::layerwise::{
         LayerwiseLoadOptions, LayerwiseModelError, NonExpertWeightResidency, WeightResidency,
     },
-    generation::speculative::MtpStats,
     residency::{dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions},
 };
 use crate::{
-    core::residency::{MemoryTier, OffloadConfig, TransferDirection},
+    core::{
+        residency::{MemoryTier, OffloadConfig, TransferDirection},
+        MtpStats,
+    },
     error::Error,
 };
 

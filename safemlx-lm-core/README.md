@@ -61,8 +61,10 @@ until the exact safe boundary. `resolve_commit_and_publish` then performs
 resolution, backend cache commit, branch promotion/discard, telemetry updates,
 and output authorization as one transaction. `SpeculativeOutputRuntime` owns
 the canonical sampler, token sequence, semantic constraint, cancellation, and
-publication lifecycle. A backend supplies only a `SpeculativePublisher` sink
-for concrete callbacks or decoded events; it cannot publish before cache commit.
+publication lifecycle. `SpeculativeSemanticState` and
+`SpeculativeCallbackPublisher` provide the standard backend-independent
+transactional event sink. Output errors are separate from executor and sampling
+errors, and no publisher can run before cache commit.
 `MtpStats`, `MtpSchedulerStats`, and `MtpBatchOutput` are canonical core types.
 `SpeculativeRequestTable` is the production request coordinator. It owns the
 stable request collection, lifecycle-bound resource slots, cancellation scan,

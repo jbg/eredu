@@ -1,10 +1,8 @@
-//! Sampling, semantic streaming, and speculative decoding.
+//! MLX token sampling and committed-token streaming.
 
 pub(crate) mod embedded_mtp;
 
 /// Token sampling policies.
 pub mod sampler;
-/// Multi-token prediction and speculative decoding.
-pub mod speculative;
 /// Protocol-independent semantic streaming.
 pub mod streaming;

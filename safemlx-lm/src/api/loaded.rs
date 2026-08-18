@@ -394,7 +394,7 @@ struct PreparedChatMtpLaneRuntime<'a> {
     config: MtpConfig,
     prng_key: Option<Array>,
     sampler: ConstrainedSampler<crate::runtime::generation::sampler::GenerationSampler>,
-    semantic: Box<dyn MtpSemanticState>,
+    semantic: Box<dyn SpeculativeSemanticState>,
     cancellation: GenerationCancellationToken,
     on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
@@ -457,9 +457,9 @@ fn run_prepared_chat_mtp_batch<'a, B>(
     options: MtpSchedulerOptions,
 ) -> Result<PreparedChatMtpBatchOutput, Exception>
 where
-    B: crate::runtime::generation::speculative::MlxSpeculativeRuntime<'a>,
+    B: crate::backend::mlx::speculative::scheduler::MlxSpeculativeRuntime<'a>,
 {
-    let mut scheduler = MtpScheduler::new(backend, streams, options)?;
+    let mut scheduler = MlxMtpScheduler::new(backend, streams, options)?;
     for (lane_index, lane) in lanes.into_iter().enumerate() {
         let PreparedChatMtpLaneRuntime {
             input,
@@ -527,7 +527,7 @@ fn model_mtp_cache(cache: &mut ModelCache) -> Option<&mut ModelCache> {
 
 struct ExternalMtpBatch<'a, B, S>
 where
-    B: crate::runtime::generation::speculative::MlxSpeculativeRuntime<'a>,
+    B: crate::backend::mlx::speculative::scheduler::MlxSpeculativeRuntime<'a>,
 {
     lanes: &'a mut [ModelCache],
     cache_for_lane: fn(&mut ModelCache) -> Option<&mut B::Cache>,
@@ -544,7 +544,7 @@ fn run_external_mtp_batch<'a, B, S>(
     batch: ExternalMtpBatch<'a, B, S>,
 ) -> Result<MtpBatchOutput, Exception>
 where
-    B: crate::runtime::generation::speculative::MlxSpeculativeRuntime<'a>,
+    B: crate::backend::mlx::speculative::scheduler::MlxSpeculativeRuntime<'a>,
     S: SpeculativeSampler + Clone + 'a,
 {
     let ExternalMtpBatch {
@@ -558,7 +558,7 @@ where
         streams,
     } = batch;
     let mut batch_prng = prng_key.map(RandomState::from_key);
-    let mut scheduler = MtpScheduler::new(backend, streams, MtpSchedulerOptions::default())?;
+    let mut scheduler = MlxMtpScheduler::new(backend, streams, MtpSchedulerOptions::default())?;
     for (lane, lane_cache) in lanes.iter_mut().enumerate() {
         let lane_cache = cache_for_lane(lane_cache).ok_or_else(|| {
             Exception::custom(format!(
@@ -642,13 +642,13 @@ fn run_embedded_mtp_batch<'a, B, C: 'a, S>(
     stream: &'a Stream,
 ) -> Result<MtpBatchOutput, Exception>
 where
-    B: crate::runtime::generation::speculative::MlxSpeculativeRuntime<'a>
+    B: crate::backend::mlx::speculative::scheduler::MlxSpeculativeRuntime<'a>
         + safemlx_lm_core::SpeculativeExecutor<Cache = C>,
     S: SpeculativeSampler + Clone + 'a,
 {
     let streams = MtpExecutionStreams::single(stream);
     let mut batch_prng = prng_key.map(RandomState::from_key);
-    let mut scheduler = MtpScheduler::new(backend, streams, MtpSchedulerOptions::default())?;
+    let mut scheduler = MlxMtpScheduler::new(backend, streams, MtpSchedulerOptions::default())?;
     for (lane, lane_cache) in lanes.iter_mut().enumerate() {
         let lane_cache = cache_for_lane(lane_cache).ok_or_else(|| {
             Exception::custom(format!(

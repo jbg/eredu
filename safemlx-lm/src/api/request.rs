@@ -307,7 +307,7 @@ impl PreparedChatSemanticState {
         initial_decoder: PreparedChatTokenDecoder,
         plan: SemanticRuntimePlan,
         caller_stop_sequences: &[String],
-    ) -> Result<Self, Exception> {
+    ) -> Result<Self, SpeculativeOutputError> {
         let pipeline = Self::build_pipeline(initial_decoder.clone(), &plan, caller_stop_sequences)?;
         Ok(Self {
             initial_decoder,
@@ -323,10 +323,10 @@ impl PreparedChatSemanticState {
         decoder: PreparedChatTokenDecoder,
         plan: &SemanticRuntimePlan,
         caller_stop_sequences: &[String],
-    ) -> Result<CommittedTokenPipeline<PreparedChatTokenDecoder>, Exception> {
+    ) -> Result<CommittedTokenPipeline<PreparedChatTokenDecoder>, SpeculativeOutputError> {
         let parser = plan
             .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
-            .map_err(Exception::custom)?;
+            .map_err(|error| SpeculativeOutputError::semantic("create parser", error))?;
         Ok(CommittedTokenPipeline::new(
             RawTokenDecoder::with_structural_tokens(
                 decoder,
@@ -338,8 +338,8 @@ impl PreparedChatSemanticState {
     }
 }
 
-impl MtpSemanticState for PreparedChatSemanticState {
-    fn fork_box(&self) -> Result<Box<dyn MtpSemanticState>, Exception> {
+impl SpeculativeSemanticState for PreparedChatSemanticState {
+    fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
         let mut pipeline = Self::build_pipeline(
             self.initial_decoder.clone(),
             &self.plan,
@@ -348,7 +348,7 @@ impl MtpSemanticState for PreparedChatSemanticState {
         for &token in &self.token_ids {
             pipeline
                 .push(token, &mut |_| {})
-                .map_err(Exception::custom)?;
+                .map_err(|error| SpeculativeOutputError::semantic("replay token", error))?;
         }
         Ok(Box::new(Self {
             initial_decoder: self.initial_decoder.clone(),
@@ -360,22 +360,22 @@ impl MtpSemanticState for PreparedChatSemanticState {
         }))
     }
 
-    fn push_token(&mut self, token: u32) -> Result<bool, Exception> {
+    fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
         let matched = self
             .pipeline
             .push(token, &mut |event| self.events.push(event))
-            .map_err(Exception::custom)?;
+            .map_err(|error| SpeculativeOutputError::semantic("push token", error))?;
         self.token_ids.push(token);
         Ok(matched)
     }
 
-    fn finish(&mut self, reason: FinishReason) -> Result<(), Exception> {
+    fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError> {
         self.pipeline
             .finish(reason, &mut |event| self.events.push(event))
-            .map_err(Exception::custom)
+            .map_err(|error| SpeculativeOutputError::semantic("finish", error))
     }
 
-    fn cancel(&mut self) -> Result<(), Exception> {
+    fn cancel(&mut self) -> Result<(), SpeculativeOutputError> {
         self.pipeline.cancel(&mut |event| self.events.push(event));
         Ok(())
     }

@@ -1,5 +1,10 @@
 //! MLX execution primitives for speculative model sessions.
 
+/// MLX scheduler and semantic-generation adapter over the portable core engine.
+pub(crate) mod scheduler;
+
+pub use scheduler::MtpComponentTimingGuard;
+
 use std::path::Path;
 
 use safemlx::{

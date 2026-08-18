@@ -9,21 +9,24 @@ use safemlx::{
     quantization::MaybeQuantized,
     Array, Stream,
 };
-use safemlx_lm_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
+use safemlx_lm_core::{
+    MtpStats, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, SpeculativeSemanticState,
+    Submission,
+};
 
 use crate::{
     api::input::ModelInput,
     backend::mlx::{
-        speculative::{MlxSpeculativeCompletion, MtpExecutionStreams},
+        speculative::{
+            scheduler::{self as speculative, MtpComponentTimings},
+            MlxSpeculativeCompletion, MtpExecutionStreams,
+        },
         MlxModelInput,
     },
     core::generation::{
         FinishReason, GenerationCancellationToken, MtpConfig, MtpSchedulerOptions, SemanticEvent,
     },
-    runtime::generation::{
-        sampler::SpeculativeSampler,
-        speculative::{self, MtpComponentTimings, MtpSemanticState},
-    },
+    runtime::generation::sampler::SpeculativeSampler,
 };
 
 /// Sampler wrapper that keeps PRNG and grammar state identical on every rank
@@ -591,7 +594,7 @@ pub(crate) fn generate_with_callback<T, S, F>(
     sampler: &mut S,
     stream: &Stream,
     on_token: F,
-) -> Result<(Vec<u32>, speculative::MtpStats), Exception>
+) -> Result<(Vec<u32>, MtpStats), Exception>
 where
     T: EmbeddedMtpTarget,
     S: SpeculativeSampler + Clone,
@@ -617,12 +620,12 @@ pub(crate) fn generate_with_semantics_and_options<T, S, F>(
     config: &MtpConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
-    semantic: Box<dyn MtpSemanticState>,
+    semantic: Box<dyn SpeculativeSemanticState>,
     cancellation: GenerationCancellationToken,
     stream: &Stream,
     options: MtpSchedulerOptions,
     on_event: F,
-) -> Result<(Vec<u32>, speculative::MtpStats, FinishReason), Exception>
+) -> Result<(Vec<u32>, MtpStats, FinishReason), Exception>
 where
     T: EmbeddedMtpTarget,
     S: SpeculativeSampler + Clone,

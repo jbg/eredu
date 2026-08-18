@@ -226,12 +226,16 @@ cannot commit caches or choose which branch becomes canonical.
 
 `MlxSpeculativeSampling` maps sampling operations to MLX arrays,
 position-stable PRNG keys, target/draft streams, cross-device distribution
-transfer, probability ratios, and residual sampling. `MlxOutputPublisher`
-invokes concrete token callbacks and drains decoded semantic events after core
-authorizes publication. MLX component timings are returned as opaque executor
-telemetry and folded into the core-owned `MtpStats`. The facade contains no
-parallel request table, action dispatcher, in-flight transaction, optimistic
-promotion, cache-commit, callback ordering, or telemetry state machine.
+transfer, probability ratios, and residual sampling. Core's
+`SpeculativeSemanticState`, `SpeculativeSemanticConstraint`, and
+`SpeculativeCallbackPublisher` own transactional semantic forks, cancellation,
+and callback draining after exact commit authorization. Their structured
+`SpeculativeOutputError` is independent of the executor error; prepared-chat
+parsing no longer passes through `safemlx::Exception`. MLX component timings
+are returned as opaque executor telemetry and folded into the core-owned
+`MtpStats`. The facade contains no parallel request table, action dispatcher,
+in-flight transaction, optimistic promotion, cache-commit, callback ordering,
+or telemetry state machine.
 
 The public `api::load_model_with_options` route performs format, architecture,
 catalog, and policy planning in core before calling `Backend::prepare_model`.
