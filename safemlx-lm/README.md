@@ -220,11 +220,12 @@ let request = AutomaticPlanRequest::new(
     DevicePlan::new("mlx", "metal:0")?,
 )
 .with_prior_telemetry(prior_runs);
-let (mut model, report) = LoadedModel::plan_and_load(
+let (mut planned, report) = LoadedModel::plan_and_load(
     &factory,
     &AutomaticPlanner::default(),
     &request,
 )?;
+let model = planned.model_mut();
 
 # fn load_prior_runs() -> Vec<ExecutionTelemetry> { Vec::new() }
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -237,11 +238,14 @@ against current available memory and header-only loader admission. Use
 `AutomaticPlanner::new` with an `AutomaticPlannerPolicy` for explicit policy
 bounds. Its `plan` method accepts an `AutomaticPlanningBackend`, so the same
 selection policy works with another backend's discovery and admission adapter.
-`ExecutionPlanBackendFactory` turns the selected portable plan into an owned
-backend plus its opaque load policy. `LoadedModel::load_execution_plan` and
-`LoadedModel::plan_and_load` consume that realization without exposing device
-queues or backend load options to generic callers. MLX discovery, bounded-load
-probing, device/stream creation, plan translation, and telemetry collection
+`ExecutionPlanBackendFactory` first turns the selected portable plan into an
+owned target backend plus its opaque load policy, then realizes the plan's
+disabled, embedded, or external drafting mode against the prepared target.
+`LoadedModel::load_execution_plan` and `LoadedModel::plan_and_load` return a
+`PlannedModel` which owns both the target and any external assistant. Generic
+callers never construct backend devices, queues, assistants, or load options.
+MLX discovery, bounded-load probing, device/stream creation, target and
+assistant plan translation, compatibility validation, and telemetry collection
 live in `backend::mlx::automatic::MlxBackendFactory`. Backend and device
 identifiers are adapter-defined rather than a closed core enumeration.
 Speculative generation uses the same core-owned committed-token and terminal

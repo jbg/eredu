@@ -509,18 +509,27 @@ explanations, and the planning/telemetry schemas. Its high-level
 `AutomaticPlanningBackend` receives whole candidate plans and supplies only
 hardware/resource observations, admission, bounded-window requirements, and
 embedded-drafting metadata. `ExecutionPlanBackendFactory` adds the production
-realization boundary: it returns an owned backend and opaque load policy for
-one complete plan. Core verifies factory/backend identity, selected-device
-identity, plan structure, and required capabilities before the facade loads
-the artifact. `LoadedModel::load_execution_plan` consumes a persisted plan;
-`LoadedModel::plan_and_load` performs selection and realization together.
+realization boundary. It first returns an owned target backend and opaque load
+policy, then realizes the plan's disabled, embedded, or external drafting mode
+against the prepared target session. The facade loads portable tokenizer
+metadata and supplies only target/assistant vocabulary fingerprints; the
+backend owns assistant materialization, placement, and target compatibility.
+Core verifies factory/backend identity, selected-device identity, plan
+structure, required capabilities, artifact-context presence, and that the
+factory returned the requested drafting mode. `LoadedModel::load_execution_plan`
+consumes a persisted plan and returns a `PlannedModel` owning the target and
+optional assistant; `LoadedModel::plan_and_load` performs selection and both
+realization phases together.
 
 The MLX implementation is `backend::mlx::automatic::MlxBackendFactory`. It
 translates CPU, Metal, and CUDA device identifiers, validates candidates with
-MLX checkpoint inspection, probes bounded loads, creates the selected target
-and weight streams, and privately maps the plan to `ModelLoadOptions`. Neither
-the conversion nor stream construction is a caller API. The example CLI uses
-the same factory boundary for automatic and exact-plan execution.
+MLX checkpoint inspection, probes bounded loads, creates the selected target,
+weight, and optional assistant streams, privately maps the plan to
+`ModelLoadOptions`, loads an external `MlxDrafter` when selected, and validates
+its architecture, geometry, and tokenizer identity against the prepared
+target. Neither conversion, stream construction, nor drafter construction is a
+caller API. The example CLI uses the same factory boundary for automatic,
+explicit, and exact-plan execution.
 Process-global MLX allocator cache configuration is deliberately not part of
 the neutral plan.
 

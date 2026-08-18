@@ -5,16 +5,20 @@ use std::{fs, path::Path};
 use safemlx::{Device, DeviceType, Stream};
 use safemlx_lm_core::{
     AutomaticPlanningBackend, AutomaticPlanningError, BackendId, BoundedResidencyRequirement,
-    CandidateAdmission, DevicePlan, DurationSeconds, ExecutionPlan, ExecutionPlanBackendFactory,
-    ExecutionPlanRealization, ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile,
-    HardwareMemorySemantics, HardwareProfile, InspectionSeverity, ModelKind, ModelResourceProfile,
-    MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics, ResidencyPlan, ResidencyTelemetry,
+    CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
+    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExpertCacheTelemetry,
+    ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
+    HardwareProfile, InspectionSeverity, ModelKind, ModelResourceProfile, ModelRuntime,
+    MtpCapability, MtpCheckpointKind, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics,
+    RealizedDrafting, ResidencyPlan, ResidencyTelemetry, SpeculativeGenerationBackend,
     TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 
 use super::{
     capability::available_memory,
     inspection::{inspect_model, MlxInspectionOptions},
+    prepared_speculative::validate_external_drafter,
+    speculative::MlxDrafter,
     MlxBackend, ModelLoadOptions,
 };
 use crate::{
@@ -228,6 +232,18 @@ fn mlx_load_options(
     Ok(load)
 }
 
+fn mlx_drafter_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions, Error> {
+    match plan.weight_transformation {
+        WeightTransformationPlan::PreserveCheckpoint => Ok(ModelLoadOptions::default()),
+        WeightTransformationPlan::Affine { bits, group_size } => Ok(
+            ModelLoadOptions::with_quantization(AffineQuantization::new(group_size, bits)?),
+        ),
+        WeightTransformationPlan::MxFp4 => Ok(ModelLoadOptions::with_quantization(
+            WeightQuantization::MxFp4,
+        )),
+    }
+}
+
 impl AutomaticPlanningBackend for MlxBackendFactory {
     fn backend_id(&self) -> BackendId {
         BackendId::new("mlx").expect("MLX is a valid backend identifier")
@@ -361,19 +377,85 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
 
 impl ExecutionPlanBackendFactory for MlxBackendFactory {
     type Backend = MlxBackend<'static>;
+    type Drafter = MlxDrafter;
 
-    fn realize(
+    fn realize_target(
         &self,
         plan: &ExecutionPlan,
-    ) -> Result<ExecutionPlanRealization<Self::Backend>, AutomaticPlanningError> {
+    ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
         let stream = Stream::new_with_device(&mlx_device(&plan.device)?);
         let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let options = mlx_load_options(self, plan)
-            .map_err(|error| planning_backend_error("realize_execution_plan", error))?;
-        Ok(ExecutionPlanRealization::new(
+            .map_err(|error| planning_backend_error("realize_execution_plan_target", error))?;
+        Ok(ExecutionPlanTarget::new(
             MlxBackend::for_execution_plan(&stream, &weights_stream, plan.device.device.clone()),
             options,
         ))
+    }
+
+    fn realize_drafting(
+        &self,
+        plan: &ExecutionPlan,
+        target: &ModelRuntime<Self::Backend>,
+        external_artifact: Option<ExternalDraftArtifact>,
+    ) -> Result<RealizedDrafting<MlxDrafter>, AutomaticPlanningError> {
+        let capability =
+            <MlxBackend<'static> as SpeculativeGenerationBackend>::mtp_capability(target);
+        match &plan.drafting {
+            DraftingPlan::Disabled => Ok(RealizedDrafting::Disabled),
+            DraftingPlan::Embedded { .. } => {
+                if capability
+                    != (MtpCapability::Ready {
+                        checkpoint: MtpCheckpointKind::Embedded,
+                    })
+                {
+                    return Err(AutomaticPlanningError::Invalid(format!(
+                        "execution plan selects embedded drafting but target capability is {capability:?}"
+                    )));
+                }
+                Ok(RealizedDrafting::Embedded)
+            }
+            DraftingPlan::External {
+                model, placement, ..
+            } => {
+                if capability
+                    != (MtpCapability::Ready {
+                        checkpoint: MtpCheckpointKind::Separate,
+                    })
+                {
+                    return Err(AutomaticPlanningError::Invalid(format!(
+                        "execution plan selects external drafting but target capability is {capability:?}"
+                    )));
+                }
+                let artifact = external_artifact.ok_or_else(|| {
+                    AutomaticPlanningError::Invalid(
+                        "external drafting is missing tokenizer identities".into(),
+                    )
+                })?;
+                let draft_stream = match placement {
+                    DraftPlacementPlan::Target => target.backend().stream().clone(),
+                    DraftPlacementPlan::Device { device } => {
+                        Stream::new_with_device(&mlx_device(device)?)
+                    }
+                };
+                let options = mlx_drafter_load_options(plan)
+                    .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
+                let drafter = MlxDrafter::load_with_fingerprint(
+                    model,
+                    artifact.draft_tokenizer_fingerprint,
+                    options,
+                    &draft_stream,
+                    target.backend().weights_stream(),
+                )
+                .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
+                validate_external_drafter(target, artifact.target_tokenizer_fingerprint, &drafter)
+                    .map_err(|error| planning_backend_error("validate_external_drafter", error))?;
+                draft_stream.synchronize().map_err(|error| {
+                    planning_backend_error("complete_external_drafter_load", error)
+                })?;
+                Ok(RealizedDrafting::External(drafter))
+            }
+        }
     }
 }
 

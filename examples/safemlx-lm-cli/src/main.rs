@@ -16,36 +16,31 @@ use safemlx::{
     ops::indexing::{NewAxis, TryIndexOp},
     random::RandomState,
     transforms::eval,
-    Array, Device, DeviceType, ExecutionContext, Stream,
+    Array, Stream,
 };
+#[cfg(test)]
+use safemlx::{Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::{
         LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
         PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
-        ResidencyPlan, SpeculativeDraft, TextDecoder, TextModelError,
+        ResidencyPlan, TextDecoder, TextModelError,
     },
     backend::mlx::automatic::{
         discover_hardware, expert_cache_telemetry, mtp_telemetry, residency_telemetry,
         MlxBackendFactory,
     },
     backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-    backend::mlx::runtime::execution::layerwise::{
-        LayerwiseLoadOptions, NonExpertWeightResidency, WeightResidency,
-    },
     backend::mlx::runtime::generation::sampler::{MirostatV2Sampler, Sampler},
     backend::mlx::runtime::media::input::{InputPart, ModelInput},
     backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    backend::mlx::runtime::residency::expert_cache::{
-        ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
-    },
-    backend::mlx::speculative::MlxDrafter,
+    backend::mlx::runtime::residency::expert_cache::{ExpertPassStatistics, ExpertTierStatistics},
     backend::mlx::{
         inspect_model, speculative::MtpComponentTimingGuard, MlxBackend, MlxInspectionOptions,
         MlxModelInput, ModelLoadOptions,
     },
-    core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
+    core::residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
     core::speculative::MtpStats,
-    realize_execution_plan,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
@@ -116,6 +111,7 @@ enum CliDevice {
 }
 
 impl CliDevice {
+    #[cfg(test)]
     fn mlx(self) -> Device {
         match self {
             Self::Cpu => Device::new(DeviceType::Cpu, 0),
@@ -1242,7 +1238,8 @@ fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &Exec
 }
 
 fn candidate_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions> {
-    let realization = realize_execution_plan(&MlxBackendFactory::default(), plan)?;
+    let realization =
+        safemlx_lm::core::realize_execution_plan_target(&MlxBackendFactory::default(), plan)?;
     let (_, options) = realization.into_parts();
     Ok(options)
 }
@@ -2074,6 +2071,14 @@ fn main() -> Result<()> {
     }
     let prompt = read_prompt(args.prompt.as_deref())?;
 
+    let configured_embedded_mtp = draft_model_path.is_none()
+        && args.mtp_draft_tokens > 0
+        && model_advertises_embedded_mtp(&model_path);
+    let execution_plan = automatic_report.as_ref().map_or_else(
+        || cli_execution_plan(&args, draft_model_path.as_deref(), configured_embedded_mtp),
+        |report| report.plan.clone(),
+    );
+
     if args.verbose {
         eprintln!("--- safemlx diagnostics (stderr) ---");
         eprintln!("model: {}", model_path.display());
@@ -2085,13 +2090,6 @@ fn main() -> Result<()> {
             eprintln!("draft_model: {}", path.display());
             eprintln!("mtp_draft_device: {}", args.mtp_draft_device);
         }
-        let configured_embedded_mtp = draft_model_path.is_none()
-            && args.mtp_draft_tokens > 0
-            && model_advertises_embedded_mtp(&model_path);
-        let execution_plan = automatic_report.as_ref().map_or_else(
-            || cli_execution_plan(&args, draft_model_path.as_deref(), configured_embedded_mtp),
-            |report| report.plan.clone(),
-        );
         let mut stderr = io::stderr().lock();
         writeln!(stderr, "execution_plan:")?;
         serde_json::to_writer_pretty(&mut stderr, &execution_plan)
@@ -2103,111 +2101,29 @@ fn main() -> Result<()> {
         // Capture the complete model-load and generation high-water mark.
         safemlx::memory::reset_peak_memory()?;
     }
-    let mut load_options = requested_load_quantization(&args)?.map_or_else(
-        ModelLoadOptions::default,
-        ModelLoadOptions::with_quantization,
-    );
-    let dense_options = || -> Result<DenseDiskStreamLoadOptions> {
-        let defaults = DenseDiskStreamLoadOptions::default();
-        let mut options = DenseDiskStreamLoadOptions::new(
-            args.device_budget_bytes
-                .unwrap_or(defaults.device_budget_bytes),
-            args.host_budget_bytes.unwrap_or(defaults.host_budget_bytes),
-            args.dense_host_lookahead,
-            args.dense_background_queue,
-        )?;
-        options.max_mapped_shards = args.mapped_shards;
-        options.sample_mlx_memory = args.verbose;
-        options.sample_process_memory = args.verbose;
-        Ok(options)
-    };
-    if args.expert_cache {
-        let non_expert = LayerwiseLoadOptions {
-            offload: OffloadConfig::new(
-                args.device_budget_bytes,
-                args.host_budget_bytes,
-                args.device_layer_window,
-            )?,
-            max_mapped_shards: args.mapped_shards,
-            sample_mlx_memory: args.verbose,
-            sample_process_memory: args.verbose,
-            ..LayerwiseLoadOptions::default()
-        };
-        let experts = OffloadConfig::new(
-            args.expert_cache_device_budget_bytes,
-            args.expert_cache_host_budget_bytes,
-            1,
-        )?
-        .with_eviction_policy(args.expert_cache_eviction.into());
-        let expert_options = ExpertCacheLoadOptions::new(
-            experts,
-            args.expert_cache_scratch_bytes,
-            args.expert_cache_prefill_bank_bytes,
-        )?;
-        let non_experts = if args.dense_disk_stream {
-            NonExpertWeightResidency::DenseDiskStream(dense_options()?)
-        } else if args.layerwise_host {
-            NonExpertWeightResidency::LayerwiseHost(non_expert)
-        } else {
-            NonExpertWeightResidency::FullyResident
-        };
-        load_options = load_options.with_weight_residency(WeightResidency::with_expert_cache(
-            non_experts,
-            expert_options,
-        ));
-    } else if args.dense_disk_stream {
-        load_options = load_options
-            .with_weight_residency(WeightResidency::dense_disk_stream(dense_options()?));
-    } else if args.layerwise_host {
-        let offload = OffloadConfig::new(
-            args.device_budget_bytes,
-            args.host_budget_bytes,
-            args.device_layer_window,
-        )?;
-        load_options = load_options.with_weight_residency(WeightResidency::layerwise_host(
-            LayerwiseLoadOptions {
-                offload,
-                max_mapped_shards: args.mapped_shards,
-                sample_mlx_memory: args.verbose,
-                sample_process_memory: args.verbose,
-                ..LayerwiseLoadOptions::default()
-            },
-        ));
-    }
     let resource_profile = if let Some(report) = &automatic_report {
         Some(report.resources.clone())
     } else if args.telemetry_json.is_some() {
-        Some(inspect_model(&model_path, MlxInspectionOptions { load: load_options })?.resources)
+        Some(
+            inspect_model(
+                &model_path,
+                MlxInspectionOptions {
+                    load: candidate_load_options(&execution_plan)?,
+                },
+            )?
+            .resources,
+        )
     } else {
         None
     };
     let load_started = Instant::now();
-    let mut model = if let Some(report) = &automatic_report {
-        let factory =
-            MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
-        LoadedModel::load_execution_plan(&factory, &model_path, &report.plan)
-    } else {
-        let execution = ExecutionContext::new(args.device.mlx());
-        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        LoadedModel::load(
-            MlxBackend::new(execution.stream(), weights.stream()),
-            &model_path,
-            load_options,
-        )
-        .map_err(safemlx_lm::PlannedModelLoadError::Loading)
-    }
-    .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    let factory =
+        MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
+    let planned = LoadedModel::load_execution_plan(&factory, &model_path, &execution_plan)
+        .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    let (mut model, mut drafting) = planned.into_parts();
     let stream_owner = model.runtime().backend().stream().clone();
-    let weights_stream_owner = model.runtime().backend().weights_stream().clone();
     let stream = &stream_owner;
-    let weights_stream = &weights_stream_owner;
-    let draft_execution = match args.mtp_draft_device {
-        MtpDraftDevice::Target => None,
-        MtpDraftDevice::Device(device) => Some(ExecutionContext::new(device.mlx())),
-    };
-    let draft_stream = draft_execution
-        .as_ref()
-        .map_or(stream, ExecutionContext::stream);
     let mut resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: args.temperature,
         top_k: args.top_k,
@@ -2240,35 +2156,7 @@ fn main() -> Result<()> {
             resolved_generation.do_sample
         );
     }
-    if draft_model_path.is_some()
-        && !matches!(
-            model.mtp_capability(),
-            safemlx_lm::MtpCapability::Ready {
-                checkpoint: safemlx_lm::MtpCheckpointKind::Separate
-            }
-        )
-    {
-        bail!(
-            "--draft-model cannot be used with target capability {:?}",
-            model.mtp_capability()
-        );
-    }
-    let mut drafter = draft_model_path
-        .as_ref()
-        .map(|path| {
-            let options = requested_load_quantization(&args)?.map_or_else(
-                ModelLoadOptions::default,
-                ModelLoadOptions::with_quantization,
-            );
-            let tokenizer = safemlx_lm::api::load_tokenizer(path)?;
-            MlxDrafter::load_with_options(path, &tokenizer, options, draft_stream, weights_stream)
-                .with_context(|| format!("failed to load draft model from {}", path.display()))
-        })
-        .transpose()?;
     stream.synchronize()?;
-    if draft_stream != stream {
-        draft_stream.synchronize()?;
-    }
     let load_elapsed = load_started.elapsed();
 
     let tools_requested = args.tools.is_some();
@@ -2377,13 +2265,7 @@ fn main() -> Result<()> {
     }
     let mut stderr = stderr.lock();
 
-    let embedded_mtp = args.mtp_draft_tokens > 0
-        && matches!(
-            model.mtp_capability(),
-            safemlx_lm::MtpCapability::Ready {
-                checkpoint: safemlx_lm::MtpCheckpointKind::Embedded
-            }
-        );
+    let drafting_enabled = !matches!(&drafting, safemlx_lm::RealizedDrafting::Disabled);
     let _component_timing_guard = args.verbose.then(MtpComponentTimingGuard::enable);
     let scheduler_options = MtpSchedulerOptions {
         adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
@@ -2411,55 +2293,16 @@ fn main() -> Result<()> {
             seed: args.seed,
         };
         let mut semantic_error = None;
-        if let Some(drafter) = drafter.as_mut() {
+        if let Some(speculative_draft) = drafting.as_speculative_draft() {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
-                drafting: SpeculativeDraft::External(drafter),
+                drafting: speculative_draft,
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)
-                        .expect("external MTP validates non-zero draft tokens"),
-                    scheduler: scheduler_options,
-                },
-                caller_stop_sequences: &args.stop_sequences,
-                cancellation,
-                on_event: |event| {
-                    if time_to_first_token.is_none()
-                        && !matches!(event, SemanticEvent::Finished { .. })
-                    {
-                        time_to_first_token = Some(generation_started.elapsed());
-                    }
-                    if semantic_error.is_none() {
-                        semantic_error = write_semantic_event(
-                            &event,
-                            &mut stdout,
-                            &mut stderr,
-                            &mut streamed_text,
-                            &mut reasoning_stream,
-                            reasoning_output,
-                        )
-                        .err();
-                        if semantic_error.is_some() {
-                            cancel_on_error.cancel();
-                        }
-                    }
-                },
-            })?;
-            output_ids = output.token_ids;
-            mtp_stats = Some(output.stats);
-            prepared_finish_reason = Some(output.finish_reason);
-        } else if embedded_mtp {
-            let cancellation = GenerationCancellationToken::new();
-            let cancel_on_error = cancellation.clone();
-            let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(prepared),
-                drafting: SpeculativeDraft::Embedded,
-                settings,
-                options: PreparedChatMtpGenerationOptions {
-                    max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)
-                        .expect("embedded MTP validates non-zero draft tokens"),
+                        .expect("planned speculative execution validates non-zero draft tokens"),
                     scheduler: scheduler_options,
                 },
                 caller_stop_sequences: &args.stop_sequences,
@@ -2525,7 +2368,7 @@ fn main() -> Result<()> {
         if let Some(error) = semantic_error {
             return Err(error);
         }
-    } else if drafter.is_some() || embedded_mtp {
+    } else if drafting_enabled {
         bail!(
             "speculative generation requires a prepared chat with executable semantic support; raw and unrecognized-template fallbacks use ordinary generation"
         );
@@ -2823,10 +2666,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = &args.telemetry_json {
-        let plan = automatic_report.as_ref().map_or_else(
-            || cli_execution_plan(&args, draft_model_path.as_deref(), embedded_mtp),
-            |report| report.plan.clone(),
-        );
+        let plan = execution_plan.clone();
         let plan_explanation = automatic_report.as_ref().map_or_else(
             || PlanExplanation {
                 summary: "recorded the concrete execution settings supplied to the CLI".into(),

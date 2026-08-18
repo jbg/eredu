@@ -6,11 +6,12 @@
 
 use crate::{
     artifact::{ArtifactFormat, ModelKind},
-    backend::{Backend, ModelLoadingBackend},
+    backend::{Backend, ModelLoadingBackend, ModelRuntime},
     execution::{
         DevicePlan, DraftingPlan, ExecutionPlan, ExpertCachePlan, ResidencyPlan,
         DEFAULT_MAX_MAPPED_SHARDS,
     },
+    speculative::SpeculativeDraft,
 };
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
@@ -595,22 +596,22 @@ pub trait AutomaticPlanningBackend {
     ) -> Result<Option<usize>, AutomaticPlanningError>;
 }
 
-/// One backend instance and load policy realized from a portable execution plan.
+/// One target-backend instance and load policy realized from a portable execution plan.
 ///
 /// The backend owns its selected device, execution queues, transfer queues, and
 /// optional communication state. Callers pass this value directly to the
 /// generic model loader instead of reconstructing backend-specific options.
-pub struct ExecutionPlanRealization<B: ModelLoadingBackend> {
+pub struct ExecutionPlanTarget<B: ModelLoadingBackend> {
     backend: B,
     load_options: B::LoadOptions,
 }
 
-impl<B: ModelLoadingBackend> ExecutionPlanRealization<B> {
+impl<B: ModelLoadingBackend> ExecutionPlanTarget<B> {
     /// Creates one backend-owned realization.
     ///
-    /// Backend adapters call this from [`ExecutionPlanBackendFactory::realize`].
+    /// Backend adapters call this from [`ExecutionPlanBackendFactory::realize_target`].
     /// Portable identity, device, capability, and plan validation is applied by
-    /// [`realize_execution_plan`] before the value reaches an application.
+    /// [`realize_execution_plan_target`] before the value reaches an application.
     pub fn new(backend: B, load_options: B::LoadOptions) -> Self {
         Self {
             backend,
@@ -629,6 +630,41 @@ impl<B: ModelLoadingBackend> ExecutionPlanRealization<B> {
     }
 }
 
+/// Portable tokenizer identities required to validate an external assistant.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ExternalDraftArtifact {
+    /// Stable token-id vocabulary identity of the target model.
+    pub target_tokenizer_fingerprint: [u8; 32],
+    /// Stable token-id vocabulary identity of the external assistant.
+    pub draft_tokenizer_fingerprint: [u8; 32],
+}
+
+/// Backend-owned drafting resources realized for one complete execution plan.
+pub enum RealizedDrafting<D> {
+    /// Ordinary target-only decoding.
+    Disabled,
+    /// Draft heads embedded in the prepared target model.
+    Embedded,
+    /// Separately prepared assistant owned by the selected backend.
+    External(D),
+}
+
+impl<D> RealizedDrafting<D> {
+    /// Borrows the request-level draft selection when speculative execution is enabled.
+    pub fn as_speculative_draft(&mut self) -> Option<SpeculativeDraft<'_, D>> {
+        match self {
+            Self::Disabled => None,
+            Self::Embedded => Some(SpeculativeDraft::Embedded),
+            Self::External(drafter) => Some(SpeculativeDraft::External(drafter)),
+        }
+    }
+
+    /// Returns whether this plan owns a separately prepared assistant.
+    pub const fn is_external(&self) -> bool {
+        matches!(self, Self::External(_))
+    }
+}
+
 /// Creates an executable whole-model backend from a portable execution plan.
 ///
 /// This deliberately operates above tensor primitives. An implementation maps
@@ -638,22 +674,37 @@ impl<B: ModelLoadingBackend> ExecutionPlanRealization<B> {
 pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
     /// Backend implementation created for the selected model/session.
     type Backend: ModelLoadingBackend;
+    /// Backend-owned separately prepared assistant type.
+    type Drafter;
 
     /// Backend hook which owns device/queue construction and plan translation.
     ///
-    /// Applications should call [`realize_execution_plan`] so portable
+    /// Applications should call [`realize_execution_plan_target`] so portable
     /// validation cannot be bypassed accidentally.
-    fn realize(
+    fn realize_target(
         &self,
         plan: &ExecutionPlan,
-    ) -> Result<ExecutionPlanRealization<Self::Backend>, AutomaticPlanningError>;
+    ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError>;
+
+    /// Realizes the plan's complete drafting mode against a prepared target session.
+    ///
+    /// `external_artifact` is present exactly for [`DraftingPlan::External`].
+    /// It is assembled by the portable facade, which owns tokenizer loading,
+    /// while the backend owns assistant materialization, placement, and target
+    /// compatibility validation.
+    fn realize_drafting(
+        &self,
+        plan: &ExecutionPlan,
+        target: &ModelRuntime<Self::Backend>,
+        external_artifact: Option<ExternalDraftArtifact>,
+    ) -> Result<RealizedDrafting<Self::Drafter>, AutomaticPlanningError>;
 }
 
-/// Validates and realizes one portable execution plan through its selected backend factory.
-pub fn realize_execution_plan<F: ExecutionPlanBackendFactory>(
+/// Validates and realizes the target portion of a portable execution plan.
+pub fn realize_execution_plan_target<F: ExecutionPlanBackendFactory>(
     factory: &F,
     plan: &ExecutionPlan,
-) -> Result<ExecutionPlanRealization<F::Backend>, AutomaticPlanningError> {
+) -> Result<ExecutionPlanTarget<F::Backend>, AutomaticPlanningError> {
     let expected_backend = factory.backend_id();
     if plan.device.backend != expected_backend {
         return Err(AutomaticPlanningError::Invalid(format!(
@@ -664,7 +715,7 @@ pub fn realize_execution_plan<F: ExecutionPlanBackendFactory>(
     plan.validate_structure()
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
 
-    let realization = factory.realize(plan)?;
+    let realization = factory.realize_target(plan)?;
     let descriptor = realization.backend().descriptor();
     if descriptor.name != expected_backend.as_str() {
         return Err(AutomaticPlanningError::Invalid(format!(
@@ -694,6 +745,42 @@ pub fn realize_execution_plan<F: ExecutionPlanBackendFactory>(
     plan.validate(capabilities)
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
     Ok(realization)
+}
+
+/// Validates and realizes the drafting portion of a portable execution plan.
+pub fn realize_execution_plan_drafting<F: ExecutionPlanBackendFactory>(
+    factory: &F,
+    plan: &ExecutionPlan,
+    target: &ModelRuntime<F::Backend>,
+    external_artifact: Option<ExternalDraftArtifact>,
+) -> Result<RealizedDrafting<F::Drafter>, AutomaticPlanningError> {
+    match (&plan.drafting, external_artifact) {
+        (DraftingPlan::External { .. }, None) => {
+            return Err(AutomaticPlanningError::Invalid(
+                "external drafting requires target and assistant tokenizer identities".into(),
+            ));
+        }
+        (DraftingPlan::Disabled | DraftingPlan::Embedded { .. }, Some(_)) => {
+            return Err(AutomaticPlanningError::Invalid(
+                "tokenizer identities were supplied for a plan without an external assistant"
+                    .into(),
+            ));
+        }
+        _ => {}
+    }
+    let drafting = factory.realize_drafting(plan, target, external_artifact)?;
+    let matches_plan = matches!(
+        (&plan.drafting, &drafting),
+        (DraftingPlan::Disabled, RealizedDrafting::Disabled)
+            | (DraftingPlan::Embedded { .. }, RealizedDrafting::Embedded)
+            | (DraftingPlan::External { .. }, RealizedDrafting::External(_))
+    );
+    if !matches_plan {
+        return Err(AutomaticPlanningError::Invalid(
+            "backend factory realized a drafting mode different from the execution plan".into(),
+        ));
+    }
+    Ok(drafting)
 }
 
 /// Failure produced by portable planning or its selected backend adapter.

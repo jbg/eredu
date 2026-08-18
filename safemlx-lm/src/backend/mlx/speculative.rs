@@ -95,8 +95,24 @@ impl MlxDrafter {
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
-        let source = source.as_ref();
         let tokenizer_fingerprint = safemlx_lm_utils::tokenizer::vocabulary_fingerprint(tokenizer);
+        Self::load_with_fingerprint(
+            source,
+            tokenizer_fingerprint,
+            options,
+            stream,
+            weights_stream,
+        )
+    }
+
+    pub(crate) fn load_with_fingerprint(
+        source: impl AsRef<Path>,
+        tokenizer_fingerprint: [u8; 32],
+        options: ModelLoadOptions,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<Self, Error> {
+        let source = source.as_ref();
         let is_gguf = source
             .extension()
             .and_then(|extension| extension.to_str())

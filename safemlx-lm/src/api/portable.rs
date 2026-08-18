@@ -4,7 +4,9 @@ use safemlx_lm_core::generation::{
     resolve_generation_config, CheckpointGenerationConfig, GenerationConfigOverrides,
     ResolvedGenerationConfig,
 };
-use safemlx_lm_core::{ModelRuntime, TextGeneration, TextGenerationBackend, TextGenerationConfig};
+use safemlx_lm_core::{
+    ModelRuntime, RealizedDrafting, TextGeneration, TextGenerationBackend, TextGenerationConfig,
+};
 use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
 /// Backend-independent failure from tokenizer-aware text facade operations.
@@ -90,6 +92,47 @@ pub struct LoadedModel<B: TextGenerationBackend> {
     pub(crate) model_id: String,
     pub(crate) eos_token_ids: Vec<u32>,
     pub(crate) checkpoint_generation_config: Option<CheckpointGenerationConfig>,
+}
+
+/// One completely realized execution plan: target model plus drafting resources.
+///
+/// The backend factory owns both target and assistant placement. Callers can
+/// execute the same code for any backend without constructing a backend-native
+/// assistant, stream, or device.
+pub struct PlannedModel<B: TextGenerationBackend, D> {
+    model: LoadedModel<B>,
+    drafting: RealizedDrafting<D>,
+}
+
+impl<B: TextGenerationBackend, D> PlannedModel<B, D> {
+    pub(crate) fn new(model: LoadedModel<B>, drafting: RealizedDrafting<D>) -> Self {
+        Self { model, drafting }
+    }
+
+    /// Borrows the loaded target model.
+    pub const fn model(&self) -> &LoadedModel<B> {
+        &self.model
+    }
+
+    /// Mutably borrows the loaded target model.
+    pub fn model_mut(&mut self) -> &mut LoadedModel<B> {
+        &mut self.model
+    }
+
+    /// Borrows the backend-owned drafting realization.
+    pub const fn drafting(&self) -> &RealizedDrafting<D> {
+        &self.drafting
+    }
+
+    /// Mutably borrows the target and drafting resources as one planned session.
+    pub fn parts_mut(&mut self) -> (&mut LoadedModel<B>, &mut RealizedDrafting<D>) {
+        (&mut self.model, &mut self.drafting)
+    }
+
+    /// Consumes the planned session into its target model and drafting resources.
+    pub fn into_parts(self) -> (LoadedModel<B>, RealizedDrafting<D>) {
+        (self.model, self.drafting)
+    }
 }
 
 impl<B: TextGenerationBackend> LoadedModel<B> {

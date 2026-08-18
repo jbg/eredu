@@ -30,18 +30,19 @@ use safemlx_lm::{
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningBackend, AutomaticPlanningError,
     Backend, BackendCapabilities, BackendDescriptor, BackendId, BackendSession, CacheStateStrategy,
     CapabilityError, CollectiveScope, DeviceDescriptor, DevicePlan, DistributedBackend,
-    DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
-    EstimationCompleteness, ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanRealization,
-    FinishReason, GenerationConfigOverrides, GrowingState, HardwareBackendProfile,
-    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
-    InputTokenCount, MemoryTier, ModelCapabilities, ModelCapabilityBackend, ModelKind,
-    ModelLoadingBackend, ModelResourceProfile, ModelRuntime, MtpCapability, MtpCheckpointKind,
-    MultimodalPreparationBackend, Observed, OffloadConfig, OffloadPlan, OffloadUnitId,
-    OffloadUnitSpec, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, PreparedModel,
-    RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler,
-    RealtimeSpeechConfig, RequestId, ResidencyLedger, ResidencyPlan, ResidencyPolicy,
-    RuntimeStateEstimate, SchedulerLimits, SemanticEvent, SemanticStateTransaction,
-    SpeculativeDraft, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
+    DistributedCapabilities, DistributedSession, DistributedSessionDescriptor, DraftPlacementPlan,
+    DraftingPlan, EstimationCompleteness, ExecutionPlan, ExecutionPlanBackendFactory,
+    ExecutionPlanTarget, ExternalDraftArtifact, FinishReason, GenerationConfigOverrides,
+    GrowingState, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
+    HardwareProfile, InputModalities, InputTokenCount, MemoryTier, ModelCapabilities,
+    ModelCapabilityBackend, ModelKind, ModelLoadingBackend, ModelResourceProfile, ModelRuntime,
+    MtpCapability, MtpCheckpointKind, MultimodalPreparationBackend, Observed, OffloadConfig,
+    OffloadPlan, OffloadUnitId, OffloadUnitSpec, ParallelAxis, ParallelTopology,
+    PhysicalMemorySemantics, PreparedModel, RealizedDrafting, RealtimeBackend,
+    RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig,
+    RequestId, ResidencyLedger, ResidencyPlan, ResidencyPolicy, RuntimeStateEstimate,
+    SchedulerLimits, SemanticEvent, SemanticStateTransaction, SpeculativeDraft,
+    SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
     SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, SpeculativeGenerationRequest,
     SpeculativeTokenFilterController, StateLayout, StaticMemoryReport, Submission,
     TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
@@ -560,12 +561,39 @@ impl AutomaticPlanningBackend for MockBackend {
 
 impl ExecutionPlanBackendFactory for MockBackend {
     type Backend = Self;
+    type Drafter = MockDrafter;
 
-    fn realize(
+    fn realize_target(
         &self,
         _: &ExecutionPlan,
-    ) -> Result<ExecutionPlanRealization<Self::Backend>, AutomaticPlanningError> {
-        Ok(ExecutionPlanRealization::new(MockBackend, ()))
+    ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
+        Ok(ExecutionPlanTarget::new(MockBackend, ()))
+    }
+
+    fn realize_drafting(
+        &self,
+        plan: &ExecutionPlan,
+        _: &ModelRuntime<Self::Backend>,
+        external_artifact: Option<ExternalDraftArtifact>,
+    ) -> Result<RealizedDrafting<MockDrafter>, AutomaticPlanningError> {
+        Ok(match plan.drafting {
+            DraftingPlan::Disabled => {
+                assert!(external_artifact.is_none());
+                RealizedDrafting::Disabled
+            }
+            DraftingPlan::Embedded { .. } => {
+                assert!(external_artifact.is_none());
+                RealizedDrafting::Embedded
+            }
+            DraftingPlan::External { .. } => {
+                let artifact = external_artifact.expect("external drafting carries identities");
+                assert_eq!(
+                    artifact.target_tokenizer_fingerprint,
+                    artifact.draft_tokenizer_fingerprint
+                );
+                RealizedDrafting::External(MockDrafter)
+            }
+        })
     }
 }
 
@@ -876,7 +904,10 @@ fn planned_loading_client_code<F>(
     factory: &F,
     model_path: &Path,
     device: &str,
-) -> (LoadedModel<F::Backend>, safemlx_lm::ExecutionPlanReport)
+) -> (
+    safemlx_lm::api::PlannedModel<F::Backend, F::Drafter>,
+    safemlx_lm::ExecutionPlanReport,
+)
 where
     F: ExecutionPlanBackendFactory,
     F::Backend: TextGenerationBackend,
@@ -957,16 +988,17 @@ fn assert_automatic_planning_conformance() {
         requirement.static_bytes + requirement.window_bytes
     );
 
-    let (mut model, realized_report) =
+    let (mut planned, realized_report) =
         planned_loading_client_code(&backend, artifact.path(), "gpu:0");
     assert_eq!(realized_report.plan, report.plan);
+    let model = planned.model_mut();
     assert_eq!(model.runtime().backend().descriptor().name, "mock");
-    assert_eq!(client_code(&mut model), vec![1, 2, 3]);
+    assert_eq!(client_code(model), vec![1, 2, 3]);
 
     let mut wrong_backend = report.plan.clone();
     wrong_backend.device = DevicePlan::new("other", "gpu:0").unwrap();
     assert!(matches!(
-        safemlx_lm::realize_execution_plan(&backend, &wrong_backend),
+        safemlx_lm::core::realize_execution_plan_target(&backend, &wrong_backend),
         Err(AutomaticPlanningError::Invalid(message))
             if message.contains("factory owns mock")
     ));
@@ -974,9 +1006,26 @@ fn assert_automatic_planning_conformance() {
     let mut missing_device = report.plan.clone();
     missing_device.device = DevicePlan::new("mock", "gpu:1").unwrap();
     assert!(matches!(
-        safemlx_lm::realize_execution_plan(&backend, &missing_device),
+        safemlx_lm::core::realize_execution_plan_target(&backend, &missing_device),
         Err(AutomaticPlanningError::Invalid(message))
             if message.contains("does not expose selected device gpu:1")
+    ));
+
+    let mut external = report.plan.clone();
+    external.drafting = DraftingPlan::External {
+        model: artifact.path().display().to_string(),
+        placement: DraftPlacementPlan::Target,
+        max_draft_tokens: 4,
+        lookahead: true,
+        adaptive_lookahead: true,
+    };
+    let mut planned = LoadedModel::load_execution_plan(&backend, artifact.path(), &external)
+        .expect("generic plan loading realizes the external assistant");
+    assert!(planned.drafting().is_external());
+    let (_, drafting) = planned.parts_mut();
+    assert!(matches!(
+        drafting.as_speculative_draft(),
+        Some(SpeculativeDraft::External(_))
     ));
 }
 

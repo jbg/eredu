@@ -282,6 +282,28 @@ impl ExecutionPlan {
         if self.max_mapped_shards == 0 {
             return Err(ExecutionPlanError::ZeroMappedShards);
         }
+        match &self.drafting {
+            DraftingPlan::Disabled => {}
+            DraftingPlan::Embedded {
+                max_draft_tokens, ..
+            } => {
+                if *max_draft_tokens == 0 {
+                    return Err(ExecutionPlanError::ZeroDraftTokens);
+                }
+            }
+            DraftingPlan::External {
+                model,
+                max_draft_tokens,
+                ..
+            } => {
+                if model.trim().is_empty() {
+                    return Err(ExecutionPlanError::EmptyDraftModel);
+                }
+                if *max_draft_tokens == 0 {
+                    return Err(ExecutionPlanError::ZeroDraftTokens);
+                }
+            }
+        }
         ParallelTopology::new(
             self.topology.tensor,
             self.topology.pipeline,
@@ -314,6 +336,12 @@ pub enum ExecutionPlanError {
     /// The checkpoint source bound is zero.
     #[error("execution-plan max_mapped_shards must be greater than zero")]
     ZeroMappedShards,
+    /// An external assistant artifact path or identifier is empty.
+    #[error("execution-plan external draft model must not be empty")]
+    EmptyDraftModel,
+    /// Speculative execution has no proposal capacity.
+    #[error("execution-plan max_draft_tokens must be greater than zero")]
+    ZeroDraftTokens,
 }
 
 #[cfg(test)]
@@ -343,5 +371,31 @@ mod tests {
     fn backend_and_device_identifiers_fail_closed_during_deserialization() {
         assert!(serde_json::from_str::<DevicePlan>(r#"{"backend":"","device":"cpu:0"}"#).is_err());
         assert!(serde_json::from_str::<DevicePlan>(r#"{"backend":"mlx","device":""}"#).is_err());
+    }
+
+    #[test]
+    fn speculative_plan_structure_fails_closed() {
+        let mut plan = ExecutionPlan::fully_resident(DevicePlan::new("mock", "gpu:0").unwrap());
+        plan.drafting = DraftingPlan::Embedded {
+            max_draft_tokens: 0,
+            lookahead: false,
+            adaptive_lookahead: false,
+        };
+        assert_eq!(
+            plan.validate_structure(),
+            Err(ExecutionPlanError::ZeroDraftTokens)
+        );
+
+        plan.drafting = DraftingPlan::External {
+            model: "  ".into(),
+            placement: DraftPlacementPlan::Target,
+            max_draft_tokens: 1,
+            lookahead: false,
+            adaptive_lookahead: false,
+        };
+        assert_eq!(
+            plan.validate_structure(),
+            Err(ExecutionPlanError::EmptyDraftModel)
+        );
     }
 }

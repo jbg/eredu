@@ -33,7 +33,7 @@ pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;
 
 pub use portable::{
-    LoadedModel, LoadedTextModelConfig, TextDecoder, TextDecoderError, TextModelError,
+    LoadedModel, LoadedTextModelConfig, PlannedModel, TextDecoder, TextDecoderError, TextModelError,
 };
 pub use safemlx_lm_core::{
     Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry,

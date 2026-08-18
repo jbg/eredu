@@ -5,9 +5,9 @@ use std::{num::NonZeroUsize, path::Path};
 use safemlx_gguf::MetadataValue as GgufMetadataValue;
 use safemlx_lm_core::{
     generation::{resolve_generation_config, FinishReason, SemanticEvent},
-    ModelKind, MtpCapability, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeGenerationOutput,
-    SpeculativeGenerationRequest,
+    DraftingPlan, ExternalDraftArtifact, ModelKind, MtpCapability, SpeculativeGenerationBackend,
+    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
+    SpeculativeGenerationOutput, SpeculativeGenerationRequest,
 };
 use safemlx_lm_utils::{
     gguf::GgufTokenizer,
@@ -19,7 +19,7 @@ use safemlx_lm_utils::{
 use serde::Serialize;
 
 use super::{
-    LoadedModel, LoadedTextModelConfig, PreparedChat, PreparedChatError,
+    LoadedModel, LoadedTextModelConfig, PlannedModel, PreparedChat, PreparedChatError,
     PreparedChatGenerationOutput, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
     PreparedChatInput, PreparedChatMtpBatchRequest, PreparedChatMtpError,
     PreparedChatMtpGenerationRequest, PreparedChatSpeculativeConstraint, TextDecoderError,
@@ -527,25 +527,52 @@ impl<B> LoadedModel<B>
 where
     B: safemlx_lm_core::TextGenerationBackend + safemlx_lm_core::ModelLoadingBackend,
 {
-    /// Realizes a portable execution plan and loads its artifact through the selected factory.
+    /// Realizes a complete portable execution plan through the selected factory.
     ///
     /// The factory owns device and queue construction plus translation to the
     /// backend's opaque load policy. Generic callers never construct backend
-    /// streams or inspect backend-specific load options.
+    /// streams, assistants, or backend-specific load options. The returned
+    /// [`PlannedModel`] owns the target and the plan's complete drafting mode.
     pub fn load_execution_plan<F>(
         factory: &F,
         artifact: impl AsRef<Path>,
         plan: &safemlx_lm_core::ExecutionPlan,
-    ) -> Result<Self, PlannedModelLoadError<B::Error>>
+    ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError<B::Error>>
     where
         F: safemlx_lm_core::ExecutionPlanBackendFactory<Backend = B>,
     {
-        let realization = safemlx_lm_core::realize_execution_plan(factory, plan)?;
+        let artifact = artifact.as_ref();
+        let inspection =
+            safemlx_lm_core::inspect_artifact(artifact).map_err(LoadedModelLoadError::Artifact)?;
+        let (tokenizer, config) =
+            loaded_text_artifact(&inspection).map_err(LoadedModelLoadError::Metadata)?;
+        let target_tokenizer_fingerprint =
+            safemlx_lm_utils::tokenizer::vocabulary_fingerprint(&tokenizer);
+        let external_artifact = match &plan.drafting {
+            DraftingPlan::External { model, .. } => {
+                let draft_tokenizer = super::load_tokenizer(Path::new(model))
+                    .map_err(LoadedModelLoadError::Metadata)?;
+                Some(ExternalDraftArtifact {
+                    target_tokenizer_fingerprint,
+                    draft_tokenizer_fingerprint:
+                        safemlx_lm_utils::tokenizer::vocabulary_fingerprint(&draft_tokenizer),
+                })
+            }
+            DraftingPlan::Disabled | DraftingPlan::Embedded { .. } => None,
+        };
+        let realization = safemlx_lm_core::realize_execution_plan_target(factory, plan)?;
         let (backend, options) = realization.into_parts();
-        Self::load(backend, artifact, options).map_err(PlannedModelLoadError::Loading)
+        let model = Self::from_inspected(backend, inspection, options, tokenizer, config)?;
+        let drafting = safemlx_lm_core::realize_execution_plan_drafting(
+            factory,
+            plan,
+            model.runtime(),
+            external_artifact,
+        )?;
+        Ok(PlannedModel::new(model, drafting))
     }
 
-    /// Plans and loads one artifact without exposing backend construction or load policy.
+    /// Plans and loads one complete model session without exposing backend construction.
     ///
     /// The returned report is the exact portable plan used to realize the
     /// backend and remains suitable for persistence and execution telemetry.
@@ -553,7 +580,13 @@ where
         factory: &F,
         planner: &safemlx_lm_core::AutomaticPlanner,
         request: &safemlx_lm_core::AutomaticPlanRequest,
-    ) -> Result<(Self, safemlx_lm_core::ExecutionPlanReport), PlannedModelLoadError<B::Error>>
+    ) -> Result<
+        (
+            PlannedModel<B, F::Drafter>,
+            safemlx_lm_core::ExecutionPlanReport,
+        ),
+        PlannedModelLoadError<B::Error>,
+    >
     where
         F: safemlx_lm_core::ExecutionPlanBackendFactory<Backend = B>,
     {
@@ -575,6 +608,16 @@ where
         let artifact = artifact.as_ref();
         let inspection = safemlx_lm_core::inspect_artifact(artifact)?;
         let (tokenizer, config) = loaded_text_artifact(&inspection)?;
+        Self::from_inspected(backend, inspection, options, tokenizer, config)
+    }
+
+    fn from_inspected(
+        backend: B,
+        inspection: safemlx_lm_core::ArtifactInspection,
+        options: B::LoadOptions,
+        tokenizer: ChatTokenizer,
+        config: LoadedTextModelConfig,
+    ) -> Result<Self, LoadedModelLoadError<B::Error>> {
         let prepared = match safemlx_lm_core::prepare_inspected_model(&backend, inspection, options)
         {
             Ok(prepared) => prepared,

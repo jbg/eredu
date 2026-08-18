@@ -71,6 +71,50 @@ struct MlxSpeculativeLaneRuntime<'a, C> {
 
 type MlxPreparedSampler<C> = ConstrainedSampler<GenerationSampler, C>;
 
+pub(crate) fn validate_external_drafter(
+    runtime: &ModelRuntime<MlxBackend<'_>>,
+    target_tokenizer_fingerprint: [u8; 32],
+    drafter: &MlxDrafter,
+) -> Result<(), Error> {
+    let model = runtime.session().complete_model();
+    match (model, drafter.kind()) {
+        (Model::Gemma4(target), MlxDrafterKind::Gemma4Assistant) => {
+            validate_gemma4_drafter(target.args(), drafter.gemma4())?
+        }
+        (Model::MuseGlimmer(target), MlxDrafterKind::MuseGlimmerDFlash) => {
+            let assistant = drafter.muse_glimmer();
+            let target_args = target.args();
+            if assistant.config.hidden_size != target_args.hidden_size
+                || assistant
+                    .config
+                    .target_layer_ids
+                    .iter()
+                    .any(|layer| *layer >= target_args.num_hidden_layers as usize)
+                || assistant.config.mask_token_id >= target_args.vocab_size as u32
+                || assistant.config.block_size != 16
+            {
+                return Err(Error::UnsupportedArchitecture(
+                    "Muse-Glimmer DFlash hidden geometry, layer mapping, mask token, or block size does not match the target"
+                        .into(),
+                ));
+            }
+        }
+        (model, kind) => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "drafter {kind:?} is incompatible with target {} ({:?})",
+                model.model_type(),
+                model.mtp_capability()
+            )))
+        }
+    }
+    if drafter.tokenizer_fingerprint() != target_tokenizer_fingerprint {
+        return Err(Error::UnsupportedArchitecture(
+            "assistant token-id vocabulary mapping does not match the target".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn run_speculative_batch<'a, B, C>(
     backend: &'a mut B,
     lanes: Vec<MlxSpeculativeLaneRuntime<'a, C>>,
@@ -195,10 +239,6 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         }
     }
 
-    fn model(&self) -> &Model {
-        self.runtime.session().complete_model()
-    }
-
     fn model_and_cache(&mut self) -> (&mut Model, &mut ModelCache) {
         self.runtime.session_mut().complete_parts_mut()
     }
@@ -227,42 +267,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     /// and the token-id vocabulary mapping when the drafter carries tokenizer
     /// metadata.
     fn validate_drafter_compatibility(&self, drafter: &MlxDrafter) -> Result<(), Error> {
-        match (self.model(), drafter.kind()) {
-            (Model::Gemma4(target), MlxDrafterKind::Gemma4Assistant) => {
-                validate_gemma4_drafter(target.args(), drafter.gemma4())?
-            }
-            (Model::MuseGlimmer(target), MlxDrafterKind::MuseGlimmerDFlash) => {
-                let assistant = drafter.muse_glimmer();
-                let target_args = target.args();
-                if assistant.config.hidden_size != target_args.hidden_size
-                    || assistant
-                        .config
-                        .target_layer_ids
-                        .iter()
-                        .any(|layer| *layer >= target_args.num_hidden_layers as usize)
-                    || assistant.config.mask_token_id >= target_args.vocab_size as u32
-                    || assistant.config.block_size != 16
-                {
-                    return Err(Error::UnsupportedArchitecture(
-                    "Muse-Glimmer DFlash hidden geometry, layer mapping, mask token, or block size does not match the target"
-                        .into(),
-                ));
-                }
-            }
-            (model, kind) => {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "drafter {kind:?} is incompatible with target {} ({:?})",
-                    model.model_type(),
-                    model.mtp_capability()
-                )))
-            }
-        }
-        if drafter.tokenizer_fingerprint() != self.tokenizer_fingerprint {
-            return Err(Error::UnsupportedArchitecture(
-                "assistant token-id vocabulary mapping does not match the target".into(),
-            ));
-        }
-        Ok(())
+        validate_external_drafter(self.runtime, self.tokenizer_fingerprint, drafter)
     }
 
     fn prepare_speculative_batch_lanes<'a, C>(

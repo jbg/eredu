@@ -1,7 +1,7 @@
 use safemlx_lm::{
-    backend::mlx::automatic::MlxBackendFactory, realize_execution_plan, AutomaticPlanRequest,
-    AutomaticPlanner, AutomaticPlannerPolicy, Backend, DevicePlan, ExecutionPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    backend::mlx::automatic::MlxBackendFactory, core::realize_execution_plan_target,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, Backend, DevicePlan,
+    ExecutionPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 
 #[test]
@@ -21,7 +21,7 @@ fn portable_planner_realizes_an_owned_mlx_backend() {
     assert_eq!(decoded, request);
 
     let plan = ExecutionPlan::fully_resident(device);
-    let realization = realize_execution_plan(&MlxBackendFactory::default(), &plan).unwrap();
+    let realization = realize_execution_plan_target(&MlxBackendFactory::default(), &plan).unwrap();
     let (backend, _) = realization.into_parts();
     assert_eq!(backend.descriptor().name, "mlx");
     assert_eq!(backend.devices().unwrap()[0].0.id, "cpu:0");
