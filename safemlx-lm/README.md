@@ -38,7 +38,9 @@ safemlx-lm = "0.4"
 
 Enable `image-processing` when the application wants the built-in image
 preprocessing path. Enable `cuda` for an MLX CUDA build on a supported Linux or
-Windows host.
+Windows host. Tokenization always has the portable pure-Rust `fancy-regex`
+engine available, including under `--no-default-features`; default builds also
+enable Oniguruma and select it as the faster tokenizer regex implementation.
 
 ## Inspect before loading
 

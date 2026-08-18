@@ -15,9 +15,10 @@ runtime.
 safemlx-lm-utils = "0.1"
 ```
 
-Default features enable the Oniguruma and fast SentencePiece-compatible
-tokenizer paths. Consult the crate features in `Cargo.toml` when a smaller or
-more portable build is required.
+The portable pure-Rust `fancy-regex` tokenizer engine is always available, so
+`--no-default-features` is a valid configuration. Default features additionally
+enable Oniguruma (which the tokenizer selects when both engines are present)
+and the fast SentencePiece-compatible path.
 
 ## License
 
