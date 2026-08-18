@@ -15,6 +15,13 @@ backend and session once, and submits prefill/decode without exposing an
 executable or cache. The same generic client code is exercised by the core mock
 backend and the production MLX adapter.
 
+`load_model(&backend, artifact, options)` is the canonical artifact entry
+point. `ModelLoadingBackend` supplies only policy resolution and conversion of
+the neutral `ModelPreparationPlan` into its associated model configuration.
+The selected backend instance owns devices, queues, and communication state;
+generic caller code never passes a native stream or chooses an architecture
+loader. `ModelRuntime::load` combines this operation with session creation.
+
 Core owns the production weight-residency policy and ownership state machine,
 not a parallel summary schema. `OffloadPlan` validates stable unit identities,
 tier assignments, budgets, prefetch depth, and eviction policy.

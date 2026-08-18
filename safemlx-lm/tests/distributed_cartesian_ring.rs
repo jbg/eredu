@@ -111,7 +111,7 @@ fn cartesian_ring_worker() {
     // TP+PP: TP groups are [0, 1] and [2, 3]; pipeline lanes are [0, 2]
     // and [1, 3]. Both axes are logical subgroups under Ring.
     {
-        let execution = MlxBackend::new(&stream)
+        let execution = MlxBackend::new(&stream, &stream)
             .communication_for_topology(topology(expected_rank, 2, 2, 1), &world)
             .unwrap();
         let input = scalar(expected_rank as i32 + 1);
@@ -145,7 +145,7 @@ fn cartesian_ring_worker() {
 
     // TP+EP: TP groups are [0, 2] and [1, 3]; EP groups are [0, 1] and [2, 3].
     {
-        let execution = MlxBackend::new(&stream)
+        let execution = MlxBackend::new(&stream, &stream)
             .communication_for_topology(topology(expected_rank, 2, 1, 2), &world)
             .unwrap();
         let input = scalar(expected_rank as i32 + 1);
@@ -213,7 +213,7 @@ fn cartesian_ring_worker() {
 
     // PP+EP: stage-local EP reduction followed by matching-EP pipeline transport.
     {
-        let execution = MlxBackend::new(&stream)
+        let execution = MlxBackend::new(&stream, &stream)
             .communication_for_topology(topology(expected_rank, 1, 2, 2), &world)
             .unwrap();
         let input = scalar(expected_rank as i32 + 1);
@@ -268,7 +268,7 @@ fn cartesian_triple_ring_worker() {
     )
     .unwrap();
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let execution = MlxBackend::new(&stream)
+    let execution = MlxBackend::new(&stream, &stream)
         .communication_for_topology(topology, &world)
         .unwrap();
     let input = scalar(expected_rank as i32 + 1);

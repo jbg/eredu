@@ -113,7 +113,7 @@ pub(crate) fn ensure_replicated_load_options(options: ModelLoadOptions) -> Resul
         .is_some_and(|topology| !topology.is_replicated())
     {
         return Err(Error::Parallel(
-            "this facade owns replicated runtime state; use load_model_with_options and create an MlxModelSession for distributed execution"
+            "this facade owns replicated runtime state; load through a distributed MlxBackend and create its MlxModelSession"
                 .into(),
         ));
     }

@@ -8820,7 +8820,8 @@ mod tests {
         )
         .unwrap();
 
-        let model = crate::api::load_model(&dir, stream, weights_ctx.stream())
+        let backend = crate::MlxBackend::new(stream, weights_ctx.stream());
+        let model = crate::load_model(&backend, &dir, crate::ModelLoadOptions::default())
             .unwrap()
             .into_inner()
             .into_complete()
@@ -8869,13 +8870,12 @@ mod tests {
         assert_eq!(stats.rounds, 1);
         assert_eq!(stats.accepted_tokens, 1);
 
-        let quantized = crate::api::load_model_with_options(
+        let quantized = crate::load_model(
+            &backend,
             &dir,
             crate::api::ModelLoadOptions::with_quantization(
                 AffineQuantization::new(32, 4).unwrap(),
             ),
-            stream,
-            weights_ctx.stream(),
         )
         .unwrap()
         .into_inner()

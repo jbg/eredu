@@ -32,13 +32,14 @@ pub use safemlx_lm_core::generation::{
     ResolvedGenerationConfig, SemanticEvent,
 };
 pub use safemlx_lm_core::{
-    Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession, CollectiveScope,
-    Completion, ControlledTextGeneration, ControlledTextGenerationError, ControlledToken,
-    DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
-    DistributedSessionDescriptor, ModelRuntime, MtpCapability, MtpCheckpointKind, ParallelAxis,
-    ParallelCoordinates, ParallelRankTopology, ParallelTopology, PreparedModel, SubgroupMembership,
-    Submission, TextGeneration, TextGenerationBackend, TextGenerationConfig, TokenFilter,
-    TokenFilterController, TokenFilterError, TokenOutput, TopologyPreflightReport, ValueDescriptor,
+    load_model, Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession,
+    CollectiveScope, Completion, ControlledTextGeneration, ControlledTextGenerationError,
+    ControlledToken, DeviceDescriptor, DistributedBackend, DistributedCapabilities,
+    DistributedSession, DistributedSessionDescriptor, ModelLoadingBackend, ModelRuntime,
+    MtpCapability, MtpCheckpointKind, ParallelAxis, ParallelCoordinates, ParallelRankTopology,
+    ParallelTopology, PreparedModel, SubgroupMembership, Submission, TextGeneration,
+    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenFilterController,
+    TokenFilterError, TokenOutput, TopologyPreflightReport, ValueDescriptor,
 };
 #[cfg(test)]
 mod test_utils;
@@ -75,17 +76,17 @@ pub use api::realtime::{
     RealtimeSchedulerCapabilities, RealtimeSchedulerReport, RealtimeSession, RealtimeSpeechConfig,
 };
 pub use api::{
-    discover_hardware, execution_plan_load_options, inspect_model, load_model,
-    load_model_with_options, plan_automatic_execution, AllocatorTelemetry, ArtifactKind,
-    ArtifactModality, ArtifactTensorEncoding, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlannerPolicy, BackendId, DevicePlan, DraftPlacementPlan, DraftingPlan,
-    DurationSeconds, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
-    ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
-    HardwareProfile, InspectionIssue, InspectionIssueCode, InspectionReadiness,
-    InspectionRequirement, InspectionSeverity, ModelInspectionOptions, ModelInspectionReport,
-    ModelLoadOptions, ModelResourceProfile, ObservationKind, Observed, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry, TimingTelemetry,
-    TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
+    AllocatorTelemetry, ArtifactKind, ArtifactModality, ArtifactTensorEncoding,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, BackendId, DevicePlan,
+    DraftPlacementPlan, DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport,
+    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
+    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InspectionIssue,
+    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
+    ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions, ModelResourceProfile,
+    ObservationKind, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
+    ResidencyPlan, ResidencyTelemetry, TimingTelemetry, TransferTelemetry,
+    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
 pub use backend::mlx::realtime::{

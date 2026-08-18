@@ -1,9 +1,13 @@
 //! High-level contract implemented once per execution backend.
 
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use std::{fmt::Debug, path::Path};
 
 use crate::{
+    artifact::{
+        inspect_artifact, plan_model_preparation, ArtifactError, ModelPreparationPlan,
+        PreparationPolicy,
+    },
     checkpoint::TensorDtype,
     generation::ResolvedGenerationConfig,
     topology::{ParallelAxis, ParallelTopology},
@@ -268,6 +272,53 @@ pub trait Backend: Sized {
     ) -> Result<Self::Session, Self::Error>;
 }
 
+/// Artifact-loading extension for a selected whole-model backend.
+///
+/// Core owns checkpoint inspection and preparation planning. Implementations
+/// translate the resulting neutral plan and their associated load options into
+/// the backend's concrete [`Backend::ModelConfig`]. Tensor materialization
+/// remains entirely inside [`Backend::prepare_model`].
+pub trait ModelLoadingBackend: Backend
+where
+    Self::Error: From<ArtifactError>,
+{
+    /// Backend load policy exposed to a generic caller.
+    type LoadOptions;
+
+    /// Resolves backend options into the policy used during neutral planning.
+    fn preparation_policy(
+        &self,
+        options: &Self::LoadOptions,
+    ) -> Result<PreparationPolicy, Self::Error>;
+
+    /// Binds a neutral preparation plan to backend-owned materialization input.
+    fn model_config(
+        &self,
+        plan: ModelPreparationPlan,
+        options: Self::LoadOptions,
+    ) -> Result<Self::ModelConfig, Self::Error>;
+}
+
+/// Inspects, plans, and prepares one artifact on the selected backend.
+///
+/// This is the sole generic artifact-loading entry point. The backend instance
+/// already owns its device, execution queues, transfer queues, and optional
+/// distributed communication state; none are passed separately to loading.
+pub fn load_model<B: ModelLoadingBackend>(
+    backend: &B,
+    artifact: impl AsRef<Path>,
+    options: B::LoadOptions,
+) -> Result<PreparedModel<B::Model>, B::Error>
+where
+    B::Error: From<ArtifactError>,
+{
+    let inspection = inspect_artifact(artifact)?;
+    let policy = backend.preparation_policy(&options)?;
+    let plan = plan_model_preparation(inspection, policy)?;
+    let config = backend.model_config(plan, options)?;
+    backend.prepare_model(config)
+}
+
 /// Prefill/decode interface for an already selected backend session.
 ///
 /// The session owns its prepared executable and cache. The contract
@@ -369,6 +420,21 @@ impl<B: Backend> ModelRuntime<B> {
         B::Error,
     > {
         self.session.decode(&self.backend, input)
+    }
+}
+
+impl<B: ModelLoadingBackend> ModelRuntime<B>
+where
+    B::Error: From<ArtifactError>,
+{
+    /// Loads an artifact and creates its sole session on `backend`.
+    pub fn load(
+        backend: B,
+        artifact: impl AsRef<Path>,
+        options: B::LoadOptions,
+    ) -> Result<Self, B::Error> {
+        let model = load_model(&backend, artifact, options)?;
+        Self::from_prepared(backend, model)
     }
 }
 
@@ -889,7 +955,7 @@ pub trait DistributedBackend: Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::Infallible;
+    use std::{convert::Infallible, io::Write};
 
     #[derive(Debug, Clone, Copy)]
     struct Done;
@@ -927,6 +993,124 @@ mod tests {
                 distributed: None,
             })
         }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum LoadingMockError {
+        #[error(transparent)]
+        Artifact(#[from] ArtifactError),
+    }
+
+    struct LoadingMock;
+    struct LoadingMockSession;
+
+    impl Backend for LoadingMock {
+        type ModelConfig = (ModelPreparationPlan, u32);
+        type Model = u32;
+        type Session = LoadingMockSession;
+        type Error = LoadingMockError;
+
+        fn descriptor(&self) -> BackendDescriptor {
+            BackendDescriptor {
+                name: "loading-mock".into(),
+                version: "1".into(),
+            }
+        }
+
+        fn devices(&self) -> Result<Vec<(DeviceDescriptor, BackendCapabilities)>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn prepare_model(
+            &self,
+            (plan, model): Self::ModelConfig,
+        ) -> Result<PreparedModel<Self::Model>, Self::Error> {
+            assert_eq!(
+                plan.inspection().configuration().kind,
+                crate::ModelKind::Llama
+            );
+            Ok(PreparedModel::new(model))
+        }
+
+        fn create_session(
+            &self,
+            _: PreparedModel<Self::Model>,
+        ) -> Result<Self::Session, Self::Error> {
+            Ok(LoadingMockSession)
+        }
+    }
+
+    impl BackendSession<LoadingMock> for LoadingMockSession {
+        type PrefillInput = ();
+        type DecodeInput = ();
+        type Output = ();
+        type Completion = LoadingDone;
+
+        fn prefill(
+            &mut self,
+            _: &LoadingMock,
+            _: (),
+        ) -> Result<Submission<(), LoadingDone>, LoadingMockError> {
+            Ok(Submission {
+                output: (),
+                completion: LoadingDone,
+            })
+        }
+
+        fn decode(
+            &mut self,
+            _: &LoadingMock,
+            _: (),
+        ) -> Result<Submission<(), LoadingDone>, LoadingMockError> {
+            Ok(Submission {
+                output: (),
+                completion: LoadingDone,
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct LoadingDone;
+
+    impl Completion for LoadingDone {
+        type Error = LoadingMockError;
+
+        fn is_complete(&self) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        fn wait(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl ModelLoadingBackend for LoadingMock {
+        type LoadOptions = u32;
+
+        fn preparation_policy(
+            &self,
+            _: &Self::LoadOptions,
+        ) -> Result<PreparationPolicy, Self::Error> {
+            Ok(PreparationPolicy::default())
+        }
+
+        fn model_config(
+            &self,
+            plan: ModelPreparationPlan,
+            options: Self::LoadOptions,
+        ) -> Result<Self::ModelConfig, Self::Error> {
+            Ok((plan, options))
+        }
+    }
+
+    fn write_loading_fixture(root: &Path) {
+        std::fs::write(root.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        let header = br#"{"token_embd.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut file = std::fs::File::create(root.join("model.safetensors")).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header).unwrap();
+        file.write_all(&[0; 4]).unwrap();
     }
     struct MockSession {
         model: u32,
@@ -1021,6 +1205,17 @@ mod tests {
                     .map(|token| token as u32)
             })
             .expect("validated token filters allow at least one token")
+    }
+
+    #[test]
+    fn generic_loader_inspects_plans_and_prepares_on_the_selected_backend() {
+        let root = tempfile::tempdir().unwrap();
+        write_loading_fixture(root.path());
+        let prepared = load_model(&LoadingMock, root.path(), 41).unwrap();
+        assert_eq!(*prepared, 41);
+
+        let runtime = ModelRuntime::load(LoadingMock, root.path(), 7).unwrap();
+        assert_eq!(runtime.backend().descriptor().name, "loading-mock");
     }
 
     struct FixedController {

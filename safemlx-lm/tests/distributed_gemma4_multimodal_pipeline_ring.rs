@@ -694,7 +694,7 @@ fn gemma4_multimodal_pipeline_ring_worker() {
         &stream,
     )
     .unwrap();
-    let execution = MlxBackend::new(&stream)
+    let execution = MlxBackend::new(&stream, &stream)
         .communication_for_topology(topology, &group)
         .unwrap();
     assert_eq!(

@@ -8680,16 +8680,12 @@ mod tests {
                 crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
             ),
         );
-        let mut loaded = crate::api::load_model_with_options(
-            &path,
-            options,
-            execution.stream(),
-            weights.stream(),
-        )
-        .unwrap()
-        .into_inner()
-        .into_complete()
-        .unwrap();
+        let backend = crate::MlxBackend::new(execution.stream(), weights.stream());
+        let mut loaded = crate::load_model(&backend, &path, options)
+            .unwrap()
+            .into_inner()
+            .into_complete()
+            .unwrap();
         let crate::api::Model::Gemma4(model) = &loaded else {
             panic!("expected Gemma 4 model");
         };

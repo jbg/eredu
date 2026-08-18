@@ -140,12 +140,14 @@ communicator.
 
 ## MLX mapping
 
-`api::load_model_with_options` first calls the core `inspect_artifact` and
-`plan_model_preparation` functions. The resulting `ModelPreparationPlan` owns
+The core `load_model` entry point operates on any selected
+`ModelLoadingBackend`. It calls `inspect_artifact` and
+`plan_model_preparation`, then asks that backend to bind the neutral plan to
+its associated load options. The resulting `ModelPreparationPlan` owns
 the resolved `ModelKind`, raw portable configuration, neutral tensor catalog,
 validated load-policy route, and—when applicable—the already-opened
-`safemlx_gguf::Checkpoint`. Only then is the plan passed to
-`MlxBackend::prepare_model`.
+`safemlx_gguf::Checkpoint`. Only then is the plan passed to the selected
+backend's `prepare_model` implementation.
 
 The MLX adapter's `loading` module is the sole materializer. It consumes the
 plan, performs exact architecture/module binding, creates MLX arrays and
@@ -154,6 +156,11 @@ semantics. It does not call back into the public facade loader. GGUF headers and
 metadata are not reopened: `GgufCheckpoint::from_portable` wraps the core-owned
 checkpoint for payload conversion. Combined model/tokenizer loading uses the
 same core plan; tokenizer and chat sidecars remain facade concerns.
+
+`MlxBackend` owns both its execution stream and its weight-materialization
+stream. Callers select MLX by constructing that backend and then use the same
+`load_model(&backend, artifact, options)` function used by another backend.
+There is no MLX-only loader that accepts loose streams alongside the artifact.
 
 `MlxBackend` maps session creation to `MlxModelSession`. The opaque `MlxModel`
 contains exactly one private MLX executable form: complete, pipeline stage, or
@@ -266,11 +273,10 @@ no embedded-only or architecture-specific generation loops, forwarding
 implementations differ only in model math, cache checkpoints, verification
 materialization, and exact completion ownership.
 
-The public `api::load_model_with_options` route performs format, architecture,
-catalog, and policy planning in core before calling `Backend::prepare_model`.
-It returns the resulting `PreparedModel<MlxModel>` rather than discarding the
-core preparation marker; `Backend::create_session` consumes that marker and
-the opaque model it proves was prepared by MLX.
+The public core `load_model` route performs format, architecture, catalog, and
+policy planning before calling the selected backend's `prepare_model`. Its
+return type is `PreparedModel<B::Model>`; `Backend::create_session` consumes
+that marker and the opaque model it proves was prepared by the chosen backend.
 `ModelLoadOptions::with_parallel` selects TP, PP, EP, or a supported Cartesian
 materialization through this same entry point. Architecture-specific
 distributed loaders and rank-local model types are private materializers, not

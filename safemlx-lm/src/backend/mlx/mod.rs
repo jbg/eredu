@@ -32,8 +32,8 @@ pub use topology::{DeviceAssignment, MlxParallelContext};
 
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
 use safemlx_lm_core::backend::{
-    Backend, BackendCapabilities, BackendDescriptor, Completion, DeviceDescriptor, PreparedModel,
-    Submission,
+    Backend, BackendCapabilities, BackendDescriptor, Completion, DeviceDescriptor,
+    ModelLoadingBackend, PreparedModel, Submission,
 };
 
 use crate::{
@@ -138,26 +138,26 @@ impl MlxModel {
 
 /// Request to prepare any facade-supported model on MLX.
 #[derive(Debug, Clone)]
-pub struct MlxModelConfig<'a> {
+pub struct MlxModelConfig {
     /// Backend-neutral inspected artifact and materialization route.
     pub plan: safemlx_lm_core::ModelPreparationPlan,
     /// MLX materialization details for the selected neutral route.
     pub options: ModelLoadOptions,
-    /// Stream used for checkpoint materialization and transfers.
-    pub weights_stream: &'a Stream,
 }
 
 /// MLX backend selected for a complete model/session.
 pub struct MlxBackend<'a> {
     stream: Stream,
+    weights_stream: Stream,
     world: Option<&'a safemlx::distributed::Group>,
 }
 
 impl MlxBackend<'static> {
-    /// Uses the selected session execution stream.
-    pub fn new(stream: &Stream) -> Self {
+    /// Uses the selected execution and weight-materialization streams.
+    pub fn new(stream: &Stream, weights_stream: &Stream) -> Self {
         Self {
             stream: stream.clone(),
+            weights_stream: weights_stream.clone(),
             world: None,
         }
     }
@@ -165,15 +165,25 @@ impl MlxBackend<'static> {
 
 impl<'a> MlxBackend<'a> {
     /// Selects MLX distributed communication for sessions created by this backend.
-    pub fn with_distributed_world(stream: &Stream, world: &'a safemlx::distributed::Group) -> Self {
+    pub fn with_distributed_world(
+        stream: &Stream,
+        weights_stream: &Stream,
+        world: &'a safemlx::distributed::Group,
+    ) -> Self {
         Self {
             stream: stream.clone(),
+            weights_stream: weights_stream.clone(),
             world: Some(world),
         }
     }
     /// Execution stream used by this backend instance.
     pub const fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    /// Checkpoint materialization and transfer stream owned by this backend.
+    pub const fn weights_stream(&self) -> &Stream {
+        &self.weights_stream
     }
 
     #[cfg(test)]
@@ -187,7 +197,7 @@ impl<'a> MlxBackend<'a> {
 }
 
 impl<'a> Backend for MlxBackend<'a> {
-    type ModelConfig = MlxModelConfig<'a>;
+    type ModelConfig = MlxModelConfig;
     type Model = MlxModel;
     type Session = MlxModelSession<'a>;
     type Error = Error;
@@ -229,7 +239,7 @@ impl<'a> Backend for MlxBackend<'a> {
             config.plan,
             config.options,
             &self.stream,
-            config.weights_stream,
+            &self.weights_stream,
         )
         .map(PreparedModel::new)
     }
@@ -254,6 +264,25 @@ impl<'a> Backend for MlxBackend<'a> {
             None => None,
         };
         MlxModelSession::from_model(model.into_inner(), distributed)
+    }
+}
+
+impl ModelLoadingBackend for MlxBackend<'_> {
+    type LoadOptions = ModelLoadOptions;
+
+    fn preparation_policy(
+        &self,
+        options: &Self::LoadOptions,
+    ) -> Result<safemlx_lm_core::PreparationPolicy, Self::Error> {
+        options.preparation_policy()
+    }
+
+    fn model_config(
+        &self,
+        plan: safemlx_lm_core::ModelPreparationPlan,
+        options: Self::LoadOptions,
+    ) -> Result<Self::ModelConfig, Self::Error> {
+        Ok(MlxModelConfig { plan, options })
     }
 }
 

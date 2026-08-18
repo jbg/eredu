@@ -316,8 +316,8 @@ impl GeneralizedTensorModel {
         let options = ModelLoadOptions::default()
             .with_parallel_topology(topology)
             .with_weight_residency(WeightResidency::with_layers(residency.load_options()));
-        let loaded =
-            safemlx_lm::load_model_with_options(checkpoint, options, stream, stream).unwrap();
+        let backend = MlxBackend::new(stream, stream);
+        let loaded = safemlx_lm::load_model(&backend, checkpoint, options).unwrap();
         assert_eq!(loaded.model_type(), family.model_type());
         Self(loaded)
     }
@@ -832,7 +832,7 @@ fn tensor_ring_worker() {
     } else {
         CacheResidencyPolicy::Paged(paged.clone())
     };
-    let backend = MlxBackend::with_distributed_world(&stream, &group);
+    let backend = MlxBackend::with_distributed_world(&stream, &stream, &group);
     let mut session = safemlx_lm::core::Backend::create_session(&backend, model.0).unwrap();
     session.configure_cache(cache_policy).unwrap();
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);

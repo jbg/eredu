@@ -2,7 +2,7 @@
 //!
 //! Use [`crate::api::LoadedModel`] when you want to load a model directory
 //! together with its tokenizer and chat template. Use
-//! [`crate::api::load_model`] and [`crate::api::load_tokenizer`] when you
+//! [`crate::load_model`] and [`crate::api::load_tokenizer`] when you
 //! want to manage those pieces separately.
 //! Ordinary generation is available for every `TextGenerationBackend`;
 //! prepared-chat speculative generation is available through the
@@ -322,39 +322,6 @@ pub use inspection::{
     InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
     ModelInspectionOptions, ModelInspectionReport,
 };
-
-/// Loads only the model weights and architecture from a model directory.
-pub fn load_model(
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<safemlx_lm_core::PreparedModel<crate::backend::mlx::MlxModel>, Error> {
-    load_model_with_options(
-        model_dir,
-        ModelLoadOptions::default(),
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads only the model weights and architecture using shared load options.
-pub fn load_model_with_options(
-    model_dir: impl AsRef<Path>,
-    options: ModelLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<safemlx_lm_core::PreparedModel<crate::backend::mlx::MlxModel>, Error> {
-    use safemlx_lm_core::Backend;
-    let inspection = safemlx_lm_core::inspect_artifact(model_dir.as_ref())?;
-    let plan = safemlx_lm_core::plan_model_preparation(inspection, options.preparation_policy()?)?;
-    crate::backend::mlx::MlxBackend::new(stream).prepare_model(
-        crate::backend::mlx::MlxModelConfig {
-            plan,
-            options,
-            weights_stream,
-        },
-    )
-}
 
 mod tokenizer;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer};

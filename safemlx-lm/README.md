@@ -58,20 +58,21 @@ if !report.is_loadable() {
 # Ok::<(), safemlx_lm::error::Error>(())
 ```
 
-Use the high-level `api` module for loading, prepared inputs, generation, cache
-creation, and memory admission. `safemlx_lm::load_model_with_options` is the
-single model-loading entry point for supported checkpoint formats and
-architectures. It first builds a backend-neutral `ModelPreparationPlan` in
+Use the high-level `api` module for prepared inputs, generation, cache
+creation, and memory admission. `safemlx_lm::load_model` is the single generic
+model-loading entry point for supported checkpoint formats, architectures, and
+execution backends. The caller passes the selected backend plus its associated
+load options. Core first builds a backend-neutral `ModelPreparationPlan` from
 `safemlx-lm-core`: format detection, model-family resolution,
 SafeTensors/GGUF header catalogs, and load-route validation happen without
-MLX. The selected MLX backend then consumes that plan to map payloads and
-construct executable arrays/modules; it never calls back into the public
-facade loader.
+MLX. The selected backend then consumes that plan. `MlxBackend` owns its
+execution and weight-materialization streams and maps payloads into executable
+MLX arrays/modules; streams are not separate loader arguments.
 Replicated, tensor-, pipeline-, and expert-parallel prefill/decode execution
 crosses the single stateful `MlxModelSession` implementation of the core
-session contract. `load_model_with_options` always returns a
-`PreparedModel<MlxModel>`; the preparation marker is required when creating a
-session and is consumed by that operation, while its opaque MLX model selects
+session contract. `load_model(&backend, artifact, options)` returns a
+`PreparedModel<B::Model>`; the preparation marker is required when creating a
+session and is consumed by that operation. For MLX, the opaque model selects
 complete-model, rank-local pipeline, or rank-local expert materialization
 inside the adapter. The session
 owns that model, the matching cache state, and its optional distributed

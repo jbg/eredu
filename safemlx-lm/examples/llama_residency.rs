@@ -8,7 +8,7 @@ use safemlx_lm::{
     architectures::llama::model as llama,
     core::residency::{MemoryTier, OffloadConfig, TransferDirection},
     core::{Backend as _, BackendSession as _},
-    load_model_with_options,
+    load_model,
     runtime::execution::layerwise::LayerwiseLoadOptions,
     runtime::media::input,
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
@@ -98,18 +98,17 @@ fn main() -> anyhow::Result<()> {
         };
         WeightResidency::layerwise_host(layerwise)
     };
-    let model = load_model_with_options(
+    let backend = MlxBackend::new(stream, weights.stream());
+    let model = load_model(
+        &backend,
         &args.model_dir,
         ModelLoadOptions::default().with_weight_residency(weight_residency),
-        stream,
-        weights.stream(),
     )?;
     anyhow::ensure!(
         model.model_type() == "llama",
         "the Llama residency benchmark requires a Llama-compatible checkpoint, got {}",
         model.model_type()
     );
-    let backend = MlxBackend::new(stream);
     let mut session = backend.create_session(model)?;
 
     if let Some(report) = session.dense_stream_report()? {

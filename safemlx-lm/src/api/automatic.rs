@@ -14,9 +14,8 @@ use safemlx::{Device, DeviceType, Stream};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    available_memory, inspect_model, load_model_with_options, ArtifactKind, CapabilityValue,
-    InspectionSeverity, ModelInspectionOptions, ModelKind, ModelLoadOptions,
-    PhysicalMemorySemantics,
+    available_memory, inspect_model, ArtifactKind, CapabilityValue, InspectionSeverity,
+    ModelInspectionOptions, ModelKind, ModelLoadOptions, PhysicalMemorySemantics,
 };
 use crate::runtime::{
     checkpoint::quantization::{AffineQuantization, WeightQuantization},
@@ -993,12 +992,8 @@ fn probe_automatic_bounded_requirement(
     }
     let stream = Stream::new_with_device(&automatic_probe_device(&probe.device)?);
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    match load_model_with_options(
-        model_path,
-        execution_plan_load_options(&probe)?,
-        &stream,
-        &weights_stream,
-    ) {
+    let backend = crate::MlxBackend::new(&stream, &weights_stream);
+    match crate::load_model(&backend, model_path, execution_plan_load_options(&probe)?) {
         Err(Error::LayerwiseModel(LayerwiseModelError::DeviceBudgetTooSmall {
             static_bytes,
             window_bytes,

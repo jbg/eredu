@@ -6,7 +6,7 @@ use safemlx::{
 };
 use safemlx_lm::{
     core::{Backend as _, BackendSession as _},
-    load_model_with_options,
+    load_model,
     runtime::{generation::sampler::DefaultSampler, media::input},
     DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions,
 };
@@ -29,13 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let model = load_model_with_options(
+    let backend = MlxBackend::with_distributed_world(&stream, &weights_stream, &group);
+    let model = load_model(
+        &backend,
         &model_dir,
         ModelLoadOptions::with_parallel(topology),
-        &stream,
-        &weights_stream,
     )?;
-    let backend = MlxBackend::with_distributed_world(&stream, &group);
     let mut session = backend.create_session(model)?;
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let parts = [input::InputPart::text_token_ids(&prompt)];

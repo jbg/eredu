@@ -6410,11 +6410,11 @@ mod tests {
         save_zero_checkpoint(&source, fixture.path(), stream);
 
         let expected_topology = rank_one_topology();
-        let generic = crate::api::load_model_with_options(
+        let backend = crate::MlxBackend::new(stream, weights_stream);
+        let generic = crate::load_model(
+            &backend,
             fixture.path(),
             ModelLoadOptions::with_parallel(expected_topology),
-            stream,
-            weights_stream,
         )
         .unwrap();
         assert_eq!(generic.topology(), Some(expected_topology));

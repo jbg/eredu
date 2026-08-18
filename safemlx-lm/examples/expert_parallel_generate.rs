@@ -7,7 +7,7 @@ use safemlx::{
 use safemlx_lm::{
     api::ModelLoadOptions,
     core::{Backend as _, BackendSession as _},
-    load_model_with_options,
+    load_model,
     runtime::residency::expert_cache::ExpertCacheLoadOptions,
     runtime::{generation::sampler::DefaultSampler, media::input},
     DeviceAssignment, MlxBackend, MlxParallelContext, WeightResidency,
@@ -37,12 +37,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ExpertCacheLoadOptions::default(),
         ),
     );
-    let model = load_model_with_options(&model_dir, options, &stream, &weights_stream)?;
+    let backend = MlxBackend::with_distributed_world(&stream, &weights_stream, &group);
+    let model = load_model(&backend, &model_dir, options)?;
     if group.rank() == 0 {
         eprintln!("loaded {} with EP={}", model.model_type(), group.size());
     }
 
-    let backend = MlxBackend::with_distributed_world(&stream, &group);
     let mut session = backend.create_session(model)?;
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let parts = [input::InputPart::text_token_ids(&prompt)];

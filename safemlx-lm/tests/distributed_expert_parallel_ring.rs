@@ -37,7 +37,7 @@ use safemlx_lm::{
         nemotron_h::model as nemotron_h,
         qwen::{dense as dense_qwen, hybrid::qwen3_5, vl::model as qwen3_vl},
     },
-    load_model_with_options,
+    load_model,
     runtime::cache::{ConcatKeyValueCache, SlidingKeyValueCache},
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
@@ -215,8 +215,8 @@ fn expert_parallel_model_ring_worker() {
         };
     }
     if assignment_kind == "opaque-session" {
-        let model = load_model_with_options(&checkpoint, options, stream, weights_stream).unwrap();
-        let backend = MlxBackend::with_distributed_world(stream, &group);
+        let backend = MlxBackend::with_distributed_world(stream, weights_stream, &group);
+        let model = load_model(&backend, &checkpoint, options).unwrap();
         let mut session = backend.create_session(model).unwrap();
         let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
         let parts = [runtime_input::InputPart::text_token_ids(&prompt)];
@@ -307,7 +307,7 @@ fn expert_parallel_model_ring_worker() {
             .map(|(name, value)| (name, value.copy(stream).unwrap()))
             .collect::<HashMap<_, _>>();
     let _profiling = profile_expert_parallel_timings();
-    let execution = MlxBackend::new(&stream)
+    let execution = MlxBackend::new(&stream, &stream)
         .communication_for_topology(topology, &group)
         .unwrap();
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);

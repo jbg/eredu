@@ -1825,7 +1825,7 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
             let model_type = model.model_type().to_owned();
             let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
-                crate::backend::mlx::MlxBackend::new(stream),
+                crate::backend::mlx::MlxBackend::new(stream, weights_stream),
                 safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(model)),
             )?;
             #[cfg(feature = "media-processing")]
@@ -1863,10 +1863,10 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 "PersonaPlex is a realtime speech-to-speech token model; use architectures::moshi::personaplex instead of LoadedModel".into(),
             ));
         }
-        let model = load_model_with_options(model_dir, options, stream, weights_stream)?;
-        let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
-            crate::backend::mlx::MlxBackend::new(stream),
-            model,
+        let runtime = safemlx_lm_core::ModelRuntime::load(
+            crate::backend::mlx::MlxBackend::new(stream, weights_stream),
+            model_dir,
+            options,
         )?;
         #[cfg(feature = "media-processing")]
         let runtime = {

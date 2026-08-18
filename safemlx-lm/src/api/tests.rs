@@ -1,6 +1,6 @@
 use super::{
     chat_template_kwargs, eos_token_ids_from_sidecar_dir, gguf_eos_token_ids,
-    inspect_chat_template_kwargs, load_chat_template, load_model_with_options, load_tokenizer,
+    inspect_chat_template_kwargs, load_chat_template, load_tokenizer,
     load_tokenizer_template_kwargs, merge_eos_token_id_sources, prepare_chat_from_parts,
     resolve_model_config, validate_gguf_quantization_source, with_prepared_chat_runtime,
     LoadedModel, ModelLoadOptions, PreparedChatDraft, PreparedChatInput,
@@ -41,6 +41,17 @@ use std::{
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
 static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn load_test_model(
+    path: impl AsRef<std::path::Path>,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<crate::PreparedModel<crate::backend::mlx::MlxModel>, Error> {
+    let backend = crate::MlxBackend::new(stream, weights_stream);
+    crate::load_model(&backend, path, options)
+}
+
 const QWEN25_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
 const QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
@@ -752,17 +763,18 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     let qwen = super::qwen3_5::Model::new(args, None, None, None, stream).unwrap();
     let directory = temp_model_dir(&config.to_string());
     save_zero_checkpoint(&qwen, &directory, stream);
-    let super::Model::Qwen35(qwen) = super::load_model(&directory, stream, stream)
-        .unwrap()
-        .into_inner()
-        .into_complete()
-        .unwrap()
+    let super::Model::Qwen35(qwen) =
+        load_test_model(&directory, ModelLoadOptions::default(), stream, stream)
+            .unwrap()
+            .into_inner()
+            .into_complete()
+            .unwrap()
     else {
         panic!("expected canonical Qwen3.5 model");
     };
     let tokenizer_fingerprint = super::tokenizer_vocabulary_fingerprint(&tokenizer);
     let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
-        crate::backend::mlx::MlxBackend::new(stream),
+        crate::backend::mlx::MlxBackend::new(stream, stream),
         safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(
             super::Model::Qwen35(qwen),
         )),
@@ -4618,7 +4630,7 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
     for residency in policies {
         let options =
             ModelLoadOptions::with_quantization(quantization).with_weight_residency(residency);
-        let mut loaded = load_model_with_options(&path, options, stream, weights_stream)
+        let mut loaded = load_test_model(&path, options, stream, weights_stream)
             .unwrap()
             .into_inner()
             .into_complete()
@@ -4789,12 +4801,12 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
             WeightQuantization::MxFp4,
         ] {
             let mut dense =
-                load_model_with_options(&dir, ModelLoadOptions::default(), stream, weights_stream)
+                load_test_model(&dir, ModelLoadOptions::default(), stream, weights_stream)
                     .unwrap()
                     .into_inner()
                     .into_complete()
                     .unwrap();
-            let mut quantized = load_model_with_options(
+            let mut quantized = load_test_model(
                 &dir,
                 ModelLoadOptions::with_quantization(quantization),
                 stream,
@@ -4820,7 +4832,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 stream,
             )
             .unwrap();
-            let mut saved_quantized = load_model_with_options(
+            let mut saved_quantized = load_test_model(
                 &saved_dir,
                 ModelLoadOptions::with_quantization(quantization),
                 stream,
@@ -4919,7 +4931,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 }
 
                 let mut runtime = safemlx_lm_core::ModelRuntime::from_prepared(
-                    crate::backend::mlx::MlxBackend::new(stream),
+                    crate::backend::mlx::MlxBackend::new(stream, stream),
                     safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(
                         dense,
                     )),
@@ -4968,7 +4980,7 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
         stream,
     );
 
-    let model = load_model_with_options(
+    let model = load_test_model(
         &dir,
         ModelLoadOptions::with_quantization(WeightQuantization::MxFp4),
         stream,
@@ -5022,7 +5034,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     );
 
     let quantization = WeightQuantization::MxFp4;
-    let mut quantized = load_model_with_options(
+    let mut quantized = load_test_model(
         &dir,
         ModelLoadOptions::with_quantization(quantization),
         stream,
@@ -5070,7 +5082,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
         stream,
     )
     .unwrap();
-    let saved_quantized = load_model_with_options(
+    let saved_quantized = load_test_model(
         &saved_dir,
         ModelLoadOptions::with_quantization(quantization),
         stream,
@@ -5153,13 +5165,12 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
         stream,
     );
 
-    let mut dense =
-        load_model_with_options(&dir, ModelLoadOptions::default(), stream, weights_stream)
-            .unwrap()
-            .into_inner()
-            .into_complete()
-            .unwrap();
-    let mut quantized = load_model_with_options(
+    let mut dense = load_test_model(&dir, ModelLoadOptions::default(), stream, weights_stream)
+        .unwrap()
+        .into_inner()
+        .into_complete()
+        .unwrap();
+    let mut quantized = load_test_model(
         &dir,
         ModelLoadOptions::with_quantization(WeightQuantization::MxFp4),
         stream,

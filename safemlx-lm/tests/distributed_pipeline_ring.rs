@@ -31,7 +31,7 @@ use safemlx_lm::{
         qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen_hybrid},
     },
     core::{residency::OffloadConfig, Backend as _, BackendSession as _},
-    load_model_with_options,
+    load_model,
     runtime::generation::sampler::DefaultSampler,
     runtime::{
         checkpoint::binding::canonical_checkpoint_name,
@@ -327,14 +327,13 @@ fn pipeline_ring_worker() {
     let pipeline_rank = topology.pipeline_parallel_rank;
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     if std::env::var_os(OPAQUE_SESSION).is_some() {
-        let model = load_model_with_options(
+        let backend = MlxBackend::with_distributed_world(&stream, &stream, &group);
+        let model = load_model(
+            &backend,
             &checkpoint,
             ModelLoadOptions::with_parallel(topology),
-            &stream,
-            &stream,
         )
         .unwrap();
-        let backend = MlxBackend::with_distributed_world(&stream, &group);
         let mut session = backend.create_session(model).unwrap();
         let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
             .unwrap()
@@ -363,7 +362,7 @@ fn pipeline_ring_worker() {
         assert_eq!(output.logits().is_some(), pipeline_rank == 1);
         return;
     }
-    let execution = MlxBackend::new(&stream)
+    let execution = MlxBackend::new(&stream, &stream)
         .communication_for_topology(topology, &group)
         .unwrap();
     let reference = (pipeline_rank == 1
@@ -864,7 +863,8 @@ fn resident_reference_quantized(
     let options = quantization
         .map(ModelLoadOptions::with_quantization)
         .unwrap_or_default();
-    let mut model = safemlx_lm::api::load_model_with_options(checkpoint, options, stream, stream)
+    let backend = MlxBackend::new(stream, stream);
+    let mut model = safemlx_lm::load_model(&backend, checkpoint, options)
         .unwrap()
         .into_inner()
         .into_complete()
@@ -945,7 +945,8 @@ fn multimodal_resident_reference(
     checkpoint: &Path,
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
-    let mut model = safemlx_lm::api::load_model(checkpoint, stream, stream)
+    let backend = MlxBackend::new(stream, stream);
+    let mut model = safemlx_lm::load_model(&backend, checkpoint, ModelLoadOptions::default())
         .unwrap()
         .into_inner()
         .into_complete()

@@ -4377,11 +4377,11 @@ mod tests {
                 cpu.stream(),
             )
             .unwrap();
-            let loaded = crate::api::load_model_with_options(
+            let backend = crate::MlxBackend::new(gpu.stream(), cpu.stream());
+            let loaded = crate::load_model(
+                &backend,
                 dir.path(),
                 crate::api::ModelLoadOptions::with_quantization(quantization),
-                gpu.stream(),
-                cpu.stream(),
             )
             .unwrap()
             .into_inner()

@@ -27600,11 +27600,11 @@ mod tests {
         write_llama_fixture(directory.path(), &source, false);
         let expected_topology = topology(0, 2);
 
-        let loaded = crate::api::load_model_with_options(
+        let backend = crate::MlxBackend::new(stream, stream);
+        let loaded = crate::load_model(
+            &backend,
             directory.path(),
             ModelLoadOptions::with_parallel(expected_topology),
-            stream,
-            stream,
         )
         .unwrap();
 
