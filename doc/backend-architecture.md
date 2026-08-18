@@ -50,6 +50,12 @@ to MLX samplers, exact streams, model caches, and embedded or external MTP
 executors. This is an implementation bridge, not a second public facade or a
 compatibility namespace.
 
+The same ownership rule applies to tests. Portable tokenizer, chat, EOS,
+metadata, and request-orchestration tests compile in `api::tests` with no
+backend feature. Native arrays, MLX model execution, quantization, MTP, and
+architecture materialization tests live in the feature-gated
+`api::tests::mlx` module.
+
 ## Core and backend responsibilities
 
 Core owns concepts whose meaning does not depend on tensor representation:

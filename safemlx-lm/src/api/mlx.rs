@@ -622,7 +622,3 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         )
     }
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

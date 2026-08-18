@@ -1,6 +1,6 @@
 //! Private constrained-decoding implementation for native tool plans.
 
-#[cfg(all(test, feature = "mlx"))]
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -395,9 +395,9 @@ fn constraint_error(error: String) -> ConstraintError {
 pub(crate) struct ConstraintCompiler {
     factory: Arc<ParserFactory>,
     eos_token_ids: Vec<u32>,
-    #[cfg(all(test, feature = "mlx"))]
+    #[cfg(test)]
     tokenizer_analysis_runs: usize,
-    #[cfg(all(test, feature = "mlx"))]
+    #[cfg(test)]
     schema_compilation_runs: AtomicUsize,
 }
 
@@ -444,9 +444,9 @@ impl ConstraintCompiler {
         Ok(Self {
             factory: Arc::new(factory),
             eos_token_ids,
-            #[cfg(all(test, feature = "mlx"))]
+            #[cfg(test)]
             tokenizer_analysis_runs: 1,
-            #[cfg(all(test, feature = "mlx"))]
+            #[cfg(test)]
             schema_compilation_runs: AtomicUsize::new(0),
         })
     }
@@ -460,7 +460,7 @@ impl ConstraintCompiler {
         .expect("single-byte tokenizer must support llguidance")
     }
 
-    #[cfg(all(test, feature = "mlx"))]
+    #[cfg(test)]
     pub(crate) fn synthetic_with_eos_aliases_for_tests(eos_token_ids: &[u32]) -> Self {
         use llguidance::toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
 
@@ -523,7 +523,7 @@ impl ConstraintCompiler {
         runtime_stop_sequences: Vec<String>,
         tool_surface: bool,
     ) -> Result<GenerationRuntimePlan, String> {
-        #[cfg(all(test, feature = "mlx"))]
+        #[cfg(test)]
         self.schema_compilation_runs.fetch_add(1, Ordering::Relaxed);
 
         let grammar_structural_token_spellings = dialect.required_structural_tokens(parameters)?;
@@ -633,7 +633,7 @@ impl ConstraintCompiler {
         )
     }
 
-    #[cfg(all(test, feature = "mlx"))]
+    #[cfg(test)]
     pub(crate) fn cache_analysis_counts(&self) -> (usize, usize) {
         (
             self.tokenizer_analysis_runs,

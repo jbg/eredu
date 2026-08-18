@@ -124,3 +124,26 @@ fn generic_loaded_model_source_does_not_import_backend_implementations() {
         );
     }
 }
+
+#[test]
+fn portable_api_tests_do_not_depend_on_backend_implementations() {
+    let api = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api");
+    let portable =
+        std::fs::read_to_string(api.join("tests.rs")).expect("portable API tests must be readable");
+    for forbidden in [
+        "safemlx::",
+        "safemlx_sys::",
+        "crate::backend::mlx",
+        "crate::architectures",
+        "crate::nn",
+    ] {
+        assert!(
+            !portable.contains(forbidden),
+            "portable API tests contain backend implementation reference {forbidden:?}"
+        );
+    }
+    assert!(
+        api.join("tests/mlx.rs").is_file(),
+        "MLX integration tests must have a dedicated module"
+    );
+}

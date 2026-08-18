@@ -277,7 +277,7 @@ impl GenerationRuntimePlan {
         self.tool_surface
     }
 
-    #[cfg(all(test, feature = "mlx"))]
+    #[cfg(test)]
     pub(crate) fn structural_token_ids(&self) -> impl Iterator<Item = u32> + '_ {
         self.semantic
             .structural_tokens
@@ -517,7 +517,7 @@ impl PreparedChat {
         &self.capabilities
     }
 
-    #[cfg(all(test, feature = "mlx"))]
+    #[cfg(test)]
     pub(crate) fn tool_runtime_plan(&self) -> Option<&GenerationRuntimePlan> {
         self.generation_runtime_plan
             .as_ref()

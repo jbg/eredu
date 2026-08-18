@@ -61,3 +61,6 @@ pub use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokeni
 #[cfg(feature = "mlx")]
 #[path = "mlx.rs"]
 pub(crate) mod mlx;
+
+#[cfg(test)]
+mod tests;
