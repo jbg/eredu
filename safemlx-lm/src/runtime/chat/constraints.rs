@@ -1,8 +1,6 @@
 //! Private constrained-decoding implementation for native tool plans.
 
-#![allow(dead_code)]
-
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -20,6 +18,7 @@ use sha2::{Digest, Sha256};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
 use crate::{
+    core::{TokenFilter, TokenFilterController},
     runtime::chat::dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
     runtime::chat::{
         GenerationConstraint, GenerationRuntimePlan, GenerationRuntimePlanParts,
@@ -44,14 +43,364 @@ impl ConstraintError {
     }
 }
 
+/// Canonical backend-independent grammar and activation state.
+pub(crate) struct ConstraintController {
+    runtime: ConstraintRuntime,
+    committed_tokens: Vec<u32>,
+}
+
+enum ConstraintRuntime {
+    Forbidden {
+        vocabulary: Arc<Vec<Vec<u8>>>,
+        trigger: Vec<u8>,
+        pending: Vec<u8>,
+    },
+    Auto {
+        grammar: GrammarState,
+        vocabulary: Arc<Vec<Vec<u8>>>,
+        trigger: Vec<u8>,
+        pending: Vec<u8>,
+    },
+    Active(GrammarState),
+}
+
+impl Clone for ConstraintRuntime {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Forbidden {
+                vocabulary,
+                trigger,
+                pending,
+            } => Self::Forbidden {
+                vocabulary: Arc::clone(vocabulary),
+                trigger: trigger.clone(),
+                pending: pending.clone(),
+            },
+            Self::Auto {
+                grammar,
+                vocabulary,
+                trigger,
+                pending,
+            } => Self::Auto {
+                grammar: grammar.fork(),
+                vocabulary: Arc::clone(vocabulary),
+                trigger: trigger.clone(),
+                pending: pending.clone(),
+            },
+            Self::Active(grammar) => Self::Active(grammar.fork()),
+        }
+    }
+}
+
+impl Clone for ConstraintController {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            committed_tokens: self.committed_tokens.clone(),
+        }
+    }
+}
+
+impl ConstraintController {
+    /// Creates canonical constraint state from one prepared-chat plan.
+    pub(crate) fn from_generation_plan(
+        plan: &GenerationRuntimePlan,
+    ) -> Result<Self, ConstraintError> {
+        let constraint = plan.generation_constraint().clone();
+        let runtime = if !plan.has_tool_surface() {
+            ConstraintRuntime::Active(constraint.grammar_state())
+        } else {
+            match plan.tool_choice() {
+                ToolChoice::None => {
+                    let trigger =
+                        required_tool_call_trigger(plan.tool_call_trigger(), "forbidden")?;
+                    let vocabulary = constraint
+                        .grammar_state()
+                        .token_vocabulary()
+                        .map_err(constraint_error)?;
+                    ConstraintRuntime::Forbidden {
+                        vocabulary: Arc::new(vocabulary),
+                        trigger,
+                        pending: Vec::new(),
+                    }
+                }
+                ToolChoice::Auto => {
+                    let trigger =
+                        required_tool_call_trigger(plan.auto_activation_trigger(), "automatic")?;
+                    let grammar = constraint.grammar_state();
+                    let vocabulary = grammar.token_vocabulary().map_err(constraint_error)?;
+                    ConstraintRuntime::Auto {
+                        grammar,
+                        vocabulary: Arc::new(vocabulary),
+                        trigger,
+                        pending: Vec::new(),
+                    }
+                }
+                ToolChoice::Required => ConstraintRuntime::Active(constraint.grammar_state()),
+            }
+        };
+        Ok(Self {
+            runtime,
+            committed_tokens: Vec::new(),
+        })
+    }
+
+    #[cfg(all(test, feature = "mlx"))]
+    pub(crate) fn constraint_is_active(&self) -> bool {
+        matches!(self.runtime, ConstraintRuntime::Active(_))
+    }
+
+    pub(crate) fn grammar_is_complete(&mut self) -> Result<bool, ConstraintError> {
+        match &mut self.runtime {
+            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
+        }
+    }
+
+    #[cfg(feature = "mlx")]
+    pub(crate) fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, ConstraintError> {
+        match &mut self.runtime_at(history)? {
+            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
+        }
+    }
+
+    #[cfg(feature = "mlx")]
+    fn runtime_at(&self, history: &[u32]) -> Result<ConstraintRuntime, ConstraintError> {
+        if !history.starts_with(&self.committed_tokens) {
+            return Err(ConstraintError::new(
+                "constrained sampler history diverges from its committed logical prefix",
+            ));
+        }
+        let mut runtime = self.runtime.clone();
+        for &token in &history[self.committed_tokens.len()..] {
+            commit_runtime_token(&mut runtime, token)?;
+        }
+        Ok(runtime)
+    }
+
+    #[cfg(feature = "mlx")]
+    pub(crate) fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, ConstraintError> {
+        token_filter_at_runtime(&mut self.runtime_at(history)?)
+    }
+
+    pub(crate) fn commit(&mut self, token: u32) -> Result<(), ConstraintError> {
+        commit_runtime_token(&mut self.runtime, token)?;
+        self.committed_tokens.push(token);
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "mlx"))]
+    pub(crate) fn valid_token_ids(&mut self) -> Result<Option<Vec<u32>>, ConstraintError> {
+        match &mut self.runtime {
+            ConstraintRuntime::Active(grammar) => grammar
+                .allowed_tokens()
+                .map(|mask| Some(mask.iter().collect()))
+                .map_err(constraint_error),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(None),
+        }
+    }
+}
+
+impl TokenFilterController for ConstraintController {
+    type Error = ConstraintError;
+
+    fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+        token_filter_at_runtime(&mut self.runtime)
+    }
+
+    fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
+        self.commit(token_id)
+    }
+
+    fn is_complete(&mut self) -> Result<bool, Self::Error> {
+        self.grammar_is_complete()
+    }
+}
+
+fn token_filter_at_runtime(
+    runtime: &mut ConstraintRuntime,
+) -> Result<TokenFilter, ConstraintError> {
+    let allowed = match runtime {
+        ConstraintRuntime::Active(grammar) => {
+            let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
+            (0..allowed.len())
+                .map(|token| allowed.is_allowed(token as u32))
+                .collect::<Vec<_>>()
+        }
+        ConstraintRuntime::Forbidden {
+            vocabulary,
+            trigger,
+            pending,
+        } => vocabulary
+            .iter()
+            .map(|bytes| !completes_trigger(pending, bytes, trigger))
+            .collect(),
+        ConstraintRuntime::Auto {
+            grammar,
+            vocabulary,
+            trigger,
+            pending,
+        } => vocabulary
+            .iter()
+            .enumerate()
+            .map(|(token, bytes)| {
+                let Some(activation) = trigger_activation_bytes(pending, bytes, trigger) else {
+                    return Ok(true);
+                };
+                let mut candidate = grammar.fork();
+                if activation.starts_at_token_boundary {
+                    candidate.try_commit(token as u32)
+                } else {
+                    candidate.try_commit_bytes(&activation.bytes)
+                }
+                .map_err(constraint_error)
+            })
+            .collect::<Result<Vec<_>, ConstraintError>>()?,
+    };
+    TokenFilter::allowed(allowed).map_err(|error| ConstraintError::new(error.to_string()))
+}
+
+fn commit_runtime_token(
+    runtime: &mut ConstraintRuntime,
+    token: u32,
+) -> Result<(), ConstraintError> {
+    match runtime {
+        ConstraintRuntime::Forbidden {
+            vocabulary,
+            trigger,
+            pending,
+        } => {
+            let bytes = vocabulary.get(token as usize).ok_or_else(|| {
+                ConstraintError::new(format!(
+                    "token {token} is outside constraint vocabulary {}",
+                    vocabulary.len()
+                ))
+            })?;
+            if completes_trigger(pending, bytes, trigger) {
+                return Err(ConstraintError::new(
+                    "token would emit a tool-call activation trigger while tool_choice is None",
+                ));
+            }
+            advance_trigger_prefix(pending, bytes, trigger);
+            Ok(())
+        }
+        ConstraintRuntime::Active(grammar) => grammar.commit(token).map_err(constraint_error),
+        ConstraintRuntime::Auto {
+            grammar,
+            vocabulary,
+            trigger,
+            pending,
+        } => {
+            let bytes = vocabulary.get(token as usize).ok_or_else(|| {
+                ConstraintError::new(format!(
+                    "token {token} is outside constraint vocabulary {}",
+                    vocabulary.len()
+                ))
+            })?;
+            if let Some(activation) = trigger_activation_bytes(pending, bytes, trigger) {
+                let mut active = grammar.fork();
+                let valid = if activation.starts_at_token_boundary {
+                    active.try_commit(token)
+                } else {
+                    active.try_commit_bytes(&activation.bytes)
+                };
+                if !valid.map_err(constraint_error)? {
+                    return Err(ConstraintError::new(
+                        "token crosses the tool-call activation boundary with bytes that are not allowed by the tool grammar",
+                    ));
+                }
+                *runtime = ConstraintRuntime::Active(active);
+            } else {
+                advance_trigger_prefix(pending, bytes, trigger);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn required_tool_call_trigger(
+    trigger: Option<&str>,
+    mode: &str,
+) -> Result<Vec<u8>, ConstraintError> {
+    let trigger = trigger.ok_or_else(|| {
+        ConstraintError::new(format!(
+            "{mode} tool-call sampling requires an exact activation trigger"
+        ))
+    })?;
+    if trigger.is_empty() {
+        return Err(ConstraintError::new(format!(
+            "{mode} tool-call sampling requires a non-empty activation trigger"
+        )));
+    }
+    Ok(trigger.as_bytes().to_vec())
+}
+
+pub(crate) fn completes_trigger(pending: &[u8], bytes: &[u8], trigger: &[u8]) -> bool {
+    trigger_activation_bytes(pending, bytes, trigger).is_some()
+}
+
+struct TriggerActivation {
+    bytes: Vec<u8>,
+    starts_at_token_boundary: bool,
+}
+
+fn trigger_activation_bytes(
+    pending: &[u8],
+    bytes: &[u8],
+    trigger: &[u8],
+) -> Option<TriggerActivation> {
+    for start in 0..pending.len() {
+        let pending_suffix = &pending[start..];
+        if pending_suffix.len() + bytes.len() < trigger.len()
+            || !pending_suffix
+                .iter()
+                .chain(bytes)
+                .take(trigger.len())
+                .eq(trigger)
+        {
+            continue;
+        }
+        let trigger_bytes_in_token = trigger.len() - pending_suffix.len();
+        let mut activation = Vec::with_capacity(trigger.len() + bytes.len());
+        activation.extend_from_slice(trigger);
+        activation.extend_from_slice(&bytes[trigger_bytes_in_token..]);
+        return Some(TriggerActivation {
+            bytes: activation,
+            starts_at_token_boundary: false,
+        });
+    }
+    let start = bytes
+        .windows(trigger.len())
+        .position(|window| window == trigger)?;
+    Some(TriggerActivation {
+        bytes: bytes[start..].to_vec(),
+        starts_at_token_boundary: start == 0,
+    })
+}
+
+pub(crate) fn advance_trigger_prefix(pending: &mut Vec<u8>, bytes: &[u8], trigger: &[u8]) {
+    pending.extend_from_slice(bytes);
+    let keep = (0..=pending.len().min(trigger.len().saturating_sub(1)))
+        .rev()
+        .find(|&length| pending.ends_with(&trigger[..length]))
+        .unwrap_or(0);
+    let discard = pending.len() - keep;
+    pending.drain(..discard);
+}
+
+fn constraint_error(error: String) -> ConstraintError {
+    ConstraintError::new(error)
+}
+
 /// Tokenizer-wide llguidance data. A `LoadedModel` constructs exactly one and
 /// every request grammar shares it.
 pub(crate) struct ConstraintCompiler {
     factory: Arc<ParserFactory>,
     eos_token_ids: Vec<u32>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mlx"))]
     tokenizer_analysis_runs: usize,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mlx"))]
     schema_compilation_runs: AtomicUsize,
 }
 
@@ -98,9 +447,9 @@ impl ConstraintCompiler {
         Ok(Self {
             factory: Arc::new(factory),
             eos_token_ids,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "mlx"))]
             tokenizer_analysis_runs: 1,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "mlx"))]
             schema_compilation_runs: AtomicUsize::new(0),
         })
     }
@@ -114,7 +463,7 @@ impl ConstraintCompiler {
         .expect("single-byte tokenizer must support llguidance")
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mlx"))]
     pub(crate) fn synthetic_with_eos_aliases_for_tests(eos_token_ids: &[u32]) -> Self {
         use llguidance::toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
 
@@ -133,7 +482,7 @@ impl ConstraintCompiler {
             .expect("single-byte tokenizer with EOS aliases must support llguidance")
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mlx"))]
     pub(crate) fn synthetic_with_tokens_for_tests(extra_tokens: &[&[u8]]) -> Self {
         use llguidance::toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
 
@@ -177,7 +526,7 @@ impl ConstraintCompiler {
         runtime_stop_sequences: Vec<String>,
         tool_surface: bool,
     ) -> Result<GenerationRuntimePlan, String> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "mlx"))]
         self.schema_compilation_runs.fetch_add(1, Ordering::Relaxed);
 
         let grammar_structural_token_spellings = dialect.required_structural_tokens(parameters)?;
@@ -287,7 +636,7 @@ impl ConstraintCompiler {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mlx"))]
     pub(crate) fn cache_analysis_counts(&self) -> (usize, usize) {
         (
             self.tokenizer_analysis_runs,

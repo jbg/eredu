@@ -11,31 +11,29 @@ use safemlx_lm_core::{
 use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
 use super::{LoadedModel, TextDecoderError, TextModelError};
-use crate::runtime::chat::constraints::{ConstraintCompiler, ConstraintError};
+use crate::api::TextDecoder;
+use crate::runtime::chat::constraints::{
+    ConstraintCompiler, ConstraintController, ConstraintError,
+};
 use crate::runtime::chat::{
     prepare_format_profile, resolve_structural_tokens, CapabilitySupport, ChatCapabilities,
     ChatTemplateIdentity, ChatTemplateRequest, NativeToolSupport, PreparedChat, SemanticSupport,
     ToolChoice,
 };
+use crate::runtime::generation::streaming::{CommittedTokenSource, TokenDecoderBackend};
+use std::collections::HashMap;
 
-#[cfg(feature = "mlx")]
-use crate::{api::TextDecoder, runtime::chat::SemanticRuntimePlan};
 #[cfg(feature = "mlx")]
 use crate::{
     error::Error,
-    runtime::generation::{
-        sampler::ConstrainedSampler,
-        streaming::{
-            CommittedTokenPipeline, CommittedTokenSource, RawTokenDecoder, TokenDecoderBackend,
-        },
-    },
+    runtime::chat::SemanticRuntimePlan,
+    runtime::generation::sampler::ConstrainedSampler,
+    runtime::generation::streaming::{CommittedTokenPipeline, RawTokenDecoder},
 };
 #[cfg(feature = "mlx")]
 use safemlx::Array;
 #[cfg(feature = "mlx")]
 use safemlx_lm_core::{SpeculativeOutputError, SpeculativeSemanticState};
-#[cfg(feature = "mlx")]
-use std::collections::HashMap;
 
 /// Model sampling and stopping settings for one prepared chat generation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -160,7 +158,6 @@ pub enum PreparedChatError<E: std::error::Error + Send + Sync + 'static> {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[cfg(feature = "mlx")]
 pub(super) enum PreparedChatSetupError {
     #[error(transparent)]
     Constraint(#[from] ConstraintError),
@@ -294,13 +291,11 @@ pub struct PreparedChatMtpBatchOutput {
     pub scheduler: MtpSchedulerStats,
 }
 
-#[cfg(feature = "mlx")]
 #[derive(Clone)]
 pub(super) struct PreparedChatTokenDecoder {
     pub(super) decoder: TextDecoder,
 }
 
-#[cfg(feature = "mlx")]
 impl TokenDecoderBackend for PreparedChatTokenDecoder {
     type Error = TextDecoderError;
 
@@ -331,9 +326,8 @@ pub(super) struct PreparedChatRuntime<S> {
     pub(super) sampler: ConstrainedSampler<S>,
 }
 
-#[cfg(feature = "mlx")]
 pub(super) struct PreparedChatControlRuntime {
-    pub(super) controller: crate::runtime::generation::sampler::ConstraintController,
+    pub(super) controller: ConstraintController,
     pub(super) parser: crate::runtime::generation::streaming::ToolRuntimeParser,
     pub(super) structural_tokens: HashMap<u32, String>,
 }
@@ -458,7 +452,6 @@ pub(super) fn with_prepared_chat_runtime<R>(
     execute(PreparedChatRuntime { sampler })
 }
 
-#[cfg(feature = "mlx")]
 pub(super) fn prepared_chat_control_runtime(
     prepared_chat: &PreparedChat,
     caller_stop_sequences: &[String],
@@ -476,10 +469,7 @@ pub(super) fn prepared_chat_control_runtime(
     let generation_plan = prepared_chat
         .generation_runtime_plan()
         .expect("supported prepared chats carry a generation runtime plan");
-    let controller =
-        crate::runtime::generation::sampler::ConstraintController::from_generation_plan(
-            generation_plan,
-        )?;
+    let controller = ConstraintController::from_generation_plan(generation_plan)?;
     let parser = semantic_plan
         .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
         .map_err(PreparedChatSetupError::Semantic)?;
@@ -494,19 +484,13 @@ pub(super) fn prepared_chat_control_runtime(
     })
 }
 
-#[cfg(feature = "mlx")]
 pub(super) struct BackendGenerationTokenSource<'a, B>
 where
     B: safemlx_lm_core::TextGenerationBackend,
 {
-    pub(super) generator: safemlx_lm_core::ControlledTextGeneration<
-        'a,
-        B,
-        crate::runtime::generation::sampler::ConstraintController,
-    >,
+    pub(super) generator: safemlx_lm_core::ControlledTextGeneration<'a, B, ConstraintController>,
 }
 
-#[cfg(feature = "mlx")]
 impl<B> CommittedTokenSource for BackendGenerationTokenSource<'_, B>
 where
     B: safemlx_lm_core::TextGenerationBackend,

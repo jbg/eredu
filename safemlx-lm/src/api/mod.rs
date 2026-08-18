@@ -28,7 +28,9 @@ pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 #[cfg(feature = "mlx")]
 mod capability;
 mod inspection;
+mod loaded;
 pub use inspection::{inspect_text_model, TextInspectionOptions};
+pub use loaded::LoadedModelLoadError;
 
 pub use portable::{
     LoadedModel, LoadedTextModelConfig, TextDecoder, TextDecoderError, TextModelError,
@@ -42,7 +44,7 @@ pub use safemlx_lm_core::{
     ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
     HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
     InputTokenCount, InspectionIssue, InspectionIssueCode, InspectionReadiness,
-    InspectionRequirement, InspectionSeverity, ModelCapabilities, ModelInspectionReport,
+    InspectionRequirement, InspectionSeverity, ModelCapabilities, ModelInspectionReport, ModelKind,
     ModelResourceProfile, MtpTelemetry, ObservationKind, Observed, PhysicalMemorySemantics,
     PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
     RuntimeStateEstimate, SlidingWindowLayerCount, StateMemoryAssumptions, StaticMemoryReport,
@@ -53,5 +55,3 @@ pub use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokeni
 #[cfg(feature = "mlx")]
 #[path = "mlx.rs"]
 pub(crate) mod mlx;
-#[cfg(feature = "mlx")]
-pub use mlx::*;

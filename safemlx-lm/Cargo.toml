@@ -96,7 +96,6 @@ required-features = ["mlx"]
 [[test]]
 name = "backend_generic_text"
 path = "tests/backend_generic_text.rs"
-required-features = ["mlx"]
 
 [[test]]
 name = "backend_generic_realtime"

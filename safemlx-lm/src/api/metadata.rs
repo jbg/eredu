@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use safemlx_gguf::MetadataValue as GgufMetadataValue;
-#[cfg(feature = "mlx")]
 use safemlx_lm_core::generation::CheckpointGenerationConfig;
 use serde::Deserialize;
 
@@ -39,7 +38,6 @@ impl TokenIdOrIds {
     }
 }
 
-#[cfg(feature = "mlx")]
 pub(crate) fn read_checkpoint_generation_config(
     sidecar_dir: &Path,
 ) -> Result<Option<CheckpointGenerationConfig>, TextMetadataError> {

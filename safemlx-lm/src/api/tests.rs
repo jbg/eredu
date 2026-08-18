@@ -1,23 +1,31 @@
-use super::{
-    eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, inspect_chat_template_kwargs,
-    load_chat_template, load_tokenizer_template_kwargs, merge_eos_token_id_sources,
-    prepare_chat_from_parts, with_prepared_chat_runtime, LoadedModel, PreparedChatDraft,
-    PreparedChatInput, PreparedChatMtpBatchRequest, TextModelError,
+use crate::api::metadata::{
+    eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, merge_eos_token_id_sources,
+    read_checkpoint_generation_config,
 };
-use crate::api::{chat_template_kwargs, load_tokenizer};
+use crate::api::request::{prepare_chat_from_parts, with_prepared_chat_runtime};
+use crate::api::tokenizer::{load_chat_template, load_tokenizer_template_kwargs};
+use crate::api::{
+    chat_template_kwargs, load_tokenizer, LoadedModel, PreparedChatDraft, PreparedChatInput,
+    PreparedChatMtpBatchRequest, TextModelError,
+};
+use crate::architectures::gemma4::model as gemma4;
 use crate::{
     architectures::{
-        gpt_oss::model as gpt_oss, llama::model as llama, qwen::dense as dense_qwen,
-        qwen::vl::model as qwen3_vl,
+        gpt_oss::model as gpt_oss,
+        llama::model as llama,
+        qwen::dense as dense_qwen,
+        qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
     },
     backend::mlx::{
-        resolve_model_config, validate_gguf_quantization_source, ModelLoadOptions,
+        resolve_model_config, validate_gguf_quantization_source, Model, ModelLoadOptions,
         ResolvedModelConfig,
     },
-    core::generation::{FinishReason, MtpSchedulerOptions, SemanticEvent},
-    core::SpeculativeExecutionTopology,
+    core::generation::{
+        resolve_generation_config, FinishReason, GenerationConfigOverrides, MtpSchedulerOptions,
+        SemanticEvent,
+    },
+    core::{GgufArchitecture, ModelKind, SpeculativeExecutionTopology},
     error::Error,
-    runtime::chat::constraints::ConstraintCompiler,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, PreparedChat, ToolChoice,
         SYNTHETIC_STRUCTURAL_TOKEN, SYNTHETIC_TOOL_TEMPLATE,
@@ -27,6 +35,7 @@ use crate::{
     },
     runtime::execution::inspection::ActivationRecorder,
     runtime::generation::sampler::{ConstrainedSampler, DefaultSampler, GenerationSampler},
+    runtime::{chat::constraints::ConstraintCompiler, media::input},
 };
 use safemlx::{
     argmax_axis,
@@ -35,6 +44,7 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
+use safemlx_lm_utils::tokenizer::chat_template_kwargs as inspect_chat_template_kwargs;
 use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
 use safemlx_lm_utils::tokenizer::{ChatTemplateIdentity, ModelChatTemplate};
 use serde_json::json;
@@ -774,11 +784,11 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         "tie_word_embeddings": true,
         "layer_types": ["full_attention"]
     });
-    let args = super::qwen3_5::model_args_from_config_value(&config).unwrap();
-    let qwen = super::qwen3_5::Model::new(args, None, None, None, stream).unwrap();
+    let args = qwen3_5::model_args_from_config_value(&config).unwrap();
+    let qwen = qwen3_5::Model::new(args, None, None, None, stream).unwrap();
     let directory = temp_model_dir(&config.to_string());
     save_zero_checkpoint(&qwen, &directory, stream);
-    let super::Model::Qwen35(qwen) =
+    let Model::Qwen35(qwen) =
         load_test_model(&directory, ModelLoadOptions::default(), stream, stream)
             .unwrap()
             .into_inner()
@@ -790,7 +800,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
         crate::backend::mlx::MlxBackend::new(stream, stream),
         safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(
-            super::Model::Qwen35(qwen),
+            Model::Qwen35(qwen),
         )),
     )
     .unwrap();
@@ -4296,14 +4306,9 @@ fn checkpoint_generation_config_resolves_declared_values_and_request_overrides()
     )
     .unwrap();
 
-    let checkpoint = super::read_checkpoint_generation_config(&dir)
-        .unwrap()
-        .unwrap();
-    let resolved = super::resolve_generation_config(
-        Some(&checkpoint),
-        super::GenerationConfigOverrides::default(),
-    )
-    .unwrap();
+    let checkpoint = read_checkpoint_generation_config(&dir).unwrap().unwrap();
+    let resolved =
+        resolve_generation_config(Some(&checkpoint), GenerationConfigOverrides::default()).unwrap();
     assert!(resolved.do_sample);
     assert_eq!(resolved.temperature, 1.0);
     assert_eq!(resolved.top_k, 64);
@@ -4311,9 +4316,9 @@ fn checkpoint_generation_config_resolves_declared_values_and_request_overrides()
     assert_eq!(resolved.min_p, 0.0);
     assert_eq!(resolved.max_new_tokens, Some(512));
 
-    let overridden = super::resolve_generation_config(
+    let overridden = resolve_generation_config(
         Some(&checkpoint),
-        super::GenerationConfigOverrides {
+        GenerationConfigOverrides {
             temperature: Some(0.0),
             top_k: Some(12),
             max_new_tokens: Some(32),
@@ -4336,18 +4341,15 @@ fn checkpoint_generation_config_honors_do_sample_false() {
         top_k: Some(20),
         ..Default::default()
     };
-    let resolved = super::resolve_generation_config(
-        Some(&checkpoint),
-        super::GenerationConfigOverrides::default(),
-    )
-    .unwrap();
+    let resolved =
+        resolve_generation_config(Some(&checkpoint), GenerationConfigOverrides::default()).unwrap();
     assert!(!resolved.do_sample);
     assert_eq!(resolved.temperature, 0.0);
     assert_eq!(resolved.top_k, 20);
 
-    let temperature_override = super::resolve_generation_config(
+    let temperature_override = resolve_generation_config(
         Some(&checkpoint),
-        super::GenerationConfigOverrides {
+        GenerationConfigOverrides {
             temperature: Some(0.6),
             ..Default::default()
         },
@@ -4356,9 +4358,9 @@ fn checkpoint_generation_config_honors_do_sample_false() {
     assert!(temperature_override.do_sample);
     assert_eq!(temperature_override.temperature, 0.6);
 
-    let greedy_override = super::resolve_generation_config(
+    let greedy_override = resolve_generation_config(
         Some(&checkpoint),
-        super::GenerationConfigOverrides {
+        GenerationConfigOverrides {
             do_sample: Some(false),
             temperature: Some(0.6),
             ..Default::default()
@@ -4649,7 +4651,7 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
             .into_inner()
             .into_complete()
             .unwrap();
-        let super::Model::Llama(model) = &loaded else {
+        let Model::Llama(model) = &loaded else {
             panic!("expected Llama GGUF model");
         };
         let materialization = model.metadata().materialization().unwrap();
@@ -4666,10 +4668,10 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
         );
 
         let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let parts = [super::input::InputPart::text_token_ids(&tokens)];
+        let parts = [input::InputPart::text_token_ids(&tokens)];
         let mut cache = loaded.new_cache();
         let logits = loaded
-            .submit_prefill(super::input::ModelInput::new(&parts), &mut cache, stream)
+            .submit_prefill(input::ModelInput::new(&parts), &mut cache, stream)
             .unwrap()
             .wait()
             .unwrap();
@@ -4781,9 +4783,9 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
             }
             "qwen3_5" => {
                 let (args, image_token_id, video_token_id, vision_config) =
-                    super::qwen3_5::get_qwen3_5_model_args(&dir).unwrap();
+                    qwen3_5::get_qwen3_5_model_args(&dir).unwrap();
                 save_zero_checkpoint(
-                    &super::qwen3_5::Model::new(
+                    &qwen3_5::Model::new(
                         args,
                         image_token_id,
                         video_token_id,
@@ -4796,12 +4798,8 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 );
             }
             "gemma4" => {
-                let args = super::gemma4::get_gemma4_model_args(&dir).unwrap();
-                save_zero_checkpoint(
-                    &super::gemma4::Model::new(args, stream).unwrap(),
-                    &dir,
-                    stream,
-                );
+                let args = gemma4::get_gemma4_model_args(&dir).unwrap();
+                save_zero_checkpoint(&gemma4::Model::new(args, stream).unwrap(), &dir, stream);
             }
             _ => unreachable!(),
         }
@@ -4853,8 +4851,8 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
             .into_complete()
             .unwrap();
             let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
-            let parts = [super::input::InputPart::text_token_ids(&tokens)];
-            let input = super::input::ModelInput::new(&parts);
+            let parts = [input::InputPart::text_token_ids(&tokens)];
+            let input = input::ModelInput::new(&parts);
             let mut dense_cache = dense.new_cache();
             let dense_logits = dense
                 .submit_prefill(input, &mut dense_cache, stream)
@@ -4996,7 +4994,7 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     .into_inner()
     .into_complete()
     .unwrap();
-    let super::Model::GptOss(model) = model else {
+    let Model::GptOss(model) = model else {
         panic!("expected GPT-OSS model")
     };
     assert_eq!(
@@ -5046,7 +5044,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     .into_inner()
     .into_complete()
     .unwrap();
-    let super::Model::Qwen3Vl(model) = &quantized else {
+    let Model::Qwen3Vl(model) = &quantized else {
         panic!("expected Qwen3-VL model");
     };
     assert_eq!(
@@ -5058,15 +5056,12 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     let pixels = Array::zeros::<f32>(&[4, 24], stream).unwrap();
     let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
     let parts = [
-        super::input::InputPart::text_token_ids(&tokens),
-        super::input::InputPart::image_tensor(
-            &pixels,
-            super::input::InputMetadata::qwen_grid_thw(&grid),
-        ),
+        input::InputPart::text_token_ids(&tokens),
+        input::InputPart::image_tensor(&pixels, input::InputMetadata::qwen_grid_thw(&grid)),
     ];
     let mut cache = quantized.new_cache();
     let logits = quantized
-        .submit_prefill(super::input::ModelInput::new(&parts), &mut cache, stream)
+        .submit_prefill(input::ModelInput::new(&parts), &mut cache, stream)
         .unwrap()
         .wait()
         .unwrap();
@@ -5094,7 +5089,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     .into_inner()
     .into_complete()
     .unwrap();
-    let super::Model::Qwen3Vl(saved_model) = &saved_quantized else {
+    let Model::Qwen3Vl(saved_model) = &saved_quantized else {
         panic!("expected saved Qwen3-VL model");
     };
     assert_eq!(
@@ -5159,10 +5154,9 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
         }"#;
     let dir = temp_model_dir(config);
     let (args, image_token_id, video_token_id, vision_config) =
-        super::qwen3_5::get_qwen3_5_model_args(&dir).unwrap();
+        qwen3_5::get_qwen3_5_model_args(&dir).unwrap();
     save_zero_checkpoint(
-        &super::qwen3_5::Model::new(args, image_token_id, video_token_id, vision_config, stream)
-            .unwrap(),
+        &qwen3_5::Model::new(args, image_token_id, video_token_id, vision_config, stream).unwrap(),
         &dir,
         stream,
     );
@@ -5182,7 +5176,7 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
     .into_inner()
     .into_complete()
     .unwrap();
-    let super::Model::Qwen35(quantized_model) = &quantized else {
+    let Model::Qwen35(quantized_model) = &quantized else {
         panic!("expected Qwen3.5-MoE model");
     };
     assert_eq!(
@@ -5191,8 +5185,8 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
     );
 
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let parts = [super::input::InputPart::text_token_ids(&tokens)];
-    let input = super::input::ModelInput::new(&parts);
+    let parts = [input::InputPart::text_token_ids(&tokens)];
+    let input = input::ModelInput::new(&parts);
     let mut dense_cache = dense.new_cache();
     let dense_logits = dense
         .submit_prefill(input, &mut dense_cache, stream)
@@ -5394,7 +5388,7 @@ fn resolve_model_config_recognizes_exact_qwen2_identity() {
     assert_eq!(
         resolve_model_config(&config).ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Qwen2,
+            kind: ModelKind::Qwen2,
             model_type: "qwen2".into(),
             effective_model_type: "qwen2".into(),
         })
@@ -5416,11 +5410,11 @@ fn resolve_model_config_recognizes_exact_qwen2_identity() {
 #[test]
 fn gguf_architecture_resolution_recognizes_exact_qwen2_identity() {
     assert_eq!(
-        super::GgufArchitecture::resolve("qwen2").unwrap(),
-        super::GgufArchitecture::Qwen2
+        GgufArchitecture::resolve("qwen2").unwrap(),
+        GgufArchitecture::Qwen2
     );
     for nearby in ["qwen", "qwen2moe", "qwen2vl", "qwen2.5"] {
-        assert!(super::GgufArchitecture::resolve(nearby).is_err());
+        assert!(GgufArchitecture::resolve(nearby).is_err());
     }
 }
 
@@ -5500,7 +5494,7 @@ fn resolve_model_config_reports_supported_kimi_linear() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::KimiLinear,
+            kind: ModelKind::KimiLinear,
             model_type: "kimi_linear".into(),
             effective_model_type: "kimi_linear".into(),
         })
@@ -5528,7 +5522,7 @@ fn resolve_model_config_reports_supported_dense_mistral() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Llama,
+            kind: ModelKind::Llama,
             model_type: "mistral".to_string(),
             effective_model_type: "mistral".to_string(),
         })
@@ -5551,7 +5545,7 @@ fn resolve_model_config_reports_supported_lfm2_families() {
     assert_eq!(
         resolve_model_config(&dense).ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Lfm2,
+            kind: ModelKind::Lfm2,
             model_type: "lfm2".into(),
             effective_model_type: "lfm2".into(),
         })
@@ -5595,7 +5589,7 @@ fn resolve_model_config_reports_supported_gpt_oss() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::GptOss,
+            kind: ModelKind::GptOss,
             model_type: "gpt_oss".to_string(),
             effective_model_type: "gpt_oss".to_string(),
         })
@@ -5670,7 +5664,7 @@ fn resolve_model_config_reports_supported_qwen3_5_moe() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Qwen35,
+            kind: ModelKind::Qwen35,
             model_type: "qwen3_5_moe".to_string(),
             effective_model_type: "qwen3_5_moe_text".to_string(),
         })
@@ -5691,7 +5685,7 @@ fn resolve_model_config_reports_supported_qwen3_next() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Qwen3Next,
+            kind: ModelKind::Qwen3Next,
             model_type: "qwen3_next".to_string(),
             effective_model_type: "qwen3_next".to_string(),
         })
@@ -5723,7 +5717,7 @@ fn resolve_model_config_reports_supported_qwen3_vl_moe() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Qwen3VlMoe,
+            kind: ModelKind::Qwen3VlMoe,
             model_type: "qwen3_vl_moe".to_string(),
             effective_model_type: "qwen3_vl_moe_text".to_string(),
         })
@@ -5750,7 +5744,7 @@ fn resolve_model_config_reports_supported_dense_qwen3_5() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Qwen35,
+            kind: ModelKind::Qwen35,
             model_type: "qwen3_5".to_string(),
             effective_model_type: "qwen3_5_text".to_string(),
         })
@@ -5774,7 +5768,7 @@ fn resolve_model_config_reports_supported_dense_qwen3_5_text() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Qwen35,
+            kind: ModelKind::Qwen35,
             model_type: "qwen3_5_text".to_string(),
             effective_model_type: "qwen3_5_text".to_string(),
         })
@@ -5824,7 +5818,7 @@ fn resolve_model_config_reports_supported_qwen3_vl() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Qwen3Vl,
+            kind: ModelKind::Qwen3Vl,
             model_type: "qwen3_vl".to_string(),
             effective_model_type: "qwen3_vl_text".to_string(),
         })
@@ -5861,7 +5855,7 @@ fn resolve_model_config_reports_supported_nemotron_h() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::NemotronH,
+            kind: ModelKind::NemotronH,
             model_type: "nemotron_h".to_string(),
             effective_model_type: "nemotron_h".to_string(),
         })
@@ -5893,7 +5887,7 @@ fn resolve_model_config_reports_supported_gemma4_moe() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Gemma4,
+            kind: ModelKind::Gemma4,
             model_type: "gemma4".to_string(),
             effective_model_type: "gemma4_text".to_string(),
         })
@@ -5922,7 +5916,7 @@ fn resolve_model_config_reports_supported_gemma4_unified_text() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Gemma4,
+            kind: ModelKind::Gemma4,
             model_type: "gemma4_unified".to_string(),
             effective_model_type: "gemma4_unified_text".to_string(),
         })
@@ -5954,7 +5948,7 @@ fn resolve_model_config_reports_supported_gemma4_unified_moe() {
     assert_eq!(
         support.ok(),
         Some(ResolvedModelConfig {
-            kind: super::ModelKind::Gemma4,
+            kind: ModelKind::Gemma4,
             model_type: "gemma4_unified".to_string(),
             effective_model_type: "gemma4_unified_text".to_string(),
         })

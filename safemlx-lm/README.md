@@ -47,8 +47,8 @@ safemlx-lm = { version = "0.4", default-features = false }
 
 That build exposes the canonical `LoadedModel<B>`, `ModelRuntime<B>`, portable
 artifact and generation contracts, tokenizer loading, EOS and chat-template
-discovery, semantic chat inspection, and token-generation
-lifecycle. The `mlx` feature adds architecture implementations, native model
+discovery, semantic chat inspection, `LoadedModel::load`, chat preparation, and
+ordinary constrained prepared-chat generation. The `mlx` feature adds architecture implementations, native model
 loading, prepared MLX inputs, sampling, residency, distributed execution, and
 runtime diagnostics. `cuda`, `nccl`, and media-processing features imply
 `mlx`; they are capabilities of that backend rather than facade features.

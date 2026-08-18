@@ -1,6 +1,51 @@
 //! Loaded-model facade and prepared generation entry points.
 
-use super::*;
+use std::{num::NonZeroUsize, path::Path};
+
+use safemlx_gguf::MetadataValue as GgufMetadataValue;
+use safemlx_lm_core::{
+    generation::{resolve_generation_config, FinishReason, SemanticEvent},
+    ModelKind, MtpCapability,
+};
+use safemlx_lm_utils::{
+    gguf::GgufTokenizer,
+    tokenizer::{
+        chat_template_kwargs as inspect_chat_template_kwargs, ApplyChatTemplateArgs, Chat,
+        ModelChatTemplate, Tokenizer as ChatTokenizer,
+    },
+};
+use serde::Serialize;
+
+use super::{
+    LoadedModel, LoadedTextModelConfig, PreparedChat, PreparedChatError,
+    PreparedChatGenerationOutput, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
+    PreparedChatInput, PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest,
+    PreparedChatMtpGenerationOutput, PreparedChatMtpGenerationRequest,
+    PreparedChatSpeculativeBackend, TextDecoderError, TextMetadataError, TextModelError,
+};
+use crate::{
+    api::{
+        metadata::{
+            eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, merge_eos_token_id_sources,
+            read_checkpoint_generation_config,
+        },
+        request::{
+            prepare_chat_from_parts, prepared_chat_control_runtime, BackendGenerationTokenSource,
+            PreparedChatSetupError, PreparedChatTokenDecoder,
+        },
+        tokenizer::{
+            gguf_sidecar_dir, load_chat_template, load_gguf_tokenizer_from_metadata,
+            load_tokenizer_for_kind, load_tokenizer_template_kwargs,
+        },
+    },
+    runtime::{
+        chat::{constraints::ConstraintCompiler, ChatTemplateIdentity, ChatTemplateRequest},
+        generation::streaming::{
+            drive_committed_generation_cancellable, CommittedGenerationError,
+            CommittedTokenPipeline, CommittedTokenPipelineError, RawTokenDecoder,
+        },
+    },
+};
 
 /// Failure while assembling a tokenizer-aware model around a selected backend.
 #[derive(Debug, thiserror::Error)]
@@ -445,6 +490,68 @@ fn loaded_text_artifact(
     ))
 }
 
+#[cfg(feature = "mlx")]
+use crate::api::request::{
+    with_prepared_chat_runtime, PreparedChatDraft, PreparedChatMtpBatchLane,
+    PreparedChatMtpGenerationOptions, PreparedChatSemanticState,
+    ResolvedPreparedChatGenerationSettings,
+};
+#[cfg(feature = "mlx")]
+use crate::architectures::deepseek_v3::model as deepseek_v3;
+#[cfg(feature = "mlx")]
+use crate::architectures::gemma4::model as gemma4;
+#[cfg(feature = "mlx")]
+use crate::architectures::inkling::model as inkling;
+#[cfg(feature = "mlx")]
+use crate::architectures::nemotron_h::model as nemotron_h;
+#[cfg(feature = "mlx")]
+use crate::architectures::qwen::hybrid::qwen3_5;
+#[cfg(feature = "mlx")]
+use crate::backend::mlx::speculative::{
+    scheduler::MlxMtpScheduler, MlxDrafter, MlxDrafterKind, MlxMtpCache, MtpExecutionStreams,
+};
+#[cfg(feature = "mlx")]
+use crate::backend::mlx::{validate_gemma4_drafter, MlxGeneration, Model, ModelCache};
+#[cfg(feature = "mlx")]
+use crate::core::cache::{
+    CacheResidencyPool, LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheOptions,
+};
+#[cfg(feature = "mlx")]
+use crate::core::generation::{
+    GenerationCancellationToken, GenerationConfigOverrides, MtpConfig, MtpSchedulerOptions,
+};
+#[cfg(feature = "mlx")]
+use crate::core::{MtpBatchOutput, MtpStats, SpeculativeSemanticState};
+#[cfg(feature = "mlx")]
+use crate::error::Error;
+#[cfg(feature = "mlx")]
+use crate::runtime::attention::LayerSchedule;
+#[cfg(feature = "mlx")]
+use crate::runtime::cache::residency::{
+    CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+};
+#[cfg(feature = "mlx")]
+use crate::runtime::chat::SemanticSupport;
+#[cfg(feature = "mlx")]
+use crate::runtime::execution::inspection::ActivationObserver;
+#[cfg(feature = "mlx")]
+use crate::runtime::generation::sampler::{
+    ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler,
+};
+#[cfg(feature = "mlx")]
+use crate::runtime::media::input;
+#[cfg(feature = "media-processing")]
+use crate::runtime::media::{ChatMediaBinding, ModelProcessor, ProcessorInput};
+#[cfg(feature = "mlx")]
+use safemlx::{
+    error::Exception,
+    ops::indexing::{NewAxis, TryIndexOp},
+    random::RandomState,
+    Array, Stream,
+};
+
+#[cfg(feature = "mlx")]
 struct PreparedChatMtpLaneRuntime<'a> {
     input: PreparedChatModelInput,
     cache: &'a mut ModelCache,
@@ -456,11 +563,13 @@ struct PreparedChatMtpLaneRuntime<'a> {
     on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
 
+#[cfg(feature = "mlx")]
 enum PreparedChatModelInput {
     RenderedPrompt(Array),
     Prepared(crate::backend::mlx::MlxModelInput),
 }
 
+#[cfg(feature = "mlx")]
 impl PreparedChatModelInput {
     fn with_model_input<T>(&self, function: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
         match self {
@@ -505,6 +614,7 @@ mod prepared_chat_model_input_tests {
     }
 }
 
+#[cfg(feature = "mlx")]
 fn run_prepared_chat_mtp_batch<'a, B>(
     backend: &'a mut B,
     lanes: Vec<PreparedChatMtpLaneRuntime<'a>>,
@@ -571,6 +681,7 @@ where
     })
 }
 
+#[cfg(feature = "mlx")]
 fn gemma4_mtp_cache(cache: &mut ModelCache) -> Option<&mut gemma4::Cache> {
     match cache {
         ModelCache::Gemma4(cache) => Some(cache),
@@ -578,10 +689,12 @@ fn gemma4_mtp_cache(cache: &mut ModelCache) -> Option<&mut gemma4::Cache> {
     }
 }
 
+#[cfg(feature = "mlx")]
 fn model_mtp_cache(cache: &mut ModelCache) -> Option<&mut ModelCache> {
     Some(cache)
 }
 
+#[cfg(feature = "mlx")]
 struct ExternalMtpBatch<'a, B, S>
 where
     B: crate::backend::mlx::speculative::scheduler::MlxSpeculativeRuntime<'a>,
@@ -596,6 +709,7 @@ where
     streams: MtpExecutionStreams<'a>,
 }
 
+#[cfg(feature = "mlx")]
 fn run_external_mtp_batch<'a, B, S>(
     backend: &'a mut B,
     batch: ExternalMtpBatch<'a, B, S>,
@@ -652,6 +766,7 @@ where
     })
 }
 
+#[cfg(feature = "mlx")]
 fn qwen_next_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
     match cache {
         ModelCache::Qwen3Next(cache) => Some(cache),
@@ -659,6 +774,7 @@ fn qwen_next_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
     }
 }
 
+#[cfg(feature = "mlx")]
 fn qwen35_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
     match cache {
         ModelCache::Qwen35(cache) => Some(cache),
@@ -666,6 +782,7 @@ fn qwen35_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
     }
 }
 
+#[cfg(feature = "mlx")]
 fn deepseek_mtp_cache(cache: &mut ModelCache) -> Option<&mut deepseek_v3::Cache> {
     match cache {
         ModelCache::DeepSeekV3(cache) => Some(cache),
@@ -673,6 +790,7 @@ fn deepseek_mtp_cache(cache: &mut ModelCache) -> Option<&mut deepseek_v3::Cache>
     }
 }
 
+#[cfg(feature = "mlx")]
 fn inkling_mtp_cache(cache: &mut ModelCache) -> Option<&mut inkling::Cache> {
     match cache {
         ModelCache::Inkling(cache) => Some(cache),
@@ -680,6 +798,7 @@ fn inkling_mtp_cache(cache: &mut ModelCache) -> Option<&mut inkling::Cache> {
     }
 }
 
+#[cfg(feature = "mlx")]
 fn nemotron_mtp_cache(cache: &mut ModelCache) -> Option<&mut nemotron_h::Cache> {
     match cache {
         ModelCache::NemotronH(cache) => Some(cache),
@@ -688,6 +807,7 @@ fn nemotron_mtp_cache(cache: &mut ModelCache) -> Option<&mut nemotron_h::Cache> 
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "mlx")]
 fn run_embedded_mtp_batch<'a, B, C: 'a, S>(
     backend: &'a mut B,
     lanes: &'a mut [ModelCache],
@@ -742,6 +862,7 @@ where
     })
 }
 
+#[cfg(feature = "mlx")]
 impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     pub(crate) fn model(&self) -> &Model {
         self.runtime.session().complete_model()
@@ -793,9 +914,9 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     || assistant.config.block_size != 16
                 {
                     return Err(Error::UnsupportedArchitecture(
-                        "Muse-Glimmer DFlash hidden geometry, layer mapping, mask token, or block size does not match the target"
-                            .into(),
-                    ));
+                    "Muse-Glimmer DFlash hidden geometry, layer mapping, mask token, or block size does not match the target"
+                        .into(),
+                ));
                 }
             }
             (model, kind) => {
@@ -863,8 +984,8 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                     .clone(),
                 SemanticSupport::Unsupported { reason } => {
                     return Err(Error::PreparedChatSemantic(format!(
-                        "prepared chat lane {lane_index} does not have an executable semantic plan: {reason}"
-                    )));
+                    "prepared chat lane {lane_index} does not have an executable semantic plan: {reason}"
+                )));
                 }
             };
             let generation_plan = prepared_chat
@@ -1030,7 +1151,8 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
             Model::Qwen3Next(target) => {
-                let mut backend = crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                let mut backend =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -1042,7 +1164,8 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
             Model::Qwen35(target) => {
-                let mut backend = crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                let mut backend =
+                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -1054,10 +1177,10 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
             model => Err(Error::Speculative(format!(
-                "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
-                model.model_type(),
-                model.mtp_capability()
-            ))),
+            "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
+            model.model_type(),
+            model.mtp_capability()
+        ))),
         }
     }
 

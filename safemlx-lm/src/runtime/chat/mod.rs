@@ -31,7 +31,6 @@ use crate::runtime::chat::dialect::{
     ExactEnvelope, JsonFunctionEnvelope, NamedCallIdEncoding, NamedJsonArgumentsEncoding,
     ParallelCallLayout, StructuralObjectEncoding, ToolNameConstraint,
 };
-#[cfg(any(feature = "mlx", test))]
 use crate::runtime::generation::streaming::ToolRuntimeParser;
 use crate::{
     runtime::chat::constraints::ConstraintBlueprint,
@@ -159,7 +158,6 @@ impl SemanticRuntimePlan {
             .map(|token| (token.token_id, token.spelling.as_str()))
     }
 
-    #[cfg(any(feature = "mlx", test))]
     pub(crate) fn create_parser_with_stops<'a>(
         &self,
         caller_stops: impl IntoIterator<Item = &'a str>,
@@ -257,29 +255,24 @@ impl GenerationRuntimePlan {
         &self.semantic
     }
 
-    #[cfg(any(feature = "mlx", test))]
     pub(crate) fn generation_constraint(&self) -> &GenerationConstraint {
         &self.generation_constraint
     }
 
-    #[cfg(any(feature = "mlx", test))]
     pub(crate) fn auto_activation_trigger(&self) -> Option<&str> {
         (self.tool_choice == ToolChoice::Auto)
             .then_some(self.tool_call_trigger.as_deref())
             .flatten()
     }
 
-    #[cfg(feature = "mlx")]
     pub(crate) fn tool_call_trigger(&self) -> Option<&str> {
         self.tool_call_trigger.as_deref()
     }
 
-    #[cfg(feature = "mlx")]
     pub(crate) fn tool_choice(&self) -> ToolChoice {
         self.tool_choice
     }
 
-    #[cfg(feature = "mlx")]
     pub(crate) fn has_tool_surface(&self) -> bool {
         self.tool_surface
     }
@@ -531,14 +524,12 @@ impl PreparedChat {
             .filter(|plan| plan.has_tool_surface())
     }
 
-    #[cfg(feature = "mlx")]
     pub(crate) fn semantic_runtime_plan(&self) -> Option<&SemanticRuntimePlan> {
         self.generation_runtime_plan
             .as_ref()
             .map(GenerationRuntimePlan::semantic_plan)
     }
 
-    #[cfg(feature = "mlx")]
     pub(crate) fn generation_runtime_plan(&self) -> Option<&GenerationRuntimePlan> {
         self.generation_runtime_plan.as_ref()
     }

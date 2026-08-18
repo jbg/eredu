@@ -125,7 +125,9 @@ the exact backend completion. It never exposes logits. The ordinary
 `PreparedChatGenerationRequest<B, F>` uses this path for tokenization, grammar
 masking, cancellation, semantic parsing, stop/EOS precedence, and callback
 publication. Its sampling settings contain a portable seed rather than an MLX
-random array.
+random array. This complete load, prepare, and generate path is compiled and
+tested with a mock backend under `safemlx-lm --no-default-features`; it is not
+an MLX-gated facade extension.
 
 Every submission returns an opaque output and an exact `Completion`. Completion
 can be polled or waited without draining unrelated work. A scheduler-owned
