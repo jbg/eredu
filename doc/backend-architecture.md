@@ -42,6 +42,14 @@ distributed, execution, media, residency}` or `runtime::generation::sampler`
 paths. Backend-neutral attention types are canonical core exports rather than
 a `runtime::attention` alias.
 
+The generic `api::loaded` module owns tokenizer-aware loading, ordinary text
+generation, prepared-chat construction, and backend-generic speculative
+request assembly. It does not name MLX or architecture tensor types. The
+feature-gated `api::mlx` integration module alone binds those prepared requests
+to MLX samplers, exact streams, model caches, and embedded or external MTP
+executors. This is an implementation bridge, not a second public facade or a
+compatibility namespace.
+
 ## Core and backend responsibilities
 
 Core owns concepts whose meaning does not depend on tensor representation:

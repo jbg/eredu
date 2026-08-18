@@ -106,3 +106,21 @@ fn crate_root_does_not_reexport_mlx_implementation_types() {
     assert!(!source.contains("pub use backend::mlx"));
     assert!(!source.contains("pub mod error;"));
 }
+
+#[test]
+fn generic_loaded_model_source_does_not_import_backend_implementations() {
+    let loaded = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/loaded.rs");
+    let source = std::fs::read_to_string(loaded).expect("loaded-model source must be readable");
+    for forbidden in [
+        "safemlx::",
+        "safemlx_sys::",
+        "crate::backend::mlx",
+        "crate::architectures",
+        "cfg(feature = \"mlx\")",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "generic LoadedModel orchestration contains backend implementation reference {forbidden:?}"
+        );
+    }
+}
