@@ -8,7 +8,9 @@ use std::path::Path;
 
 use safemlx::Stream;
 
-use crate::{error::Error, runtime::checkpoint::quantization::WeightQuantization};
+use crate::{
+    backend::mlx::error::Error, backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+};
 
 pub use super::model::{
     Cache, Generate, Model, ModelArgs, Qwen3VLModel, QwenVisionTransformer, VisionConfig,

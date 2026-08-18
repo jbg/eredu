@@ -28,6 +28,16 @@ use safemlx_lm::{
         discover_hardware, execution_plan_load_options, expert_cache_telemetry, mtp_telemetry,
         plan_automatic_execution, residency_telemetry,
     },
+    backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    backend::mlx::runtime::execution::layerwise::{
+        LayerwiseLoadOptions, NonExpertWeightResidency, WeightResidency,
+    },
+    backend::mlx::runtime::generation::sampler::{MirostatV2Sampler, Sampler},
+    backend::mlx::runtime::media::input::{InputPart, ModelInput},
+    backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    backend::mlx::runtime::residency::expert_cache::{
+        ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
+    },
     backend::mlx::speculative::MlxDrafter,
     backend::mlx::{
         inspect_model, speculative::MtpComponentTimingGuard, MlxBackend, MlxInspectionOptions,
@@ -37,16 +47,6 @@ use safemlx_lm::{
     core::speculative::MtpStats,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
-    },
-    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-    runtime::execution::layerwise::{
-        LayerwiseLoadOptions, NonExpertWeightResidency, WeightResidency,
-    },
-    runtime::generation::sampler::{MirostatV2Sampler, Sampler},
-    runtime::media::input::{InputPart, ModelInput},
-    runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    runtime::residency::expert_cache::{
-        ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
     },
     AllocatorTelemetry, AutomaticPlanRequest, DevicePlan, DraftPlacementPlan, DraftingPlan,
     ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
@@ -2969,7 +2969,7 @@ fn format_bytes(bytes: usize) -> String {
 }
 
 fn format_weight_store_diagnostics(
-    diagnostics: &safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics,
+    diagnostics: &safemlx_lm::backend::mlx::runtime::checkpoint::store::WeightStoreDiagnostics,
 ) -> String {
     format!(
         "backend={:?}, mapping_hits={}, mapping_misses={}, evictions={}, currently_mapped_shards={}, touched_shards={}, physical_reads={}, physical_read_bytes={}, coalesced_group_hits={}",
@@ -5037,8 +5037,8 @@ mod tests {
 
     #[test]
     fn concise_weight_store_diagnostics_omit_shard_paths() {
-        let diagnostics = safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
-            backend: safemlx_lm::runtime::checkpoint::store::WeightStoreBackend::Safetensors,
+        let diagnostics = safemlx_lm::backend::mlx::runtime::checkpoint::store::WeightStoreDiagnostics {
+            backend: safemlx_lm::backend::mlx::runtime::checkpoint::store::WeightStoreBackend::Safetensors,
             mapping_hits: 17,
             mapping_misses: 2,
             evictions: 1,

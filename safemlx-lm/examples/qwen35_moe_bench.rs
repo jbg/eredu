@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Instant};
 
 use safemlx::ExecutionContext;
 use safemlx_lm::architectures::qwen::hybrid::qwen3_5;
-use safemlx_lm::runtime::checkpoint::quantization::AffineQuantization;
+use safemlx_lm::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
 use safemlx_lm::{
     api::LoadedModel, backend::mlx::ModelLoadOptions, GenerationConfigOverrides,
     TextGenerationConfig, TokenOutput,

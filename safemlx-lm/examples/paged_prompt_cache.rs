@@ -6,9 +6,9 @@ use clap::Parser;
 use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::LoadedModel,
-    runtime::media::input::{InputPart, ModelInput},
-    AttentionPolicy, CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology,
+    backend::mlx::runtime::media::input::{InputPart, ModelInput},
+    backend::mlx::{CacheResidencyPolicy, PagedCacheOptions},
+    AttentionPolicy, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
 };
 
 #[derive(Debug, Parser)]

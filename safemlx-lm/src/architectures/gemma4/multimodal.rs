@@ -11,7 +11,7 @@ use safemlx::{
 };
 
 use super::model::{maybe_quantized_linear_with_bias, rms_norm_without_scale};
-use crate::runtime::checkpoint::quantization::WeightQuantization;
+use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct Gemma4ClippedLinear {
@@ -126,11 +126,12 @@ impl Gemma4ModalityEmbedder {
         quantization: Option<WeightQuantization>,
         local_input_range: Range<usize>,
         stream: &Stream,
-    ) -> Result<Self, crate::error::Error> {
-        let input = usize::try_from(input_size)
-            .map_err(|_| crate::error::Error::Parallel("negative modality width".into()))?;
+    ) -> Result<Self, crate::backend::mlx::error::Error> {
+        let input = usize::try_from(input_size).map_err(|_| {
+            crate::backend::mlx::error::Error::Parallel("negative modality width".into())
+        })?;
         if local_input_range.start >= local_input_range.end || local_input_range.end > input {
-            return Err(crate::error::Error::Parallel(format!(
+            return Err(crate::backend::mlx::error::Error::Parallel(format!(
                 "invalid Gemma modality input range {local_input_range:?} for width {input}"
             )));
         }
@@ -142,7 +143,9 @@ impl Gemma4ModalityEmbedder {
             embedding_projection: maybe_quantized_linear_with_bias(
                 quantization,
                 i32::try_from(local).map_err(|_| {
-                    crate::error::Error::Parallel("local modality width exceeds i32".into())
+                    crate::backend::mlx::error::Error::Parallel(
+                        "local modality width exceeds i32".into(),
+                    )
                 })?,
                 output_size,
                 bias,

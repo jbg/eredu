@@ -19,8 +19,35 @@ use crate::core::cache::{
 
 use crate::{
     architectures::llama::model::{self as resident, AttentionInput, ModelArgs, TransformerBlock},
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions,
+    },
+    backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
+    backend::mlx::runtime::checkpoint::binding::{
+        build_module_bindings, populate_module_from_lease,
+    },
+    backend::mlx::runtime::checkpoint::{
+        quantization::WeightQuantization,
+        store::{GgufWeightStore, WeightStore},
+    },
+    backend::mlx::runtime::distributed::parallel::{
+        register_replicated_module, ParallelPlanBuilder,
+    },
+    backend::mlx::runtime::execution::layerwise::{
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        DenseDiskStreamReport, ExecutionResidency, LayerWeightResidency, LayerwiseForwardState,
+        LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings,
+        WeightResidency,
+    },
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::residency::manager::{
+        ResidencyReport, ResidentUnitLease, WeightBinding,
+    },
     core::cache::LayerCachePolicy,
-    error::Error,
     nn::{
         generation::CausalLm,
         linear::{
@@ -36,27 +63,6 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    runtime::cache::residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions,
-    },
-    runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
-    runtime::checkpoint::binding::{build_module_bindings, populate_module_from_lease},
-    runtime::checkpoint::{
-        quantization::WeightQuantization,
-        store::{GgufWeightStore, WeightStore},
-    },
-    runtime::distributed::parallel::{register_replicated_module, ParallelPlanBuilder},
-    runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
-        DenseDiskStreamReport, ExecutionResidency, LayerWeightResidency, LayerwiseForwardState,
-        LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings,
-        WeightResidency,
-    },
-    runtime::media::input,
-    runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
 const EMBEDDING_UNIT: &str = "llama.static.embedding";
@@ -179,7 +185,7 @@ impl LlamaModel {
     /// Returns rank-local generalized parallel information when applicable.
     pub fn parallel_info(
         &self,
-    ) -> Option<&crate::runtime::execution::layerwise::ParallelModelInfo> {
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
@@ -322,7 +328,7 @@ impl LlamaModel {
         mask: Option<&Array>,
         cache: &mut LlamaCache,
         stream: &Stream,
-        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
         self.execution.forward_with_observer(
@@ -415,7 +421,7 @@ impl LlamaModel {
 
 fn validate_cache_policies<C: KeyValueCache>(
     caches: &[Option<C>],
-    schedule: &crate::runtime::attention::LayerSchedule<crate::runtime::attention::AttentionPolicy>,
+    schedule: &crate::core::attention::LayerSchedule<crate::core::attention::AttentionPolicy>,
 ) -> Result<(), Error> {
     for (layer, (cache, policy)) in caches.iter().zip(schedule.iter()).enumerate() {
         let cache = cache
@@ -511,7 +517,7 @@ pub(crate) fn execute_transformed_llama_model(
 pub(crate) fn load_llama_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
@@ -523,7 +529,7 @@ pub(crate) fn load_llama_tensor_parallel_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         return load_llama_gguf_tensor_parallel_model(
             &checkpoint,
             &metadata,
@@ -557,11 +563,11 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     options: LayerWeightResidency,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(LlamaModel, Vec<u32>), Error> {
-    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
         checkpoint, metadata, options,
     )?;
     let prepared =
@@ -770,13 +776,15 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         &self.args.model_type
     }
 
-    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(
+        &self,
+    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
         self.args.weight_quantization()
     }
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
@@ -1000,7 +1008,9 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
@@ -1028,8 +1038,10 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
+            "text_decoder",
+        ])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1059,8 +1071,8 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn register_parallel_parameters(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
@@ -1098,8 +1110,8 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_kv_heads = Some(planned_kv_head_layout(
@@ -1132,7 +1144,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if group != 0 {
@@ -1189,11 +1201,11 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -1245,7 +1257,9 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -1317,7 +1331,9 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.finish(hidden, cache, context, execution.stream());
@@ -1341,10 +1357,12 @@ mod tests {
     use safemlx::{Device, DeviceType, ExecutionContext};
 
     use super::*;
-    use crate::runtime::{
-        attention::LayerSchedule,
-        checkpoint::quantization::AffineQuantization,
-        distributed::parallel::{ParallelBuildContext, ShardingPolicy},
+    use crate::{
+        backend::mlx::runtime::{
+            checkpoint::quantization::AffineQuantization,
+            distributed::parallel::{ParallelBuildContext, ShardingPolicy},
+        },
+        core::attention::LayerSchedule,
     };
 
     fn build_context(rank: usize) -> ParallelBuildContext {

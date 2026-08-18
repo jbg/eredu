@@ -36,20 +36,21 @@ use safemlx_lm::{
         nemotron_h::model as nemotron_h,
         qwen::{dense as dense_qwen, hybrid::qwen3_5, vl::model as qwen3_vl},
     },
-    backend::mlx::ModelLoadOptions,
-    load_model,
-    runtime::cache::{ConcatKeyValueCache, SlidingKeyValueCache},
-    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-    runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
-    runtime::generation::sampler::DefaultSampler,
-    runtime::media::input as runtime_input,
-    runtime::residency::{
+    backend::mlx::runtime::cache::{ConcatKeyValueCache, SlidingKeyValueCache},
+    backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    backend::mlx::runtime::generation::sampler::DefaultSampler,
+    backend::mlx::runtime::media::input as runtime_input,
+    backend::mlx::runtime::residency::{
         dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions,
     },
-    Backend as _, BackendSession as _, CacheResidencyPolicy, DeviceAssignment, MlxBackend,
-    MlxDistributedSession, MlxParallelContext, MtpCapability, MtpCheckpointKind, MtpConfig,
-    NonExpertWeightResidency, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
-    PromptCacheTopology, WeightResidency,
+    backend::mlx::{
+        CacheResidencyPolicy, DeviceAssignment, MlxBackend, MlxDistributedSession,
+        MlxParallelContext, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions,
+        WeightResidency,
+    },
+    load_model, Backend as _, BackendSession as _, MtpCapability, MtpCheckpointKind, MtpConfig,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
 };
 
 const WORKER_RANK: &str = "SAFEMLX_LM_EXPERT_MODEL_RING_WORKER";
@@ -1171,7 +1172,9 @@ fn save_zero_fixture(
         .into_iter()
         .map(|(name, value)| {
             (
-                safemlx_lm::runtime::checkpoint::binding::canonical_checkpoint_name(&name),
+                safemlx_lm::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                    &name,
+                ),
                 value.clone(),
             )
         })

@@ -6435,7 +6435,7 @@ mod tests {
                 },
                 llama::layerwise::LlamaCache,
             },
-            runtime::cache::PagedKeyValueCache,
+            backend::mlx::runtime::cache::PagedKeyValueCache,
         };
 
         let manager = manager_with_leased_block();

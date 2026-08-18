@@ -26,8 +26,21 @@ use crate::core::cache::{
 
 use crate::{
     architectures::qwen::dense::gguf_string,
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions,
+    },
+    backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
+        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
+    },
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::media::input,
+    core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::CacheRankIdentity,
-    error::Error,
     nn::{
         self as common,
         generation::CausalLm,
@@ -35,21 +48,6 @@ use crate::{
             create_causal_mask,
             rope::{initialize_rope, FloatOrString, RopeVariant},
         },
-    },
-    runtime::cache::residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions,
-    },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
-        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::media::input,
-    runtime::{
-        attention::{AttentionPolicy, LayerSchedule},
-        cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     },
 };
 
@@ -1603,7 +1601,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// GPT-OSS token generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 pub(crate) struct LoadedGptOssGguf {
@@ -2073,7 +2071,7 @@ pub fn load_model_quantized(
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let mut args = get_model_args(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "GPT-OSS dense matrices",
         args.quantization,
         quantization,
@@ -2115,11 +2113,9 @@ mod tests {
 
     use super::{Cache, Model, ModelArgs, MxFp4Config};
     use crate::{
+        backend::mlx::runtime::cache::KeyValueCache,
+        core::attention::{AttentionPolicy, LayerSchedule},
         nn::rope::FloatOrString,
-        runtime::{
-            attention::{AttentionPolicy, LayerSchedule},
-            cache::KeyValueCache,
-        },
     };
 
     fn tiny_args() -> ModelArgs {
@@ -2584,7 +2580,9 @@ mod tests {
 
     #[test]
     fn arbitrary_schedule_ordinary_and_paged_caches_match_and_retain_exactly() {
-        use crate::runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions};
+        use crate::backend::mlx::runtime::cache::residency::{
+            CacheResidencyPolicy, PagedCacheOptions,
+        };
 
         let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = ctx.stream();

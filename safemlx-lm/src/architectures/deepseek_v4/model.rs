@@ -35,28 +35,28 @@ use crate::{
     architectures::qwen::hybrid::qwen3_5::{
         QwenLinear as Linear, QwenWeightFormat as WeightFormat,
     },
-    core::cache::{
-        CacheRankIdentity, LayerCachePolicy, MutableStateResidency, PoolingStateComponent,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
-    },
-    error::Error,
-    nn::{
-        generation::CausalLm,
-        hyper_connections::{expand, HyperConnection, HyperHead},
-    },
-    runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::residency::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
         load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
         CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
         PagedCacheOptions, PromptCacheSnapshotBlock,
     },
-    runtime::checkpoint::load::{
+    backend::mlx::runtime::checkpoint::load::{
         gguf_quantization_configs,
         load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadConfig,
         StrictLoadReport,
     },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::media::input as runtime_input,
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::media::input as runtime_input,
+    core::attention::{AttentionPolicy, LayerSchedule},
+    core::cache::{
+        CacheRankIdentity, LayerCachePolicy, MutableStateResidency, PoolingStateComponent,
+        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
+    },
+    nn::{
+        generation::CausalLm,
+        hyper_connections::{expand, HyperConnection, HyperHead},
+    },
 };
 
 use super::{
@@ -355,7 +355,7 @@ impl ModelArgs {
                 "{context} checkpoint already contains checkpoint-native mixed or FP8 weights; implicit dequantization and requantization is unsupported"
             )));
         }
-        crate::runtime::checkpoint::quantization::should_quantize_on_load(
+        crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
             context,
             self.quantization,
             requested,
@@ -2552,7 +2552,7 @@ impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for Model {
 }
 
 /// DeepSeek-V4 token generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
@@ -2562,8 +2562,10 @@ mod tests {
         prompt_cache_model_identity_for_range, save_prompt_cache_with_rank, AttentionCache, Cache,
         ModelArgs,
     };
+    use crate::backend::mlx::runtime::cache::{
+        residency::PagedCacheOptions, KeyValueCache, PoolingCache,
+    };
     use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
-    use crate::runtime::cache::{residency::PagedCacheOptions, KeyValueCache, PoolingCache};
     use safemlx::{ops::zeros_dtype, Device, DeviceType, Dtype, Stream};
     use serde_json::json;
     use tempfile::TempDir;

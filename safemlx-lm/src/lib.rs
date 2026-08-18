@@ -10,16 +10,12 @@ pub mod api;
 /// Model-family implementations and architecture-specific adapters.
 #[cfg(feature = "mlx")]
 pub mod architectures;
-/// MLX implementation of the backend-neutral execution contract.
-#[cfg(feature = "mlx")]
+/// Execution-backend implementations selected by crate features.
 pub mod backend;
-/// Error types returned by the language-model runtime.
-#[cfg(feature = "mlx")]
-pub mod error;
 /// Reusable MLX neural-network building blocks.
 #[cfg(feature = "mlx")]
 pub mod nn;
-/// Backend-independent chat/streaming infrastructure and optional MLX runtime implementations.
+/// Backend-independent chat and committed-generation orchestration.
 pub mod runtime;
 pub use api::{inspect_text_model, TextInspectionOptions};
 /// Canonical backend-neutral runtime types.
@@ -93,51 +89,6 @@ mod distributed_qwen3_vl_pipeline_ring;
 #[path = "../tests/distributed_tensor_parallel_ring.rs"]
 mod distributed_tensor_parallel_ring;
 
-#[cfg(feature = "mlx")]
-pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
-#[cfg(feature = "mlx")]
-pub use backend::mlx::realtime::{
-    generate_encoded_greedy, MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeCompletion,
-    MlxRealtimeInput, MlxRealtimeModel, MlxRealtimeModelIdentity, MlxRealtimeOutput,
-    MlxRealtimeSession, RealtimeModelKind,
-};
-#[cfg(feature = "mlx")]
-pub use backend::mlx::{DeviceAssignment, MlxParallelContext};
-#[cfg(feature = "mlx")]
-pub use backend::mlx::{
-    MlxBackend, MlxDistributedSession, MlxModel, MlxModelInput, MlxModelOutput, MlxModelSession,
-    MlxSessionCompletion, MlxTextCompletion, MlxTextGenerationState, MlxTextToken,
-};
-#[cfg(feature = "mlx")]
-pub use runtime::cache::residency::{
-    inspect_prompt_cache, CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyError,
-    CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, LiveCacheDiskPolicy,
-    PagedCacheOptions, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
-};
-#[cfg(feature = "mlx")]
-pub use runtime::cache::PagedKeyValueCache;
-#[cfg(feature = "mlx")]
-pub use runtime::distributed::completion::DistributedCompletion;
-#[cfg(feature = "mlx")]
-pub use runtime::distributed::parallel::{
-    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelBuildContext,
-    ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, ShardingPolicy, SynchronizedToken,
-};
-#[cfg(feature = "mlx")]
-pub use runtime::distributed::topology::{PlacementPlan, RankPartition, TensorPlacement};
-#[cfg(feature = "mlx")]
-pub use runtime::execution::layerwise::{
-    load_layerwise_model, ArchitectureAdapter, DenseCacheMetrics, DenseDiskStreamReport,
-    DenseExecutionGroupReport, DensePassReport, DenseTierResidencyReport, ExecutionResidency,
-    ExpertWeightResidency, LayerWeightResidency, LayerwiseForwardState, LayerwiseLoadOptions,
-    LayerwiseModel, LayerwiseModelMetadata, NonExpertWeightResidency, ParallelModelInfo,
-    SharedWeightStore, WeightResidency,
-};
-#[cfg(feature = "mlx")]
-pub use runtime::residency::dense_stream::{DenseDiskStreamLoadOptions, DenseStreamError};
-#[cfg(feature = "mlx")]
-pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
 pub use safemlx_lm_core::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use safemlx_lm_core::cache::{
     CacheBlockId, CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation,

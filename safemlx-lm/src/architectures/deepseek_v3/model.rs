@@ -39,35 +39,35 @@ use crate::{
     architectures::qwen::hybrid::qwen3_5::{
         QwenLinear as Linear, QwenWeightFormat as WeightFormat,
     },
+    backend::mlx::runtime::media::input as runtime_input,
     nn::{
         generation::CausalLm,
         layers::silu,
         moe::{weighted_route_sum, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
     },
-    runtime::media::input as runtime_input,
 };
 use crate::{
-    core::cache::CacheRankIdentity,
-    error::Error,
-    nn::tensor::{
-        create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-    },
-    runtime::attention::LayerSchedule,
-    runtime::cache::residency::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
         open_prompt_cache, CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy,
         CacheResidencyReport, PagedCacheOptions,
     },
-    runtime::cache::{
+    backend::mlx::runtime::cache::{
         BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock,
     },
-    runtime::checkpoint::load::{
+    backend::mlx::runtime::checkpoint::load::{
         for_each_safetensor_array, gguf_metadata, gguf_quantization_configs,
         load_array_quantized_strict, load_array_strict, safetensors_files, GgufTensorNames,
         StrictLoadConfig, StrictLoadReport,
     },
-    runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
-    runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    backend::mlx::runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
+    backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    core::attention::LayerSchedule,
+    core::cache::CacheRankIdentity,
+    nn::tensor::{
+        create_causal_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+    },
 };
 
 type ObserverOption<'a> = Option<&'a mut dyn ActivationObserver>;
@@ -3329,7 +3329,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// DeepSeek token-generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 fn parse_config_value(value: Value) -> Result<ModelArgs, Error> {
@@ -3825,7 +3825,7 @@ pub fn load_model_quantized(
                 .into(),
         ));
     }
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "DeepSeek-V3",
         args.affine_quantization()?,
         quantization,
@@ -4252,11 +4252,11 @@ mod tests {
     };
     use crate::{
         api::LoadedModel,
+        backend::mlx::error::Error,
+        backend::mlx::runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
+        backend::mlx::runtime::cache::CompressedLatentCache,
+        backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
         core::ModelKind,
-        error::Error,
-        runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
-        runtime::cache::CompressedLatentCache,
-        runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
     };
     use safemlx::{
         error::Exception,
@@ -4758,7 +4758,7 @@ mod tests {
     fn arbitrary_internal_schedule_drives_layers_cache_and_identity_exactly() {
         let mut first = tiny_args(Some(4));
         first.num_hidden_layers = 4;
-        first.layer_schedule = crate::runtime::attention::LayerSchedule::new(
+        first.layer_schedule = crate::core::attention::LayerSchedule::new(
             4,
             vec![
                 LayerPolicy::SparseMoe,
@@ -4770,7 +4770,7 @@ mod tests {
         .unwrap();
         first.validate().unwrap();
         let mut second = first.clone();
-        second.layer_schedule = crate::runtime::attention::LayerSchedule::new(
+        second.layer_schedule = crate::core::attention::LayerSchedule::new(
             4,
             vec![
                 LayerPolicy::DenseMlp,
@@ -4807,7 +4807,7 @@ mod tests {
         let context = test_context();
         let stream = context.stream();
         let mut args = tiny_args(Some(4));
-        args.layer_schedule = crate::runtime::attention::LayerSchedule::new(
+        args.layer_schedule = crate::core::attention::LayerSchedule::new(
             2,
             vec![LayerPolicy::SparseMoe, LayerPolicy::DenseMlp],
         )
@@ -4820,7 +4820,9 @@ mod tests {
 
     #[test]
     fn parses_converter_affine_metadata_from_both_config_keys() {
-        use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
+        use crate::backend::mlx::runtime::checkpoint::quantization::{
+            AffineQuantization, WeightQuantization,
+        };
         let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
         let metadata = serde_json::to_value(quantization).unwrap();
         let mut value = affine_config_value();
@@ -4874,7 +4876,7 @@ mod tests {
         let generalized =
             crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
                 &directory,
-                crate::LayerWeightResidency::FullyResident,
+                crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
                 stream,
                 weights.stream(),
             )
@@ -5394,7 +5396,9 @@ mod tests {
 
     #[test]
     fn affine_and_mxfp4_on_load_and_prequantized_expert_banks_run() {
-        use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
+        use crate::backend::mlx::runtime::checkpoint::quantization::{
+            AffineQuantization, WeightQuantization,
+        };
         let context = test_context();
         let stream = context.stream();
         let mut source =
@@ -5476,7 +5480,9 @@ mod tests {
 
     #[test]
     fn loads_dense_and_mixed_quantized_deepseek2_gguf_checkpoints() {
-        use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
+        use crate::backend::mlx::runtime::checkpoint::quantization::{
+            AffineQuantization, WeightQuantization,
+        };
         use safemlx_gguf::GgmlType;
         let context = test_context();
         let stream = context.stream();
@@ -5521,7 +5527,7 @@ mod tests {
         let checkpoint = safemlx::ops::GgufCheckpoint::open(dense_fixture.path()).unwrap();
         let mut on_load = super::load_gguf_checkpoint(
             &checkpoint,
-            crate::runtime::checkpoint::load::gguf_metadata(&checkpoint),
+            crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint),
             Some(q4.into()),
             stream,
             stream,
@@ -5587,7 +5593,9 @@ mod tests {
 
     #[test]
     fn native_fp8_on_load_transcoding_is_rejected() {
-        use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
+        use crate::backend::mlx::runtime::checkpoint::quantization::{
+            AffineQuantization, WeightQuantization,
+        };
         let context = test_context();
         let stream = context.stream();
         let mut source = Model::new(tiny_fp8_args(), stream).unwrap();

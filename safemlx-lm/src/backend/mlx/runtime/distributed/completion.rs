@@ -7,7 +7,7 @@
 
 use safemlx::{transforms::async_eval_with_event, Array, Event, EventBackend, Stream};
 
-use crate::error::Error;
+use crate::backend::mlx::error::Error;
 
 /// A submitted distributed result and its exact backend completion.
 ///

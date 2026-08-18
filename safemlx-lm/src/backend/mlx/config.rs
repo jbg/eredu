@@ -1,8 +1,8 @@
 //! MLX model materialization options.
 
-use crate::error::Error;
-use crate::runtime::checkpoint::quantization::WeightQuantization;
-use crate::runtime::execution::layerwise::WeightResidency;
+use crate::backend::mlx::error::Error;
+use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
+use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
 
 use super::MlxParallelContext;
 
@@ -45,7 +45,7 @@ impl ModelLoadOptions {
     }
 
     pub(crate) fn preparation_policy(self) -> Result<safemlx_lm_core::PreparationPolicy, Error> {
-        use crate::runtime::execution::layerwise::LayerWeightResidency;
+        use crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency;
         use safemlx_lm_core::{QuantizationRequest, ResidencyRequest};
 
         if let Some(quantization) = self.quantization {
@@ -115,7 +115,7 @@ pub(crate) fn ensure_replicated_load_options(options: ModelLoadOptions) -> Resul
 #[cfg(test)]
 mod tests {
     use super::ModelLoadOptions;
-    use crate::runtime::{
+    use crate::backend::mlx::runtime::{
         checkpoint::quantization::WeightQuantization,
         execution::layerwise::{LayerwiseLoadOptions, WeightResidency},
     };

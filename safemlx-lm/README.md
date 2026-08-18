@@ -82,7 +82,7 @@ if !report.is_loadable() {
         eprintln!("{:?}: {}", issue.code, issue.detail);
     }
 }
-# Ok::<(), safemlx_lm::error::Error>(())
+# Ok::<(), safemlx_lm::backend::mlx::error::Error>(())
 ```
 
 Use the high-level `api` module for prepared inputs, generation, cache
@@ -145,7 +145,10 @@ let model = LoadedModel::load(backend, artifact, ModelLoadOptions::default())?;
 
 MLX-owned executable, cache, load-policy, and generation types are exposed only
 from `backend::mlx`: `Model`, `ModelCache`, `ModelLoadOptions`, and
-`MlxGeneration`. The backend-neutral `api` namespace does not alias them.
+`MlxGeneration`. MLX cache, checkpoint, distributed, execution, sampling,
+media, and residency infrastructure is grouped under `backend::mlx::runtime`.
+The backend-neutral `api`, crate root, and facade `runtime` namespaces do not
+alias these implementation types.
 
 `LoadedModel<B>` has no default backend type. The same call accepts another
 `ModelLoadingBackend + TextGenerationBackend`; only backend construction and

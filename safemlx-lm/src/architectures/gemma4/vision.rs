@@ -11,7 +11,9 @@ use safemlx::{
 use serde::Deserialize;
 
 use super::{model::rms_norm_without_scale, multimodal::Gemma4ClippedLinear};
-use crate::{nn::rope::FloatOrString, runtime::checkpoint::quantization::WeightQuantization};
+use crate::{
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization, nn::rope::FloatOrString,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Gemma4VisionConfig {
@@ -92,12 +94,12 @@ impl VisionPatchEmbedder {
         local_hidden: i32,
         parallel_widths: Vec<usize>,
         stream: &Stream,
-    ) -> Result<Self, crate::error::Error> {
+    ) -> Result<Self, crate::backend::mlx::error::Error> {
         if local_hidden <= 0
             || parallel_widths.is_empty()
             || parallel_widths.iter().sum::<usize>() != config.hidden_size as usize
         {
-            return Err(crate::error::Error::Parallel(
+            return Err(crate::backend::mlx::error::Error::Parallel(
                 "invalid Gemma vision patch tensor-parallel widths".into(),
             ));
         }

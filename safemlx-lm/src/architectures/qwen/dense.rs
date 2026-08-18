@@ -29,8 +29,24 @@ pub use crate::core::cache::{
 pub use crate::nn::generation::sample;
 
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{
+        residency::{
+            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
+            CacheResidencyManager, PromptCacheSnapshotBlock,
+        },
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
+        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
+    },
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    backend::mlx::runtime::media::input,
+    core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::CacheRankIdentity,
-    error::Error,
     nn::tensor::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -47,22 +63,6 @@ use crate::{
         linear::project_logits_maybe_quantized,
         moe::TopKRouterScoreFunction,
     },
-    runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::{
-        residency::{
-            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            CacheResidencyManager, PromptCacheSnapshotBlock,
-        },
-        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-    },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
-        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
-    runtime::media::input,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2355,19 +2355,21 @@ impl Model {
     }
 
     /// Creates architecture-correct per-layer KV caches, including Qwen2 SWA layers.
-    pub fn new_cache(&self) -> Vec<Option<crate::runtime::cache::ConcatKeyValueCache>> {
+    pub fn new_cache(
+        &self,
+    ) -> Vec<Option<crate::backend::mlx::runtime::cache::ConcatKeyValueCache>> {
         self.args
             .attention_schedule
             .iter()
             .map(|policy| {
                 Some(match policy.window() {
                     Some(window) => {
-                        crate::runtime::cache::ConcatKeyValueCache::new_for_sliding_attention(
+                        crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new_for_sliding_attention(
                             i32::try_from(window.get())
                                 .expect("validated dense-Qwen attention window fits i32"),
                         )
                     }
-                    None => crate::runtime::cache::ConcatKeyValueCache::new(),
+                    None => crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new(),
                 })
             })
             .collect()
@@ -3648,7 +3650,7 @@ pub fn load_safetensors_quantized(
         Architecture::Qwen2 => "Qwen2/Qwen2.5",
         Architecture::Qwen3 => "Qwen3",
     };
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         architecture_name,
         model_args.weight_quantization(),
         quantization,
@@ -3714,7 +3716,7 @@ where
 }
 
 /// Dense-Qwen token generation iterator.
-pub type Generate<'a, C, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, C, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Vec<Option<C>>, S>;
 
 #[cfg(test)]
@@ -3731,10 +3733,10 @@ mod tests {
 
     use crate::{
         architectures::qwen::dense::{load_safetensors, load_tokenizer},
+        backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+        backend::mlx::runtime::checkpoint::quantization::AffineQuantization,
+        core::attention::{AttentionPolicy, LayerSchedule},
         nn::generation::CausalLm,
-        runtime::attention::{AttentionPolicy, LayerSchedule},
-        runtime::cache::{ConcatKeyValueCache, KeyValueCache},
-        runtime::checkpoint::quantization::AffineQuantization,
     };
 
     const CACHED_TEST_MODEL_DIR: &str = "../cache/Qwen3-4B-bf16";
@@ -3979,8 +3981,8 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_qwen2_paged_save_drop_reload_preserves_distinct_windows() {
         use crate::{
+            backend::mlx::runtime::cache::residency::{CacheResidencyManager, PagedCacheOptions},
             core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
-            runtime::cache::residency::{CacheResidencyManager, PagedCacheOptions},
         };
 
         let context =
@@ -4076,14 +4078,15 @@ mod tests {
         drop(paged);
 
         let identity = super::prompt_cache_model_identity(&args).unwrap();
-        let (manager, manifest) = crate::runtime::cache::residency::open_prompt_cache(
-            &destination,
-            &descriptor,
-            &identity,
-            &prefix_ids,
-            options,
-        )
-        .unwrap();
+        let (manager, manifest) =
+            crate::backend::mlx::runtime::cache::residency::open_prompt_cache(
+                &destination,
+                &descriptor,
+                &identity,
+                &prefix_ids,
+                options,
+            )
+            .unwrap();
         assert_eq!(manifest.schema_version, 6);
         let mut restored_paged = super::new_paged_cache_with_manager(&args, manager, None).unwrap();
         assert_eq!(
@@ -4345,7 +4348,7 @@ mod tests {
 
     #[test]
     fn arbitrary_schedule_ordinary_and_paged_caches_match() {
-        use crate::runtime::cache::{
+        use crate::backend::mlx::runtime::cache::{
             residency::{CacheResidencyManager, PagedCacheOptions},
             PagedKeyValueCache,
         };
@@ -4444,7 +4447,7 @@ mod tests {
             "model.layers.3.mlp.experts.down_proj"
         );
         assert_eq!(
-            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+            crate::backend::mlx::runtime::checkpoint::quantization::gguf_affine_quantization(
                 &[4096, 256],
                 &[4096, 64],
                 "q_proj",
@@ -4453,7 +4456,7 @@ mod tests {
             AffineQuantization::new(32, 4).unwrap()
         );
         assert_eq!(
-            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+            crate::backend::mlx::runtime::checkpoint::quantization::gguf_affine_quantization(
                 &[512, 512],
                 &[512, 64],
                 "k_proj",
@@ -4462,7 +4465,7 @@ mod tests {
             AffineQuantization::new(32, 8).unwrap()
         );
         assert_eq!(
-            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+            crate::backend::mlx::runtime::checkpoint::quantization::gguf_affine_quantization(
                 &[4096, 320],
                 &[4096, 64],
                 "v_proj",
@@ -4471,7 +4474,7 @@ mod tests {
             AffineQuantization::new(32, 5).unwrap()
         );
         assert_eq!(
-            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+            crate::backend::mlx::runtime::checkpoint::quantization::gguf_affine_quantization(
                 &[1024, 192],
                 &[1024, 64],
                 "down_proj",
@@ -4480,7 +4483,7 @@ mod tests {
             AffineQuantization::new(16, 6).unwrap()
         );
         assert_eq!(
-            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+            crate::backend::mlx::runtime::checkpoint::quantization::gguf_affine_quantization(
                 &[1024, 64],
                 &[1024, 64],
                 "q2_proj",
@@ -4489,7 +4492,7 @@ mod tests {
             AffineQuantization::new(16, 2).unwrap()
         );
         assert_eq!(
-            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+            crate::backend::mlx::runtime::checkpoint::quantization::gguf_affine_quantization(
                 &[1024, 96],
                 &[1024, 64],
                 "q3_proj",
@@ -5145,13 +5148,12 @@ mod tests {
         assert_eq!(model.args.num_experts_per_tok, 8);
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-            &tokens,
-        )];
+        let parts =
+            [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
         let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
-            crate::runtime::media::input::ModelInput::new(&parts),
+            crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -5189,13 +5191,12 @@ mod tests {
             .is_some_and(|configs| configs.values().any(|config| config.bits() == 4)));
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-            &tokens,
-        )];
+        let parts =
+            [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
         let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
-            crate::runtime::media::input::ModelInput::new(&parts),
+            crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -5225,13 +5226,12 @@ mod tests {
         // exercises the tiled group-16 prefill kernels in every projection.
         let token_ids = vec![1_u32; 64];
         let tokens = Array::from_slice(&token_ids, &[1, 64]);
-        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-            &tokens,
-        )];
+        let parts =
+            [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
         let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
-            crate::runtime::media::input::ModelInput::new(&parts),
+            crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -5299,10 +5299,10 @@ mod tests {
         let mut cache = Vec::new();
 
         let mut tokens = Vec::new();
-        let input_parts = [crate::runtime::media::input::InputPart::text_token_ids(
-            &prompt_tokens,
-        )];
-        let input = crate::runtime::media::input::ModelInput::new(&input_parts);
+        let input_parts = [
+            crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt_tokens),
+        ];
+        let input = crate::backend::mlx::runtime::media::input::ModelInput::new(&input_parts);
         let generate = super::Generate::<ConcatKeyValueCache>::new(
             &mut model, &mut cache, 0.0, input, None, stream,
         );

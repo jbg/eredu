@@ -16,6 +16,13 @@ use crate::{
         qwen::dense as dense_qwen,
         qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
     },
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::quantization::{
+        AffineQuantization, CheckpointQuantizationOptions, WeightQuantization,
+    },
+    backend::mlx::runtime::execution::inspection::ActivationRecorder,
+    backend::mlx::runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
+    backend::mlx::runtime::media::input,
     backend::mlx::{
         resolve_model_config, validate_gguf_quantization_source, Model, ModelLoadOptions,
         ResolvedModelConfig,
@@ -25,17 +32,11 @@ use crate::{
         SemanticEvent,
     },
     core::{GgufArchitecture, ModelKind, SpeculativeExecutionTopology},
-    error::Error,
+    runtime::chat::constraints::ConstraintCompiler,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, PreparedChat, ToolChoice,
         SYNTHETIC_STRUCTURAL_TOKEN, SYNTHETIC_TOOL_TEMPLATE,
     },
-    runtime::checkpoint::quantization::{
-        AffineQuantization, CheckpointQuantizationOptions, WeightQuantization,
-    },
-    runtime::execution::inspection::ActivationRecorder,
-    runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
-    runtime::{chat::constraints::ConstraintCompiler, media::input},
 };
 use safemlx::{
     argmax_axis,
@@ -65,7 +66,7 @@ fn load_test_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<crate::PreparedModel<crate::backend::mlx::MlxModel>, crate::ModelLoadError<Error>> {
-    let backend = crate::MlxBackend::new(stream, weights_stream);
+    let backend = crate::backend::mlx::MlxBackend::new(stream, weights_stream);
     crate::load_model(&backend, path, options)
 }
 
@@ -143,11 +144,9 @@ fn observer_forward_reports_attention_and_residual_hooks() {
         .try_index_device(safemlx::ops::indexing::NewAxis, ctx.stream())
         .unwrap();
     let mut recorder = ActivationRecorder::new();
-    let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-        &input,
-    )];
+    let parts = [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&input)];
     let input = crate::backend::mlx::MlxModelInput::from(
-        crate::runtime::media::input::ModelInput::new(&parts),
+        crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
     );
     let (backend, session) = model.runtime_mut().parts_mut();
     session
@@ -725,8 +724,8 @@ fn prepared_chat_input_keeps_its_semantic_owner_with_an_opaque_backend_prompt() 
         PreparedChatInput::rendered_prompt(&prepared);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(input.backend_prompt().is_none());
-    let model_input = crate::runtime::media::prepared_model_input(vec![
-        crate::runtime::media::PreparedInputPart::text_token_ids(&[7]),
+    let model_input = crate::backend::mlx::runtime::media::prepared_model_input(vec![
+        crate::backend::mlx::runtime::media::PreparedInputPart::text_token_ids(&[7]),
     ])
     .unwrap();
     let model_input =
@@ -4673,9 +4672,17 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
     write_zero_llama_gguf(&path);
     let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
     let policies = [
-        crate::WeightResidency::layerwise_host(crate::LayerwiseLoadOptions::default()),
-        crate::WeightResidency::dense_disk_stream(
-            crate::DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 1, 1).unwrap(),
+        crate::backend::mlx::runtime::execution::layerwise::WeightResidency::layerwise_host(
+            crate::backend::mlx::runtime::execution::layerwise::LayerwiseLoadOptions::default(),
+        ),
+        crate::backend::mlx::runtime::execution::layerwise::WeightResidency::dense_disk_stream(
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                1 << 20,
+                1 << 20,
+                1,
+                1,
+            )
+            .unwrap(),
         ),
     ];
 
@@ -4867,7 +4874,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 "q4"
             };
             let saved_dir = dir.with_extension(suffix);
-            crate::runtime::checkpoint::quantization::quantize_checkpoint(
+            crate::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
                 &dir,
                 &saved_dir,
                 &CheckpointQuantizationOptions {
@@ -5105,7 +5112,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     assert_eq!(logits.shape(), &[1, 32]);
 
     let saved_dir = dir.with_extension("mxfp4");
-    crate::runtime::checkpoint::quantization::quantize_checkpoint(
+    crate::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
         &dir,
         &saved_dir,
         &CheckpointQuantizationOptions {

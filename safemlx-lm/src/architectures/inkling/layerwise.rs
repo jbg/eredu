@@ -30,7 +30,35 @@ use crate::{
     architectures::inkling::model::{
         self as resident, AudioModel, Cache, DecoderLayer, ModelArgs, VisionLayer, VisionModel,
     },
-    error::Error,
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+    },
+    backend::mlx::runtime::cache::KeyValueCache,
+    backend::mlx::runtime::checkpoint::binding::{
+        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        packed_companion_checkpoint_name, populate_module_from_lease,
+        populate_module_from_lease_excluding,
+    },
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
+    backend::mlx::runtime::execution::layerwise::{
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
+        ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
+        LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
+    },
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::residency::expert_cache::{
+        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
+        ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
+    },
+    backend::mlx::runtime::residency::manager::{
+        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
+    },
     nn::{
         self as common,
         generation::CausalLm,
@@ -40,30 +68,6 @@ use crate::{
             VocabParallelLmHead,
         },
     },
-    runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
-    runtime::cache::KeyValueCache,
-    runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
-        packed_companion_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
-    },
-    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
-        recipe::DerivedWeightRecipe,
-    },
-    runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
-        LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
-    },
-    runtime::media::input,
-    runtime::residency::expert_cache::{
-        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
-    },
-    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
 const EMBEDDING_UNIT: &str = "inkling.static.embedding";
@@ -225,7 +229,9 @@ impl InklingMtpModule {
         tokens: &Array,
         depth: usize,
         cache: &mut [resident::LayerCache],
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         if self.layers.is_empty() || cache.len() != self.layers.len() {
@@ -290,7 +296,10 @@ impl InklingLayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
+    pub(crate) fn bind_parallel_topology(
+        &mut self,
+        topology: crate::backend::mlx::MlxParallelContext,
+    ) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -412,7 +421,7 @@ impl InklingLayerwiseModel {
             .ok_or_else(|| Exception::custom("Inkling MTP target has no parallel topology"))?
             .topology();
         let execution =
-            crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+            crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
                 topology, group, stream,
             )
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -448,7 +457,9 @@ impl InklingLayerwiseModel {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
@@ -530,7 +541,10 @@ impl InklingLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -776,7 +790,7 @@ impl InklingLayerwiseModel {
             .topology();
         let execution = tensor_group
             .map(|group| {
-                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
                     topology, group, stream,
                 )
             })
@@ -1116,7 +1130,7 @@ pub fn load_inkling_layerwise_model(
 pub(crate) fn load_inkling_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -1128,7 +1142,7 @@ pub(crate) fn load_inkling_tensor_parallel_layerwise_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let mmproj = resident::open_sibling_mmproj(model_dir)?;
         return load_inkling_gguf_tensor_parallel_model(
             &checkpoint,
@@ -1165,7 +1179,7 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
     metadata: &HashMap<String, GgufMetadataValue>,
     mmproj: Option<&resident::InklingMmprojGguf>,
     options: LayerWeightResidency,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
@@ -1299,7 +1313,7 @@ fn load_inkling_gguf_sparse_with_store(
 /// Loads Inkling with independently cached experts and bounded non-expert units.
 pub fn load_inkling_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::NonExpertWeightResidency,
+    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1387,7 +1401,7 @@ pub(crate) fn load_inkling_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -1894,7 +1908,9 @@ impl InklingLayerwiseAdapter {
     pub(crate) fn embed_pipeline_tokens(
         &mut self,
         tokens: &Array,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let embedded = match execution {
@@ -1971,7 +1987,9 @@ impl InklingLayerwiseAdapter {
         tokens: &Array,
         depth: usize,
         cache: &mut [resident::LayerCache],
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let embeddings = match execution.filter(|execution| execution.is_tensor_parallel()) {
@@ -2007,7 +2025,9 @@ impl InklingLayerwiseAdapter {
     pub(crate) fn begin_pipeline_ingress(
         &mut self,
         input: input::ModelInput<'_>,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<InklingPipelineIngressState, Error> {
         let mut cache = Cache::new(&self.args.text_config);
@@ -2095,7 +2115,9 @@ impl InklingLayerwiseAdapter {
         index: usize,
         layer: &mut InklingLayer,
         state: &mut InklingPipelineIngressState,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Vec<Array>, Error> {
         state.forward.hidden = match execution {
@@ -2132,7 +2154,9 @@ impl InklingLayerwiseAdapter {
     pub(crate) fn finish_pipeline_ingress(
         &mut self,
         mut state: InklingPipelineIngressState,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let text_group = self.pipeline_text_group();
@@ -2390,7 +2414,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_layout = match topology {
             Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
@@ -2774,7 +2798,9 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         _cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.begin_forward(input, _cache, execution.stream());
@@ -2995,7 +3021,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if self.execution_group_name(group)? == "vision_encoder" {
@@ -3021,8 +3047,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if self.execution_group_name(group)? == "vision_encoder" {
@@ -3058,7 +3084,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
@@ -3075,7 +3102,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             ));
         }
         Ok(Some(
-            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
                 self.args.text_config.n_routed_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -3085,9 +3112,10 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
 
     fn parallel_parameter_groups(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-    ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
-        use crate::runtime::distributed::parallel::{
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    ) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error>
+    {
+        use crate::backend::mlx::runtime::distributed::parallel::{
             aligned_partition_units, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
             ParameterRole,
         };
@@ -3159,8 +3187,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
 
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         let text = &self.args.text_config;
@@ -3333,8 +3361,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
 
     fn register_parallel_parameters(
         &self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         for group in self.parallel_parameter_groups(context)? {
@@ -3347,21 +3375,21 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         if let Some(mtp) = &self.mtp {
             for (index, layer) in mtp.layers.iter().enumerate() {
                 let prefix = format!("mtp.layers.{index}");
-                crate::runtime::distributed::parallel::register_replicated_module(
+                crate::backend::mlx::runtime::distributed::parallel::register_replicated_module(
                     planner,
                     &layer.hidden_norm,
                     &format!("{prefix}.hidden_norm"),
                 )?;
-                crate::runtime::distributed::parallel::register_replicated_module(
+                crate::backend::mlx::runtime::distributed::parallel::register_replicated_module(
                     planner,
                     &layer.embed_norm,
                     &format!("{prefix}.embed_norm"),
                 )?;
-                crate::runtime::distributed::parallel::register_projection_module(
+                crate::backend::mlx::runtime::distributed::parallel::register_projection_module(
                     planner,
                     &layer.input_proj,
                     &format!("{prefix}.input_proj"),
-                    crate::runtime::distributed::parallel::ProjectionSharding::Replicated,
+                    crate::backend::mlx::runtime::distributed::parallel::ProjectionSharding::Replicated,
                 )?;
                 layer
                     .transformer_block
@@ -3371,7 +3399,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                     )?;
             }
             if let Some(chain_norm) = &mtp.chain_norm {
-                crate::runtime::distributed::parallel::register_replicated_module(
+                crate::backend::mlx::runtime::distributed::parallel::register_replicated_module(
                     planner,
                     chain_norm,
                     "mtp.chain_norm",
@@ -3388,7 +3416,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if self.execution_group_name(group)? != "vision_encoder" {
@@ -3503,11 +3531,11 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -3521,7 +3549,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -3648,7 +3676,9 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -3846,7 +3876,9 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(head) = &mut self.parallel_lm_head else {
             return self.finish(hidden, cache, context, execution.stream());
@@ -4043,7 +4075,7 @@ pub(crate) fn inkling_expert_catalog(
 }
 
 /// Inkling text token generation using bounded layer execution.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, InklingLayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -4065,23 +4097,25 @@ mod tests {
     };
     use crate::{
         architectures::inkling::model::{self as resident, Model, ModelArgs},
+        backend::mlx::runtime::cache::{residency::CacheResidencyPolicy, KeyValueCache},
+        backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+        backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
+        backend::mlx::runtime::execution::layerwise::{
+            load_layerwise_model_with_quantization, transformed_module_weight_store,
+            ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
+            LoadTimeQuantizableAdapter,
+        },
+        backend::mlx::runtime::media::input as runtime_input,
+        backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+        backend::mlx::runtime::residency::expert_cache::{
+            ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch,
+        },
+        backend::mlx::PagedCacheOptions,
         core::{
             cache::{PromptCacheDescriptor, PromptCacheOptions},
             residency::{OffloadConfig, ResidencyPolicy},
         },
         nn::generation::CausalLm,
-        runtime::cache::{residency::CacheResidencyPolicy, KeyValueCache},
-        runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-        runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-        runtime::execution::layerwise::{
-            load_layerwise_model_with_quantization, transformed_module_weight_store,
-            ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
-            LoadTimeQuantizableAdapter,
-        },
-        runtime::media::input as runtime_input,
-        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch},
-        PagedCacheOptions,
     };
 
     fn config() -> serde_json::Value {
@@ -4370,14 +4404,14 @@ mod tests {
             .unwrap();
             let mut cached = load_inkling_expert_cache_model(
                 dir.path(),
-                crate::NonExpertWeightResidency::FullyResident,
+                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::FullyResident,
                 expert_options,
                 Some(quantization),
                 gpu.stream(),
                 cpu.stream(),
             )
             .unwrap();
-            let backend = crate::MlxBackend::new(gpu.stream(), cpu.stream());
+            let backend = crate::backend::mlx::MlxBackend::new(gpu.stream(), cpu.stream());
             let loaded = crate::load_model(
                 &backend,
                 dir.path(),
@@ -4977,19 +5011,19 @@ mod tests {
     fn inkling_global_and_sliding_attention_paged_parity() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let mut args = args();
-        args.text_config.layer_schedule = crate::runtime::attention::LayerSchedule::new(
+        args.text_config.layer_schedule = crate::core::attention::LayerSchedule::new(
             3,
             vec![
                 resident::LayerPolicy {
-                    attention: crate::runtime::attention::AttentionPolicy::Full,
+                    attention: crate::core::attention::AttentionPolicy::Full,
                     feed_forward: resident::FeedForwardPolicy::Dense,
                 },
                 resident::LayerPolicy {
-                    attention: crate::runtime::attention::AttentionPolicy::sliding(4).unwrap(),
+                    attention: crate::core::attention::AttentionPolicy::sliding(4).unwrap(),
                     feed_forward: resident::FeedForwardPolicy::SparseMoe,
                 },
                 resident::LayerPolicy {
-                    attention: crate::runtime::attention::AttentionPolicy::sliding(2).unwrap(),
+                    attention: crate::core::attention::AttentionPolicy::sliding(2).unwrap(),
                     feed_forward: resident::FeedForwardPolicy::SparseMoe,
                 },
             ],
@@ -5061,7 +5095,7 @@ mod tests {
                 .unwrap();
         let mut cached = load_inkling_expert_cache_model(
             dir.path(),
-            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,
@@ -5129,7 +5163,7 @@ mod tests {
         let quantization: WeightQuantization = AffineQuantization::new(32, 4).unwrap().into();
         let mut cached = load_inkling_expert_cache_model(
             dir.path(),
-            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
             )),
             expert_options,

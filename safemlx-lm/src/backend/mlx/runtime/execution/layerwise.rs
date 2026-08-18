@@ -1,9 +1,9 @@
 //! Architecture-independent execution of decoder models from resident layers.
 //!
-//! [`crate::runtime::execution::layerwise::LayerwiseModel`] owns checkpoint
+//! [`crate::backend::mlx::runtime::execution::layerwise::LayerwiseModel`] owns checkpoint
 //! storage, residency, bounded device
 //! windows, and synchronization. Model-family behavior is supplied by an
-//! [`crate::runtime::execution::layerwise::ArchitectureAdapter`].
+//! [`crate::backend::mlx::runtime::execution::layerwise::ArchitectureAdapter`].
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -20,31 +20,33 @@ use crate::core::cache::{
 };
 
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::PagedCacheOptions,
+    backend::mlx::runtime::checkpoint::binding::{
+        binding_bytes, build_module_bindings, is_materialized_module_parameter,
+        populate_module_from_lease, ModuleBindingError,
+    },
+    backend::mlx::runtime::checkpoint::bounded_quantization::{
+        BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
+        BoundedQuantizedWeightStore,
+    },
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
+    backend::mlx::runtime::checkpoint::store::{
+        MemoryWeightStore, SafetensorsWeightStore, WeightStore,
+    },
+    backend::mlx::runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
+    backend::mlx::runtime::residency::dense_stream::{
+        BackgroundLayerPrefetch, DenseDiskStreamLoadOptions, DENSE_TRANSFER_WINDOW,
+    },
+    backend::mlx::runtime::residency::manager::{
+        host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyError, ResidencyManager,
+        ResidencyReport, ResidentLayerGroup, ResidentTransfer, ResidentUnitLease,
+    },
     core::residency::BackgroundPrefetchReport,
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
         ResidencyLedgerError, ResidencyPolicy, TransferDirection,
-    },
-    error::Error,
-    runtime::cache::residency::PagedCacheOptions,
-    runtime::checkpoint::binding::{
-        binding_bytes, build_module_bindings, is_materialized_module_parameter,
-        populate_module_from_lease, ModuleBindingError,
-    },
-    runtime::checkpoint::bounded_quantization::{
-        BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
-        BoundedQuantizedWeightStore,
-    },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::checkpoint::recipe::RecipeDtype,
-    runtime::checkpoint::store::{MemoryWeightStore, SafetensorsWeightStore, WeightStore},
-    runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
-    runtime::residency::dense_stream::{
-        BackgroundLayerPrefetch, DenseDiskStreamLoadOptions, DENSE_TRANSFER_WINDOW,
-    },
-    runtime::residency::manager::{
-        host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyError, ResidencyManager,
-        ResidencyReport, ResidentLayerGroup, ResidentTransfer, ResidentUnitLease,
     },
 };
 
@@ -76,7 +78,9 @@ pub(crate) fn transformed_module_weight_store(
         .filter(|(name, parameter)| is_materialized_module_parameter(name, parameter, &parameters))
     {
         let checkpoint_name =
-            crate::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name);
+            crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                parameter_name,
+            );
         if arrays
             .insert(checkpoint_name.clone(), (*value).clone())
             .is_some()
@@ -195,7 +199,7 @@ pub enum ExpertWeightResidency {
     #[default]
     WithLayer,
     /// Catalog routed experts as independent atomic residency units.
-    IndependentCache(crate::runtime::residency::expert_cache::ExpertCacheLoadOptions),
+    IndependentCache(crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions),
 }
 
 /// Placement of non-expert parameters when routed experts are independent units.
@@ -239,7 +243,7 @@ pub enum WeightResidency {
         /// Bounded ordinary-layer policy.
         non_experts: NonExpertWeightResidency,
         /// Expert-granular cache controls.
-        cache: crate::runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        cache: crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions,
     },
 }
 
@@ -267,7 +271,7 @@ impl WeightResidency {
     /// Gives routed experts an independent cache beside the selected ordinary-layer policy.
     pub const fn with_expert_cache(
         non_experts: NonExpertWeightResidency,
-        experts: crate::runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        experts: crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions,
     ) -> Self {
         Self::IndependentExperts {
             non_experts,
@@ -296,7 +300,7 @@ impl WeightResidency {
     /// Returns independently cached expert controls, when selected.
     pub const fn expert_cache(
         self,
-    ) -> Option<crate::runtime::residency::expert_cache::ExpertCacheLoadOptions> {
+    ) -> Option<crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions> {
         match self {
             Self::Layers(_) => None,
             Self::IndependentExperts { cache, .. } => Some(cache),
@@ -965,7 +969,7 @@ impl DenseStreamController {
             .map(|unit| unit.device_allocated_bytes())
             .sum();
         let mut activity = self.group_activity.lock().map_err(|_| {
-            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
         })?;
         let state = activity
             .get_mut(group)
@@ -1004,16 +1008,16 @@ impl DenseStreamController {
             .map(|unit| unit.device_allocated_bytes())
             .sum();
         let mut pass = self.pass.lock().map_err(|_| {
-            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
         })?;
         let active = pass.active.as_mut().ok_or(
-            crate::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
                 "residency was observed without an active forward",
             ),
         )?;
         if active.prefill != prefill {
             return Err(
-                crate::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+                crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
                     "residency observation changed pass category",
                 )
                 .into(),
@@ -1028,7 +1032,7 @@ impl DenseStreamController {
 
     fn record_group_execution(&self, group: &str) -> Result<(), Error> {
         let mut activity = self.group_activity.lock().map_err(|_| {
-            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
         })?;
         let state = activity
             .get_mut(group)
@@ -1053,11 +1057,11 @@ impl DenseStreamController {
     ) -> Result<DenseStreamForwardGuard, Error> {
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
         let mut state = self.pass.lock().map_err(|_| {
-            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
         })?;
         if state.active.is_some() {
             return Err(
-                crate::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+                crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
                     "a forward is already active",
                 )
                 .into(),
@@ -1085,10 +1089,10 @@ impl DenseStreamController {
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
         let current = DenseCounterSnapshot::from_report(&offload);
         let mut state = self.pass.lock().map_err(|_| {
-            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
         })?;
         let active = state.active.take().ok_or(
-            crate::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
                 "a forward was committed without being started",
             ),
         )?;
@@ -1190,7 +1194,7 @@ impl DenseStreamController {
             }
         };
         let activity = self.group_activity.lock().map_err(|_| {
-            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
         })?;
         let groups = self
             .groups
@@ -1233,7 +1237,7 @@ impl DenseStreamController {
             })
             .collect();
         let pass = self.pass.lock().map_err(|_| {
-            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
         })?;
         Ok(DenseDiskStreamReport {
             planned_layer_count: self.planned_layer_count,
@@ -1447,7 +1451,8 @@ impl Drop for DenseStreamGroupGuard {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LayerwiseModelMetadata {
     model_type: String,
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+    quantization:
+        Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization>,
     layer_count: usize,
     static_device_bytes: u64,
     residency: ExecutionResidency,
@@ -1515,7 +1520,7 @@ impl LayerwiseModelMetadata {
     /// Returns checkpoint-native packed quantization metadata, if present.
     pub const fn quantization(
         &self,
-    ) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
         self.quantization
     }
     /// Returns the decoder layer count.
@@ -1557,14 +1562,14 @@ impl LayerwiseModelMetadata {
 /// One pinned static module and its checkpoint bindings.
 pub struct StaticUnitBindings {
     id: OffloadUnitId,
-    bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
+    bindings: Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>,
 }
 
 impl StaticUnitBindings {
     /// Creates a pinned static unit definition.
     pub(crate) fn new(
         id: impl Into<String>,
-        bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
+        bindings: Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>,
     ) -> Result<Self, Error> {
         Ok(Self {
             id: OffloadUnitId::new(id.into())?,
@@ -1578,7 +1583,9 @@ impl StaticUnitBindings {
     }
 
     /// Returns the authoritative checkpoint bindings for this static module.
-    pub(crate) fn bindings(&self) -> &[crate::runtime::residency::manager::WeightBinding] {
+    pub(crate) fn bindings(
+        &self,
+    ) -> &[crate::backend::mlx::runtime::residency::manager::WeightBinding] {
         &self.bindings
     }
 }
@@ -1920,7 +1927,9 @@ pub trait ArchitectureAdapter: Sized {
     }
 
     /// Model-wide checkpoint quantization, when one uniform encoding exists.
-    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(
+        &self,
+    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
         None
     }
 
@@ -1929,7 +1938,7 @@ pub trait ArchitectureAdapter: Sized {
     /// checkpoint components whose target modules intentionally stay dense.
     fn quantizes_static_binding(
         &self,
-        _binding: &crate::runtime::residency::manager::WeightBinding,
+        _binding: &crate::backend::mlx::runtime::residency::manager::WeightBinding,
     ) -> bool {
         true
     }
@@ -2018,7 +2027,9 @@ pub trait ArchitectureAdapter: Sized {
         &mut self,
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         self.begin_forward(input, cache, execution.stream())
     }
@@ -2045,8 +2056,9 @@ pub trait ArchitectureAdapter: Sized {
     /// Adapters without an exact tensor-parallel parameter plan fail closed.
     fn parallel_parameter_groups(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-    ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    ) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error>
+    {
         Err(Error::Parallel(format!(
             "architecture adapter {} has not declared tensor-parallel parameter roles",
             std::any::type_name::<Self>()
@@ -2058,8 +2070,8 @@ pub trait ArchitectureAdapter: Sized {
     /// families instead of duplicating parameter-name logic.
     fn register_parallel_parameters(
         &self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         _stream: &Stream,
     ) -> Result<(), Error> {
         for group in self.parallel_parameter_groups(context)? {
@@ -2075,8 +2087,8 @@ pub trait ArchitectureAdapter: Sized {
     /// initialization.
     fn configure_parallel_static(
         &mut self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         _stream: &Stream,
     ) -> Result<(), Error> {
         Ok(())
@@ -2087,7 +2099,7 @@ pub trait ArchitectureAdapter: Sized {
         &self,
         _group: usize,
         _index: usize,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         _stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         Err(Error::Parallel(format!(
@@ -2105,7 +2117,7 @@ pub trait ArchitectureAdapter: Sized {
         &self,
         _group: usize,
         _index: usize,
-        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         _stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         Err(Error::Parallel(format!(
@@ -2123,8 +2135,8 @@ pub trait ArchitectureAdapter: Sized {
         &self,
         _group: usize,
         _index: usize,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         _stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         Err(Error::Parallel(format!(
@@ -2140,7 +2152,8 @@ pub trait ArchitectureAdapter: Sized {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size > 1 {
             Err(Error::Parallel(format!(
                 "architecture adapter {} has not declared expert ownership for EP size {}",
@@ -2161,8 +2174,8 @@ pub trait ArchitectureAdapter: Sized {
         &self,
         group: usize,
         index: usize,
-        layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
-        assignment: Option<&crate::runtime::distributed::expert::ExpertAssignment>,
+        layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         match (layout, assignment) {
@@ -2200,7 +2213,7 @@ pub trait ArchitectureAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn WeightStore,
-    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
         Ok(build_module_bindings(
             layer,
             &self.layer_checkpoint_prefix(group, index),
@@ -2215,9 +2228,9 @@ pub trait ArchitectureAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         _stream: &Stream,
-    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
         build_parallel_module_bindings(
             layer,
             &self.layer_checkpoint_prefix(group, index),
@@ -2236,9 +2249,9 @@ pub trait ArchitectureAdapter: Sized {
         _index: usize,
         _layer: &Self::Layer,
         _store: &dyn WeightStore,
-        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         _stream: &Stream,
-    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
         Err(Error::Parallel(format!(
             "architecture adapter {} has not implemented expert-local checkpoint bindings",
             std::any::type_name::<Self>()
@@ -2258,10 +2271,10 @@ pub trait ArchitectureAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
         let bindings =
             self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
         shard_layer_bindings(
@@ -2281,10 +2294,10 @@ pub trait ArchitectureAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
-        assignment: Option<&crate::runtime::distributed::expert::ExpertAssignment>,
+        layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
-    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
         match (layout, assignment) {
             (None, None) => {
                 // The execution layer can have transformed target geometry
@@ -2364,7 +2377,9 @@ pub trait ArchitectureAdapter: Sized {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         if execution.is_tensor_parallel() {
             return Err(Error::Parallel(format!(
@@ -2435,7 +2450,9 @@ pub trait ArchitectureAdapter: Sized {
         dependency_outputs: &[Array],
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         self.begin_execution_group(
             group,
@@ -2469,7 +2486,9 @@ pub trait ArchitectureAdapter: Sized {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         self.complete_execution_group(group, hidden, cache, context, execution.stream())
     }
@@ -2489,7 +2508,9 @@ pub trait ArchitectureAdapter: Sized {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         self.finish(hidden, cache, context, execution.stream())
     }
@@ -2536,7 +2557,7 @@ pub struct LayerwiseModel<A: ArchitectureAdapter> {
     sample_mlx_memory: bool,
     sample_process_memory: bool,
     metadata: LayerwiseModelMetadata,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
     parallel_info: Option<ParallelModelInfo>,
     execution_streams: Vec<Stream>,
@@ -2790,7 +2811,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     /// Returns the exact typed rank-local parameter layout, when parallel.
     pub const fn parallel_layout(
         &self,
-    ) -> Option<&crate::runtime::distributed::parallel::LocalModelLayout> {
+    ) -> Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout> {
         self.parallel_layout.as_ref()
     }
 
@@ -2813,7 +2834,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     /// Returns this execution rank's exact ordered cache-state layout.
     pub fn prompt_cache_layer_layout(
         &self,
-    ) -> Result<crate::runtime::attention::LayerSchedule<crate::LayerCachePolicy>, Error> {
+    ) -> Result<crate::core::attention::LayerSchedule<crate::LayerCachePolicy>, Error> {
         Ok(self
             .adapter
             .prompt_cache_model_identity(self.parallel_topology)?
@@ -2994,7 +3015,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             true,
             |adapter, group, index, layer, hidden, cache, context, stream| {
                 let execution =
-                    crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(
+                    crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::replicated(
                         stream,
                     );
                 adapter.forward_layer_with_execution(
@@ -3081,7 +3102,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             &Array,
             &mut A::Cache,
             &mut A::ForwardContext,
-            &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         ) -> Result<Array, Error>,
     {
         self.forward_tensor_parallel_with_hooks(
@@ -3145,7 +3166,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             &Array,
             &mut A::Cache,
             &mut A::ForwardContext,
-            &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         ) -> Result<Array, Error>,
     {
         self.forward_tensor_parallel_with_hooks(
@@ -3183,7 +3204,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             &Array,
             &mut A::Cache,
             &mut A::ForwardContext,
-            &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         ) -> Result<Array, Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
     {
@@ -3201,12 +3222,12 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         };
         let initial_execution = match (topology, tensor_parallel_group) {
             (Some(topology), Some(group)) => {
-                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
                     topology, group, stream,
                 )?
             }
             (None, None) => {
-                crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(stream)
+                crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::replicated(stream)
             }
             _ => unreachable!("topology and TP group are created together"),
         };
@@ -3325,12 +3346,12 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                     })
                     .collect::<Vec<_>>();
                 let execution = match (topology, tensor_parallel_group) {
-                    (Some(topology), Some(group)) => crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                    (Some(topology), Some(group)) => crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
                         topology,
                         group,
                         &states[group_index].stream,
                     )?,
-                    (None, None) => crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(&states[group_index].stream),
+                    (None, None) => crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::replicated(&states[group_index].stream),
                     _ => unreachable!("topology and TP group are created together"),
                 };
                 let hidden = match self.adapter.begin_execution_group_with_execution(
@@ -3371,12 +3392,12 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                 let layer_count = resident_group.units().len();
                 let group_stream = states[group_index].stream.clone();
                 let execution = match (topology, tensor_parallel_group) {
-                    (Some(topology), Some(group)) => crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                    (Some(topology), Some(group)) => crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
                         topology,
                         group,
                         &group_stream,
                     )?,
-                    (None, None) => crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(&group_stream),
+                    (None, None) => crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::replicated(&group_stream),
                     _ => unreachable!("topology and TP group are created together"),
                 };
 
@@ -3703,12 +3724,12 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         }
         let final_execution = match (topology, tensor_parallel_group) {
             (Some(topology), Some(group)) => {
-                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
                     topology, group, stream,
                 )?
             }
             (None, None) => {
-                crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(stream)
+                crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::replicated(stream)
             }
             _ => unreachable!("topology and TP group are created together"),
         };
@@ -3746,7 +3767,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             &Array,
             &mut A::Cache,
             &mut A::ForwardContext,
-            &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         ) -> Result<Array, Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
     {
@@ -3874,7 +3895,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             false,
             |adapter, group, index, layer, hidden, cache, context, stream| {
                 let execution =
-                    crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(
+                    crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::replicated(
                         stream,
                     );
                 adapter.forward_layer_with_execution(
@@ -3991,7 +4012,8 @@ fn packed_weight_companion_dtypes(module: &impl ModuleParameters) -> BTreeMap<St
         .iter()
         .filter(|(_, parameter)| parameter.dtype() == safemlx::Dtype::Uint32)
         .map(|(name, _)| {
-            let canonical = crate::runtime::checkpoint::binding::canonical_checkpoint_name(name);
+            let canonical =
+                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(name);
             let scales = canonical
                 .strip_suffix(".weight")
                 .map(|prefix| format!("{prefix}.scales"))
@@ -4017,7 +4039,7 @@ where
 {
     let mut recipes = BTreeMap::new();
     let mut collect =
-        |bindings: &[crate::runtime::residency::manager::WeightBinding],
+        |bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
          selected_local_weights: Option<&BTreeMap<String, RecipeDtype>>| {
             for binding in bindings {
                 let recipe = binding.source_recipe();
@@ -4030,7 +4052,9 @@ where
                     continue;
                 }
                 let canonical_local =
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        binding.name(),
+                    );
                 if selected_local_weights
                     .is_some_and(|selected| !selected.contains_key(&canonical_local))
                 {
@@ -4064,7 +4088,9 @@ where
             .filter(|binding| target_adapter.quantizes_static_binding(binding))
             .map(|binding| {
                 (
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name()),
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        binding.name(),
+                    ),
                     RecipeDtype::F32,
                 )
             })
@@ -4161,7 +4187,7 @@ pub(crate) fn load_tensor_parallel_layerwise_model_with_quantization<A, O>(
     source_adapter: A,
     options: O,
     quantization: Option<WeightQuantization>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseModel<A>, Error>
@@ -4251,7 +4277,7 @@ where
 {
     let mut recipes = BTreeMap::new();
     let mut collect =
-        |bindings: &[crate::runtime::residency::manager::WeightBinding],
+        |bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
          selected_local_weights: Option<&BTreeMap<String, RecipeDtype>>| {
             for binding in bindings {
                 let recipe = binding.source_recipe();
@@ -4264,7 +4290,9 @@ where
                     continue;
                 }
                 let canonical_local =
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        binding.name(),
+                    );
                 if selected_local_weights
                     .is_some_and(|selected| !selected.contains_key(&canonical_local))
                 {
@@ -4306,7 +4334,9 @@ where
             .filter(|binding| target_adapter.quantizes_static_binding(binding))
             .map(|binding| {
                 (
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name()),
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        binding.name(),
+                    ),
                     RecipeDtype::F32,
                 )
             })
@@ -4673,7 +4703,7 @@ pub(crate) fn load_tensor_parallel_layerwise_model<A, O>(
     store: SharedWeightStore,
     mut adapter: A,
     options: O,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseModel<A>, Error>
@@ -4962,11 +4992,11 @@ fn packed_semantic_weight_name(name: &str) -> Option<String> {
 }
 
 fn stored_tensor_selection(
-    tensor: &crate::runtime::distributed::parallel::LocalTensorLayout,
+    tensor: &crate::backend::mlx::runtime::distributed::parallel::LocalTensorLayout,
     stored_shape: &[usize],
-) -> Result<crate::runtime::checkpoint::store::TensorSelection, Error> {
-    use crate::runtime::checkpoint::store::TensorSelection;
-    use crate::runtime::distributed::topology::TensorPlacement;
+) -> Result<crate::backend::mlx::runtime::checkpoint::store::TensorSelection, Error> {
+    use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
+    use crate::backend::mlx::runtime::distributed::topology::TensorPlacement;
 
     let scale_boundary = |axis: usize, boundary: usize| -> Result<usize, Error> {
         let semantic = tensor.global_shape()[axis];
@@ -5028,28 +5058,30 @@ fn stored_tensor_selection(
 }
 
 pub(crate) fn shard_layer_bindings(
-    bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
+    bindings: Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>,
     prefix: &str,
     store: &dyn WeightStore,
-    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
-    use crate::runtime::checkpoint::store::TensorSelection;
+    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+    use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
 
     let store_keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let mut output = Vec::with_capacity(bindings.len());
     for binding in bindings {
-        let canonical_name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(
-            &format!("{prefix}.{}", binding.name()),
-        );
+        let canonical_name =
+            crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&format!(
+                "{prefix}.{}",
+                binding.name()
+            ));
         let logical_target = binding.logical_target();
         let tensor = logical_target
             .and_then(|target| layout.tensor(target))
             .or_else(|| {
                 logical_target.and_then(|logical| {
                     let canonical_logical =
-                        crate::runtime::checkpoint::binding::canonical_checkpoint_name(logical);
+                        crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(logical);
                     layout.tensors().find_map(|(target, tensor)| {
-                        (crate::runtime::checkpoint::binding::canonical_checkpoint_name(target)
+                        (crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(target)
                             == canonical_logical)
                             .then_some(tensor)
                     })
@@ -5060,7 +5092,7 @@ pub(crate) fn shard_layer_bindings(
             .or_else(|| {
                 layout.tensors().find_map(|(target, tensor)| {
                     let canonical_target =
-                        crate::runtime::checkpoint::binding::canonical_checkpoint_name(target);
+                        crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(target);
                     (canonical_target == binding.checkpoint_key()
                         || canonical_target == canonical_name)
                         .then_some(tensor)
@@ -5078,7 +5110,7 @@ pub(crate) fn shard_layer_bindings(
                 .find_map(|weight| {
                     layout.tensor(&weight).or_else(|| {
                         let canonical =
-                            crate::runtime::checkpoint::binding::canonical_checkpoint_name(&weight);
+                            crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&weight);
                         layout.tensor(&canonical)
                     })
                 })
@@ -5111,24 +5143,26 @@ pub(crate) fn shard_layer_bindings(
                         binding.name()
                     ))
                 })?;
-            output.push(crate::runtime::residency::manager::WeightBinding::new(
-                binding.name(),
-                binding.checkpoint_key(),
-                selection,
-                expected_bytes,
-            )?);
+            output.push(
+                crate::backend::mlx::runtime::residency::manager::WeightBinding::new(
+                    binding.name(),
+                    binding.checkpoint_key(),
+                    selection,
+                    expected_bytes,
+                )?,
+            );
             continue;
         }
         let recipe = binding.source_recipe();
         let metadata = recipe.infer(store)?;
         let selection = stored_tensor_selection(tensor, metadata.shape())?;
-        if selection == crate::runtime::checkpoint::store::TensorSelection::Full {
+        if selection == crate::backend::mlx::runtime::checkpoint::store::TensorSelection::Full {
             output.push(binding);
             continue;
         }
         let recipe = recipe.select_bounded(store, selection)?;
         let expected_bytes = recipe.infer(store)?.byte_len();
-        let sharded = crate::runtime::residency::manager::WeightBinding::from_recipe(
+        let sharded = crate::backend::mlx::runtime::residency::manager::WeightBinding::from_recipe(
             binding.name(),
             recipe,
             expected_bytes,
@@ -5142,9 +5176,9 @@ fn build_parallel_module_bindings(
     module: &impl ModuleParameters,
     prefix: &str,
     store: &dyn WeightStore,
-    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
-    use crate::runtime::checkpoint::store::TensorSelection;
+    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+    use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
     let mut names = params
@@ -5162,14 +5196,16 @@ fn build_parallel_module_bindings(
             format!("{prefix}.{local_name}")
         };
         let canonical =
-            crate::runtime::checkpoint::binding::canonical_checkpoint_name(&destination);
+            crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                &destination,
+            );
         let checkpoint_key = if keys.contains(&destination) {
             destination.clone()
         } else if keys.contains(&canonical) {
             canonical.clone()
         } else {
             return Err(
-                crate::runtime::checkpoint::binding::ModuleBindingError::MissingParameter {
+                crate::backend::mlx::runtime::checkpoint::binding::ModuleBindingError::MissingParameter {
                     destination,
                 }
                 .into(),
@@ -5185,7 +5221,7 @@ fn build_parallel_module_bindings(
                     .and_then(|weight| {
                         layout.tensor(&weight).or_else(|| {
                             let canonical =
-                                crate::runtime::checkpoint::binding::canonical_checkpoint_name(
+                                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
                                     &weight,
                                 );
                             layout.tensor(&canonical)
@@ -5219,10 +5255,11 @@ fn build_parallel_module_bindings(
                     selected_shape, local_shape
                 )));
             }
-            let recipe = crate::runtime::checkpoint::recipe::DerivedWeightRecipe::source(
-                checkpoint_key.clone(),
-                selection.clone(),
-            );
+            let recipe =
+                crate::backend::mlx::runtime::checkpoint::recipe::DerivedWeightRecipe::source(
+                    checkpoint_key.clone(),
+                    selection.clone(),
+                );
             let bytes = recipe.infer(store)?.byte_len();
             (selection, bytes)
         } else {
@@ -5240,12 +5277,14 @@ fn build_parallel_module_bindings(
             }
             (TensorSelection::Full, metadata.logical_byte_len as u64)
         };
-        bindings.push(crate::runtime::residency::manager::WeightBinding::new(
-            local_name,
-            checkpoint_key,
-            selection,
-            expected_bytes,
-        )?);
+        bindings.push(
+            crate::backend::mlx::runtime::residency::manager::WeightBinding::new(
+                local_name,
+                checkpoint_key,
+                selection,
+                expected_bytes,
+            )?,
+        );
     }
     Ok(bindings)
 }
@@ -5256,7 +5295,7 @@ fn add_unit(
     specs: &mut Vec<OffloadUnitSpec>,
     consumed: &mut BTreeSet<String>,
     id: OffloadUnitId,
-    bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
+    bindings: Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>,
     policy: ResidencyPolicy,
     tier: MemoryTier,
     byte_total: &mut u64,
@@ -5527,7 +5566,9 @@ mod tests {
     #[test]
     fn weight_residency_decomposes_layers_and_experts() {
         let host = LayerwiseLoadOptions::default();
-        let experts = crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default();
+        let experts =
+            crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(
+            );
         let residency = WeightResidency::with_expert_cache(
             NonExpertWeightResidency::LayerwiseHost(host),
             experts,
@@ -5851,12 +5892,12 @@ mod tests {
             mlp_bias: true,
             rope_scaling: None,
             attention_schedule: match sliding_window {
-                Some(window) => crate::runtime::attention::LayerSchedule::all_sliding(
+                Some(window) => crate::core::attention::LayerSchedule::all_sliding(
                     3,
                     u32::try_from(window).unwrap(),
                 )
                 .unwrap(),
-                None => crate::runtime::attention::LayerSchedule::all_full(3).unwrap(),
+                None => crate::core::attention::LayerSchedule::all_full(3).unwrap(),
             },
             quantization: None,
             quantization_config: None,
@@ -5867,11 +5908,11 @@ mod tests {
 
     #[test]
     fn execution_group_binding_sharding_preserves_direct_and_derived_selections() {
-        use crate::runtime::distributed::parallel::{
+        use crate::backend::mlx::runtime::distributed::parallel::{
             MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
             ParameterRole,
         };
-        use crate::runtime::{
+        use crate::backend::mlx::runtime::{
             checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection},
             residency::manager::WeightBinding,
         };
@@ -5990,7 +6031,9 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        name,
+                    ),
                     *value,
                 )
             })
@@ -6139,7 +6182,7 @@ mod tests {
 
     #[test]
     fn arbitrary_llama_schedule_resident_layerwise_parity() {
-        use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
+        use crate::core::attention::{AttentionPolicy, LayerSchedule};
 
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -6630,13 +6673,17 @@ mod tests {
 
         let converted_root = tempfile::tempdir().unwrap();
         let converted = converted_root.path().join("affine");
-        let options = crate::runtime::checkpoint::quantization::CheckpointQuantizationOptions {
-            quantization: crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
-                .unwrap()
-                .into(),
-            ..Default::default()
-        };
-        crate::runtime::checkpoint::quantization::quantize_checkpoint(
+        let options =
+            crate::backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions {
+                quantization:
+                    crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(
+                        32, 4,
+                    )
+                    .unwrap()
+                    .into(),
+                ..Default::default()
+            };
+        crate::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
             source.path(),
             &converted,
             &options,

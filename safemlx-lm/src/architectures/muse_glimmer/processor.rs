@@ -9,8 +9,8 @@ use safemlx::{
 use serde::Deserialize;
 
 use crate::{
-    error::Error,
-    runtime::media::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::media::{
         image::{rescale_and_normalize_rgb8, resize_rgb8_lanczos3, NormalizedImage, RgbImageView},
         input::Modality,
         prepared_model_input, push_text_token_ids,

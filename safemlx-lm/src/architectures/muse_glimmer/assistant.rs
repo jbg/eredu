@@ -20,20 +20,20 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    backend::mlx::ModelLoadOptions,
-    error::Error,
-    nn::{
-        layers::silu,
-        linear::unloaded_maybe_quantized_linear,
-        tensor::{rope::initialize_rope, scaled_dot_product_attention},
-    },
-    runtime::checkpoint::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::{
         load::{
             gguf_metadata, gguf_quantization_configs, load_gguf_strict,
             load_safetensors_quantized_strict, load_safetensors_strict, StrictLoadConfig,
             StrictLoadReport,
         },
         quantization::WeightQuantization,
+    },
+    backend::mlx::ModelLoadOptions,
+    nn::{
+        layers::silu,
+        linear::unloaded_maybe_quantized_linear,
+        tensor::{rope::initialize_rope, scaled_dot_product_attention},
     },
 };
 
@@ -443,7 +443,7 @@ impl DFlashAttention {
             q,
             keys,
             values,
-            Option::<crate::runtime::cache::ConcatKeyValueCache>::None,
+            Option::<crate::backend::mlx::runtime::cache::ConcatKeyValueCache>::None,
             self.scale,
             Some(&mask),
             stream,

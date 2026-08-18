@@ -32,32 +32,32 @@ use crate::core::cache::{
 
 use crate::{
     architectures::qwen::{dense as dense_qwen, vl::vision::grid_thw_from_array},
-    core::cache::{
-        LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorOwner,
-        StateTensorPolicy, StateTensorRole,
-    },
-    error::Error,
-    nn::{
-        self as common,
-        attention::AttentionInput,
-        generation::CausalLm,
-        tensor::{create_attention_mask, AttentionMask},
-    },
-    runtime::attention::LayerSchedule,
-    runtime::cache::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{
         residency::{
             open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
             PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache,
     },
-    runtime::checkpoint::load::{
+    backend::mlx::runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
         load_named_iq_array_strict, load_safetensors_dir_quantized_strict,
         load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
     },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::media::input as runtime_input,
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::media::input as runtime_input,
+    core::attention::LayerSchedule,
+    core::cache::{
+        LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorOwner,
+        StateTensorPolicy, StateTensorRole,
+    },
+    nn::{
+        self as common,
+        attention::AttentionInput,
+        generation::CausalLm,
+        tensor::{create_attention_mask, AttentionMask},
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -891,7 +891,7 @@ pub fn load_qwen3_vl_model_quantized(
         .text_config
         .quantization
         .or(args.text_config.quantization_config);
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "Qwen3-VL",
         existing,
         quantization,
@@ -1505,12 +1505,13 @@ pub(crate) fn load_qwen_vision_mmproj_weights<M: safemlx::module::ModuleParamete
 
 /// Finds the dense sibling mmproj used by the single-path dense or MoE loader.
 pub(crate) fn find_qwen3_vl_mmproj(gguf_file: &Path) -> Result<PathBuf, Error> {
-    crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen3vl")?.ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!(
-            "qwen3vl GGUF requires a nearby mmproj file relative to {}",
-            gguf_file.display()
-        ))
-    })
+    crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen3vl")?
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "qwen3vl GGUF requires a nearby mmproj file relative to {}",
+                gguf_file.display()
+            ))
+        })
 }
 
 impl CausalLm<Cache> for Model {
@@ -1540,7 +1541,7 @@ impl CausalLm<Cache> for Model {
             .kv
             .first()
             .and_then(Option::as_ref)
-            .map(crate::runtime::cache::KeyValueCache::offset)
+            .map(crate::backend::mlx::runtime::cache::KeyValueCache::offset)
             .unwrap_or(0)
             + cache.rope_delta;
         let positions = [
@@ -1554,7 +1555,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Qwen3-VL generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
@@ -1568,7 +1569,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use crate::{nn::generation::CausalLm, runtime::media::input as runtime_input};
+    use crate::{backend::mlx::runtime::media::input as runtime_input, nn::generation::CausalLm};
 
     fn tiny_args() -> super::ModelArgs {
         let text_config = crate::architectures::qwen::dense::DecoderConfig {
@@ -1589,7 +1590,7 @@ mod tests {
             attention_dropout: 0.0,
             attention_bias: Some(false),
             mlp_bias: Some(false),
-            attention_schedule: crate::runtime::attention::LayerSchedule::all_full(1).unwrap(),
+            attention_schedule: crate::core::attention::LayerSchedule::all_full(1).unwrap(),
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -1600,7 +1601,7 @@ mod tests {
             quantized_weight_configs: None,
         };
         let vision_config = super::VisionConfig {
-            layer_schedule: crate::runtime::attention::LayerSchedule::new(
+            layer_schedule: crate::core::attention::LayerSchedule::new(
                 1,
                 vec![super::VisionLayerPolicy {
                     attention: super::VisionAttentionPolicy::Full,
@@ -1649,7 +1650,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_layout_accepts_exact_rank_local_kv_geometry() {
-        use crate::{core::cache::LayerCachePolicy, runtime::attention::LayerSchedule};
+        use crate::{core::attention::LayerSchedule, core::cache::LayerCachePolicy};
 
         let mut args = tiny_args();
         args.text_config.num_hidden_layers = 2;
@@ -1677,13 +1678,13 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_multimodal_position_state_save_reload_parity() {
+        use crate::backend::mlx::runtime::cache::KeyValueCache;
         use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
-        use crate::runtime::cache::KeyValueCache;
 
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         let args = tiny_args();
-        let mut kv = crate::runtime::cache::ConcatKeyValueCache::new();
+        let mut kv = crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new();
         let values = (0..48).map(|value| value as f32).collect::<Vec<_>>();
         let keys = Array::from_slice(&values, &[1, 1, 4, 12]);
         kv.update_and_fetch(keys.clone(), keys, stream).unwrap();
@@ -1766,7 +1767,7 @@ mod tests {
         let args = super::parse_model_args_value(config).unwrap();
         assert_eq!(
             args.text_config.quantization,
-            Some(crate::runtime::checkpoint::quantization::AffineQuantization::default().into())
+            Some(crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::default().into())
         );
     }
 
@@ -1885,7 +1886,7 @@ mod tests {
         let mut source_args = tiny_args();
         source_args.text_config.num_hidden_layers = 2;
         source_args.text_config.attention_schedule =
-            crate::runtime::attention::LayerSchedule::all_full(2).unwrap();
+            crate::core::attention::LayerSchedule::all_full(2).unwrap();
         source_args.vision_config.hidden_size = 32;
         source_args.vision_config.intermediate_size = 32;
         source_args.vision_config.num_heads = 4;
@@ -2086,12 +2087,12 @@ mod tests {
         fs::copy(fixture.path(), &model_path).unwrap();
         fs::copy(vision_fixture.path(), mmproj_path).unwrap();
         let topology = |rank| {
-            crate::MlxParallelContext::for_rank(
+            crate::backend::mlx::MlxParallelContext::for_rank(
                 rank,
                 1,
                 2,
                 1,
-                crate::DeviceAssignment::new(DeviceType::Cpu, 0),
+                crate::backend::mlx::DeviceAssignment::new(DeviceType::Cpu, 0),
             )
             .unwrap()
         };
@@ -2209,7 +2210,7 @@ mod tests {
         assert_eq!(
             cache.kv[0]
                 .as_ref()
-                .map(crate::runtime::cache::KeyValueCache::offset),
+                .map(crate::backend::mlx::runtime::cache::KeyValueCache::offset),
             Some(3)
         );
     }

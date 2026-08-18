@@ -1,6 +1,6 @@
 //! Persistent, lazy checkpoint tensor storage.
 //!
-//! A [`crate::runtime::checkpoint::store::WeightLease`] pins the bytes backing a safetensors
+//! A [`crate::backend::mlx::runtime::checkpoint::store::WeightLease`] pins the bytes backing a safetensors
 //! view. Materialization returns an owning completion guard that retains the
 //! view through asynchronous MLX evaluation. Callers may order a compatible
 //! consumer stream without blocking the host, or synchronize the exact

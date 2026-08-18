@@ -24,8 +24,42 @@ use crate::core::cache::{
 };
 
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+    },
+    backend::mlx::runtime::cache::{
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::binding::{
+        build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
+        populate_module_from_lease, populate_module_from_lease_excluding,
+    },
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
+    backend::mlx::runtime::distributed::parallel::{
+        aligned_partition_units, array_parameter_member, register_replicated_module,
+        MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
+    },
+    backend::mlx::runtime::execution::layerwise::{
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
+    },
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
+        ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
+    },
+    backend::mlx::runtime::residency::manager::{
+        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
+    },
     core::cache::LayerCachePolicy,
-    error::Error,
     nn::{
         attention::AttentionInput,
         generation::CausalLm,
@@ -42,36 +76,6 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
-    runtime::cache::{
-        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
-    },
-    runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
-        populate_module_from_lease, populate_module_from_lease_excluding,
-    },
-    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
-        recipe::DerivedWeightRecipe,
-    },
-    runtime::distributed::parallel::{
-        aligned_partition_units, array_parameter_member, register_replicated_module,
-        MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
-    },
-    runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
-        StaticUnitBindings, WeightResidency,
-    },
-    runtime::media::input,
-    runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
-    },
-    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
 const EMBEDDING_UNIT: &str = "dense_qwen.static.embedding";
@@ -99,7 +103,10 @@ impl LayerwiseDecoder {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
+    pub(crate) fn bind_parallel_topology(
+        &mut self,
+        topology: crate::backend::mlx::MlxParallelContext,
+    ) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -129,7 +136,10 @@ impl LayerwiseDecoder {
         match policy {
             CacheResidencyPolicy::Device => Ok(DenseQwenLayerwiseCache::Concat(self.new_cache())),
             CacheResidencyPolicy::Paged(options) => {
-                let manager = crate::CacheResidencyManager::new(options)
+                let manager =
+                    crate::backend::mlx::runtime::cache::residency::CacheResidencyManager::new(
+                        options,
+                    )
                     .map_err(|error| Exception::custom(error.to_string()))?;
                 let caches = resident::new_paged_cache_with_manager(
                     self.args(),
@@ -159,12 +169,16 @@ impl LayerwiseDecoder {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
     /// Returns generalized parameter-residency and memory metadata.
-    pub fn residency_metadata(&self) -> &crate::LayerwiseModelMetadata {
+    pub fn residency_metadata(
+        &self,
+    ) -> &crate::backend::mlx::runtime::execution::layerwise::LayerwiseModelMetadata {
         self.execution.metadata()
     }
 
@@ -242,7 +256,10 @@ impl LayerwiseDecoder {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -306,7 +323,7 @@ impl LayerwiseDecoder {
         mask: Option<&Array>,
         cache: &mut Vec<Option<ConcatKeyValueCache>>,
         stream: &Stream,
-        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
         let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
         let result = self.execution.forward_with_observer(
@@ -329,7 +346,7 @@ impl LayerwiseDecoder {
         mask: Option<&Array>,
         cache: &mut Vec<Option<PagedKeyValueCache>>,
         stream: &Stream,
-        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
         let mut owned = DenseQwenLayerwiseCache::Paged(std::mem::take(cache));
         let result = self.execution.forward_with_observer(
@@ -766,7 +783,7 @@ pub(crate) fn execute_transformed_model(
 pub(crate) fn load_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -778,7 +795,7 @@ pub(crate) fn load_tensor_parallel_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let architecture = match metadata.get("general.architecture") {
             Some(GgufMetadataValue::String(architecture)) => architecture.as_str(),
             Some(_) => {
@@ -827,11 +844,11 @@ pub(crate) fn load_gguf_tensor_parallel_model(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     options: LayerWeightResidency,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(LayerwiseDecoder, Vec<u32>), Error> {
-    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
         checkpoint, metadata, options,
     )?;
     let is_moe = architecture == "qwen3moe";
@@ -968,7 +985,7 @@ pub(crate) fn load_qwen3_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: DecoderConfig,
     non_expert: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -992,7 +1009,7 @@ pub(crate) fn load_qwen3_sparse_tp_ep_base_with_store(
 /// Loads sparse Qwen3 with independently cached experts and bounded non-expert units.
 pub fn load_qwen3_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::NonExpertWeightResidency,
+    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1319,13 +1336,15 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         &self.args.model_type
     }
 
-    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(
+        &self,
+    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
         self.args.quantization.or(self.args.quantization_config)
     }
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
@@ -1495,7 +1514,9 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
@@ -1520,8 +1541,10 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
+            "text_decoder",
+        ])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1611,8 +1634,8 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
 
     fn register_parallel_parameters(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
@@ -1650,8 +1673,8 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
 
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_kv_heads = Some(planned_kv_head_layout(
@@ -1684,7 +1707,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if group != 0 {
@@ -1735,7 +1758,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if !self.args.is_moe() {
@@ -1772,8 +1795,8 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if !self.args.is_moe() {
@@ -1811,7 +1834,8 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
@@ -1821,7 +1845,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
             ));
         }
         Ok(Some(
-            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
                 self.args.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -1877,11 +1901,11 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -1895,7 +1919,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -1971,7 +1995,9 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         }
     }
 
-    fn forward_layer_with_observer<O: crate::runtime::execution::inspection::ActivationObserver>(
+    fn forward_layer_with_observer<
+        O: crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+    >(
         &mut self,
         group: usize,
         index: usize,
@@ -2034,7 +2060,9 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -2106,7 +2134,9 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.finish(hidden, cache, context, execution.stream());
@@ -2392,7 +2422,7 @@ pub(crate) fn qwen3_expert_catalog_cartesian(
     args: &DecoderConfig,
     store: &dyn WeightStore,
     layer_root: &str,
-    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
@@ -2542,9 +2572,11 @@ pub(crate) fn qwen3_expert_catalog_cartesian(
                 )?);
             }
             let bindings = match layout {
-                Some(layout) => crate::runtime::execution::layerwise::shard_layer_bindings(
-                    bindings, &prefix, store, layout,
-                )?,
+                Some(layout) => {
+                    crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
+                        bindings, &prefix, store, layout,
+                    )?
+                }
                 None => bindings,
             };
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
@@ -2600,13 +2632,13 @@ mod tests {
     use super::*;
     use crate::{
         architectures::qwen::dense as dense_qwen,
-        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
-        runtime::{
+        backend::mlx::runtime::{
             distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{
                 ExecutionResidency, LayerWeightResidency, LayerwiseLoadOptions,
             },
         },
+        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
     fn tensor_parallel_context_for(rank: usize) -> ParallelBuildContext {
@@ -2640,7 +2672,7 @@ mod tests {
             attention_dropout: 0.0,
             attention_bias: Some(false),
             mlp_bias: Some(false),
-            attention_schedule: crate::runtime::attention::LayerSchedule::all_full(3).unwrap(),
+            attention_schedule: crate::core::attention::LayerSchedule::all_full(3).unwrap(),
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -2680,7 +2712,8 @@ mod tests {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
-            let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+            let name =
+                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             if split_experts {
                 if let Some(prefix) = name.strip_suffix(".mlp.experts.gate_up_proj") {
                     for expert in 0..model.args.num_experts {
@@ -2884,10 +2917,10 @@ mod tests {
         config.head_dim = 16;
         config.vocab_size = 64;
         config.moe_intermediate_size = 96;
-        config.attention_schedule = crate::runtime::attention::LayerSchedule::all_full(1).unwrap();
+        config.attention_schedule = crate::core::attention::LayerSchedule::all_full(1).unwrap();
         config.quantized_weight_configs = Some(HashMap::from([(
             "model.layers.0.mlp.experts.down_proj".into(),
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
                 .unwrap()
                 .into(),
         )]));
@@ -3025,12 +3058,11 @@ mod tests {
             );
 
             let tokens = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-            let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-                &tokens,
-            )];
+            let parts =
+                [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
             model
                 .submit_prefill(
-                    crate::runtime::media::input::ModelInput::new(&parts),
+                    crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                     &mut cache,
                     gpu.stream(),
                 )
@@ -3096,7 +3128,7 @@ mod tests {
         model_args.model_type = "qwen2".into();
         model_args.attention_bias = Some(true);
         model_args.attention_schedule =
-            crate::runtime::attention::LayerSchedule::from_sliding_pattern(
+            crate::core::attention::LayerSchedule::from_sliding_pattern(
                 3,
                 &[false, true, true],
                 Some(2),
@@ -3107,7 +3139,7 @@ mod tests {
 
     #[test]
     fn qwen2_resident_and_layerwise_arbitrary_pattern_parity() {
-        use crate::runtime::checkpoint::store::SafetensorsWeightStore;
+        use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
 
         let gpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -3115,7 +3147,7 @@ mod tests {
         model_args.model_type = "qwen2".into();
         model_args.attention_bias = Some(true);
         model_args.attention_schedule =
-            crate::runtime::attention::LayerSchedule::from_sliding_pattern(
+            crate::core::attention::LayerSchedule::from_sliding_pattern(
                 3,
                 &[true, false, true],
                 Some(2),
@@ -3185,16 +3217,17 @@ mod tests {
         let expert_options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
                 .unwrap();
-        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            u64::MAX,
-            u64::MAX,
-            1,
-            1,
-        )
-        .unwrap();
+        let dense =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+            )
+            .unwrap();
         let mut cached = load_qwen3_expert_cache_model(
             dir.path(),
-            crate::NonExpertWeightResidency::DenseDiskStream(dense),
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense),
             expert_options,
             None,
             gpu.stream(),
@@ -3241,7 +3274,7 @@ mod tests {
 
     #[test]
     fn qwen3_load_time_quantization_packs_complete_and_cached_expert_banks() {
-        use crate::runtime::checkpoint::quantization::AffineQuantization;
+        use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
 
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -3261,16 +3294,17 @@ mod tests {
         let expert_options =
             ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
                 .unwrap();
-        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            u64::MAX,
-            u64::MAX,
-            1,
-            1,
-        )
-        .unwrap();
+        let dense =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+            )
+            .unwrap();
         let mut loaded = load_qwen3_expert_cache_model(
             dir.path(),
-            crate::NonExpertWeightResidency::DenseDiskStream(dense),
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense),
             expert_options,
             Some(quantization),
             gpu.stream(),
@@ -3279,7 +3313,7 @@ mod tests {
         .unwrap();
         let mut complete = load_safetensors_quantized_residency(
             dir.path(),
-            crate::LayerWeightResidency::FullyResident,
+            crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency::FullyResident,
             quantization,
             gpu.stream(),
             cpu.stream(),
@@ -3368,7 +3402,7 @@ mod tests {
 
     #[test]
     fn qwen3_dense_disk_load_time_quantization_accounts_only_packed_bytes() {
-        use crate::runtime::checkpoint::quantization::AffineQuantization;
+        use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
 
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -3383,13 +3417,14 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, false, gpu.stream());
-        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            u64::MAX,
-            u64::MAX,
-            1,
-            1,
-        )
-        .unwrap();
+        let dense =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+            )
+            .unwrap();
         let loaded = load_safetensors_quantized_residency(
             dir.path(),
             dense,
@@ -3427,7 +3462,7 @@ mod tests {
                 .unwrap();
         let mut cached = load_qwen3_expert_cache_model(
             dir.path(),
-            crate::NonExpertWeightResidency::LayerwiseHost(non_expert),
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(non_expert),
             expert_options,
             None,
             gpu.stream(),

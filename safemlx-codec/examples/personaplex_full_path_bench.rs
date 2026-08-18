@@ -3,8 +3,9 @@ use std::{path::PathBuf, time::Instant};
 use safemlx::{transforms::eval, Array, Device, DeviceType, ExecutionContext, Stream};
 use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
-    load_realtime_model, MlxRealtimeBackend, MlxRealtimeInput, RealtimeModel, RealtimeSampling,
-    RealtimeScheduler, RequestId, SchedulerLimits,
+    backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
+    load_realtime_model, RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId,
+    SchedulerLimits,
 };
 
 const SAMPLE_RATE: f64 = 24_000.0;

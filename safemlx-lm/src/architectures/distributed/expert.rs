@@ -1,7 +1,7 @@
 //! Reusable expert-parallel assignment, routing, and exchange infrastructure.
 //!
 //! Pure expert parallelism keeps ordinary model state replicated and partitions
-//! only routed expert banks. [`crate::runtime::distributed::expert::dispatch_replicated`]
+//! only routed expert banks. [`crate::backend::mlx::runtime::distributed::expert::dispatch_replicated`]
 //! exploits the replicated
 //! token layout: ranks compact only routes owned by their experts and all-sum
 //! the resulting token buffer. Sharded-token dispatch uses compact native or
@@ -42,6 +42,30 @@ use crate::{
             vl::model as qwen3_vl,
         },
     },
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions,
+    },
+    backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
+    backend::mlx::runtime::checkpoint::load::{transform_split_swiglu_experts, StrictLoadConfig},
+    backend::mlx::runtime::checkpoint::quantization::{
+        should_quantize_on_load, WeightQuantization,
+    },
+    backend::mlx::runtime::checkpoint::store::{
+        GgufWeightStore, SafetensorsWeightStore, WeightStore,
+    },
+    backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
+    backend::mlx::runtime::distributed::topology::{
+        load_partition_from_store_on_streams, PlacementPlan, TensorPlacement,
+    },
+    backend::mlx::runtime::execution::inspection::ActivationObserver,
+    backend::mlx::runtime::generation::sampler::SpeculativeSampler,
+    backend::mlx::runtime::media::input as runtime_input,
+    backend::mlx::runtime::residency::expert_cache::{
+        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
+        ExpertCatalogEntry, ExpertPass, ExpertRouteBatch,
+    },
     backend::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
@@ -50,38 +74,18 @@ use crate::{
     core::generation::MtpConfig,
     core::ModelKind,
     core::{MtpCapability, MtpCheckpointKind, MtpStats},
-    error::Error,
-    runtime::cache::residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions,
-    },
-    runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
-    runtime::checkpoint::load::{transform_split_swiglu_experts, StrictLoadConfig},
-    runtime::checkpoint::quantization::{should_quantize_on_load, WeightQuantization},
-    runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore, WeightStore},
-    runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-    runtime::distributed::topology::{
-        load_partition_from_store_on_streams, PlacementPlan, TensorPlacement,
-    },
-    runtime::execution::inspection::ActivationObserver,
-    runtime::generation::sampler::SpeculativeSampler,
-    runtime::media::input as runtime_input,
-    runtime::residency::expert_cache::{
-        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertPass, ExpertRouteBatch,
-    },
 };
 
-use crate::runtime::execution::layerwise::LayerWeightResidency;
+use crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency;
 #[cfg(test)]
-use crate::runtime::execution::layerwise::WeightResidency;
+use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
 
 use crate::{
     architectures::{deepseek_v3::model::RoutedExperts, qwen::dense as dense_qwen},
     nn::moe::{quantize_expert_bank, PackedSwiGluExperts},
 };
 
-pub use crate::runtime::distributed::expert::*;
+pub use crate::backend::mlx::runtime::distributed::expert::*;
 
 impl LocalExpertBank for RoutedExperts {
     fn execute_local_routes(
@@ -233,24 +237,23 @@ impl ExpertParallelCache {
             Self::DeepSeek(cache) => cache.offset(),
             Self::DeepSeekV4(cache) => cache.offset(),
             Self::KimiLinear(cache) => cache.offset(),
-            Self::DenseQwen(cache) => cache
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, crate::runtime::cache::KeyValueCache::offset),
-            Self::DenseQwenPaged(cache) => cache
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, crate::runtime::cache::KeyValueCache::offset),
+            Self::DenseQwen(cache) => cache.first().and_then(Option::as_ref).map_or(
+                0,
+                crate::backend::mlx::runtime::cache::KeyValueCache::offset,
+            ),
+            Self::DenseQwenPaged(cache) => cache.first().and_then(Option::as_ref).map_or(
+                0,
+                crate::backend::mlx::runtime::cache::KeyValueCache::offset,
+            ),
             Self::GptOss(cache) => cache.offset(),
             Self::Inkling(cache) => cache.offset(),
             Self::Lfm2(cache) => cache.offset(),
             Self::NemotronH(cache) => cache.offset(),
             Self::QwenHybrid(cache) => cache.offset(),
-            Self::Qwen3Vl(cache) => cache
-                .kv
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, crate::runtime::cache::KeyValueCache::offset),
+            Self::Qwen3Vl(cache) => cache.kv.first().and_then(Option::as_ref).map_or(
+                0,
+                crate::backend::mlx::runtime::cache::KeyValueCache::offset,
+            ),
             Self::Gemma4(cache) => i32::try_from(cache.mtp_len()).unwrap_or(i32::MAX),
         }
     }
@@ -316,7 +319,7 @@ struct ExpertParallelQwenMtpTarget<'a> {
 
 #[derive(Clone)]
 enum ExpertParallelMtpDraftCache {
-    DeepSeek(Vec<crate::runtime::cache::CompressedLatentCache>),
+    DeepSeek(Vec<crate::backend::mlx::runtime::cache::CompressedLatentCache>),
     DeepSeekV4(deepseek_v4::DraftCache),
     Inkling(Vec<inkling::LayerCache>),
     NemotronH(Vec<nemotron_h::LayerCache>),
@@ -737,7 +740,10 @@ impl ExpertParallelModel {
     /// policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         match &self.architecture {
             ExpertArchitecture::DeepSeekLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::DeepSeekV4Layerwise(model) => model.dense_stream_report(),
@@ -1283,7 +1289,7 @@ impl ExpertParallelModel {
         tokens: &Array,
         mask: Option<&Array>,
         cache: &mut ExpertParallelCache,
-        execution: &crate::MlxDistributedSession<'_>,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
     ) -> Result<Array, Error> {
         if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
@@ -2502,7 +2508,7 @@ impl ExpertParallelModel {
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        execution: &crate::MlxDistributedSession<'_>,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         let topology = execution.topology();
         if topology != self.topology {
@@ -2664,7 +2670,7 @@ fn load_expert_parallel_model_impl(
         .is_some_and(|extension| extension == "gguf")
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let architecture = match metadata.get("general.architecture") {
             Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
             Some(_) => {
@@ -2901,7 +2907,7 @@ impl ExpertParallelModel {
         tokens: &Array,
         mask: Option<&Array>,
         cache: &mut ExpertParallelCache,
-        execution: &crate::MlxDistributedSession<'_>,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Error> {
         let tensor = execution.tensor_context()?;
@@ -2920,7 +2926,7 @@ impl ExpertParallelModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: crate::runtime::generation::sampler::Sampler>(
+    pub fn sample_and_synchronize<S: crate::backend::mlx::runtime::generation::sampler::Sampler>(
         &self,
         logits: &Array,
         sampler: &mut S,
@@ -2928,8 +2934,8 @@ impl ExpertParallelModel {
         prng_state: Option<&mut safemlx::random::RandomState>,
         finished: bool,
         sampling_rank: usize,
-        execution: &crate::MlxDistributedSession<'_>,
-    ) -> Result<crate::runtime::distributed::parallel::SynchronizedToken, Error> {
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+    ) -> Result<crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken, Error> {
         execution.sample_and_synchronize_on_rank(
             Some(logits),
             logits.dim(0),
@@ -3766,7 +3772,7 @@ fn load_gguf_ep(
         let mut structural_options = options;
         structural_options.parallel = None;
         structural_options.weight_residency =
-            crate::runtime::execution::layerwise::WeightResidency::fully_resident();
+            crate::backend::mlx::runtime::execution::layerwise::WeightResidency::fully_resident();
         crate::backend::mlx::structural::validate_gguf(
             crate::core::GgufArchitecture::DeepSeek4,
             checkpoint,
@@ -4158,7 +4164,7 @@ fn load_external_gguf_ep(
             })?;
             let vision_checkpoint = GgufCheckpoint::open(vision_path)?;
             let vision_metadata =
-                crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
             let prepared = qwen3_vl::prepare_qwen3_vl_gguf_checkpoint(
                 checkpoint,
                 metadata,
@@ -5687,8 +5693,8 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
     stream: &Stream,
     weights_stream: &Stream,
 ) {
+    use crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions;
     use crate::backend::mlx::DeviceAssignment;
-    use crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions;
     use safemlx::DeviceType;
 
     let topology =
@@ -5700,7 +5706,7 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
             quantization: None,
             parallel: Some(topology),
             weight_residency: WeightResidency::with_expert_cache(
-                crate::NonExpertWeightResidency::LayerwiseHost(Default::default()),
+                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(Default::default()),
                 expert_options,
             ),
         },
@@ -5722,7 +5728,7 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
             quantization: None,
             parallel: Some(topology),
             weight_residency: WeightResidency::with_expert_cache(
-                crate::NonExpertWeightResidency::FullyResident,
+                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::FullyResident,
                 expert_options,
             ),
         },
@@ -5747,7 +5753,7 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
             quantization: None,
             parallel: Some(topology),
             weight_residency: WeightResidency::with_expert_cache(
-                crate::NonExpertWeightResidency::DenseDiskStream(dense),
+                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense),
                 expert_options,
             ),
         },
@@ -5790,7 +5796,7 @@ pub(crate) fn assert_rank_owned_quantized_sparse_ep_load(
         ModelLoadOptions::with_quantization(quantization)
             .with_parallel_topology(topology)
             .with_weight_residency(WeightResidency::with_expert_cache(
-                crate::NonExpertWeightResidency::LayerwiseHost(Default::default()),
+                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(Default::default()),
                 expert_options,
             )),
         stream,
@@ -5829,17 +5835,17 @@ mod tests {
 
     fn host_expert_residency(experts: ExpertCacheLoadOptions) -> WeightResidency {
         WeightResidency::with_expert_cache(
-            crate::NonExpertWeightResidency::LayerwiseHost(Default::default()),
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(Default::default()),
             experts,
         )
     }
 
     fn dense_expert_residency(
         experts: ExpertCacheLoadOptions,
-        dense: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+        dense: crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     ) -> WeightResidency {
         WeightResidency::with_expert_cache(
-            crate::NonExpertWeightResidency::DenseDiskStream(dense),
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense),
             experts,
         )
     }
@@ -6292,13 +6298,14 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let fixture = synthetic_kimi_gguf(context.stream());
-        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            u64::MAX,
-            u64::MAX,
-            1,
-            1,
-        )
-        .unwrap();
+        let dense =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+            )
+            .unwrap();
         let residency = dense_expert_residency(ExpertCacheLoadOptions::default(), dense);
         let loaded = load_expert_parallel_model_with_options(
             fixture.path(),
@@ -6332,7 +6339,7 @@ mod tests {
 
         for rank in 0..4 {
             let topology = tensor_expert_topology(rank);
-            let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+            let dense = crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
                 u64::MAX,
                 u64::MAX,
                 1,
@@ -6426,7 +6433,7 @@ mod tests {
         save_zero_checkpoint(&source, fixture.path(), stream);
 
         let expected_topology = rank_one_topology();
-        let backend = crate::MlxBackend::new(stream, weights_stream);
+        let backend = crate::backend::mlx::MlxBackend::new(stream, weights_stream);
         let generic = crate::load_model(
             &backend,
             fixture.path(),
@@ -6549,13 +6556,14 @@ mod tests {
         let args = dense_qwen::load_config(fixture.path()).unwrap();
         let source = dense_qwen::Model::new(args, context.stream()).unwrap();
         save_zero_checkpoint(&source, fixture.path(), context.stream());
-        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            u64::MAX,
-            u64::MAX,
-            1,
-            1,
-        )
-        .unwrap();
+        let dense =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+            )
+            .unwrap();
         let residency = dense_expert_residency(ExpertCacheLoadOptions::default(), dense);
         let topology = tensor_expert_topology(3);
         let loaded = load_expert_parallel_model_with_options(
@@ -6615,13 +6623,14 @@ mod tests {
         let args = gpt_oss::model_args_from_config_value(&config).unwrap();
         let source = gpt_oss::Model::new(args, context.stream()).unwrap();
         save_zero_checkpoint(&source, fixture.path(), context.stream());
-        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            u64::MAX,
-            u64::MAX,
-            1,
-            1,
-        )
-        .unwrap();
+        let dense =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+            )
+            .unwrap();
         let residency = dense_expert_residency(ExpertCacheLoadOptions::default(), dense);
         let topology = tensor_expert_topology(3);
         let loaded = load_expert_parallel_model_with_options(
@@ -6692,13 +6701,14 @@ mod tests {
         let args = lfm2::model_args_from_config_value(&config).unwrap();
         let source = lfm2::Model::new(args, context.stream()).unwrap();
         save_zero_checkpoint(&source, fixture.path(), context.stream());
-        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            u64::MAX,
-            u64::MAX,
-            1,
-            1,
-        )
-        .unwrap();
+        let dense =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+            )
+            .unwrap();
         let residency = dense_expert_residency(ExpertCacheLoadOptions::default(), dense);
         let topology = tensor_expert_topology(3);
         let loaded = load_expert_parallel_model_with_options(

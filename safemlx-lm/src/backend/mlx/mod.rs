@@ -9,6 +9,8 @@ pub mod capability;
 mod config;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
+/// Errors produced by MLX model loading and execution.
+pub mod error;
 mod family;
 /// MLX artifact admission and structural compatibility inspection.
 pub mod inspection;
@@ -20,6 +22,8 @@ mod model;
 pub mod realtime;
 /// MLX allocator observations for neutral residency telemetry.
 pub mod residency;
+/// MLX-only tensor, checkpoint, execution, and residency infrastructure.
+pub mod runtime;
 /// MLX stream assignment and exact completion for speculative sessions.
 pub mod speculative;
 /// Exact MLX loader binding against portable checkpoint catalogs.
@@ -41,6 +45,14 @@ pub(crate) use family::{resolve_model_config, ModelConfigResolutionError};
 pub use inspection::{inspect_model, MlxInspectionOptions};
 pub(crate) use model::validate_gemma4_drafter;
 pub use model::{Model, ModelCache};
+pub use runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions};
+pub use runtime::distributed::topology::{PlacementPlan, RankPartition, TensorPlacement};
+pub use runtime::execution::layerwise::{
+    LayerWeightResidency, LayerwiseLoadOptions, NonExpertWeightResidency, ParallelModelInfo,
+    WeightResidency,
+};
+pub use runtime::residency::dense_stream::DenseDiskStreamLoadOptions;
+pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
 pub(crate) use session::{submit_decode_with_cache, submit_prefill_with_cache};
 pub use session::{
     MlxGeneration, MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion,
@@ -55,10 +67,10 @@ use safemlx_lm_core::backend::{
 };
 
 #[cfg(feature = "media-processing")]
-use crate::runtime::media::ModelProcessor;
+use crate::backend::mlx::runtime::media::ModelProcessor;
 use crate::{
     architectures::distributed::{expert::ExpertParallelModel, pipeline::PipelineModel},
-    error::Error,
+    backend::mlx::error::Error,
 };
 
 /// Opaque MLX executable selected for one complete model session.
@@ -130,7 +142,7 @@ impl MlxModel {
     }
 
     /// Returns the rank-local topology for a distributed executable.
-    pub fn topology(&self) -> Option<crate::MlxParallelContext> {
+    pub fn topology(&self) -> Option<crate::backend::mlx::MlxParallelContext> {
         match &self.inner {
             MlxModelKind::Complete(model) => model.parallel_info().map(|info| info.topology()),
             MlxModelKind::Pipeline(model) => Some(model.stage_info().topology),
@@ -142,7 +154,8 @@ impl MlxModel {
     /// Returns bounded parameter-residency telemetry when available.
     pub fn residency_report(
         &self,
-    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::residency::manager::ResidencyReport>, Error>
+    {
         match &self.inner {
             MlxModelKind::Complete(model) => model.residency_report(),
             MlxModelKind::Pipeline(model) => model.parameter_residency_report(),
@@ -151,7 +164,12 @@ impl MlxModel {
     }
 
     /// Returns dense checkpoint-streaming telemetry when enabled.
-    pub fn dense_stream_report(&self) -> Result<Option<crate::DenseDiskStreamReport>, Error> {
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         match &self.inner {
             MlxModelKind::Complete(model) => model.dense_stream_report(),
             MlxModelKind::Pipeline(model) => model.dense_stream_report(),
@@ -160,7 +178,12 @@ impl MlxModel {
     }
 
     /// Returns sparse routed-expert cache telemetry when enabled.
-    pub fn expert_cache_report(&self) -> Result<Option<crate::ExpertCacheReport>, Error> {
+    pub fn expert_cache_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheReport>,
+        Error,
+    > {
         match &self.inner {
             MlxModelKind::Complete(model) => model.expert_cache_report(),
             MlxModelKind::Pipeline(model) => model.expert_cache_report(),
@@ -222,7 +245,7 @@ impl<'a> MlxBackend<'a> {
     #[cfg(test)]
     pub(crate) fn communication_for_topology(
         &self,
-        topology: crate::MlxParallelContext,
+        topology: crate::backend::mlx::MlxParallelContext,
         world: &'a safemlx::distributed::Group,
     ) -> Result<MlxDistributedSession<'a>, Error> {
         MlxDistributedSession::new(MlxDistributedConfig { topology, world }, &self.stream)

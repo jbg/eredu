@@ -16,10 +16,10 @@ use serde::Deserialize;
 
 use crate::{
     architectures::moshi::model as moshi,
+    backend::mlx::error::Error,
     backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     core::realtime::{RealtimeError, RealtimeScheduler},
-    error::Error,
-    runtime::checkpoint::quantization::WeightQuantization,
     RealtimeModel, RequestId, WorkId,
 };
 
@@ -161,7 +161,7 @@ pub fn load_native_model_with_options(
 ) -> Result<Model, Error> {
     let metadata = get_model_metadata(&model_dir)?;
     let quantize_on_load = if let Some(quantization) = options.quantization {
-        crate::runtime::checkpoint::quantization::should_quantize_on_load(
+        crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
             "PersonaPlex",
             metadata.quantization,
             quantization,
@@ -173,15 +173,15 @@ pub fn load_native_model_with_options(
     args.moshi_name = Some(MODEL_SAFETENSORS.to_string());
     args.quantization = options.quantization.or(metadata.quantization);
     let mut model = moshi::Model::new(args, stream)?;
-    let config = crate::runtime::checkpoint::load::StrictLoadConfig::default();
-    let mut report = crate::runtime::checkpoint::load::StrictLoadReport::default();
+    let config = crate::backend::mlx::runtime::checkpoint::load::StrictLoadConfig::default();
+    let mut report = crate::backend::mlx::runtime::checkpoint::load::StrictLoadReport::default();
     if model_dir
         .as_ref()
         .join("model.safetensors.index.json")
         .exists()
     {
         if quantize_on_load {
-            crate::runtime::checkpoint::load::load_safetensors_dir_quantized_strict(
+            crate::backend::mlx::runtime::checkpoint::load::load_safetensors_dir_quantized_strict(
                 &mut model,
                 &model_dir,
                 weights_stream,
@@ -191,7 +191,7 @@ pub fn load_native_model_with_options(
                 &mut report,
             )?;
         } else {
-            crate::runtime::checkpoint::load::load_safetensors_dir_strict(
+            crate::backend::mlx::runtime::checkpoint::load::load_safetensors_dir_strict(
                 &mut model,
                 &model_dir,
                 weights_stream,
@@ -202,7 +202,7 @@ pub fn load_native_model_with_options(
     } else {
         let path = model_dir.as_ref().join(MODEL_SAFETENSORS);
         if quantize_on_load {
-            crate::runtime::checkpoint::load::load_safetensors_quantized_strict(
+            crate::backend::mlx::runtime::checkpoint::load::load_safetensors_quantized_strict(
                 &mut model,
                 path,
                 weights_stream,
@@ -212,7 +212,7 @@ pub fn load_native_model_with_options(
                 &mut report,
             )?;
         } else {
-            crate::runtime::checkpoint::load::load_safetensors_strict(
+            crate::backend::mlx::runtime::checkpoint::load::load_safetensors_strict(
                 &mut model,
                 path,
                 weights_stream,
@@ -247,7 +247,7 @@ pub fn load_model(
             .exists()
     {
         let mut model = moshi::Model::new(args, stream)?;
-        let files = crate::runtime::checkpoint::load::safetensors_files(&model_dir)?;
+        let files = crate::backend::mlx::runtime::checkpoint::load::safetensors_files(&model_dir)?;
         moshi::load_pytorch_safetensors_files_strict(&mut model, files, weights_stream)?;
         model.copy_to_stream(stream)?;
         Ok(model)
@@ -274,7 +274,7 @@ pub fn load_model_quantized(
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let metadata = get_model_metadata(&model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "PersonaPlex",
         metadata.quantization,
         quantization,
@@ -284,7 +284,7 @@ pub fn load_model_quantized(
     let mut args = model_args_7b_v1();
     args.quantization = Some(quantization);
     let mut model = moshi::Model::new(args, stream)?;
-    let files = crate::runtime::checkpoint::load::safetensors_files(&model_dir)?;
+    let files = crate::backend::mlx::runtime::checkpoint::load::safetensors_files(&model_dir)?;
     moshi::load_pytorch_safetensors_files_quantized_strict(
         &mut model,
         files,
@@ -543,7 +543,8 @@ mod tests {
             MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
             &model_dir,
             crate::backend::mlx::ModelLoadOptions::with_quantization(
-                crate::runtime::checkpoint::quantization::AffineQuantization::default(),
+                crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::default(
+                ),
             ),
         )
         .unwrap();

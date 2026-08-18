@@ -1,7 +1,7 @@
 //! Reusable neural-network primitives with explicit tensor-parallel semantics.
 //!
 //! These modules do not retain communication groups. Callers borrow a
-//! [`crate::runtime::distributed::parallel::ParallelExecutionContext`] for each
+//! [`crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext`] for each
 //! operation, allowing the same module
 //! implementation to execute in replicated and tensor-parallel modes.
 
@@ -18,10 +18,8 @@ use safemlx::{
 };
 
 use crate::{
-    core::balanced_contiguous_range,
-    error::Error,
-    nn::{convolution::DepthwiseConv1d, layers::silu, linear},
-    runtime::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::{
         checkpoint::quantization::WeightQuantization,
         distributed::parallel::{
             aligned_partition_units, partitioned_projection_members,
@@ -31,6 +29,8 @@ use crate::{
             ParameterRole, ProjectionSharding, ShardingPolicy,
         },
     },
+    core::balanced_contiguous_range,
+    nn::{convolution::DepthwiseConv1d, layers::silu, linear},
 };
 
 /// Execution contract of one linear projection.
@@ -309,7 +309,7 @@ pub(crate) fn register_gated_depthwise_conv_group(
 /// Cache creation and persistence use this planner-derived geometry instead of
 /// reconstructing it from topology scalars.
 pub(crate) fn planned_kv_head_layout(
-    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
     layer_count: usize,
     head_dim: i32,
     layer_prefix: &str,
@@ -332,7 +332,7 @@ pub(crate) fn planned_kv_head_layout(
 /// Layers without attention deliberately have no KV entry; their architecture
 /// remains responsible for describing any other recurrent state.
 pub(crate) fn planned_optional_kv_head_layout(
-    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
     attention_layers: impl IntoIterator<Item = bool>,
     head_dim: i32,
     layer_prefix: &str,
@@ -351,7 +351,7 @@ pub(crate) fn planned_optional_kv_head_layout(
 /// or convolution channels so cache topology never re-derives partitions from
 /// rank counts.
 pub(crate) fn planned_optional_partition_widths(
-    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
     participating_layers: impl IntoIterator<Item = bool>,
     unit_width: i32,
     layer_prefix: &str,
@@ -1752,7 +1752,8 @@ mod tests {
     fn row_quantization_requires_local_group_alignment() {
         let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(DeviceType::Cpu, 0));
         let quantization = WeightQuantization::Affine(
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(64, 4).unwrap(),
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(64, 4)
+                .unwrap(),
         );
         let error = ParallelLinear::unloaded(
             96,
@@ -1771,7 +1772,8 @@ mod tests {
     fn row_quantization_balances_complete_groups() {
         let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(DeviceType::Cpu, 0));
         let quantization = WeightQuantization::Affine(
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(64, 4).unwrap(),
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(64, 4)
+                .unwrap(),
         );
         let first = ParallelLinear::unloaded(
             192,

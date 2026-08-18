@@ -24,7 +24,7 @@ use safemlx::{
 use safemlx_lm_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
 
 #[cfg(feature = "media-processing")]
-use crate::runtime::media::{load_processor, ModelProcessor};
+use crate::backend::mlx::runtime::media::{load_processor, ModelProcessor};
 
 pub(crate) fn gguf_eos_token_ids(
     metadata: &std::collections::HashMap<String, safemlx_gguf::MetadataValue>,
@@ -36,16 +36,16 @@ pub(crate) fn gguf_eos_token_ids(
     )?)
 }
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::{structural, MlxModel, Model, ModelLoadOptions},
-    error::Error,
-    runtime::checkpoint::quantization::WeightQuantization,
 };
 
 /// MLX arrays/modules plus backend-owned preprocessing from one GGUF artifact.
 struct MaterializedGgufModel {
     model: Model,
     #[cfg(feature = "media-processing")]
-    processor: Option<crate::runtime::media::ModelProcessor>,
+    processor: Option<crate::backend::mlx::runtime::media::ModelProcessor>,
 }
 
 fn materialize_gguf_model(
@@ -214,8 +214,9 @@ fn materialize_gguf_model(
             GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
                 let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
                 let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-                let vision_metadata =
-                    crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+                let vision_metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
+                    &vision_checkpoint,
+                );
                 let loaded = qwen3_vl::load_qwen3_vl_gguf_checkpoint(
                     &checkpoint,
                     metadata.clone(),
@@ -460,8 +461,9 @@ fn materialize_gguf_model(
             GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
                 let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
                 let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-                let vision_metadata =
-                    crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+                let vision_metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
+                    &vision_checkpoint,
+                );
                 let (loaded, eos_token_ids) =
                     crate::architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_layerwise_model(
                         &checkpoint,
@@ -649,9 +651,9 @@ fn materialize_tensor_parallel(
         )));
     }
     let execution = options.weight_residency.layers();
-    let build = crate::runtime::distributed::parallel::ParallelBuildContext::new(
+    let build = crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
-        crate::runtime::distributed::parallel::ShardingPolicy::Require,
+        crate::backend::mlx::runtime::distributed::parallel::ShardingPolicy::Require,
     );
     match kind {
         ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
@@ -823,7 +825,7 @@ fn materialize_gguf_artifact(
         ));
     };
     let checkpoint = safemlx::ops::GgufCheckpoint::from_portable(checkpoint);
-    let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     let architecture = configuration.gguf_architecture.ok_or_else(|| {
         Error::UnsupportedArchitecture("backend-neutral GGUF plan omitted its architecture".into())
     })?;
@@ -904,9 +906,9 @@ fn materialize_gguf_tensor_parallel(
         )));
     }
     let residency = options.weight_residency.layers();
-    let build = crate::runtime::distributed::parallel::ParallelBuildContext::new(
+    let build = crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
-        crate::runtime::distributed::parallel::ShardingPolicy::Require,
+        crate::backend::mlx::runtime::distributed::parallel::ShardingPolicy::Require,
     );
     match architecture {
         GgufArchitecture::KimiLinear => {
@@ -1019,7 +1021,7 @@ fn materialize_gguf_tensor_parallel(
             let vision_path = qwen3_vl::find_qwen3_vl_mmproj(gguf_path)?;
             let vision_checkpoint = GgufCheckpoint::open(vision_path)?;
             let vision_metadata =
-                crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
             let (model, eos) = crate::architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_tensor_parallel_model(checkpoint, metadata, (&vision_checkpoint, &vision_metadata), residency, build, stream, weights_stream)?;
             Ok((
                 if architecture == GgufArchitecture::Qwen3VlMoe {
@@ -1050,7 +1052,7 @@ fn materialize_gguf_tensor_parallel(
 }
 
 pub(crate) fn validate_gguf_quantization_source<
-    S: crate::runtime::checkpoint::load::GgufTensorNames,
+    S: crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames,
 >(
     source: &S,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,

@@ -19,8 +19,8 @@ use super::{
     MlxBackend, ModelLoadOptions,
 };
 use crate::{
-    error::Error,
-    runtime::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::{
         checkpoint::quantization::{AffineQuantization, WeightQuantization},
         execution::layerwise::{
             LayerwiseLoadOptions, LayerwiseModelError, NonExpertWeightResidency, WeightResidency,

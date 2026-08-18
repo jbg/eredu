@@ -6,7 +6,7 @@ use std::{
 use safemlx::ExecutionContext;
 use safemlx_lm::{
     api::{LoadedModel, LoadedModelLoadError},
-    error::Error,
+    backend::mlx::error::Error,
     GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
 use serde_json::Value;

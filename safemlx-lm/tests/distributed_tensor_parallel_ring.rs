@@ -23,16 +23,17 @@ use safemlx_lm::{
         kimi_linear::model as kimi_model, lfm2::model as lfm2_model, llama::model as llama_model,
         nemotron_h::model as nemotron_model, qwen::dense as dense_qwen,
     },
-    backend::mlx::ModelLoadOptions,
+    backend::mlx::runtime::cache::KeyValueCache,
+    backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name,
+    backend::mlx::runtime::generation::sampler::DefaultSampler,
+    backend::mlx::{
+        CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, LayerWeightResidency,
+        LayerwiseLoadOptions, MlxBackend, MlxParallelContext, ModelLoadOptions, PagedCacheOptions,
+        ParallelModelInfo, WeightResidency,
+    },
     core::BackendSession,
     nn::generation::CausalLm,
-    runtime::cache::KeyValueCache,
-    runtime::checkpoint::binding::canonical_checkpoint_name,
-    runtime::generation::sampler::DefaultSampler,
-    CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, LayerCachePolicy,
-    LayerWeightResidency, LayerwiseLoadOptions, MlxBackend, MlxParallelContext, PagedCacheOptions,
-    ParallelModelInfo, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-    WeightResidency,
+    LayerCachePolicy, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -304,7 +305,7 @@ impl FixtureFamily {
     }
 }
 
-struct GeneralizedTensorModel(safemlx_lm::core::PreparedModel<safemlx_lm::MlxModel>);
+struct GeneralizedTensorModel(safemlx_lm::core::PreparedModel<safemlx_lm::backend::mlx::MlxModel>);
 
 impl GeneralizedTensorModel {
     fn load(
@@ -339,7 +340,7 @@ impl GeneralizedTensorModel {
 
     fn checkpoint_diagnostics(
         &self,
-    ) -> safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
+    ) -> safemlx_lm::backend::mlx::runtime::checkpoint::store::WeightStoreDiagnostics {
         checkpoint_diagnostics(self.complete())
     }
 
@@ -353,7 +354,7 @@ impl GeneralizedTensorModel {
 
 fn checkpoint_diagnostics(
     model: &safemlx_lm::backend::mlx::Model,
-) -> safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
+) -> safemlx_lm::backend::mlx::runtime::checkpoint::store::WeightStoreDiagnostics {
     match model {
         safemlx_lm::backend::mlx::Model::Llama(model) => {
             model.checkpoint_store().diagnostics().unwrap()
@@ -501,7 +502,7 @@ impl GeneralizedTensorCacheExt for safemlx_lm::backend::mlx::ModelCache {
         };
         assert!(matches!(
             attention,
-            safemlx_lm::runtime::cache::LiveKeyValueCache::Paged(_)
+            safemlx_lm::backend::mlx::runtime::cache::LiveKeyValueCache::Paged(_)
         ));
         assert_eq!(attention.offset(), sequence);
         for array in attention.retained_arrays() {
@@ -847,11 +848,12 @@ fn tensor_ring_worker() {
     let mut session = safemlx_lm::core::Backend::create_session(&backend, model.0).unwrap();
     session.configure_cache(cache_policy).unwrap();
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
-    let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+    let parts =
+        [safemlx_lm::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
     let logits = session
         .prefill(
             &backend,
-            safemlx_lm::runtime::media::input::ModelInput::new(&parts).into(),
+            safemlx_lm::backend::mlx::runtime::media::input::ModelInput::new(&parts).into(),
         )
         .unwrap()
         .wait()
@@ -908,10 +910,11 @@ fn tensor_ring_worker() {
             _ => unreachable!(),
         };
         let mut reference_cache = reference.new_cache();
-        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let parts =
+            [safemlx_lm::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
             .prefill_input_logits(
-                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                safemlx_lm::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                 &mut reference_cache,
                 &stream,
             )
@@ -996,10 +999,11 @@ fn tensor_ring_worker() {
             _ => unreachable!(),
         };
         let mut reference_cache = reference.new_cache();
-        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let parts =
+            [safemlx_lm::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
             .prefill_input_logits(
-                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                safemlx_lm::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                 &mut reference_cache,
                 &stream,
             )
@@ -1021,10 +1025,11 @@ fn tensor_ring_worker() {
             _ => unreachable!(),
         };
         let mut reference_cache = reference.new_cache();
-        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let parts =
+            [safemlx_lm::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let reference_logits = reference
             .prefill_input_logits(
-                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                safemlx_lm::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                 &mut reference_cache,
                 &stream,
             )

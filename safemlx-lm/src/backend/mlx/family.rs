@@ -20,7 +20,7 @@ use crate::architectures::{
         vl::{model as qwen3_vl, moe as qwen3_vl_moe},
     },
 };
-use crate::error::Error;
+use crate::backend::mlx::error::Error;
 
 /// Canonical resolution of a model configuration supported by MLX.
 #[derive(Debug, Clone, Eq, PartialEq)]

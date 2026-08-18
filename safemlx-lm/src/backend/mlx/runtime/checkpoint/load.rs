@@ -15,8 +15,8 @@ use safemlx::{
 use safetensors::SafeTensors;
 use serde::Deserialize;
 
-use crate::error::Error;
-use crate::runtime::checkpoint::quantization::{
+use crate::backend::mlx::error::Error;
+use crate::backend::mlx::runtime::checkpoint::quantization::{
     quantize_tensor, AffineQuantization, WeightQuantization,
 };
 
@@ -1337,10 +1337,10 @@ mod tests {
     use safemlx_gguf::{Endian, GgmlType, TensorInput, Writer, WriterOptions};
 
     use crate::{
-        nn::linear::unloaded_maybe_quantized_linear,
-        runtime::checkpoint::quantization::{
+        backend::mlx::runtime::checkpoint::quantization::{
             quantize_tensor, AffineQuantization, WeightQuantization,
         },
+        nn::linear::unloaded_maybe_quantized_linear,
     };
 
     use super::{

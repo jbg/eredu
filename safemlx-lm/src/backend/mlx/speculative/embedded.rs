@@ -12,14 +12,14 @@ use safemlx::{
 use safemlx_lm_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
 
 use crate::{
+    backend::mlx::runtime::generation::sampler::SpeculativeSampler,
+    backend::mlx::runtime::media::input::ModelInput,
     backend::mlx::{
         speculative::{
             scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
         },
         MlxModelInput,
     },
-    runtime::generation::sampler::SpeculativeSampler,
-    runtime::media::input::ModelInput,
 };
 
 /// Sampler wrapper that keeps PRNG and grammar state identical on every rank
@@ -104,12 +104,12 @@ impl<S: SpeculativeSampler> SpeculativeSampler for DistributedEmbeddedMtpSampler
 }
 
 use crate::{
-    error::Error,
-    nn::parallel::VocabParallelLmHead,
-    runtime::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::{
         checkpoint::quantization::WeightQuantization,
         distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
     },
+    nn::parallel::VocabParallelLmHead,
 };
 
 /// One vocabulary projection whose parameter tree stays stable when TP turns
@@ -167,7 +167,7 @@ impl EmbeddedMtpVocabHead {
 
     pub(crate) fn register(
         &self,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         prefix: &str,
     ) -> Result<(), Error> {
         planner.register(crate::nn::parallel::vocab_lm_head_parameter_group(

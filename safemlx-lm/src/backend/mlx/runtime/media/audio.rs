@@ -2,7 +2,7 @@
 
 use rustfft::{num_complex::Complex32, FftPlanner};
 
-use crate::error::Error;
+use crate::backend::mlx::error::Error;
 
 /// Borrowed mono floating-point PCM waveform.
 #[derive(Debug, Clone, Copy)]

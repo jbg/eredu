@@ -4,28 +4,28 @@ use std::{fs, path::Path};
 use safemlx::Array;
 use serde::Deserialize;
 
-use crate::error::Error;
+use crate::backend::mlx::error::Error;
 #[cfg(feature = "audio-processing")]
-use crate::runtime::media::audio::{extract_log_mel, LogMelConfig};
+use crate::backend::mlx::runtime::media::audio::{extract_log_mel, LogMelConfig};
 #[cfg(feature = "image-processing")]
-use crate::runtime::media::image::{
+use crate::backend::mlx::runtime::media::image::{
     rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage,
 };
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-use crate::runtime::media::input::Modality;
+use crate::backend::mlx::runtime::media::input::Modality;
 #[cfg(feature = "image-processing")]
-use crate::runtime::media::video::{
+use crate::backend::mlx::runtime::media::video::{
     format_mm_ss, frame_timestamps, sampled_frame_count, uniform_sample_indices,
     validate_rgb_frames,
 };
-use crate::runtime::media::{
+use crate::backend::mlx::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
     ProcessorInput, ProcessorPreparationError,
 };
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-use crate::runtime::media::{MediaPayload, OwnedInputMetadata};
+use crate::backend::mlx::runtime::media::{MediaPayload, OwnedInputMetadata};
 #[cfg(feature = "image-processing")]
-use crate::runtime::media::{VideoFrames, VideoSampling};
+use crate::backend::mlx::runtime::media::{VideoFrames, VideoSampling};
 
 #[derive(Debug, Clone, Deserialize)]
 struct Gemma4ModelConfig {
@@ -394,7 +394,7 @@ impl Gemma4Processor {
     #[cfg(feature = "image-processing")]
     fn process_image(
         &self,
-        image: crate::runtime::media::image::RgbImageView<'_>,
+        image: crate::backend::mlx::runtime::media::image::RgbImageView<'_>,
     ) -> Result<PreparedInputPart, Error> {
         let max_patches = self
             .max_soft_tokens
@@ -495,7 +495,7 @@ impl Gemma4Processor {
     #[cfg(feature = "audio-processing")]
     fn process_audio(
         &self,
-        waveform: crate::runtime::media::audio::AudioWaveform<'_>,
+        waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
     ) -> Result<PreparedInputPart, Error> {
         let features = extract_log_mel(
             waveform,
@@ -624,8 +624,8 @@ mod tests {
 
     use super::{aspect_ratio_preserving_size, Gemma4Processor};
     use crate::{
-        runtime::media::input::{InputPayload, Modality},
-        runtime::media::{MediaInput, ProcessorInput, RgbImageView, VideoSampling},
+        backend::mlx::runtime::media::input::{InputPayload, Modality},
+        backend::mlx::runtime::media::{MediaInput, ProcessorInput, RgbImageView, VideoSampling},
     };
 
     #[test]
@@ -758,8 +758,8 @@ mod tests {
 mod audio_tests {
     use super::Gemma4Processor;
     use crate::{
-        runtime::media::input::{InputPayload, Modality},
-        runtime::media::{MediaInput, ProcessorInput},
+        backend::mlx::runtime::media::input::{InputPayload, Modality},
+        backend::mlx::runtime::media::{MediaInput, ProcessorInput},
     };
 
     #[test]

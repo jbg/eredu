@@ -11,21 +11,20 @@ use safemlx_lm_core::{
 };
 use std::path::Path;
 
-use crate::core::generation::MtpConfig;
 #[cfg(feature = "media-processing")]
-use crate::runtime::media::{ModelProcessor, PreparedModelInput};
+use crate::backend::mlx::runtime::media::{ModelProcessor, PreparedModelInput};
+use crate::core::generation::MtpConfig;
 use crate::{
     architectures::distributed::{
         expert::ExpertParallelCache,
         pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
     },
-    error::Error,
+    backend::mlx::runtime::execution::inspection::ActivationObserver,
+    backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
+    backend::mlx::runtime::media::input,
+    backend::mlx::{error::Error, CacheResidencyPolicy, PagedCacheOptions},
     nn::generation::CausalLm,
-    runtime::execution::inspection::ActivationObserver,
-    runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
-    runtime::media::input,
-    CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-    PromptCacheOptions,
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
 };
 use safemlx_lm_core::MtpStats;
 
@@ -104,7 +103,7 @@ impl Completion for MlxTextCompletion {
 pub struct MlxTextGenerationState {
     temperature: f32,
     prng: Option<RandomState>,
-    sampler: crate::runtime::generation::sampler::GenerationSampler,
+    sampler: crate::backend::mlx::runtime::generation::sampler::GenerationSampler,
 }
 
 enum MlxSessionCompletionKind {
@@ -313,7 +312,8 @@ impl<'a> MlxModelSession<'a> {
     /// Returns bounded parameter-residency telemetry when available.
     pub fn residency_report(
         &self,
-    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::residency::manager::ResidencyReport>, Error>
+    {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.residency_report(),
             MlxSessionKind::Pipeline(model, _) => model.parameter_residency_report(),
@@ -322,7 +322,12 @@ impl<'a> MlxModelSession<'a> {
     }
 
     /// Returns dense checkpoint-streaming telemetry when enabled.
-    pub fn dense_stream_report(&self) -> Result<Option<crate::DenseDiskStreamReport>, Error> {
+    pub fn dense_stream_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.dense_stream_report(),
             MlxSessionKind::Pipeline(model, _) => model.dense_stream_report(),
@@ -331,7 +336,12 @@ impl<'a> MlxModelSession<'a> {
     }
 
     /// Returns sparse routed-expert cache telemetry when enabled.
-    pub fn expert_cache_report(&self) -> Result<Option<crate::ExpertCacheReport>, Error> {
+    pub fn expert_cache_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheReport>,
+        Error,
+    > {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.expert_cache_report(),
             MlxSessionKind::Pipeline(model, _) => model.expert_cache_report(),
@@ -459,7 +469,10 @@ impl<'a> MlxModelSession<'a> {
     }
 
     /// Returns aggregate cache-residency telemetry for this session.
-    pub fn cache_residency_report(&self) -> Result<Option<crate::CacheResidencyReport>, Error> {
+    pub fn cache_residency_report(
+        &self,
+    ) -> Result<Option<crate::backend::mlx::runtime::cache::residency::CacheResidencyReport>, Error>
+    {
         match &self.inner {
             MlxSessionKind::Complete(_, cache) => cache
                 .residency_report()
@@ -647,7 +660,7 @@ impl<'a> MlxModelSession<'a> {
         temperature: f32,
         prng_state: Option<&mut RandomState>,
         finished: bool,
-    ) -> Result<crate::SynchronizedToken, Error> {
+    ) -> Result<crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken, Error> {
         self.distributed
             .as_ref()
             .ok_or_else(|| {
@@ -929,9 +942,10 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         Ok(MlxTextGenerationState {
             temperature: sampling.temperature,
             prng,
-            sampler: crate::runtime::generation::sampler::GenerationSampler::from_resolved(
-                sampling,
-            ),
+            sampler:
+                crate::backend::mlx::runtime::generation::sampler::GenerationSampler::from_resolved(
+                    sampling,
+                ),
         })
     }
 
@@ -983,7 +997,9 @@ fn sample_text_submission(
     let logits = submission.output.into_logits().ok_or_else(|| {
         Error::Parallel("text generation requires logits on the local session rank".into())
     })?;
-    let logits = crate::runtime::generation::sampler::apply_token_filter(&logits, filter, &stream)?;
+    let logits = crate::backend::mlx::runtime::generation::sampler::apply_token_filter(
+        &logits, filter, &stream,
+    )?;
     let token = state
         .sampler
         .sample(&logits, state.temperature, state.prng.as_mut(), &stream)?;

@@ -3,11 +3,13 @@ use std::{path::PathBuf, time::Instant};
 use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_lm::{
     architectures::moshi::personaplex,
-    backend::mlx::{realtime::MlxRealtimeBackend, ModelLoadOptions},
-    load_realtime_model, load_realtime_model_with_options,
-    runtime::checkpoint::quantization::AffineQuantization,
-    MlxRealtimeInput, RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId,
-    SchedulerLimits,
+    backend::mlx::runtime::checkpoint::quantization::AffineQuantization,
+    backend::mlx::{
+        realtime::{MlxRealtimeBackend, MlxRealtimeInput},
+        ModelLoadOptions,
+    },
+    load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
+    RealtimeScheduler, RequestId, SchedulerLimits,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

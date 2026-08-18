@@ -17,21 +17,9 @@ use crate::core::cache::{
 };
 
 use crate::{
-    error::Error,
-    nn::{
-        generation::CausalLm,
-        linear::{
-            project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
-            unloaded_maybe_quantized_linear,
-        },
-        parallel::{
-            planned_optional_partition_widths, register_swiglu_projection_group,
-            SwiGluProjectionNames, VocabParallelEmbedding, VocabParallelLmHead,
-        },
-        tensor::create_causal_mask,
-    },
-    runtime::media::input,
-    runtime::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::{
         cache::residency::PagedCacheOptions,
         checkpoint::{
             binding::{
@@ -61,6 +49,18 @@ use crate::{
             },
             manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
         },
+    },
+    nn::{
+        generation::CausalLm,
+        linear::{
+            project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
+            unloaded_maybe_quantized_linear,
+        },
+        parallel::{
+            planned_optional_partition_widths, register_swiglu_projection_group,
+            SwiGluProjectionNames, VocabParallelEmbedding, VocabParallelLmHead,
+        },
+        tensor::create_causal_mask,
     },
 };
 
@@ -399,7 +399,10 @@ impl KimiLinearLayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
+    pub(crate) fn bind_parallel_topology(
+        &mut self,
+        topology: crate::backend::mlx::MlxParallelContext,
+    ) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -412,7 +415,7 @@ impl KimiLinearLayerwiseModel {
     /// convolution and recurrent tensors remain resident under either policy.
     pub fn new_cache_with_options(
         &self,
-        policy: crate::CacheResidencyPolicy,
+        policy: crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy,
     ) -> Result<Cache, Error> {
         Cache::new_with_options_and_rank(
             self.args(),
@@ -426,12 +429,15 @@ impl KimiLinearLayerwiseModel {
     pub fn cache_residency_report(
         &self,
         cache: &Cache,
-    ) -> Result<Option<crate::CacheResidencyReport>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::cache::residency::CacheResidencyReport>, Error>
+    {
         cache.residency_report().map_err(Into::into)
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
@@ -498,7 +504,10 @@ impl KimiLinearLayerwiseModel {
     /// Returns disk-stream telemetry when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -529,7 +538,7 @@ impl KimiLinearLayerwiseModel {
         inputs: &Array,
         cache: &mut Cache,
         stream: &Stream,
-        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
         self.execution
             .forward_with_observer(inputs, cache, stream, observer)
@@ -694,7 +703,7 @@ pub(crate) fn execute_transformed_kimi_linear_model(
 pub(crate) fn load_kimi_linear_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
@@ -706,7 +715,7 @@ pub(crate) fn load_kimi_linear_tensor_parallel_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         return load_kimi_linear_gguf_tensor_parallel_model(
             &checkpoint,
             &metadata,
@@ -740,11 +749,11 @@ pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     options: LayerWeightResidency,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(KimiLinearLayerwiseModel, Vec<u32>), Error> {
-    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
         checkpoint, metadata, options,
     )?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
@@ -816,7 +825,7 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
 /// expert-parallel execution and returns the shared lazy checkpoint store.
 pub fn load_kimi_linear_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::NonExpertWeightResidency,
+    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -933,7 +942,7 @@ pub(crate) fn load_kimi_linear_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
@@ -1194,7 +1203,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let geometry = match topology {
             Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
@@ -1376,7 +1385,9 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let Some(v) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
@@ -1402,8 +1413,10 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
+            "text_decoder",
+        ])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1425,7 +1438,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
@@ -1455,8 +1468,8 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
@@ -1486,7 +1499,8 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
@@ -1502,7 +1516,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
             ));
         }
         Ok(Some(
-            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
                 self.args.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -1511,8 +1525,8 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
     }
     fn register_parallel_parameters(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
@@ -1544,8 +1558,8 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
     }
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         let kda_heads = planned_optional_partition_widths(
@@ -1587,7 +1601,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         self.layer_count(group)?;
@@ -1713,11 +1727,11 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -1731,7 +1745,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -1912,7 +1926,9 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -1964,7 +1980,9 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.finish(hidden, cache, context, execution.stream());
@@ -2167,7 +2185,7 @@ fn recipe_binding(
 }
 
 /// Token generation over a bounded Kimi model.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, KimiLinearLayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -2190,9 +2208,7 @@ mod tests {
         architectures::kimi_linear::model::{
             load_model, model_args_from_config_value, Model, ModelInput,
         },
-        core::residency::OffloadConfig,
-        core::ModelKind,
-        runtime::{
+        backend::mlx::runtime::{
             checkpoint::store::{SafetensorsWeightStore, WeightStore},
             distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{
@@ -2200,6 +2216,8 @@ mod tests {
             },
             residency::expert_cache::ExpertCacheLoadOptions,
         },
+        core::residency::OffloadConfig,
+        core::ModelKind,
     };
 
     fn tiny_config() -> serde_json::Value {
@@ -2619,11 +2637,20 @@ mod tests {
             crate::backend::mlx::Model::KimiLinear(fully_resident),
             crate::backend::mlx::Model::KimiLinear(layerwise),
         ] {
-            let options = crate::PagedCacheOptions::new(1, 16 * 1024, 16 * 1024, 1)
-                .unwrap()
-                .with_full_attention(true);
+            let options = crate::backend::mlx::runtime::cache::residency::PagedCacheOptions::new(
+                1,
+                16 * 1024,
+                16 * 1024,
+                1,
+            )
+            .unwrap()
+            .with_full_attention(true);
             let mut cache = model
-                .new_cache_with_options(crate::CacheResidencyPolicy::Paged(options))
+                .new_cache_with_options(
+                    crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
+                        options,
+                    ),
+                )
                 .unwrap();
             assert_eq!(
                 cache
@@ -2634,12 +2661,11 @@ mod tests {
                 0
             );
             let tokens = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-            let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-                &tokens,
-            )];
+            let parts =
+                [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
             model
                 .submit_prefill(
-                    crate::runtime::media::input::ModelInput::new(&parts),
+                    crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                     &mut cache,
                     gpu.stream(),
                 )
@@ -2733,7 +2759,7 @@ mod tests {
                 .unwrap();
         let mut sparse = load_kimi_linear_expert_cache_model(
             directory.path(),
-            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,

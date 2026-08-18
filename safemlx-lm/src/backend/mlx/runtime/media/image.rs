@@ -2,7 +2,7 @@
 
 use image::{imageops::FilterType, ImageBuffer, Rgb};
 
-use crate::error::Error;
+use crate::backend::mlx::error::Error;
 
 /// Borrowed RGB8 image pixels.
 #[derive(Debug, Clone, Copy)]

@@ -48,11 +48,27 @@ pub use crate::core::cache::{
 pub use crate::nn::generation::sample;
 
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{
+        residency::{
+            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
+            PromptCacheSnapshotBlock, PromptCacheStateArray,
+        },
+        ConcatKeyValueCache, KeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
+        load_named_iq_array_strict, load_safetensors_quantized_strict, load_safetensors_strict,
+        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
+    },
+    backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    backend::mlx::runtime::execution::inspection::ActivationObserver,
+    backend::mlx::runtime::media::input,
+    core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
         LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorOwner,
         StateTensorPolicy, StateTensorRole,
     },
-    error::Error,
     nn::tensor::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -65,22 +81,6 @@ use crate::{
         generation::CausalLm,
         moe::{packed_grouped_linear_with_options, top_k_softmax_routing, weighted_route_sum},
     },
-    runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::{
-        residency::{
-            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            PromptCacheSnapshotBlock, PromptCacheStateArray,
-        },
-        ConcatKeyValueCache, KeyValueCache,
-    },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
-        load_named_iq_array_strict, load_safetensors_quantized_strict, load_safetensors_strict,
-        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-    runtime::execution::inspection::ActivationObserver,
-    runtime::media::input,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -2670,10 +2670,10 @@ impl Gemma4Embedding {
 
     pub(crate) fn register_tensor_parallel_parameters(
         &self,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         prefix: &str,
     ) -> Result<(), Error> {
-        use crate::runtime::distributed::parallel::{
+        use crate::backend::mlx::runtime::distributed::parallel::{
             MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
         };
         let mut members = vec![ParameterMemberSpec::new(
@@ -4092,7 +4092,7 @@ impl Model {
     pub fn new_from_config_value(
         config: &Value,
         stream: &Stream,
-    ) -> Result<Self, crate::error::Error> {
+    ) -> Result<Self, crate::backend::mlx::error::Error> {
         let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
             model_config_from_value(config)?;
         Ok(Self::new_with_modalities(
@@ -4357,7 +4357,8 @@ pub(crate) struct Gemma4MmprojGguf {
 }
 
 pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<Gemma4MmprojGguf>, Error> {
-    let Some(path) = crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "gemma4")?
+    let Some(path) =
+        crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "gemma4")?
     else {
         return Ok(None);
     };
@@ -6035,7 +6036,7 @@ pub fn load_gemma4_model_quantized(
         mut audio_config,
         audio_token_id,
     ) = get_gemma4_model_config(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "Gemma 4",
         model_args.weight_quantization(),
         quantization,
@@ -6725,7 +6726,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Gemma 4 token generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
@@ -6743,13 +6744,13 @@ mod tests {
         partial_rotary_dims, Attention, Cache, FeedForwardPolicy, FloatOrString, KeyValuePolicy,
         LayerPolicy, ModelArgs, ValuePolicy,
     };
-    use crate::nn::generation::CausalLm;
-    use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
-    use crate::runtime::checkpoint::load::{
+    use crate::backend::mlx::runtime::checkpoint::load::{
         load_arrays_strict, StrictLoadConfig, StrictLoadReport,
     };
-    use crate::runtime::checkpoint::quantization::WeightQuantization;
-    use crate::runtime::media::input::{InputMetadata, InputPart, ModelInput};
+    use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
+    use crate::backend::mlx::runtime::media::input::{InputMetadata, InputPart, ModelInput};
+    use crate::core::attention::{AttentionPolicy, LayerSchedule};
+    use crate::nn::generation::CausalLm;
 
     #[test]
     fn native_gguf_embedding_layout_never_enters_affine_mode() {
@@ -7138,8 +7139,8 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_multimodal_prefix_embedding_save_reload_parity() {
+        use crate::backend::mlx::runtime::cache::KeyValueCache;
         use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
-        use crate::runtime::cache::KeyValueCache;
 
         let stream = test_stream();
         let args = model_args(false);

@@ -9,10 +9,10 @@ use safemlx::{
 };
 
 use crate::{
-    core::cache::{CacheBlockId, CacheRankIdentity, CacheRepresentation},
-    runtime::cache::residency::{
+    backend::mlx::runtime::cache::residency::{
         CacheBlockArrays, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,
     },
+    core::cache::{CacheBlockId, CacheRankIdentity, CacheRepresentation},
 };
 
 // TODO: somehow move quantized methods to a separate trait?
@@ -2929,13 +2929,13 @@ mod tests {
         SlidingKeyValueCache,
     };
     use crate::{
+        backend::mlx::runtime::cache::residency::{
+            inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheResidencyManager,
+            PagedCacheOptions,
+        },
         core::cache::{
             CacheRankIdentity, CacheRepresentation, PromptCacheDescriptor,
             PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
-        },
-        runtime::cache::residency::{
-            inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheResidencyManager,
-            PagedCacheOptions,
         },
     };
     use safemlx::{

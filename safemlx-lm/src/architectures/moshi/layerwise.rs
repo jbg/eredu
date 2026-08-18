@@ -15,29 +15,29 @@ use crate::{
         self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
         MoshiTransformerLayer, SampleStepOutput, TokenStepOutput,
     },
+    backend::mlx::error::Error,
     backend::mlx::realtime::MlxRealtimeOutput,
-    core::realtime::RealtimeSpeechConfig,
-    error::Error,
-    runtime::cache::KeyValueCache,
-    runtime::checkpoint::artifact::LoadedArtifactIdentity,
-    runtime::checkpoint::binding::{
+    backend::mlx::runtime::cache::KeyValueCache,
+    backend::mlx::runtime::checkpoint::artifact::LoadedArtifactIdentity,
+    backend::mlx::runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
-    runtime::checkpoint::store::{TensorSelection, WeightStore},
-    runtime::execution::layerwise::{
+    backend::mlx::runtime::checkpoint::recipe::DerivedWeightRecipe,
+    backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStore},
+    backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model, transformed_module_weight_store,
         ArchitectureAdapter, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
         StaticUnitBindings,
     },
-    runtime::generation::sampler::Sampler,
-    runtime::residency::manager::{
+    backend::mlx::runtime::generation::sampler::Sampler,
+    backend::mlx::runtime::residency::manager::{
         ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease, WeightBinding,
     },
+    core::realtime::RealtimeSpeechConfig,
 };
 
 #[cfg(test)]
-use crate::runtime::execution::layerwise::{
+use crate::backend::mlx::runtime::execution::layerwise::{
     load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
 };
 
@@ -101,7 +101,10 @@ impl MoshiLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -415,9 +418,9 @@ impl MoshiLayerwiseModel {
         cache: &mut MoshiCache,
         stream: &Stream,
     ) -> Result<resident::SampleStepOutput, Exception> {
-        let mut text_sampler = crate::runtime::generation::sampler::DefaultSampler;
+        let mut text_sampler = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
         let mut audio_samplers = (0..self.args().dep_q)
-            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
+            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         self.sample_step(
             text_token,
@@ -880,7 +883,7 @@ fn token_position(
 /// Loads a native MLX-layout Moshi checkpoint through bounded layer residency.
 pub fn load_moshi_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
+    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -912,8 +915,8 @@ pub fn load_moshi_layerwise_model(
 #[cfg(test)]
 pub(crate) fn load_moshi_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -948,7 +951,7 @@ pub(crate) fn load_moshi_tensor_parallel_layerwise_model(
 /// Loads the released PersonaPlex PyTorch checkpoint through bounded layer residency.
 pub fn load_personaplex_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
+    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -1016,7 +1019,7 @@ fn load_with_layout(
     source: impl AsRef<Path>,
     args: ModelArgs,
     layout: CheckpointLayout,
-    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
+    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -1281,7 +1284,9 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let Some(group) = execution.group() else {
             return self.begin_forward(input, cache, execution.stream());
@@ -1347,8 +1352,8 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::runtime::execution::layerwise::ExecutionGroupDag::chain([
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
             "temporal_transformer",
             "depth_codebook_slices",
         ])
@@ -1380,9 +1385,10 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
 
     fn parallel_parameter_groups(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-    ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
-        use crate::runtime::distributed::parallel::{
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    ) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error>
+    {
+        use crate::backend::mlx::runtime::distributed::parallel::{
             MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
         };
         use safemlx::ops::quantized_packed_dimension;
@@ -1557,8 +1563,8 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
 
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.static_modules =
@@ -1570,7 +1576,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let (prefix, dim, heads, feed_forward) = if group == 0 {
@@ -1675,11 +1681,11 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -1755,7 +1761,9 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -1876,14 +1884,14 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
 fn new_cache(args: &ModelArgs) -> MoshiCache {
     MoshiCache {
         temporal: vec![
-            crate::runtime::cache::ConcatKeyValueCache::new_with_max_size_and_step(
+            crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new_with_max_size_and_step(
                 args.context + 1,
                 256
             );
             args.num_layers as usize
         ],
         depth: vec![
-            crate::runtime::cache::ConcatKeyValueCache::new();
+            crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new();
             args.depformer_num_layers as usize
         ],
     }
@@ -2084,19 +2092,20 @@ mod tests {
     use super::*;
     use crate::{
         architectures::moshi::model as eager,
+        backend::mlx::realtime::MlxRealtimeBackend,
         backend::mlx::realtime::{generate_encoded_greedy, MlxRealtimeModel},
+        backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
+        backend::mlx::runtime::execution::layerwise::{
+            LayerWeightResidency, LayerwiseLoadOptions, WeightResidency,
+        },
+        backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         backend::mlx::ModelLoadOptions,
         core::realtime::{
             load_realtime_model, load_realtime_model_with_options, RealtimeSampling,
             RealtimeScheduler,
         },
         core::residency::{MemoryTier, OffloadConfig},
-        runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
-        runtime::execution::layerwise::{
-            LayerWeightResidency, LayerwiseLoadOptions, WeightResidency,
-        },
-        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        MlxRealtimeBackend, RealtimeModel, RequestId, SchedulerLimits,
+        RealtimeModel, RequestId, SchedulerLimits,
     };
 
     fn config() -> &'static str {
@@ -2417,13 +2426,13 @@ mod tests {
         let mut resident_state = resident::GenerationState::new(&resident);
         let mut layerwise_state = layerwise.new_generation_state();
         let input = Array::from_slice(&[4i32, 5], &[1, 2]);
-        let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
-        let mut layerwise_text = crate::runtime::generation::sampler::DefaultSampler;
+        let mut resident_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
+        let mut layerwise_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
         let mut resident_audio = (0..2)
-            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
+            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         let mut layerwise_audio = (0..2)
-            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
+            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         for _ in 0..3 {
             let expected = resident
@@ -2485,7 +2494,7 @@ mod tests {
             MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
             dir.path(),
             crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(
-                crate::runtime::execution::layerwise::WeightResidency::layerwise_host(
+                crate::backend::mlx::runtime::execution::layerwise::WeightResidency::layerwise_host(
                     LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
                 ),
             ),
@@ -2557,13 +2566,13 @@ mod tests {
         let mut resident_state = resident::GenerationState::new(&resident);
         let mut streamed_state = streamed.new_generation_state();
         let input = Array::from_slice(&[4i32, 5], &[1, 2]);
-        let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
-        let mut streamed_text = crate::runtime::generation::sampler::DefaultSampler;
+        let mut resident_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
+        let mut streamed_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
         let mut resident_audio = (0..2)
-            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
+            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         let mut streamed_audio = (0..2)
-            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
+            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         for _ in 0..2 {
             let expected = resident
@@ -2605,7 +2614,7 @@ mod tests {
             MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
             dir.path(),
             crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(
-                crate::runtime::execution::layerwise::WeightResidency::dense_disk_stream(dense),
+                crate::backend::mlx::runtime::execution::layerwise::WeightResidency::dense_disk_stream(dense),
             ),
         )
         .unwrap();
@@ -2686,13 +2695,13 @@ mod tests {
         let user = Array::from_slice(&[3i32, 4], &[1, 2]);
         let agent = Array::from_slice(&[1i32, 2], &[1, 2]);
         let forced_text = Array::from_slice(&[5i32], &[1, 1]);
-        let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
-        let mut layerwise_text = crate::runtime::generation::sampler::DefaultSampler;
+        let mut resident_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
+        let mut layerwise_text = crate::backend::mlx::runtime::generation::sampler::DefaultSampler;
         let mut resident_audio = (0..4)
-            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
+            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         let mut layerwise_audio = (0..4)
-            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
+            .map(|_| crate::backend::mlx::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
 
         for forced in [true, true, false] {

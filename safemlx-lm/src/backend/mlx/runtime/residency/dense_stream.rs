@@ -13,11 +13,11 @@ use std::{
 };
 
 use crate::{
+    backend::mlx::runtime::residency::manager::{ResidencyManager, ResidentUnitLease},
     core::residency::{
         BackgroundPrefetchReport, CacheEvictionPolicy, MemoryTier, OffloadUnitId,
         PrefetchAdmission, PrefetchDemandResolution, PrefetchExecutionState,
     },
-    runtime::residency::manager::{ResidencyManager, ResidentUnitLease},
 };
 
 /// Current plus next layer retained by dense streamed execution.
@@ -363,7 +363,7 @@ pub enum DenseStreamError {
     },
     /// A residency transition failed.
     #[error(transparent)]
-    Residency(#[from] crate::runtime::residency::manager::ResidencyError),
+    Residency(#[from] crate::backend::mlx::runtime::residency::manager::ResidencyError),
     /// Backend-neutral prefetch lifecycle misuse.
     #[error(transparent)]
     PrefetchState(#[from] crate::core::residency::PrefetchStateError),
@@ -376,9 +376,9 @@ pub enum DenseStreamError {
 mod tests {
     use super::*;
     use crate::{
+        backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
+        backend::mlx::runtime::residency::manager::{OffloadUnit, WeightBinding},
         core::residency::{OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy},
-        runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
-        runtime::residency::manager::{OffloadUnit, WeightBinding},
     };
     use safemlx::{
         host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy, Stream,

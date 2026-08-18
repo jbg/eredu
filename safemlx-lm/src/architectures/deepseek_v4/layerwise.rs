@@ -22,10 +22,9 @@ use crate::core::cache::{
 };
 
 use crate::{
-    error::Error,
-    nn::generation::CausalLm,
-    runtime::media::input,
-    runtime::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::{
         cache::residency::PagedCacheOptions,
         checkpoint::{
             binding::{
@@ -50,6 +49,7 @@ use crate::{
             manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
         },
     },
+    nn::generation::CausalLm,
 };
 
 use super::{
@@ -86,13 +86,20 @@ impl DeepSeekV4LayerwiseModel {
     /// parameter residency.
     pub fn new_cache_with_options(
         &self,
-        policy: crate::CacheResidencyPolicy,
+        policy: crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy,
     ) -> Result<Cache, Error> {
         let rank = self.execution.prompt_cache_rank_identity();
         match policy {
-            crate::CacheResidencyPolicy::Device => self.new_cache().map_err(Into::into),
-            crate::CacheResidencyPolicy::Paged(options) => {
-                let manager = crate::CacheResidencyManager::new(options)
+            crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Device => {
+                self.new_cache().map_err(Into::into)
+            }
+            crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
+                options,
+            ) => {
+                let manager =
+                    crate::backend::mlx::runtime::cache::residency::CacheResidencyManager::new(
+                        options,
+                    )
                     .map_err(|error| Error::Parallel(error.to_string()))?;
                 self.execution
                     .adapter()
@@ -194,11 +201,16 @@ impl DeepSeekV4LayerwiseModel {
     }
 
     /// Returns the active Cartesian topology and rank-local parameter accounting.
-    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
+    pub(crate) fn bind_parallel_topology(
+        &mut self,
+        topology: crate::backend::mlx::MlxParallelContext,
+    ) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -312,7 +324,10 @@ impl DeepSeekV4LayerwiseModel {
     /// Dense disk-stream telemetry when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -528,7 +543,7 @@ impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekV
 }
 
 /// Token generation over a bounded V4 model.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, DeepSeekV4LayerwiseModel, Cache, S>;
 
 /// Per-forward token state retained across streamed decoder units.
@@ -544,7 +559,7 @@ pub struct DeepSeekV4LayerwiseAdapter {
     static_model: ResidentModel,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
-    parallel_topology: Option<crate::MlxParallelContext>,
+    parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
 }
 
 impl DeepSeekV4LayerwiseAdapter {
@@ -637,8 +652,8 @@ impl DeepSeekV4LayerwiseAdapter {
 
     pub(crate) fn configure_cartesian_layout(
         &mut self,
-        build: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.configure_parallel_static(build, layout, stream)
@@ -711,7 +726,7 @@ impl DeepSeekV4LayerwiseAdapter {
 
     pub(crate) fn embedded_mtp_cache_with_manager(
         &self,
-        manager: crate::CacheResidencyManager,
+        manager: crate::backend::mlx::runtime::cache::residency::CacheResidencyManager,
         rank: Option<crate::CacheRankIdentity>,
     ) -> Result<super::model::DraftCache, Error> {
         Ok(self
@@ -909,7 +924,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         prompt_cache_model_identity(
             &self.args,
@@ -1078,8 +1093,10 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
+            "text_decoder",
+        ])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1104,12 +1121,12 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
 
     fn register_parallel_parameters(
         &self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         let _ = context;
-        use crate::runtime::distributed::parallel::register_replicated_module;
+        use crate::backend::mlx::runtime::distributed::parallel::register_replicated_module;
 
         register_replicated_module(planner, &self.static_model.model.embed_tokens, "embed")?;
         register_replicated_module(planner, &self.static_model.model.norm, "norm")?;
@@ -1130,8 +1147,8 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
 
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         _stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_topology = Some(context.topology());
@@ -1142,7 +1159,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<DecoderLayer, Error> {
         self.layer_count(group)?;
@@ -1194,7 +1211,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<DecoderLayer, Error> {
         self.new_layer(group, index, stream)
@@ -1204,8 +1221,8 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<DecoderLayer, Error> {
         self.new_parallel_layer(group, index, layout, stream)
@@ -1214,7 +1231,8 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
@@ -1224,7 +1242,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
             ));
         }
         Ok(Some(
-            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
                 self.args.n_routed_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -1269,11 +1287,11 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         index: usize,
         _layer: &DecoderLayer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -1287,7 +1305,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -1399,7 +1417,9 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         hidden: &Array,
         cache: &mut Cache,
         context: &mut DeepSeekV4ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -1509,7 +1529,7 @@ pub fn load_deepseek_v4_layerwise_model(
 pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    residency: crate::WeightResidency,
+    residency: crate::backend::mlx::runtime::execution::layerwise::WeightResidency,
     requested_quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1575,7 +1595,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
     metadata: &HashMap<String, GgufMetadataValue>,
     options: LayerWeightResidency,
     requested_quantization: Option<WeightQuantization>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
@@ -1618,7 +1638,7 @@ pub(crate) fn load_deepseek_v4_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
     requested_quantization: Option<WeightQuantization>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV4LayerwiseModel, Error> {
@@ -1629,7 +1649,7 @@ pub(crate) fn load_deepseek_v4_tensor_parallel_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         return load_deepseek_v4_gguf_tensor_parallel_model(
             &checkpoint,
             &metadata,
@@ -1667,7 +1687,7 @@ pub(crate) fn load_deepseek_v4_tensor_parallel_model(
 /// Loads V4 with routed experts in independent cache units.
 pub fn load_deepseek_v4_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::NonExpertWeightResidency,
+    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     requested_quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1740,7 +1760,7 @@ pub(crate) fn load_deepseek_v4_sparse_tp_ep_base_with_store(
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     requested_quantization: Option<WeightQuantization>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV4LayerwiseModel, Error> {
@@ -1800,11 +1820,11 @@ fn capture_draft_hidden(
 }
 
 fn register_v4_layer_parallel_plan(
-    planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+    planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
     layer: &DecoderLayer,
     index: usize,
 ) -> Result<(), Error> {
-    use crate::runtime::distributed::parallel::{
+    use crate::backend::mlx::runtime::distributed::parallel::{
         array_parameter_member, partitioned_projection_members, register_replicated_module,
         MemberSharding, ParameterGroupSpec, ParameterRole, ProjectionSharding,
     };
@@ -2267,7 +2287,7 @@ mod tests {
     use super::{raw_layer_key, DeepSeekV4LayerwiseAdapter};
     use crate::{
         architectures::deepseek_v4::model::ModelArgs,
-        runtime::{
+        backend::mlx::runtime::{
             checkpoint::quantization::WeightQuantization,
             checkpoint::store::TensorSelection,
             distributed::parallel::{ParallelBuildContext, ShardingPolicy},

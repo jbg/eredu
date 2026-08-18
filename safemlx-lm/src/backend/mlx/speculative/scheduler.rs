@@ -20,6 +20,8 @@ use safemlx_lm_core::{
 };
 
 use crate::{
+    backend::mlx::runtime::generation::sampler::SpeculativeSampler,
+    backend::mlx::runtime::media::input::{InputPayload, Modality, ModelInput},
     backend::mlx::{
         speculative::{MlxSpeculativeCompletion, MlxSpeculativeSampling, MtpExecutionStreams},
         MlxModelInput,
@@ -28,8 +30,6 @@ use crate::{
         FinishReason, GenerationCancellationToken, GenerationSequence, MtpConfig, MtpRequestId,
         MtpSchedulerOptions, SemanticEvent,
     },
-    runtime::generation::sampler::SpeculativeSampler,
-    runtime::media::input::{InputPayload, Modality, ModelInput},
 };
 
 /// Component timings accumulated by an architecture-specific MTP backend.
@@ -618,8 +618,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        runtime::generation::sampler::{DefaultSampler, GenerationSampler, MirostatV2Sampler},
-        runtime::media::input::InputPart,
+        backend::mlx::runtime::generation::sampler::{
+            DefaultSampler, GenerationSampler, MirostatV2Sampler,
+        },
+        backend::mlx::runtime::media::input::InputPart,
     };
 
     #[derive(Clone, Default)]

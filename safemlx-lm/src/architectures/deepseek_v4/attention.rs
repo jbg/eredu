@@ -18,12 +18,12 @@ use safemlx::{
 
 use crate::{
     architectures::qwen::hybrid::qwen3_5::QwenLinear as Linear,
-    core::cache::{CacheRankIdentity, PoolingStateComponent, StateTensorOwner, StateTensorRole},
-    nn::attention::indexed_sparse_attention,
-    runtime::cache::{
+    backend::mlx::runtime::cache::{
         residency::{CacheResidencyManager, PromptCacheStateArray},
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache, PoolingCache, PoolingCacheState,
     },
+    core::cache::{CacheRankIdentity, PoolingStateComponent, StateTensorOwner, StateTensorRole},
+    nn::attention::indexed_sparse_attention,
 };
 
 use super::{
@@ -217,7 +217,7 @@ impl Compressor {
             cache.accumulate_windows(values, gates, offset, stream)?
         } else {
             let usable = values.dim(1) / self.ratio * self.ratio;
-            crate::runtime::cache::PoolingWindows {
+            crate::backend::mlx::runtime::cache::PoolingWindows {
                 values: values.try_index_device((.., ..usable, ..), stream)?,
                 gates: gates.try_index_device((.., ..usable, ..), stream)?,
                 base_position: offset,

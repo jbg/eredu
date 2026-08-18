@@ -4,7 +4,7 @@ use safemlx::{
     distributed::{self, Backend},
     DeviceType,
 };
-use safemlx_lm::{DeviceAssignment, MlxParallelContext};
+use safemlx_lm::backend::mlx::{DeviceAssignment, MlxParallelContext};
 
 fn parse(index: usize, name: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(std::env::args()

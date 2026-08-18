@@ -31,11 +31,27 @@ use crate::core::cache::{
 };
 
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{
+        residency::{
+            load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
+            CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+            PagedCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
+        },
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict,
+        load_safetensors_dir_strict_with_split_relu2_experts, transform_split_relu2_experts,
+        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
+    },
+    backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    backend::mlx::runtime::media::input,
+    core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
         CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
         StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
-    error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
     nn::{
         self as common,
@@ -46,22 +62,6 @@ use crate::{
         linear::project_logits_maybe_quantized,
         moe::{packed_grouped_linear, weighted_route_sum, TopKRouterScoreFunction},
     },
-    runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::{
-        residency::{
-            load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
-            CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-            PagedCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
-        },
-        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-    },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict,
-        load_safetensors_dir_strict_with_split_relu2_experts, transform_split_relu2_experts,
-        GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-    runtime::media::input,
 };
 
 /// Executable operator and state policy for one Nemotron-H decoder layer.
@@ -3958,7 +3958,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Nemotron-H token generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 pub(crate) struct LoadedNemotronHGguf {
@@ -4293,7 +4293,7 @@ fn gguf_affine_quantization(
     scales_shape: &[i32],
     weight_name: &str,
 ) -> Result<AffineQuantization, Error> {
-    crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+    crate::backend::mlx::runtime::checkpoint::quantization::gguf_affine_quantization(
         weight_shape,
         scales_shape,
         weight_name,
@@ -4817,13 +4817,13 @@ mod tests {
         unique_nonzero_layer_value, validate_model_config_value, AttentionCache, Experts,
         LayerCache, LayerPolicy, Model, ModelArgs, ModelInput, SparseMoeBlock,
     };
-    use crate::runtime::checkpoint::load::{StrictLoadConfig, StrictLoadReport};
+    use crate::backend::mlx::runtime::checkpoint::load::{StrictLoadConfig, StrictLoadReport};
     use crate::{
+        backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
         nn::{
             generation::CausalLm,
             moe::{quantize_expert_bank, TopKRouterScoreFunction},
         },
-        runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
         AttentionPolicy, LayerSchedule,
     };
     use safemlx::{
@@ -5318,10 +5318,9 @@ mod tests {
         let mut model = Model::new(tiny_full_args(), stream).unwrap();
         let mut cache = model.new_cache();
         let prompt = Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-        let input_parts = [crate::runtime::media::input::InputPart::text_token_ids(
-            &prompt,
-        )];
-        let input = crate::runtime::media::input::ModelInput::new(&input_parts);
+        let input_parts =
+            [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let input = crate::backend::mlx::runtime::media::input::ModelInput::new(&input_parts);
         let logits = CausalLm::prefill_input_logits(&mut model, input, &mut cache, stream).unwrap();
         assert_eq!(logits.shape(), &[1, 16]);
         assert!(cache.offset() >= 3);
@@ -5336,8 +5335,8 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn heterogeneous_live_paging_matches_resident_mamba_and_attention() {
         use crate::{
+            backend::mlx::runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
             core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
-            runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
         };
 
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
@@ -5485,7 +5484,9 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn heterogeneous_sliding_live_paging_matches_resident() {
-        use crate::runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions};
+        use crate::backend::mlx::runtime::cache::residency::{
+            CacheResidencyPolicy, PagedCacheOptions,
+        };
 
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
@@ -5564,11 +5565,11 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_nemotron_h_save_drop_paged_reload_continue_matches_uninterrupted() {
         use crate::{
-            core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
-            runtime::{
+            backend::mlx::runtime::{
                 cache::residency::PagedCacheOptions,
                 media::input::{InputPart, ModelInput as RuntimeModelInput},
             },
+            core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
         };
 
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
@@ -5796,13 +5797,12 @@ mod tests {
             .any(|policy| *policy == LayerPolicy::SparseMoe));
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-            &tokens,
-        )];
+        let parts =
+            [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
         let mut cache = model.new_cache();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
-            crate::runtime::media::input::ModelInput::new(&parts),
+            crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -5872,7 +5872,7 @@ mod tests {
             vec![
                 LayerPolicy::Mamba,
                 LayerPolicy::SelfAttention(
-                    crate::runtime::attention::AttentionPolicy::sliding(7).unwrap()
+                    crate::core::attention::AttentionPolicy::sliding(7).unwrap()
                 ),
                 LayerPolicy::DenseMlp,
                 LayerPolicy::SparseMoe,
@@ -5883,7 +5883,7 @@ mod tests {
         assert!(matches!(
             &cache.layers[1],
             super::LayerCache::Attention(cache)
-                if cache.policy() == crate::runtime::attention::AttentionPolicy::sliding(7).unwrap()
+                if cache.policy() == crate::core::attention::AttentionPolicy::sliding(7).unwrap()
         ));
         assert!(matches!(cache.layers[2], super::LayerCache::Mlp));
         assert!(matches!(cache.layers[3], super::LayerCache::Moe));

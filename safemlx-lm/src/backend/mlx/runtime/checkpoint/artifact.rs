@@ -9,7 +9,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::error::Error;
+use crate::backend::mlx::error::Error;
 
 /// Immutable identity attached to a loaded model instance.
 ///

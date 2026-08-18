@@ -19,9 +19,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    error::Error,
+    backend::mlx::error::Error,
+    backend::mlx::runtime::{
+        cache::ConcatKeyValueCache, checkpoint::quantization::WeightQuantization,
+    },
     nn::linear::unloaded_maybe_quantized_linear,
-    runtime::{cache::ConcatKeyValueCache, checkpoint::quantization::WeightQuantization},
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

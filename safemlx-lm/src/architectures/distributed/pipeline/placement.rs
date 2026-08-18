@@ -11,8 +11,8 @@ use std::{
 };
 
 use crate::{
-    error::Error,
-    runtime::execution::layerwise::{ExecutionGroupDag, ExecutionGroupSpec},
+    backend::mlx::error::Error,
+    backend::mlx::runtime::execution::layerwise::{ExecutionGroupDag, ExecutionGroupSpec},
 };
 
 /// Semantic role of one placed execution group.

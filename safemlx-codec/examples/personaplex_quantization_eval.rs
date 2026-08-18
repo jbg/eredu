@@ -10,7 +10,7 @@ use safemlx::{random::RandomState, Array, Device, DeviceType, Dtype, ExecutionCo
 use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
     architectures::moshi::{model as moshi, personaplex},
-    runtime::generation::sampler::{DefaultSampler, GenerationSampler},
+    backend::mlx::runtime::generation::sampler::{DefaultSampler, GenerationSampler},
 };
 use sentencepiece_rs::SentencePieceProcessor;
 use serde::Serialize;

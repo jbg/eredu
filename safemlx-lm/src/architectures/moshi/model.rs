@@ -30,17 +30,17 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
+    backend::mlx::error::Error,
     backend::mlx::realtime,
-    core::realtime::RealtimeSpeechConfig,
-    error::Error,
-    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
-    runtime::checkpoint::load::{
+    backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    backend::mlx::runtime::checkpoint::load::{
         for_each_safetensor_array, load_array_quantized_strict, load_array_strict,
         load_safetensors_dir_strict, load_safetensors_quantized_strict, load_safetensors_strict,
         StrictLoadConfig, StrictLoadReport,
     },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::generation::sampler::{DefaultSampler, Sampler},
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler},
+    core::realtime::RealtimeSpeechConfig,
 };
 
 const RMS_NORM_EPS: f32 = 1e-8;
@@ -2663,7 +2663,7 @@ pub fn load_model(
 /// Loads a dense Moshi checkpoint while quantizing each matrix as it is read.
 ///
 /// This is the experimental, no-conversion counterpart to
-/// [`crate::runtime::checkpoint::quantization::quantize_checkpoint`]. Both paths call the same
+/// [`crate::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint`]. Both paths call the same
 /// affine tensor transform and produce the same in-memory parameter layout.
 pub fn load_model_quantized(
     model_dir: impl AsRef<Path>,
@@ -2673,7 +2673,7 @@ pub fn load_model_quantized(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let mut args = get_model_args(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "Moshi",
         args.quantization,
         quantization,
@@ -2691,7 +2691,7 @@ pub fn load_model_quantized(
     if weights_name == "model.safetensors"
         && model_dir.join("model.safetensors.index.json").exists()
     {
-        for file in crate::runtime::checkpoint::load::safetensors_files(model_dir)? {
+        for file in crate::backend::mlx::runtime::checkpoint::load::safetensors_files(model_dir)? {
             load_safetensors_quantized_strict(
                 &mut model,
                 file,
@@ -2981,7 +2981,7 @@ mod tests {
     use super::{
         parse_depformer_attention_weight, parse_depformer_gating_weight, Model, ModelArgs,
     };
-    use crate::runtime::checkpoint::quantization::WeightQuantization;
+    use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
     use safemlx::{module::ModuleParameters, Device, DeviceType, ExecutionContext};
 
     fn minimal_config() -> &'static str {

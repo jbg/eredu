@@ -3,17 +3,17 @@ use std::{fs, path::Path};
 use safemlx::Array;
 use serde::Deserialize;
 
-use crate::runtime::media::video::{
+use crate::backend::mlx::runtime::media::video::{
     pad_frame_indices, sampled_frame_count, temporal_group_timestamps, uniform_sample_indices,
     validate_rgb_frames,
 };
-use crate::runtime::media::{
+use crate::backend::mlx::runtime::media::{
     image::{rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage, RgbImageView},
     prepared_model_input, push_text_token_ids, MediaInput, MediaPayload, OwnedInputMetadata,
     PreparedInputPart, PreparedModelInput, ProcessorInput, ProcessorPreparationError, VideoFrames,
     VideoSampling,
 };
-use crate::{error::Error, runtime::media::input::Modality};
+use crate::{backend::mlx::error::Error, backend::mlx::runtime::media::input::Modality};
 
 #[derive(Debug, Clone, Deserialize)]
 struct QwenProcessorSize {
@@ -572,8 +572,8 @@ mod tests {
         QwenVisualProcessorConfig,
     };
     use crate::{
-        runtime::media::input::{InputPayload, Modality},
-        runtime::media::{
+        backend::mlx::runtime::media::input::{InputPayload, Modality},
+        backend::mlx::runtime::media::{
             image::{rescale_and_normalize_rgb8, RgbImageView},
             MediaInput, ProcessorInput, VideoSampling,
         },

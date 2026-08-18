@@ -9,16 +9,16 @@ use std::collections::HashMap;
 use safemlx::{ops::GgufMetadataValue, Array};
 use serde::Deserialize;
 
-use crate::error::Error;
+use crate::backend::mlx::error::Error;
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-use crate::runtime::media::input::Modality;
+use crate::backend::mlx::runtime::media::input::Modality;
 
-use crate::runtime::media::{
+use crate::backend::mlx::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
     ProcessorInput, ProcessorPreparationError,
 };
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-use crate::runtime::media::{MediaPayload, OwnedInputMetadata};
+use crate::backend::mlx::runtime::media::{MediaPayload, OwnedInputMetadata};
 
 #[derive(Debug, Clone)]
 pub(crate) struct InklingProcessor {
@@ -151,7 +151,7 @@ impl InklingProcessor {
     #[cfg(feature = "audio-processing")]
     fn process_audio(
         &self,
-        waveform: crate::runtime::media::audio::AudioWaveform<'_>,
+        waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
     ) -> Result<PreparedInputPart, Error> {
         let features = inkling_log_mel(waveform)?;
         let span = (self.dmel_max - self.dmel_min) as f64;
@@ -235,7 +235,7 @@ fn default_dmel_max() -> f32 {
 
 #[cfg(feature = "image-processing")]
 fn process_image(
-    image: crate::runtime::media::image::RgbImageView<'_>,
+    image: crate::backend::mlx::runtime::media::image::RgbImageView<'_>,
 ) -> Result<PreparedInputPart, Error> {
     const PATCH: usize = 40;
     const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
@@ -284,7 +284,7 @@ fn image_patch_grid(height: usize, width: usize) -> (usize, usize) {
 
 #[cfg(feature = "audio-processing")]
 fn inkling_log_mel(
-    waveform: crate::runtime::media::audio::AudioWaveform<'_>,
+    waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
 ) -> Result<Vec<f32>, Error> {
     use rustfft::{num_complex::Complex32, FftPlanner};
 
@@ -395,7 +395,8 @@ mod tests {
     #[test]
     fn dmel_frontend_uses_fifty_millisecond_frames() {
         let samples = vec![0.0f32; 801];
-        let waveform = crate::runtime::media::AudioWaveform::new(&samples, 16_000).unwrap();
+        let waveform =
+            crate::backend::mlx::runtime::media::AudioWaveform::new(&samples, 16_000).unwrap();
         let features = super::inkling_log_mel(waveform).unwrap();
         assert_eq!(features.len(), 2 * 80);
         assert!(features.iter().all(|value| (*value + 10.0).abs() < 1e-6));

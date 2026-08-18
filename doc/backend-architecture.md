@@ -24,6 +24,24 @@ Separate dependency-graph tests enforce both properties. Native architecture,
 array, stream, cache, sampler, residency, and distributed modules exist only
 when `mlx` is enabled; they are not placeholder types in the portable API.
 
+## Module ownership
+
+`safemlx_lm::backend` is always present so backend selection has one stable
+namespace in portable builds. Concrete implementations are feature-gated
+inside it: the default `mlx` feature exposes `backend::mlx`, while a build with
+`default-features = false` exposes no MLX implementation or native dependency.
+
+The facade-level `runtime` namespace contains only backend-independent chat
+preparation and committed semantic streaming. MLX arrays, checkpoint stores,
+KV-cache storage, native distributed transport, model execution, sampling,
+media tensor preparation, residency workers, and the MLX-aware error type live
+under `backend::mlx::runtime` and `backend::mlx::error`. Common MLX load-policy
+types are reexported within `backend::mlx`, never at the facade crate root.
+There are no forwarding modules at the former `runtime::{cache, checkpoint,
+distributed, execution, media, residency}` or `runtime::generation::sampler`
+paths. Backend-neutral attention types are canonical core exports rather than
+a `runtime::attention` alias.
+
 ## Core and backend responsibilities
 
 Core owns concepts whose meaning does not depend on tensor representation:
@@ -564,7 +582,8 @@ The current boundary leaves these components MLX-coupled:
   logits/sampler/executor implementation beneath the capability.
 
 The former facade `runtime::residency::policy` module was deleted. It was not
-retained as a forwarding namespace. The earlier placeholder core
+retained as a forwarding namespace; MLX residency execution now lives under
+`backend::mlx::runtime::residency`. The earlier placeholder core
 `ResidencyPlan`, `ResourceSpec`, and `ResidencyReport` schemas were also deleted;
 the validated `OffloadPlan`, `OffloadUnitSpec`, and `OffloadReport` types used by
 production are now canonical and are reexported at the facade root.
@@ -603,8 +622,8 @@ The former facade definitions of cache block identity, logical tiers, layer
 cache geometry, and fixed-state policy were deleted as well.
 Architecture modules import the canonical core contract directly. MLX manifest
 and array validation call core policy validation, symbolic shape resolution,
-and dtype-family matching; `runtime::cache::residency` does not forward these
-types.
+and dtype-family matching; `backend::mlx::runtime::cache::residency` binds
+them to MLX storage without redefining or forwarding the core types.
 
 Prompt-cache identity, topology, descriptors, options, versioned manifests,
 catalog entries, fingerprints, and structural/compatibility errors likewise

@@ -18,12 +18,12 @@ use safemlx::{
 use serde::Deserialize;
 
 use crate::{
-    error::Error,
-    nn::{layers::silu, linear::unloaded_maybe_quantized_linear},
-    runtime::{
-        attention::LayerSchedule, cache::ConcatKeyValueCache,
-        checkpoint::quantization::WeightQuantization,
+    backend::mlx::error::Error,
+    backend::mlx::runtime::{
+        cache::ConcatKeyValueCache, checkpoint::quantization::WeightQuantization,
     },
+    core::attention::LayerSchedule,
+    nn::{layers::silu, linear::unloaded_maybe_quantized_linear},
 };
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -1341,8 +1341,8 @@ pub(crate) fn vision_parallel_parameter_groups(
     config: &VisionConfig,
     prefix: &str,
     stream: &Stream,
-) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
-    use crate::runtime::distributed::parallel::{
+) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+    use crate::backend::mlx::runtime::distributed::parallel::{
         partitioned_projection_members, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
         ParameterRole, ProjectionSharding,
     };
@@ -1478,7 +1478,7 @@ pub(crate) fn vision_parallel_parameter_groups(
 pub(crate) fn configure_vision_parallel_static(
     vision: &mut QwenVisionLayerwiseStatic,
     prefix: &str,
-    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
     stream: &Stream,
 ) -> Result<(), Error> {
     let target = format!("{prefix}.merger.linear_fc1");
@@ -1525,7 +1525,7 @@ pub(crate) fn new_parallel_vision_block(
     config: &VisionConfig,
     prefix: &str,
     index: usize,
-    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
     stream: &Stream,
 ) -> Result<QwenVisionBlock, Error> {
     let block = format!("{prefix}.blocks.{index}");
@@ -2152,9 +2152,13 @@ mod tests {
         config.intermediate_size = 32;
         config.num_heads = 4;
         config.out_hidden_size = 32;
-        let format = crate::runtime::checkpoint::quantization::WeightQuantization::Affine(
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 8).unwrap(),
-        );
+        let format =
+            crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization::Affine(
+                crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(
+                    32, 8,
+                )
+                .unwrap(),
+            );
         for name in [
             "blocks.0.attn.qkv.weight",
             "blocks.0.attn.proj.weight",

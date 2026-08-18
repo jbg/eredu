@@ -30,7 +30,7 @@ if !report.is_loadable() {
         eprintln!("{:?}: {}", issue.code, issue.detail);
     }
 }
-# Ok::<(), safemlx_lm::error::Error>(())
+# Ok::<(), safemlx_lm::backend::mlx::error::Error>(())
 ```
 
 Structural inspection reads configuration and bounded checkpoint headers,

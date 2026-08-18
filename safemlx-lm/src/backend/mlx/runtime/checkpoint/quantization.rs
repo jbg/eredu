@@ -20,7 +20,7 @@ use safemlx::{
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
-use crate::{error::Error, runtime::checkpoint::load as weights};
+use crate::{backend::mlx::error::Error, backend::mlx::runtime::checkpoint::load as weights};
 
 /// MLX affine quantization settings stored in `config.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -575,7 +575,7 @@ fn quantize_checkpoint_inner(
     let mut total_size = 0;
 
     for file in weight_files {
-        crate::runtime::checkpoint::load::for_each_safetensor_array(
+        crate::backend::mlx::runtime::checkpoint::load::for_each_safetensor_array(
             file,
             stream,
             |name, tensor| {

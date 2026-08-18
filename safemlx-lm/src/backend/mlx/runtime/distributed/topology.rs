@@ -12,9 +12,9 @@ use safemlx_lm_core::{
 };
 
 use crate::{
-    error::Error,
-    runtime::checkpoint::load::StrictLoadConfig,
-    runtime::checkpoint::store::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
+    backend::mlx::runtime::checkpoint::store::{
         SafetensorsWeightStore, TensorSelection, WeightReadPolicy, WeightStore,
     },
 };
@@ -1074,12 +1074,12 @@ mod tests {
         let singleton = crate::backend::mlx::ModelLoadOptions::with_parallel(topology(0, 1, 1, 1));
         crate::backend::mlx::ensure_replicated_load_options(singleton).unwrap();
         let combined = crate::backend::mlx::ModelLoadOptions::with_quantization(
-            crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4,
+            crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization::MxFp4,
         )
         .with_parallel_topology(topology(0, 1, 1, 1));
         assert_eq!(
             combined.quantization,
-            Some(crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4)
+            Some(crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization::MxFp4)
         );
         assert!(combined.parallel.unwrap().is_replicated());
 

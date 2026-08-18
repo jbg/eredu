@@ -17,15 +17,15 @@ use safemlx::{
 };
 
 use crate::{
-    backend::mlx::MlxParallelContext,
-    core::balanced_contiguous_range,
-    error::Error,
-    runtime::checkpoint::binding::is_materialized_module_parameter,
-    runtime::distributed::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::binding::is_materialized_module_parameter,
+    backend::mlx::runtime::distributed::{
         completion::synchronize_outputs,
         topology::{PlacementPlan, TensorPlacement},
     },
-    runtime::generation::sampler::Sampler,
+    backend::mlx::runtime::generation::sampler::Sampler,
+    backend::mlx::MlxParallelContext,
+    core::balanced_contiguous_range,
 };
 
 /// Token selected on one distributed rank together with synchronized stop state.

@@ -9,11 +9,11 @@ use crate::{
     architectures::qwen::hybrid::qwen3_5::{
         QwenLinear as Linear, QwenWeightFormat as WeightFormat,
     },
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     nn::{
         layers::silu,
         moe::{PackedSwiGluExperts, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
     },
-    runtime::checkpoint::quantization::WeightQuantization,
 };
 
 use super::model::ModelArgs;

@@ -21,15 +21,15 @@ use safemlx_lm::{
         dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
         DispatchedRoutes, ExpertAssignment, RoutedTransport, ShardedRouteBlocks,
     },
-    core::residency::OffloadConfig,
-    error::Error,
-    nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
-    runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
-    runtime::residency::expert_cache::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
+    backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
         ExpertRouteBatch,
     },
-    runtime::residency::manager::{OffloadUnit, WeightBinding},
+    backend::mlx::runtime::residency::manager::{OffloadUnit, WeightBinding},
+    core::residency::OffloadConfig,
+    nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
 };
 use safetensors::tensor::{serialize_to_file, Dtype as TensorDtype, TensorView};
 

@@ -1,6 +1,6 @@
 //! Bounded, out-of-core load-time weight quantization.
 //!
-//! A [`BoundedQuantizedWeightStore`](crate::runtime::checkpoint::bounded_quantization::BoundedQuantizedWeightStore)
+//! A [`BoundedQuantizedWeightStore`](crate::backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizedWeightStore)
 //! overlays packed tensors on an existing
 //! checkpoint store. Source matrices are selected in row tiles, quantized on
 //! explicit conversion streams, and written directly into temporary SafeTensors
@@ -27,8 +27,8 @@ use serde::Serialize;
 use tempfile::TempDir;
 
 use crate::{
-    error::Error,
-    runtime::checkpoint::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::{
         quantization::{quantize_tensor, WeightQuantization},
         recipe::{DerivedWeightRecipe, RecipeDtype},
         store::{
@@ -1194,15 +1194,15 @@ mod tests {
     use super::*;
     use crate::test_utils::SyntheticGguf;
     use crate::{
-        core::residency::{
-            MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
-        },
-        runtime::{
+        backend::mlx::runtime::{
             checkpoint::{quantization::AffineQuantization, store::GgufWeightStore},
             residency::manager::{
                 host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyManager,
                 WeightBinding,
             },
+        },
+        core::residency::{
+            MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
         },
     };
 
@@ -1808,7 +1808,7 @@ mod tests {
                 .metadata("model.proj.scales")
                 .unwrap()
                 .stored_dtype,
-            crate::runtime::checkpoint::store::StoredDtype::U8
+            crate::backend::mlx::runtime::checkpoint::store::StoredDtype::U8
         );
         assert!(!transformed.keys().contains(&"model.proj.biases".into()));
 

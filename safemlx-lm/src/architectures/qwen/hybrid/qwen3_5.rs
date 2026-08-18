@@ -44,12 +44,30 @@ use crate::architectures::qwen::vl::{model as qwen_vl, vision::grid_thw_from_arr
 pub use crate::nn::generation::sample;
 
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{
+        residency::{
+            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
+            CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+            PromptCacheSnapshotBlock, PromptCacheStateArray,
+        },
+        ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::load::{
+        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
+        load_named_array_strict, load_safetensors_dir_strict_with_split_swiglu_experts,
+        load_safetensors_strict, safetensors_files, GgufTensorNames, StrictLoadConfig,
+        StrictLoadReport,
+    },
+    backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    backend::mlx::runtime::media::input as runtime_input,
     backend::mlx::structural::GgufArchitectureValidation,
+    core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
         CacheRankIdentity, CacheResidencyPool, LayerCachePolicy, StateTensorDimension,
         StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
-    error::Error,
     nn::tensor::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -59,24 +77,6 @@ use crate::{
         self as common, attention::attention_probabilities, generation::CausalLm, layers::silu,
         linear::project_logits_maybe_quantized, moe::TopKRouterScoreFunction,
     },
-    runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::{
-        residency::{
-            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-            PromptCacheSnapshotBlock, PromptCacheStateArray,
-        },
-        ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
-    },
-    runtime::checkpoint::load::{
-        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
-        load_named_array_strict, load_safetensors_dir_strict_with_split_swiglu_experts,
-        load_safetensors_strict, safetensors_files, GgufTensorNames, StrictLoadConfig,
-        StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-    runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
-    runtime::media::input as runtime_input,
 };
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -5499,7 +5499,8 @@ pub(crate) struct Qwen35MmprojGguf {
 
 /// Opens and validates the optional sibling Qwen3.5 vision projector.
 pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<Qwen35MmprojGguf>, Error> {
-    let Some(path) = crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen35")?
+    let Some(path) =
+        crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen35")?
     else {
         return Ok(None);
     };
@@ -6318,7 +6319,7 @@ fn qwen35_gguf_affine_quantization(
     scales_shape: &[i32],
     weight_name: &str,
 ) -> Result<AffineQuantization, Error> {
-    crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+    crate::backend::mlx::runtime::checkpoint::quantization::gguf_affine_quantization(
         weight_shape,
         scales_shape,
         weight_name,
@@ -6778,7 +6779,7 @@ pub fn load_qwen3_5_model_quantized(
             "Qwen3.5/3.6 on-load quantization requires floating-point weights; native FP8 checkpoints cannot be implicitly transcoded".into(),
         ));
     }
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "Qwen3.5/3.6",
         args.quantization,
         quantization,
@@ -6822,7 +6823,7 @@ fn quantize_packed_expert_tensor(
     value: &Array,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<crate::runtime::checkpoint::quantization::QuantizedTensor, Error> {
+) -> Result<crate::backend::mlx::runtime::checkpoint::quantization::QuantizedTensor, Error> {
     common::moe::quantize_expert_bank(value, quantization, stream)
 }
 
@@ -7398,7 +7399,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Qwen3.5 MoE token generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
@@ -7413,18 +7414,20 @@ mod tests {
         SparseMoeBlock, VisionConfig,
     };
     #[cfg(feature = "image-processing")]
-    use crate::runtime::media::{load_processor, MediaInput, ProcessorInput, RgbImageView};
+    use crate::backend::mlx::runtime::media::{
+        load_processor, MediaInput, ProcessorInput, RgbImageView,
+    };
     use crate::{
-        backend::mlx::Model as AnyModel,
-        error::Error,
-        nn::generation::CausalLm,
-        runtime::checkpoint::quantization::AffineQuantization,
-        runtime::execution::inspection::ActivationRecorder,
-        runtime::{
-            attention::{AttentionPolicy, LayerSchedule},
+        backend::mlx::error::Error,
+        backend::mlx::runtime::checkpoint::quantization::AffineQuantization,
+        backend::mlx::runtime::execution::inspection::ActivationRecorder,
+        backend::mlx::runtime::{
             checkpoint::load::{load_safetensors_strict, StrictLoadReport},
             media::input as runtime_input,
         },
+        backend::mlx::Model as AnyModel,
+        core::attention::{AttentionPolicy, LayerSchedule},
+        nn::generation::CausalLm,
     };
     use safemlx::{
         module::{Module, ModuleParameters, Param},
@@ -7526,13 +7529,19 @@ mod tests {
         let pool = crate::CacheResidencyPool::new(
             crate::CachePoolLimits::new(4096, 4096, 4096, 0).unwrap(),
         );
-        let options = crate::PagedCacheOptions::new(1, 4096, 4096, 1)
-            .unwrap()
-            .with_full_attention(true)
-            .with_pool(pool.clone())
-            .unwrap();
+        let options = crate::backend::mlx::runtime::cache::residency::PagedCacheOptions::new(
+            1, 4096, 4096, 1,
+        )
+        .unwrap()
+        .with_full_attention(true)
+        .with_pool(pool.clone())
+        .unwrap();
         let cache = model
-            .new_cache_with_options(crate::CacheResidencyPolicy::Paged(options))
+            .new_cache_with_options(
+                crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
+                    options,
+                ),
+            )
             .unwrap();
         assert_eq!(cache.residency_pool().unwrap().id(), pool.id());
         assert_eq!(pool.report().unwrap().managers, 1);
@@ -7677,9 +7686,14 @@ mod tests {
             CausalLm::decode_logits(&mut model, &suffix, &mut uninterrupted_cache, stream).unwrap();
         let mut paged_cache = super::Cache::new_paged(
             &args,
-            crate::PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
-                .unwrap()
-                .with_full_attention(true),
+            crate::backend::mlx::runtime::cache::residency::PagedCacheOptions::new(
+                1,
+                1 << 20,
+                1 << 20,
+                1,
+            )
+            .unwrap()
+            .with_full_attention(true),
             None,
         )
         .unwrap();
@@ -7967,7 +7981,8 @@ mod tests {
         args.moe_intermediate_size = 32;
         args.shared_expert_intermediate_size = 32;
         let quantization =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4).unwrap();
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+                .unwrap();
 
         let gate_up_values = (0..(4 * 64 * 32))
             .map(|index| ((index % 97) as f32 - 48.0) / 64.0)
@@ -8239,9 +8254,10 @@ mod tests {
             .map(|index| ((index % 37) as f32 - 18.0) / 19.0)
             .collect::<Vec<_>>();
         let dense = Array::from_slice(&values, &[16, 128]);
-        let quantized =
-            crate::runtime::checkpoint::quantization::quantize_tensor(&dense, affine, stream)
-                .unwrap();
+        let quantized = crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor(
+            &dense, affine, stream,
+        )
+        .unwrap();
         let scales = quantized.scales.as_dtype(Dtype::Float16, stream).unwrap();
         let biases = quantized
             .biases
@@ -8821,7 +8837,7 @@ mod tests {
         )
         .unwrap();
 
-        let backend = crate::MlxBackend::new(stream, weights_ctx.stream());
+        let backend = crate::backend::mlx::MlxBackend::new(stream, weights_ctx.stream());
         let model = crate::load_model(
             &backend,
             &dir,
@@ -8865,7 +8881,7 @@ mod tests {
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
-            &mut crate::runtime::generation::sampler::DefaultSampler,
+            &mut crate::backend::mlx::runtime::generation::sampler::DefaultSampler,
             crate::backend::mlx::speculative::MtpExecutionStreams::single(stream),
             crate::core::generation::MtpSchedulerOptions::default(),
             |_| Ok(()),
@@ -8912,7 +8928,7 @@ mod tests {
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
-            &mut crate::runtime::generation::sampler::DefaultSampler,
+            &mut crate::backend::mlx::runtime::generation::sampler::DefaultSampler,
             crate::backend::mlx::speculative::MtpExecutionStreams::single(stream),
             crate::core::generation::MtpSchedulerOptions::default(),
             |_| Ok(()),
@@ -8997,7 +9013,8 @@ mod tests {
         let cpu = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let error = super::load_qwen3_5_model_quantized(
             &dir,
-            crate::runtime::checkpoint::quantization::AffineQuantization::default().into(),
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::default()
+                .into(),
             cpu.stream(),
             cpu.stream(),
         )
@@ -9688,7 +9705,7 @@ mod tests {
                     ProcessorInput::Media(MediaInput::video_rgb8_with_sampling(
                         &frames,
                         Some(2.0),
-                        crate::runtime::media::VideoSampling::ProcessorDefault,
+                        crate::backend::mlx::runtime::media::VideoSampling::ProcessorDefault,
                     )),
                     ProcessorInput::TokenIds(&[8]),
                 ],
@@ -9759,7 +9776,7 @@ mod tests {
                     ProcessorInput::Media(MediaInput::video_rgb8_with_sampling(
                         &frames,
                         Some(2.0),
-                        crate::runtime::media::VideoSampling::ProcessorDefault,
+                        crate::backend::mlx::runtime::media::VideoSampling::ProcessorDefault,
                     )),
                     ProcessorInput::TokenIds(&[8]),
                 ],
@@ -9968,10 +9985,12 @@ mod tests {
                 .unwrap();
             let mut cache = model.new_cache();
             let mut tokens = Vec::new();
-            let input_parts = [crate::runtime::media::input::InputPart::text_token_ids(
-                &prompt_tokens,
-            )];
-            let input = crate::runtime::media::input::ModelInput::new(&input_parts);
+            let input_parts = [
+                crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(
+                    &prompt_tokens,
+                ),
+            ];
+            let input = crate::backend::mlx::runtime::media::input::ModelInput::new(&input_parts);
             let generate = super::Generate::new(&mut model, &mut cache, 0.0, input, None, stream);
             for token in generate.take(expected_tokens.len()) {
                 let token = token.unwrap();

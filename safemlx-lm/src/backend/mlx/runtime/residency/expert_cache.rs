@@ -17,12 +17,8 @@ use safemlx::{
 };
 
 use crate::{
-    core::residency::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec,
-        ResidencyLedgerError, ResidencyPolicy,
-    },
-    error::Error,
-    runtime::checkpoint::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::{
         bounded_quantization::{
             BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
             BoundedQuantizedWeightStore,
@@ -31,9 +27,13 @@ use crate::{
         recipe::RecipeDtype,
         store::{TensorSelection, WeightStore},
     },
-    runtime::residency::manager::{
+    backend::mlx::runtime::residency::manager::{
         OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentTransfer,
         ResidentUnitLease, WeightBinding,
+    },
+    core::residency::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec,
+        ResidencyLedgerError, ResidencyPolicy,
     },
 };
 
@@ -1462,12 +1462,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        core::residency::CacheEvictionPolicy,
-        runtime::checkpoint::{
+        backend::mlx::runtime::checkpoint::{
             recipe::DerivedWeightRecipe,
             store::{SafetensorsWeightStore, TensorSelection},
         },
-        runtime::residency::manager::WeightBinding,
+        backend::mlx::runtime::residency::manager::WeightBinding,
+        core::residency::CacheEvictionPolicy,
     };
 
     fn stream() -> Stream {

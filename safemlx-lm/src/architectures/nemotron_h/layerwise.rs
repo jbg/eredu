@@ -27,7 +27,41 @@ use crate::{
         self as resident, BlockInput, Cache, Experts, LayerCache, LayerPolicy, ModelArgs,
         TransformerBlock,
     },
-    error::Error,
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{
+        residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
+        KeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::binding::{
+        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        canonical_checkpoint_name, packed_companion_checkpoint_name, populate_module_from_lease,
+        populate_module_from_lease_excluding,
+    },
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
+    backend::mlx::runtime::distributed::parallel::{
+        aligned_partition_units, array_parameter_member, partitioned_projection_members,
+        register_partitioned_projection_group, register_projection_module,
+        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
+        ParameterMemberSpec, ParameterRole, ProjectionSharding,
+    },
+    backend::mlx::runtime::execution::layerwise::{
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
+    },
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass, ExpertRouteBatch,
+    },
+    backend::mlx::runtime::residency::manager::{
+        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
+    },
     nn::{
         self as common,
         generation::CausalLm,
@@ -38,38 +72,6 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    runtime::cache::{
-        residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
-        KeyValueCache,
-    },
-    runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
-        canonical_checkpoint_name, packed_companion_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
-    },
-    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
-        recipe::DerivedWeightRecipe,
-    },
-    runtime::distributed::parallel::{
-        aligned_partition_units, array_parameter_member, partitioned_projection_members,
-        register_partitioned_projection_group, register_projection_module,
-        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
-        ParameterMemberSpec, ParameterRole, ProjectionSharding,
-    },
-    runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
-        StaticUnitBindings, WeightResidency,
-    },
-    runtime::media::input,
-    runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass, ExpertRouteBatch,
-    },
-    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
 const EMBEDDING_UNIT: &str = "nemotron_h.static.embedding";
@@ -186,7 +188,9 @@ impl NemotronMtpModule {
         expert_cache: Option<&ExpertCache>,
         mut external_expert: Option<&mut NemotronMtpExpertExecutor<'_>>,
         args: &ModelArgs,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         if cache.len() != self.blocks.len() || depth >= self.steps {
@@ -603,7 +607,10 @@ impl NemotronHLayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
+    pub(crate) fn bind_parallel_topology(
+        &mut self,
+        topology: crate::backend::mlx::MlxParallelContext,
+    ) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -720,7 +727,7 @@ impl NemotronHLayerwiseModel {
             .ok_or_else(|| Exception::custom("Nemotron-H MTP target has no parallel topology"))?
             .topology();
         let execution =
-            crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+            crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
                 topology, group, stream,
             )
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -800,7 +807,9 @@ impl NemotronHLayerwiseModel {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
@@ -851,7 +860,10 @@ impl NemotronHLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -1044,7 +1056,7 @@ impl NemotronHLayerwiseModel {
             .topology();
         let execution = tensor_group
             .map(|group| {
-                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
                     topology, group, stream,
                 )
             })
@@ -1380,7 +1392,7 @@ pub fn load_nemotron_h_layerwise_model(
 pub(crate) fn load_nemotron_h_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
@@ -1392,7 +1404,7 @@ pub(crate) fn load_nemotron_h_tensor_parallel_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         return load_nemotron_h_gguf_tensor_parallel_model(
             &checkpoint,
             &metadata,
@@ -1427,11 +1439,11 @@ pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     options: LayerWeightResidency,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(NemotronHLayerwiseModel, Vec<u32>), Error> {
-    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
         checkpoint, metadata, options,
     )?;
     let prepared =
@@ -1604,7 +1616,7 @@ pub(crate) fn load_nemotron_h_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
@@ -1624,7 +1636,7 @@ pub(crate) fn load_nemotron_h_sparse_tp_ep_base_with_store(
 /// Loads Nemotron-H with independently cached experts and bounded non-expert units.
 pub fn load_nemotron_h_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::NonExpertWeightResidency,
+    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1758,8 +1770,8 @@ impl NemotronHLayerwiseAdapter {
     /// Configures rank-local operator geometry for a Cartesian pipeline stage.
     pub(crate) fn configure_cartesian_layout(
         &mut self,
-        build: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.configure_parallel_static(build, layout, stream)
@@ -1811,7 +1823,9 @@ impl NemotronHLayerwiseAdapter {
         tokens: &Array,
         depth: usize,
         cache: &mut [LayerCache],
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         external_expert: Option<&mut F>,
         stream: &Stream,
     ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
@@ -2289,7 +2303,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Nemotron-H cache layer count"))?;
@@ -2531,7 +2545,9 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let Some(v) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
@@ -2562,8 +2578,10 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
+            "text_decoder",
+        ])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -2585,7 +2603,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
@@ -2617,8 +2635,8 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
@@ -2650,7 +2668,8 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
@@ -2665,7 +2684,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
             ));
         }
         Ok(Some(
-            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
                 self.args.n_routed_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -2674,8 +2693,8 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
     }
     fn register_parallel_parameters(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
@@ -2738,8 +2757,8 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
     }
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         let local_dimension = |target: &str, axis: usize| -> Result<i32, Error> {
@@ -2857,7 +2876,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         self.layer_count(group)?;
@@ -2938,11 +2957,11 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -2956,7 +2975,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -3054,7 +3073,9 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -3121,7 +3142,9 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.finish(hidden, cache, context, execution.stream());
@@ -3281,7 +3304,7 @@ fn nemotron_recipe_binding(
 }
 
 /// Nemotron-H token generation iterator using bounded layer execution.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, NemotronHLayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -3303,17 +3326,19 @@ mod tests {
         architectures::nemotron_h::model::{
             self as resident, Cache, LayerCache, LayerPolicy, Model, ModelArgs, ModelInput,
         },
-        core::{
-            cache::{PromptCacheDescriptor, PromptCacheOptions},
-            residency::{OffloadConfig, ResidencyPolicy},
+        backend::mlx::runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
+        backend::mlx::runtime::residency::expert_cache::{
+            ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch,
         },
-        runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
-        runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch},
-        runtime::{
+        backend::mlx::runtime::{
             cache::KeyValueCache,
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
             distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
+        },
+        core::{
+            cache::{PromptCacheDescriptor, PromptCacheOptions},
+            residency::{OffloadConfig, ResidencyPolicy},
         },
     };
 
@@ -3383,7 +3408,7 @@ mod tests {
     #[test]
     #[ignore = "requires an MLX Metal device"]
     fn load_time_adapter_packs_every_operator_and_preserves_external_experts() {
-        use crate::runtime::execution::layerwise::LoadTimeQuantizableAdapter;
+        use crate::backend::mlx::runtime::execution::layerwise::LoadTimeQuantizableAdapter;
 
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut value = config();
@@ -3464,14 +3489,14 @@ mod tests {
             .unwrap();
             let mut cached = load_nemotron_h_expert_cache_model(
                 dir.path(),
-                crate::NonExpertWeightResidency::FullyResident,
+                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::FullyResident,
                 expert_options,
                 Some(quantization),
                 gpu.stream(),
                 cpu.stream(),
             )
             .unwrap();
-            let backend = crate::MlxBackend::new(gpu.stream(), cpu.stream());
+            let backend = crate::backend::mlx::MlxBackend::new(gpu.stream(), cpu.stream());
             let loaded = crate::load_model(
                 &backend,
                 dir.path(),
@@ -3876,7 +3901,8 @@ mod tests {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
-            let runtime = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+            let runtime =
+                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             if runtime.ends_with("moe.experts.up_proj") {
                 let prefix = public_name(runtime.trim_end_matches(".up_proj"), &model.args);
                 for expert in 0..model.args.n_routed_experts {
@@ -3966,16 +3992,16 @@ mod tests {
             for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
                 let expected_offset = match expected {
                     LayerCache::Mamba(cache) => Some(cache.offset),
-                    LayerCache::Attention(cache) => {
-                        Some(crate::runtime::cache::KeyValueCache::offset(cache))
-                    }
+                    LayerCache::Attention(cache) => Some(
+                        crate::backend::mlx::runtime::cache::KeyValueCache::offset(cache),
+                    ),
                     LayerCache::Mlp | LayerCache::Moe => None,
                 };
                 let actual_offset = match actual {
                     LayerCache::Mamba(cache) => Some(cache.offset),
-                    LayerCache::Attention(cache) => {
-                        Some(crate::runtime::cache::KeyValueCache::offset(cache))
-                    }
+                    LayerCache::Attention(cache) => Some(
+                        crate::backend::mlx::runtime::cache::KeyValueCache::offset(cache),
+                    ),
                     LayerCache::Mlp | LayerCache::Moe => None,
                 };
                 assert_eq!(expected_offset, actual_offset);
@@ -4033,7 +4059,7 @@ mod tests {
                 .unwrap();
         let mut cached = load_nemotron_h_expert_cache_model(
             dir.path(),
-            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,
@@ -4104,7 +4130,7 @@ mod tests {
         let quantization: WeightQuantization = AffineQuantization::new(32, 4).unwrap().into();
         let mut cached = load_nemotron_h_expert_cache_model(
             dir.path(),
-            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
             )),
             expert_options,

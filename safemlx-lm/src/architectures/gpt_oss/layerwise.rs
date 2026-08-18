@@ -25,46 +25,46 @@ use crate::{
     architectures::gpt_oss::model::{
         self as resident, Cache, Experts, LayerCache, ModelArgs, TransformerBlock,
     },
-    error::Error,
-    nn::parallel::{
-        gqa_projection_members, planned_kv_head_layout, GqaProjectionNames, VocabParallelEmbedding,
-        VocabParallelLmHead,
-    },
-    nn::{self as common, generation::CausalLm},
-    runtime::cache::residency::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
         open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
     },
-    runtime::checkpoint::binding::{
+    backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
+    backend::mlx::runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::checkpoint::{
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::{
         quantization::{should_quantize_on_load, WeightQuantization},
         recipe::DerivedWeightRecipe,
     },
-    runtime::distributed::parallel::{
+    backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, register_projection_module,
         register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
         ParameterRole, ProjectionSharding,
     },
-    runtime::execution::layerwise::{
+    backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
-    runtime::media::input,
-    runtime::residency::expert_cache::{
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
         ExpertPass, ExpertRouteBatch,
     },
-    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
-    runtime::{
-        attention::{AttentionPolicy, LayerSchedule},
-        cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
+    backend::mlx::runtime::residency::manager::{
+        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
     },
+    core::attention::{AttentionPolicy, LayerSchedule},
+    nn::parallel::{
+        gqa_projection_members, planned_kv_head_layout, GqaProjectionNames, VocabParallelEmbedding,
+        VocabParallelLmHead,
+    },
+    nn::{self as common, generation::CausalLm},
 };
 
 const EMBEDDING_UNIT: &str = "gpt_oss.static.embedding";
@@ -82,7 +82,10 @@ impl GptOssLayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
+    pub(crate) fn bind_parallel_topology(
+        &mut self,
+        topology: crate::backend::mlx::MlxParallelContext,
+    ) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -106,12 +109,14 @@ impl GptOssLayerwiseModel {
     /// Returns rank-local generalized parallel information when applicable.
     pub fn parallel_info(
         &self,
-    ) -> Option<&crate::runtime::execution::layerwise::ParallelModelInfo> {
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
     /// Returns generalized parameter-residency and encoding metadata.
-    pub fn residency_metadata(&self) -> &crate::LayerwiseModelMetadata {
+    pub fn residency_metadata(
+        &self,
+    ) -> &crate::backend::mlx::runtime::execution::layerwise::LayerwiseModelMetadata {
         self.execution.metadata()
     }
 
@@ -237,7 +242,10 @@ impl GptOssLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -440,7 +448,7 @@ pub(crate) fn execute_transformed_gpt_oss_model(
 pub(crate) fn load_gpt_oss_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
@@ -452,7 +460,7 @@ pub(crate) fn load_gpt_oss_tensor_parallel_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         return load_gpt_oss_gguf_tensor_parallel_model(
             &checkpoint,
             &metadata,
@@ -485,11 +493,11 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     options: LayerWeightResidency,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(GptOssLayerwiseModel, Vec<u32>), Error> {
-    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
         checkpoint, metadata, options,
     )?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
@@ -595,7 +603,7 @@ fn load_gpt_oss_gguf_sparse_with_store(
 /// Loads GPT-OSS with independently cached experts and bounded non-expert units.
 pub fn load_gpt_oss_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::NonExpertWeightResidency,
+    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -672,7 +680,7 @@ pub(crate) fn load_gpt_oss_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
@@ -971,13 +979,15 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         &self.args.model_type
     }
 
-    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(
+        &self,
+    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
         self.args.quantization
     }
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid GPT-OSS cache layer count"))?;
@@ -1163,7 +1173,9 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let Some(v) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
@@ -1179,8 +1191,10 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
+            "text_decoder",
+        ])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1202,7 +1216,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
@@ -1221,8 +1235,8 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
@@ -1246,12 +1260,13 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
         Ok(Some(
-            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
                 self.args.num_local_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -1261,8 +1276,8 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
 
     fn register_parallel_parameters(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
@@ -1292,8 +1307,8 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
     }
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
@@ -1323,7 +1338,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         self.layer_count(group)?;
@@ -1399,11 +1414,11 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -1417,7 +1432,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -1561,7 +1576,9 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -1616,7 +1633,9 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(head) = &mut self.parallel_lm_head else {
             return self.finish(hidden, cache, context, execution.stream());
@@ -1640,7 +1659,7 @@ pub(crate) fn gpt_oss_expert_catalog(
 pub(crate) fn gpt_oss_expert_catalog_cartesian(
     args: &ModelArgs,
     store: &dyn WeightStore,
-    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let mut entries = Vec::new();
     for layer in 0..args.num_hidden_layers as usize {
@@ -1724,9 +1743,11 @@ pub(crate) fn gpt_oss_expert_catalog_cartesian(
                 bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
             }
             let bindings = match layout {
-                Some(layout) => crate::runtime::execution::layerwise::shard_layer_bindings(
-                    bindings, &prefix, store, layout,
-                )?,
+                Some(layout) => {
+                    crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
+                        bindings, &prefix, store, layout,
+                    )?
+                }
                 None => bindings,
             };
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
@@ -1745,7 +1766,7 @@ pub(crate) fn gpt_oss_expert_catalog_cartesian(
 }
 
 /// GPT-OSS token generation iterator using bounded layer execution.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, GptOssLayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -1762,17 +1783,15 @@ mod tests {
     use super::{load_gpt_oss_expert_cache_model, load_gpt_oss_layerwise_model};
     use crate::{
         architectures::gpt_oss::model::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
-        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
-        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        runtime::{
-            attention::{AttentionPolicy, LayerSchedule},
-            cache::KeyValueCache,
-        },
-        runtime::{
+        backend::mlx::runtime::cache::KeyValueCache,
+        backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+        backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        backend::mlx::runtime::{
             distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{LayerWeightResidency, LayerwiseLoadOptions},
         },
+        core::attention::{AttentionPolicy, LayerSchedule},
+        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
     fn tiny_args() -> ModelArgs {
@@ -1838,7 +1857,9 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        name,
+                    ),
                     *value,
                 )
             })
@@ -2120,7 +2141,7 @@ mod tests {
                 .unwrap();
         let mut cached = load_gpt_oss_expert_cache_model(
             dir.path(),
-            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,

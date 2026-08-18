@@ -16,14 +16,14 @@ use crate::{
         assistant::{Gemma4AssistantDraftModel, Gemma4AssistantDraftState},
         model::{Cache, Gemma4Embedding, Gemma4StepOutput, Model as Gemma4Model},
     },
+    backend::mlx::runtime::media::input::ModelInput as RuntimeInput,
     backend::mlx::{
         speculative::{
             scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
         },
         MlxModelInput,
     },
-    runtime::attention::AttentionPolicy,
-    runtime::media::input::ModelInput as RuntimeInput,
+    core::attention::AttentionPolicy,
 };
 
 #[derive(Clone)]

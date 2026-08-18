@@ -1,6 +1,6 @@
 //! Shared decoded-video validation, sampling, and timing operations.
 
-use crate::{error::Error, runtime::media::RgbImageView};
+use crate::{backend::mlx::error::Error, backend::mlx::runtime::media::RgbImageView};
 
 /// Validates that a decoded frame sequence is non-empty and has stable dimensions.
 pub fn validate_rgb_frames(frames: &[RgbImageView<'_>]) -> Result<(u32, u32), Error> {

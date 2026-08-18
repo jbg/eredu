@@ -5,12 +5,13 @@ use safemlx::{
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    backend::mlx::ModelLoadOptions,
+    backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions,
+    backend::mlx::runtime::{generation::sampler::DefaultSampler, media::input},
+    backend::mlx::{
+        DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions, WeightResidency,
+    },
     core::{Backend as _, BackendSession as _},
     load_model,
-    runtime::residency::expert_cache::ExpertCacheLoadOptions,
-    runtime::{generation::sampler::DefaultSampler, media::input},
-    DeviceAssignment, MlxBackend, MlxParallelContext, WeightResidency,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
     let options = ModelLoadOptions::with_parallel(topology).with_weight_residency(
         WeightResidency::with_expert_cache(
-            safemlx_lm::NonExpertWeightResidency::LayerwiseHost(Default::default()),
+            safemlx_lm::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(Default::default()),
             ExpertCacheLoadOptions::default(),
         ),
     );

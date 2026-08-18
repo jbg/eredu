@@ -23,16 +23,16 @@ use crate::{
     architectures::gemma4::model::{
         self as gemma4, Gemma4Embedding, KeyValuePolicy, ModelArgs, TransformerBlock,
     },
-    backend::mlx::ModelLoadOptions,
-    error::Error,
-    nn as common,
-    nn::tensor::rope::FloatOrString,
-    runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::checkpoint::load::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::load::{
         gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
         load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
-    runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::ModelLoadOptions,
+    core::attention::{AttentionPolicy, LayerSchedule},
+    nn as common,
+    nn::tensor::rope::FloatOrString,
 };
 
 #[derive(Debug, Clone)]
@@ -428,7 +428,7 @@ impl Gemma4AssistantDraftModel {
                 crate::architectures::gemma4::model::AttentionInput {
                     x: &h,
                     mask: mask.as_ref(),
-                    cache: None::<&mut crate::runtime::cache::ConcatKeyValueCache>,
+                    cache: None::<&mut crate::backend::mlx::runtime::cache::ConcatKeyValueCache>,
                     position_offset: query_offset,
                     per_layer_input: None,
                     shared_kv: Some(&mut kv_map),
@@ -509,11 +509,12 @@ pub(crate) fn load_gemma4_assistant_model_with_options(
                 "Gemma 4 assistant affine quantization does not support ordered masked embeddings because that head indexes raw dense embedding rows".into(),
             ));
         }
-        let quantize = crate::runtime::checkpoint::quantization::should_quantize_on_load(
-            "Gemma 4 assistant",
-            config.quantization,
-            quantization,
-        )?;
+        let quantize =
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
+                "Gemma 4 assistant",
+                config.quantization,
+                quantization,
+            )?;
         config.quantization = Some(quantization);
         quantize
     } else {
@@ -908,9 +909,9 @@ mod tests {
     };
 
     use crate::{
+        backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
         backend::mlx::ModelLoadOptions,
-        runtime::attention::AttentionPolicy,
-        runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+        core::attention::AttentionPolicy,
     };
 
     const CONFIG: &str = r#"{

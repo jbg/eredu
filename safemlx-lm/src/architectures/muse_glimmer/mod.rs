@@ -37,8 +37,24 @@ pub use crate::core::cache::{
 pub use crate::nn::generation::sample;
 
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{
+        residency::{
+            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
+            CacheResidencyManager, PromptCacheSnapshotBlock,
+        },
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
+        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
+    },
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    backend::mlx::runtime::media::input,
+    core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::CacheRankIdentity,
-    error::Error,
     nn::tensor::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -54,22 +70,6 @@ use crate::{
         linear::project_logits_maybe_quantized,
         moe::TopKRouterScoreFunction,
     },
-    runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::{
-        residency::{
-            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            CacheResidencyManager, PromptCacheSnapshotBlock,
-        },
-        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-    },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
-        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
-    runtime::media::input,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1782,19 +1782,21 @@ impl Model {
     }
 
     /// Creates architecture-correct per-layer KV caches, including Qwen2 SWA layers.
-    pub fn new_cache(&self) -> Vec<Option<crate::runtime::cache::ConcatKeyValueCache>> {
+    pub fn new_cache(
+        &self,
+    ) -> Vec<Option<crate::backend::mlx::runtime::cache::ConcatKeyValueCache>> {
         self.args
             .attention_schedule
             .iter()
             .map(|policy| {
                 Some(match policy.window() {
                     Some(window) => {
-                        crate::runtime::cache::ConcatKeyValueCache::new_for_sliding_attention(
+                        crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new_for_sliding_attention(
                             i32::try_from(window.get())
                                 .expect("validated Muse-Glimmer attention window fits i32"),
                         )
                     }
-                    None => crate::runtime::cache::ConcatKeyValueCache::new(),
+                    None => crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new(),
                 })
             })
             .collect()
@@ -2294,8 +2296,10 @@ pub(crate) struct MuseGlimmerMmprojGguf {
 pub(crate) fn open_sibling_mmproj(
     gguf_file: &Path,
 ) -> Result<Option<MuseGlimmerMmprojGguf>, Error> {
-    let Some(path) =
-        crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "muse-glimmer")?
+    let Some(path) = crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(
+        gguf_file,
+        "muse-glimmer",
+    )?
     else {
         return Ok(None);
     };
@@ -3277,7 +3281,7 @@ mod tests {
         let mut loaded = Model::new(args, stream).unwrap();
         let config = safetensors_strict_load_config();
         let mut report = StrictLoadReport::default();
-        crate::runtime::checkpoint::load::load_arrays_strict(
+        crate::backend::mlx::runtime::checkpoint::load::load_arrays_strict(
             &mut loaded,
             checkpoint,
             &config,
@@ -3323,7 +3327,7 @@ mod tests {
                 },
                 stream,
                 "model.language_model.layers.0",
-                &mut crate::runtime::execution::inspection::NoopObserver,
+                &mut crate::backend::mlx::runtime::execution::inspection::NoopObserver,
             )
             .unwrap();
         safemlx::transforms::eval([&actual, &expected]).unwrap();
@@ -3455,7 +3459,7 @@ pub fn load_safetensors_quantized(
         model_dir,
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "Muse-Glimmer",
         model_args.weight_quantization(),
         quantization,
@@ -3531,5 +3535,5 @@ where
 }
 
 /// Dense-Qwen token generation iterator.
-pub type Generate<'a, C, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, C, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Vec<Option<C>>, S>;

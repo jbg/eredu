@@ -13,8 +13,10 @@ use safemlx_lm_core::{
 };
 
 use crate::{
-    error::Error,
-    runtime::media::input::{InputMetadata, InputPart, InputPayload, Modality, ModelInput},
+    backend::mlx::error::Error,
+    backend::mlx::runtime::media::input::{
+        InputMetadata, InputPart, InputPayload, Modality, ModelInput,
+    },
 };
 
 /// Shared PCM waveform validation and spectral operations.

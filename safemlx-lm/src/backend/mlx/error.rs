@@ -17,16 +17,8 @@ fn format_keys(keys: &[String]) -> String {
 }
 
 #[derive(Debug, thiserror::Error)]
-/// Error type used by `safemlx-lm` loaders and tokenizer helpers.
+/// Error type used by MLX model loading and execution.
 pub enum Error {
-    /// Backend-independent tokenizer, chat-template, or text-sidecar loading failed.
-    #[error(transparent)]
-    TextMetadata(#[from] crate::api::TextMetadataError),
-
-    /// Backend-independent tokenizer-aware text facade operation failed.
-    #[error(transparent)]
-    TextModel(#[from] crate::api::TextModelError),
-
     /// Backend capability discovery, preparation, execution, or completion failed.
     #[error(transparent)]
     Backend(#[from] safemlx_lm_core::BackendError),
@@ -45,7 +37,7 @@ pub enum Error {
 
     /// Invalid dense disk streaming configuration or background work.
     #[error(transparent)]
-    DenseStream(#[from] crate::runtime::residency::dense_stream::DenseStreamError),
+    DenseStream(#[from] crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError),
 
     /// Invalid unified Llama model configuration or cache usage.
     #[error(transparent)]
@@ -53,19 +45,19 @@ pub enum Error {
 
     /// Invalid or failed layerwise model execution.
     #[error(transparent)]
-    LayerwiseModel(#[from] crate::runtime::execution::layerwise::LayerwiseModelError),
+    LayerwiseModel(#[from] crate::backend::mlx::runtime::execution::layerwise::LayerwiseModelError),
 
     /// Invalid module-to-checkpoint or resident-lease binding.
     #[error(transparent)]
-    ModuleBinding(#[from] crate::runtime::checkpoint::binding::ModuleBindingError),
+    ModuleBinding(#[from] crate::backend::mlx::runtime::checkpoint::binding::ModuleBindingError),
 
     /// Persistent checkpoint catalog, mapping, or materialization failure.
     #[error(transparent)]
-    WeightStore(#[from] crate::runtime::checkpoint::store::WeightStoreError),
+    WeightStore(#[from] crate::backend::mlx::runtime::checkpoint::store::WeightStoreError),
 
     /// Invalid checkpoint-derived weight recipe.
     #[error(transparent)]
-    WeightRecipe(#[from] crate::runtime::checkpoint::recipe::WeightRecipeError),
+    WeightRecipe(#[from] crate::backend::mlx::runtime::checkpoint::recipe::WeightRecipeError),
 
     /// Invalid architecture-independent offload planning request.
     #[error(transparent)]
@@ -73,11 +65,11 @@ pub enum Error {
 
     /// Invalid or failed weight residency operation.
     #[error(transparent)]
-    Residency(#[from] crate::runtime::residency::manager::ResidencyError),
+    Residency(#[from] crate::backend::mlx::runtime::residency::manager::ResidencyError),
 
     /// Invalid sparse expert catalog, routing, capacity, or execution request.
     #[error(transparent)]
-    ExpertCache(#[from] crate::runtime::residency::expert_cache::ExpertCacheError),
+    ExpertCache(#[from] crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheError),
 
     /// Invalid runtime parallel topology, tensor placement, or partition request.
     #[error("parallel placement error: {0}")]

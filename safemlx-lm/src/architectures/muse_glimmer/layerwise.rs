@@ -28,8 +28,42 @@ use crate::core::cache::{
 };
 
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+    },
+    backend::mlx::runtime::cache::{
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::binding::{
+        build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
+        populate_module_from_lease, populate_module_from_lease_excluding,
+    },
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
+    backend::mlx::runtime::distributed::parallel::{
+        aligned_partition_units, array_parameter_member, register_replicated_module,
+        MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
+    },
+    backend::mlx::runtime::execution::layerwise::{
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, ArchitectureAdapter, LayerWeightResidency,
+        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, SharedWeightStore,
+        StaticUnitBindings, WeightResidency,
+    },
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
+        ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
+    },
+    backend::mlx::runtime::residency::manager::{
+        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
+    },
     core::cache::LayerCachePolicy,
-    error::Error,
     nn::{
         attention::AttentionInput,
         generation::CausalLm,
@@ -46,36 +80,6 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
-    runtime::cache::{
-        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
-    },
-    runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
-        populate_module_from_lease, populate_module_from_lease_excluding,
-    },
-    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
-        recipe::DerivedWeightRecipe,
-    },
-    runtime::distributed::parallel::{
-        aligned_partition_units, array_parameter_member, register_replicated_module,
-        MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
-    },
-    runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, ArchitectureAdapter, LayerWeightResidency,
-        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, SharedWeightStore,
-        StaticUnitBindings, WeightResidency,
-    },
-    runtime::media::input,
-    runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
-    },
-    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
 const EMBEDDING_UNIT: &str = "muse_glimmer.static.embedding";
@@ -204,7 +208,9 @@ impl LayerwiseDecoder {
         let mut device_time = Duration::ZERO;
         let logits = if component_timing {
             let mut observer =
-                crate::runtime::execution::inspection::ActivationObserverProxy(&mut observer);
+                crate::backend::mlx::runtime::execution::inspection::ActivationObserverProxy(
+                    &mut observer,
+                );
             self.execution.forward_with_layer_executor(
                 input,
                 cache,
@@ -263,7 +269,10 @@ impl LayerwiseDecoder {
         match policy {
             CacheResidencyPolicy::Device => Ok(MuseGlimmerLayerwiseCache::Concat(self.new_cache())),
             CacheResidencyPolicy::Paged(options) => {
-                let manager = crate::CacheResidencyManager::new(options)
+                let manager =
+                    crate::backend::mlx::runtime::cache::residency::CacheResidencyManager::new(
+                        options,
+                    )
                     .map_err(|error| Exception::custom(error.to_string()))?;
                 let caches = resident::new_paged_cache_with_manager(
                     self.args(),
@@ -295,12 +304,16 @@ impl LayerwiseDecoder {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
     /// Returns generalized parameter-residency and memory metadata.
-    pub fn residency_metadata(&self) -> &crate::LayerwiseModelMetadata {
+    pub fn residency_metadata(
+        &self,
+    ) -> &crate::backend::mlx::runtime::execution::layerwise::LayerwiseModelMetadata {
         self.execution.metadata()
     }
 
@@ -378,7 +391,10 @@ impl LayerwiseDecoder {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -459,7 +475,7 @@ impl LayerwiseDecoder {
         mask: Option<&Array>,
         cache: &mut Vec<Option<ConcatKeyValueCache>>,
         stream: &Stream,
-        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
         let mut owned = MuseGlimmerLayerwiseCache::Concat(std::mem::take(cache));
         let result = self.execution.forward_with_observer(
@@ -482,7 +498,7 @@ impl LayerwiseDecoder {
         mask: Option<&Array>,
         cache: &mut Vec<Option<PagedKeyValueCache>>,
         stream: &Stream,
-        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
         let mut owned = MuseGlimmerLayerwiseCache::Paged(std::mem::take(cache));
         let result = self.execution.forward_with_observer(
@@ -685,7 +701,7 @@ pub(crate) fn load_safetensors_quantized_residency(
 pub(crate) fn load_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -697,7 +713,7 @@ pub(crate) fn load_tensor_parallel_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let architecture = match metadata.get("general.architecture") {
             Some(GgufMetadataValue::String(architecture)) => architecture.as_str(),
             Some(_) => {
@@ -746,11 +762,11 @@ pub(crate) fn load_gguf_tensor_parallel_model(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     options: LayerWeightResidency,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(LayerwiseDecoder, Vec<u32>), Error> {
-    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
         checkpoint, metadata, options,
     )?;
     if architecture != "muse-glimmer" {
@@ -842,7 +858,7 @@ fn apply_mmproj_config(
     )
     .into_loader_result()?;
     let mut vision = VisionConfig::from_gguf_metadata(&mmproj.metadata, args.hidden_size)?;
-    let configs = crate::runtime::checkpoint::load::gguf_quantization_configs(
+    let configs = crate::backend::mlx::runtime::checkpoint::load::gguf_quantization_configs(
         &mmproj.checkpoint,
         resident::translate_mmproj_weight_name,
     )?;
@@ -892,7 +908,7 @@ pub(crate) fn prepare_gguf_pipeline_source(
 /// Loads sparse Qwen3 with independently cached experts and bounded non-expert units.
 pub fn load_qwen3_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::NonExpertWeightResidency,
+    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1062,7 +1078,9 @@ impl MuseGlimmerLayerwiseAdapter {
     pub(crate) fn begin_pipeline_ingress(
         &mut self,
         typed: input::ModelInput<'_>,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<MuseGlimmerPipelineIngressState, Error> {
         let cache = self.pipeline_cache();
@@ -1162,7 +1180,9 @@ impl MuseGlimmerLayerwiseAdapter {
         index: usize,
         layer: &mut MuseGlimmerLayer,
         state: &mut MuseGlimmerPipelineIngressState,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Vec<Array>, Error> {
         state.forward.hidden = match execution {
@@ -1208,7 +1228,9 @@ impl MuseGlimmerLayerwiseAdapter {
         &mut self,
         typed: input::ModelInput<'_>,
         vision_layers: &mut [MuseGlimmerLayer],
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<MuseGlimmerPipelinePrepared, Error> {
         let mut state = self.begin_pipeline_ingress(typed, execution, stream)?;
@@ -1234,7 +1256,9 @@ impl MuseGlimmerLayerwiseAdapter {
     pub(crate) fn prepare_pipeline_tokens(
         &mut self,
         tokens: &Array,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let hidden = match (&mut self.parallel_embedding, execution) {
@@ -1252,7 +1276,9 @@ impl MuseGlimmerLayerwiseAdapter {
     pub(crate) fn finish_pipeline_text(
         &mut self,
         hidden: &Array,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let hidden = self.norm.forward(hidden, stream)?;
@@ -1645,7 +1671,9 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         &self.args.model_type
     }
 
-    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(
+        &self,
+    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
         self.args.quantization.or(self.args.quantization_config)
     }
 
@@ -1656,7 +1684,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Muse-Glimmer cache layer count"))?;
@@ -1833,7 +1861,9 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         _cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         match input {
             MuseGlimmerAdapterInput::Prefill(input) => {
@@ -1864,8 +1894,8 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::runtime::execution::layerwise::ExecutionGroupDag::chain([
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
             "vision_encoder",
             "text_decoder",
         ])
@@ -1995,8 +2025,8 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
 
     fn register_parallel_parameters(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         let root = self.language_model_root();
@@ -2080,8 +2110,8 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
 
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_kv_heads = Some(planned_kv_head_layout(
@@ -2114,7 +2144,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if group == 0 {
@@ -2195,7 +2225,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         &self,
         _group: usize,
         _index: usize,
-        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         _stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         Err(Error::Parallel(
@@ -2207,8 +2237,8 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         &self,
         _group: usize,
         _index: usize,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         _stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         Err(Error::Parallel(
@@ -2219,7 +2249,8 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
@@ -2229,7 +2260,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             ));
         }
         Ok(Some(
-            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
                 self.args.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -2303,11 +2334,11 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -2321,7 +2352,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -2424,7 +2455,9 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         }
     }
 
-    fn forward_layer_with_observer<O: crate::runtime::execution::inspection::ActivationObserver>(
+    fn forward_layer_with_observer<
+        O: crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+    >(
         &mut self,
         group: usize,
         index: usize,
@@ -2512,7 +2545,9 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -2720,7 +2755,9 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.finish(hidden, cache, context, execution.stream());
@@ -2755,7 +2792,9 @@ impl MuseGlimmerLayerwiseAdapter {
     fn prepare_multimodal_prefill(
         &mut self,
         typed: input::ModelInput<'_>,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<LayerwiseForwardState<MuseGlimmerForwardContext>, Error> {
         input::validate(typed)?;
@@ -3122,7 +3161,7 @@ pub(crate) fn qwen3_expert_catalog_cartesian(
     args: &DecoderConfig,
     store: &dyn WeightStore,
     layer_root: &str,
-    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
@@ -3272,9 +3311,11 @@ pub(crate) fn qwen3_expert_catalog_cartesian(
                 )?);
             }
             let bindings = match layout {
-                Some(layout) => crate::runtime::execution::layerwise::shard_layer_bindings(
-                    bindings, &prefix, store, layout,
-                )?,
+                Some(layout) => {
+                    crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
+                        bindings, &prefix, store, layout,
+                    )?
+                }
                 None => bindings,
             };
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
@@ -3321,7 +3362,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::runtime::checkpoint::{quantization::AffineQuantization, store::MemoryWeightStore};
+    use crate::backend::mlx::runtime::checkpoint::{
+        quantization::AffineQuantization, store::MemoryWeightStore,
+    };
 
     fn tiny_vision_config() -> VisionConfig {
         VisionConfig::from_hf_value(

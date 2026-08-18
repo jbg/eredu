@@ -20,6 +20,7 @@ use crate::{
         layerwise::{DFlashTargetOutput, LayerwiseDecoder, MuseGlimmerLayerwiseCache},
         scale_logits,
     },
+    backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::{
         speculative::{
             scheduler::{MtpComponentTimingEvaluations, MtpComponentTimings},
@@ -27,7 +28,6 @@ use crate::{
         },
         MlxModelInput, ModelCache,
     },
-    runtime::cache::KeyValueCache,
 };
 
 #[derive(Clone)]

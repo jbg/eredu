@@ -27,9 +27,9 @@ use crate::{
         Gemma4AssistantDraftModel,
     },
     architectures::muse_glimmer::assistant::{self as muse_dflash, MuseGlimmerDFlash},
+    backend::mlx::error::Error,
+    backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::{ModelCache, ModelLoadOptions},
-    error::Error,
-    runtime::generation::sampler::SpeculativeSampler,
 };
 
 /// Architecture-dispatched MLX draft model with its fixed execution placement.
@@ -101,7 +101,8 @@ impl MlxDrafter {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
         let model = if is_gguf {
             let checkpoint = safemlx::ops::GgufCheckpoint::open(source)?;
-            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             let architecture = metadata
                 .get("general.architecture")
                 .and_then(safemlx::ops::GgufMetadataValue::as_str)

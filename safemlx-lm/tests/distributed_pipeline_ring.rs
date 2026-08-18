@@ -30,19 +30,20 @@ use safemlx_lm::{
         nemotron_h::model as nemotron_model,
         qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen_hybrid},
     },
-    backend::mlx::ModelLoadOptions,
-    core::{residency::OffloadConfig, Backend as _, BackendSession as _},
-    load_model,
-    runtime::generation::sampler::DefaultSampler,
-    runtime::{
+    backend::mlx::runtime::generation::sampler::DefaultSampler,
+    backend::mlx::runtime::{
         checkpoint::binding::canonical_checkpoint_name,
         checkpoint::quantization::{AffineQuantization, WeightQuantization},
         media::{input::InputPayload, PreparedModelInput},
     },
-    CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
-    LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, MlxParallelContext, MtpCapability,
-    MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PagedCacheOptions,
-    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
+    backend::mlx::{
+        CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
+        LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, MlxParallelContext,
+        ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions, WeightResidency,
+    },
+    core::{residency::OffloadConfig, Backend as _, BackendSession as _},
+    load_model, MtpCapability, MtpCheckpointKind, MtpConfig, PromptCacheDescriptor,
+    PromptCacheOptions, PromptCacheTopology,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -343,11 +344,12 @@ fn pipeline_ring_worker() {
             .configure_cache(CacheResidencyPolicy::Paged(paged))
             .unwrap();
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let parts =
+            [safemlx_lm::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let mut output = session
             .prefill(
                 &backend,
-                safemlx_lm::runtime::media::input::ModelInput::new(&parts).into(),
+                safemlx_lm::backend::mlx::runtime::media::input::ModelInput::new(&parts).into(),
             )
             .unwrap()
             .wait()
@@ -829,12 +831,13 @@ fn pipeline_ring_worker() {
             usize::from(pipeline_rank == 1)
         );
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let parts =
+            [safemlx_lm::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
         let mut mtp_cache = model.new_cache().unwrap();
         let (generated, stats) = model
             .generate_embedded_mtp_distributed(
                 &mut mtp_cache,
-                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                safemlx_lm::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                 &MtpConfig {
                     max_tokens: 3,
                     max_draft_tokens: 1,
@@ -872,10 +875,11 @@ fn resident_reference_quantized(
         .unwrap();
     let mut cache = model.new_cache();
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+    let parts =
+        [safemlx_lm::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
     let prefill = model
         .submit_prefill(
-            safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+            safemlx_lm::backend::mlx::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -900,7 +904,9 @@ fn resident_reference_quantized(
 }
 
 fn inkling_multimodal_prepared_input() -> PreparedModelInput {
-    use safemlx_lm::runtime::media::input::{InputMetadata, InputPart, Modality, ModelInput};
+    use safemlx_lm::backend::mlx::runtime::media::input::{
+        InputMetadata, InputPart, Modality, ModelInput,
+    };
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let image = Array::from_slice(&[0.01f32; 16], &[1, 1, 16]);
@@ -919,7 +925,7 @@ fn inkling_multimodal_prepared_input() -> PreparedModelInput {
 }
 
 fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
-    use safemlx_lm::runtime::media::input::{InputMetadata, InputPart, ModelInput};
+    use safemlx_lm::backend::mlx::runtime::media::input::{InputMetadata, InputPart, ModelInput};
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
@@ -957,7 +963,7 @@ fn multimodal_resident_reference(
     let parts = prepared.input_parts();
     let prefill = model
         .submit_prefill(
-            safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+            safemlx_lm::backend::mlx::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )

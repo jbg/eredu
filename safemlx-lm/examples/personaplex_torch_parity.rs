@@ -6,8 +6,11 @@ use safemlx::{
 };
 use safemlx_lm::{
     architectures::moshi::{layerwise, model as moshi, personaplex},
-    LayerWeightResidency, MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel, RealtimeModel,
-    RealtimeSampling, RealtimeScheduler, RequestId, SchedulerLimits,
+    backend::mlx::{
+        realtime::{MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel},
+        LayerWeightResidency,
+    },
+    RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId, SchedulerLimits,
 };
 
 fn main() -> anyhow::Result<()> {

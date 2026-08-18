@@ -26,7 +26,39 @@ use crate::{
         self as resident, Cache, DecoderLayer, FeedForwardPolicy, LayerCache, ModelArgs,
         OperatorPolicy,
     },
-    error::Error,
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{
+        residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
+        KeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::binding::{
+        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
+        populate_module_from_lease_excluding,
+    },
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
+    backend::mlx::runtime::distributed::parallel::{
+        aligned_partition_units, array_parameter_member, register_replicated_module,
+        MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
+    },
+    backend::mlx::runtime::execution::layerwise::{
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
+    },
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass, ExpertRouteBatch,
+    },
+    backend::mlx::runtime::residency::manager::{
+        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
+    },
     nn::{
         self as common,
         generation::CausalLm,
@@ -40,36 +72,6 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    runtime::cache::{
-        residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
-        KeyValueCache,
-    },
-    runtime::checkpoint::binding::{
-        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
-        populate_module_from_lease_excluding,
-    },
-    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
-        recipe::DerivedWeightRecipe,
-    },
-    runtime::distributed::parallel::{
-        aligned_partition_units, array_parameter_member, register_replicated_module,
-        MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
-    },
-    runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
-        StaticUnitBindings, WeightResidency,
-    },
-    runtime::media::input,
-    runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass, ExpertRouteBatch,
-    },
-    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
 const EMBEDDING_UNIT: &str = "lfm2.static.embedding";
@@ -311,7 +313,10 @@ impl Lfm2LayerwiseModel {
         self.execution.adapter().args()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
+    pub(crate) fn bind_parallel_topology(
+        &mut self,
+        topology: crate::backend::mlx::MlxParallelContext,
+    ) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -343,7 +348,9 @@ impl Lfm2LayerwiseModel {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
@@ -404,7 +411,10 @@ impl Lfm2LayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -587,7 +597,7 @@ pub(crate) fn execute_transformed_lfm2_model(
 pub(crate) fn load_lfm2_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
@@ -599,7 +609,7 @@ pub(crate) fn load_lfm2_tensor_parallel_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         return load_lfm2_gguf_tensor_parallel_model(
             &checkpoint,
             &metadata,
@@ -631,11 +641,11 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     options: LayerWeightResidency,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(Lfm2LayerwiseModel, Vec<u32>), Error> {
-    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
         checkpoint, metadata, options,
     )?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
@@ -764,7 +774,7 @@ pub(crate) fn load_lfm2_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
@@ -784,7 +794,7 @@ pub(crate) fn load_lfm2_sparse_tp_ep_base_with_store(
 /// Loads MoE LFM2 with independently cached experts and bounded non-expert units.
 pub fn load_lfm2_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::NonExpertWeightResidency,
+    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1067,13 +1077,15 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         &self.args.model_type
     }
 
-    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(
+        &self,
+    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
         self.args.weight_quantization
     }
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid LFM2 cache layer count"))?;
@@ -1279,7 +1291,9 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let Some(v) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
@@ -1307,8 +1321,10 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
+            "text_decoder",
+        ])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1332,7 +1348,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
@@ -1362,8 +1378,8 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
@@ -1398,7 +1414,8 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
@@ -1408,7 +1425,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
             ));
         }
         Ok(Some(
-            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
                 self.args.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -1417,8 +1434,8 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
     }
     fn register_parallel_parameters(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
@@ -1450,8 +1467,8 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
     }
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         let head_dim = self.args.hidden_size / self.args.num_attention_heads;
@@ -1509,7 +1526,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         self.layer_count(group)?;
@@ -1644,11 +1661,11 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -1662,7 +1679,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -1818,7 +1835,9 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -1870,7 +1889,9 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.finish(hidden, cache, context, execution.stream());
@@ -2058,7 +2079,7 @@ pub(crate) fn lfm2_expert_catalog(
 }
 
 /// LFM2 token generation iterator using bounded layer execution.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Lfm2LayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -2081,19 +2102,21 @@ mod tests {
             self as resident, Cache, FeedForwardPolicy, LayerCache, LayerPolicy, Model, ModelArgs,
             OperatorPolicy,
         },
-        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
-        runtime::checkpoint::{quantization::AffineQuantization, recipe::DerivedWeightRecipe},
-        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        runtime::{
-            attention::LayerSchedule,
+        backend::mlx::runtime::checkpoint::{
+            quantization::AffineQuantization, recipe::DerivedWeightRecipe,
+        },
+        backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+        backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        backend::mlx::runtime::{
             distributed::parallel::{ParallelBuildContext, ShardingPolicy},
             execution::layerwise::{
                 load_safetensors_layerwise_model, ArchitectureAdapter, LayerWeightResidency,
                 LayerwiseLoadOptions,
             },
         },
-        CacheResidencyPolicy, PagedCacheOptions,
+        backend::mlx::{CacheResidencyPolicy, PagedCacheOptions},
+        core::attention::LayerSchedule,
+        core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
     fn args(moe: bool) -> ModelArgs {
@@ -2382,7 +2405,8 @@ mod tests {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
-            let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+            let name =
+                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             if name.ends_with("feed_forward.experts.gate_up_proj") {
                 let prefix = name.trim_end_matches(".gate_up_proj");
                 for expert in 0..model.args.num_experts {
@@ -2536,13 +2560,13 @@ mod tests {
             for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
                 let expected_offset = match expected {
                     LayerCache::Attention(cache) => {
-                        crate::runtime::cache::KeyValueCache::offset(cache)
+                        crate::backend::mlx::runtime::cache::KeyValueCache::offset(cache)
                     }
                     LayerCache::Conv(cache) => cache.offset,
                 };
                 let actual_offset = match actual {
                     LayerCache::Attention(cache) => {
-                        crate::runtime::cache::KeyValueCache::offset(cache)
+                        crate::backend::mlx::runtime::cache::KeyValueCache::offset(cache)
                     }
                     LayerCache::Conv(cache) => cache.offset,
                 };
@@ -2661,7 +2685,7 @@ mod tests {
                 .unwrap();
         let mut cached = load_lfm2_expert_cache_model(
             dir.path(),
-            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+            crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,

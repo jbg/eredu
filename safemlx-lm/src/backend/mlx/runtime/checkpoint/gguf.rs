@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::error::Error;
+use crate::backend::mlx::error::Error;
 
 /// Finds the preferred sibling multimodal-projector GGUF for a model file.
 ///

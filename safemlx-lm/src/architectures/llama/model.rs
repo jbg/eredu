@@ -22,8 +22,17 @@ use tokenizers::Tokenizer;
 pub use crate::nn::generation::sample;
 
 use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_safetensors_dir_lenient,
+        load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
+    },
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::execution::inspection::ActivationObserver,
+    backend::mlx::runtime::media::input,
+    core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::derive_prompt_cache_architecture_fingerprint,
-    error::Error,
     nn::tensor::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
@@ -38,17 +47,6 @@ use crate::{
         generation::CausalLm,
         layers::SwiGluMlp,
         linear::project_logits_maybe_quantized,
-    },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_safetensors_dir_lenient,
-        load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::execution::inspection::ActivationObserver,
-    runtime::media::input,
-    runtime::{
-        attention::{AttentionPolicy, LayerSchedule},
-        cache::{ConcatKeyValueCache, KeyValueCache},
     },
 };
 
@@ -1686,7 +1684,7 @@ pub fn load_resident_llama_model_quantized(
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let mut model_args = get_llama_model_args(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "Llama",
         model_args.weight_quantization(),
         quantization,
@@ -1752,7 +1750,7 @@ where
 }
 
 /// Llama token generation iterator.
-pub type Generate<'a, C, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, C, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, ResidentModel, Vec<Option<C>>, S>;
 
 #[cfg(test)]
@@ -1774,8 +1772,8 @@ mod tests {
 
     use crate::{
         architectures::llama::model::{load_llama_tokenizer, load_resident_llama_model},
-        runtime::cache::{ConcatKeyValueCache, KeyValueCache},
-        runtime::checkpoint::quantization::AffineQuantization,
+        backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+        backend::mlx::runtime::checkpoint::quantization::AffineQuantization,
     };
 
     #[test]
@@ -1860,8 +1858,8 @@ mod tests {
 
     #[test]
     fn fingerprint_and_cache_geometry_include_ordered_attention_schedule() {
-        use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
-        use crate::runtime::cache::KeyValueCache;
+        use crate::backend::mlx::runtime::cache::KeyValueCache;
+        use crate::core::attention::{AttentionPolicy, LayerSchedule};
 
         let mut first = super::model_args_from_config_value(&tiny_config(None)).unwrap();
         first.attention_schedule = LayerSchedule::new(
@@ -1933,12 +1931,12 @@ mod tests {
 
     #[test]
     fn arbitrary_schedule_prefill_decode_and_paged_cache_parity() {
-        use crate::runtime::{
-            attention::{AttentionPolicy, LayerSchedule},
-            cache::{
+        use crate::{
+            backend::mlx::runtime::cache::{
                 residency::{CacheResidencyManager, PagedCacheOptions},
                 PagedKeyValueCache,
             },
+            core::attention::{AttentionPolicy, LayerSchedule},
         };
 
         let context =
@@ -2069,13 +2067,13 @@ mod tests {
             "rope_theta": 10000.0
         }))
         .unwrap();
-        args.attention_schedule = crate::runtime::attention::LayerSchedule::new(
+        args.attention_schedule = crate::core::attention::LayerSchedule::new(
             4,
             vec![
-                crate::runtime::attention::AttentionPolicy::Full,
-                crate::runtime::attention::AttentionPolicy::sliding(3).unwrap(),
-                crate::runtime::attention::AttentionPolicy::Full,
-                crate::runtime::attention::AttentionPolicy::sliding(9).unwrap(),
+                crate::core::attention::AttentionPolicy::Full,
+                crate::core::attention::AttentionPolicy::sliding(3).unwrap(),
+                crate::core::attention::AttentionPolicy::Full,
+                crate::core::attention::AttentionPolicy::sliding(9).unwrap(),
             ],
         )
         .unwrap();
@@ -2088,13 +2086,13 @@ mod tests {
             vec![None, Some(3), None, Some(9)]
         );
         let first = super::prompt_cache_architecture_fingerprint(&args);
-        args.attention_schedule = crate::runtime::attention::LayerSchedule::new(
+        args.attention_schedule = crate::core::attention::LayerSchedule::new(
             4,
             vec![
-                crate::runtime::attention::AttentionPolicy::sliding(3).unwrap(),
-                crate::runtime::attention::AttentionPolicy::Full,
-                crate::runtime::attention::AttentionPolicy::Full,
-                crate::runtime::attention::AttentionPolicy::sliding(9).unwrap(),
+                crate::core::attention::AttentionPolicy::sliding(3).unwrap(),
+                crate::core::attention::AttentionPolicy::Full,
+                crate::core::attention::AttentionPolicy::Full,
+                crate::core::attention::AttentionPolicy::sliding(9).unwrap(),
             ],
         )
         .unwrap();
@@ -2170,7 +2168,7 @@ mod tests {
                 attention_bias: false,
                 mlp_bias: false,
                 rope_scaling: None,
-                attention_schedule: crate::runtime::attention::LayerSchedule::all_sliding(1, 16)
+                attention_schedule: crate::core::attention::LayerSchedule::all_sliding(1, 16)
                     .unwrap(),
                 quantization: None,
                 quantization_config: None,
@@ -2315,7 +2313,7 @@ mod tests {
         let checkpoint = safemlx::ops::GgufCheckpoint::open(mixed_fixture.path()).unwrap();
         let mut mixed = super::load_llama_gguf_checkpoint(
             &checkpoint,
-            crate::runtime::checkpoint::load::gguf_metadata(&checkpoint),
+            crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint),
             None,
             stream,
             stream,
@@ -2347,11 +2345,11 @@ mod tests {
 
         let gpu = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let quantized = super::load_llama_gguf_checkpoint(
             &checkpoint,
             metadata,
-            Some(crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4),
+            Some(crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization::MxFp4),
             gpu.stream(),
             stream,
         )
@@ -2386,7 +2384,7 @@ mod tests {
             attention_bias: false,
             mlp_bias: false,
             rope_scaling: None,
-            attention_schedule: crate::runtime::attention::LayerSchedule::all_full(1).unwrap(),
+            attention_schedule: crate::core::attention::LayerSchedule::all_full(1).unwrap(),
             quantization: Some(AffineQuantization::new(32, 4).unwrap().into()),
             quantization_config: None,
             quantized_weights: Some(selected),
@@ -2527,10 +2525,10 @@ mod tests {
         let eot_token_id = 128009u32;
 
         let mut token_ids = Vec::new();
-        let input_parts = [crate::runtime::media::input::InputPart::text_token_ids(
-            &prompt_tokens,
-        )];
-        let input = crate::runtime::media::input::ModelInput::new(&input_parts);
+        let input_parts = [
+            crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt_tokens),
+        ];
+        let input = crate::backend::mlx::runtime::media::input::ModelInput::new(&input_parts);
         let generate = super::Generate::<ConcatKeyValueCache>::new(
             &mut model, &mut cache, 0.0, input, None, stream,
         );

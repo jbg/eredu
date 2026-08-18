@@ -1,11 +1,11 @@
 //! Reusable expert-parallel assignment, routing, and exchange infrastructure.
 //!
 //! Pure expert parallelism keeps ordinary model state replicated and partitions
-//! only routed expert banks. [`crate::runtime::distributed::expert::dispatch_replicated`]
+//! only routed expert banks. [`crate::backend::mlx::runtime::distributed::expert::dispatch_replicated`]
 //! exploits the replicated
 //! token layout: ranks compact only routes owned by their experts and all-sum
 //! the resulting token buffer. Sharded-token dispatch uses one reusable
-//! [`AllToAllVPlan`](crate::runtime::distributed::expert::AllToAllVPlan)
+//! [`AllToAllVPlan`](crate::backend::mlx::runtime::distributed::expert::AllToAllVPlan)
 //! and compact variable-count exchanges in both directions.
 
 use std::{
@@ -21,7 +21,7 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
+    backend::mlx::error::Error,
     nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
 };
 

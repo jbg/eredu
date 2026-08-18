@@ -25,11 +25,27 @@ use crate::core::cache::{
 
 use crate::{
     architectures::qwen::dense::gguf_string,
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{
+        residency::{
+            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
+            CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+            PromptCacheSnapshotBlock, PromptCacheStateArray,
+        },
+        ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
+        load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
+    },
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::media::input,
+    core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
         CacheRankIdentity, CacheResidencyPool, LayerCachePolicy, StateTensorDimension,
         StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
-    error::Error,
     nn::{
         self as common,
         attention::{
@@ -48,22 +64,6 @@ use crate::{
             AttentionMask,
         },
     },
-    runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::{
-        residency::{
-            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-            PromptCacheSnapshotBlock, PromptCacheStateArray,
-        },
-        ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
-    },
-    runtime::checkpoint::load::{
-        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
-        load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::media::input,
 };
 
 fn default_true() -> bool {
@@ -2246,7 +2246,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// LFM2 token generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 /// Reads and validates LFM2 model arguments.
@@ -2322,7 +2322,7 @@ pub fn load_model_quantized(
         crate::backend::mlx::ModelLoadOptions::with_quantization(quantization),
     )?;
     let mut args = get_model_args(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "LFM2",
         args.weight_quantization,
         quantization,
@@ -2915,13 +2915,19 @@ mod tests {
         let pool = crate::CacheResidencyPool::new(
             crate::CachePoolLimits::new(4096, 4096, 4096, 0).unwrap(),
         );
-        let options = crate::PagedCacheOptions::new(1, 4096, 4096, 1)
-            .unwrap()
-            .with_full_attention(true)
-            .with_pool(pool.clone())
-            .unwrap();
+        let options = crate::backend::mlx::runtime::cache::residency::PagedCacheOptions::new(
+            1, 4096, 4096, 1,
+        )
+        .unwrap()
+        .with_full_attention(true)
+        .with_pool(pool.clone())
+        .unwrap();
         let cache = model
-            .new_cache_with_options(crate::CacheResidencyPolicy::Paged(options))
+            .new_cache_with_options(
+                crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
+                    options,
+                ),
+            )
             .unwrap();
         assert_eq!(cache.residency_pool().unwrap().id(), pool.id());
         assert_eq!(pool.report().unwrap().managers, 1);
@@ -3371,12 +3377,11 @@ mod tests {
             }
             let mut cache = model.new_cache();
             let prompt = safemlx::Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-            let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-                &prompt,
-            )];
+            let parts =
+                [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
             let logits = crate::nn::generation::CausalLm::prefill_input_logits(
                 &mut model,
-                crate::runtime::media::input::ModelInput::new(&parts),
+                crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                 &mut cache,
                 stream,
             )
@@ -3399,9 +3404,9 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_lfm2_save_drop_reload_continue_matches_uninterrupted() {
         use crate::{
+            backend::mlx::runtime::media::input::{InputPart, ModelInput},
             core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
             nn::generation::CausalLm,
-            runtime::media::input::{InputPart, ModelInput},
         };
 
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));

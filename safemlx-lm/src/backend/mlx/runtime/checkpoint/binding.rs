@@ -11,16 +11,18 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    runtime::checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype, WeightRecipeError},
-    runtime::checkpoint::store::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::recipe::{
+        DerivedWeightRecipe, RecipeDtype, WeightRecipeError,
+    },
+    backend::mlx::runtime::checkpoint::store::{
         TensorSelection, WeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreError,
     },
-    runtime::checkpoint::{
+    backend::mlx::runtime::checkpoint::{
         load::{load_array_quantized_strict, StrictLoadConfig, StrictLoadReport},
         quantization::WeightQuantization,
     },
-    runtime::residency::manager::{ResidentUnitLease, WeightBinding},
+    backend::mlx::runtime::residency::manager::{ResidentUnitLease, WeightBinding},
 };
 
 const MODEL_LOAD_MATERIALIZATION_BUFFERS: usize = 2;
@@ -650,13 +652,13 @@ pub enum ModuleBindingError {
     },
     /// Persistent checkpoint inspection failed.
     #[error(transparent)]
-    WeightStore(#[from] crate::runtime::checkpoint::store::WeightStoreError),
+    WeightStore(#[from] crate::backend::mlx::runtime::checkpoint::store::WeightStoreError),
     /// Derived-weight metadata validation failed.
     #[error(transparent)]
-    WeightRecipe(#[from] crate::runtime::checkpoint::recipe::WeightRecipeError),
+    WeightRecipe(#[from] crate::backend::mlx::runtime::checkpoint::recipe::WeightRecipeError),
     /// Residency binding or lookup failed.
     #[error(transparent)]
-    Residency(#[from] crate::runtime::residency::manager::ResidencyError),
+    Residency(#[from] crate::backend::mlx::runtime::residency::manager::ResidencyError),
 }
 
 #[cfg(test)]
@@ -674,9 +676,9 @@ mod tests {
 
     use super::*;
     use crate::{
+        backend::mlx::runtime::checkpoint::quantization::AffineQuantization,
+        backend::mlx::runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore},
         nn::linear::unloaded_maybe_quantized_linear,
-        runtime::checkpoint::quantization::AffineQuantization,
-        runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore},
         test_utils::SyntheticGguf,
     };
 

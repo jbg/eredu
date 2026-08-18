@@ -27,11 +27,9 @@ use crate::{
             vl::model as qwen3_vl,
         },
     },
-    error::Error,
-    runtime::{
-        attention::AttentionPolicy,
-        checkpoint::store::{SafetensorsWeightStore, StoredDtype, WeightStore},
-    },
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+    core::attention::AttentionPolicy,
 };
 
 pub(crate) trait GgufArchitectureValidation {
@@ -343,7 +341,7 @@ enum TensorOperation {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum SafetensorsMatrixFormat {
     Dense,
-    Affine(crate::runtime::checkpoint::quantization::WeightQuantization),
+    Affine(crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization),
     Fp8Block128,
 }
 
@@ -2383,7 +2381,9 @@ fn validate_gemma4_vision_catalog(
     issues: &mut Vec<StructuralIssue>,
     config: &crate::architectures::gemma4::vision::Gemma4VisionConfig,
     text_hidden: usize,
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+    quantization: Option<
+        crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    >,
 ) {
     let hidden = config.hidden_size as usize;
     let intermediate = config.intermediate_size as usize;
@@ -2492,7 +2492,9 @@ fn validate_gemma4_audio_catalog(
     issues: &mut Vec<StructuralIssue>,
     config: &crate::architectures::gemma4::audio::Gemma4AudioConfig,
     text_hidden: usize,
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+    quantization: Option<
+        crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    >,
 ) {
     let hidden = config.hidden_size as usize;
     let head = hidden / config.num_attention_heads as usize;
@@ -2724,7 +2726,9 @@ fn validate_gemma4_tensor(
     canonical: String,
     shape: Vec<usize>,
     operation: TensorOperation,
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+    quantization: Option<
+        crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    >,
     released_alias: bool,
 ) {
     let released = released_alias
@@ -2811,7 +2815,9 @@ fn validate_gemma4_experts(
     experts: usize,
     hidden: usize,
     intermediate: usize,
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+    quantization: Option<
+        crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    >,
     bounded: bool,
 ) {
     let expert_prefix = format!("{layer_prefix}.experts.switch_glu");
@@ -4411,7 +4417,9 @@ fn validate_float_element_count(
 ) {
     let metadata = match store.metadata(name) {
         Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
+        Err(crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::UnknownTensor {
+            ..
+        }) => {
             issues.push(missing(name));
             return;
         }
@@ -4459,16 +4467,18 @@ fn validate_native_mxfp4_tensor(
 ) {
     let metadata = match store.metadata(name) {
         Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. })
-            if companion =>
-        {
+        Err(crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::UnknownTensor {
+            ..
+        }) if companion => {
             issues.push(quantization_companion_issue(
                 name,
                 format!("native MXFP4 expert weight is missing required companion {name:?}"),
             ));
             return;
         }
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
+        Err(crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::UnknownTensor {
+            ..
+        }) => {
             issues.push(missing(name));
             return;
         }
@@ -5686,7 +5696,9 @@ fn validate_personaplex_matrix(
     aliases: &[String],
     companion_prefix: &str,
     shape: &[usize],
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+    quantization: Option<
+        crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    >,
     allowed: &mut BTreeSet<String>,
     issues: &mut Vec<StructuralIssue>,
 ) {
@@ -5760,7 +5772,9 @@ fn validate_personaplex_norm(
     allowed.insert(name.into());
     let metadata = match store.metadata(name) {
         Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
+        Err(crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::UnknownTensor {
+            ..
+        }) => {
             issues.push(missing(name));
             return;
         }
@@ -6026,8 +6040,12 @@ fn validate_split_or_packed_swiglu_experts(
     intermediate: usize,
     allow_per_expert_split: bool,
     allow_separate_packed: bool,
-    gate_up_quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
-    down_quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+    gate_up_quantization: Option<
+        crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    >,
+    down_quantization: Option<
+        crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    >,
     issues: &mut Vec<StructuralIssue>,
 ) {
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
@@ -6210,7 +6228,9 @@ fn validate_split_or_packed_swiglu_experts(
 fn validate_safetensor_plan(
     store: &SafetensorsWeightStore,
     expected: Vec<ExpectedTensor>,
-    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+    quantization: Option<
+        crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    >,
 ) -> StructuralValidation {
     let mut issues = Vec::new();
     for tensor in expected {
@@ -6319,7 +6339,9 @@ fn validate_fp8_safetensor(
 ) {
     let metadata = match store.metadata(name) {
         Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
+        Err(crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::UnknownTensor {
+            ..
+        }) => {
             issues.push(missing(name));
             return;
         }
@@ -6381,8 +6403,9 @@ fn validate_safetensor_plan_with(
     expected: Vec<ExpectedTensor>,
     quantization_for: impl Fn(
         &str,
-    )
-        -> Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
+    ) -> Option<
+        crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    >,
 ) -> StructuralValidation {
     let mut issues = Vec::new();
     for tensor in expected {
@@ -6406,7 +6429,7 @@ fn validate_safetensor_plan_with(
 fn validate_quantized_safetensor(
     store: &SafetensorsWeightStore,
     tensor: &ExpectedTensor,
-    quantization: crate::runtime::checkpoint::quantization::WeightQuantization,
+    quantization: crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     issues: &mut Vec<StructuralIssue>,
 ) {
     let input = *tensor.safetensors_shape.last().expect("matrix shape");
@@ -6482,7 +6505,9 @@ fn validate_safetensor(
 ) {
     let metadata = match store.metadata(name) {
         Ok(metadata) => metadata,
-        Err(crate::runtime::checkpoint::store::WeightStoreError::UnknownTensor { .. }) => {
+        Err(crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::UnknownTensor {
+            ..
+        }) => {
             issues.push(missing(name));
             return;
         }

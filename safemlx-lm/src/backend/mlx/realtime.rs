@@ -23,15 +23,15 @@ use crate::{
         layerwise::{self, MoshiLayerwiseModel},
         model as moshi, personaplex,
     },
-    backend::mlx::{ensure_replicated_load_options, ModelLoadOptions},
-    error::Error,
-    runtime::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::{
         checkpoint::{
             artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
             quantization::WeightQuantization,
         },
         generation::sampler::DefaultSampler,
     },
+    backend::mlx::{ensure_replicated_load_options, ModelLoadOptions},
 };
 
 /// Supported MLX realtime speech-to-speech model-family dispatch target.
@@ -82,7 +82,7 @@ fn realtime_artifact_identity(
 ) -> Result<LoadedArtifactIdentity, Error> {
     let index = model_dir.join("model.safetensors.index.json");
     let weight_files = if index.exists() {
-        crate::runtime::checkpoint::load::safetensors_files(model_dir)?
+        crate::backend::mlx::runtime::checkpoint::load::safetensors_files(model_dir)?
     } else {
         match kind {
             RealtimeModelKind::Moshi => {
@@ -149,7 +149,8 @@ impl MlxRealtimeModel {
     /// Returns current residency telemetry for the selected parameter policy.
     pub fn residency_report(
         &self,
-    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::residency::manager::ResidencyReport>, Error>
+    {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => model.residency_report().map(Some),
         }
@@ -158,7 +159,10 @@ impl MlxRealtimeModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => model.dense_stream_report(),
         }
@@ -167,8 +171,10 @@ impl MlxRealtimeModel {
     /// Returns per-group residency for the selected parameter policy.
     pub fn execution_group_reports(
         &self,
-    ) -> Result<Option<Vec<crate::runtime::residency::manager::ResidentLayerGroupReport>>, Error>
-    {
+    ) -> Result<
+        Option<Vec<crate::backend::mlx::runtime::residency::manager::ResidentLayerGroupReport>>,
+        Error,
+    > {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => {
                 model.execution_group_reports().map(Some)
@@ -820,8 +826,10 @@ mod tests {
             MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)
         );
 
-        explicit.quantization =
-            Some(crate::runtime::checkpoint::quantization::AffineQuantization::default().into());
+        explicit.quantization = Some(
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::default()
+                .into(),
+        );
         assert_ne!(
             MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &implicit),
             MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)

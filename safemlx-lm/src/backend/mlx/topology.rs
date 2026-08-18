@@ -5,7 +5,7 @@ use std::ops::Deref;
 use safemlx::{distributed, distributed::Group, Device, DeviceType, Stream};
 use safemlx_lm_core::{BackendError, ParallelRankTopology, ParallelTopology};
 
-use crate::error::Error;
+use crate::backend::mlx::error::Error;
 
 /// Explicit process-local MLX execution-device assignment.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

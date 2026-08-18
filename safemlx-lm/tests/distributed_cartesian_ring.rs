@@ -13,8 +13,8 @@ use safemlx::{
 };
 use safemlx_lm::{
     architectures::distributed::expert::{AllToAllVPlan, RoutedTransport},
+    backend::mlx::{DeviceAssignment, MlxBackend, MlxParallelContext},
     core::{CollectiveScope, DistributedSession},
-    DeviceAssignment, MlxBackend, MlxParallelContext,
 };
 
 const WORKER_ENV: &str = "SAFEMLX_CARTESIAN_RING_WORKER";

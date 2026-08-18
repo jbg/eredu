@@ -14,10 +14,10 @@ use super::request::{
     PreparedChatMtpExecutionRequest, PreparedChatMtpGenerationOutput,
     PreparedChatSpeculativeBackend,
 };
+use crate::backend::mlx::error::Error;
 use crate::backend::mlx::speculative::MlxDrafter;
 use crate::core::generation::SemanticEvent;
 use crate::core::MtpCapability;
-use crate::error::Error;
 
 impl PreparedChatSpeculativeBackend for crate::backend::mlx::MlxBackend<'static> {
     type Drafter = MlxDrafter;

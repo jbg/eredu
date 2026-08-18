@@ -23,7 +23,7 @@ use crate::{
         gemma4::model as gemma4, inkling::model as inkling, muse_glimmer,
         qwen::vl::model as qwen3_vl,
     },
-    runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
 };
 
 /// Options applied while inspecting a model artifact.
@@ -218,7 +218,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
                 report.requested_load = InspectionReadiness::Invalid;
                 let missing = matches!(
                     error,
-                    crate::runtime::checkpoint::store::WeightStoreError::MissingShard { .. }
+                    crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::MissingShard { .. }
                 );
                 report.issue(
                     if missing {
@@ -247,7 +247,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
             report.requested_load = InspectionReadiness::Invalid;
             let missing = matches!(
                 error,
-                crate::runtime::checkpoint::store::WeightStoreError::MissingShard { .. }
+                crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::MissingShard { .. }
             );
             report.issue(
                 if missing {
@@ -347,7 +347,7 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         }
     }
 
-    let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     let architecture = match metadata.get("general.architecture") {
         Some(GgufMetadataValue::String(value)) => {
             report.architecture = Some(value.clone());
@@ -534,7 +534,10 @@ fn inspect_gguf_projector(
             match qwen3_vl::find_qwen3_vl_mmproj(path) {
                 Ok(projector) => match GgufCheckpoint::open(&projector) {
                     Ok(checkpoint) => {
-                        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+                        let metadata =
+                            crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
+                                &checkpoint,
+                            );
                         let validation = structural::validate_qwen3_vl_projector_gguf(
                             model_checkpoint,
                             model_metadata,
@@ -574,10 +577,12 @@ fn inspect_gguf_projector(
             match crate::architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(path) {
                 Ok(Some(mmproj)) => {
                     let projector_path =
-                        crate::runtime::checkpoint::gguf::find_sibling_mmproj(path, "qwen35")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| path.to_path_buf());
+                        crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(
+                            path, "qwen35",
+                        )
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| path.to_path_buf());
                     let validation = structural::validate_qwen35_projector_gguf(
                         model_checkpoint,
                         model_metadata,
@@ -629,10 +634,12 @@ fn inspect_gguf_projector(
         GgufArchitecture::Inkling => match inkling::open_sibling_mmproj(path) {
             Ok(Some(mmproj)) => {
                 let projector_path =
-                    crate::runtime::checkpoint::gguf::find_sibling_mmproj(path, "inkling")
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| path.to_path_buf());
+                    crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(
+                        path, "inkling",
+                    )
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| path.to_path_buf());
                 let validation = structural::validate_inkling_mmproj_gguf(model_metadata, &mmproj);
                 let exact = matches!(validation, structural::StructuralValidation::Exact);
                 apply_structural_validation(report, validation, &projector_path);
@@ -667,10 +674,12 @@ fn inspect_gguf_projector(
         GgufArchitecture::Gemma4 => match gemma4::open_sibling_mmproj(path) {
             Ok(Some(mmproj)) => {
                 let projector_path =
-                    crate::runtime::checkpoint::gguf::find_sibling_mmproj(path, "gemma4")
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| path.to_path_buf());
+                    crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(
+                        path, "gemma4",
+                    )
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| path.to_path_buf());
                 let validation = structural::validate_gemma4_mmproj_gguf(
                     model_checkpoint,
                     model_metadata,
@@ -974,7 +983,7 @@ mod tests {
     use super::*;
     use crate::{
         architectures::{deepseek_v4::model as deepseek_v4, moshi::personaplex},
-        NonExpertWeightResidency, WeightResidency,
+        backend::mlx::{NonExpertWeightResidency, WeightResidency},
     };
 
     fn llama_config() -> Value {
@@ -6475,7 +6484,7 @@ mod tests {
         assert!(report.is_loadable());
 
         let checkpoint = GgufCheckpoint::open(&path).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         assert_eq!(
             structural::validate_gguf(
                 GgufArchitecture::KimiLinear,
@@ -6831,7 +6840,8 @@ mod tests {
             assert!(report.is_loadable(), "{:#?}", report.issues);
 
             let checkpoint = GgufCheckpoint::open(&path).unwrap();
-            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             assert_eq!(
                 structural::validate_gguf(
                     architecture,
@@ -7137,7 +7147,7 @@ mod tests {
         assert!(!resident.is_loadable());
         let load =
             ModelLoadOptions::default().with_weight_residency(WeightResidency::layerwise_host(
-                crate::runtime::execution::layerwise::LayerwiseLoadOptions::default(),
+                crate::backend::mlx::runtime::execution::layerwise::LayerwiseLoadOptions::default(),
             ));
         let bounded = inspect_model(directory.path(), MlxInspectionOptions { load }).unwrap();
         assert_eq!(bounded.structural_binding, InspectionReadiness::Ready);
@@ -7982,7 +7992,7 @@ mod tests {
         assert!(report.is_loadable());
 
         let checkpoint = GgufCheckpoint::open(&path).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         assert_eq!(
             structural::validate_gguf(
                 GgufArchitecture::Llama,
@@ -8009,7 +8019,8 @@ mod tests {
             assert!(report.is_loadable(), "{:#?}", report.issues);
 
             let checkpoint = GgufCheckpoint::open(&path).unwrap();
-            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             assert_eq!(
                 structural::validate_gguf(
                     architecture,
@@ -8031,16 +8042,20 @@ mod tests {
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let weights =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let quantization = crate::runtime::checkpoint::quantization::WeightQuantization::Affine(
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4).unwrap(),
-        );
-        let options = ModelLoadOptions::with_quantization(quantization).with_weight_residency(
-            WeightResidency::with_expert_cache(
-                NonExpertWeightResidency::FullyResident,
-                crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+        let quantization =
+            crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization::Affine(
+                crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(
+                    32, 4,
+                )
+                .unwrap(),
+            );
+        let options = ModelLoadOptions::with_quantization(quantization)
+            .with_weight_residency(WeightResidency::with_expert_cache(
+            NonExpertWeightResidency::FullyResident,
+            crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(
             ),
-        );
-        let backend = crate::MlxBackend::new(execution.stream(), weights.stream());
+        ));
+        let backend = crate::backend::mlx::MlxBackend::new(execution.stream(), weights.stream());
         let mut loaded = crate::load_model(&backend, &path, options)
             .unwrap()
             .into_inner()
@@ -8060,13 +8075,12 @@ mod tests {
         assert_eq!(experts.transformed_weights, 18);
         assert!(experts.output_bytes < experts.source_bytes_read);
         let tokens = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
-        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-            &tokens,
-        )];
+        let parts =
+            [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&tokens)];
         let mut cache = loaded.new_cache();
         let logits = loaded
             .submit_prefill(
-                crate::runtime::media::input::ModelInput::new(&parts),
+                crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                 &mut cache,
                 execution.stream(),
             )
@@ -8101,7 +8115,8 @@ mod tests {
             );
 
             let checkpoint = GgufCheckpoint::open(&path).unwrap();
-            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             assert_eq!(
                 structural::validate_gguf(
                     GgufArchitecture::Gemma4,
@@ -8210,7 +8225,7 @@ mod tests {
         assert!(report.is_loadable(), "{:#?}", report.issues);
 
         let checkpoint = GgufCheckpoint::open(&path).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         assert_eq!(
             structural::validate_gguf(
                 GgufArchitecture::Inkling,
@@ -8285,7 +8300,8 @@ mod tests {
             );
 
             let checkpoint = GgufCheckpoint::open(&path).unwrap();
-            let loaded_metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let loaded_metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             assert!(
                 matches!(
                     structural::validate_gguf(
@@ -8410,7 +8426,7 @@ mod tests {
         let report = inspect_model(&model_path, MlxInspectionOptions::default()).unwrap();
         assert!(report.is_loadable(), "{:#?}", report.issues);
         let checkpoint = GgufCheckpoint::open(&model_path).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let mmproj = crate::architectures::inkling::model::open_sibling_mmproj(&model_path)
             .unwrap()
             .unwrap();
@@ -8463,7 +8479,8 @@ mod tests {
             assert!(report.is_loadable(), "{:#?}", report.issues);
 
             let checkpoint = GgufCheckpoint::open(&path).unwrap();
-            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             assert_eq!(
                 structural::validate_gguf(
                     architecture,
@@ -8505,7 +8522,7 @@ mod tests {
         }));
 
         let checkpoint = GgufCheckpoint::open(&model).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let mmproj = crate::architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(&model)
             .unwrap()
             .unwrap();
@@ -8657,7 +8674,7 @@ mod tests {
         assert!(report.is_loadable(), "{:#?}", report.issues);
 
         let checkpoint = GgufCheckpoint::open(&path).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         assert_eq!(
             structural::validate_gguf(
                 GgufArchitecture::Qwen3Next,
@@ -8743,7 +8760,7 @@ mod tests {
         assert!(report.is_loadable(), "{:#?}", report.issues);
 
         let checkpoint = GgufCheckpoint::open(&path).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         assert_eq!(
             structural::validate_gguf(
                 GgufArchitecture::DeepSeek4,
@@ -8766,7 +8783,7 @@ mod tests {
         let path = directory.path().join("deepseek4.gguf");
         write_complete_deepseek4_gguf(&path, |_| {}, |_| {});
         let checkpoint = GgufCheckpoint::open(&path).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let context =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let weights =
@@ -8774,12 +8791,12 @@ mod tests {
         for residency in [
             WeightResidency::fully_resident(),
             WeightResidency::layerwise_host(
-                crate::runtime::execution::layerwise::LayerwiseLoadOptions::default(),
+                crate::backend::mlx::runtime::execution::layerwise::LayerwiseLoadOptions::default(),
             ),
-            WeightResidency::dense_disk_stream(crate::DenseDiskStreamLoadOptions::default()),
+            WeightResidency::dense_disk_stream(crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::default()),
             WeightResidency::with_expert_cache(
                 NonExpertWeightResidency::FullyResident,
-                crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
             ),
         ] {
             let (model, _) =
@@ -8793,8 +8810,8 @@ mod tests {
                 )
                 .unwrap();
             let cache = model
-                .new_cache_with_options(crate::CacheResidencyPolicy::Paged(
-                    crate::PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
+                .new_cache_with_options(crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
+                    crate::backend::mlx::runtime::cache::residency::PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
                 ))
                 .unwrap();
             assert!(cache.residency_report().unwrap().is_some());
@@ -8826,9 +8843,9 @@ mod tests {
                 WeightResidency::fully_resident(),
                 WeightResidency::with_expert_cache(
                     NonExpertWeightResidency::DenseDiskStream(
-                        crate::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
+                        crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
                     ),
-                    crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                    crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
                 ),
             ] {
                 let loaded =
@@ -8842,8 +8859,8 @@ mod tests {
                 assert_eq!(loaded.stage_info().topology, topology);
                 assert!(!loaded.stage_info().global_layer_range.is_empty());
                 let cache = loaded
-                    .new_cache_with_options(crate::CacheResidencyPolicy::Paged(
-                        crate::PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
+                    .new_cache_with_options(crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
+                        crate::backend::mlx::runtime::cache::residency::PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
                     ))
                     .unwrap();
                 assert!(loaded.cache_residency_report(&cache).unwrap().is_some());
@@ -8876,9 +8893,9 @@ mod tests {
                 WeightResidency::fully_resident(),
                 WeightResidency::with_expert_cache(
                     NonExpertWeightResidency::DenseDiskStream(
-                        crate::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
+                        crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
                     ),
-                    crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                    crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
                 ),
             ] {
                 let loaded = crate::architectures::distributed::expert::
@@ -8893,8 +8910,8 @@ mod tests {
                 assert_eq!(loaded.info().topology, topology);
                 assert_eq!(loaded.info().assignment.local_expert_count(), 1);
                 let cache = loaded
-                    .new_cache_with_options(crate::CacheResidencyPolicy::Paged(
-                        crate::PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
+                    .new_cache_with_options(crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
+                        crate::backend::mlx::runtime::cache::residency::PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
                     ))
                     .unwrap();
                 assert!(loaded.cache_residency_report(&cache).unwrap().is_some());
@@ -8993,7 +9010,8 @@ mod tests {
             assert!(report.is_loadable(), "{:#?}", report.issues);
 
             let checkpoint = GgufCheckpoint::open(&path).unwrap();
-            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             assert_eq!(
                 structural::validate_gguf(
                     GgufArchitecture::DeepSeek2,
@@ -9117,7 +9135,8 @@ mod tests {
             assert!(report.is_loadable(), "{:#?}", report.issues);
 
             let checkpoint = GgufCheckpoint::open(&path).unwrap();
-            let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             assert_eq!(
                 structural::validate_gguf(
                     architecture,
@@ -9141,7 +9160,7 @@ mod tests {
         assert!(report.is_loadable(), "{:#?}", report.issues);
 
         let checkpoint = GgufCheckpoint::open(&path).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         assert_eq!(
             structural::validate_gguf(
                 GgufArchitecture::GptOss,
@@ -9328,8 +9347,9 @@ mod tests {
 
         let checkpoint = GgufCheckpoint::open(&model_path).unwrap();
         let projector = GgufCheckpoint::open(&projector_path).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-        let projector_metadata = crate::runtime::checkpoint::load::gguf_metadata(&projector);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let projector_metadata =
+            crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&projector);
         let prepared = qwen3_vl::prepare_qwen3_vl_gguf_checkpoint(
             &checkpoint,
             &metadata,
@@ -9431,7 +9451,7 @@ mod tests {
 
     #[test]
     fn requested_quantization_and_residency_use_shared_loader_policy() {
-        use crate::runtime::{
+        use crate::backend::mlx::runtime::{
             checkpoint::quantization::WeightQuantization, execution::layerwise::WeightResidency,
             residency::expert_cache::ExpertCacheLoadOptions,
         };

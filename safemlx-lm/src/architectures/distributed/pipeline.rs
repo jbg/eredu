@@ -69,6 +69,49 @@ use crate::{
             vl::model as qwen3_vl,
         },
     },
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
+        load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheStateArray,
+    },
+    backend::mlx::runtime::cache::{
+        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::binding::{
+        binding_bytes, materialize_module_bindings, populate_module_from_arrays_excluding,
+        populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
+    },
+    backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
+    backend::mlx::runtime::checkpoint::quantization::{
+        quantize_tensor, should_quantize_on_load, WeightQuantization,
+    },
+    backend::mlx::runtime::checkpoint::store::{
+        GgufWeightStore, WeightStore, WeightStoreDiagnostics,
+    },
+    backend::mlx::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
+    backend::mlx::runtime::distributed::expert::{
+        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
+    },
+    backend::mlx::runtime::distributed::parallel::{
+        ParallelBuildContext, ParallelExecutionContext, ShardingPolicy,
+    },
+    backend::mlx::runtime::execution::layerwise::{
+        open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
+        ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
+        ExecutionGroupReadySet, LayerWeightResidency, LayerwiseLoadOptions,
+        LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection, SharedWeightStore,
+        StaticUnitBindings,
+    },
+    backend::mlx::runtime::generation::sampler::SpeculativeSampler,
+    backend::mlx::runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
+    backend::mlx::runtime::residency::dense_stream::DENSE_TRANSFER_WINDOW,
+    backend::mlx::runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
+    },
+    backend::mlx::runtime::residency::manager::{
+        host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyManager, ResidencyReport,
+        ResidentLayerGroup,
+    },
     backend::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
@@ -82,7 +125,6 @@ use crate::{
     core::ModelKind,
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
-    error::Error,
     nn::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
     nn::{
         parallel::{
@@ -91,51 +133,11 @@ use crate::{
         },
         tensor::create_causal_mask,
     },
-    runtime::cache::residency::{
-        load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheStateArray,
-    },
-    runtime::cache::{
-        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-    },
-    runtime::checkpoint::binding::{
-        binding_bytes, materialize_module_bindings, populate_module_from_arrays_excluding,
-        populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
-    },
-    runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
-    runtime::checkpoint::quantization::{
-        quantize_tensor, should_quantize_on_load, WeightQuantization,
-    },
-    runtime::checkpoint::store::{GgufWeightStore, WeightStore, WeightStoreDiagnostics},
-    runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
-    runtime::distributed::expert::{
-        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
-    },
-    runtime::distributed::parallel::{
-        ParallelBuildContext, ParallelExecutionContext, ShardingPolicy,
-    },
-    runtime::execution::layerwise::{
-        open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
-        ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
-        ExecutionGroupReadySet, LayerWeightResidency, LayerwiseLoadOptions,
-        LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection, SharedWeightStore,
-        StaticUnitBindings,
-    },
-    runtime::generation::sampler::SpeculativeSampler,
-    runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
-    runtime::residency::dense_stream::DENSE_TRANSFER_WINDOW,
-    runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
-    },
-    runtime::residency::manager::{
-        host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyManager, ResidencyReport,
-        ResidentLayerGroup,
-    },
 };
 use safemlx_lm_core::MtpStats;
 
 #[cfg(test)]
-use crate::runtime::execution::layerwise::WeightResidency;
+use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
 
 use safemlx::ops::indexing::TryIndexOp;
 
@@ -672,7 +674,7 @@ pub enum PipelineStageInput<'a> {
 #[derive(Clone, Copy)]
 enum PipelineIngress<'a> {
     Tokens(&'a Array),
-    ModelInput(crate::runtime::media::input::ModelInput<'a>),
+    ModelInput(crate::backend::mlx::runtime::media::input::ModelInput<'a>),
 }
 
 /// Result of one stage-local forward operation.
@@ -941,7 +943,7 @@ struct LlamaStage {
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     parallel_kv_heads: Option<Vec<i32>>,
 }
 
@@ -956,7 +958,7 @@ struct DeepSeekStage {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -968,7 +970,7 @@ struct DeepSeekV4Stage {
     range: Range<usize>,
     layers: Vec<deepseek_v4::DecoderLayer>,
     dense_layers: Option<PipelineLayerStorage>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -999,7 +1001,7 @@ struct GemmaStage {
     parallel_per_layer_vocabulary: Option<Range<usize>>,
     parallel_per_layer_projection: Option<crate::nn::parallel::ParallelLinear>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_cache: Option<ExpertCache>,
     routing_statistics: RoutingStatistics,
@@ -1024,7 +1026,7 @@ struct DenseQwenStage {
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_cache: Option<ExpertCache>,
     routing_statistics: RoutingStatistics,
@@ -1038,7 +1040,7 @@ struct MuseGlimmerStage {
     vision_layers: Vec<MuseGlimmerLayer>,
     layers: Vec<MuseGlimmerLayer>,
     dense_layers: Option<PipelineLayerStorage>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 }
 
 struct Qwen3VlStage {
@@ -1051,7 +1053,7 @@ struct Qwen3VlStage {
     dense_layers: Option<PipelineLayerStorage>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     parallel_output_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -1068,7 +1070,7 @@ struct GptOssStage {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     parallel_kv_heads: Option<Vec<i32>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_cache: Option<ExpertCache>,
@@ -1107,7 +1109,7 @@ struct Lfm2Stage {
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     parallel_cache_geometry: Option<Vec<lfm2::Lfm2LayerCacheGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
@@ -1127,7 +1129,7 @@ struct NemotronHStage {
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     parallel_geometry: Option<Vec<nemotron_h::ParallelLayerGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
@@ -1151,7 +1153,7 @@ struct QwenHybridStage {
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     parallel_geometry: Option<Vec<qwen_hybrid::ParallelLayerGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
@@ -1171,7 +1173,7 @@ struct KimiLinearStage {
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     parallel_cache_geometry: Option<Vec<kimi_linear::KimiLayerCacheGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
@@ -1194,7 +1196,7 @@ struct InklingStage {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -1221,13 +1223,13 @@ trait PipelineStageAdapter {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error>;
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error>;
@@ -1318,7 +1320,7 @@ trait PipelineStageAdapter {
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -1350,7 +1352,7 @@ trait PipelineStageSemantics {
     }
     fn begin_placed_ingress(
         &mut self,
-        _input: crate::runtime::media::input::ModelInput<'_>,
+        _input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         _stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -1358,7 +1360,7 @@ trait PipelineStageSemantics {
     }
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -1501,7 +1503,7 @@ trait PipelineStageSemantics {
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &mut self,
-        _input: crate::runtime::media::input::ModelInput<'_>,
+        _input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _step: PipelineStep,
         _mask: Option<&Array>,
         _cache: &mut [PipelineLayerCache],
@@ -1580,7 +1582,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -1589,7 +1591,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -1737,7 +1739,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -1767,7 +1769,9 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 #[derive(Debug, Clone, Copy)]
 enum PipelineLayerLoadOptions {
     LayerwiseHost(LayerwiseLoadOptions),
-    DenseDiskStream(crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions),
+    DenseDiskStream(
+        crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    ),
 }
 
 enum PipelineLayerController {
@@ -1805,14 +1809,14 @@ impl PipelineLayerStorage {
     fn prepare_layerwise(
         &self,
         local_index: usize,
-    ) -> Result<crate::runtime::residency::manager::ResidentUnitLease, Error> {
+    ) -> Result<crate::backend::mlx::runtime::residency::manager::ResidentUnitLease, Error> {
         self.prepare_layerwise_absolute(self.execution_offset + local_index)
     }
 
     fn prepare_layerwise_absolute(
         &self,
         unit_index: usize,
-    ) -> Result<crate::runtime::residency::manager::ResidentUnitLease, Error> {
+    ) -> Result<crate::backend::mlx::runtime::residency::manager::ResidentUnitLease, Error> {
         if unit_index >= self.units.len() {
             return Err(Error::Parallel(format!(
                 "pipeline unit index {unit_index} exceeds {} planned units",
@@ -2008,7 +2012,7 @@ where
             );
             let mut layer = new_layer(global_layer, stream)?;
             if let Some(prefix) = dense_layers.unwrap().independent_expert_prefix {
-                crate::runtime::checkpoint::binding::populate_module_from_lease_excluding(
+                crate::backend::mlx::runtime::checkpoint::binding::populate_module_from_lease_excluding(
                     &mut layer,
                     transfer.lease(),
                     |name| name.starts_with(prefix),
@@ -2030,7 +2034,7 @@ where
             let lease = dense.prepare_layerwise(local_index)?;
             let mut layer = new_layer(global_layer, stream)?;
             if let Some(prefix) = dense.independent_expert_prefix {
-                crate::runtime::checkpoint::binding::populate_module_from_lease_excluding(
+                crate::backend::mlx::runtime::checkpoint::binding::populate_module_from_lease_excluding(
                     &mut layer,
                     &lease,
                     |name| name.starts_with(prefix),
@@ -2797,7 +2801,7 @@ impl PipelineStageSemantics for GemmaStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -2812,7 +2816,7 @@ impl PipelineStageSemantics for GemmaStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -2969,7 +2973,7 @@ impl PipelineStageSemantics for GemmaStage {
 
     fn prefill(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -3141,7 +3145,7 @@ impl PipelineStageSemantics for MuseGlimmerStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -3152,7 +3156,7 @@ impl PipelineStageSemantics for MuseGlimmerStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -3292,7 +3296,7 @@ impl PipelineStageSemantics for MuseGlimmerStage {
 
     fn prefill(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -3355,7 +3359,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -3366,7 +3370,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -3595,7 +3599,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
 
     fn prefill(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -3643,7 +3647,7 @@ impl Qwen3VlStage {
     fn forward_decoder(
         &mut self,
         input: Option<PipelineStageInput<'_>>,
-        typed: Option<crate::runtime::media::input::ModelInput<'_>>,
+        typed: Option<crate::backend::mlx::runtime::media::input::ModelInput<'_>>,
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
@@ -3888,7 +3892,7 @@ fn qwen3_vl_forward_pipeline_block<C: KeyValueCache>(
     assignment: Option<&ExpertAssignment>,
     expert_cache: Option<&ExpertCache>,
     args: &dense_qwen::DecoderConfig,
-    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     pass: ExpertPass,
     statistics: &mut RoutingStatistics,
     global_layer: usize,
@@ -4478,7 +4482,7 @@ impl PipelineStageSemantics for QwenHybridStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -4493,7 +4497,7 @@ impl PipelineStageSemantics for QwenHybridStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -4715,7 +4719,7 @@ impl PipelineStageSemantics for QwenHybridStage {
 
     fn prefill(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -4884,7 +4888,7 @@ impl PipelineStageSemantics for InklingStage {
 
     fn begin_placed_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -4899,7 +4903,7 @@ impl PipelineStageSemantics for InklingStage {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         _stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error> {
@@ -5097,7 +5101,7 @@ impl PipelineStageSemantics for InklingStage {
 
     fn prefill(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -5171,25 +5175,25 @@ pub struct PipelineModel {
 
 struct PipelineEmbeddedMtpTarget<'a> {
     model: &'a mut PipelineModel,
-    execution: &'a crate::MlxDistributedSession<'a>,
+    execution: &'a crate::backend::mlx::MlxDistributedSession<'a>,
 }
 
 fn pipeline_mtp_token_identity(
-    input: crate::runtime::media::input::ModelInput<'_>,
+    input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    crate::runtime::media::input::validate(input)?;
+    crate::backend::mlx::runtime::media::input::validate(input)?;
     let tokens = input
         .parts
         .iter()
         .filter_map(|part| match (part.modality, part.payload) {
             (
-                crate::runtime::media::input::Modality::Text,
-                crate::runtime::media::input::InputPayload::TokenIds(tokens),
+                crate::backend::mlx::runtime::media::input::Modality::Text,
+                crate::backend::mlx::runtime::media::input::InputPayload::TokenIds(tokens),
             ) => Some(Ok(tokens.clone())),
-            (crate::runtime::media::input::Modality::Text, _) => Some(Err(Exception::custom(
-                "pipeline embedded MTP requires token-id text ingress",
-            ))),
+            (crate::backend::mlx::runtime::media::input::Modality::Text, _) => Some(Err(
+                Exception::custom("pipeline embedded MTP requires token-id text ingress"),
+            )),
             _ => None,
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -5657,7 +5661,7 @@ impl PipelineModel {
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
-        execution: &crate::MlxDistributedSession<'_>,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
     ) -> Result<PipelineStageCompletion, Error> {
         if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
@@ -5705,11 +5709,11 @@ impl PipelineModel {
     /// Runs typed multimodal prefill through the selected distributed session.
     pub fn prefill_distributed(
         &mut self,
-        input: Option<crate::runtime::media::input::ModelInput<'_>>,
+        input: Option<crate::backend::mlx::runtime::media::input::ModelInput<'_>>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
-        execution: &crate::MlxDistributedSession<'_>,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
     ) -> Result<PipelineStageCompletion, Error> {
         if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
@@ -5786,7 +5790,7 @@ impl PipelineModel {
         local_logits: Option<Array>,
         local_hidden: Option<Array>,
         tokens: Array,
-        execution: &crate::MlxDistributedSession<'_>,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
         // Every TP/EP replica on the final PP coordinate owns the same gathered
@@ -5863,7 +5867,7 @@ impl PipelineModel {
     #[allow(clippy::too_many_arguments)]
     fn execute_placed_ingress_dag(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         group: &Group,
         tensor: Option<&ParallelExecutionContext<'_>>,
@@ -6203,11 +6207,11 @@ impl PipelineModel {
     pub fn generate_embedded_mtp_distributed<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut PipelineCache,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        execution: &crate::MlxDistributedSession<'_>,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         if execution.topology() != self.topology {
             return Err(Exception::custom(
@@ -6300,17 +6304,19 @@ impl PipelineModel {
         let ingress = routed_parts
             .as_ref()
             .map(|parts| {
-                PipelineIngress::ModelInput(crate::runtime::media::input::ModelInput::new(parts))
+                PipelineIngress::ModelInput(
+                    crate::backend::mlx::runtime::media::input::ModelInput::new(parts),
+                )
             })
             .or(ingress);
         let mut placed_payload = None;
         if let Some(PipelineIngress::ModelInput(input)) = ingress {
             if self.info.placement.groups().len() > 1 {
                 let has_media_tensor = input.parts.iter().any(|part| {
-                    part.modality != crate::runtime::media::input::Modality::Text
+                    part.modality != crate::backend::mlx::runtime::media::input::Modality::Text
                         && matches!(
                             part.payload,
-                            crate::runtime::media::input::InputPayload::Tensor(_)
+                            crate::backend::mlx::runtime::media::input::InputPayload::Tensor(_)
                         )
                 });
                 if has_media_tensor {
@@ -6409,7 +6415,7 @@ impl PipelineModel {
                     )?
                 }
                 PipelineIngress::ModelInput(input) => {
-                    crate::runtime::media::input::validate(input)?;
+                    crate::backend::mlx::runtime::media::input::validate(input)?;
                     if let Some(payload) = placed_payload.as_ref() {
                         self.stage.forward_with_execution(
                             PipelineStageInput::Hidden(payload),
@@ -6533,7 +6539,7 @@ impl PipelineModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: crate::runtime::generation::sampler::Sampler>(
+    pub fn sample_and_synchronize<S: crate::backend::mlx::runtime::generation::sampler::Sampler>(
         &self,
         logits: Option<&Array>,
         step: PipelineStep,
@@ -6541,8 +6547,8 @@ impl PipelineModel {
         temperature: f32,
         prng_state: Option<&mut safemlx::random::RandomState>,
         finished: bool,
-        execution: &crate::MlxDistributedSession<'_>,
-    ) -> Result<crate::runtime::distributed::parallel::SynchronizedToken, Error> {
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+    ) -> Result<crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken, Error> {
         execution.sample_and_synchronize(
             logits,
             step.batch_size,
@@ -6579,7 +6585,7 @@ impl PipelineModel {
 
     pub(crate) fn prefill_stage(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
@@ -6591,7 +6597,7 @@ impl PipelineModel {
                 self.info.pipeline_stage
             )));
         }
-        crate::runtime::media::input::validate(input)?;
+        crate::backend::mlx::runtime::media::input::validate(input)?;
         self.topology.validate_execution_stream(stream)?;
         if cache.model_kind != self.info.model_kind {
             return Err(Error::Parallel(format!(
@@ -6610,15 +6616,14 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
 
     fn prefill_target(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
         let tokens = pipeline_mtp_token_identity(input, stream)?;
-        let multimodal = input
-            .parts
-            .iter()
-            .any(|part| part.modality != crate::runtime::media::input::Modality::Text);
+        let multimodal = input.parts.iter().any(|part| {
+            part.modality != crate::backend::mlx::runtime::media::input::Modality::Text
+        });
         cache
             .reset()
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -7143,7 +7148,9 @@ fn decoder_only_placement(
     PlacedExecutionDag::plan(
         pipeline_stages,
         vec![ExecutionGroupPlacementRequest {
-            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::root("text_decoder"),
+            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::root(
+                "text_decoder",
+            ),
             kind: ExecutionGroupKind::Decoder,
             unit_count: global_layers,
             rank_path: (0..pipeline_stages).collect(),
@@ -7185,7 +7192,9 @@ fn multimodal_placement(
     let mut projected = Vec::new();
     if let Some(depth) = vision_depth {
         requests.push(ExecutionGroupPlacementRequest {
-            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::root("vision_encoder"),
+            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::root(
+                "vision_encoder",
+            ),
             kind: ExecutionGroupKind::VisionEncoder,
             unit_count: depth,
             rank_path: all_ranks(),
@@ -7202,7 +7211,7 @@ fn multimodal_placement(
             checkpoint_group: "vision_encoder".into(),
         });
         requests.push(ExecutionGroupPlacementRequest {
-            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
                 "vision_projector",
                 ["vision_encoder"],
             ),
@@ -7225,7 +7234,9 @@ fn multimodal_placement(
     }
     if let Some(depth) = audio_depth {
         requests.push(ExecutionGroupPlacementRequest {
-            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::root("audio_encoder"),
+            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::root(
+                "audio_encoder",
+            ),
             kind: ExecutionGroupKind::AudioEncoder,
             // Static dMel ingress remains a placed unit even when the family
             // has no repeated audio blocks.
@@ -7244,7 +7255,7 @@ fn multimodal_placement(
             checkpoint_group: "audio_encoder".into(),
         });
         requests.push(ExecutionGroupPlacementRequest {
-            spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
                 "audio_projector",
                 ["audio_encoder"],
             ),
@@ -7269,7 +7280,7 @@ fn multimodal_placement(
         return decoder_only_placement(decoder_layers, pipeline_stages);
     }
     requests.push(ExecutionGroupPlacementRequest {
-        spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+        spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
             "modality_merger",
             projected.iter().copied(),
         ),
@@ -7289,7 +7300,7 @@ fn multimodal_placement(
         checkpoint_group: "modality_merger".into(),
     });
     requests.push(ExecutionGroupPlacementRequest {
-        spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+        spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
             "modality_finalization",
             ["modality_merger"],
         ),
@@ -7309,7 +7320,7 @@ fn multimodal_placement(
         checkpoint_group: "modality_finalization".into(),
     });
     requests.push(ExecutionGroupPlacementRequest {
-        spec: crate::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+        spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
             "text_decoder",
             ["modality_finalization"],
         ),
@@ -7419,7 +7430,7 @@ fn validate_hidden_metadata(
 }
 
 fn checkpoint_name(parameter_name: &str) -> String {
-    crate::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name)
+    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name)
 }
 
 pub(crate) fn assign_module(
@@ -7535,7 +7546,7 @@ where
 fn load_bound_module(
     module: &mut (impl ModuleParameters + ?Sized),
     store: &dyn WeightStore,
-    bindings: &[crate::runtime::residency::manager::WeightBinding],
+    bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
@@ -7555,7 +7566,7 @@ fn load_bound_module(
 fn load_bound_module_excluding(
     module: &mut (impl ModuleParameters + ?Sized),
     store: &dyn WeightStore,
-    bindings: &[crate::runtime::residency::manager::WeightBinding],
+    bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
@@ -7622,7 +7633,7 @@ impl PipelineLoadAccumulator {
         &mut self,
         module: &mut M,
         store: &dyn WeightStore,
-        bindings: &[crate::runtime::residency::manager::WeightBinding],
+        bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
         quantize_on_load: Option<WeightQuantization>,
         weights_stream: &Stream,
         stream: &Stream,
@@ -7648,7 +7659,7 @@ impl PipelineLoadAccumulator {
         &mut self,
         module: &mut M,
         store: &dyn WeightStore,
-        bindings: &[crate::runtime::residency::manager::WeightBinding],
+        bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
         quantize_on_load: Option<WeightQuantization>,
         weights_stream: &Stream,
         stream: &Stream,
@@ -7697,7 +7708,7 @@ impl PipelineLoadAccumulator {
 fn pipeline_static_bindings<'a>(
     units: &'a [StaticUnitBindings],
     role: &str,
-) -> Result<&'a [crate::runtime::residency::manager::WeightBinding], Error> {
+) -> Result<&'a [crate::backend::mlx::runtime::residency::manager::WeightBinding], Error> {
     let suffix = format!(".static.{role}");
     units
         .iter()
@@ -7714,8 +7725,8 @@ fn pipeline_cartesian_static_bindings(
     units: &[StaticUnitBindings],
     role: &str,
     store: &dyn WeightStore,
-    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
-) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
     let bindings = pipeline_static_bindings(units, role)?.to_vec();
     match layout {
         Some(layout) => shard_layer_bindings(bindings, "", store, layout),
@@ -7768,7 +7779,8 @@ where
         usize,
         &L,
         &dyn WeightStore,
-    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error>,
+    )
+        -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error>,
 {
     let layer_count = range.len();
     let device_depth = match options {
@@ -7995,7 +8007,7 @@ pub(crate) fn load_pipeline_model_with_options(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let architecture = pipeline_gguf_architecture(&metadata)?;
         if expert_cache.is_some()
             && !matches!(
@@ -8106,7 +8118,7 @@ pub(crate) fn load_pipeline_model_with_options(
         // validate the artifact geometry without reapplying the standalone
         // nonresident-loader restriction.
         structural_options.weight_residency =
-            crate::runtime::execution::layerwise::WeightResidency::fully_resident();
+            crate::backend::mlx::runtime::execution::layerwise::WeightResidency::fully_resident();
         crate::backend::mlx::structural::validate_gguf(
             architecture,
             &checkpoint,
@@ -8264,8 +8276,9 @@ pub(crate) fn load_pipeline_model_with_options(
             crate::core::GgufArchitecture::Qwen3Vl | crate::core::GgufArchitecture::Qwen3VlMoe => {
                 let vision_path = qwen3_vl::find_qwen3_vl_mmproj(model_dir)?;
                 let vision_checkpoint = GgufCheckpoint::open(vision_path)?;
-                let vision_metadata =
-                    crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+                let vision_metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
+                    &vision_checkpoint,
+                );
                 let prepared = qwen3_vl::prepare_qwen3_vl_gguf_checkpoint(
                     &checkpoint,
                     &metadata,
@@ -8881,7 +8894,7 @@ fn load_llama_pipeline(
     topology.preflight(Some(source_args.attention_schedule.len()), None)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Llama pipeline",
                 source_args.weight_quantization(),
                 requested,
@@ -10252,7 +10265,7 @@ fn load_dense_qwen_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "dense-Qwen pipeline",
                 source_args.weight_quantization(),
                 requested,
@@ -10959,7 +10972,7 @@ fn load_qwen3_vl_pipeline(
         .or(source_args.text_config.quantization_config);
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Qwen3-VL pipeline",
                 source_quantization,
                 requested,
@@ -12362,7 +12375,7 @@ impl DenseQwenStage {
 #[allow(clippy::too_many_arguments)]
 fn qwen_pipeline_local_expert_args(
     args: &dense_qwen::DecoderConfig,
-    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
     global_layer: usize,
     layer_root: &str,
 ) -> Result<dense_qwen::DecoderConfig, Error> {
@@ -12429,7 +12442,7 @@ fn execute_pipeline_cached_qwen3(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_qwen3_at(
             args,
@@ -12473,7 +12486,7 @@ fn execute_pipeline_cached_gemma4(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_gemma4(args, global_layer, routes, pass, cache, stream)
     };
@@ -12502,7 +12515,7 @@ fn execute_pipeline_cached_deepseek(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_deepseek(args, global_layer, routes, pass, cache, stream)
     };
@@ -12531,7 +12544,7 @@ fn execute_pipeline_cached_deepseek_v4(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_deepseek_v4(args, global_layer, routes, pass, cache, stream)
     };
@@ -12560,7 +12573,7 @@ fn execute_pipeline_cached_lfm2(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_lfm2(args, global_layer, routes, pass, cache, stream)
     };
@@ -12589,7 +12602,7 @@ fn execute_pipeline_cached_qwen_hybrid(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_qwen_hybrid(args, global_layer, routes, pass, cache, stream)
     };
@@ -12618,7 +12631,7 @@ fn execute_pipeline_cached_kimi_linear(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_kimi_linear(args, global_layer, routes, pass, cache, stream)
     };
@@ -12647,7 +12660,7 @@ fn execute_pipeline_cached_inkling(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_inkling(args, global_layer, routes, pass, cache, stream)
     };
@@ -12676,7 +12689,7 @@ fn execute_pipeline_cached_nemotron_h(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_nemotron_h(args, global_layer, routes, pass, cache, stream)
     };
@@ -12707,7 +12720,7 @@ fn execute_pipeline_cached_gpt_oss(
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let tensor_parallel_size = tensor_group.map_or(1, Group::size);
-    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_gpt_oss_at(
             args,
@@ -12773,7 +12786,7 @@ fn load_gpt_oss_pipeline(
     }
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "GPT-OSS pipeline dense matrices",
                 source_args.quantization,
                 requested,
@@ -13727,7 +13740,7 @@ fn load_lfm2_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "LFM2 pipeline",
                 source_args.weight_quantization,
                 requested,
@@ -14919,11 +14932,11 @@ impl GemmaStage {
         let stream = execution.stream();
         let prepared_ingress = match input {
             PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => {
-                let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-                    tokens,
-                )];
+                let parts = [
+                    crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(tokens),
+                ];
                 Some(self.prepare_multimodal_ingress(
-                    crate::runtime::media::input::ModelInput::new(&parts),
+                    crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                     step,
                     Some(execution),
                     stream,
@@ -15244,7 +15257,7 @@ fn load_nemotron_h_pipeline(
     let existing = source_args.quantization;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Nemotron-H pipeline",
                 existing,
                 requested,
@@ -16549,7 +16562,7 @@ fn load_qwen_hybrid_pipeline(
     }
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Qwen hybrid pipeline",
                 source_args.quantization,
                 requested,
@@ -17381,7 +17394,7 @@ fn forward_qwen_hybrid_external_expert_layer(
 impl QwenHybridStage {
     fn prepare_multimodal_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
@@ -18099,7 +18112,7 @@ fn load_kimi_linear_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Kimi Linear pipeline",
                 source_args.quantization,
                 requested,
@@ -19180,7 +19193,7 @@ fn load_inkling_pipeline(
     };
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Inkling pipeline",
                 args.text_config.weight_quantization,
                 requested,
@@ -19862,7 +19875,7 @@ fn forward_inkling_cartesian_layer(
 impl InklingStage {
     fn prepare_multimodal_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
@@ -20720,7 +20733,7 @@ fn load_gemma_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Gemma pipeline",
                 source_args.weight_quantization(),
                 requested,
@@ -21612,7 +21625,7 @@ impl GemmaStage {
 
     fn prepare_multimodal_ingress(
         &mut self,
-        input: crate::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
@@ -21931,7 +21944,7 @@ impl GemmaStage {
         &self,
         auxiliary: &'a PipelineAuxiliaryState,
         step: PipelineStep,
-        policy: crate::runtime::attention::AttentionPolicy,
+        policy: crate::core::attention::AttentionPolicy,
     ) -> Result<Option<&'a Array>, Error> {
         if !self.has_multimodal_ingress || step.sequence_length <= 1 {
             return Ok(None);
@@ -22035,7 +22048,7 @@ impl GemmaStage {
         cache: Option<&mut C>,
         offset: i32,
         per_layer_input: Option<&Array>,
-        shared_kv: &mut HashMap<crate::runtime::attention::AttentionPolicy, (Array, Array)>,
+        shared_kv: &mut HashMap<crate::core::attention::AttentionPolicy, (Array, Array)>,
         tensor_group: Option<&Group>,
         assignment: Option<&ExpertAssignment>,
         expert_group: Option<&Group>,
@@ -22116,11 +22129,11 @@ impl GemmaStage {
         }
         let prepared_ingress = match input {
             PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => {
-                let parts = [crate::runtime::media::input::InputPart::text_token_ids(
-                    tokens,
-                )];
+                let parts = [
+                    crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(tokens),
+                ];
                 Some(self.prepare_multimodal_ingress(
-                    crate::runtime::media::input::ModelInput::new(&parts),
+                    crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                     step,
                     None,
                     stream,
@@ -22357,7 +22370,7 @@ fn load_deepseek_pipeline(
     }
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "DeepSeek pipeline",
                 source_args.affine_quantization()?,
                 requested,
@@ -24010,7 +24023,9 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        name,
+                    ),
                     (*value).clone(),
                 )
             })
@@ -24032,7 +24047,8 @@ mod tests {
     ) {
         let mut arrays = Vec::new();
         for (name, value) in model.parameters().flatten() {
-            let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+            let name =
+                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             if let Some(prefix) = name.strip_suffix(".mlp.experts.gate_up_proj") {
                 for expert in 0..model.args.num_experts {
                     let selected = value.try_index_device(expert, stream).unwrap();
@@ -24119,9 +24135,9 @@ mod tests {
         outputs
     }
 
-    fn dense_stream_options() -> crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions
-    {
-        crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+    fn dense_stream_options(
+    ) -> crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions {
+        crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
             u64::MAX,
             u64::MAX,
             1,
@@ -24261,7 +24277,9 @@ mod tests {
             .into_iter()
             .map(|(name, value)| {
                 let canonical =
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        &name,
+                    );
                 let gguf = match canonical.as_str() {
                     "model.embed_tokens.weight" => "token_embd.weight".into(),
                     "model.embedding_norm.weight" => "token_embd_norm.weight".into(),
@@ -24336,7 +24354,8 @@ mod tests {
     fn lfm2_moe_gguf_fixture(model: &lfm2::Model, stream: &Stream) -> SyntheticGguf {
         let mut arrays = HashMap::new();
         for (name, value) in model.parameters().flatten() {
-            let canonical = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+            let canonical =
+                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             let layer_name = |name: &str| {
                 name.replace("model.layers.", "blk.")
                     .replace(".conv.conv.", ".shortconv.conv.")
@@ -25376,8 +25395,8 @@ mod tests {
             )
             .unwrap();
             let residency = WeightResidency::with_expert_cache(
-                crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
-                crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
             );
             let loaded =
                 crate::architectures::distributed::expert::load_expert_parallel_model_with_options(
@@ -25488,8 +25507,8 @@ mod tests {
             for residency in [
                 WeightResidency::fully_resident(),
                 WeightResidency::with_expert_cache(
-                    crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
-                    crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                    crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                    crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
                 ),
             ] {
                 let loaded = load_pipeline_model_with_options(
@@ -25550,8 +25569,8 @@ mod tests {
                 for residency in [
                     WeightResidency::fully_resident(),
                     WeightResidency::with_expert_cache(
-                        crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
-                        crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                        crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                        crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
                     ),
                 ] {
                     let loaded = load_pipeline_model_with_options(
@@ -25676,7 +25695,7 @@ mod tests {
 
         let dense_gguf = dense_qwen_gguf_fixture(&dense_source, stream);
         let checkpoint = GgufCheckpoint::open(dense_gguf.path()).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let (gguf_dense_args, _) =
             dense_qwen::prepare_gguf_checkpoint(&checkpoint, &metadata, "qwen3", false).unwrap();
         let dense_store: SharedWeightStore = Arc::new(
@@ -25718,7 +25737,7 @@ mod tests {
 
         let moe_gguf = dense_qwen_gguf_fixture(&moe_source, stream);
         let checkpoint = GgufCheckpoint::open(moe_gguf.path()).unwrap();
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let (gguf_moe_args, _) =
             dense_qwen::prepare_gguf_checkpoint(&checkpoint, &metadata, "qwen3moe", true).unwrap();
         let moe_store: SharedWeightStore = Arc::new(
@@ -26234,8 +26253,8 @@ mod tests {
                 moe.path(),
                 ModelLoadOptions::with_parallel(topology).with_weight_residency(
                     WeightResidency::with_expert_cache(
-                        crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
-                        crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                        crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                        crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
                     ),
                 ),
                 stream,
@@ -26266,7 +26285,7 @@ mod tests {
         let qwen_dir = tempfile::tempdir().unwrap();
         write_parameter_fixture(qwen_dir.path(), &qwen_config, &qwen_source);
         let affine: WeightQuantization =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
                 .unwrap()
                 .into();
         let qwen_load = |rank, quantization| {
@@ -26366,7 +26385,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_parameter_fixture(dir.path(), &config, &source);
         let affine: WeightQuantization =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
                 .unwrap()
                 .into();
 
@@ -26441,7 +26460,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_parameter_fixture(dir.path(), &config, &source);
         let affine: WeightQuantization =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
                 .unwrap()
                 .into();
         let load = |rank, quantization| {
@@ -26502,15 +26521,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_parameter_fixture(dir.path(), &config, &source);
         let affine: WeightQuantization =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
                 .unwrap()
                 .into();
 
         for rank in 0..8 {
             let topology = tp_pp_ep_gpu_topology(rank);
             let residency = WeightResidency::with_expert_cache(
-                crate::NonExpertWeightResidency::FullyResident,
-                crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::FullyResident,
+                crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
             );
             let loaded = load_pipeline_model_with_options(
                 dir.path(),
@@ -26538,8 +26557,8 @@ mod tests {
                 ModelLoadOptions::with_quantization(affine)
                     .with_parallel_topology(topology)
                     .with_weight_residency(WeightResidency::with_expert_cache(
-                        crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
-                        crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                        crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                        crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
                     )),
                 stream,
                 cpu.stream(),
@@ -26578,7 +26597,7 @@ mod tests {
             attention_bias: false,
             mlp_bias: false,
             rope_scaling: None,
-            attention_schedule: crate::runtime::attention::LayerSchedule::all_full(4).unwrap(),
+            attention_schedule: crate::core::attention::LayerSchedule::all_full(4).unwrap(),
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -26654,7 +26673,9 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        name,
+                    ),
                     (*value).clone(),
                 )
             })
@@ -26712,7 +26733,9 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 let canonical =
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name);
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        name,
+                    );
                 let gguf = if canonical.starts_with("model.language_model.embed_tokens_per_layer.")
                 {
                     canonical.replacen(
@@ -27167,7 +27190,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_gemma_fixture(dir.path(), &source);
         let dense_options = || {
-            crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
                 u64::MAX,
                 u64::MAX,
                 1,
@@ -27254,7 +27277,8 @@ mod tests {
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = gpu.stream();
         let quantization =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4).unwrap();
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+                .unwrap();
 
         for tied in [true, false] {
             let mut config = quantizable_gemma_config();
@@ -27384,7 +27408,7 @@ mod tests {
             }
 
             let dense_stream =
-                crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
                     u64::MAX,
                     u64::MAX,
                     1,
@@ -27435,7 +27459,8 @@ mod tests {
         let stream = gpu.stream();
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let quantization =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4).unwrap();
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+                .unwrap();
         let config = quantizable_gemma_moe_config();
         let (args, _, _, _, _, _) = gemma4::model_config_from_value(&config).unwrap();
         let mut source = gemma4::Model::new(args, stream).unwrap();
@@ -27567,7 +27592,9 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        name,
+                    ),
                     (*value).clone(),
                 )
             })
@@ -27618,7 +27645,7 @@ mod tests {
         write_llama_fixture(directory.path(), &source, false);
         let expected_topology = topology(0, 2);
 
-        let backend = crate::MlxBackend::new(stream, stream);
+        let backend = crate::backend::mlx::MlxBackend::new(stream, stream);
         let loaded = crate::load_model(
             &backend,
             directory.path(),
@@ -27647,7 +27674,9 @@ mod tests {
             .into_iter()
             .map(|(name, value)| {
                 let canonical =
-                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        &name,
+                    );
                 let gguf = match canonical.as_str() {
                     "model.embed_tokens.weight" => "token_embd.weight".into(),
                     "model.norm.weight" => "output_norm.weight".into(),
@@ -27889,7 +27918,7 @@ mod tests {
             model_dir,
             ModelLoadOptions::with_parallel(topology).with_weight_residency(
                 WeightResidency::dense_disk_stream(
-                    crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                    crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
                         u64::MAX,
                         u64::MAX,
                         1,
@@ -27913,14 +27942,15 @@ mod tests {
     fn sampled_dense_options(
         device_budget_bytes: u64,
         host_budget_bytes: u64,
-    ) -> crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions {
-        let mut options = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            device_budget_bytes,
-            host_budget_bytes,
-            1,
-            1,
-        )
-        .unwrap();
+    ) -> crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions {
+        let mut options =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                device_budget_bytes,
+                host_budget_bytes,
+                1,
+                1,
+            )
+            .unwrap();
         options.sample_mlx_memory = true;
         options.sample_process_memory = true;
         options
@@ -27936,13 +27966,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_llama_fixture(dir.path(), &reference, true);
 
-        let mut dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            u64::MAX,
-            u64::MAX,
-            1,
-            1,
-        )
-        .unwrap();
+        let mut dense =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+            )
+            .unwrap();
         let strict_error = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0))
@@ -28343,7 +28374,7 @@ mod tests {
             qk_nope_head_dim: 2,
             qk_rope_head_dim: 2,
             v_head_dim: 2,
-            layer_schedule: crate::runtime::attention::LayerSchedule::new(
+            layer_schedule: crate::core::attention::LayerSchedule::new(
                 2,
                 vec![
                     deepseek_v3::LayerPolicy::DenseMlp,
@@ -28402,7 +28433,8 @@ mod tests {
     fn write_deepseek_fixture(dir: &Path, model: &deepseek_v3::Model, stream: &Stream) {
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in model.parameters().flatten() {
-            let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+            let name =
+                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             let packed_projection = ["gate_proj", "up_proj", "down_proj"]
                 .into_iter()
                 .find(|projection| name.ends_with(&format!(".mlp.experts.{projection}")));
@@ -28471,13 +28503,14 @@ mod tests {
         let mut reference = initialized_deepseek(stream);
         let dir = tempfile::tempdir().unwrap();
         write_deepseek_fixture(dir.path(), &reference, stream);
-        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-            u64::MAX,
-            u64::MAX,
-            1,
-            1,
-        )
-        .unwrap();
+        let dense =
+            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+            )
+            .unwrap();
         let mut first = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0))

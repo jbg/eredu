@@ -15,8 +15,8 @@ use safemlx::{
 };
 
 use crate::{
+    backend::mlx::runtime::cache::KeyValueCache,
     nn::tensor::{create_causal_mask, rope::RopeVariant, scaled_dot_product_attention},
-    runtime::cache::KeyValueCache,
 };
 
 /// Common attention-layer input.

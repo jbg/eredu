@@ -12,7 +12,7 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use crate::runtime::checkpoint::store::{
+use crate::backend::mlx::runtime::checkpoint::store::{
     PendingWeightMaterialization, StoredDtype, TensorSelection, WeightReadPolicy, WeightStore,
     WeightStoreError,
 };
@@ -1821,7 +1821,7 @@ pub enum WeightRecipeError {
     NonNegativeNegLogInput,
     /// Checkpoint storage failed.
     #[error(transparent)]
-    WeightStore(#[from] crate::runtime::checkpoint::store::WeightStoreError),
+    WeightStore(#[from] crate::backend::mlx::runtime::checkpoint::store::WeightStoreError),
     /// MLX transformation or synchronization failed.
     #[error(transparent)]
     Mlx(#[from] safemlx::error::Exception),
@@ -1835,7 +1835,7 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 
     use super::*;
-    use crate::runtime::checkpoint::store::SafetensorsWeightStore;
+    use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
 
     fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
         let dir = tempfile::tempdir().unwrap();

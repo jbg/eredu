@@ -12,8 +12,8 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use crate::backend::mlx::runtime::cache::KeyValueCache;
 pub(crate) use crate::nn::rope;
-use crate::runtime::cache::KeyValueCache;
 
 #[allow(unused_macros)]
 macro_rules! try_unwrap {

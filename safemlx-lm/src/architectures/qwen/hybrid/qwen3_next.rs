@@ -15,11 +15,11 @@ use safemlx::{
 use tokenizers::Tokenizer;
 
 use crate::{
-    error::Error,
-    runtime::checkpoint::load::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::checkpoint::load::{
         load_safetensors_dir_strict_with_split_swiglu_experts_and_transform, StrictLoadReport,
     },
-    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
 };
 
 pub use super::qwen3_5::{
@@ -77,7 +77,7 @@ pub fn load_qwen3_next_model_quantized(
             "Qwen3-Next on-load quantization requires floating-point weights; native FP8 checkpoints cannot be implicitly transcoded".into(),
         ));
     }
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "Qwen3-Next",
         args.quantization,
         quantization,
@@ -509,8 +509,12 @@ mod tests {
 
     #[test]
     fn splits_mixed_affine_fused_projection_configs() {
-        let q3 = crate::runtime::checkpoint::quantization::AffineQuantization::new(16, 3).unwrap();
-        let q5 = crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 5).unwrap();
+        let q3 =
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(16, 3)
+                .unwrap();
+        let q5 =
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 5)
+                .unwrap();
         let mut configs = HashMap::from([
             ("model.layers.0.linear_attn.in_proj_qkvz.weight".into(), q3),
             ("model.layers.0.linear_attn.in_proj_ba.weight".into(), q5),
@@ -533,16 +537,18 @@ mod tests {
         let mut args = fp8_args();
         args.quantization_config = None;
         let affine =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 5).unwrap();
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 5)
+                .unwrap();
         let (widths, _) = super::fused_projection_widths(&args).unwrap();
         let rows = args.linear_num_key_heads * widths.iter().sum::<i32>();
         let values = (0..rows * args.hidden_size)
             .map(|index| ((index % 101) as f32 - 50.0) / 61.0)
             .collect::<Vec<_>>();
         let dense = Array::from_slice(&values, &[rows, args.hidden_size]);
-        let quantized =
-            crate::runtime::checkpoint::quantization::quantize_tensor(&dense, affine, stream)
-                .unwrap();
+        let quantized = crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor(
+            &dense, affine, stream,
+        )
+        .unwrap();
         let scales = quantized.scales.as_dtype(Dtype::Float16, stream).unwrap();
         let biases = quantized
             .biases
@@ -686,7 +692,8 @@ mod tests {
         .unwrap();
 
         let config = super::super::qwen3_5::qwen3_5_strict_load_config(false);
-        let mut report = crate::runtime::checkpoint::load::StrictLoadReport::default();
+        let mut report =
+            crate::backend::mlx::runtime::checkpoint::load::StrictLoadReport::default();
         super::super::qwen3_5::load_qwen_fp8_safetensors_dir_strict_with_transform(
             &mut model,
             dir.path(),
@@ -735,7 +742,7 @@ mod tests {
         );
 
         let store = Arc::new(
-            crate::runtime::checkpoint::store::SafetensorsWeightStore::open_with_max_mapped_shards(
+            crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore::open_with_max_mapped_shards(
                 dir.path(),
                 1,
             )
@@ -746,13 +753,14 @@ mod tests {
             store.as_ref(),
         )
         .unwrap();
-        let options = crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::new(
-            crate::core::residency::OffloadConfig::new(None, None, 1).unwrap(),
-            u64::MAX,
-            1 << 30,
-        )
-        .unwrap();
-        let cache = crate::runtime::residency::expert_cache::ExpertCache::new(
+        let options =
+            crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions::new(
+                crate::core::residency::OffloadConfig::new(None, None, 1).unwrap(),
+                u64::MAX,
+                1 << 30,
+            )
+            .unwrap();
+        let cache = crate::backend::mlx::runtime::residency::expert_cache::ExpertCache::new(
             Arc::clone(&store),
             entries,
             options,
@@ -766,13 +774,16 @@ mod tests {
                     0,
                     &[1],
                     &[1],
-                    crate::runtime::residency::expert_cache::ExpertPass::Decode,
+                    crate::backend::mlx::runtime::residency::expert_cache::ExpertPass::Decode,
                     gpu.stream(),
                 )
                 .unwrap(),
         );
         let diagnostics =
-            crate::runtime::checkpoint::store::WeightStore::diagnostics(store.as_ref()).unwrap();
+            crate::backend::mlx::runtime::checkpoint::store::WeightStore::diagnostics(
+                store.as_ref(),
+            )
+            .unwrap();
         assert_eq!(diagnostics.currently_mapped_shards, 1);
         assert_eq!(diagnostics.touched_shard_paths.len(), 2);
         assert!(diagnostics.evictions >= 1);
@@ -816,7 +827,8 @@ mod tests {
         .unwrap();
 
         let config = super::super::qwen3_5::qwen3_5_strict_load_config(false);
-        let mut report = crate::runtime::checkpoint::load::StrictLoadReport::default();
+        let mut report =
+            crate::backend::mlx::runtime::checkpoint::load::StrictLoadReport::default();
         let error = super::super::qwen3_5::load_qwen_fp8_safetensors_dir_strict_with_transform(
             &mut model,
             dir.path(),
@@ -827,7 +839,7 @@ mod tests {
             2,
             |key, value| {
                 if key == "zz_stop_after_complete_layer" {
-                    Err(crate::error::Error::UnsupportedArchitecture(
+                    Err(crate::backend::mlx::error::Error::UnsupportedArchitecture(
                         "intentional stop after complete layer".into(),
                     ))
                 } else {
@@ -884,7 +896,8 @@ mod tests {
         let stream = context.stream();
         let args = fp8_args();
         let affine =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 5).unwrap();
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 5)
+                .unwrap();
         let rows = args.linear_num_key_heads
             * (2 * args.linear_key_head_dim
                 + 2 * args.linear_num_value_heads * args.linear_value_head_dim
@@ -913,7 +926,8 @@ mod tests {
         assert!(error.to_string().contains("dtype Float16"));
 
         let unaligned =
-            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4).unwrap();
+            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+                .unwrap();
         let mut unaligned_args = args;
         unaligned_args.hidden_size = 130;
         let codes = Array::from_slice(&vec![0u32; (rows * 17) as usize], &[rows, 17]);

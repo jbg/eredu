@@ -3,6 +3,10 @@ use safemlx_lm::api::{
     DevicePlan, LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
     AUTOMATIC_SCHEMA_VERSION,
 };
+// Resolving this import in the no-default-features test build proves that the
+// implementation namespace exists independently of any selected backend.
+#[allow(unused_imports)]
+use safemlx_lm::backend as _;
 use safemlx_lm::{
     ArtifactFormat, Backend, BackendCapabilities, BackendDescriptor, BackendSession, Completion,
     DeviceDescriptor, GenerationConfigOverrides, InspectionReadiness, ModelInspectionReport,

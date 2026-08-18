@@ -6,7 +6,7 @@ use safemlx_lm_core::{
 };
 
 use super::{MlxBackend, MlxModelInput};
-use crate::{error::Error, runtime::media::ProcessorPreparationError};
+use crate::{backend::mlx::error::Error, backend::mlx::runtime::media::ProcessorPreparationError};
 
 impl MultimodalPreparationBackend for MlxBackend<'_> {
     fn prepare_multimodal_input<E>(

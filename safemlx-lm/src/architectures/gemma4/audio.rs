@@ -14,7 +14,7 @@ use safemlx::{
 use serde::Deserialize;
 
 use super::multimodal::{maybe_quantized_linear_bias, Gemma4ClippedLinear};
-use crate::runtime::checkpoint::quantization::WeightQuantization;
+use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Gemma4AudioConfig {
@@ -150,13 +150,13 @@ impl AudioSubsampleConvProjection {
         local_hidden: i32,
         parallel_widths: Vec<usize>,
         stream: &Stream,
-    ) -> Result<Self, crate::error::Error> {
+    ) -> Result<Self, crate::backend::mlx::error::Error> {
         let mut output = Self::new(config, stream)?;
         if local_hidden <= 0
             || parallel_widths.is_empty()
             || parallel_widths.iter().sum::<usize>() != config.hidden_size as usize
         {
-            return Err(crate::error::Error::Parallel(
+            return Err(crate::backend::mlx::error::Error::Parallel(
                 "invalid Gemma audio input tensor-parallel widths".into(),
             ));
         }
@@ -923,7 +923,7 @@ impl Gemma4AudioLayerwiseStatic {
         input_widths: Vec<usize>,
         local_output: i32,
         stream: &Stream,
-    ) -> Result<Self, crate::error::Error> {
+    ) -> Result<Self, crate::backend::mlx::error::Error> {
         Ok(Self {
             subsample_conv_projection: AudioSubsampleConvProjection::new_tensor_parallel(
                 config,

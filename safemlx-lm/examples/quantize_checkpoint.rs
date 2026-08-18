@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use safemlx::{Device, DeviceType, ExecutionContext};
-use safemlx_lm::runtime::checkpoint::quantization::{
+use safemlx_lm::backend::mlx::runtime::checkpoint::quantization::{
     AffineQuantization, CheckpointQuantizationOptions, WeightQuantization,
 };
 
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exclude: args.exclude,
         minimum_elements: args.minimum_elements,
     };
-    let report = safemlx_lm::runtime::checkpoint::quantization::quantize_checkpoint(
+    let report = safemlx_lm::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
         args.source,
         args.output,
         &options,

@@ -30,15 +30,15 @@ use crate::architectures::{
         vl::{model as qwen3_vl, moe as qwen3_vl_moe},
     },
 };
-use crate::backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
-use crate::error::Error;
-use crate::runtime::cache::residency::{
+use crate::backend::mlx::error::Error;
+use crate::backend::mlx::runtime::cache::residency::{
     CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
 };
-use crate::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache};
-use crate::runtime::execution::inspection::ActivationObserver;
-use crate::runtime::generation::sampler::SpeculativeSampler;
-use crate::runtime::media::input;
+use crate::backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache};
+use crate::backend::mlx::runtime::execution::inspection::ActivationObserver;
+use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
+use crate::backend::mlx::runtime::media::input;
+use crate::backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
 use crate::{LayerCachePolicy, LayerSchedule};
 
 /// Loaded model value for any architecture supported by this crate.
@@ -82,7 +82,9 @@ pub enum Model {
 impl Model {
     /// Returns architecture-neutral rank-local placement information when this
     /// model was loaded through generalized parallel execution groups.
-    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         match self {
             Self::Llama(model) => model.parallel_info(),
             Self::MuseGlimmer(model) => model.parallel_info(),
@@ -213,7 +215,7 @@ impl Model {
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        execution: &crate::MlxDistributedSession<'_>,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         let topology = execution.topology();
         if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
@@ -626,7 +628,8 @@ impl Model {
     /// Returns residency telemetry when this model uses bounded layer execution.
     pub fn residency_report(
         &self,
-    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::residency::manager::ResidencyReport>, Error>
+    {
         match self {
             Self::DeepSeekV3(model) => Ok(Some(model.residency_report()?)),
             Self::DeepSeekV4(_) => Ok(None),
@@ -648,7 +651,10 @@ impl Model {
     /// Returns experimental dense-stream telemetry when enabled.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         match self {
             Self::DeepSeekV3(model) => model.dense_stream_report(),
             Self::DeepSeekV4(_) => Ok(None),
@@ -670,7 +676,10 @@ impl Model {
     /// Returns sparse routed-expert cache telemetry when enabled.
     pub fn expert_cache_report(
         &self,
-    ) -> Result<Option<crate::runtime::residency::expert_cache::ExpertCacheReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheReport>,
+        Error,
+    > {
         match self {
             Self::DeepSeekV3(model) => model.expert_cache_report(),
             Self::DeepSeekV4Layerwise(model) => model.expert_cache_report(),
@@ -1380,7 +1389,7 @@ mod gemma4_drafter_compatibility_tests {
         assistant::{Gemma4AssistantConfig, Gemma4AssistantDraftModel},
         model::{model_args_from_config_value, ModelArgs},
     };
-    use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
+    use crate::core::attention::{AttentionPolicy, LayerSchedule};
 
     fn target_args() -> ModelArgs {
         model_args_from_config_value(&serde_json::json!({

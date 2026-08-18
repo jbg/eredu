@@ -32,25 +32,8 @@ use crate::{
         MultiHeadLatentAttention,
     },
     architectures::qwen::hybrid::qwen3_5::{QwenLinear, QwenWeightFormat},
-    core::cache::{
-        CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
-        StateTensorOwner, StateTensorPolicy, StateTensorRole,
-    },
-    error::Error,
-    nn::{
-        convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
-        gated_delta::gated_delta_scan,
-        generation::CausalLm,
-        layers::{silu, SwiGluMlp},
-        linear::{
-            project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
-            unloaded_maybe_quantized_linear,
-        },
-        moe::{PackedSwiGluExperts, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
-        tensor::create_causal_mask,
-    },
-    runtime::{
-        attention::{AttentionPolicy, LayerSchedule},
+    backend::mlx::error::Error,
+    backend::mlx::runtime::{
         cache::{
             residency::{
                 load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
@@ -71,10 +54,27 @@ use crate::{
         execution::inspection::{ActivationObserver, MoeRoutingObservation},
         media::input as runtime_input,
     },
+    core::attention::{AttentionPolicy, LayerSchedule},
+    core::cache::{
+        CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
+        StateTensorOwner, StateTensorPolicy, StateTensorRole,
+    },
+    nn::{
+        convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
+        gated_delta::gated_delta_scan,
+        generation::CausalLm,
+        layers::{silu, SwiGluMlp},
+        linear::{
+            project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
+            unloaded_maybe_quantized_linear,
+        },
+        moe::{PackedSwiGluExperts, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
+        tensor::create_causal_mask,
+    },
 };
 
 #[cfg(test)]
-use crate::runtime::cache::residency::open_prompt_cache_snapshot;
+use crate::backend::mlx::runtime::cache::residency::open_prompt_cache_snapshot;
 
 fn default_model_type() -> String {
     "kimi_linear".into()
@@ -2801,7 +2801,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Kimi Linear token generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, Model, Cache, S>;
 
 pub(crate) fn transform_safetensors_weight(
@@ -2904,7 +2904,7 @@ pub fn load_model_quantized(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let args = get_model_args(model_dir)?;
-    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+    if !crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
         "Kimi Linear",
         args.quantization,
         quantization,
@@ -3445,7 +3445,7 @@ mod tests {
         prompt_cache_architecture_fingerprint, translate_gguf_weight_name, AttentionKind, Cache,
         FeedForwardPolicy, LayerCache, LayerPolicy, Model, ModelInput,
     };
-    use crate::runtime::attention::LayerSchedule;
+    use crate::core::attention::LayerSchedule;
 
     fn config() -> serde_json::Value {
         json!({

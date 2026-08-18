@@ -26,12 +26,10 @@ use crate::{
         qwen::dense as dense_qwen,
         qwen::hybrid::qwen3_5::{self, LayerPolicy as QwenHybridLayerPolicy},
     },
+    backend::mlx::runtime::media::input::{self, InputPayload, Modality},
+    core::attention::AttentionPolicy,
     core::residency::MemoryTier,
     nn::rope::FloatOrString,
-    runtime::{
-        attention::AttentionPolicy,
-        media::input::{self, InputPayload, Modality},
-    },
 };
 
 fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
@@ -2536,13 +2534,13 @@ mod tests {
             "tie_word_embeddings": false
         }))
         .unwrap();
-        args.attention_schedule = crate::runtime::attention::LayerSchedule::new(
+        args.attention_schedule = crate::core::attention::LayerSchedule::new(
             4,
             vec![
-                crate::runtime::attention::AttentionPolicy::sliding(4).unwrap(),
-                crate::runtime::attention::AttentionPolicy::Full,
-                crate::runtime::attention::AttentionPolicy::sliding(8).unwrap(),
-                crate::runtime::attention::AttentionPolicy::sliding(4).unwrap(),
+                crate::core::attention::AttentionPolicy::sliding(4).unwrap(),
+                crate::core::attention::AttentionPolicy::Full,
+                crate::core::attention::AttentionPolicy::sliding(8).unwrap(),
+                crate::core::attention::AttentionPolicy::sliding(4).unwrap(),
             ],
         )
         .unwrap();
@@ -2597,7 +2595,7 @@ mod tests {
 
     #[test]
     fn gpt_oss_runtime_state_uses_exact_schedule_and_distinct_windows() {
-        use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
+        use crate::core::attention::{AttentionPolicy, LayerSchedule};
 
         let mut args = gpt_oss::model_args_from_config_value(&json!({
             "model_type": "gpt_oss", "hidden_size": 32,
@@ -2737,12 +2735,12 @@ mod tests {
             mlp_bias: false,
             rope_scaling: None,
             attention_schedule: match sliding_window {
-                Some(window) => crate::runtime::attention::LayerSchedule::all_sliding(
+                Some(window) => crate::core::attention::LayerSchedule::all_sliding(
                     2,
                     u32::try_from(window).unwrap(),
                 )
                 .unwrap(),
-                None => crate::runtime::attention::LayerSchedule::all_full(2).unwrap(),
+                None => crate::core::attention::LayerSchedule::all_full(2).unwrap(),
             },
             quantization: None,
             quantization_config: None,
@@ -2780,7 +2778,7 @@ mod tests {
             quantization_bits: 4,
             hidden_size_per_layer_input: 0,
             vocab_size_per_layer_input: None,
-            layer_schedule: crate::runtime::attention::LayerSchedule::new(
+            layer_schedule: crate::core::attention::LayerSchedule::new(
                 4,
                 vec![
                     layer(
@@ -2849,7 +2847,7 @@ mod tests {
 
     #[test]
     fn llama_runtime_state_groups_exact_per_layer_windows() {
-        use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
+        use crate::core::attention::{AttentionPolicy, LayerSchedule};
 
         let mut args = tiny_llama(2, None);
         args.attention_schedule = LayerSchedule::new(
@@ -3068,7 +3066,7 @@ mod tests {
     #[test]
     fn qwen_prepared_grid_bounds_vision_workspace() {
         let config = crate::architectures::qwen::vl::vision::VisionConfig {
-            layer_schedule: crate::runtime::attention::LayerSchedule::new(
+            layer_schedule: crate::core::attention::LayerSchedule::new(
                 2,
                 vec![
                     crate::architectures::qwen::vl::vision::VisionLayerPolicy {
@@ -3142,7 +3140,7 @@ mod tests {
     #[test]
     fn inkling_runtime_state_groups_the_exact_ordered_schedule() {
         use crate::architectures::inkling::model::{FeedForwardPolicy, LayerPolicy};
-        use crate::runtime::attention::LayerSchedule;
+        use crate::core::attention::LayerSchedule;
 
         let mut args = tiny_inkling();
         args.text_config.num_key_value_heads = 1;
@@ -3270,7 +3268,7 @@ mod tests {
             AttentionPolicy::sliding(5).unwrap(),
             AttentionPolicy::Full,
         ];
-        args.layer_schedule = crate::runtime::attention::LayerSchedule::new(
+        args.layer_schedule = crate::core::attention::LayerSchedule::new(
             4,
             args.layer_schedule
                 .iter()
@@ -3309,7 +3307,7 @@ mod tests {
         let mut args = tiny_gemma4();
         let mut policies = args.layer_schedule.iter().copied().collect::<Vec<_>>();
         policies[0].head_dim = std::num::NonZeroU32::new(8).unwrap();
-        args.layer_schedule = crate::runtime::attention::LayerSchedule::new(4, policies).unwrap();
+        args.layer_schedule = crate::core::attention::LayerSchedule::new(4, policies).unwrap();
 
         let (_, _, _, _, layout) = gemma4_spec(&args, text_modalities()).unwrap();
         assert_eq!(layout.growing.len(), 2);

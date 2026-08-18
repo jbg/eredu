@@ -21,16 +21,17 @@ use safemlx_lm::{
         distributed::pipeline::{load_pipeline_model_with_options, PipelineStep},
         gemma4::model::{self as gemma4, Cache, Model},
     },
-    backend::mlx::ModelLoadOptions,
-    core::residency::OffloadConfig,
-    nn::generation::CausalLm,
-    runtime::media::{
+    backend::mlx::runtime::media::{
         input::{InputMetadata, InputPart, ModelInput},
         PreparedModelInput,
     },
-    DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions, MlxBackend,
-    MlxParallelContext, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
-    PromptCacheTopology, WeightResidency,
+    backend::mlx::{
+        DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions, MlxBackend,
+        MlxParallelContext, ModelLoadOptions, PagedCacheOptions, WeightResidency,
+    },
+    core::residency::OffloadConfig,
+    nn::generation::CausalLm,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
 };
 
 const WORKER: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_WORKER";
@@ -152,10 +153,11 @@ fn write_safetensors_fixture(directory: &Path, config: serde_json::Value) {
         .flatten()
         .iter()
         .map(|(name, value)| {
-            let canonical = safemlx_lm::runtime::checkpoint::binding::canonical_checkpoint_name(
-                name,
-            )
-            .replacen("model.language_model.", "language_model.model.", 1);
+            let canonical =
+                safemlx_lm::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                    name,
+                )
+                .replacen("model.language_model.", "language_model.model.", 1);
             (canonical, *value)
         })
         .collect::<Vec<_>>();
@@ -460,7 +462,10 @@ fn write_gguf_fixture_kind(directory: &Path, moe: bool) -> PathBuf {
     let mut text = HashMap::new();
     let mut projector = HashMap::new();
     for (name, value) in model.parameters().flatten() {
-        let name = safemlx_lm::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+        let name =
+            safemlx_lm::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                &name,
+            );
         if name.starts_with("model.language_model.") || name.starts_with("lm_head.") {
             text.insert(text_gguf_name(&name), value.clone());
         } else {
@@ -741,7 +746,11 @@ fn gemma4_multimodal_pipeline_ring_worker() {
         .unwrap()
         .with_full_attention(true);
     let mut cache = model
-        .new_cache_with_options(safemlx_lm::CacheResidencyPolicy::Paged(paged.clone()))
+        .new_cache_with_options(
+            safemlx_lm::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
+                paged.clone(),
+            ),
+        )
         .unwrap();
     // Two text tokens, one pooled image token, and two audio tokens.
     let step = PipelineStep::new(1, 5).unwrap();

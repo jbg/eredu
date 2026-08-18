@@ -12,8 +12,8 @@ use safemlx_lm_core::{
 };
 
 use crate::{
-    error::Error,
-    runtime::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::{
         distributed::{
             completion::DistributedCompletion,
             parallel::{sample_and_synchronize, ParallelExecutionContext, SynchronizedToken},

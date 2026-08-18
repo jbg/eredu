@@ -36,11 +36,26 @@ use crate::core::cache::{
 
 use crate::{
     architectures::qwen::dense::{gguf_i32_catalog, gguf_string},
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::residency::{
+        open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
+        CacheResidencyManager, CacheResidencyReport, PagedCacheOptions, PromptCacheSnapshotBlock,
+        PromptCacheStateArray,
+    },
+    backend::mlx::runtime::cache::{
+        BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+    },
+    backend::mlx::runtime::checkpoint::load::{
+        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
+        load_named_array_strict, safetensors_files, StrictLoadConfig, StrictLoadReport,
+    },
+    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
+    backend::mlx::runtime::media::input,
+    core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
         CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
         StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
-    error::Error,
     nn::{
         self as common,
         convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
@@ -48,21 +63,6 @@ use crate::{
         layers::SwiGluMlp,
         moe::PackedSwiGluExperts,
     },
-    runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::residency::{
-        open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-        CacheResidencyManager, CacheResidencyReport, PagedCacheOptions, PromptCacheSnapshotBlock,
-        PromptCacheStateArray,
-    },
-    runtime::cache::{
-        BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-    },
-    runtime::checkpoint::load::{
-        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
-        load_named_array_strict, safetensors_files, StrictLoadConfig, StrictLoadReport,
-    },
-    runtime::checkpoint::quantization::WeightQuantization,
-    runtime::media::input,
 };
 
 fn default_model_type() -> String {
@@ -1930,10 +1930,10 @@ impl DecoderLayer {
 
     pub(crate) fn register_tensor_parallel_parameters(
         &self,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         prefix: &str,
     ) -> Result<(), Error> {
-        use crate::runtime::distributed::parallel::{
+        use crate::backend::mlx::runtime::distributed::parallel::{
             aligned_partition_units, array_parameter_member, partitioned_projection_members,
             register_partitioned_projection_group, MemberSharding, ParameterGroupSpec,
             ParameterMemberSpec, ParameterRole, ProjectionSharding,
@@ -2866,10 +2866,10 @@ impl AudioModel {
 
     pub(crate) fn register_tensor_parallel_parameters(
         &self,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         prefix: &str,
     ) -> Result<(), Error> {
-        use crate::runtime::distributed::parallel::{
+        use crate::backend::mlx::runtime::distributed::parallel::{
             MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
         };
         let mut members = Vec::new();
@@ -3603,7 +3603,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Inkling token generation iterator.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 pub(crate) struct LoadedInklingGguf {
@@ -3622,7 +3622,8 @@ pub(crate) struct InklingMmprojGguf {
 }
 
 pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<InklingMmprojGguf>, Error> {
-    let Some(path) = crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "inkling")?
+    let Some(path) =
+        crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "inkling")?
     else {
         return Ok(None);
     };
@@ -5005,8 +5006,8 @@ mod tests {
     #[test]
     fn prompt_cache_layout_records_four_convolutions_and_attention_order() {
         use crate::{
+            core::attention::AttentionPolicy,
             core::cache::{LayerCachePolicy, StateTensorRole},
-            runtime::attention::AttentionPolicy,
         };
 
         let args = super::args_from_gguf_catalog(&tiny_gguf_metadata()).unwrap();
@@ -5036,8 +5037,8 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_paged_multimodal_convolution_state_save_reload_parity() {
+        use crate::backend::mlx::runtime::cache::{residency::PagedCacheOptions, KeyValueCache};
         use crate::core::cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology};
-        use crate::runtime::cache::{residency::PagedCacheOptions, KeyValueCache};
 
         let args = super::args_from_gguf_catalog(&tiny_gguf_metadata()).unwrap();
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -5412,9 +5413,11 @@ mod tests {
             audio.weight_quantization_for("audio.encoder.weight"),
             Some(audio_quantization)
         );
-        let config = crate::runtime::checkpoint::load::StrictLoadConfig::default();
-        let mut audio_report = crate::runtime::checkpoint::load::StrictLoadReport::default();
-        let mut vision_report = crate::runtime::checkpoint::load::StrictLoadReport::default();
+        let config = crate::backend::mlx::runtime::checkpoint::load::StrictLoadConfig::default();
+        let mut audio_report =
+            crate::backend::mlx::runtime::checkpoint::load::StrictLoadReport::default();
+        let mut vision_report =
+            crate::backend::mlx::runtime::checkpoint::load::StrictLoadReport::default();
         let mut materializer = mmproj.checkpoint.materializer();
         for tensor in mmproj.checkpoint.catalog().tensors() {
             let physical = &tensor.descriptor().name;
@@ -5425,7 +5428,7 @@ mod tests {
             {
                 let translated = super::translate_mmproj_weight_name(&name);
                 if let Some(name) = translated.strip_prefix("audio.") {
-                    crate::runtime::checkpoint::load::load_named_array_strict(
+                    crate::backend::mlx::runtime::checkpoint::load::load_named_array_strict(
                         &mut audio_model,
                         name.into(),
                         value,
@@ -5435,7 +5438,7 @@ mod tests {
                     )
                     .unwrap();
                 } else if let Some(name) = translated.strip_prefix("visual.layers.0.") {
-                    crate::runtime::checkpoint::load::load_named_array_strict(
+                    crate::backend::mlx::runtime::checkpoint::load::load_named_array_strict(
                         &mut vision_layer,
                         name.into(),
                         value,

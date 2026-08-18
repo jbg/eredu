@@ -22,14 +22,16 @@ use safemlx_lm::{
         distributed::pipeline::{load_pipeline_model_with_options, PipelineStep},
         qwen::vl::model as qwen3_vl,
     },
-    backend::mlx::ModelLoadOptions,
+    backend::mlx::runtime::generation::sampler::DefaultSampler,
+    backend::mlx::runtime::media::input::{InputMetadata, InputPart, ModelInput},
+    backend::mlx::runtime::media::PreparedModelInput,
+    backend::mlx::{
+        DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions, LayerwiseLoadOptions,
+        MlxBackend, MlxParallelContext, ModelLoadOptions, NonExpertWeightResidency,
+        PagedCacheOptions, WeightResidency,
+    },
     nn::generation::CausalLm,
-    runtime::generation::sampler::DefaultSampler,
-    runtime::media::input::{InputMetadata, InputPart, ModelInput},
-    runtime::media::PreparedModelInput,
-    DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions, LayerwiseLoadOptions,
-    MlxBackend, MlxParallelContext, NonExpertWeightResidency, PagedCacheOptions,
-    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
 };
 
 const WORKER: &str = "SAFEMLX_QWEN3_VL_PIPELINE_WORKER";
@@ -128,7 +130,9 @@ fn write_fixture(directory: &Path, moe: bool) {
         .iter()
         .map(|(name, value)| {
             (
-                safemlx_lm::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+                safemlx_lm::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                    name,
+                ),
                 *value,
             )
         })
@@ -534,7 +538,11 @@ fn qwen3_vl_pipeline_ring_worker() {
     let input = multimodal_input(&before, &pixels, &grid, &after, &mut parts);
     let prepared = PreparedModelInput::from_model_input(input).unwrap();
     let mut cache = model
-        .new_cache_with_options(safemlx_lm::CacheResidencyPolicy::Paged(paged.clone()))
+        .new_cache_with_options(
+            safemlx_lm::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
+                paged.clone(),
+            ),
+        )
         .unwrap();
     let logits = prepared
         .with_model_input(|input| {

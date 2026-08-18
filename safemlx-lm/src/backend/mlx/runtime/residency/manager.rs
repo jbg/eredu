@@ -1,12 +1,12 @@
 //! MLX materialization and transfer execution for immutable weight units.
 //!
-//! A [`crate::runtime::residency::manager::ResidencyManager`] moves caller-defined groups of
-//! checkpoint selections from a [`crate::runtime::checkpoint::store::WeightStore`] into
+//! A [`crate::backend::mlx::runtime::residency::manager::ResidencyManager`] moves caller-defined groups of
+//! checkpoint selections from a [`crate::backend::mlx::runtime::checkpoint::store::WeightStore`] into
 //! immutable typed host-transfer buffers or execution-stream arrays. The
 //! manager accounts for logical host and device copies independently, even on
 //! unified-memory systems.
 //! Missing units can be reserved and submitted as one batch. Caller-owned
-//! [`crate::runtime::residency::manager::ResidentTransfer`] values retain
+//! [`crate::backend::mlx::runtime::residency::manager::ResidentTransfer`] values retain
 //! source mappings until MLX reports exact completion of the submitted
 //! transfer.
 
@@ -25,15 +25,15 @@ use safemlx::{
 
 use crate::{
     backend::mlx::residency::sample_allocator_memory,
+    backend::mlx::runtime::checkpoint::recipe::{DerivedWeightRecipe, WeightRecipeError},
+    backend::mlx::runtime::checkpoint::store::{
+        PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore,
+        WeightStoreDiagnostics, WeightStoreError,
+    },
     core::residency::{
         EvictedResidencyCopy, MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId,
         OffloadUnitSpec, PrefetchOutcome, ResidencyLedger, ResidencyLedgerError, TransferDirection,
         UnitResidencyReport,
-    },
-    runtime::checkpoint::recipe::{DerivedWeightRecipe, WeightRecipeError},
-    runtime::checkpoint::store::{
-        PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore,
-        WeightStoreDiagnostics, WeightStoreError,
     },
 };
 
@@ -660,8 +660,9 @@ pub struct ResidencyReport {
     units: Vec<UnitResidencyReport>,
     active_window: Vec<OffloadUnitId>,
     weight_store: WeightStoreDiagnostics,
-    materialization:
-        Option<crate::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport>,
+    materialization: Option<
+        crate::backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
+    >,
 }
 
 impl ResidencyReport {
@@ -688,14 +689,16 @@ impl ResidencyReport {
     /// Returns bounded load-time materialization telemetry for these units.
     pub const fn materialization(
         &self,
-    ) -> Option<&crate::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport> {
+    ) -> Option<
+        &crate::backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
+    > {
         self.materialization.as_ref()
     }
 
     pub(crate) fn with_materialization(
         mut self,
         materialization: Option<
-            crate::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
+            crate::backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
         >,
     ) -> Self {
         self.materialization = materialization;
@@ -2182,8 +2185,8 @@ mod tests {
 
     use super::*;
     use crate::{
+        backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
         core::residency::{OffloadConfig, OffloadUnitSpec, ResidencyLedgerError, ResidencyPolicy},
-        runtime::checkpoint::store::SafetensorsWeightStore,
     };
 
     fn cpu_stream() -> Stream {

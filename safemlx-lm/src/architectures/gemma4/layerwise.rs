@@ -38,42 +38,44 @@ use crate::{
             Gemma4VisionTower, VisionLayer,
         },
     },
-    error::Error,
-    nn::{
-        generation::CausalLm,
-        parallel::{LinearParallelism, ParallelLinear, VocabParallelLmHead},
-        tensor::create_causal_mask,
-    },
-    runtime::attention::AttentionPolicy,
-    runtime::cache::{residency::PagedCacheOptions, KeyValueCache},
-    runtime::checkpoint::binding::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::cache::{residency::PagedCacheOptions, KeyValueCache},
+    backend::mlx::runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::{
+    backend::mlx::runtime::checkpoint::{
         quantization::WeightQuantization,
         recipe::DerivedWeightRecipe,
         store::{GgufWeightStore, TensorSelection, WeightStore},
     },
-    runtime::distributed::parallel::{
+    backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
         register_partitioned_projection_group, register_projection_module,
         register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
         ParameterMemberSpec, ParameterRole, ProjectionSharding,
     },
-    runtime::execution::layerwise::{
+    backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
     },
-    runtime::media::input,
-    runtime::residency::expert_cache::{
+    backend::mlx::runtime::media::input,
+    backend::mlx::runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
         ExpertIdentity, ExpertPass, ExpertRouteBatch,
     },
-    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+    backend::mlx::runtime::residency::manager::{
+        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
+    },
+    core::attention::AttentionPolicy,
+    nn::{
+        generation::CausalLm,
+        parallel::{LinearParallelism, ParallelLinear, VocabParallelLmHead},
+        tensor::create_causal_mask,
+    },
 };
 
 const EMBEDDING_UNIT: &str = "gemma4.static.embedding";
@@ -538,11 +540,16 @@ impl Gemma4LayerwiseModel {
     }
 
     /// Returns canonical parameter and residency metadata.
-    pub fn metadata(&self) -> &crate::LayerwiseModelMetadata {
+    pub fn metadata(
+        &self,
+    ) -> &crate::backend::mlx::runtime::execution::layerwise::LayerwiseModelMetadata {
         self.execution.metadata()
     }
 
-    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::MlxParallelContext) {
+    pub(crate) fn bind_parallel_topology(
+        &mut self,
+        topology: crate::backend::mlx::MlxParallelContext,
+    ) {
         self.execution.bind_parallel_topology(topology);
     }
 
@@ -573,7 +580,9 @@ impl Gemma4LayerwiseModel {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
     }
 
@@ -628,7 +637,10 @@ impl Gemma4LayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<
+        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
+        Error,
+    > {
         self.execution.dense_stream_report()
     }
 
@@ -665,7 +677,7 @@ impl Gemma4LayerwiseModel {
         inputs: &Array,
         cache: &mut Cache,
         stream: &Stream,
-        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
         self.execution
             .forward_with_observer(Gemma4Input::Decode(inputs), cache, stream, observer)
@@ -677,7 +689,7 @@ impl Gemma4LayerwiseModel {
         input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
         self.execution
             .forward_with_observer(Gemma4Input::Prefill(input), cache, stream, observer)
@@ -997,7 +1009,7 @@ pub(crate) fn execute_transformed_gemma4_model_with_modalities(
 pub(crate) fn load_gemma4_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4LayerwiseModel, Error> {
@@ -1009,7 +1021,7 @@ pub(crate) fn load_gemma4_tensor_parallel_layerwise_model(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let mmproj = resident::open_sibling_mmproj(model_dir)?;
         return load_gemma4_gguf_tensor_parallel_model(
             &checkpoint,
@@ -1055,7 +1067,7 @@ pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
     metadata: &HashMap<String, GgufMetadataValue>,
     mmproj: Option<&resident::Gemma4MmprojGguf>,
     options: LayerWeightResidency,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(Gemma4LayerwiseModel, Vec<u32>), Error> {
@@ -1200,7 +1212,7 @@ pub(crate) fn load_gemma4_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4LayerwiseModel, Error> {
@@ -1230,7 +1242,7 @@ pub(crate) fn gemma4_expert_catalog_for_layers(
     args: &ModelArgs,
     store: &dyn WeightStore,
     layers: impl IntoIterator<Item = usize>,
-    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let global_experts = usize::try_from(args.num_experts.ok_or_else(|| {
         Error::UnsupportedArchitecture("Gemma 4 MoE config has no expert count".into())
@@ -1309,12 +1321,14 @@ pub(crate) fn gemma4_expert_catalog_for_layers(
                 }
             }
             let bindings = match layout {
-                Some(layout) => crate::runtime::execution::layerwise::shard_layer_bindings(
-                    bindings,
-                    &logical_prefix,
-                    store,
-                    layout,
-                )?,
+                Some(layout) => {
+                    crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
+                        bindings,
+                        &logical_prefix,
+                        store,
+                        layout,
+                    )?
+                }
                 None => bindings,
             };
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
@@ -1708,8 +1722,8 @@ impl Gemma4LayerwiseAdapter {
     pub(crate) fn new_cartesian_text_layer(
         &self,
         index: usize,
-        layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
-        assignment: Option<&crate::runtime::distributed::expert::ExpertAssignment>,
+        layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<TransformerBlock, Error> {
         match self.new_cartesian_layer(
@@ -1732,7 +1746,7 @@ impl Gemma4LayerwiseAdapter {
         index: usize,
         _layer: &TransformerBlock,
         store: &dyn WeightStore,
-        layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+        layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_cartesian_text_layer(index, None, None, stream)?;
@@ -1740,7 +1754,7 @@ impl Gemma4LayerwiseAdapter {
         let Some(layout) = layout else {
             return Ok(bindings);
         };
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             bindings,
             &format!("model.language_model.layers.{index}"),
             store,
@@ -1967,7 +1981,9 @@ impl Gemma4LayerwiseAdapter {
         &mut self,
         input_ids: &Array,
         hidden: &Array,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Option<Array>, Error> {
         match (
@@ -2251,7 +2267,9 @@ impl Gemma4LayerwiseAdapter {
     pub(crate) fn begin_pipeline_ingress(
         &mut self,
         input: input::ModelInput<'_>,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Gemma4PipelineIngressState, Error> {
         let mut cache = Cache::new(&self.args);
@@ -2368,7 +2386,9 @@ impl Gemma4LayerwiseAdapter {
         index: usize,
         layer: &mut Gemma4Layer,
         state: &mut Gemma4PipelineIngressState,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Vec<Array>, Error> {
         state.forward.hidden = match execution {
@@ -2405,7 +2425,9 @@ impl Gemma4LayerwiseAdapter {
     pub(crate) fn finish_pipeline_ingress(
         &mut self,
         mut state: Gemma4PipelineIngressState,
-        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execution: Option<
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        >,
         stream: &Stream,
     ) -> Result<Gemma4PipelineIngressOutput, Error> {
         let text_group = self.pipeline_text_group();
@@ -2505,7 +2527,9 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         &self.args.model_type
     }
 
-    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(
+        &self,
+    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
         self.args.weight_quantization()
     }
 
@@ -2549,7 +2573,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 
     fn prompt_cache_model_identity(
         &self,
-        topology: Option<crate::MlxParallelContext>,
+        topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = self.args.num_hidden_layers as usize;
         let layer_layout = match topology {
@@ -3020,7 +3044,9 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         &mut self,
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let Some(group) = execution.group() else {
             return self.begin_forward(input, cache, execution.stream());
@@ -3264,8 +3290,10 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 
     fn execution_graph(
         &self,
-    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        use crate::runtime::execution::layerwise::{ExecutionGroupDag, ExecutionGroupSpec};
+    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        use crate::backend::mlx::runtime::execution::layerwise::{
+            ExecutionGroupDag, ExecutionGroupSpec,
+        };
         let mut groups = Vec::new();
         let mut ingress = Vec::new();
         if self.vision_depth > 0 {
@@ -3337,8 +3365,8 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 
     fn register_parallel_parameters(
         &self,
-        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.embedding
@@ -3532,8 +3560,8 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 
     fn configure_parallel_static(
         &mut self,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         let local_semantic = |targets: &[String], global: i32| -> Result<i32, Error> {
@@ -3789,7 +3817,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let local_semantic = |target: &str, global: i32| -> Result<i32, Error> {
@@ -3873,7 +3901,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
@@ -3908,8 +3936,8 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
-        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
@@ -3941,7 +3969,8 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
     fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+    {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
         }
@@ -3959,7 +3988,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
             Error::Parallel("Gemma 4 MoE config has no global expert count".into())
         })?;
         Ok(Some(
-            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
                 usize::try_from(experts)
                     .map_err(|_| Error::Parallel("Gemma 4 expert count is negative".into()))?,
                 topology.expert_parallel_size,
@@ -3974,7 +4003,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let source = self.new_layer(group, index, stream)?;
@@ -4058,11 +4087,11 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn WeightStore,
-        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
-        crate::runtime::execution::layerwise::shard_layer_bindings(
+        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
             store,
@@ -4164,7 +4193,9 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         }
     }
 
-    fn forward_layer_with_observer<O: crate::runtime::execution::inspection::ActivationObserver>(
+    fn forward_layer_with_observer<
+        O: crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+    >(
         &mut self,
         group: usize,
         index: usize,
@@ -4232,7 +4263,9 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.forward_layer(
@@ -4429,7 +4462,9 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         dependency_outputs: &[Array],
         cache: &mut Self::Cache,
         context: &mut Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(tp_group) = execution.group() else {
             return self.begin_execution_group(
@@ -4557,7 +4592,9 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         hidden: &Array,
         cache: &mut Self::Cache,
         context: &Self::ForwardContext,
-        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
     ) -> Result<Array, Error> {
         let Some(group) = execution.group() else {
             return self.finish(hidden, cache, context, execution.stream());
@@ -4615,7 +4652,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 }
 
 /// Gemma 4 token generation using bounded text-layer execution.
-pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, Gemma4LayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -4637,9 +4674,7 @@ mod tests {
             model::{self as resident, Model, ModelInput},
             vision::Gemma4VisionConfig,
         },
-        core::residency::{MemoryTier, OffloadConfig},
-        nn::generation::CausalLm,
-        runtime::{
+        backend::mlx::runtime::{
             cache::ConcatKeyValueCache,
             checkpoint::quantization::{AffineQuantization, WeightQuantization},
             distributed::parallel::{ParallelBuildContext, ShardingPolicy},
@@ -4651,6 +4686,8 @@ mod tests {
             media::input as runtime_input,
             residency::dense_stream::DenseDiskStreamLoadOptions,
         },
+        core::residency::{MemoryTier, OffloadConfig},
+        nn::generation::CausalLm,
     };
 
     fn config() -> serde_json::Value {
@@ -4903,8 +4940,15 @@ mod tests {
             .flatten()
             .iter()
             .map(|(name, value)| {
-                let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(name)
-                    .replacen("model.language_model.", "language_model.model.", 1);
+                let name =
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        name,
+                    )
+                    .replacen(
+                        "model.language_model.",
+                        "language_model.model.",
+                        1,
+                    );
                 (name, *value)
             })
             .collect::<Vec<_>>();
@@ -4976,8 +5020,15 @@ mod tests {
             .flatten()
             .iter()
             .map(|(name, value)| {
-                let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(name)
-                    .replacen("model.language_model.", "language_model.model.", 1);
+                let name =
+                    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                        name,
+                    )
+                    .replacen(
+                        "model.language_model.",
+                        "language_model.model.",
+                        1,
+                    );
                 (name, *value)
             })
             .collect::<Vec<_>>();
@@ -5276,7 +5327,7 @@ mod tests {
 
     #[test]
     fn tensor_parallel_plan_keeps_gemma_expert_companions_block_aligned() {
-        use crate::runtime::checkpoint::quantization::WeightQuantization;
+        use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
 
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut value = config();
