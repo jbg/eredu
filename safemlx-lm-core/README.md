@@ -15,6 +15,14 @@ backend and session once, and submits prefill/decode without exposing an
 executable or cache. The same generic client code is exercised by the core mock
 backend and the production MLX adapter.
 
+Capability and inspection documents are canonical here as well. `Observed<T>`
+is the single fail-closed measurement vocabulary; `ModelCapabilities`,
+`StateLayout`, runtime-state reports, memory reports, and admission outcomes do
+not name an accelerator. Core performs checked state estimation and admission
+policy. `ModelInspectionReport` carries portable readiness and structured
+issues. A selected backend derives these values from its executable formats,
+prepared inputs, allocator counters, and structural loader constraints.
+
 `load_model(&backend, artifact, options)` is the canonical artifact entry
 point. `ModelLoadingBackend` supplies only policy resolution and conversion of
 the neutral `ModelPreparationPlan` into its associated model configuration.

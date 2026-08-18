@@ -7,18 +7,18 @@ use safemlx_lm_core::{
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningBackend, AutomaticPlanningError,
     BackendId, BoundedResidencyRequirement, CandidateAdmission, DevicePlan, DurationSeconds,
     ExecutionPlan, ExecutionPlanReport, ExpertCacheTelemetry, HardwareBackendProfile,
-    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, ModelKind,
-    ModelResourceProfile, MtpStats, MtpTelemetry, ObservationKind, Observed, ResidencyPlan,
+    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InspectionSeverity, ModelKind,
+    ModelResourceProfile, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics, ResidencyPlan,
     ResidencyTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
     EXECUTION_PLAN_SCHEMA_VERSION,
 };
 
-use super::{MlxBackend, ModelLoadOptions};
+use super::{
+    capability::available_memory,
+    inspection::{inspect_model, MlxInspectionOptions},
+    MlxBackend, ModelLoadOptions,
+};
 use crate::{
-    api::{
-        available_memory, inspect_model, CapabilityValue, InspectionSeverity, MeasurementKind,
-        ModelInspectionOptions, PhysicalMemorySemantics,
-    },
     error::Error,
     runtime::{
         checkpoint::quantization::{AffineQuantization, WeightQuantization},
@@ -44,8 +44,8 @@ pub fn discover_hardware() -> HardwareProfile {
     );
     let (physical_memory_bytes, available_memory_bytes, semantics) = match available_memory() {
         Ok(memory) => (
-            observed_capability(&memory.physical_memory_bytes),
-            observed_capability(&memory.available_memory_bytes),
+            memory.physical_memory_bytes,
+            memory.available_memory_bytes,
             memory_semantics(memory.physical_semantics),
         ),
         Err(error) => (
@@ -230,7 +230,7 @@ impl AutomaticPlanningBackend for MlxAutomaticPlanningBackend {
         &self,
         model_path: &Path,
     ) -> Result<ModelResourceProfile, AutomaticPlanningError> {
-        inspect_model(model_path, ModelInspectionOptions::default())
+        inspect_model(model_path, MlxInspectionOptions::default())
             .map(|report| report.resources)
             .map_err(|error| planning_backend_error("inspect_resources", error))
     }
@@ -244,7 +244,7 @@ impl AutomaticPlanningBackend for MlxAutomaticPlanningBackend {
             .map_err(|error| planning_backend_error("realize_plan", error))?;
         let report = inspect_model(
             model_path,
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load,
                 chat_request: None,
             },
@@ -424,27 +424,6 @@ pub fn mtp_telemetry(stats: &MtpStats) -> MtpTelemetry {
         adaptive_lookahead_disabled: stats.adaptive_lookahead_disabled,
         optimistic_draft_seconds: stats.optimistic_draft_time.as_secs_f64(),
         verification_in_flight_seconds: stats.verification_in_flight_time.as_secs_f64(),
-    }
-}
-
-fn observed_capability(value: &CapabilityValue<u64>) -> Observed<u64> {
-    match value {
-        CapabilityValue::Available {
-            value,
-            kind,
-            source,
-        } => Observed::Available {
-            value: *value,
-            kind: match kind {
-                MeasurementKind::Exact => ObservationKind::Exact,
-                MeasurementKind::Conservative => ObservationKind::Conservative,
-                MeasurementKind::Observational => ObservationKind::Observational,
-                MeasurementKind::Estimated => ObservationKind::Estimated,
-            },
-            source: (*source).into(),
-        },
-        CapabilityValue::Unsupported { reason } => Observed::unsupported(reason.clone()),
-        CapabilityValue::Unavailable { reason } => Observed::unavailable(reason.clone()),
     }
 }
 

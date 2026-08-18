@@ -124,7 +124,7 @@ pub(super) fn read_model_configuration(
     Ok(safemlx_lm_core::resolve_model_configuration(&json)?)
 }
 
-pub(super) fn is_gguf_file(path: &Path) -> bool {
+pub(crate) fn is_gguf_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -149,7 +149,7 @@ fn portable_gguf_metadata(
         .collect())
 }
 
-pub(super) fn load_gguf_tokenizer_from_metadata(
+pub(crate) fn load_gguf_tokenizer_from_metadata(
     gguf_file: &Path,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
 ) -> Result<GgufTokenizer, TextMetadataError> {
@@ -168,7 +168,7 @@ pub(super) fn load_gguf_tokenizer_from_metadata(
     })
 }
 
-pub(super) fn load_chat_template(
+pub(crate) fn load_chat_template(
     model_dir: &Path,
 ) -> Result<Option<ModelChatTemplate>, TextMetadataError> {
     let config_path = model_dir.join("tokenizer_config.json");
@@ -205,7 +205,7 @@ pub(super) fn load_chat_template(
     Ok(None)
 }
 
-pub(super) fn load_tokenizer_template_kwargs(
+pub(crate) fn load_tokenizer_template_kwargs(
     model_dir: &Path,
 ) -> Result<Map<String, Value>, TextMetadataError> {
     let config_path = model_dir.join("tokenizer_config.json");

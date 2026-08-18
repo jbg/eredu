@@ -180,4 +180,20 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<safemlx_lm::ValueDescriptor>(),
         TypeId::of::<safemlx_lm::core::backend::ValueDescriptor>(),
     );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::ModelCapabilities>(),
+        TypeId::of::<safemlx_lm::core::capability::ModelCapabilities>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::RuntimeStateEstimate>(),
+        TypeId::of::<safemlx_lm::core::capability::RuntimeStateEstimate>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::AdmissionResult>(),
+        TypeId::of::<safemlx_lm::core::capability::AdmissionResult>(),
+    );
+    assert_eq!(
+        TypeId::of::<safemlx_lm::ModelInspectionReport>(),
+        TypeId::of::<safemlx_lm::core::inspection::ModelInspectionReport>(),
+    );
 }

@@ -80,7 +80,8 @@ impl<T> Observed<T> {
         }
     }
 
-    fn value(&self) -> Option<&T> {
+    /// Borrows the available value, returning `None` when no value was reported.
+    pub const fn value(&self) -> Option<&T> {
         match self {
             Self::Available { value, .. } => Some(value),
             Self::Unsupported { .. } | Self::Unavailable { .. } => None,

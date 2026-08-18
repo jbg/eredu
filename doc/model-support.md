@@ -11,9 +11,12 @@ policy produces a structured error.
 Use `inspect_model` before reserving a device or loading weights:
 
 ```rust,no_run
-use safemlx_lm::{inspect_model, InspectionSeverity, ModelInspectionOptions};
+use safemlx_lm::{
+    backend::mlx::{inspect_model, MlxInspectionOptions},
+    InspectionSeverity,
+};
 
-let report = inspect_model("/path/to/model", ModelInspectionOptions::default())?;
+let report = inspect_model("/path/to/model", MlxInspectionOptions::default())?;
 if !report.is_loadable() {
     for issue in report
         .issues

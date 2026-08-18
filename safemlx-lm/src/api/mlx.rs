@@ -61,7 +61,6 @@ use crate::runtime::generation::streaming::{
     CommittedTokenPipelineError, CommittedTokenSource, RawTokenDecoder, TokenDecoderBackend,
 };
 pub(crate) use crate::runtime::media::input;
-use crate::runtime::media::PreparedModelInput;
 #[cfg(feature = "media-processing")]
 use crate::runtime::media::{ChatMediaBinding, ModelProcessor, ProcessorInput};
 use crate::{
@@ -78,27 +77,14 @@ use crate::{
 pub(crate) use crate::architectures::deepseek_v3::model as deepseek_v3;
 /// Gemma 4 text model support.
 pub(crate) use crate::architectures::gemma4::model as gemma4;
-/// OpenAI GPT-OSS sparse decoder architecture.
-pub(crate) use crate::architectures::gpt_oss::model as gpt_oss;
 /// Thinking Machines Lab Inkling multimodal decoder support.
 pub(crate) use crate::architectures::inkling::model as inkling;
 /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder support.
 pub(crate) use crate::architectures::kimi_linear::model as kimi_linear;
-/// Liquid AI LFM2/LFM2.5 dense and MoE text model support.
-pub(crate) use crate::architectures::lfm2::model as lfm2;
-/// Llama decoder-only model support.
-pub(crate) use crate::architectures::llama::model as llama;
-/// Meta Muse-Glimmer dense multimodal decoder support.
-pub(crate) use crate::architectures::muse_glimmer;
 /// Nemotron-H hybrid Mamba2/attention/MoE config support.
 pub(crate) use crate::architectures::nemotron_h::model as nemotron_h;
-/// Shared Qwen2/Qwen2.5/Qwen3 dense decoder support.
-use crate::architectures::qwen::dense as dense_qwen;
 /// Qwen3.5 dense and MoE text model support.
 pub(crate) use crate::architectures::qwen::hybrid::qwen3_5;
-/// Qwen3-VL multimodal conditional-generation support.
-pub(crate) use crate::architectures::qwen::vl::model as qwen3_vl;
-
 #[derive(Debug, Clone, Default, Deserialize)]
 struct EosTokenMetadata {
     #[serde(default)]
@@ -149,7 +135,7 @@ fn append_unique_eos_token_ids(output: &mut Vec<u32>, ids: impl IntoIterator<Ite
     }
 }
 
-fn merge_eos_token_id_sources(
+pub(crate) fn merge_eos_token_id_sources(
     sources: impl IntoIterator<Item = impl IntoIterator<Item = u32>>,
 ) -> Vec<u32> {
     let mut output = Vec::new();
@@ -170,7 +156,7 @@ fn read_optional_eos_token_metadata(
     Ok(Some(serde_json::from_reader(file)?))
 }
 
-fn eos_token_ids_from_sidecar_dir(
+pub(crate) fn eos_token_ids_from_sidecar_dir(
     sidecar_dir: &Path,
 ) -> Result<Vec<u32>, tokenizer::TextMetadataError> {
     let mut output = Vec::new();
@@ -199,25 +185,15 @@ pub(crate) fn gguf_eos_token_ids(
         .map_err(|error| tokenizer::TextMetadataError::UnsupportedArchitecture(error.to_string()))
 }
 
-use crate::backend::mlx::ModelLoadOptions;
 pub use safemlx_lm_core::GgufArchitecture;
 pub use safemlx_lm_core::ModelKind;
 
 pub use safemlx_lm_core::ArtifactFormat;
 
-#[path = "capability.rs"]
-mod capability;
-pub use capability::{
-    available_memory, Admission, AdmissionRejection, AdmissionRequest, AdmissionResult,
-    AvailableMemory, CacheStateStrategy, CapabilityError, CapabilityValue, EstimationCompleteness,
-    InputModalities, InputTokenCount, MeasurementKind, ModelCapabilities, PhysicalMemorySemantics,
-    RuntimeStateEstimate, SlidingWindowLayerCount, StateMemoryAssumptions, StaticMemoryReport,
-};
-
 use crate::backend::mlx::{validate_gemma4_drafter, Model, ModelCache};
 
 #[path = "request.rs"]
-mod request;
+pub(crate) mod request;
 use request::{
     prepare_chat_from_parts, prepared_chat_control_runtime, with_prepared_chat_runtime,
     BackendGenerationTokenSource, PreparedChatSemanticState, PreparedChatSetupError,
@@ -259,23 +235,14 @@ impl PreparedChatSpeculativeBackend for crate::backend::mlx::MlxBackend<'static>
 
 #[path = "loaded.rs"]
 mod loaded;
-pub(crate) use crate::backend::mlx::validate_gguf_quantization_source;
 pub use loaded::LoadedModelLoadError;
 
-#[path = "inspection.rs"]
-mod inspection;
-pub use inspection::{
-    inspect_model, ArtifactModality, ArtifactTensorEncoding, InspectionIssue, InspectionIssueCode,
-    InspectionReadiness, InspectionRequirement, InspectionSeverity, ModelInspectionOptions,
-    ModelInspectionReport,
-};
-
 #[path = "tokenizer.rs"]
-mod tokenizer;
+pub(crate) mod tokenizer;
 pub(crate) use tokenizer::gguf_sidecar_dir;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 use tokenizer::{
-    is_gguf_file, load_chat_template, load_gguf_tokenizer_from_metadata, load_tokenizer_for_kind,
+    load_chat_template, load_gguf_tokenizer_from_metadata, load_tokenizer_for_kind,
     load_tokenizer_template_kwargs,
 };
 

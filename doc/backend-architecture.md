@@ -39,6 +39,9 @@ Core owns concepts whose meaning does not depend on tensor representation:
 - queue fairness, request/work lifecycle, transactional branch commit/discard,
   exact-completion observation, cancellation, abandonment, and capacity;
 - backend/device descriptors and fail-closed capability discovery;
+- model capability, input-position, cache-layout, runtime-state, static-memory,
+  admission request/result, and artifact-inspection schemas; checked state
+  estimation and context/memory admission policy;
 - validated parallel shapes and rank snapshots, axes, coordinates, subgroup
   membership, balanced ownership/preflight planning, and portable placement
   descriptions;
@@ -60,6 +63,10 @@ A backend owns executable models, tensor values, streams/queues, cache storage,
 sampling math, transfers, collectives, kernels, native errors, and the concrete
 completion primitive. Core does not define a primitive tensor algebra and does
 not accept `Any`, raw pointers, or operation names as an execution escape hatch.
+Backends also own loaded-model capability derivation, prepared-input accounting,
+process allocator/availability observations, and structural checkpoint
+admission. Those operations populate canonical core reports rather than
+defining backend-specific copies of the schemas.
 
 ## Model, session, and completion lifecycle
 
@@ -407,6 +414,18 @@ embedded-drafting metadata. The MLX implementation lives in
 bounded loads, and realizes a selected plan as `ModelLoadOptions`.
 Process-global MLX allocator cache configuration is deliberately not part of
 the neutral plan.
+
+Capability and inspection follow the same direction. Core owns `Observed`,
+`ModelCapabilities`, `StateLayout`, `RuntimeStateEstimate`, admission policy,
+and `ModelInspectionReport`. `backend::mlx::capability` maps validated MLX model
+configuration and prepared MLX media shapes into those values, fixes the
+current MLX cache scalar width, and supplies native allocator/memory
+observations. `backend::mlx::inspection` performs MLX loader binding, tensor
+catalog validation, quantization/residency admission, and companion-artifact
+checks. `MlxInspectionOptions` and `inspect_model` therefore live only under
+the selected backend; the generic `api` namespace contains no MLX inspection
+entry point. A second backend reuses the core reports and policies while
+providing its own derivation and admission implementation.
 
 Automatic planning documents now use schema version 2. This deliberately
 breaks the former facade-owned schema: resource profiles use the canonical

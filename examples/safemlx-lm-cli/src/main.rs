@@ -21,17 +21,19 @@ use safemlx::{
 };
 use safemlx_lm::{
     api::{
-        inspect_model, LoadedModel, ModelInspectionOptions, PreparedChatDraft,
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
-        TextDecoder, TextModelError,
+        LoadedModel, PreparedChatDraft, PreparedChatGenerationRequest,
+        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
+        PreparedChatMtpGenerationRequest, ResidencyPlan, TextDecoder, TextModelError,
     },
     backend::mlx::automatic::{
         collect_expert_cache_telemetry, collect_residency_telemetry, discover_hardware,
         execution_plan_load_options, mtp_telemetry, plan_automatic_execution,
     },
     backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams},
-    backend::mlx::{speculative::MtpComponentTimingGuard, MlxBackend, ModelLoadOptions},
+    backend::mlx::{
+        inspect_model, speculative::MtpComponentTimingGuard, MlxBackend, MlxInspectionOptions,
+        ModelLoadOptions,
+    },
     core::residency::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     core::speculative::MtpStats,
     runtime::chat::{
@@ -1315,7 +1317,7 @@ fn candidate_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions> {
 fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCandidate> {
     let report = inspect_model(
         model_path,
-        ModelInspectionOptions {
+        MlxInspectionOptions {
             load: candidate_load_options(plan)?,
             chat_request: None,
         },
@@ -1435,7 +1437,7 @@ fn automatic_observations(model_path: &Path, device: CliDevice) -> Result<Execut
     let hardware = discover_hardware();
     let selected_device = device_plan(device);
     validate_automatic_device(&hardware, &selected_device)?;
-    let resources = inspect_model(model_path, ModelInspectionOptions::default())?.resources;
+    let resources = inspect_model(model_path, MlxInspectionOptions::default())?.resources;
     Ok(ExecutionPlanReport {
         schema_version: safemlx_lm::AUTOMATIC_SCHEMA_VERSION,
         hardware,
@@ -1818,7 +1820,7 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
     validate_automatic_device(&hardware, &plan.device)?;
     let inspection = inspect_model(
         model_path,
-        ModelInspectionOptions {
+        MlxInspectionOptions {
             load: candidate_load_options(&plan)?,
             chat_request: None,
         },
@@ -2249,7 +2251,7 @@ fn main() -> Result<()> {
         Some(
             inspect_model(
                 &model_path,
-                ModelInspectionOptions {
+                MlxInspectionOptions {
                     load: load_options,
                     chat_request: None,
                 },

@@ -12,19 +12,24 @@ pub use portable::{
     LoadedModel, LoadedTextModelConfig, TextDecoder, TextDecoderError, TextModelError,
 };
 pub use safemlx_lm_core::{
-    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
-    AutomaticPlanningBackend, AutomaticPlanningError, BackendId, DevicePlan, DraftPlacementPlan,
-    DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
-    ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile, HardwareDeviceProfile,
-    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, MtpTelemetry, ObservationKind,
-    Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan,
-    ResidencyTelemetry, TimingTelemetry, TransferTelemetry, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry,
+    ArtifactModality, ArtifactTensorEncoding, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlannerPolicy, AutomaticPlanningBackend, AutomaticPlanningError, AvailableMemory,
+    BackendId, CacheStateStrategy, CapabilityError, DevicePlan, DraftPlacementPlan, DraftingPlan,
+    DurationSeconds, EstimationCompleteness, ExecutionPlan, ExecutionPlanReport,
+    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
+    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
+    InputTokenCount, InspectionIssue, InspectionIssueCode, InspectionReadiness,
+    InspectionRequirement, InspectionSeverity, ModelCapabilities, ModelInspectionReport,
+    ModelResourceProfile, MtpTelemetry, ObservationKind, Observed, PhysicalMemorySemantics,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
+    RuntimeStateEstimate, SlidingWindowLayerCount, StateMemoryAssumptions, StaticMemoryReport,
+    TimingTelemetry, TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use safemlx_lm_utils::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
 #[cfg(feature = "mlx")]
 #[path = "mlx.rs"]
-mod mlx;
+pub(crate) mod mlx;
 #[cfg(feature = "mlx")]
 pub use mlx::*;

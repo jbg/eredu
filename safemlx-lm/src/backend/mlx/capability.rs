@@ -1,448 +1,43 @@
-//! Architecture-independent model capability, accounting, and admission APIs.
+//! MLX model capability derivation, resource observation, and admission adapter.
 
 use std::{collections::BTreeMap, num::NonZeroU8};
 
 use safemlx::{Array, Stream};
-
-use super::{
-    deepseek_v3, gemma4, gpt_oss, inkling, kimi_linear, lfm2, nemotron_h, qwen3_5, Model,
-    PreparedModelInput,
+use safemlx_lm_core::{
+    apply_admission_policy, estimate_runtime_state, AdmissionRequest, AdmissionResult,
+    AvailableMemory, CacheStateStrategy, CapabilityError, EstimationCompleteness, GrowingState,
+    InputModalities, InputTokenCount, ModelCapabilities, ObservationKind, Observed,
+    PhysicalMemorySemantics, RuntimeStateEstimate, SlidingWindowLayerCount, StateLayout,
+    StaticMemoryReport,
 };
+
+use super::Model;
+use crate::api::LoadedModel;
 use crate::{
-    architectures::{deepseek_v4, qwen::hybrid::qwen3_5::LayerPolicy as QwenHybridLayerPolicy},
+    architectures::{
+        deepseek_v3::model as deepseek_v3,
+        deepseek_v4,
+        gemma4::model as gemma4,
+        gpt_oss::model as gpt_oss,
+        inkling::model as inkling,
+        kimi_linear::model as kimi_linear,
+        lfm2::model as lfm2,
+        llama::model as llama,
+        muse_glimmer,
+        nemotron_h::model as nemotron_h,
+        qwen::dense as dense_qwen,
+        qwen::hybrid::qwen3_5::{self, LayerPolicy as QwenHybridLayerPolicy},
+    },
     core::residency::MemoryTier,
     nn::rope::FloatOrString,
     runtime::{
         attention::AttentionPolicy,
-        media::input::{InputPayload, Modality},
+        media::{
+            input::{self, InputPayload, Modality},
+            PreparedModelInput,
+        },
     },
 };
-
-/// Confidence/semantics attached to a reported number.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MeasurementKind {
-    /// Derived exactly from validated configuration or an exact counter.
-    Exact,
-    /// An upper bound intentionally chosen to avoid underestimating admission cost.
-    Conservative,
-    /// A point-in-time runtime observation rather than ownership accounting.
-    Observational,
-    /// A platform-derived estimate whose value can change immediately.
-    Estimated,
-}
-
-/// A value that may be unsupported or unavailable without inventing a numeric default.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CapabilityValue<T> {
-    /// A usable value and its documented measurement semantics.
-    Available {
-        /// Reported value.
-        value: T,
-        /// Exact, conservative, observational, or estimated semantics.
-        kind: MeasurementKind,
-        /// Stable description of the source.
-        source: &'static str,
-    },
-    /// The architecture or platform cannot produce this value.
-    Unsupported {
-        /// Human-readable reason.
-        reason: String,
-    },
-    /// The value is meaningful in principle but was not available now.
-    Unavailable {
-        /// Human-readable reason.
-        reason: String,
-    },
-}
-
-impl<T> CapabilityValue<T> {
-    /// Borrows the available value, returning `None` for unsupported/unavailable values.
-    pub const fn value(&self) -> Option<&T> {
-        match self {
-            Self::Available { value, .. } => Some(value),
-            Self::Unsupported { .. } | Self::Unavailable { .. } => None,
-        }
-    }
-}
-
-/// Model inputs accepted by the loaded architecture.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct InputModalities {
-    /// Ordinary tokenizer IDs.
-    pub text: bool,
-    /// Prepared image tensors.
-    pub image: bool,
-    /// Prepared audio tensors.
-    pub audio: bool,
-    /// Prepared video tensors.
-    pub video: bool,
-}
-
-impl InputModalities {
-    const TEXT: Self = Self {
-        text: true,
-        image: false,
-        audio: false,
-        video: false,
-    };
-}
-
-/// Persistent decoder-state strategy used by a model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CacheStateStrategy {
-    /// Ordinary full-context K/V attention.
-    FullKv,
-    /// Every attention cache is bounded by a sliding window.
-    SlidingKv {
-        /// Maximum retained positions per attention layer.
-        window: u64,
-    },
-    /// A model combines full-context and sliding-window attention layers.
-    MixedKv {
-        /// Number of full-context layers.
-        full_layers: u64,
-        /// Bounded layer counts grouped by exact retained window.
-        sliding: Vec<SlidingWindowLayerCount>,
-    },
-    /// Full-context KV backing with some layers using sliding attention masks
-    /// and later layers reusing earlier K/V state.
-    SharedFullKv {
-        /// Layers that allocate and retain their own K/V state.
-        cached_layers: u64,
-        /// Layers that reuse K/V produced by an earlier layer.
-        shared_layers: u64,
-        /// Total full-attention layer count, including shared layers.
-        full_attention_layers: u64,
-        /// Total sliding-mask layers grouped by exact attention window,
-        /// including shared layers. These windows do not bound KV allocation.
-        sliding_attention: Vec<SlidingWindowLayerCount>,
-    },
-    /// Multi-head latent attention stores compressed latent and rotary state.
-    CompressedMla {
-        /// Compressed latent width stored per layer and position.
-        latent_width: u64,
-        /// Shared rotary-key width stored per layer and position.
-        rotary_width: u64,
-    },
-    /// Attention is combined with bounded convolution or recurrent state.
-    HybridRecurrent {
-        /// Full-context attention layer count.
-        full_attention_layers: u64,
-        /// Bounded attention layers grouped by exact window.
-        sliding_attention: Vec<SlidingWindowLayerCount>,
-        /// Recurrent/linear-attention layer count.
-        recurrent_layers: u64,
-    },
-    /// Multimodal preparation feeds model positions into a decoder state strategy.
-    Multimodal {
-        /// Underlying decoder state.
-        decoder: Box<CacheStateStrategy>,
-        /// Media embeddings consume persistent decoder positions.
-        media_consumes_decoder_positions: bool,
-    },
-}
-
-/// Sliding-attention layer count sharing one exact retained window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlidingWindowLayerCount {
-    /// Exact positive retained positions, including the current token.
-    pub window: u64,
-    /// Number of layers using this window.
-    pub layers: u64,
-}
-
-/// Whether an estimator covers all persistent and transient runtime state.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum EstimationCompleteness {
-    /// Persistent request state is modeled exactly for the stated dtype and cache layout.
-    Complete,
-    /// The estimate is a complete, safe upper bound for the stated assumptions.
-    Conservative,
-    /// Persistent decoder state is covered, but some architecture-visible transients are not.
-    PersistentStateOnly,
-}
-
-/// Public capability report derived from validated config and the loaded architecture.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelCapabilities {
-    /// Effective architecture/model type from the loaded model.
-    pub model_type: String,
-    /// Original trained context before a supported extension, when identifiable.
-    pub native_max_context: CapabilityValue<u64>,
-    /// Maximum model positions accepted by the configured architecture.
-    pub effective_max_context: CapabilityValue<u64>,
-    /// Persistent cache or recurrent-state model.
-    pub state_strategy: CacheStateStrategy,
-    /// Accepted input modalities.
-    pub modalities: InputModalities,
-    /// Coverage of the runtime-state estimator.
-    pub estimation: EstimationCompleteness,
-}
-
-/// Accounting for a tokenized or prepared input.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct InputTokenCount {
-    /// Ordinary tokenizer IDs present in the input.
-    pub text_tokens: u64,
-    /// Positions inserted by prepared media.
-    pub media_positions: u64,
-    /// Total decoder/model positions consumed by prefill.
-    pub model_positions: u64,
-    /// Semantics of the model-position count.
-    pub kind: MeasurementKind,
-    media_execution_workspace_bytes: u64,
-    media_execution_workspace_kind: MeasurementKind,
-}
-
-impl InputTokenCount {
-    /// Creates an exact count for an already-tokenized text prompt.
-    pub const fn text(tokens: u64) -> Self {
-        Self {
-            text_tokens: tokens,
-            media_positions: 0,
-            model_positions: tokens,
-            kind: MeasurementKind::Exact,
-            media_execution_workspace_bytes: 0,
-            media_execution_workspace_kind: MeasurementKind::Exact,
-        }
-    }
-
-    fn prepared(
-        text_tokens: u64,
-        media_positions: u64,
-        model_positions: u64,
-        media_execution_workspace_bytes: u64,
-        media_execution_workspace_kind: MeasurementKind,
-    ) -> Self {
-        Self {
-            text_tokens,
-            media_positions,
-            model_positions,
-            kind: MeasurementKind::Exact,
-            media_execution_workspace_bytes,
-            media_execution_workspace_kind,
-        }
-    }
-
-    /// Conservative media-tower workspace attributed to this prepared input.
-    pub const fn media_execution_workspace_bytes(&self) -> u64 {
-        self.media_execution_workspace_bytes
-    }
-
-    /// Exact or conservative semantics of the media workspace value.
-    pub const fn media_execution_workspace_kind(&self) -> MeasurementKind {
-        self.media_execution_workspace_kind
-    }
-}
-
-/// Dtype and request assumptions used by state estimation.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct StateMemoryAssumptions {
-    /// Bytes per retained cache/state scalar.
-    pub state_dtype_bytes: NonZeroU8,
-    /// Logical request batch size.
-    pub batch_size: u64,
-    /// Total requested model positions, including output allowance.
-    pub requested_positions: u64,
-    /// Distinct sliding-window bounds applied by the estimator, in ascending order.
-    pub sliding_window_bounds: Vec<u64>,
-    /// Backing-array growth granularity used for unbounded caches.
-    pub allocation_granularity: u64,
-}
-
-/// Persistent and transient runtime-state estimate for one request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeStateEstimate {
-    /// Context-independent recurrent/convolution state.
-    pub fixed_state_bytes: u64,
-    /// Unbounded bytes added per additional position before multiplying by batch.
-    pub bytes_per_position_per_batch: u64,
-    /// Persistent context-dependent bytes at the requested length.
-    pub context_state_bytes: u64,
-    /// Prepared-media embedding bytes retained during multimodal prefill.
-    pub multimodal_embedding_bytes: u64,
-    /// Conservative model-visible media-tower execution workspace.
-    pub media_execution_workspace_bytes: u64,
-    /// Total modeled state for prompt plus output allowance.
-    pub requested_state_bytes: u64,
-    /// Estimator assumptions.
-    pub assumptions: StateMemoryAssumptions,
-    /// Estimator coverage.
-    pub completeness: EstimationCompleteness,
-}
-
-/// Physical relationship between logical host and device tiers.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum PhysicalMemorySemantics {
-    /// Apple/UMA host and GPU allocations draw from one physical capacity.
-    Unified,
-    /// Host and accelerator memory may be physically separate.
-    SeparateTiers,
-    /// The runtime cannot determine the physical relationship.
-    Unknown,
-}
-
-/// Static checkpoint and current residency observations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaticMemoryReport {
-    /// Logical bytes in loaded parameters or the complete residency plan.
-    pub logical_parameter_bytes: CapabilityValue<u64>,
-    /// Current logical host-resident bytes tracked by bounded residency.
-    pub current_host_resident_bytes: CapabilityValue<u64>,
-    /// Current logical device-resident bytes tracked by bounded residency.
-    pub current_device_resident_bytes: CapabilityValue<u64>,
-    /// Planned logical disk-backed bytes.
-    pub planned_disk_backed_bytes: CapabilityValue<u64>,
-    /// Process-global MLX active allocation counter, not model ownership or RSS.
-    pub mlx_active_allocation_bytes: CapabilityValue<u64>,
-    /// Process-global MLX allocator-cache counter.
-    pub mlx_allocator_cache_bytes: CapabilityValue<u64>,
-    /// Whether logical host/device tiers share one physical capacity.
-    pub physical_semantics: PhysicalMemorySemantics,
-    /// Number of currently retained memory mappings, when bounded residency is used.
-    pub currently_mapped_shards: CapabilityValue<u64>,
-}
-
-/// System memory usable as an admission signal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AvailableMemory {
-    /// Unified/host physical memory.
-    pub physical_memory_bytes: CapabilityValue<u64>,
-    /// Defensible point-in-time availability estimate.
-    pub available_memory_bytes: CapabilityValue<u64>,
-    /// Physical tier semantics for host and accelerator allocations.
-    pub physical_semantics: PhysicalMemorySemantics,
-}
-
-/// One pre-generation admission request.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct AdmissionRequest {
-    /// Authoritative prompt accounting.
-    pub input: InputTokenCount,
-    /// Maximum generated-token allowance.
-    pub max_output_tokens: u64,
-    /// Logical batch size.
-    pub batch_size: u64,
-    /// Caller-selected reserve added to modeled incremental state.
-    pub safety_reserve_bytes: u64,
-    /// Optional application budget for incremental state plus reserve.
-    pub application_memory_budget_bytes: Option<u64>,
-    /// Reject estimates that omit execution scratch or media-tower transients.
-    pub require_complete_estimate: bool,
-}
-
-/// Detailed successful admission.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Admission {
-    /// Prompt plus output allowance.
-    pub requested_positions: u64,
-    /// Runtime-state estimate.
-    pub state: RuntimeStateEstimate,
-    /// State plus caller reserve compared with budgets/availability.
-    pub incremental_required_bytes: u64,
-    /// Memory signal used for the availability check, when supplied.
-    pub available_memory_bytes: Option<u64>,
-}
-
-/// Structured reason a request was rejected before allocation/generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdmissionRejection {
-    /// Prompt alone exceeds the configured context.
-    PromptExceedsContext {
-        /// Prompt model positions.
-        prompt_positions: u64,
-        /// Effective model limit.
-        maximum_positions: u64,
-    },
-    /// Prompt fits, but output allowance does not.
-    OutputHeadroomExceedsContext {
-        /// Prompt model positions.
-        prompt_positions: u64,
-        /// Requested maximum output tokens.
-        output_tokens: u64,
-        /// Effective model limit.
-        maximum_positions: u64,
-    },
-    /// The supplied application budget is smaller than modeled state plus reserve.
-    MemoryBudgetExceeded {
-        /// Required incremental bytes.
-        required_bytes: u64,
-        /// Caller-supplied budget.
-        budget_bytes: u64,
-    },
-    /// Current platform availability is smaller than modeled state plus reserve.
-    InsufficientAvailableMemory {
-        /// Required incremental bytes.
-        required_bytes: u64,
-        /// Observed/estimated available bytes.
-        available_bytes: u64,
-    },
-    /// A requested platform-availability check could not be performed.
-    AvailableMemoryUnavailable {
-        /// Platform report detail.
-        reason: String,
-    },
-    /// Admission policy requires coverage the architecture estimator cannot provide.
-    EstimationUnsupported {
-        /// Coverage detail.
-        reason: String,
-    },
-}
-
-/// Admission outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdmissionResult {
-    /// Request may proceed under the supplied policy.
-    Admitted(Admission),
-    /// Request was rejected before model allocation/generation.
-    Rejected(AdmissionRejection),
-}
-
-/// Structured failures from capability and checked-memory accounting.
-#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
-pub enum CapabilityError {
-    /// A validated architecture exposed an invalid value to the estimator.
-    #[error("invalid model capability field {field}: {detail}")]
-    InvalidConfiguration {
-        /// Field name.
-        field: &'static str,
-        /// Invalid-value detail.
-        detail: String,
-    },
-    /// Checked byte or position arithmetic overflowed.
-    #[error("capability arithmetic overflow while computing {operation}")]
-    ArithmeticOverflow {
-        /// Stable operation label.
-        operation: &'static str,
-    },
-    /// Prepared input does not match the loaded architecture.
-    #[error("unsupported prepared input for {architecture}: {reason}")]
-    UnsupportedInput {
-        /// Effective architecture name.
-        architecture: String,
-        /// Unsupported-input detail.
-        reason: String,
-    },
-    /// A runtime observation could not be obtained.
-    #[error("capability observation failed: {0}")]
-    Observation(String),
-}
-
-#[derive(Debug, Clone)]
-struct GrowingState {
-    layers: u64,
-    scalars_per_position: u64,
-    window: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct ArchitectureEstimate {
-    fixed_scalars_per_batch: u64,
-    growing: Vec<GrowingState>,
-    hidden_size: u64,
-    allocation_granularity: u64,
-    completeness: EstimationCompleteness,
-}
 
 fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
     u64::try_from(value).map_err(|_| CapabilityError::InvalidConfiguration {
@@ -472,21 +67,18 @@ fn checked_mul(left: u64, right: u64, operation: &'static str) -> Result<u64, Ca
         .ok_or(CapabilityError::ArithmeticOverflow { operation })
 }
 
-fn rounded_cache_positions(
-    requested_positions: u64,
-    allocation_granularity: u64,
-) -> Result<u64, CapabilityError> {
-    let adjustment =
-        allocation_granularity
-            .checked_sub(1)
-            .ok_or(CapabilityError::InvalidConfiguration {
-                field: "allocation_granularity",
-                detail: "cache allocation granularity must be nonzero".into(),
-            })?;
-    Ok(
-        checked_add(requested_positions, adjustment, "cache allocation rounding")?
-            / allocation_granularity
-            * allocation_granularity,
+fn estimate_mlx_runtime_state(
+    layout: &StateLayout,
+    input: InputTokenCount,
+    max_output_tokens: u64,
+    batch_size: u64,
+) -> Result<RuntimeStateEstimate, CapabilityError> {
+    estimate_runtime_state(
+        layout,
+        input,
+        max_output_tokens,
+        batch_size,
+        NonZeroU8::new(4).expect("MLX cache scalar width is nonzero"),
     )
 }
 
@@ -504,7 +96,7 @@ fn config_number(
 fn context_from_rope(
     effective: i32,
     rope: Option<&std::collections::HashMap<String, FloatOrString>>,
-) -> Result<(CapabilityValue<u64>, CapabilityValue<u64>), CapabilityError> {
+) -> Result<(Observed<u64>, Observed<u64>), CapabilityError> {
     let effective = positive(effective, "max_position_embeddings")?;
     let original =
         match rope.and_then(|rope| config_number(rope, "original_max_position_embeddings")) {
@@ -518,13 +110,13 @@ fn context_from_rope(
             }
             Some(_) => {
                 return Ok((
-                    CapabilityValue::Unsupported {
+                    Observed::Unsupported {
                         reason: "RoPE original context is not a positive integer".into(),
                     },
-                    CapabilityValue::Available {
+                    Observed::Available {
                         value: effective,
-                        kind: MeasurementKind::Exact,
-                        source: "validated model configuration",
+                        kind: ObservationKind::Exact,
+                        source: "validated model configuration".into(),
                     },
                 ))
             }
@@ -540,12 +132,12 @@ fn context_from_rope(
                 let scaled = effective as f64 * f64::from(factor);
                 if !scaled.is_finite() || scaled.fract() != 0.0 || scaled > u64::MAX as f64 {
                     return Ok((
-                        CapabilityValue::Available {
+                        Observed::Available {
                             value: native,
-                            kind: MeasurementKind::Exact,
-                            source: "validated model configuration",
+                            kind: ObservationKind::Exact,
+                            source: "validated model configuration".into(),
                         },
-                        CapabilityValue::Unsupported {
+                        Observed::Unsupported {
                             reason:
                                 "RoPE factor does not produce an exact integer effective context"
                                     .into(),
@@ -560,22 +152,20 @@ fn context_from_rope(
         effective
     };
     Ok((
-        CapabilityValue::Available {
+        Observed::Available {
             value: native,
-            kind: MeasurementKind::Exact,
-            source: "validated model configuration",
+            kind: ObservationKind::Exact,
+            source: "validated model configuration".into(),
         },
-        CapabilityValue::Available {
+        Observed::Available {
             value: effective,
-            kind: MeasurementKind::Exact,
-            source: "validated model configuration and supported RoPE setup",
+            kind: ObservationKind::Exact,
+            source: "validated model configuration and supported RoPE setup".into(),
         },
     ))
 }
 
-fn plain_context(
-    maximum: i32,
-) -> Result<(CapabilityValue<u64>, CapabilityValue<u64>), CapabilityError> {
+fn plain_context(maximum: i32) -> Result<(Observed<u64>, Observed<u64>), CapabilityError> {
     context_from_rope(maximum, None)
 }
 
@@ -595,7 +185,7 @@ fn text_modalities() -> InputModalities {
 impl Model {
     fn capabilities_and_estimate(
         &self,
-    ) -> Result<(ModelCapabilities, ArchitectureEstimate), CapabilityError> {
+    ) -> Result<(ModelCapabilities, StateLayout), CapabilityError> {
         let model_type = self.model_type().to_string();
         let result = match self {
             Self::Llama(model) => llama_spec(model.args(), false)?,
@@ -649,14 +239,14 @@ impl Model {
 }
 
 type Spec = (
-    CapabilityValue<u64>,
-    CapabilityValue<u64>,
+    Observed<u64>,
+    Observed<u64>,
     CacheStateStrategy,
     InputModalities,
-    ArchitectureEstimate,
+    StateLayout,
 );
 
-fn llama_spec(args: &super::llama::ModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
+fn llama_spec(args: &llama::ModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
     let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
     let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
@@ -712,7 +302,7 @@ fn llama_spec(args: &super::llama::ModelArgs, multimodal: bool) -> Result<Spec, 
         } else {
             text_modalities()
         },
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: 0,
             growing: std::iter::once(GrowingState {
                 layers: full,
@@ -734,11 +324,11 @@ fn llama_spec(args: &super::llama::ModelArgs, multimodal: bool) -> Result<Spec, 
 }
 
 fn dense_qwen_spec(
-    args: &super::dense_qwen::DecoderConfig,
+    args: &dense_qwen::DecoderConfig,
     multimodal: bool,
 ) -> Result<Spec, CapabilityError> {
     let mut spec = llama_spec(
-        &super::llama::ModelArgs {
+        &llama::ModelArgs {
             model_type: args.model_type.clone(),
             hidden_size: args.hidden_size,
             num_hidden_layers: args.num_hidden_layers,
@@ -801,7 +391,7 @@ fn dense_qwen_spec(
     Ok(spec)
 }
 
-fn muse_glimmer_spec(args: &super::muse_glimmer::DecoderConfig) -> Result<Spec, CapabilityError> {
+fn muse_glimmer_spec(args: &muse_glimmer::DecoderConfig) -> Result<Spec, CapabilityError> {
     let context = plain_context(args.max_position_embeddings)?;
     let full_layers = args.attention_schedule.full_layer_count() as u64;
     let sliding = args
@@ -839,9 +429,9 @@ fn muse_glimmer_spec(args: &super::muse_glimmer::DecoderConfig) -> Result<Spec, 
             image: args.vision_config.is_some(),
             audio: false,
             video: args.vision_config.is_some()
-                && args.weight_convention == super::muse_glimmer::WeightConvention::HuggingFace,
+                && args.weight_convention == muse_glimmer::WeightConvention::HuggingFace,
         },
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: 0,
             growing,
             hidden_size: positive(args.hidden_size, "hidden_size")?,
@@ -874,22 +464,22 @@ fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError>
     let rotary = positive(args.qk_rope_head_dim, "qk_rope_head_dim")?;
     let width = checked_add(latent, rotary, "MLA latent plus rotary width")?;
     Ok((
-        CapabilityValue::Available {
+        Observed::Available {
             value: native,
-            kind: MeasurementKind::Exact,
-            source: "validated DeepSeek YaRN configuration",
+            kind: ObservationKind::Exact,
+            source: "validated DeepSeek YaRN configuration".into(),
         },
-        CapabilityValue::Available {
+        Observed::Available {
             value: effective,
-            kind: MeasurementKind::Exact,
-            source: "validated DeepSeek configuration",
+            kind: ObservationKind::Exact,
+            source: "validated DeepSeek configuration".into(),
         },
         CacheStateStrategy::CompressedMla {
             latent_width: latent,
             rotary_width: rotary,
         },
         text_modalities(),
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: 0,
             growing: vec![GrowingState {
                 layers,
@@ -924,15 +514,15 @@ fn deepseek_v4_spec(args: &deepseek_v4::ModelArgs) -> Result<Spec, CapabilityErr
         .count() as u64;
     let head_dim = positive(args.head_dim, "head_dim")?;
     Ok((
-        CapabilityValue::Available {
+        Observed::Available {
             value: native,
-            kind: MeasurementKind::Exact,
-            source: "validated DeepSeek-V4 YaRN configuration",
+            kind: ObservationKind::Exact,
+            source: "validated DeepSeek-V4 YaRN configuration".into(),
         },
-        CapabilityValue::Available {
+        Observed::Available {
             value: effective,
-            kind: MeasurementKind::Exact,
-            source: "validated DeepSeek-V4 configuration",
+            kind: ObservationKind::Exact,
+            source: "validated DeepSeek-V4 configuration".into(),
         },
         CacheStateStrategy::MixedKv {
             full_layers: compressed,
@@ -942,7 +532,7 @@ fn deepseek_v4_spec(args: &deepseek_v4::ModelArgs) -> Result<Spec, CapabilityErr
             }],
         },
         text_modalities(),
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: 0,
             // Pooled state grows more slowly than one vector per source token;
             // charging a full vector is a complete safe upper bound across the
@@ -1013,7 +603,7 @@ fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityErr
             recurrent_layers: recurrent,
         },
         text_modalities(),
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: fixed,
             growing: vec![GrowingState {
                 layers: attention,
@@ -1056,7 +646,7 @@ fn gpt_oss_spec(args: &gpt_oss::ModelArgs) -> Result<Spec, CapabilityError> {
         context.1,
         state_strategy,
         text_modalities(),
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: 0,
             growing: std::iter::once(GrowingState {
                 layers: full,
@@ -1126,7 +716,7 @@ fn gemma4_spec(
             decoder
         },
         modalities,
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: 0,
             growing: {
                 let mut groups = BTreeMap::<u64, u64>::new();
@@ -1162,10 +752,10 @@ fn inkling_spec(args: &inkling::ModelArgs) -> Result<Spec, CapabilityError> {
     let context = match text.model_max_length {
         Some(maximum) => plain_context(maximum)?,
         None => (
-            CapabilityValue::Unsupported {
+            Observed::Unsupported {
                 reason: "Inkling configuration does not expose a native maximum context".into(),
             },
-            CapabilityValue::Unsupported {
+            Observed::Unsupported {
                 reason: "Inkling configuration does not expose an effective maximum context".into(),
             },
         ),
@@ -1231,7 +821,7 @@ fn inkling_spec(args: &inkling::ModelArgs) -> Result<Spec, CapabilityError> {
             media_consumes_decoder_positions: true,
         },
         modalities,
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: fixed,
             growing: std::iter::once(GrowingState {
                 layers: global,
@@ -1283,7 +873,7 @@ fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
             recurrent_layers: conv,
         },
         text_modalities(),
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: fixed,
             growing: vec![GrowingState {
                 layers: attention,
@@ -1363,7 +953,7 @@ fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> 
             recurrent_layers: mamba,
         },
         text_modalities(),
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: fixed,
             growing: attention_groups
                 .into_iter()
@@ -1391,10 +981,10 @@ fn qwen_hybrid_spec(args: &qwen3_5::ModelArgs, multimodal: bool) -> Result<Spec,
         .and_then(serde_json::Value::as_u64);
     let native = original.unwrap_or(configured);
     let effective = if original.is_some() {
-        CapabilityValue::Available {
+        Observed::Available {
             value: configured,
-            kind: MeasurementKind::Exact,
-            source: "validated Qwen RoPE configuration",
+            kind: ObservationKind::Exact,
+            source: "validated Qwen RoPE configuration".into(),
         }
     } else {
         match args
@@ -1407,23 +997,23 @@ fn qwen_hybrid_spec(args: &qwen3_5::ModelArgs, multimodal: bool) -> Result<Spec,
             Some(factor) => {
                 let scaled = configured as f64 * factor;
                 if scaled.is_finite() && scaled.fract() == 0.0 && scaled <= u64::MAX as f64 {
-                    CapabilityValue::Available {
+                    Observed::Available {
                         value: scaled as u64,
-                        kind: MeasurementKind::Exact,
-                        source: "validated Qwen configuration and supported RoPE setup",
+                        kind: ObservationKind::Exact,
+                        source: "validated Qwen configuration and supported RoPE setup".into(),
                     }
                 } else {
-                    CapabilityValue::Unsupported {
+                    Observed::Unsupported {
                         reason:
                             "Qwen RoPE factor does not produce an exact integer effective context"
                                 .into(),
                     }
                 }
             }
-            None => CapabilityValue::Available {
+            None => Observed::Available {
                 value: configured,
-                kind: MeasurementKind::Exact,
-                source: "validated Qwen configuration",
+                kind: ObservationKind::Exact,
+                source: "validated Qwen configuration".into(),
             },
         }
     };
@@ -1479,10 +1069,10 @@ fn qwen_hybrid_spec(args: &qwen3_5::ModelArgs, multimodal: bool) -> Result<Spec,
         recurrent_layers: recurrent,
     };
     Ok((
-        CapabilityValue::Available {
+        Observed::Available {
             value: native,
-            kind: MeasurementKind::Exact,
-            source: "validated Qwen RoPE configuration",
+            kind: ObservationKind::Exact,
+            source: "validated Qwen RoPE configuration".into(),
         },
         effective,
         if multimodal {
@@ -1503,7 +1093,7 @@ fn qwen_hybrid_spec(args: &qwen3_5::ModelArgs, multimodal: bool) -> Result<Spec,
         } else {
             text_modalities()
         },
-        ArchitectureEstimate {
+        StateLayout {
             fixed_scalars_per_batch: fixed,
             growing: vec![GrowingState {
                 layers: attention,
@@ -1517,8 +1107,8 @@ fn qwen_hybrid_spec(args: &qwen3_5::ModelArgs, multimodal: bool) -> Result<Spec,
     ))
 }
 
-fn unavailable_counter(error: safemlx::error::Exception) -> CapabilityValue<u64> {
-    CapabilityValue::Unavailable {
+fn unavailable_counter(error: safemlx::error::Exception) -> Observed<u64> {
+    Observed::Unavailable {
         reason: error.to_string(),
     }
 }
@@ -1526,15 +1116,15 @@ fn unavailable_counter(error: safemlx::error::Exception) -> CapabilityValue<u64>
 fn runtime_counter(
     function: fn() -> Result<usize, safemlx::error::Exception>,
     source: &'static str,
-) -> CapabilityValue<u64> {
+) -> Observed<u64> {
     match function() {
         Ok(value) => match u64::try_from(value) {
-            Ok(value) => CapabilityValue::Available {
+            Ok(value) => Observed::Available {
                 value,
-                kind: MeasurementKind::Observational,
-                source,
+                kind: ObservationKind::Observational,
+                source: source.into(),
             },
-            Err(_) => CapabilityValue::Unavailable {
+            Err(_) => Observed::Unavailable {
                 reason: "counter does not fit u64".into(),
             },
         },
@@ -1687,7 +1277,7 @@ fn qwen_vision_workspace(
     config: &crate::architectures::qwen::vl::vision::VisionConfig,
     modality: Modality,
     payload: &Array,
-    metadata: super::input::InputMetadata<'_>,
+    metadata: input::InputMetadata<'_>,
     stream: &Stream,
     architecture: &str,
 ) -> Result<(u64, u64), CapabilityError> {
@@ -1883,7 +1473,7 @@ fn gemma_vision_workspace(
     config: &crate::architectures::gemma4::vision::Gemma4VisionConfig,
     text_hidden: u64,
     payload: &Array,
-    metadata: super::input::InputMetadata<'_>,
+    metadata: input::InputMetadata<'_>,
     architecture: &str,
 ) -> Result<(u64, u64), CapabilityError> {
     if payload.ndim() != 3 || payload.dim(0) != 1 {
@@ -1994,7 +1584,7 @@ fn gemma_audio_workspace(
     config: &crate::architectures::gemma4::audio::Gemma4AudioConfig,
     text_hidden: u64,
     payload: &Array,
-    metadata: super::input::InputMetadata<'_>,
+    metadata: input::InputMetadata<'_>,
     architecture: &str,
 ) -> Result<(u64, u64), CapabilityError> {
     if payload.ndim() != 3 || payload.dim(0) != 1 || payload.dim(2) != 128 {
@@ -2145,7 +1735,7 @@ fn inkling_workspace(
     args: &inkling::ModelArgs,
     modality: Modality,
     payload: &Array,
-    metadata: super::input::InputMetadata<'_>,
+    metadata: input::InputMetadata<'_>,
     architecture: &str,
 ) -> Result<(u64, u64), CapabilityError> {
     match modality {
@@ -2305,7 +1895,7 @@ impl Model {
         &self,
         modality: Modality,
         payload: &Array,
-        metadata: super::input::InputMetadata<'_>,
+        metadata: input::InputMetadata<'_>,
         stream: &Stream,
     ) -> Result<(u64, u64), CapabilityError> {
         match self {
@@ -2391,8 +1981,7 @@ impl Model {
                 })?;
                 if modality == Modality::Audio
                     || (modality == Modality::Video
-                        && model.args().weight_convention
-                            == super::muse_glimmer::WeightConvention::Gguf)
+                        && model.args().weight_convention == muse_glimmer::WeightConvention::Gguf)
                 {
                     return Err(CapabilityError::UnsupportedInput {
                         architecture: self.model_type().into(),
@@ -2497,136 +2086,7 @@ impl Model {
     }
 }
 
-fn estimate_architecture_state(
-    estimate: &ArchitectureEstimate,
-    input: InputTokenCount,
-    max_output_tokens: u64,
-    batch_size: u64,
-) -> Result<RuntimeStateEstimate, CapabilityError> {
-    if batch_size == 0 {
-        return Err(CapabilityError::InvalidConfiguration {
-            field: "batch_size",
-            detail: "batch size must be positive".into(),
-        });
-    }
-    let requested_positions = checked_add(
-        input.model_positions,
-        max_output_tokens,
-        "prompt plus output positions",
-    )?;
-    let dtype = NonZeroU8::new(4).expect("four is nonzero");
-    let scalar_bytes = u64::from(dtype.get());
-    let fixed_state_bytes = checked_mul(
-        checked_mul(
-            estimate.fixed_scalars_per_batch,
-            batch_size,
-            "fixed state times batch",
-        )?,
-        scalar_bytes,
-        "fixed state bytes",
-    )?;
-    let mut context_state_bytes = 0u64;
-    let mut unbounded_per_position = 0u64;
-    let mut sliding_window_bounds = Vec::new();
-    for component in &estimate.growing {
-        let per_position = checked_mul(
-            component.layers,
-            component.scalars_per_position,
-            "component scalars per position",
-        )?;
-        let retained = component.window.map_or_else(
-            || rounded_cache_positions(requested_positions, estimate.allocation_granularity),
-            |window| Ok(requested_positions.min(window)),
-        )?;
-        let component_bytes = checked_mul(
-            checked_mul(
-                checked_mul(per_position, retained, "component context scalars")?,
-                batch_size,
-                "component context batch",
-            )?,
-            scalar_bytes,
-            "component context bytes",
-        )?;
-        context_state_bytes = checked_add(
-            context_state_bytes,
-            component_bytes,
-            "context state byte total",
-        )?;
-        if component.window.is_none() {
-            unbounded_per_position = checked_add(
-                unbounded_per_position,
-                checked_mul(per_position, scalar_bytes, "unbounded bytes per position")?,
-                "unbounded bytes-per-position total",
-            )?;
-        }
-        if let Some(window) = component.window {
-            sliding_window_bounds.push(window);
-        }
-    }
-    let multimodal_embedding_bytes = checked_mul(
-        checked_mul(
-            checked_mul(
-                input.media_positions,
-                estimate.hidden_size,
-                "media positions times hidden size",
-            )?,
-            batch_size,
-            "media embeddings times batch",
-        )?,
-        scalar_bytes,
-        "media embedding bytes",
-    )?;
-    let media_execution_workspace_bytes = checked_mul(
-        input.media_execution_workspace_bytes,
-        batch_size,
-        "media execution workspace times batch",
-    )?;
-    let requested_state_bytes = checked_add(
-        checked_add(
-            checked_add(
-                fixed_state_bytes,
-                context_state_bytes,
-                "fixed plus context state",
-            )?,
-            multimodal_embedding_bytes,
-            "persistent plus multimodal embedding state",
-        )?,
-        media_execution_workspace_bytes,
-        "persistent plus media execution workspace",
-    )?;
-    let completeness = if input.media_positions == 0 {
-        estimate.completeness
-    } else {
-        match input.media_execution_workspace_kind {
-            MeasurementKind::Exact => estimate.completeness,
-            MeasurementKind::Conservative
-            | MeasurementKind::Observational
-            | MeasurementKind::Estimated => EstimationCompleteness::Conservative,
-        }
-    };
-    Ok(RuntimeStateEstimate {
-        fixed_state_bytes,
-        bytes_per_position_per_batch: unbounded_per_position,
-        context_state_bytes,
-        multimodal_embedding_bytes,
-        media_execution_workspace_bytes,
-        requested_state_bytes,
-        assumptions: StateMemoryAssumptions {
-            state_dtype_bytes: dtype,
-            batch_size,
-            requested_positions,
-            sliding_window_bounds: {
-                sliding_window_bounds.sort_unstable();
-                sliding_window_bounds.dedup();
-                sliding_window_bounds
-            },
-            allocation_granularity: estimate.allocation_granularity,
-        },
-        completeness,
-    })
-}
-
-impl super::LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
+impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
     /// Returns architecture-independent capabilities derived from validated loaded state.
     pub fn capabilities(&self) -> Result<ModelCapabilities, CapabilityError> {
         self.model()
@@ -2677,7 +2137,7 @@ impl super::LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         let mut text_tokens = 0u64;
         let mut media_positions = 0u64;
         let mut media_execution_workspace_bytes = 0u64;
-        let mut media_execution_workspace_kind = MeasurementKind::Exact;
+        let mut media_execution_workspace_kind = ObservationKind::Exact;
         for part in prepared.input_parts() {
             match (part.modality, part.payload) {
                 (Modality::Text, InputPayload::TokenIds(tokens)) => {
@@ -2732,7 +2192,7 @@ impl super::LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                         workspace_bytes,
                         "prepared media-workspace total",
                     )?;
-                    media_execution_workspace_kind = MeasurementKind::Conservative;
+                    media_execution_workspace_kind = ObservationKind::Conservative;
                 }
                 (_, InputPayload::TokenIds(_)) => {
                     return Err(CapabilityError::UnsupportedInput {
@@ -2768,7 +2228,7 @@ impl super::LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         batch_size: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError> {
         let (_, estimate) = self.model().capabilities_and_estimate()?;
-        estimate_architecture_state(&estimate, input, max_output_tokens, batch_size)
+        estimate_mlx_runtime_state(&estimate, input, max_output_tokens, batch_size)
     }
 
     /// Reports logical checkpoint/residency accounting and MLX allocator observations.
@@ -2790,48 +2250,48 @@ impl super::LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
                 "complete planned parameter bytes",
             )?;
             (
-                CapabilityValue::Available {
+                Observed::Available {
                     value: logical,
-                    kind: MeasurementKind::Exact,
-                    source: "validated bounded-residency plan",
+                    kind: ObservationKind::Exact,
+                    source: "validated bounded-residency plan".into(),
                 },
-                CapabilityValue::Available {
+                Observed::Available {
                     value: resident.get(MemoryTier::Host),
-                    kind: MeasurementKind::Exact,
-                    source: "bounded-residency manager",
+                    kind: ObservationKind::Exact,
+                    source: "bounded-residency manager".into(),
                 },
-                CapabilityValue::Available {
+                Observed::Available {
                     value: resident.get(MemoryTier::Device),
-                    kind: MeasurementKind::Exact,
-                    source: "bounded-residency manager",
+                    kind: ObservationKind::Exact,
+                    source: "bounded-residency manager".into(),
                 },
-                CapabilityValue::Available {
+                Observed::Available {
                     value: planned.get(MemoryTier::Disk),
-                    kind: MeasurementKind::Exact,
-                    source: "bounded-residency plan",
+                    kind: ObservationKind::Exact,
+                    source: "bounded-residency plan".into(),
                 },
-                CapabilityValue::Available {
+                Observed::Available {
                     value: report.weight_store().currently_mapped_shards as u64,
-                    kind: MeasurementKind::Observational,
-                    source: "checkpoint-store mapping cache",
+                    kind: ObservationKind::Observational,
+                    source: "checkpoint-store mapping cache".into(),
                 },
             )
         } else {
             (
-                CapabilityValue::Unavailable {
+                Observed::Unavailable {
                     reason: "loaded model exposes neither resident parameters nor a residency plan"
                         .into(),
                 },
-                CapabilityValue::Unavailable {
+                Observed::Unavailable {
                     reason: "host residency unavailable".into(),
                 },
-                CapabilityValue::Unavailable {
+                Observed::Unavailable {
                     reason: "device residency unavailable".into(),
                 },
-                CapabilityValue::Unavailable {
+                Observed::Unavailable {
                     reason: "disk residency unavailable".into(),
                 },
-                CapabilityValue::Unavailable {
+                Observed::Unavailable {
                     reason: "mapping information unavailable".into(),
                 },
             )
@@ -2841,11 +2301,11 @@ impl super::LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             current_host_resident_bytes: host,
             current_device_resident_bytes: device,
             planned_disk_backed_bytes: disk,
-            mlx_active_allocation_bytes: runtime_counter(
+            backend_active_allocation_bytes: runtime_counter(
                 safemlx::memory::active_memory,
                 "process-global MLX active allocation counter",
             ),
-            mlx_allocator_cache_bytes: runtime_counter(
+            backend_allocator_cache_bytes: runtime_counter(
                 safemlx::memory::cache_memory,
                 "process-global MLX allocator cache counter",
             ),
@@ -2865,107 +2325,13 @@ impl super::LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         available: Option<&AvailableMemory>,
     ) -> Result<AdmissionResult, CapabilityError> {
         let capabilities = self.capabilities()?;
-        let maximum = match capabilities.effective_max_context {
-            CapabilityValue::Available { value, .. } => value,
-            CapabilityValue::Unsupported { reason } | CapabilityValue::Unavailable { reason } => {
-                return Ok(AdmissionResult::Rejected(
-                    AdmissionRejection::EstimationUnsupported { reason },
-                ))
-            }
-        };
-        if request.input.model_positions > maximum {
-            return Ok(AdmissionResult::Rejected(
-                AdmissionRejection::PromptExceedsContext {
-                    prompt_positions: request.input.model_positions,
-                    maximum_positions: maximum,
-                },
-            ));
-        }
-        let requested_positions = checked_add(
-            request.input.model_positions,
-            request.max_output_tokens,
-            "admission prompt plus output",
-        )?;
-        if requested_positions > maximum {
-            return Ok(AdmissionResult::Rejected(
-                AdmissionRejection::OutputHeadroomExceedsContext {
-                    prompt_positions: request.input.model_positions,
-                    output_tokens: request.max_output_tokens,
-                    maximum_positions: maximum,
-                },
-            ));
-        }
         let state = self.estimate_runtime_state(
             request.input,
             request.max_output_tokens,
             request.batch_size,
         )?;
-        apply_admission_memory_policy(request, requested_positions, state, available)
+        apply_admission_policy(&capabilities, request, state, available)
     }
-}
-
-fn apply_admission_memory_policy(
-    request: AdmissionRequest,
-    requested_positions: u64,
-    state: RuntimeStateEstimate,
-    available: Option<&AvailableMemory>,
-) -> Result<AdmissionResult, CapabilityError> {
-    if request.require_complete_estimate
-        && state.completeness == EstimationCompleteness::PersistentStateOnly
-    {
-        return Ok(AdmissionResult::Rejected(
-            AdmissionRejection::EstimationUnsupported {
-                reason: format!(
-                    "architecture estimator coverage is {:?}",
-                    state.completeness
-                ),
-            },
-        ));
-    }
-    let incremental_required_bytes = checked_add(
-        state.requested_state_bytes,
-        request.safety_reserve_bytes,
-        "state plus safety reserve",
-    )?;
-    if let Some(budget_bytes) = request.application_memory_budget_bytes {
-        if incremental_required_bytes > budget_bytes {
-            return Ok(AdmissionResult::Rejected(
-                AdmissionRejection::MemoryBudgetExceeded {
-                    required_bytes: incremental_required_bytes,
-                    budget_bytes,
-                },
-            ));
-        }
-    }
-    let available_bytes = match available {
-        Some(report) => match &report.available_memory_bytes {
-            CapabilityValue::Available { value, .. } => Some(*value),
-            CapabilityValue::Unsupported { reason } | CapabilityValue::Unavailable { reason } => {
-                return Ok(AdmissionResult::Rejected(
-                    AdmissionRejection::AvailableMemoryUnavailable {
-                        reason: reason.clone(),
-                    },
-                ))
-            }
-        },
-        None => None,
-    };
-    if let Some(available_bytes) = available_bytes {
-        if incremental_required_bytes > available_bytes {
-            return Ok(AdmissionResult::Rejected(
-                AdmissionRejection::InsufficientAvailableMemory {
-                    required_bytes: incremental_required_bytes,
-                    available_bytes,
-                },
-            ));
-        }
-    }
-    Ok(AdmissionResult::Admitted(Admission {
-        requested_positions,
-        state,
-        incremental_required_bytes,
-        available_memory_bytes: available_bytes,
-    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -2987,24 +2353,24 @@ fn macos_memory() -> Result<AvailableMemory, CapabilityError> {
         )
     };
     let physical_memory_bytes = if status == 0 && size == std::mem::size_of::<u64>() {
-        CapabilityValue::Available {
+        Observed::Available {
             value: total,
-            kind: MeasurementKind::Exact,
-            source: "macOS sysctl hw.memsize",
+            kind: ObservationKind::Exact,
+            source: "macOS sysctl hw.memsize".into(),
         }
     } else {
-        CapabilityValue::Unavailable {
+        Observed::Unavailable {
             reason: std::io::Error::last_os_error().to_string(),
         }
     };
     let available = unsafe { os_proc_available_memory() };
     let available_memory_bytes = match u64::try_from(available) {
-        Ok(value) if value > 0 => CapabilityValue::Available {
+        Ok(value) if value > 0 => Observed::Available {
             value,
-            kind: MeasurementKind::Estimated,
-            source: "macOS os_proc_available_memory",
+            kind: ObservationKind::Estimated,
+            source: "macOS os_proc_available_memory".into(),
         },
-        _ => CapabilityValue::Unavailable {
+        _ => Observed::Unavailable {
             reason: "os_proc_available_memory returned no usable value".into(),
         },
     };
@@ -3035,23 +2401,23 @@ fn linux_memory() -> Result<AvailableMemory, CapabilityError> {
     };
     Ok(AvailableMemory {
         physical_memory_bytes: value("MemTotal").map_or_else(
-            || CapabilityValue::Unavailable {
+            || Observed::Unavailable {
                 reason: "/proc/meminfo has no MemTotal".into(),
             },
-            |value| CapabilityValue::Available {
+            |value| Observed::Available {
                 value,
-                kind: MeasurementKind::Exact,
-                source: "Linux /proc/meminfo MemTotal",
+                kind: ObservationKind::Exact,
+                source: "Linux /proc/meminfo MemTotal".into(),
             },
         ),
         available_memory_bytes: value("MemAvailable").map_or_else(
-            || CapabilityValue::Unavailable {
+            || Observed::Unavailable {
                 reason: "/proc/meminfo has no MemAvailable".into(),
             },
-            |value| CapabilityValue::Available {
+            |value| Observed::Available {
                 value,
-                kind: MeasurementKind::Estimated,
-                source: "Linux /proc/meminfo MemAvailable",
+                kind: ObservationKind::Estimated,
+                source: "Linux /proc/meminfo MemAvailable".into(),
             },
         ),
         physical_semantics: PhysicalMemorySemantics::Unknown,
@@ -3091,25 +2457,25 @@ fn windows_memory() -> Result<AvailableMemory, CapabilityError> {
     };
     if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
         return Ok(AvailableMemory {
-            physical_memory_bytes: CapabilityValue::Unavailable {
+            physical_memory_bytes: Observed::Unavailable {
                 reason: "GlobalMemoryStatusEx failed".into(),
             },
-            available_memory_bytes: CapabilityValue::Unavailable {
+            available_memory_bytes: Observed::Unavailable {
                 reason: "GlobalMemoryStatusEx failed".into(),
             },
             physical_semantics: PhysicalMemorySemantics::Unknown,
         });
     }
     Ok(AvailableMemory {
-        physical_memory_bytes: CapabilityValue::Available {
+        physical_memory_bytes: Observed::Available {
             value: status.total_physical,
-            kind: MeasurementKind::Exact,
-            source: "Windows GlobalMemoryStatusEx ullTotalPhys",
+            kind: ObservationKind::Exact,
+            source: "Windows GlobalMemoryStatusEx ullTotalPhys".into(),
         },
-        available_memory_bytes: CapabilityValue::Available {
+        available_memory_bytes: Observed::Available {
             value: status.available_physical,
-            kind: MeasurementKind::Estimated,
-            source: "Windows GlobalMemoryStatusEx ullAvailPhys",
+            kind: ObservationKind::Estimated,
+            source: "Windows GlobalMemoryStatusEx ullAvailPhys".into(),
         },
         physical_semantics: PhysicalMemorySemantics::Unknown,
     })
@@ -3135,10 +2501,10 @@ pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Ok(AvailableMemory {
-            physical_memory_bytes: CapabilityValue::Unavailable {
+            physical_memory_bytes: Observed::Unavailable {
                 reason: "portable physical-memory query is not implemented on this platform".into(),
             },
-            available_memory_bytes: CapabilityValue::Unavailable {
+            available_memory_bytes: Observed::Unavailable {
                 reason: "portable available-memory query is not implemented on this platform"
                     .into(),
             },
@@ -3222,7 +2588,7 @@ mod tests {
                 ],
             }
         );
-        let state = estimate_architecture_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
+        let state = estimate_mlx_runtime_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
         assert_eq!(state.assumptions.sliding_window_bounds, vec![4, 8]);
         assert_eq!(state.context_state_bytes, (10 + 2 * 4 + 8) * 16 * 2 * 4);
     }
@@ -3339,8 +2705,7 @@ mod tests {
         assert_eq!(estimate.growing[0].layers, 1);
         assert_eq!(estimate.growing[0].scalars_per_position, 8);
         assert_eq!(estimate.growing[0].window, Some(5));
-        let state =
-            estimate_architecture_state(&estimate, InputTokenCount::text(10), 0, 2).unwrap();
+        let state = estimate_mlx_runtime_state(&estimate, InputTokenCount::text(10), 0, 2).unwrap();
         assert_eq!(state.fixed_state_bytes, 512);
         assert_eq!(state.context_state_bytes, 320);
         assert_eq!(state.bytes_per_position_per_batch, 0);
@@ -3480,8 +2845,8 @@ mod tests {
         positions: u64,
         batch: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError> {
-        estimate_architecture_state(
-            &ArchitectureEstimate {
+        estimate_mlx_runtime_state(
+            &StateLayout {
                 fixed_scalars_per_batch: fixed,
                 growing: components,
                 hidden_size: 1,
@@ -3499,12 +2864,11 @@ mod tests {
         let (_, _, strategy, _, llama_layout) = llama_spec(&tiny_llama(4, None), false).unwrap();
         assert_eq!(strategy, CacheStateStrategy::FullKv);
         let llama =
-            estimate_architecture_state(&llama_layout, InputTokenCount::text(10), 0, 1).unwrap();
+            estimate_mlx_runtime_state(&llama_layout, InputTokenCount::text(10), 0, 1).unwrap();
         assert_eq!(llama.requested_state_bytes, 2 * 2 * 4 * 8 * 10 * 4);
 
         let (_, _, _, _, gqa_layout) = llama_spec(&tiny_llama(1, None), false).unwrap();
-        let gqa =
-            estimate_architecture_state(&gqa_layout, InputTokenCount::text(10), 0, 1).unwrap();
+        let gqa = estimate_mlx_runtime_state(&gqa_layout, InputTokenCount::text(10), 0, 1).unwrap();
         assert_eq!(gqa.requested_state_bytes, llama.requested_state_bytes / 4);
     }
 
@@ -3530,7 +2894,7 @@ mod tests {
             }
         );
         let estimate =
-            estimate_architecture_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
+            estimate_mlx_runtime_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
         assert_eq!(estimate.context_state_bytes, (10 + 3) * 2 * 8 * 2 * 2 * 4);
         assert_eq!(estimate.assumptions.sliding_window_bounds, vec![3]);
     }
@@ -3646,7 +3010,7 @@ mod tests {
 
     #[test]
     fn multimodal_positions_are_distinct_from_text_tokens() {
-        let count = InputTokenCount::prepared(7, 12, 19, 1_024, MeasurementKind::Conservative);
+        let count = InputTokenCount::prepared(7, 12, 19, 1_024, ObservationKind::Conservative);
         assert_eq!(
             count.text_tokens + count.media_positions,
             count.model_positions
@@ -3654,7 +3018,7 @@ mod tests {
         assert_eq!(count.media_execution_workspace_bytes(), 1_024);
         assert_eq!(
             count.media_execution_workspace_kind(),
-            MeasurementKind::Conservative
+            ObservationKind::Conservative
         );
     }
 
@@ -3688,7 +3052,7 @@ mod tests {
             &vision_config,
             8,
             &vision,
-            super::super::input::InputMetadata::patch_position_ids(&patch_positions),
+            super::input::InputMetadata::patch_position_ids(&patch_positions),
             "gemma4",
         )
         .unwrap();
@@ -3718,7 +3082,7 @@ mod tests {
             &audio_config,
             8,
             &audio,
-            super::super::input::InputMetadata::audio_mask(&audio_mask),
+            super::input::InputMetadata::audio_mask(&audio_mask),
             "gemma4",
         )
         .unwrap();
@@ -3765,7 +3129,7 @@ mod tests {
             &config,
             Modality::Image,
             &payload,
-            super::super::input::InputMetadata::qwen_grid_thw(&grid),
+            super::input::InputMetadata::qwen_grid_thw(&grid),
             &stream,
             "qwen3_vl",
         )
@@ -3847,7 +3211,7 @@ mod tests {
                 media_consumes_decoder_positions: true,
             }
         );
-        let state = estimate_architecture_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
+        let state = estimate_mlx_runtime_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
         assert_eq!(state.assumptions.sliding_window_bounds, vec![3, 5]);
         // Full KV: 1 x 10 x (1 head x 8 x K/V). Sliding KV: (3 + 5) x
         // (2 heads x 8 x K/V), all for two batches of f32 state.
@@ -3862,7 +3226,7 @@ mod tests {
             &args,
             Modality::Image,
             &image,
-            super::super::input::InputMetadata::empty(),
+            super::input::InputMetadata::empty(),
             "inkling",
         )
         .unwrap();
@@ -3875,7 +3239,7 @@ mod tests {
             &args,
             Modality::Audio,
             &audio,
-            super::super::input::InputMetadata::audio_mask(&mask),
+            super::input::InputMetadata::audio_mask(&mask),
             "inkling",
         )
         .unwrap();
@@ -3907,9 +3271,9 @@ mod tests {
                 media_consumes_decoder_positions: true,
             }
         );
-        let estimate = estimate_architecture_state(
+        let estimate = estimate_mlx_runtime_state(
             &layout,
-            InputTokenCount::prepared(5, 3, 8, 1_024, MeasurementKind::Conservative),
+            InputTokenCount::prepared(5, 3, 8, 1_024, ObservationKind::Conservative),
             2,
             2,
         )
@@ -3991,7 +3355,7 @@ mod tests {
             })
         );
 
-        let layout = ArchitectureEstimate {
+        let layout = StateLayout {
             fixed_scalars_per_batch: 0,
             growing: Vec::new(),
             hidden_size: 1,
@@ -3999,9 +3363,9 @@ mod tests {
             completeness: EstimationCompleteness::Complete,
         };
         assert!(matches!(
-            estimate_architecture_state(
+            estimate_mlx_runtime_state(
                 &layout,
-                InputTokenCount::prepared(0, 1, 1, u64::MAX, MeasurementKind::Conservative,),
+                InputTokenCount::prepared(0, 1, 1, u64::MAX, ObservationKind::Conservative,),
                 0,
                 2,
             ),
@@ -4013,7 +3377,7 @@ mod tests {
 
     #[test]
     fn unavailable_memory_is_not_zero() {
-        let value: CapabilityValue<u64> = CapabilityValue::Unavailable {
+        let value: Observed<u64> = Observed::Unavailable {
             reason: "synthetic".into(),
         };
         assert_eq!(value.value(), None);
@@ -4022,15 +3386,15 @@ mod tests {
     #[test]
     fn apple_unified_semantics_do_not_create_two_capacities() {
         let report = AvailableMemory {
-            physical_memory_bytes: CapabilityValue::Available {
+            physical_memory_bytes: Observed::Available {
                 value: 16,
-                kind: MeasurementKind::Exact,
-                source: "test",
+                kind: ObservationKind::Exact,
+                source: "test".into(),
             },
-            available_memory_bytes: CapabilityValue::Available {
+            available_memory_bytes: Observed::Available {
                 value: 8,
-                kind: MeasurementKind::Estimated,
-                source: "test",
+                kind: ObservationKind::Estimated,
+                source: "test".into(),
             },
             physical_semantics: PhysicalMemorySemantics::Unified,
         };
@@ -4046,7 +3410,7 @@ mod tests {
 
     #[test]
     fn capability_value_never_invents_default() {
-        let unsupported: CapabilityValue<u64> = CapabilityValue::Unsupported {
+        let unsupported: Observed<u64> = Observed::Unsupported {
             reason: "not supported".into(),
         };
         assert!(unsupported.value().is_none());
@@ -4070,144 +3434,5 @@ mod tests {
         let (native, effective) = context_from_rope(163_840, Some(&yarn)).unwrap();
         assert_eq!(native.value(), Some(&4_096));
         assert_eq!(effective.value(), Some(&163_840));
-    }
-
-    #[test]
-    fn cache_allocation_rounding_is_checked_and_explicit() {
-        assert_eq!(rounded_cache_positions(0, 256).unwrap(), 0);
-        assert_eq!(rounded_cache_positions(257, 256).unwrap(), 512);
-        assert!(matches!(
-            rounded_cache_positions(u64::MAX, 256),
-            Err(CapabilityError::ArithmeticOverflow {
-                operation: "cache allocation rounding"
-            })
-        ));
-        assert!(matches!(
-            rounded_cache_positions(1, 0),
-            Err(CapabilityError::InvalidConfiguration {
-                field: "allocation_granularity",
-                ..
-            })
-        ));
-    }
-
-    fn request(prompt: u64, output: u64, budget: Option<u64>) -> AdmissionRequest {
-        AdmissionRequest {
-            input: InputTokenCount::text(prompt),
-            max_output_tokens: output,
-            batch_size: 1,
-            safety_reserve_bytes: 10,
-            application_memory_budget_bytes: budget,
-            require_complete_estimate: true,
-        }
-    }
-
-    fn reject_context(
-        maximum: u64,
-        request: AdmissionRequest,
-    ) -> Result<Option<AdmissionRejection>, CapabilityError> {
-        if request.input.model_positions > maximum {
-            return Ok(Some(AdmissionRejection::PromptExceedsContext {
-                prompt_positions: request.input.model_positions,
-                maximum_positions: maximum,
-            }));
-        }
-        let total = checked_add(
-            request.input.model_positions,
-            request.max_output_tokens,
-            "test admission positions",
-        )?;
-        Ok(
-            (total > maximum).then_some(AdmissionRejection::OutputHeadroomExceedsContext {
-                prompt_positions: request.input.model_positions,
-                output_tokens: request.max_output_tokens,
-                maximum_positions: maximum,
-            }),
-        )
-    }
-
-    #[test]
-    fn context_limit_rejection_is_structured() {
-        assert_eq!(
-            reject_context(8, request(9, 0, None)).unwrap(),
-            Some(AdmissionRejection::PromptExceedsContext {
-                prompt_positions: 9,
-                maximum_positions: 8,
-            })
-        );
-    }
-
-    #[test]
-    fn output_headroom_rejection_is_structured() {
-        assert_eq!(
-            reject_context(8, request(7, 2, None)).unwrap(),
-            Some(AdmissionRejection::OutputHeadroomExceedsContext {
-                prompt_positions: 7,
-                output_tokens: 2,
-                maximum_positions: 8,
-            })
-        );
-    }
-
-    #[test]
-    fn memory_budget_rejection_is_structured() {
-        let state = estimate(0, Vec::new(), 1, 1).unwrap();
-        assert_eq!(
-            apply_admission_memory_policy(request(1, 0, Some(9)), 1, state, None).unwrap(),
-            AdmissionResult::Rejected(AdmissionRejection::MemoryBudgetExceeded {
-                required_bytes: 10,
-                budget_bytes: 9,
-            })
-        );
-    }
-
-    #[test]
-    fn complete_policy_accepts_conservative_media_bound() {
-        let layout = ArchitectureEstimate {
-            fixed_scalars_per_batch: 0,
-            growing: Vec::new(),
-            hidden_size: 8,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        };
-        let input = InputTokenCount::prepared(1, 1, 2, 100, MeasurementKind::Conservative);
-        let state = estimate_architecture_state(&layout, input, 0, 1).unwrap();
-        assert_eq!(state.completeness, EstimationCompleteness::Conservative);
-        let admission = apply_admission_memory_policy(
-            AdmissionRequest {
-                input,
-                max_output_tokens: 0,
-                batch_size: 1,
-                safety_reserve_bytes: 0,
-                application_memory_budget_bytes: Some(state.requested_state_bytes),
-                require_complete_estimate: true,
-            },
-            2,
-            state,
-            None,
-        )
-        .unwrap();
-        assert!(matches!(admission, AdmissionResult::Admitted(_)));
-    }
-
-    #[test]
-    fn unavailable_platform_memory_rejects_when_check_was_requested() {
-        let state = estimate(0, Vec::new(), 1, 1).unwrap();
-        let unavailable = AvailableMemory {
-            physical_memory_bytes: CapabilityValue::Unavailable {
-                reason: "synthetic total".into(),
-            },
-            available_memory_bytes: CapabilityValue::Unavailable {
-                reason: "synthetic availability".into(),
-            },
-            physical_semantics: PhysicalMemorySemantics::Unknown,
-        };
-        assert_eq!(
-            apply_admission_memory_policy(request(1, 0, None), 1, state, Some(&unavailable))
-                .unwrap(),
-            AdmissionResult::Rejected(AdmissionRejection::AvailableMemoryUnavailable {
-                reason: "synthetic availability".into(),
-            })
-        );
     }
 }

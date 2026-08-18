@@ -17,6 +17,8 @@ pub mod automatic;
 pub mod backend;
 /// Aggregate ownership and admission for backend-managed live caches.
 pub mod cache;
+/// Portable model capabilities, runtime-state accounting, and admission policy.
+pub mod capability;
 /// Neutral checkpoint tensor descriptions and validation.
 pub mod checkpoint;
 /// Backend-neutral distributed scheduler consensus.
@@ -25,6 +27,8 @@ pub mod consensus;
 pub mod execution;
 /// Backend-independent generation lifecycle and output events.
 pub mod generation;
+/// Portable model-artifact inspection results.
+pub mod inspection;
 /// Stable model and artifact identities.
 pub mod model;
 /// Backend-generic realtime token-session execution and scheduling.
@@ -63,6 +67,13 @@ pub use backend::{
     TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenFilterController,
     TokenFilterError, TokenOutput, ValueDescriptor,
 };
+pub use capability::{
+    apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,
+    AdmissionRequest, AdmissionResult, AvailableMemory, CacheStateStrategy, CapabilityError,
+    EstimationCompleteness, GrowingState, InputModalities, InputTokenCount, ModelCapabilities,
+    PhysicalMemorySemantics, RuntimeStateEstimate, SlidingWindowLayerCount, StateLayout,
+    StateMemoryAssumptions, StaticMemoryReport,
+};
 pub use execution::{
     BackendId, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanError,
     ExpertCachePlan, ResidencyPlan, WeightTransformationPlan, DEFAULT_MAX_MAPPED_SHARDS,
@@ -75,6 +86,10 @@ pub use generation::{
     MtpRequestPhase, MtpSchedulerOptions, OptimisticReuseDecision, ResolvedGenerationConfig,
     SemanticEvent, SpeculativeCommitPlan, SpeculativeRound, SpeculativeTail, TokenCommit,
     TokenTerminalSignals,
+};
+pub use inspection::{
+    ArtifactModality, ArtifactTensorEncoding, InspectionIssue, InspectionIssueCode,
+    InspectionReadiness, InspectionRequirement, InspectionSeverity, ModelInspectionReport,
 };
 pub use realtime::{
     load_realtime_model, load_realtime_model_with_options, RealtimeBackend, RealtimeCompletedStep,

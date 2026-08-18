@@ -1,4 +1,4 @@
-//! Side-effect-free model artifact compatibility inspection.
+//! Side-effect-free MLX model artifact compatibility inspection.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -10,16 +10,43 @@ use crate::backend::mlx::resolve_model_config;
 use crate::backend::mlx::structural::{self, GgufArchitectureValidation};
 use safemlx::ops::GgufCheckpoint;
 use safemlx_gguf::MetadataValue as GgufMetadataValue;
-use safemlx_lm_core::{ModelResourceProfile, Observed};
-use serde::Serialize;
+use safemlx_lm_core::{
+    ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, GgufArchitecture, InspectionIssue,
+    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
+    ModelInspectionReport, ModelKind, Observed,
+};
 use serde_json::{json, Map, Value};
 
 use super::*;
-use crate::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore};
+use crate::{
+    api::{
+        load_tokenizer,
+        mlx::{
+            eos_token_ids_from_sidecar_dir, merge_eos_token_id_sources,
+            request::prepare_chat_from_parts,
+            tokenizer::{
+                gguf_sidecar_dir, is_gguf_file, load_chat_template,
+                load_gguf_tokenizer_from_metadata, load_tokenizer_template_kwargs,
+            },
+            ChatTokenizer, ModelChatTemplate,
+        },
+    },
+    architectures::{
+        gemma4::model as gemma4, inkling::model as inkling, muse_glimmer,
+        qwen::vl::model as qwen3_vl,
+    },
+    runtime::{
+        chat::{
+            constraints::ConstraintCompiler, ChatTemplateRequest, NativeToolSupport, PreparedChat,
+            SemanticSupport, ToolChoice,
+        },
+        checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    },
+};
 
 /// Options applied while inspecting a model artifact.
 #[derive(Debug, Clone, Default)]
-pub struct ModelInspectionOptions {
+pub struct MlxInspectionOptions {
     /// The exact loading policy that admission should validate.
     pub load: ModelLoadOptions,
     /// Optional concrete chat request to render and behaviorally probe.
@@ -30,275 +57,12 @@ pub struct ModelInspectionOptions {
     pub chat_request: Option<ChatTemplateRequest>,
 }
 
-/// A readiness result that does not collapse distinct failure modes to a bool.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InspectionReadiness {
-    /// The inspected artifacts establish this capability.
-    Ready,
-    /// The artifact omits a required component.
-    Missing,
-    /// SafeMLX does not implement the artifact or requested combination.
-    Unsupported,
-    /// The relevant artifact data is malformed.
-    Invalid,
-    /// A concrete request must be supplied before this can be decided.
-    RequestDependent,
-    /// The check necessarily occurs later in loading or execution.
-    Unverified,
-    /// The capability does not apply to this artifact.
-    NotApplicable,
-}
-
-/// Severity attached to an inspection issue.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InspectionSeverity {
-    /// Prevents the stated readiness or requested load route.
-    Error,
-    /// Does not prevent the selected load, but limits a capability or proof.
-    Warning,
-    /// Actionable context that is neither a rejection nor a warning.
-    Info,
-}
-
-/// Stable machine-readable issue category.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum InspectionIssueCode {
-    /// Artifact path or container structure is invalid.
-    InvalidContainer,
-    /// `config.json` or architecture metadata is invalid.
-    InvalidConfiguration,
-    /// Architecture dispatch has no SafeMLX implementation.
-    UnsupportedArchitecture,
-    /// A referenced checkpoint shard is absent or contradictory.
-    MissingCheckpointShard,
-    /// A tensor storage encoding cannot be consumed.
-    UnsupportedTensorEncoding,
-    /// An architecture-required tensor is absent from the catalog.
-    MissingRequiredTensor,
-    /// Tensor aliases or layouts conflict after architecture translation.
-    ConflictingTensorLayout,
-    /// A catalog tensor has the wrong rank or dimensions.
-    TensorShapeMismatch,
-    /// Packed quantization metadata and companion tensors disagree.
-    QuantizationCompanionMismatch,
-    /// Configured layer, attention, or expert geometry is invalid.
-    InvalidLayerOrExpertCount,
-    /// No usable embedded or sidecar tokenizer is available.
-    MissingTokenizer,
-    /// No checkpoint or sidecar chat template is available.
-    MissingChatTemplate,
-    /// A required multimodal projector is absent or ambiguous.
-    MissingMediaProjector,
-    /// A media processor or its build feature is unavailable.
-    MissingProcessor,
-    /// The requested on-load quantization is incompatible.
-    UnsupportedQuantizationRequest,
-    /// The requested weight residency route is incompatible.
-    UnsupportedResidencyPolicy,
-    /// The requested parallel topology cannot use this loader.
-    UnsupportedParallelTopology,
-    /// No fail-closed semantic streaming protocol was recognized.
-    UnsupportedSemanticProtocol,
-    /// No fail-closed native-tool protocol was recognized.
-    UnsupportedToolProtocol,
-    /// EOS metadata is absent; callers may need request-time stop criteria.
-    MissingEosMetadata,
-    /// Exact architecture binding still requires loader-time module validation.
-    ValidationUnavailableUntilLoad,
-    /// Real messages, schemas, kwargs, or runtime state still need validation.
-    RequestSpecificValidation,
-    /// An ordinary local I/O operation failed.
-    Io,
-}
-
-/// One structured diagnostic produced by inspection.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct InspectionIssue {
-    /// Stable category for routing and UI behavior.
-    pub code: InspectionIssueCode,
-    /// Diagnostic severity.
-    pub severity: InspectionSeverity,
-    /// Human-readable actionable detail.
-    pub detail: String,
-    /// Relevant artifact or sidecar path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-    /// Relevant GGUF or JSON metadata key.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata_key: Option<String>,
-    /// Relevant logical or physical tensor name.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tensor_name: Option<String>,
-    /// Relevant numeric GGML tensor type code.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tensor_type_code: Option<u32>,
-}
-
-/// One tensor storage encoding observed in artifact headers.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-pub struct ArtifactTensorEncoding {
-    /// Stable textual representation (for example `BF16` or `Q4K`).
-    pub name: String,
-    /// GGML type code for GGUF encodings; absent for SafeTensors dtypes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ggml_type_code: Option<u32>,
-}
-
-/// Input modality advertised by the resolved loader architecture.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactModality {
-    /// Text tokens.
-    Text,
-    /// Still images.
-    Image,
-    /// Video frame sequences.
-    Video,
-    /// Audio waveforms or features.
-    Audio,
-}
-
-/// A sidecar or companion requirement discovered during inspection.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct InspectionRequirement {
-    /// Machine-readable issue category corresponding to this requirement.
-    pub code: InspectionIssueCode,
-    /// Current readiness of the requirement.
-    pub readiness: InspectionReadiness,
-    /// Human-readable explanation.
-    pub detail: String,
-    /// Expected or selected path, when applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-}
-
-/// Structured pre-load compatibility report for a local model artifact.
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelInspectionReport {
-    /// Submitted local artifact path.
-    pub path: PathBuf,
-    /// Detected artifact container.
-    pub artifact_format: ArtifactFormat,
-    /// Resolved high-level SafeMLX model family, when architecture dispatch succeeded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_kind: Option<ModelKind>,
-    /// Submitted model type or GGUF `general.architecture` value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub architecture: Option<String>,
-    /// GGUF versions observed across validated shards.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gguf_versions: Option<Vec<u32>>,
-    /// Number of checkpoint payload shards, if their catalog was established.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub checkpoint_shards: Option<usize>,
-    /// Number of cataloged logical tensors, if established.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tensor_count: Option<usize>,
-    /// Header-only resource accounting for automatic planning.
-    pub resources: ModelResourceProfile,
-    /// Every distinct storage encoding observed in checkpoint headers.
-    pub tensor_encodings: Vec<ArtifactTensorEncoding>,
-    /// Expected input modalities derived from config/architecture metadata.
-    pub expected_modalities: Vec<ArtifactModality>,
-    /// Container/config/header validity.
-    pub container: InspectionReadiness,
-    /// Whether architecture dispatch selects a supported SafeMLX loader.
-    pub architecture_support: InspectionReadiness,
-    /// Exact header/catalog binding to the selected architecture loader.
-    pub structural_binding: InspectionReadiness,
-    /// SafeMLX model-loader readiness independent of tokenizer/chat sidecars.
-    pub model_loadability: InspectionReadiness,
-    /// Compatibility with [`ModelInspectionOptions::load`].
-    pub requested_load: InspectionReadiness,
-    /// Combined model and tokenizer readiness for raw text generation.
-    pub text_generation: InspectionReadiness,
-    /// Tokenizer reconstruction/readiness.
-    pub tokenizer: InspectionReadiness,
-    /// Chat-template availability and parseability.
-    pub chat_template: InspectionReadiness,
-    /// Behavioral structured semantic-streaming readiness.
-    pub semantic_streaming: InspectionReadiness,
-    /// Behavioral native-tool readiness.
-    pub native_tools: InspectionReadiness,
-    /// Processor/projector readiness for advertised non-text modalities.
-    pub multimodal: InspectionReadiness,
-    /// Discovered sidecar and request requirements.
-    pub requirements: Vec<InspectionRequirement>,
-    /// Structured rejection reasons, warnings, and limitations.
-    pub issues: Vec<InspectionIssue>,
-}
-
-impl ModelInspectionReport {
-    /// Returns whether the artifact and requested load policy passed preflight.
-    pub fn is_loadable(&self) -> bool {
-        self.container == InspectionReadiness::Ready
-            && self.architecture_support == InspectionReadiness::Ready
-            && self.structural_binding == InspectionReadiness::Ready
-            && self.model_loadability == InspectionReadiness::Ready
-            && self.requested_load == InspectionReadiness::Ready
-            && !self
-                .issues
-                .iter()
-                .any(|issue| issue.code == InspectionIssueCode::ValidationUnavailableUntilLoad)
-    }
-
-    fn new(path: &Path, artifact_format: ArtifactFormat) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            artifact_format,
-            model_kind: None,
-            architecture: None,
-            gguf_versions: None,
-            checkpoint_shards: None,
-            tensor_count: None,
-            resources: ModelResourceProfile::unmeasured(path.to_path_buf(), artifact_format),
-            tensor_encodings: Vec::new(),
-            expected_modalities: Vec::new(),
-            container: InspectionReadiness::Unverified,
-            architecture_support: InspectionReadiness::Unverified,
-            structural_binding: InspectionReadiness::Unverified,
-            model_loadability: InspectionReadiness::Unverified,
-            requested_load: InspectionReadiness::Unverified,
-            text_generation: InspectionReadiness::Unverified,
-            tokenizer: InspectionReadiness::Unverified,
-            chat_template: InspectionReadiness::Unverified,
-            semantic_streaming: InspectionReadiness::Unverified,
-            native_tools: InspectionReadiness::Unverified,
-            multimodal: InspectionReadiness::Unverified,
-            requirements: Vec::new(),
-            issues: Vec::new(),
-        }
-    }
-
-    fn issue(
-        &mut self,
-        code: InspectionIssueCode,
-        severity: InspectionSeverity,
-        detail: impl Into<String>,
-        path: Option<PathBuf>,
-    ) {
-        self.issues.push(InspectionIssue {
-            code,
-            severity,
-            detail: detail.into(),
-            path,
-            metadata_key: None,
-            tensor_name: None,
-            tensor_type_code: None,
-        });
-    }
-}
-
 /// Inspects a local SafeTensors model directory or GGUF checkpoint without
 /// instantiating a model, materializing tensor payloads, or creating an MLX
 /// execution stream.
 pub fn inspect_model(
     path: impl AsRef<Path>,
-    options: ModelInspectionOptions,
+    options: MlxInspectionOptions,
 ) -> Result<ModelInspectionReport, Error> {
     let path = path.as_ref();
     let mut report = if is_gguf_file(path) {
@@ -324,8 +88,8 @@ pub fn inspect_model(
     Ok(report)
 }
 
-fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelInspectionReport {
-    let mut report = ModelInspectionReport::new(path, ArtifactFormat::SafeTensors);
+fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
+    let mut report = ModelInspectionReport::unverified(path, ArtifactFormat::SafeTensors);
     let mut resolved_kind = None;
     let config_path = path.join("config.json");
     let config: Option<Value> = match std::fs::read_to_string(&config_path) {
@@ -521,8 +285,8 @@ fn inspect_safetensors(path: &Path, options: ModelInspectionOptions) -> ModelIns
     report
 }
 
-fn inspect_gguf(path: &Path, options: ModelInspectionOptions) -> ModelInspectionReport {
-    let mut report = ModelInspectionReport::new(path, ArtifactFormat::Gguf);
+fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
+    let mut report = ModelInspectionReport::unverified(path, ArtifactFormat::Gguf);
     let checkpoint = match GgufCheckpoint::open(path) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
@@ -6453,7 +6217,7 @@ mod tests {
     #[test]
     fn complete_sparse_personaplex_headers_are_structurally_exact_but_use_realtime_policy() {
         let directory = write_sparse_personaplex_safetensors_dir(|_| {});
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.container, InspectionReadiness::Ready);
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
@@ -6477,7 +6241,7 @@ mod tests {
         let missing = write_sparse_personaplex_safetensors_dir(|specs| {
             specs.retain(|(name, _)| name != "transformer.layers.31.self_attn.out_proj.weight");
         });
-        let report = inspect_model(missing.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(missing.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -6493,7 +6257,7 @@ mod tests {
                 .unwrap();
             shape[0] -= 1;
         });
-        let report = inspect_model(misshaped.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(misshaped.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -6511,7 +6275,7 @@ mod tests {
                 vec![12_288, 4_096],
             ));
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -6539,7 +6303,7 @@ mod tests {
     #[test]
     fn unrelated_poison_safetensor_is_not_authoritatively_loadable() {
         let directory = write_safetensors_dir(&llama_config());
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.container, InspectionReadiness::Ready);
         assert_eq!(report.model_kind, Some(ModelKind::Llama));
         assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
@@ -6566,7 +6330,7 @@ mod tests {
     #[test]
     fn complete_poisoned_llama_safetensors_headers_are_exactly_loadable() {
         let directory = write_complete_safetensors_dir(|_| {});
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.container, InspectionReadiness::Ready);
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
@@ -6583,7 +6347,7 @@ mod tests {
     #[test]
     fn complete_poisoned_dense_qwen3_safetensors_headers_are_exactly_loadable() {
         let directory = write_complete_qwen3_safetensors_dir(|_| {});
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.container, InspectionReadiness::Ready);
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
@@ -6601,8 +6365,7 @@ mod tests {
     fn qwen2_tied_and_untied_safetensors_catalogs_are_exactly_loadable() {
         for tied in [true, false] {
             let directory = write_complete_qwen2_safetensors_dir(tied, |_| {});
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.model_kind, Some(ModelKind::Qwen2));
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert!(report.is_loadable());
@@ -6648,8 +6411,7 @@ mod tests {
         ];
 
         for (case, directory) in cases.into_iter().enumerate() {
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(
                 report.structural_binding,
                 InspectionReadiness::Invalid,
@@ -6670,8 +6432,7 @@ mod tests {
     fn complete_poisoned_qwen3_vl_safetensors_catalogs_are_exactly_loadable() {
         for (is_moe, kind) in [(false, ModelKind::Qwen3Vl), (true, ModelKind::Qwen3VlMoe)] {
             let directory = write_complete_qwen3_vl_safetensors_dir(is_moe, |_| {});
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(
@@ -6707,8 +6468,7 @@ mod tests {
             )
             .unwrap();
 
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
             assert!(!report.is_loadable());
             assert!(structural::validate_safetensors_load_path(
@@ -6750,7 +6510,7 @@ mod tests {
             },
         );
         let directory = write_typed_safetensors_dir(&config, &specs);
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(
             report.structural_binding,
             InspectionReadiness::Ready,
@@ -6771,7 +6531,7 @@ mod tests {
         let missing = write_complete_qwen3_vl_safetensors_dir(false, |specs| {
             specs.retain(|(name, _, _)| name != "model.visual.blocks.0.attn.qkv.weight");
         });
-        let report = inspect_model(missing.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(missing.path(), MlxInspectionOptions::default()).unwrap();
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
                 && issue.tensor_name.as_deref() == Some("model.visual.blocks.0.attn.qkv.weight")
@@ -6785,7 +6545,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![8, 24];
         });
-        let report = inspect_model(wrong_shape.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(wrong_shape.path(), MlxInspectionOptions::default()).unwrap();
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
                 && issue.tensor_name.as_deref() == Some("model.visual.patch_embed.proj.weight")
@@ -6800,7 +6560,7 @@ mod tests {
                 .2 = Dtype::U8;
         });
         let report =
-            inspect_model(quantized_vision.path(), ModelInspectionOptions::default()).unwrap();
+            inspect_model(quantized_vision.path(), MlxInspectionOptions::default()).unwrap();
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::UnsupportedTensorEncoding
                 && issue.tensor_name.as_deref() == Some("model.visual.merger.linear_fc1.weight")
@@ -6810,7 +6570,7 @@ mod tests {
         let unexpected = write_complete_qwen3_vl_safetensors_dir(false, |specs| {
             specs.push(("poison.weight".into(), vec![1], Dtype::F32));
         });
-        let report = inspect_model(unexpected.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(unexpected.path(), MlxInspectionOptions::default()).unwrap();
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
                 && issue.tensor_name.as_deref() == Some("poison.weight")
@@ -6844,7 +6604,7 @@ mod tests {
                 }
             }
         });
-        let resident = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let resident = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!resident.is_loadable());
         assert!(resident.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -6857,7 +6617,7 @@ mod tests {
             .with_weight_residency(WeightResidency::layerwise_host(Default::default()));
         let bounded = inspect_model(
             directory.path(),
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load,
                 chat_request: None,
             },
@@ -6871,7 +6631,7 @@ mod tests {
     #[test]
     fn complete_poisoned_dense_lfm2_safetensors_headers_are_exactly_loadable() {
         let directory = write_complete_lfm2_safetensors_dir(|_| {});
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.container, InspectionReadiness::Ready);
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
@@ -6894,7 +6654,7 @@ mod tests {
                 .unwrap();
             *shape = vec![32, 3, 1];
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert!(report.is_loadable(), "{:#?}", report.issues);
         structural::validate_safetensors_load_path(
             ModelKind::Lfm2,
@@ -6922,7 +6682,7 @@ mod tests {
     #[test]
     fn complete_poisoned_gpt_oss_safetensors_headers_are_exactly_loadable() {
         let directory = write_complete_gpt_oss_safetensors_dir(|_| {});
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
         assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -6954,8 +6714,7 @@ mod tests {
             )
             .unwrap();
 
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
             assert!(!report.is_loadable());
             assert!(structural::validate_safetensors_load_path(
@@ -6972,7 +6731,7 @@ mod tests {
         let directory = write_complete_gpt_oss_safetensors_dir(|specs| {
             specs.retain(|(name, _, _)| name != "model.layers.0.mlp.experts.gate_up_proj_scales");
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -6990,7 +6749,7 @@ mod tests {
         let directory = write_complete_gpt_oss_safetensors_dir(|specs| {
             specs.push(("poison.weight".into(), vec![1], Dtype::F32));
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -7009,8 +6768,7 @@ mod tests {
             let directory = write_complete_kimi_linear_safetensors_dir(packed, |specs| {
                 specs.push(("model.mtp.poison.weight".into(), vec![1]));
             });
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(
@@ -7046,8 +6804,7 @@ mod tests {
             )
             .unwrap();
 
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
             assert!(!report.is_loadable());
             assert!(structural::validate_safetensors_load_path(
@@ -7064,7 +6821,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("kimi-linear.gguf");
         write_complete_kimi_linear_gguf(&path);
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(
             report.structural_binding,
             InspectionReadiness::Ready,
@@ -7092,7 +6849,7 @@ mod tests {
         let directory = write_complete_kimi_linear_safetensors_dir(false, |specs| {
             specs.retain(|(name, _)| name != "model.layers.1.block_sparse_moe.experts.3.w2.weight");
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -7114,7 +6871,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![8, 3];
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -7130,7 +6887,7 @@ mod tests {
     #[test]
     fn complete_inkling_safetensors_headers_are_exactly_loadable() {
         let directory = write_complete_inkling_safetensors_dir(|_| {});
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
         assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -7212,8 +6969,7 @@ mod tests {
             )
             .unwrap();
 
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(
                 report.model_loadability,
                 InspectionReadiness::Invalid,
@@ -7245,7 +7001,7 @@ mod tests {
         let missing = write_complete_inkling_safetensors_dir(|specs| {
             specs.retain(|(name, _)| name != "model.llm.layers.1.attn.wq_du.weight");
         });
-        let report = inspect_model(missing.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(missing.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -7259,7 +7015,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![31, 16];
         });
-        let report = inspect_model(wrong.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(wrong.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -7272,7 +7028,7 @@ mod tests {
         let conflict = write_complete_inkling_safetensors_dir(|specs| {
             specs.push(("model.embed_tokens.weight".into(), vec![32, 16]));
         });
-        let report = inspect_model(conflict.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(conflict.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -7294,8 +7050,7 @@ mod tests {
             serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
-        let report =
-            inspect_model(missing_media.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(missing_media.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -7307,8 +7062,7 @@ mod tests {
     fn complete_poisoned_nemotron_h_safetensors_layouts_are_exactly_loadable() {
         for packed in [false, true] {
             let directory = write_complete_nemotron_h_safetensors_dir(packed, |_| {});
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(
@@ -7341,8 +7095,7 @@ mod tests {
             )
             .unwrap();
 
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
             assert!(!report.is_loadable());
             assert!(structural::validate_safetensors_load_path(
@@ -7359,7 +7112,7 @@ mod tests {
         let missing = write_complete_nemotron_h_safetensors_dir(false, |specs| {
             specs.retain(|(name, _)| name != "backbone.layers.0.mixer.conv1d.weight");
         });
-        let report = inspect_model(missing.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(missing.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -7373,7 +7126,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![8, 5];
         });
-        let report = inspect_model(wrong.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(wrong.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -7390,7 +7143,7 @@ mod tests {
                 vec![6, 8],
             ));
         });
-        let report = inspect_model(mixed.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(mixed.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -7410,7 +7163,7 @@ mod tests {
             serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
-        let report = inspect_model(affine.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(affine.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| matches!(
@@ -7429,7 +7182,7 @@ mod tests {
         ] {
             let path = directory.path().join(name);
             write_complete_nemotron_h_gguf(&path, is_moe, |_| {});
-            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -7455,7 +7208,7 @@ mod tests {
         write_complete_nemotron_h_gguf(&missing, false, |specs| {
             specs.retain(|(name, _, _)| name != "blk.0.ssm_conv1d.weight");
         });
-        let report = inspect_model(&missing, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&missing, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -7470,7 +7223,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![6, 7, 2];
         });
-        let report = inspect_model(&wrong, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&wrong, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -7489,7 +7242,7 @@ mod tests {
                 .unwrap()
                 .2 = GgmlType::Q4_0;
         });
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::UnsupportedTensorEncoding
@@ -7526,7 +7279,7 @@ mod tests {
         Writer::default()
             .write(std::fs::File::create(&path).unwrap(), &metadata, &tensors)
             .unwrap();
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::InvalidLayerOrExpertCount
@@ -7540,8 +7293,7 @@ mod tests {
     fn complete_poisoned_gemma4_text_safetensors_layouts_are_exactly_loadable() {
         for is_moe in [false, true] {
             let directory = write_complete_gemma4_safetensors_dir(is_moe, |_| {});
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(
@@ -7587,8 +7339,7 @@ mod tests {
             )
             .unwrap();
 
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
             assert!(!report.is_loadable());
             assert!(structural::validate_safetensors_load_path(
@@ -7603,7 +7354,7 @@ mod tests {
     #[test]
     fn gemma4_native_affine_catalog_and_companions_are_validated_exactly() {
         let complete = write_complete_quantized_gemma4_safetensors_dir(|_| {});
-        let report = inspect_model(complete.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(complete.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert!(report.is_loadable(), "{:#?}", report.issues);
         structural::validate_safetensors_load_path(
@@ -7618,7 +7369,7 @@ mod tests {
                 name != "language_model.model.layers.0.self_attn.q_proj.biases"
             });
         });
-        let report = inspect_model(missing.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(missing.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::QuantizationCompanionMismatch
@@ -7634,7 +7385,7 @@ mod tests {
                 name != "language_model.model.layers.0.self_attn.k_proj.weight"
             });
         });
-        let report = inspect_model(missing.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(missing.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -7651,7 +7402,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![2, 7, 6];
         });
-        let report = inspect_model(wrong.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(wrong.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -7668,7 +7419,7 @@ mod tests {
                 vec![8, 8],
             ));
         });
-        let report = inspect_model(conflict.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(conflict.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -7711,7 +7462,7 @@ mod tests {
             .map(|(name, shape)| (name, shape, Dtype::F32))
             .collect::<Vec<_>>();
         let media = write_typed_safetensors_dir(&config, &specs);
-        let report = inspect_model(media.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(media.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(
             report.structural_binding,
             InspectionReadiness::Ready,
@@ -7739,7 +7490,7 @@ mod tests {
             }
         });
 
-        let resident = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let resident = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!resident.is_loadable());
         let load =
             ModelLoadOptions::default().with_weight_residency(WeightResidency::layerwise_host(
@@ -7747,7 +7498,7 @@ mod tests {
             ));
         let bounded = inspect_model(
             directory.path(),
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load,
                 chat_request: None,
             },
@@ -7763,8 +7514,7 @@ mod tests {
     fn complete_poisoned_qwen3_next_safetensors_layouts_are_exactly_loadable() {
         for packed in [false, true] {
             let directory = write_complete_qwen3_next_safetensors_dir(packed, |_| {});
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(
@@ -7786,7 +7536,7 @@ mod tests {
         let missing = write_complete_qwen3_next_safetensors_dir(false, |specs| {
             specs.retain(|(name, _)| name != "model.layers.0.linear_attn.in_proj_qkvz.weight");
         });
-        let report = inspect_model(missing.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(missing.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -7801,7 +7551,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![2, 15, 8];
         });
-        let report = inspect_model(wrong.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(wrong.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -7817,7 +7567,7 @@ mod tests {
                 vec![32, 16],
             ));
         });
-        let report = inspect_model(mixed.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(mixed.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -7842,7 +7592,7 @@ mod tests {
                 && !name.ends_with(".linear_attn.conv1d.weight")
         });
         let fp8 = write_typed_safetensors_dir(&config, &specs);
-        let report = inspect_model(fp8.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(fp8.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(
             report.structural_binding,
             InspectionReadiness::Ready,
@@ -7871,7 +7621,7 @@ mod tests {
             ] {
                 let report = inspect_model(
                     directory.path(),
-                    ModelInspectionOptions {
+                    MlxInspectionOptions {
                         load,
                         chat_request: None,
                     },
@@ -7899,7 +7649,7 @@ mod tests {
         let missing = write_complete_qwen35_safetensors_dir(true, false, |specs| {
             specs.retain(|(name, _)| name != "model.layers.0.linear_attn.in_proj_z.weight");
         });
-        let report = inspect_model(missing.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(missing.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -7929,7 +7679,7 @@ mod tests {
                 ),
             ]);
         });
-        let report = inspect_model(fused.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(fused.path(), MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -7980,7 +7730,7 @@ mod tests {
                 }),
         );
         let vision = write_typed_safetensors_dir(&config, &vision_specs);
-        let report = inspect_model(vision.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(vision.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(
             report.structural_binding,
             InspectionReadiness::Ready,
@@ -8005,7 +7755,7 @@ mod tests {
                 && !name.ends_with(".linear_attn.conv1d.weight")
         });
         let fp8 = write_typed_safetensors_dir(&config, &specs);
-        let report = inspect_model(fp8.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(fp8.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(
             report.structural_binding,
             InspectionReadiness::Ready,
@@ -8022,7 +7772,7 @@ mod tests {
             ));
         let report = inspect_model(
             dense.path(),
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load,
                 chat_request: None,
             },
@@ -8037,7 +7787,7 @@ mod tests {
         let directory = write_complete_lfm2_safetensors_dir(|specs| {
             specs.retain(|(name, _)| name != "model.layers.0.conv.conv.weight");
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -8055,7 +7805,7 @@ mod tests {
         let directory = write_complete_qwen3_safetensors_dir(|specs| {
             specs.retain(|(name, _)| name != "model.layers.0.self_attn.q_norm.weight");
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -8073,7 +7823,7 @@ mod tests {
         let directory = write_complete_safetensors_dir(|specs| {
             specs.retain(|(name, _)| name != "model.layers.0.self_attn.q_proj.weight");
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -8095,7 +7845,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![7, 8];
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -8117,7 +7867,7 @@ mod tests {
             "mode": "affine"
         });
         let directory = write_safetensors_dir(&config);
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert!(report
             .issues
             .iter()
@@ -8128,7 +7878,8 @@ mod tests {
     #[test]
     fn validation_unavailable_warning_is_always_fail_closed() {
         let directory = tempfile::tempdir().unwrap();
-        let mut report = ModelInspectionReport::new(directory.path(), ArtifactFormat::SafeTensors);
+        let mut report =
+            ModelInspectionReport::unverified(directory.path(), ArtifactFormat::SafeTensors);
         report.container = InspectionReadiness::Ready;
         report.architecture_support = InspectionReadiness::Ready;
         report.structural_binding = InspectionReadiness::Ready;
@@ -8146,7 +7897,7 @@ mod tests {
     #[test]
     fn qwen3_moe_packed_safetensors_route_is_exact() {
         let directory = write_complete_qwen3_moe_safetensors_dir(false, |_| {});
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
@@ -8157,14 +7908,14 @@ mod tests {
     #[test]
     fn qwen3_moe_split_safetensors_are_exact_for_all_residencies() {
         let directory = write_complete_qwen3_moe_safetensors_dir(true, |_| {});
-        let resident = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let resident = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(resident.structural_binding, InspectionReadiness::Ready);
         assert_eq!(resident.model_loadability, InspectionReadiness::Ready);
         assert!(resident.is_loadable());
 
         let bounded = inspect_model(
             directory.path(),
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
@@ -8188,14 +7939,14 @@ mod tests {
                 ("model.layers.0.mlp.experts.up_proj".into(), vec![4, 8, 32]),
             ]);
         });
-        let resident = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let resident = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(resident.structural_binding, InspectionReadiness::Ready);
         assert_eq!(resident.model_loadability, InspectionReadiness::Ready);
         assert!(resident.is_loadable());
 
         let bounded = inspect_model(
             directory.path(),
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
@@ -8216,7 +7967,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![4, 16];
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -8233,8 +7984,7 @@ mod tests {
     fn lfm2_moe_packed_and_split_safetensors_routes_are_exact() {
         for split_experts in [false, true] {
             let directory = write_complete_lfm2_moe_safetensors_dir(split_experts, |_| {});
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.architecture_support, InspectionReadiness::Ready);
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
@@ -8248,7 +7998,7 @@ mod tests {
         let directory = write_complete_lfm2_moe_safetensors_dir(true, |specs| {
             specs.retain(|(name, _)| name != "model.layers.1.feed_forward.experts.2.w2.weight");
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -8312,8 +8062,7 @@ mod tests {
                     && !name.ends_with(".feed_forward.gate.weight")
             });
             let directory = write_typed_safetensors_dir(&config, &specs);
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.architecture_support, InspectionReadiness::Ready);
             assert_eq!(
                 report.structural_binding,
@@ -8329,7 +8078,7 @@ mod tests {
     #[test]
     fn deepseek_v3_split_safetensors_route_is_exact() {
         let directory = write_complete_deepseek_v3_safetensors_dir(false, |_| {});
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
@@ -8338,7 +8087,7 @@ mod tests {
 
     #[test]
     fn deepseek_embedded_mtp_catalog_is_exact_and_missing_fusion_fails_preflight() {
-        let options = ModelInspectionOptions {
+        let options = MlxInspectionOptions {
             load: ModelLoadOptions::default()
                 .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
             chat_request: None,
@@ -8369,7 +8118,7 @@ mod tests {
         let directory = write_complete_deepseek_v3_safetensors_dir(false, |specs| {
             specs.push(("model.layers.2.eh_proj.weight".into(), vec![8, 16]));
         });
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -8393,8 +8142,7 @@ mod tests {
             )
             .unwrap();
 
-            let report =
-                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
             assert!(!report.is_loadable());
             assert!(structural::validate_safetensors_load_path(
@@ -8409,7 +8157,7 @@ mod tests {
     #[test]
     fn deepseek_v3_poison_only_checkpoint_is_not_loadable() {
         let directory = write_safetensors_dir(&deepseek_v3_config(false));
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
         assert!(report
@@ -8426,7 +8174,7 @@ mod tests {
     #[test]
     fn deepseek_v3_packed_safetensors_are_residency_sensitive() {
         let directory = write_complete_deepseek_v3_safetensors_dir(true, |_| {});
-        let resident = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let resident = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(resident.structural_binding, InspectionReadiness::Invalid);
         assert!(resident
             .issues
@@ -8436,7 +8184,7 @@ mod tests {
 
         let bounded = inspect_model(
             directory.path(),
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
@@ -8461,7 +8209,7 @@ mod tests {
         });
         let report = inspect_model(
             directory.path(),
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
@@ -8477,7 +8225,7 @@ mod tests {
         let split = write_complete_deepseek_v3_safetensors_dir(false, |specs| {
             specs.retain(|(name, _)| name != "model.layers.1.mlp.experts.2.down_proj.weight");
         });
-        let report = inspect_model(split.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(split.path(), MlxInspectionOptions::default()).unwrap();
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
                 && issue.tensor_name.as_deref()
@@ -8494,7 +8242,7 @@ mod tests {
         });
         let report = inspect_model(
             packed.path(),
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load: ModelLoadOptions::default()
                     .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
@@ -8518,7 +8266,7 @@ mod tests {
                 && !name.ends_with(".mlp.gate.weight")
         });
         let directory = write_typed_safetensors_dir(&config, &specs);
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(
             report.structural_binding,
@@ -8533,7 +8281,7 @@ mod tests {
     #[test]
     fn safetensors_config_rejections_are_structured() {
         let unsupported = write_safetensors_dir(&json!({"model_type": "falcon"}));
-        let report = inspect_model(unsupported.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(unsupported.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.model_loadability, InspectionReadiness::Unsupported);
         assert!(report
             .issues
@@ -8541,7 +8289,7 @@ mod tests {
             .any(|issue| issue.code == InspectionIssueCode::UnsupportedArchitecture));
 
         let invalid = write_safetensors_dir(&json!({"model_type": "llama", "hidden_size": "bad"}));
-        let report = inspect_model(invalid.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(invalid.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
         assert!(report
             .issues
@@ -8567,7 +8315,7 @@ mod tests {
             br#"{"weight_map":{"model.embed_tokens.weight":"missing-00001-of-00002.safetensors"}}"#,
         )
         .unwrap();
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.container, InspectionReadiness::Invalid);
         assert!(report
             .issues
@@ -8585,7 +8333,7 @@ mod tests {
             GgmlType::Q4K,
             std::iter::empty::<(String, MetadataValue)>(),
         );
-        let report = inspect_model(&supported, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&supported, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.container, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
         assert!(!report.is_loadable());
@@ -8598,7 +8346,7 @@ mod tests {
             GgmlType::F16,
             std::iter::empty::<(String, MetadataValue)>(),
         );
-        let report = inspect_model(&unsupported, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&unsupported, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.model_loadability, InspectionReadiness::Unsupported);
         assert!(report
             .issues
@@ -8611,7 +8359,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("complete.gguf");
         write_complete_gguf(&path, |_| {});
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
         assert!(report.is_loadable());
@@ -8638,7 +8386,7 @@ mod tests {
         ] {
             let path = directory.path().join(name);
             write_complete_qwen3_gguf(&path, is_moe, |_| {});
-            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -8726,7 +8474,7 @@ mod tests {
         for (name, is_moe) in [("gemma4.gguf", false), ("gemma4-moe.gguf", true)] {
             let path = directory.path().join(name);
             write_complete_gemma4_gguf(&path, is_moe, |_| {});
-            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(
@@ -8763,7 +8511,7 @@ mod tests {
         write_complete_gemma4_gguf(&missing, false, |specs| {
             specs.retain(|(name, _, _)| name != "blk.0.attn_q_norm.weight");
         });
-        let report = inspect_model(&missing, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&missing, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -8778,7 +8526,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![4, 7, 2];
         });
-        let report = inspect_model(&wrong, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&wrong, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -8797,7 +8545,7 @@ mod tests {
                 GgmlType::F32,
             ));
         });
-        let report = inspect_model(&mixed, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&mixed, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -8813,7 +8561,7 @@ mod tests {
             tensor.1 = vec![32];
             tensor.2 = GgmlType::Q4_0;
         });
-        let report = inspect_model(&quantized_vector, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&quantized_vector, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::UnsupportedTensorEncoding
@@ -8838,7 +8586,7 @@ mod tests {
                     .0 = "blk.1.exp_probs_b.bias".into();
             },
         );
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
         assert_eq!(report.multimodal, InspectionReadiness::Missing);
@@ -8902,7 +8650,7 @@ mod tests {
             metadata.insert(key.into(), value);
             write_inkling_gguf(&path, &metadata, inkling_gguf_specs(), |_| {});
 
-            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
             assert_eq!(
                 report.model_loadability,
                 InspectionReadiness::Invalid,
@@ -8946,7 +8694,7 @@ mod tests {
             inkling_gguf_specs(),
             |specs| specs.retain(|(name, _, _)| name != "blk.0.shortconv_k.weight"),
         );
-        let report = inspect_model(&missing, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&missing, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -8966,7 +8714,7 @@ mod tests {
                     .1 = vec![32, 31, 4];
             },
         );
-        let report = inspect_model(&wrong, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&wrong, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -8991,7 +8739,7 @@ mod tests {
                 tensor.2 = GgmlType::Q4_0;
             },
         );
-        let report = inspect_model(&convolution, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&convolution, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::UnsupportedTensorEncoding
@@ -9017,7 +8765,7 @@ mod tests {
                     .2 = GgmlType::Q8_0;
             },
         );
-        let report = inspect_model(&paired, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&paired, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::QuantizationCompanionMismatch
@@ -9042,7 +8790,7 @@ mod tests {
             inkling_mmproj_specs(),
             |_| {},
         );
-        let report = inspect_model(&model_path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&model_path, MlxInspectionOptions::default()).unwrap();
         assert!(report.is_loadable(), "{:#?}", report.issues);
         let checkpoint = GgufCheckpoint::open(&model_path).unwrap();
         let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
@@ -9075,7 +8823,7 @@ mod tests {
             inkling_mmproj_specs(),
             |specs| specs.retain(|(name, _, _)| name != "v.hmlp.2.linear.weight"),
         );
-        let report = inspect_model(&model_path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&model_path, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -9092,7 +8840,7 @@ mod tests {
         ] {
             let path = directory.path().join(name);
             write_complete_qwen35_gguf(&path, is_moe, |_| {});
-            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -9123,7 +8871,7 @@ mod tests {
             &qwen35_mmproj_specs(),
         );
 
-        let report = inspect_model(&model, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&model, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(
             report.multimodal,
@@ -9186,7 +8934,7 @@ mod tests {
         let mut specs = qwen35_mmproj_specs();
         specs.retain(|(name, _, _)| name != "mm.2.weight");
         write_gguf_specs(&invalid_projector, &qwen35_mmproj_metadata(), &specs);
-        let report = inspect_model(&invalid_model, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&invalid_model, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.multimodal, InspectionReadiness::Invalid);
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -9201,7 +8949,7 @@ mod tests {
         write_complete_qwen35_gguf(&missing, false, |specs| {
             specs.retain(|(name, _, _)| name != "blk.0.attn_qkv.weight");
         });
-        let report = inspect_model(&missing, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&missing, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -9216,7 +8964,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![16, 31, 2];
         });
-        let report = inspect_model(&wrong, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&wrong, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -9236,7 +8984,7 @@ mod tests {
             tensor.1 = vec![32, 64];
             tensor.2 = GgmlType::Q4_0;
         });
-        let report = inspect_model(&conv, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&conv, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::UnsupportedTensorEncoding
@@ -9257,7 +9005,7 @@ mod tests {
                 .unwrap()
                 .2 = GgmlType::Q8_0;
         });
-        let report = inspect_model(&experts, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&experts, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::QuantizationCompanionMismatch
@@ -9272,7 +9020,7 @@ mod tests {
                 .unwrap()
                 .2 = GgmlType::Q5_0;
         });
-        let report = inspect_model(&grouped, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&grouped, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::QuantizationCompanionMismatch
@@ -9286,7 +9034,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("qwen3next.gguf");
         write_complete_qwen3_next_gguf(&path, |_| {}, |_| {});
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
         assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -9315,7 +9063,7 @@ mod tests {
                 specs.retain(|(name, _, _)| name != "blk.0.attn_qkvz.weight");
             },
         );
-        let report = inspect_model(&missing, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&missing, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
@@ -9330,7 +9078,7 @@ mod tests {
                 specs.push(("blk.0.attn_qkv.weight".into(), vec![32, 64], GgmlType::F32));
             },
         );
-        let report = inspect_model(&mixed, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&mixed, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -9358,7 +9106,7 @@ mod tests {
                 tensor.2 = GgmlType::Q4_0;
             },
         );
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::QuantizationCompanionMismatch
@@ -9372,7 +9120,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("deepseek4.gguf");
         write_complete_deepseek4_gguf(&path, |_| {}, |_| {});
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
         assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -9557,7 +9305,7 @@ mod tests {
                     _ => specs.push(("blk.0.legacy.weight".into(), vec![32], GgmlType::F32)),
                 },
             );
-            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
             assert!(!report.is_loadable(), "{name}: {:#?}", report.issues);
         }
     }
@@ -9589,7 +9337,7 @@ mod tests {
                         .2 = encoding;
                 },
             );
-            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
             assert!(!report.is_loadable());
             assert!(report.issues.iter().any(|issue| {
                 issue.code == InspectionIssueCode::UnsupportedTensorEncoding
@@ -9608,7 +9356,7 @@ mod tests {
             },
             |_| {},
         );
-        let report = inspect_model(&bad_output, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&bad_output, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::InvalidLayerOrExpertCount
@@ -9622,7 +9370,7 @@ mod tests {
         for (name, split_kv) in [("fused.gguf", false), ("split.gguf", true)] {
             let path = directory.path().join(name);
             write_complete_deepseek2_gguf(&path, split_kv, |_| {});
-            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -9648,7 +9396,7 @@ mod tests {
         write_complete_deepseek2_gguf(&path, false, |specs| {
             specs.retain(|(name, _, _)| name == "token_embd.weight");
         });
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(
             report
@@ -9671,7 +9419,7 @@ mod tests {
                 .unwrap()
                 .1 = vec![32, 32];
         });
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
@@ -9690,7 +9438,7 @@ mod tests {
                 .unwrap()
                 .2 = GgmlType::Q4_0;
         });
-        let report = inspect_model(&invalid, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&invalid, MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -9710,7 +9458,7 @@ mod tests {
                 .unwrap()
                 .2 = GgmlType::Q4_0;
         });
-        let report = inspect_model(&valid, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&valid, MlxInspectionOptions::default()).unwrap();
         assert!(report.is_loadable(), "{:#?}", report.issues);
     }
 
@@ -9721,7 +9469,7 @@ mod tests {
         write_complete_deepseek2_gguf(&path, false, |specs| {
             specs.push(("poison.weight".into(), vec![32], GgmlType::F32));
         });
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert!(!report.is_loadable());
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
@@ -9746,7 +9494,7 @@ mod tests {
                         .0 = "blk.1.exp_probs_b.bias".into();
                 }
             });
-            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
             assert_eq!(report.structural_binding, InspectionReadiness::Ready);
             assert_eq!(report.model_loadability, InspectionReadiness::Ready);
             assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -9770,7 +9518,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("gpt-oss.gguf");
         write_complete_gpt_oss_gguf(&path, |_| {});
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
         assert!(report.is_loadable(), "{:#?}", report.issues);
@@ -9799,7 +9547,7 @@ mod tests {
                 .unwrap()
                 .2 = GgmlType::Q4_0;
         });
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -9823,14 +9571,14 @@ mod tests {
                 .unwrap()
                 .0 = "blk.0.attn_sinks".into();
         });
-        let alias_report = inspect_model(&alias_path, ModelInspectionOptions::default()).unwrap();
+        let alias_report = inspect_model(&alias_path, MlxInspectionOptions::default()).unwrap();
         assert!(alias_report.is_loadable(), "{:#?}", alias_report.issues);
 
         let extra_path = directory.path().join("gpt-oss-extra.gguf");
         write_complete_gpt_oss_gguf(&extra_path, |specs| {
             specs.push(("poison.weight".into(), vec![1], GgmlType::F32));
         });
-        let extra_report = inspect_model(&extra_path, ModelInspectionOptions::default()).unwrap();
+        let extra_report = inspect_model(&extra_path, MlxInspectionOptions::default()).unwrap();
         assert!(extra_report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::ConflictingTensorLayout
                 && issue.tensor_name.as_deref() == Some("poison.weight")
@@ -9850,7 +9598,7 @@ mod tests {
             tensor.1 = vec![32, 3];
             tensor.2 = GgmlType::Q4_0;
         });
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -9880,7 +9628,7 @@ mod tests {
                 .unwrap()
                 .2 = GgmlType::Q8_0;
         });
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -9905,7 +9653,7 @@ mod tests {
                 .unwrap()
                 .2 = GgmlType::Q4_0;
         });
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -9921,7 +9669,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("unknown.gguf");
         write_unknown_gguf_type(&path, 1234);
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         let issue = report
             .issues
             .iter()
@@ -9935,11 +9683,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.gguf");
         write_complete_gguf(&path, |_| {});
-        let missing = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let missing = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(missing.tokenizer, InspectionReadiness::Missing);
 
         save_wordlevel_tokenizer(&directory.path().join("tokenizer.json"));
-        let available = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let available = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(available.tokenizer, InspectionReadiness::Ready);
         assert_eq!(available.text_generation, InspectionReadiness::Ready);
     }
@@ -9954,7 +9702,7 @@ mod tests {
             GgmlType::F16,
             std::iter::empty::<(String, MetadataValue)>(),
         );
-        let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.model_loadability, InspectionReadiness::Missing);
         assert!(report
             .issues
@@ -9967,7 +9715,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (model_path, projector_path) =
             write_complete_qwen3_vl_gguf(directory.path(), |_| {}, |_| {});
-        let report = inspect_model(&model_path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&model_path, MlxInspectionOptions::default()).unwrap();
         assert!(report.is_loadable(), "{:#?}", report.issues);
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert!(report
@@ -10002,7 +9750,7 @@ mod tests {
                 specs.retain(|(name, _, _)| name != "v.blk.0.attn_qkv.weight");
             },
         );
-        let report = inspect_model(&model_path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&model_path, MlxInspectionOptions::default()).unwrap();
         assert!(report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::MissingRequiredTensor
                 && issue.tensor_name.as_deref() == Some("v.blk.0.attn_qkv.weight")
@@ -10020,7 +9768,7 @@ mod tests {
             },
             |_| {},
         );
-        let report = inspect_model(&model_path, ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(&model_path, MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
         assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
         assert!(report.issues.iter().any(|issue| {
@@ -10044,7 +9792,7 @@ mod tests {
                     .1 = vec![192];
             },
         );
-        let shape_report = inspect_model(&shape_model, ModelInspectionOptions::default()).unwrap();
+        let shape_report = inspect_model(&shape_model, MlxInspectionOptions::default()).unwrap();
         assert!(shape_report.issues.iter().any(|issue| {
             issue.code == InspectionIssueCode::TensorShapeMismatch
                 && issue.tensor_name.as_deref() == Some("v.blk.0.attn_qkv.weight")
@@ -10067,7 +9815,7 @@ mod tests {
             },
         );
         let encoding_report =
-            inspect_model(&encoding_model, ModelInspectionOptions::default()).unwrap();
+            inspect_model(&encoding_model, MlxInspectionOptions::default()).unwrap();
         let issue = encoding_report
             .issues
             .iter()
@@ -10095,7 +9843,7 @@ mod tests {
         );
         let report = inspect_model(
             &gguf,
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load: ModelLoadOptions::with_quantization(WeightQuantization::MxFp4),
                 chat_request: None,
             },
@@ -10110,7 +9858,7 @@ mod tests {
         let safetensors = write_safetensors_dir(&llama_config());
         let report = inspect_model(
             safetensors.path(),
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load: ModelLoadOptions::default().with_weight_residency(
                     WeightResidency::with_expert_cache(
                         NonExpertWeightResidency::LayerwiseHost(Default::default()),
@@ -10129,7 +9877,7 @@ mod tests {
 
         let report = inspect_model(
             &gguf,
-            ModelInspectionOptions {
+            MlxInspectionOptions {
                 load: ModelLoadOptions::default().with_weight_residency(
                     WeightResidency::with_expert_cache(
                         NonExpertWeightResidency::LayerwiseHost(Default::default()),
@@ -10156,7 +9904,7 @@ mod tests {
             r#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}"}"#,
         )
         .unwrap();
-        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        let report = inspect_model(directory.path(), MlxInspectionOptions::default()).unwrap();
         assert_eq!(report.chat_template, InspectionReadiness::Ready);
         assert_eq!(report.semantic_streaming, InspectionReadiness::Unsupported);
         assert_eq!(report.native_tools, InspectionReadiness::Unsupported);
@@ -10165,7 +9913,7 @@ mod tests {
     #[test]
     fn chat_protocol_is_recognized_from_rendered_behavior_after_source_refactor() {
         const TEMPLATE: &str =
-            include_str!("../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
+            include_str!("../../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
         let mut tokenizer = Tokenizer::new(WordLevel::default());
         tokenizer
             .add_tokens(
@@ -10194,7 +9942,8 @@ mod tests {
             .token_to_id("<eos>")
             .expect("the inspection fixture registers its EOS token");
         let directory = tempfile::tempdir().unwrap();
-        let mut report = ModelInspectionReport::new(directory.path(), ArtifactFormat::SafeTensors);
+        let mut report =
+            ModelInspectionReport::unverified(directory.path(), ArtifactFormat::SafeTensors);
         inspect_chat_behavior(
             &mut report,
             tokenizer,

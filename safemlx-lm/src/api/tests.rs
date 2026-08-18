@@ -2,11 +2,18 @@ use super::{
     chat_template_kwargs, eos_token_ids_from_sidecar_dir, gguf_eos_token_ids,
     inspect_chat_template_kwargs, load_chat_template, load_tokenizer,
     load_tokenizer_template_kwargs, merge_eos_token_id_sources, prepare_chat_from_parts,
-    with_prepared_chat_runtime, LoadedModel, ModelLoadOptions, PreparedChatDraft,
-    PreparedChatInput, PreparedChatMtpBatchRequest, TextModelError,
+    with_prepared_chat_runtime, LoadedModel, PreparedChatDraft, PreparedChatInput,
+    PreparedChatMtpBatchRequest, TextModelError,
 };
 use crate::{
-    backend::mlx::{resolve_model_config, validate_gguf_quantization_source, ResolvedModelConfig},
+    architectures::{
+        gpt_oss::model as gpt_oss, llama::model as llama, qwen::dense as dense_qwen,
+        qwen::vl::model as qwen3_vl,
+    },
+    backend::mlx::{
+        resolve_model_config, validate_gguf_quantization_source, ModelLoadOptions,
+        ResolvedModelConfig,
+    },
     core::generation::{FinishReason, MtpSchedulerOptions, SemanticEvent},
     core::SpeculativeExecutionTopology,
     error::Error,
@@ -4761,20 +4768,16 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
         let dir = temp_model_dir(config);
         match family {
             "llama" | "mistral" => {
-                let args = super::llama::get_llama_model_args(&dir).unwrap();
+                let args = llama::get_llama_model_args(&dir).unwrap();
                 save_zero_checkpoint(
-                    &super::llama::ResidentModel::new(args, stream).unwrap(),
+                    &llama::ResidentModel::new(args, stream).unwrap(),
                     &dir,
                     stream,
                 );
             }
             "qwen3" => {
-                let args = super::dense_qwen::load_config(&dir).unwrap();
-                save_zero_checkpoint(
-                    &super::dense_qwen::Model::new(args, stream).unwrap(),
-                    &dir,
-                    stream,
-                );
+                let args = dense_qwen::load_config(&dir).unwrap();
+                save_zero_checkpoint(&dense_qwen::Model::new(args, stream).unwrap(), &dir, stream);
             }
             "qwen3_5" => {
                 let (args, image_token_id, video_token_id, vision_config) =
@@ -4980,12 +4983,8 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
               "quantization_config":{"quant_method":"mxfp4"}
             }"#,
     );
-    let args = super::gpt_oss::get_model_args(&dir).unwrap();
-    save_zero_checkpoint(
-        &super::gpt_oss::Model::new(args, stream).unwrap(),
-        &dir,
-        stream,
-    );
+    let args = gpt_oss::get_model_args(&dir).unwrap();
+    save_zero_checkpoint(&gpt_oss::Model::new(args, stream).unwrap(), &dir, stream);
 
     let model = load_test_model(
         &dir,
@@ -5033,12 +5032,8 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
               }
             }"#,
     );
-    let args = super::qwen3_vl::get_qwen3_vl_model_args(&dir).unwrap();
-    save_zero_checkpoint(
-        &super::qwen3_vl::Model::new(args, stream).unwrap(),
-        &dir,
-        stream,
-    );
+    let args = qwen3_vl::get_qwen3_vl_model_args(&dir).unwrap();
+    save_zero_checkpoint(&qwen3_vl::Model::new(args, stream).unwrap(), &dir, stream);
 
     let quantization = WeightQuantization::MxFp4;
     let mut quantized = load_test_model(

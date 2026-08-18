@@ -35,25 +35,31 @@ pub use safemlx_lm_core::generation::{
     ResolvedGenerationConfig, SemanticEvent,
 };
 pub use safemlx_lm_core::{
-    load_model, load_realtime_model, load_realtime_model_with_options, AllocatorTelemetry,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, AutomaticPlanningBackend,
-    AutomaticPlanningError, Backend, BackendCapabilities, BackendDescriptor, BackendError,
-    BackendId, BackendSession, CollectiveScope, Completion, ControlledTextGeneration,
+    load_model, load_realtime_model, load_realtime_model_with_options, Admission,
+    AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry, ArtifactModality,
+    ArtifactTensorEncoding, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
+    AutomaticPlanningBackend, AutomaticPlanningError, AvailableMemory, Backend,
+    BackendCapabilities, BackendDescriptor, BackendError, BackendId, BackendSession,
+    CacheStateStrategy, CapabilityError, CollectiveScope, Completion, ControlledTextGeneration,
     ControlledTextGenerationError, ControlledToken, DeviceDescriptor, DevicePlan,
     DistributedBackend, DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
-    DraftPlacementPlan, DraftingPlan, DurationSeconds, ExecutionPlan, ExecutionPlanReport,
-    ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, HardwareBackendProfile,
-    HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, ModelLoadError,
-    ModelLoadingBackend, ModelResourceProfile, ModelRuntime, MtpCapability, MtpCheckpointKind,
-    MtpTelemetry, ObservationKind, Observed, ParallelAxis, ParallelCoordinates,
-    ParallelRankTopology, ParallelTopology, PlanExplanation, PlanExplanationEntry,
-    PlanExplanationLevel, PreparedModel, RealtimeBackend, RealtimeCompletedStep,
-    RealtimeConfigError, RealtimeError, RealtimeModel, RealtimeModelLoadingBackend,
-    RealtimeSampling, RealtimeScheduler, RealtimeSession, RealtimeSpeechConfig, ResidencyPlan,
-    ResidencyTelemetry, SubgroupMembership, Submission, TextGeneration, TextGenerationBackend,
-    TextGenerationConfig, TimingTelemetry, TokenFilter, TokenFilterController, TokenFilterError,
-    TokenOutput, TopologyPreflightReport, TransferTelemetry, ValueDescriptor,
-    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    DraftPlacementPlan, DraftingPlan, DurationSeconds, EstimationCompleteness, ExecutionPlan,
+    ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, ExpertCacheTelemetry, GrowingState,
+    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
+    InputModalities, InputTokenCount, InspectionIssue, InspectionIssueCode, InspectionReadiness,
+    InspectionRequirement, InspectionSeverity, ModelCapabilities, ModelInspectionReport,
+    ModelLoadError, ModelLoadingBackend, ModelResourceProfile, ModelRuntime, MtpCapability,
+    MtpCheckpointKind, MtpTelemetry, ObservationKind, Observed, ParallelAxis, ParallelCoordinates,
+    ParallelRankTopology, ParallelTopology, PhysicalMemorySemantics, PlanExplanation,
+    PlanExplanationEntry, PlanExplanationLevel, PreparedModel, RealtimeBackend,
+    RealtimeCompletedStep, RealtimeConfigError, RealtimeError, RealtimeModel,
+    RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler, RealtimeSession,
+    RealtimeSpeechConfig, ResidencyPlan, ResidencyTelemetry, RuntimeStateEstimate,
+    SlidingWindowLayerCount, StateLayout, StateMemoryAssumptions, StaticMemoryReport,
+    SubgroupMembership, Submission, TextGeneration, TextGenerationBackend, TextGenerationConfig,
+    TimingTelemetry, TokenFilter, TokenFilterController, TokenFilterError, TokenOutput,
+    TopologyPreflightReport, TransferTelemetry, ValueDescriptor, WeightTransformationPlan,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 #[cfg(all(test, feature = "mlx"))]
 mod test_utils;
@@ -84,12 +90,6 @@ mod distributed_qwen3_vl_pipeline_ring;
 #[path = "../tests/distributed_tensor_parallel_ring.rs"]
 mod distributed_tensor_parallel_ring;
 
-#[cfg(feature = "mlx")]
-pub use api::{
-    inspect_model, ArtifactModality, ArtifactTensorEncoding, InspectionIssue, InspectionIssueCode,
-    InspectionReadiness, InspectionRequirement, InspectionSeverity, ModelInspectionOptions,
-    ModelInspectionReport,
-};
 #[cfg(feature = "mlx")]
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
 #[cfg(feature = "mlx")]

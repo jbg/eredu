@@ -4,10 +4,14 @@
 pub mod automatic;
 /// Prompt-cache topology conversion for MLX distributed execution.
 pub(crate) mod cache;
+/// MLX model capability derivation and process resource observation.
+pub mod capability;
 mod config;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
 mod family;
+/// MLX artifact admission and structural compatibility inspection.
+pub mod inspection;
 mod loading;
 mod model;
 /// Realtime Moshi/PersonaPlex session execution.
@@ -24,6 +28,7 @@ pub(crate) use loading::{gguf_eos_token_ids, validate_gguf_quantization_source};
 /// Architecture-erased model/session execution.
 mod session;
 
+pub use capability::available_memory;
 pub(crate) use config::ensure_replicated_load_options;
 pub use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
@@ -31,6 +36,7 @@ pub use distributed::MlxDistributedSession;
 #[cfg(test)]
 pub(crate) use family::ResolvedModelConfig;
 pub(crate) use family::{resolve_model_config, ModelConfigResolutionError};
+pub use inspection::{inspect_model, MlxInspectionOptions};
 pub(crate) use model::validate_gemma4_drafter;
 pub use model::{Model, ModelCache};
 pub(crate) use session::{submit_decode_with_cache, submit_prefill_with_cache};

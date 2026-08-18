@@ -1370,7 +1370,7 @@ fn recognize_remaining_protocols(
     None
 }
 
-pub(super) fn prepare_chat_from_parts(
+pub(crate) fn prepare_chat_from_parts(
     tokenizer: &mut ChatTokenizer,
     template: ModelChatTemplate,
     model_id: &str,
