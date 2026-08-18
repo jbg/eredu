@@ -90,6 +90,21 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
         )?)
     }
 
+    fn resolve_text_generation_settings(
+        &self,
+        settings: PreparedChatGenerationSettings,
+    ) -> Result<(safemlx_lm_core::TextGenerationConfig, NonZeroUsize), Error> {
+        let resolved = self.resolve_generation_config(settings.overrides)?;
+        let max_tokens = resolved
+            .max_new_tokens
+            .and_then(NonZeroUsize::new)
+            .unwrap_or_else(|| NonZeroUsize::new(256).expect("256 is non-zero"));
+        Ok((
+            safemlx_lm_core::TextGenerationConfig::new(resolved).with_seed(settings.seed),
+            max_tokens,
+        ))
+    }
+
     /// Starts portable asynchronous text generation from tokenizer ids.
     pub fn generate_tokens(
         &mut self,
@@ -97,6 +112,76 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
         config: safemlx_lm_core::TextGenerationConfig,
     ) -> Result<safemlx_lm_core::TextGeneration<'_, B>, B::Error> {
         safemlx_lm_core::TextGeneration::new(&mut self.runtime, prompt_token_ids, config)
+    }
+
+    /// Generates one constrained semantic response through the selected backend.
+    pub fn generate_prepared_chat<F>(
+        &mut self,
+        request: PreparedChatGenerationRequest<'_, B, F>,
+    ) -> Result<PreparedChatGenerationOutput, Error>
+    where
+        F: FnMut(SemanticEvent),
+    {
+        let PreparedChatGenerationRequest {
+            input,
+            settings,
+            caller_stop_sequences,
+            cancellation,
+            mut on_event,
+        } = request;
+        if cancellation.is_cancelled() {
+            on_event(SemanticEvent::Finished {
+                reason: FinishReason::Cancelled,
+            });
+            return Ok(PreparedChatGenerationOutput {
+                token_ids: Vec::new(),
+                finish_reason: FinishReason::Cancelled,
+            });
+        }
+
+        let prepared_chat = input.prepared_chat();
+        let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
+        let control = prepared_chat_control_runtime(prepared_chat, caller_stop_sequences)?;
+        let decoder = PreparedChatTokenDecoder {
+            decoder: self.text_decoder(true),
+        };
+        let raw_decoder =
+            RawTokenDecoder::with_structural_tokens(decoder, control.structural_tokens);
+        let mut pipeline = CommittedTokenPipeline::new(raw_decoder, control.parser);
+        let generator = match input {
+            PreparedChatInput::RenderedPrompt(prepared_chat) => {
+                let prompt = self.encode(prepared_chat.rendered_prompt(), false)?;
+                safemlx_lm_core::ControlledTextGeneration::new(
+                    &mut self.runtime,
+                    prompt,
+                    config,
+                    control.controller,
+                )
+            }
+            PreparedChatInput::PreparedBackendInput { prompt, .. } => {
+                safemlx_lm_core::ControlledTextGeneration::from_prompt(
+                    &mut self.runtime,
+                    prompt,
+                    config,
+                    control.controller,
+                )
+            }
+        }
+        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+        let mut source = BackendGenerationTokenSource { generator };
+        let (token_ids, finish_reason) = drive_committed_generation_cancellable(
+            &mut source,
+            &mut pipeline,
+            prepared_chat.eos_token_ids(),
+            max_tokens,
+            &cancellation,
+            &mut on_event,
+        )
+        .map_err(Error::PreparedChatGeneration)?;
+        Ok(PreparedChatGenerationOutput {
+            token_ids,
+            finish_reason,
+        })
     }
 
     /// Returns the model id passed to chat-template rendering.
@@ -273,7 +358,7 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
 }
 
 struct PreparedChatMtpLaneRuntime<'a, S> {
-    input: PreparedChatModelInput<'a>,
+    input: PreparedChatModelInput,
     cache: &'a mut ModelCache,
     config: MtpConfig,
     prng_key: Option<Array>,
@@ -283,19 +368,19 @@ struct PreparedChatMtpLaneRuntime<'a, S> {
     on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
 
-enum PreparedChatModelInput<'a> {
+enum PreparedChatModelInput {
     RenderedPrompt(Array),
-    Prepared(&'a PreparedModelInput),
+    Prepared(crate::backend::mlx::MlxModelInput),
 }
 
-impl PreparedChatModelInput<'_> {
+impl PreparedChatModelInput {
     fn with_model_input<T>(&self, function: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
         match self {
             Self::RenderedPrompt(prompt) => {
                 let parts = [input::InputPart::text_token_ids(prompt)];
                 function(input::ModelInput::new(&parts))
             }
-            Self::Prepared(input) => input.with_model_input(function),
+            Self::Prepared(input) => input.with_borrowed(function),
         }
     }
 }
@@ -320,8 +405,10 @@ mod prepared_chat_model_input_tests {
             PreparedInputPart::text_token_ids(&[8]),
         ])
         .unwrap();
+        let prepared =
+            prepared.with_model_input(|input| crate::backend::mlx::MlxModelInput::from(input));
 
-        PreparedChatModelInput::Prepared(&prepared).with_model_input(|input| {
+        PreparedChatModelInput::Prepared(prepared).with_model_input(|input| {
             assert_eq!(input.parts.len(), 3);
             assert_eq!(input.parts[0].modality, Modality::Text);
             assert_eq!(input.parts[1].modality, Modality::Image);
@@ -581,16 +668,11 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         &self,
         settings: PreparedChatGenerationSettings,
     ) -> Result<ResolvedPreparedChatGenerationSettings, Error> {
-        let resolved = self.resolve_generation_config(settings.overrides)?;
-        let max_tokens = resolved
-            .max_new_tokens
-            .and_then(NonZeroUsize::new)
-            .unwrap_or_else(|| NonZeroUsize::new(256).expect("256 is non-zero"));
-        let prng_key = match (settings.prng_key, resolved.temperature) {
-            (Some(key), _) => Some(key),
-            (None, 0.0) => None,
-            (None, _) => Some(safemlx::random::key(0)?),
-        };
+        let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
+        let resolved = config.sampling();
+        let prng_key = (resolved.temperature != 0.0)
+            .then(|| safemlx::random::key(config.seed()))
+            .transpose()?;
         Ok(ResolvedPreparedChatGenerationSettings {
             temperature: resolved.temperature,
             max_tokens,
@@ -651,15 +733,15 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         &self,
         input: PreparedChatInput<'a>,
         stream: &Stream,
-    ) -> Result<PreparedChatModelInput<'a>, Error> {
+    ) -> Result<PreparedChatModelInput, Error> {
         match input {
             PreparedChatInput::RenderedPrompt(prepared_chat) => {
                 Ok(PreparedChatModelInput::RenderedPrompt(
                     self.encode_to_array(prepared_chat.rendered_prompt(), false, stream)?,
                 ))
             }
-            PreparedChatInput::PreparedModelInput { model_input, .. } => {
-                Ok(PreparedChatModelInput::Prepared(model_input))
+            PreparedChatInput::PreparedBackendInput { prompt, .. } => {
+                Ok(PreparedChatModelInput::Prepared(prompt))
             }
         }
     }
@@ -904,100 +986,6 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         }
     }
 
-    /// Generates one ordinary structured response from a prepared chat.
-    ///
-    /// This method validates native-tool support and constructs the constrained
-    /// sampler plus a fresh dialect parser before prompt prefill. It then uses
-    /// the existing architecture-dispatched token iterator, committing each
-    /// token through tokenizer-aware decoding, selective structural-token
-    /// preservation, UTF-8 assembly, combined profile/caller stop matching, and
-    /// immediate [`SemanticEvent`] delivery.
-    /// The rendered chat template is encoded without adding a second layer of
-    /// tokenizer special tokens.
-    ///
-    /// When terminal conditions coincide on one committed token, precedence is
-    /// decoded stop sequence, grammar completion, EOS, then max tokens. Grammar
-    /// completion is inspected before requesting the next token. Cancellation
-    /// is checked before model work, after each synchronous event callback, and
-    /// before requesting another token. It emits only `Finished(Cancelled)` as
-    /// finalization and does not close incomplete protocol structures.
-    /// Call [`LoadedModel::reset_session`] before an unrelated request; without
-    /// a reset this request deliberately continues the session-owned prefix.
-    pub fn generate_prepared_chat<S, F>(
-        &mut self,
-        request: PreparedChatGenerationRequest<'_, S, F>,
-    ) -> Result<PreparedChatGenerationOutput, Error>
-    where
-        S: Sampler + Clone,
-        F: FnMut(SemanticEvent),
-    {
-        let PreparedChatGenerationRequest {
-            input,
-            sampling_policy,
-            settings,
-            caller_stop_sequences,
-            cancellation,
-            mut on_event,
-        } = request;
-        if cancellation.is_cancelled() {
-            on_event(SemanticEvent::Finished {
-                reason: FinishReason::Cancelled,
-            });
-            return Ok(PreparedChatGenerationOutput {
-                token_ids: Vec::new(),
-                finish_reason: FinishReason::Cancelled,
-            });
-        }
-        let prepared_chat = input.prepared_chat();
-        let stream = self.runtime.backend().stream().clone();
-        let use_checkpoint_sampler = Sampler::uses_checkpoint_defaults(&sampling_policy);
-        let settings = self.resolve_prepared_chat_generation_settings(settings)?;
-
-        with_prepared_chat_runtime(
-            prepared_chat,
-            sampling_policy,
-            settings.checkpoint_sampler,
-            use_checkpoint_sampler,
-            caller_stop_sequences,
-            |runtime| {
-                // This closure is the execution boundary: unsupported plans
-                // and runtime-construction failures return before it is called.
-                let decoder = PreparedChatTokenDecoder {
-                    decoder: self.text_decoder(true),
-                };
-                let raw_decoder =
-                    RawTokenDecoder::with_structural_tokens(decoder, runtime.structural_tokens);
-                let mut pipeline = CommittedTokenPipeline::new(raw_decoder, runtime.parser);
-                let model_input = self.prepare_chat_model_input(input, &stream)?;
-                model_input.with_model_input(|model_input| {
-                    let generator = self.generate_input_with_sampler(
-                        settings.temperature,
-                        model_input,
-                        settings.prng_key,
-                        runtime.sampler,
-                    );
-                    let mut source = GenerationTokenSource {
-                        generator,
-                        stream: &stream,
-                    };
-                    let (token_ids, finish_reason) = drive_committed_generation_cancellable(
-                        &mut source,
-                        &mut pipeline,
-                        prepared_chat.eos_token_ids(),
-                        settings.max_tokens,
-                        &cancellation,
-                        &mut on_event,
-                    )
-                    .map_err(Error::PreparedChatGeneration)?;
-                    Ok(PreparedChatGenerationOutput {
-                        token_ids,
-                        finish_reason,
-                    })
-                })
-            },
-        )
-    }
-
     /// Generates one structured response with an external MTP assistant.
     ///
     /// Target verification, constrained-sampler state, decoded stop matching,
@@ -1043,7 +1031,6 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             sampling_policy,
             settings.checkpoint_sampler,
             use_checkpoint_sampler,
-            caller_stop_sequences,
             |runtime| {
                 let decoder = PreparedChatTokenDecoder {
                     decoder: self.text_decoder(true),
@@ -1126,7 +1113,6 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
             sampling_policy,
             settings.checkpoint_sampler,
             use_checkpoint_sampler,
-            caller_stop_sequences,
             |runtime| {
                 let decoder = PreparedChatTokenDecoder {
                     decoder: self.text_decoder(true),
@@ -1888,14 +1874,18 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
 
     /// Tokenizes and preprocesses ordered text and media segments.
     #[cfg(feature = "media-processing")]
-    pub fn prepare_input(&self, input: &[ProcessorInput<'_>]) -> Result<PreparedModelInput, Error> {
+    pub fn prepare_input(
+        &self,
+        input: &[ProcessorInput<'_>],
+    ) -> Result<crate::backend::mlx::MlxModelInput, Error> {
         let processor = self.runtime.session().processor().ok_or_else(|| {
             Error::Processor(format!(
                 "model type '{}' does not have a loaded media processor",
                 self.model_type()
             ))
         })?;
-        processor.prepare_input(input, &mut |text| self.encode(text, false))
+        let prepared = processor.prepare_input(input, &mut |text| self.encode(text, false))?;
+        Ok(crate::backend::mlx::MlxModelInput::from_prepared(&prepared))
     }
 
     /// Composes a prepared chat with decoded media at checked placeholders.
@@ -1909,16 +1899,19 @@ impl LoadedModel<crate::backend::mlx::MlxBackend<'static>> {
         &self,
         prepared_chat: &PreparedChat,
         bindings: &[ChatMediaBinding<'_>],
-    ) -> Result<PreparedModelInput, Error> {
+    ) -> Result<crate::backend::mlx::MlxModelInput, Error> {
         let processor = self.runtime.session().processor().ok_or_else(|| {
             Error::Processor(format!(
                 "model type '{}' does not have a loaded media processor",
                 self.model_type()
             ))
         })?;
-        processor.prepare_chat_input(prepared_chat.rendered_prompt(), bindings, &mut |text| {
-            self.encode(text, false)
-        })
+        let prepared = processor.prepare_chat_input(
+            prepared_chat.rendered_prompt(),
+            bindings,
+            &mut |text| self.encode(text, false),
+        )?;
+        Ok(crate::backend::mlx::MlxModelInput::from_prepared(&prepared))
     }
 
     /// Encodes text and returns a `[1, len]` token-id array on `stream`.

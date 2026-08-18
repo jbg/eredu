@@ -7,13 +7,13 @@ use safemlx::{
 };
 use safemlx_lm_core::{
     BackendSession, Completion, ModelRuntime, Submission, TextGenerationBackend,
-    TextGenerationConfig, TokenOutput,
+    TextGenerationConfig, TokenFilter, TokenOutput,
 };
 use std::path::Path;
 
 use crate::core::generation::MtpConfig;
 #[cfg(feature = "media-processing")]
-use crate::runtime::media::ModelProcessor;
+use crate::runtime::media::{ModelProcessor, PreparedModelInput};
 use crate::{
     api::{input, Model, ModelCache},
     architectures::distributed::{
@@ -191,6 +191,12 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
 }
 
 impl MlxModelInput {
+    /// Converts processor-owned MLX values into an opaque backend prompt.
+    #[cfg(feature = "media-processing")]
+    pub fn from_prepared(input: &PreparedModelInput) -> Self {
+        input.with_model_input(|input| Self::from(input))
+    }
+
     pub(crate) fn with_borrowed<T>(&self, execute: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
         let parts = self
             .parts
@@ -821,6 +827,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
 }
 
 impl<'a> TextGenerationBackend for MlxBackend<'a> {
+    type Prompt = MlxModelInput;
     type Token = MlxTextToken;
     type TextGenerationState = MlxTextGenerationState;
     type TextCompletion = MlxTextCompletion;
@@ -844,43 +851,55 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         })
     }
 
-    fn submit_text_prefill(
-        runtime: &mut ModelRuntime<Self>,
+    fn prepare_text_prompt(
+        backend: &Self,
         prompt_token_ids: Vec<u32>,
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+    ) -> Result<Self::Prompt, Error> {
         if prompt_token_ids.is_empty() {
             return Err(Error::UnsupportedArchitecture(
                 "text generation requires at least one prompt token".into(),
             ));
         }
-        let stream = runtime.backend().stream().clone();
-        let tokens = Array::from(prompt_token_ids.as_slice()).try_index_device(NewAxis, &stream)?;
+        let tokens =
+            Array::from(prompt_token_ids.as_slice()).try_index_device(NewAxis, backend.stream())?;
         let parts = [input::InputPart::text_token_ids(&tokens)];
-        let submission = runtime.prefill(MlxModelInput::from(input::ModelInput::new(&parts)))?;
-        sample_text_submission(submission, state, stream)
+        Ok(MlxModelInput::from(input::ModelInput::new(&parts)))
+    }
+
+    fn submit_text_prefill(
+        runtime: &mut ModelRuntime<Self>,
+        prompt: Self::Prompt,
+        filter: &TokenFilter,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+        let stream = runtime.backend().stream().clone();
+        let submission = runtime.prefill(prompt)?;
+        sample_text_submission(submission, filter, state, stream)
     }
 
     fn submit_text_decode(
         runtime: &mut ModelRuntime<Self>,
         token: Self::Token,
+        filter: &TokenFilter,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
         let stream = runtime.backend().stream().clone();
         let input = token.value.try_index_device((.., NewAxis), &stream)?;
         let submission = runtime.decode(input)?;
-        sample_text_submission(submission, state, stream)
+        sample_text_submission(submission, filter, state, stream)
     }
 }
 
 fn sample_text_submission(
     submission: Submission<MlxModelOutput, MlxSessionCompletion>,
+    filter: &TokenFilter,
     state: &mut MlxTextGenerationState,
     stream: Stream,
 ) -> Result<Submission<MlxTextToken, MlxTextCompletion>, Error> {
     let logits = submission.output.into_logits().ok_or_else(|| {
         Error::Parallel("text generation requires logits on the local session rank".into())
     })?;
+    let logits = crate::runtime::generation::sampler::apply_token_filter(&logits, filter, &stream)?;
     let token = state
         .sampler
         .sample(&logits, state.temperature, state.prng.as_mut(), &stream)?;

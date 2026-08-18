@@ -9,6 +9,7 @@ use safemlx::{
 };
 
 use crate::{
+    core::{TokenFilter, TokenFilterController},
     runtime::chat::constraints::GrammarState,
     runtime::chat::{GenerationRuntimePlan, ToolChoice},
 };
@@ -143,14 +144,18 @@ pub trait Sampler {
 /// MTP scheduler fork delegated adaptive state together with grammar state.
 pub(crate) struct ConstrainedSampler<S> {
     policy: S,
+    controller: ConstraintController,
+}
+
+/// Canonical backend-independent grammar and activation state.
+pub(crate) struct ConstraintController {
     runtime: ConstraintRuntime,
     committed_tokens: Vec<u32>,
 }
 
 struct ConstraintCheckpoint<S> {
     policy: S,
-    runtime: ConstraintRuntime,
-    committed_len: usize,
+    controller: ConstraintController,
 }
 
 enum ConstraintRuntime {
@@ -196,22 +201,27 @@ impl Clone for ConstraintRuntime {
     }
 }
 
-impl<S: Clone> Clone for ConstrainedSampler<S> {
+impl Clone for ConstraintController {
     fn clone(&self) -> Self {
         Self {
-            policy: self.policy.clone(),
             runtime: self.runtime.clone(),
             committed_tokens: self.committed_tokens.clone(),
         }
     }
 }
 
-impl<S> ConstrainedSampler<S> {
-    /// Wraps `policy` with the constraint and activation semantics in `plan`.
-    pub(crate) fn from_generation_plan(
-        policy: S,
-        plan: &GenerationRuntimePlan,
-    ) -> Result<Self, Exception> {
+impl<S: Clone> Clone for ConstrainedSampler<S> {
+    fn clone(&self) -> Self {
+        Self {
+            policy: self.policy.clone(),
+            controller: self.controller.clone(),
+        }
+    }
+}
+
+impl ConstraintController {
+    /// Creates canonical constraint state from one prepared-chat plan.
+    pub(crate) fn from_generation_plan(plan: &GenerationRuntimePlan) -> Result<Self, Exception> {
         let constraint = plan.generation_constraint().clone();
         let runtime = if !plan.has_tool_surface() {
             ConstraintRuntime::Active(constraint.grammar_state())
@@ -246,9 +256,74 @@ impl<S> ConstrainedSampler<S> {
             }
         };
         Ok(Self {
-            policy,
             runtime,
             committed_tokens: Vec::new(),
+        })
+    }
+
+    /// Returns whether grammar masking is currently active.
+    #[cfg(test)]
+    pub(crate) fn constraint_is_active(&self) -> bool {
+        matches!(self.runtime, ConstraintRuntime::Active(_))
+    }
+
+    /// Returns whether the active grammar can complete at the current prefix.
+    pub(crate) fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
+        match &mut self.runtime {
+            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
+        }
+    }
+
+    fn runtime_at(&self, history: &[u32]) -> Result<ConstraintRuntime, Exception> {
+        if !history.starts_with(&self.committed_tokens) {
+            return Err(Exception::custom(
+                "constrained sampler history diverges from its committed logical prefix",
+            ));
+        }
+        let mut runtime = self.runtime.clone();
+        for &token in &history[self.committed_tokens.len()..] {
+            commit_runtime_token(&mut runtime, token)?;
+        }
+        Ok(runtime)
+    }
+
+    fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Exception> {
+        token_filter_at_runtime(&mut self.runtime_at(history)?)
+    }
+
+    fn commit(&mut self, token: u32) -> Result<(), Exception> {
+        commit_runtime_token(&mut self.runtime, token)?;
+        self.committed_tokens.push(token);
+        Ok(())
+    }
+}
+
+impl TokenFilterController for ConstraintController {
+    type Error = Exception;
+
+    fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+        token_filter_at_runtime(&mut self.runtime)
+    }
+
+    fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
+        self.commit(token_id)
+    }
+
+    fn is_complete(&mut self) -> Result<bool, Self::Error> {
+        self.grammar_is_complete()
+    }
+}
+
+impl<S> ConstrainedSampler<S> {
+    /// Wraps `policy` with the constraint and activation semantics in `plan`.
+    pub(crate) fn from_generation_plan(
+        policy: S,
+        plan: &GenerationRuntimePlan,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            policy,
+            controller: ConstraintController::from_generation_plan(plan)?,
         })
     }
 
@@ -269,7 +344,7 @@ impl<S> ConstrainedSampler<S> {
     /// Returns whether grammar masking is currently active.
     #[cfg(test)]
     pub(crate) fn constraint_is_active(&self) -> bool {
-        matches!(self.runtime, ConstraintRuntime::Active(_))
+        self.controller.constraint_is_active()
     }
 
     /// Returns whether the active grammar can complete at the current prefix.
@@ -277,10 +352,7 @@ impl<S> ConstrainedSampler<S> {
     /// An inactive automatic constraint and a forbidden tool-call trigger both
     /// report `false`.
     pub fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
-        match &mut self.runtime {
-            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
-            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
-        }
+        self.controller.grammar_is_complete()
     }
 
     /// Returns the valid token IDs at the durable logical prefix.
@@ -288,7 +360,7 @@ impl<S> ConstrainedSampler<S> {
     /// `None` means grammar masking is not active.
     #[cfg(test)]
     pub(crate) fn valid_token_ids(&mut self) -> Result<Option<Vec<u32>>, Exception> {
-        match &mut self.runtime {
+        match &mut self.controller.runtime {
             ConstraintRuntime::Active(grammar) => grammar
                 .allowed_tokens()
                 .map(|mask| Some(mask.iter().collect()))
@@ -296,114 +368,58 @@ impl<S> ConstrainedSampler<S> {
             ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(None),
         }
     }
+}
 
-    fn runtime_at(&self, history: &[u32]) -> Result<ConstraintRuntime, Exception> {
-        if !history.starts_with(&self.committed_tokens) {
-            return Err(Exception::custom(
-                "constrained sampler history diverges from its committed logical prefix",
-            ));
+fn token_filter_at_runtime(runtime: &mut ConstraintRuntime) -> Result<TokenFilter, Exception> {
+    let allowed = match runtime {
+        ConstraintRuntime::Active(grammar) => {
+            let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
+            (0..allowed.len())
+                .map(|token| allowed.is_allowed(token as u32))
+                .collect::<Vec<_>>()
         }
-        let mut runtime = self.runtime.clone();
-        for &token in &history[self.committed_tokens.len()..] {
-            commit_runtime_token(&mut runtime, token)?;
+        ConstraintRuntime::Forbidden {
+            vocabulary,
+            trigger,
+            pending,
+        } => vocabulary
+            .iter()
+            .map(|bytes| !completes_trigger(pending, bytes, trigger))
+            .collect(),
+        ConstraintRuntime::Auto {
+            grammar,
+            vocabulary,
+            trigger,
+            pending,
+        } => {
+            vocabulary
+                .iter()
+                .enumerate()
+                .map(|(token, bytes)| {
+                    let Some(activation) = trigger_activation_bytes(pending, bytes, trigger) else {
+                        return Ok(true);
+                    };
+                    // A trigger and its first constrained bytes may share
+                    // one token, so validate that transition before sampling.
+                    let mut candidate = grammar.fork();
+                    if activation.starts_at_token_boundary {
+                        candidate.try_commit(token as u32)
+                    } else {
+                        candidate.try_commit_bytes(&activation.bytes)
+                    }
+                    .map_err(constraint_error)
+                })
+                .collect::<Result<Vec<_>, Exception>>()?
         }
-        Ok(runtime)
-    }
-
-    fn mask_at_runtime(
-        logits: &Array,
-        runtime: &mut ConstraintRuntime,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let vocab_size = logits.dim(-1) as usize;
-        if vocab_size == 0 {
-            return Err(Exception::custom(
-                "cannot apply a grammar mask to an empty logits vocabulary",
-            ));
-        }
-        let invalid_row = match runtime {
-            ConstraintRuntime::Active(grammar) => {
-                let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
-                if allowed.len() != vocab_size {
-                    return Err(Exception::custom(format!(
-                        "grammar vocabulary size {} does not match logits vocabulary size {vocab_size}",
-                        allowed.len()
-                    )));
-                }
-                (0..vocab_size)
-                    .map(|token| !allowed.is_allowed(token as u32))
-                    .collect::<Vec<_>>()
-            }
-            ConstraintRuntime::Forbidden {
-                vocabulary,
-                trigger,
-                pending,
-            } => {
-                if vocabulary.len() != vocab_size {
-                    return Err(Exception::custom(format!(
-                        "constraint vocabulary size {} does not match logits vocabulary size {vocab_size}",
-                        vocabulary.len()
-                    )));
-                }
-                vocabulary
-                    .iter()
-                    .map(|bytes| completes_trigger(pending, bytes, trigger))
-                    .collect()
-            }
-            ConstraintRuntime::Auto {
-                grammar,
-                vocabulary,
-                trigger,
-                pending,
-            } => {
-                if vocabulary.len() != vocab_size {
-                    return Err(Exception::custom(format!(
-                        "constraint vocabulary size {} does not match logits vocabulary size {vocab_size}",
-                        vocabulary.len()
-                    )));
-                }
-                vocabulary
-                    .iter()
-                    .enumerate()
-                    .map(|(token, bytes)| {
-                        let Some(activation) = trigger_activation_bytes(pending, bytes, trigger)
-                        else {
-                            return Ok(false);
-                        };
-                        // A trigger and its first constrained bytes may share
-                        // one token, so validate that transition before sampling.
-                        let mut candidate = grammar.fork();
-                        let valid = if activation.starts_at_token_boundary {
-                            candidate.try_commit(token as u32)
-                        } else {
-                            candidate.try_commit_bytes(&activation.bytes)
-                        };
-                        valid.map(|valid| !valid).map_err(constraint_error)
-                    })
-                    .collect::<Result<Vec<_>, Exception>>()?
-            }
-        };
-        let row_count = logits.size() / vocab_size;
-        let invalid = (0..row_count)
-            .flat_map(|_| invalid_row.iter().copied())
-            .collect::<Vec<_>>();
-        let invalid = Array::from_slice(&invalid, logits.shape());
-        mask_logits(invalid, logits.clone(), stream)
-    }
-
-    fn commit_constraint_token(&mut self, token: u32) -> Result<(), Exception> {
-        commit_runtime_token(&mut self.runtime, token)?;
-        self.committed_tokens.push(token);
-        Ok(())
-    }
+    };
+    TokenFilter::allowed(allowed).map_err(|error| Exception::custom(error.to_string()))
 }
 
 impl<S: Clone> ConstrainedSampler<S> {
     fn checkpoint(&self) -> ConstraintCheckpoint<S> {
         ConstraintCheckpoint {
             policy: self.policy.clone(),
-            runtime: self.runtime.clone(),
-            committed_len: self.committed_tokens.len(),
+            controller: self.controller.clone(),
         }
     }
 }
@@ -422,7 +438,7 @@ impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S>
     }
 
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
-        match &mut self.runtime_at(history)? {
+        match &mut self.controller.runtime_at(history)? {
             ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
             ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
         }
@@ -435,8 +451,8 @@ impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S>
         history: &[u32],
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let mut runtime = self.runtime_at(history)?;
-        let masked = Self::mask_at_runtime(logits, &mut runtime, stream)?;
+        let filter = self.controller.filter_at(history)?;
+        let masked = apply_token_filter(logits, &filter, stream)?;
         self.policy
             .process_logits(&masked, temperature, history, stream)
     }
@@ -462,11 +478,10 @@ impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S>
         if let Err(error) = self
             .policy
             .commit_token(processed_logits, token, stream)
-            .and_then(|()| self.commit_constraint_token(token))
+            .and_then(|()| self.controller.commit(token))
         {
             self.policy = checkpoint.policy;
-            self.runtime = checkpoint.runtime;
-            self.committed_tokens.truncate(checkpoint.committed_len);
+            self.controller = checkpoint.controller;
             return Err(error);
         }
         Ok(())
@@ -482,14 +497,13 @@ impl<S: Sampler + Clone> Sampler for ConstrainedSampler<S> {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let checkpoint = self.checkpoint();
-        let mut runtime = self.runtime.clone();
-        let masked = Self::mask_at_runtime(logits, &mut runtime, stream)?;
+        let filter = self.controller.current_filter()?;
+        let masked = apply_token_filter(logits, &filter, stream)?;
         let token = self.policy.sample(&masked, temp, prng_state, stream)?;
         let token_id = token.clone().item::<u32>(stream);
-        if let Err(error) = self.commit_constraint_token(token_id) {
+        if let Err(error) = self.controller.commit(token_id) {
             self.policy = checkpoint.policy;
-            self.runtime = checkpoint.runtime;
-            self.committed_tokens.truncate(checkpoint.committed_len);
+            self.controller = checkpoint.controller;
             return Err(error);
         }
         Ok(token)
@@ -1325,6 +1339,30 @@ impl Sampler for GenerationSampler {
         let logits = self.apply_top_k(logits, stream)?;
         self.sample_top_p(logits, temp, prng_state, stream)
     }
+}
+
+/// Applies a portable vocabulary filter to backend-owned MLX logits.
+pub(crate) fn apply_token_filter(
+    logits: &Array,
+    filter: &TokenFilter,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let Some(allowed) = filter.allowed_mask() else {
+        return Ok(logits.clone());
+    };
+    let vocab_size = logits.dim(-1) as usize;
+    if allowed.len() != vocab_size {
+        return Err(Exception::custom(format!(
+            "token filter vocabulary size {} does not match logits vocabulary size {vocab_size}",
+            allowed.len()
+        )));
+    }
+    let row_count = logits.size() / vocab_size;
+    let invalid = (0..row_count)
+        .flat_map(|_| allowed.iter().map(|allowed| !allowed))
+        .collect::<Vec<_>>();
+    let invalid = Array::from_slice(&invalid, logits.shape());
+    mask_logits(invalid, logits.clone(), stream)
 }
 
 fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exception> {

@@ -87,7 +87,6 @@ event.
 let mut events = Vec::new();
 let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
     input: PreparedChatInput::rendered_prompt(&prepared),
-    sampling_policy: DefaultSampler,
     settings: PreparedChatGenerationSettings::default(),
     caller_stop_sequences: &[],
     cancellation: GenerationCancellationToken::new(),

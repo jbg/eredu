@@ -186,12 +186,14 @@ caches with models. Plain text clients can be generic over
 `B: TextGenerationBackend`: `encode`, `generate_tokens`, token-id observation,
 and `decode` use the same API for MLX and a future backend. The MLX adapter keeps
 arrays, sampling math, PRNG state, streams, and exact events behind that
-contract. Applications can also prepare ordered multimodal input or a
-structured chat request through the currently MLX-specific richer APIs.
-Prepared-chat generation emits protocol-neutral semantic events for reasoning,
-visible text, and tool calls. Call `reset_session` before starting an unrelated
-sequence, or deliberately retain or restore the session cache when continuing
-a prefix.
+contract. `generate_prepared_chat` is generic over the same backend: core
+passes portable vocabulary filters to backend sampling while the facade owns
+grammar commitment, cancellation, stop/EOS precedence, and protocol-neutral
+semantic events. Ordered multimodal input crosses this API as the backend's
+opaque prompt type; MLX media processing returns `MlxModelInput`, while another
+backend can supply its own representation. Call `reset_session` before starting
+an unrelated sequence, or deliberately retain or restore the session cache
+when continuing a prefix.
 
 Raw generation remains available for completion workloads. It deliberately
 bypasses chat-template and native-tool guarantees.

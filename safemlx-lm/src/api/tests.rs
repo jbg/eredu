@@ -685,23 +685,25 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
         profile_stop_sequences: Vec::new(),
     };
     let execution_calls = AtomicUsize::new(0);
-    let input = PreparedChatInput::rendered_prompt(&prepared);
+    let input: PreparedChatInput<'_> = PreparedChatInput::rendered_prompt(&prepared);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
-    assert!(input.model_input().is_none());
+    assert!(input.backend_prompt().is_none());
     let model_input = crate::runtime::media::prepared_model_input(vec![
         crate::runtime::media::PreparedInputPart::text_token_ids(&[7]),
     ])
     .unwrap();
-    let input = PreparedChatInput::prepared_model_input(&prepared, &model_input);
+    let model_input =
+        model_input.with_model_input(|input| crate::backend::mlx::MlxModelInput::from(input));
+    let input: PreparedChatInput<'_> =
+        PreparedChatInput::prepared_backend_input(&prepared, model_input);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
-    assert!(std::ptr::eq(input.model_input().unwrap(), &model_input));
+    assert!(input.backend_prompt().is_some());
 
     let error = with_prepared_chat_runtime(
         &prepared,
         DefaultSampler,
         GenerationSampler::default(),
         true,
-        &[],
         |_| {
             execution_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -4932,6 +4934,29 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 "decode {family} {quantization:?}"
             );
             if family == "llama" && matches!(quantization, WeightQuantization::Affine(_)) {
+                struct FixedTokenController;
+
+                impl safemlx_lm_core::TokenFilterController for FixedTokenController {
+                    type Error = std::convert::Infallible;
+
+                    fn current_filter(
+                        &mut self,
+                    ) -> Result<safemlx_lm_core::TokenFilter, Self::Error> {
+                        let mut allowed = vec![false; 32];
+                        allowed[5] = true;
+                        Ok(safemlx_lm_core::TokenFilter::allowed(allowed).unwrap())
+                    }
+
+                    fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
+                        assert_eq!(token_id, 5);
+                        Ok(())
+                    }
+
+                    fn is_complete(&mut self) -> Result<bool, Self::Error> {
+                        Ok(false)
+                    }
+                }
+
                 let mut runtime = safemlx_lm_core::ModelRuntime::from_prepared(
                     crate::backend::mlx::MlxBackend::new(stream),
                     safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(
@@ -4941,15 +4966,16 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 .unwrap();
                 let sampling =
                     safemlx_lm_core::resolve_generation_config(None, Default::default()).unwrap();
-                let mut generation = safemlx_lm_core::TextGeneration::new(
+                let mut generation = safemlx_lm_core::ControlledTextGeneration::new(
                     &mut runtime,
                     vec![1, 2],
                     safemlx_lm_core::TextGenerationConfig::new(sampling),
+                    FixedTokenController,
                 )
                 .unwrap();
                 for _ in 0..3 {
                     let token = generation.next().unwrap().unwrap();
-                    safemlx_lm_core::TokenOutput::token_id(&token).unwrap();
+                    assert_eq!(token.token_id(), 5);
                 }
             }
             fs::remove_dir_all(saved_dir).unwrap();

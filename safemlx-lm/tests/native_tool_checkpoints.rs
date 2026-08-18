@@ -10,7 +10,6 @@ use safemlx_lm::{
         PreparedChatInput,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
-    runtime::generation::sampler::DefaultSampler,
     FinishReason, SemanticEvent,
 };
 use serde_json::json;
@@ -82,14 +81,13 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
     let output = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
             input: PreparedChatInput::rendered_prompt(&prepared),
-            sampling_policy: DefaultSampler,
             settings: PreparedChatGenerationSettings {
                 overrides: safemlx_lm::GenerationConfigOverrides {
                     temperature: Some(0.0),
                     max_new_tokens: Some(256),
                     ..Default::default()
                 },
-                prng_key: None,
+                seed: 0,
             },
             caller_stop_sequences: &[],
             cancellation: safemlx_lm::GenerationCancellationToken::new(),

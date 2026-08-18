@@ -126,7 +126,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model
             .generate_prepared_chat(PreparedChatGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),
-                sampling_policy: DefaultSampler,
                 settings,
                 caller_stop_sequences: &[],
                 cancellation: safemlx_lm::GenerationCancellationToken::new(),

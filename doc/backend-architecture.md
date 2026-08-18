@@ -75,7 +75,8 @@ separates the executable from its cache.
 `TextGenerationBackend` is the portable text-generation extension. It asks the
 selected backend for whole prefill-and-sample and decode-and-sample submissions,
 not logits or tensor primitives. The backend owns its token handle, sampler and
-randomness state, cache, and exact completion. `TextGeneration<B>` retains
+randomness state, cache, exact completion, and opaque prepared prompt.
+`TextGeneration<B>` retains
 unfinished completions, feeds the opaque token directly into the next decode,
 and exposes only the canonical `u32` vocabulary id through `TokenOutput` when a
 client actually needs it. The resolved token budget is enforced in core.
@@ -84,6 +85,17 @@ EOS, checkpoint-generation, and chat-template state. Code written over
 `B: TextGenerationBackend` can therefore encode, generate, and decode without
 naming MLX. `LoadedModel::from_runtime` is the constructor used by another
 backend after it prepares its model and creates its session.
+
+Constrained generation uses the same contract rather than a parallel MLX
+loop. The core `TokenFilterController` contract lets a facade-owned grammar and
+activation state return a validated portable `TokenFilter` before each submission.
+`ControlledTextGeneration<B, C>` passes that filter to the selected backend,
+observes the committed vocabulary id once, advances the controller, and retains
+the exact backend completion. It never exposes logits. The ordinary
+`PreparedChatGenerationRequest<B, F>` uses this path for tokenization, grammar
+masking, cancellation, semantic parsing, stop/EOS precedence, and callback
+publication. Its sampling settings contain a portable seed rather than an MLX
+random array.
 
 Every submission returns an opaque output and an exact `Completion`. Completion
 can be polled or waited without draining unrelated work. A scheduler-owned
@@ -141,14 +153,23 @@ embedding inputs without placing MLX arrays or modality-specific tensor layouts
 in core.
 
 `MlxBackend` implements `TextGenerationBackend` by turning portable prompt ids
-into an MLX array, submitting them through `MlxModelSession`, applying the
-existing MLX `GenerationSampler`, and returning `MlxTextToken`. Decode consumes
-that token's array directly, so the ordinary generation loop does not insert a
-host round trip. `MlxTextCompletion` retains both the model submission and the
-sampled-token submission and implements the same exact-completion contract.
+into `MlxModelInput`, submitting through `MlxModelSession`, applying the
+portable allow-mask followed by the existing MLX `GenerationSampler`, and
+returning `MlxTextToken`. Unconstrained decode consumes that token's array
+directly without a host round trip. Controlled generation observes its token id
+once because grammar state must commit the selected vocabulary id.
+`MlxTextCompletion` retains both the model submission and the sampled-token
+submission and implements the same exact-completion contract.
 The GGUF generation example puts its encode/generate/decode loop in a function
 generic over the backend; only model loading and device selection are MLX
 specific.
+
+`TextGenerationBackend::Prompt` is also the multimodal boundary. Text clients
+receive a prompt from portable token ids; an MLX media processor instead
+returns an opaque `MlxModelInput` containing its arrays. Both enter
+`PreparedChatInput::PreparedBackendInput` and use the same generic constrained
+and semantic generation loop. A second backend may supply its own prompt and
+preprocessor without changing downstream request orchestration.
 
 Speculative model execution uses the core `SpeculativeExecutor` contract. Its
 input, target and assistant state, cache checkpoint, verification output,
@@ -318,13 +339,14 @@ The current boundary leaves these components MLX-coupled:
   and terminal precedence are core-owned.
 - tokenizer/chat-template rendering and checkpoint generation metadata remain
   in the facade, but are owned by generic `LoadedModel<B>` and do not name MLX.
-  Plain text tokenization, greedy/stochastic sampling, prefill, decode, EOS
-  observation, and decoding now have one backend-generic client surface.
-  Constrained semantic generation, arbitrary custom samplers, multimodal
-  preprocessing/input tensors, speculative MTP, and realtime token/audio paths
-  still expose MLX adapter types. The next backend must implement the plain text
-  contract first; these richer request shapes need separate high-level portable
-  contracts rather than tensor escape hatches.
+  Plain text and prepared-chat tokenization, greedy/stochastic sampling,
+  portable grammar filtering, prefill, decode, semantic events, cancellation,
+  stop/EOS precedence, and decoding now have one backend-generic client
+  surface. Multimodal request orchestration is generic through the opaque
+  backend prompt, while concrete media decoding and tensor preprocessing remain
+  backend implementations. Arbitrary custom samplers, speculative MTP, and
+  realtime token/audio paths still expose MLX adapter types; they require their
+  own high-level portable contracts rather than tensor escape hatches.
 
 The former facade `runtime::residency::policy` module was deleted. It was not
 retained as a forwarding namespace. The earlier placeholder core

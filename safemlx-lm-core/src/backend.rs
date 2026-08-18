@@ -419,12 +419,89 @@ impl TokenOutput for u32 {
     }
 }
 
+/// Portable vocabulary filter applied before backend-owned sampling.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TokenFilter {
+    /// Every vocabulary token may be selected.
+    All,
+    /// One boolean per canonical vocabulary id; `true` permits selection.
+    Allowed(Vec<bool>),
+}
+
+impl TokenFilter {
+    /// Validates an explicit canonical-vocabulary allow mask.
+    pub fn allowed(mask: Vec<bool>) -> Result<Self, TokenFilterError> {
+        if mask.is_empty() {
+            return Err(TokenFilterError::EmptyVocabulary);
+        }
+        if !mask.iter().any(|allowed| *allowed) {
+            return Err(TokenFilterError::NoAllowedToken);
+        }
+        Ok(Self::Allowed(mask))
+    }
+
+    /// Returns the explicit allow mask, or `None` when all tokens are allowed.
+    pub fn allowed_mask(&self) -> Option<&[bool]> {
+        match self {
+            Self::All => None,
+            Self::Allowed(mask) => Some(mask),
+        }
+    }
+}
+
+/// Invalid portable token-filter construction.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum TokenFilterError {
+    /// An explicit mask must describe a nonempty vocabulary.
+    #[error("token filter vocabulary must not be empty")]
+    EmptyVocabulary,
+    /// Fail closed instead of asking a backend to sample an impossible row.
+    #[error("token filter does not allow any vocabulary token")]
+    NoAllowedToken,
+}
+
+/// Backend-independent logical controller for constrained token selection.
+pub trait TokenFilterController {
+    /// Constraint or grammar error.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Returns the filter for the current durable logical prefix.
+    fn current_filter(&mut self) -> Result<TokenFilter, Self::Error>;
+
+    /// Commits one backend-selected canonical vocabulary id.
+    fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error>;
+
+    /// Returns whether the committed logical prefix satisfies the constraint.
+    fn is_complete(&mut self) -> Result<bool, Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UnconstrainedTokens;
+
+impl TokenFilterController for UnconstrainedTokens {
+    type Error = std::convert::Infallible;
+
+    fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+        Ok(TokenFilter::All)
+    }
+
+    fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn is_complete(&mut self) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
 /// High-level text-generation extension implemented once per backend.
 ///
 /// The contract deliberately combines model execution and sampling. Core does
 /// not see logits or ask a backend to implement tensor primitives. The token,
 /// sampling state, cache state, and exact completion remain backend-owned.
 pub trait TextGenerationBackend: Backend {
+    /// Opaque prepared prompt, including any backend-owned multimodal values.
+    type Prompt;
     /// Backend-owned generated token handle.
     type Token: TokenOutput<Error = Self::Error>;
     /// Backend-owned sampler and randomness state for one sequence.
@@ -438,10 +515,17 @@ pub trait TextGenerationBackend: Backend {
         config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Self::Error>;
 
+    /// Converts portable tokenizer ids into a backend-owned text prompt.
+    fn prepare_text_prompt(
+        backend: &Self,
+        prompt_token_ids: Vec<u32>,
+    ) -> Result<Self::Prompt, Self::Error>;
+
     /// Submits prompt prefill followed by sampling one token.
     fn submit_text_prefill(
         runtime: &mut ModelRuntime<Self>,
-        prompt_token_ids: Vec<u32>,
+        prompt: Self::Prompt,
+        filter: &TokenFilter,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error>;
 
@@ -449,43 +533,130 @@ pub trait TextGenerationBackend: Backend {
     fn submit_text_decode(
         runtime: &mut ModelRuntime<Self>,
         token: Self::Token,
+        filter: &TokenFilter,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error>;
 }
 
-enum TextGenerationStep<T> {
-    Prefill(Vec<u32>),
+enum TextGenerationStep<P, T> {
+    Prefill(P),
     Decode(T),
 }
 
-/// Backend-generic asynchronous token-generation iterator.
-///
-/// Every yielded token handle may be fed into the following decode before its
-/// id is read on the host. Exact completions are retained until finished, and
-/// dropping the iterator waits for all still-retained submissions.
-pub struct TextGeneration<'a, B: TextGenerationBackend> {
+/// Failure from either backend execution or portable constraint control.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlledTextGenerationError<B, C>
+where
+    B: std::error::Error + 'static,
+    C: std::error::Error + 'static,
+{
+    /// Backend preparation, execution, sampling, or completion failed.
+    #[error("backend text generation failed: {0}")]
+    Backend(#[source] B),
+    /// Portable constraint filtering or commitment failed.
+    #[error("text generation constraint failed: {0}")]
+    Controller(#[source] C),
+}
+
+/// One constraint-committed token and its backend-owned output handle.
+#[derive(Debug, Clone)]
+pub struct ControlledToken<T> {
+    output: T,
+    token_id: u32,
+}
+
+impl<T> ControlledToken<T> {
+    /// Returns the committed canonical vocabulary id.
+    pub fn token_id(&self) -> u32 {
+        self.token_id
+    }
+
+    /// Borrows the backend-owned token handle.
+    pub const fn output(&self) -> &T {
+        &self.output
+    }
+
+    /// Consumes the committed token into its backend-owned handle.
+    pub fn into_output(self) -> T {
+        self.output
+    }
+}
+
+/// Backend-generic generation driven by a portable token-filter controller.
+pub struct ControlledTextGeneration<'a, B, C>
+where
+    B: TextGenerationBackend,
+    C: TokenFilterController,
+{
+    inner: TextGenerationMachine<'a, B, C>,
+}
+
+struct TextGenerationMachine<'a, B, C>
+where
+    B: TextGenerationBackend,
+    C: TokenFilterController,
+{
     runtime: &'a mut ModelRuntime<B>,
     backend_state: B::TextGenerationState,
-    step: Option<TextGenerationStep<B::Token>>,
+    controller: C,
+    step: Option<TextGenerationStep<B::Prompt, B::Token>>,
     completions: Vec<B::TextCompletion>,
     remaining_tokens: Option<usize>,
 }
 
-impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
-    /// Starts generation from portable prompt token ids.
+impl<'a, B, C> ControlledTextGeneration<'a, B, C>
+where
+    B: TextGenerationBackend,
+    C: TokenFilterController,
+{
+    /// Starts controlled generation from portable prompt token ids.
     pub fn new(
         runtime: &'a mut ModelRuntime<B>,
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
-    ) -> Result<Self, B::Error> {
-        let backend_state = B::start_text_generation(runtime.backend(), config)?;
-        let remaining_tokens = config.sampling().max_new_tokens;
+        controller: C,
+    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)
+            .map_err(ControlledTextGenerationError::Backend)?;
+        Self::from_prompt(runtime, prompt, config, controller)
+    }
+
+    /// Starts controlled generation from an opaque backend-prepared prompt.
+    pub fn from_prompt(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt: B::Prompt,
+        config: TextGenerationConfig,
+        controller: C,
+    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        TextGenerationMachine::new(runtime, prompt, config, controller).map(|inner| Self { inner })
+    }
+
+    /// Mutably borrows the canonical constraint state.
+    pub fn controller_mut(&mut self) -> &mut C {
+        &mut self.inner.controller
+    }
+}
+
+impl<'a, B, C> TextGenerationMachine<'a, B, C>
+where
+    B: TextGenerationBackend,
+    C: TokenFilterController,
+{
+    fn new(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt: B::Prompt,
+        config: TextGenerationConfig,
+        controller: C,
+    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        let backend_state = B::start_text_generation(runtime.backend(), config)
+            .map_err(ControlledTextGenerationError::Backend)?;
         Ok(Self {
             runtime,
             backend_state,
-            step: Some(TextGenerationStep::Prefill(prompt_token_ids)),
+            controller,
+            step: Some(TextGenerationStep::Prefill(prompt)),
             completions: Vec::new(),
-            remaining_tokens,
+            remaining_tokens: config.sampling().max_new_tokens,
         })
     }
 
@@ -510,32 +681,34 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         self.completions = retained;
         Ok(())
     }
-}
 
-impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
-    type Item = Result<B::Token, B::Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_output(
+        &mut self,
+    ) -> Option<Result<B::Token, ControlledTextGenerationError<B::Error, C::Error>>> {
         if self.remaining_tokens == Some(0) {
             self.step = None;
             return None;
         }
         let step = self.step.take()?;
+        let filter = match self.controller.current_filter() {
+            Ok(filter) => filter,
+            Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
+        };
         let submission = match step {
             TextGenerationStep::Prefill(prompt) => {
-                B::submit_text_prefill(self.runtime, prompt, &mut self.backend_state)
+                B::submit_text_prefill(self.runtime, prompt, &filter, &mut self.backend_state)
             }
             TextGenerationStep::Decode(token) => {
-                B::submit_text_decode(self.runtime, token, &mut self.backend_state)
+                B::submit_text_decode(self.runtime, token, &filter, &mut self.backend_state)
             }
         };
         let submission = match submission {
             Ok(submission) => submission,
-            Err(error) => return Some(Err(error)),
+            Err(error) => return Some(Err(ControlledTextGenerationError::Backend(error))),
         };
         let token = submission.output;
         if let Err(error) = self.retain_completion(submission.completion) {
-            return Some(Err(error));
+            return Some(Err(ControlledTextGenerationError::Backend(error)));
         }
         self.step = Some(TextGenerationStep::Decode(token.clone()));
         if let Some(remaining_tokens) = &mut self.remaining_tokens {
@@ -545,11 +718,100 @@ impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
     }
 }
 
-impl<B: TextGenerationBackend> Drop for TextGeneration<'_, B> {
+impl<B, C> Iterator for ControlledTextGeneration<'_, B, C>
+where
+    B: TextGenerationBackend,
+    C: TokenFilterController,
+{
+    type Item =
+        Result<ControlledToken<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let token = match self.inner.next_output()? {
+            Ok(token) => token,
+            Err(error) => return Some(Err(error)),
+        };
+        let token_id = match token.token_id() {
+            Ok(token_id) => token_id,
+            Err(error) => {
+                self.inner.step = None;
+                return Some(Err(ControlledTextGenerationError::Backend(error)));
+            }
+        };
+        if let Err(error) = self.inner.controller.commit_token(token_id) {
+            self.inner.step = None;
+            return Some(Err(ControlledTextGenerationError::Controller(error)));
+        }
+        Some(Ok(ControlledToken {
+            output: token,
+            token_id,
+        }))
+    }
+}
+
+impl<B, C> Drop for TextGenerationMachine<'_, B, C>
+where
+    B: TextGenerationBackend,
+    C: TokenFilterController,
+{
     fn drop(&mut self) {
         for completion in self.completions.drain(..) {
             let _ = completion.wait();
         }
+    }
+}
+
+/// Backend-generic asynchronous token-generation iterator.
+///
+/// Every yielded token handle may be fed into the following decode before its
+/// id is read on the host. Exact completions are retained until finished, and
+/// dropping the iterator waits for all still-retained submissions.
+pub struct TextGeneration<'a, B: TextGenerationBackend> {
+    inner: TextGenerationMachine<'a, B, UnconstrainedTokens>,
+}
+
+impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
+    /// Starts generation from portable prompt token ids.
+    pub fn new(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt_token_ids: Vec<u32>,
+        config: TextGenerationConfig,
+    ) -> Result<Self, B::Error> {
+        let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)?;
+        Self::from_prompt(runtime, prompt, config)
+    }
+
+    /// Starts generation from an opaque backend-prepared prompt.
+    pub fn from_prompt(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt: B::Prompt,
+        config: TextGenerationConfig,
+    ) -> Result<Self, B::Error> {
+        TextGenerationMachine::new(runtime, prompt, config, UnconstrainedTokens)
+            .map(|inner| Self { inner })
+            .map_err(unreachable_unconstrained_error)
+    }
+}
+
+fn unreachable_unconstrained_error<B>(
+    error: ControlledTextGenerationError<B, std::convert::Infallible>,
+) -> B
+where
+    B: std::error::Error + 'static,
+{
+    match error {
+        ControlledTextGenerationError::Backend(error) => error,
+        ControlledTextGenerationError::Controller(error) => match error {},
+    }
+}
+
+impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
+    type Item = Result<B::Token, B::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next_output()
+            .map(|result| result.map_err(unreachable_unconstrained_error))
     }
 }
 
@@ -697,6 +959,7 @@ mod tests {
     }
 
     impl TextGenerationBackend for Mock {
+        type Prompt = Vec<u32>;
         type Token = u32;
         type TextGenerationState = (u32, u64);
         type TextCompletion = Done;
@@ -708,14 +971,22 @@ mod tests {
             Ok((config.sampling().top_k as u32, config.seed()))
         }
 
+        fn prepare_text_prompt(
+            _: &Self,
+            prompt_token_ids: Vec<u32>,
+        ) -> Result<Self::Prompt, Self::Error> {
+            Ok(prompt_token_ids)
+        }
+
         fn submit_text_prefill(
             runtime: &mut ModelRuntime<Self>,
-            prompt_token_ids: Vec<u32>,
+            prompt: Self::Prompt,
+            filter: &TokenFilter,
             state: &mut Self::TextGenerationState,
         ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-            let submission = runtime.prefill(prompt_token_ids)?;
+            let submission = runtime.prefill(prompt)?;
             Ok(Submission {
-                output: submission.output + state.0 + state.1 as u32,
+                output: apply_mock_filter(submission.output + state.0 + state.1 as u32, filter),
                 completion: submission.completion,
             })
         }
@@ -723,9 +994,57 @@ mod tests {
         fn submit_text_decode(
             runtime: &mut ModelRuntime<Self>,
             token: Self::Token,
+            filter: &TokenFilter,
             _: &mut Self::TextGenerationState,
         ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-            runtime.decode(token)
+            let submission = runtime.decode(token)?;
+            Ok(Submission {
+                output: apply_mock_filter(submission.output, filter),
+                completion: submission.completion,
+            })
+        }
+    }
+
+    fn apply_mock_filter(candidate: u32, filter: &TokenFilter) -> u32 {
+        let Some(allowed) = filter.allowed_mask() else {
+            return candidate;
+        };
+        allowed
+            .get(candidate as usize)
+            .copied()
+            .unwrap_or(false)
+            .then_some(candidate)
+            .or_else(|| {
+                allowed
+                    .iter()
+                    .position(|allowed| *allowed)
+                    .map(|token| token as u32)
+            })
+            .expect("validated token filters allow at least one token")
+    }
+
+    struct FixedController {
+        tokens: Vec<u32>,
+        committed: usize,
+    }
+
+    impl TokenFilterController for FixedController {
+        type Error = Infallible;
+
+        fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+            let mut allowed = vec![false; 64];
+            allowed[self.tokens[self.committed] as usize] = true;
+            Ok(TokenFilter::allowed(allowed).unwrap())
+        }
+
+        fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
+            assert_eq!(token_id, self.tokens[self.committed]);
+            self.committed += 1;
+            Ok(())
+        }
+
+        fn is_complete(&mut self) -> Result<bool, Self::Error> {
+            Ok(self.committed == self.tokens.len())
         }
     }
 
@@ -759,6 +1078,34 @@ mod tests {
         assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 55);
         assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 13);
         assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 14);
+        assert!(generation.next().is_none());
+    }
+
+    #[test]
+    fn controlled_generation_applies_portable_filters_and_commits_tokens() {
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let sampling = crate::resolve_generation_config(
+            None,
+            crate::GenerationConfigOverrides {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let controller = FixedController {
+            tokens: vec![7, 8],
+            committed: 0,
+        };
+        let mut generation = ControlledTextGeneration::new(
+            &mut runtime,
+            vec![1, 2],
+            TextGenerationConfig::new(sampling),
+            controller,
+        )
+        .unwrap();
+        assert_eq!(generation.next().unwrap().unwrap().token_id(), 7);
+        assert_eq!(generation.next().unwrap().unwrap().token_id(), 8);
+        assert!(generation.controller_mut().is_complete().unwrap());
         assert!(generation.next().is_none());
     }
 

@@ -31,12 +31,12 @@ impl TextDecoder {
 }
 
 /// Model sampling and stopping settings for one prepared chat generation.
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PreparedChatGenerationSettings {
     /// Typed overrides layered over checkpoint-declared generation settings.
     pub overrides: GenerationConfigOverrides,
-    /// Optional MLX PRNG key. Stochastic checkpoint defaults use seed zero when omitted.
-    pub prng_key: Option<Array>,
+    /// Deterministic root seed used by the selected backend for stochastic sampling.
+    pub seed: u64,
 }
 
 pub(super) struct ResolvedPreparedChatGenerationSettings {
@@ -50,53 +50,52 @@ pub(super) struct ResolvedPreparedChatGenerationSettings {
 ///
 /// The prepared chat always owns the checkpoint-native generation semantics.
 /// The selected variant determines only how the model prompt is prefetched.
-#[derive(Debug, Clone, Copy)]
-pub enum PreparedChatInput<'a> {
+pub enum PreparedChatInput<
+    'a,
+    B: safemlx_lm_core::TextGenerationBackend = crate::backend::mlx::MlxBackend<'static>,
+> {
     /// Tokenize and prefill the rendered prompt stored in the prepared chat.
     RenderedPrompt(&'a PreparedChat),
-    /// Prefill an already-tokenized and preprocessed model input.
+    /// Prefill an already-tokenized and backend-prepared model input.
     ///
     /// The caller must ensure that `model_input` represents the same rendered
     /// conversation as `prepared_chat`. This variant supports ordered image,
     /// audio, and video parts without discarding the chat's tool runtime plan.
-    PreparedModelInput {
+    PreparedBackendInput {
         /// Prepared chat that supplies generation and semantic-streaming state.
         prepared_chat: &'a PreparedChat,
-        /// Architecture-processed prompt supplied directly to model prefill.
-        model_input: &'a PreparedModelInput,
+        /// Backend-owned prompt supplied directly to model prefill.
+        prompt: B::Prompt,
     },
 }
 
-impl<'a> PreparedChatInput<'a> {
+impl<'a, B: safemlx_lm_core::TextGenerationBackend> PreparedChatInput<'a, B> {
     /// Creates a text-only input from the prepared chat's rendered prompt.
     pub const fn rendered_prompt(prepared_chat: &'a PreparedChat) -> Self {
         Self::RenderedPrompt(prepared_chat)
     }
 
-    /// Binds an architecture-processed prompt to prepared-chat semantics.
-    pub const fn prepared_model_input(
-        prepared_chat: &'a PreparedChat,
-        model_input: &'a PreparedModelInput,
-    ) -> Self {
-        Self::PreparedModelInput {
+    /// Binds an opaque backend-prepared prompt to prepared-chat semantics.
+    pub fn prepared_backend_input(prepared_chat: &'a PreparedChat, prompt: B::Prompt) -> Self {
+        Self::PreparedBackendInput {
             prepared_chat,
-            model_input,
+            prompt,
         }
     }
 
     /// Returns the prepared chat that owns generation semantics.
-    pub const fn prepared_chat(self) -> &'a PreparedChat {
+    pub const fn prepared_chat(&self) -> &'a PreparedChat {
         match self {
             Self::RenderedPrompt(prepared_chat)
-            | Self::PreparedModelInput { prepared_chat, .. } => prepared_chat,
+            | Self::PreparedBackendInput { prepared_chat, .. } => prepared_chat,
         }
     }
 
-    /// Returns the explicitly prepared model input, when present.
-    pub const fn model_input(self) -> Option<&'a PreparedModelInput> {
+    /// Returns the explicitly prepared backend prompt, when present.
+    pub const fn backend_prompt(&self) -> Option<&B::Prompt> {
         match self {
             Self::RenderedPrompt(_) => None,
-            Self::PreparedModelInput { model_input, .. } => Some(model_input),
+            Self::PreparedBackendInput { prompt, .. } => Some(prompt),
         }
     }
 }
@@ -104,14 +103,12 @@ impl<'a> PreparedChatInput<'a> {
 /// Cohesive request for ordinary structured generation from a [`PreparedChat`].
 ///
 /// Cache and execution-stream ownership belong to the selected backend
-/// session. `sampling_policy` is wrapped in the prepared chat's constraint
-/// plan before any model execution.
-pub struct PreparedChatGenerationRequest<'a, S, F> {
+/// session. The prepared chat's portable constraint controller supplies a
+/// vocabulary filter to the backend before each sampling submission.
+pub struct PreparedChatGenerationRequest<'a, B: safemlx_lm_core::TextGenerationBackend, F> {
     /// Explicit prompt source and embedded format/runtime plan.
-    pub input: PreparedChatInput<'a>,
-    /// Caller-selected base sampling policy.
-    pub sampling_policy: S,
-    /// Temperature, token limit, and optional random state.
+    pub input: PreparedChatInput<'a, B>,
+    /// Portable sampling configuration, token limit, and random seed.
     pub settings: PreparedChatGenerationSettings,
     /// Additional decoded text sequences that terminate generation.
     pub caller_stop_sequences: &'a [String],
@@ -293,6 +290,10 @@ impl TokenDecoderBackend for PreparedChatTokenDecoder {
 
 pub(super) struct PreparedChatRuntime<S> {
     pub(super) sampler: ConstrainedSampler<S>,
+}
+
+pub(super) struct PreparedChatControlRuntime {
+    pub(super) controller: crate::runtime::generation::sampler::ConstraintController,
     pub(super) parser: crate::runtime::generation::streaming::ToolRuntimeParser,
     pub(super) structural_tokens: HashMap<u32, String>,
 }
@@ -394,12 +395,11 @@ pub(super) fn with_prepared_chat_runtime<S, R>(
     sampling_policy: S,
     checkpoint_sampler: crate::runtime::generation::sampler::GenerationSampler,
     use_checkpoint_sampler: bool,
-    caller_stop_sequences: &[String],
     execute: impl FnOnce(
         PreparedChatRuntime<crate::runtime::generation::sampler::CheckpointConfiguredSampler<S>>,
     ) -> Result<R, Error>,
 ) -> Result<R, Error> {
-    let semantic_plan = match prepared_chat.semantic_support() {
+    let _semantic_plan = match prepared_chat.semantic_support() {
         SemanticSupport::Supported => prepared_chat
             .semantic_runtime_plan()
             .expect("supported prepared chats carry a semantic runtime plan"),
@@ -420,6 +420,30 @@ pub(super) fn with_prepared_chat_runtime<S, R>(
         );
     let sampler = ConstrainedSampler::from_generation_plan(sampling_policy, generation_plan)
         .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+    execute(PreparedChatRuntime { sampler })
+}
+
+pub(super) fn prepared_chat_control_runtime(
+    prepared_chat: &PreparedChat,
+    caller_stop_sequences: &[String],
+) -> Result<PreparedChatControlRuntime, Error> {
+    let semantic_plan = match prepared_chat.semantic_support() {
+        SemanticSupport::Supported => prepared_chat
+            .semantic_runtime_plan()
+            .expect("supported prepared chats carry a semantic runtime plan"),
+        SemanticSupport::Unsupported { reason } => {
+            return Err(Error::PreparedChatGeneration(format!(
+                "prepared chat does not have an executable semantic plan: {reason}"
+            )));
+        }
+    };
+    let generation_plan = prepared_chat
+        .generation_runtime_plan()
+        .expect("supported prepared chats carry a generation runtime plan");
+    let controller =
+        crate::runtime::generation::sampler::ConstraintController::from_generation_plan(
+            generation_plan,
+        )?;
     let parser = semantic_plan
         .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
         .map_err(Error::PreparedChatGeneration)?;
@@ -427,36 +451,42 @@ pub(super) fn with_prepared_chat_runtime<S, R>(
         .structural_tokens()
         .map(|(id, spelling)| (id, spelling.to_owned()))
         .collect();
-    execute(PreparedChatRuntime {
-        sampler,
+    Ok(PreparedChatControlRuntime {
+        controller,
         parser,
         structural_tokens,
     })
 }
 
-pub(super) struct GenerationTokenSource<'a, S>
+pub(super) struct BackendGenerationTokenSource<'a, B>
 where
-    S: Sampler + Clone,
+    B: safemlx_lm_core::TextGenerationBackend,
 {
-    pub(super) generator: MlxGeneration<'a, ConstrainedSampler<S>>,
-    pub(super) stream: &'a Stream,
+    pub(super) generator: safemlx_lm_core::ControlledTextGeneration<
+        'a,
+        B,
+        crate::runtime::generation::sampler::ConstraintController,
+    >,
 }
 
-impl<S> CommittedTokenSource for GenerationTokenSource<'_, S>
+impl<B> CommittedTokenSource for BackendGenerationTokenSource<'_, B>
 where
-    S: Sampler + Clone,
+    B: safemlx_lm_core::TextGenerationBackend,
 {
-    type Error = Exception;
+    type Error = safemlx_lm_core::ControlledTextGenerationError<B::Error, Exception>;
 
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
         self.generator
             .next()
             .transpose()
-            .map(|token| token.map(|token| token.item::<u32>(self.stream)))
+            .map(|token| token.map(|token| token.token_id()))
     }
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
-        self.generator.sampler_mut().grammar_is_complete()
+        self.generator
+            .controller_mut()
+            .grammar_is_complete()
+            .map_err(safemlx_lm_core::ControlledTextGenerationError::Controller)
     }
 }
 

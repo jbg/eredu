@@ -33,9 +33,11 @@ pub use safemlx_lm_core::generation::{
 };
 pub use safemlx_lm_core::{
     Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession, CollectiveScope,
-    Completion, DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
+    Completion, ControlledTextGeneration, ControlledTextGenerationError, ControlledToken,
+    DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
     DistributedSessionDescriptor, ModelRuntime, PreparedModel, Submission, TextGeneration,
-    TextGenerationBackend, TextGenerationConfig, TokenOutput, ValueDescriptor,
+    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenFilterController,
+    TokenFilterError, TokenOutput, ValueDescriptor,
 };
 #[cfg(test)]
 mod test_utils;

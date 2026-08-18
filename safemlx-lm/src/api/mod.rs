@@ -291,8 +291,9 @@ pub use dispatch::{Model, ModelCache};
 
 mod request;
 use request::{
-    prepare_chat_from_parts, with_prepared_chat_runtime, GenerationTokenSource,
-    PreparedChatSemanticState, PreparedChatTokenDecoder, ResolvedPreparedChatGenerationSettings,
+    prepare_chat_from_parts, prepared_chat_control_runtime, with_prepared_chat_runtime,
+    BackendGenerationTokenSource, PreparedChatSemanticState, PreparedChatTokenDecoder,
+    ResolvedPreparedChatGenerationSettings,
 };
 pub use request::{
     PreparedChatEmbeddedMtpBatchRequest, PreparedChatEmbeddedMtpGenerationRequest,

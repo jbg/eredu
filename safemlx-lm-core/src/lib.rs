@@ -42,9 +42,11 @@ pub use artifact::{
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use backend::{
     Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession, CollectiveScope,
-    Completion, DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
+    Completion, ControlledTextGeneration, ControlledTextGenerationError, ControlledToken,
+    DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
     DistributedSessionDescriptor, ModelRuntime, PreparedModel, Submission, TextGeneration,
-    TextGenerationBackend, TextGenerationConfig, TokenOutput, ValueDescriptor,
+    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenFilterController,
+    TokenFilterError, TokenOutput, ValueDescriptor,
 };
 pub use generation::{
     resolve_generation_config, resolve_optimistic_reuse, CheckpointGenerationConfig, FinishReason,
