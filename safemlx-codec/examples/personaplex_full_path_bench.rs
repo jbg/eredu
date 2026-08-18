@@ -3,9 +3,8 @@ use std::{path::PathBuf, time::Instant};
 use safemlx::{transforms::eval, Array, Device, DeviceType, ExecutionContext, Stream};
 use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
-    api::realtime::{RealtimeSampling, RealtimeScheduler},
-    load_realtime_model, MlxRealtimeBackend, MlxRealtimeInput, RealtimeModel, RequestId,
-    SchedulerLimits,
+    load_realtime_model, MlxRealtimeBackend, MlxRealtimeInput, RealtimeModel, RealtimeSampling,
+    RealtimeScheduler, RequestId, SchedulerLimits,
 };
 
 const SAMPLE_RATE: f64 = 24_000.0;
@@ -42,7 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights_stream = weights_ctx.stream();
 
     let load_start = Instant::now();
-    let mut model = load_realtime_model(&model_dir, stream, weights_stream)?;
+    let mut model =
+        load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), &model_dir)?;
     let config = model.speech_config();
     let input_audio_codebooks = config.input_audio_codebooks() as i32;
     let generated_audio_codebooks = config.generated_audio_codebooks() as i32;

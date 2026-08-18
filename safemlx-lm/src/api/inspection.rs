@@ -1560,7 +1560,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        architectures::deepseek_v4::model as deepseek_v4, NonExpertWeightResidency, WeightResidency,
+        architectures::{deepseek_v4::model as deepseek_v4, moshi::personaplex},
+        NonExpertWeightResidency, WeightResidency,
     };
 
     fn llama_config() -> Value {

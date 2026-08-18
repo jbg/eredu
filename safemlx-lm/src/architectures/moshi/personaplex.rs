@@ -489,8 +489,11 @@ mod tests {
         model_args_7b_v1, validate_model_config_value, AUDIO_TOKENS_PER_STREAM, TEXT_PADDING_TOKEN,
     };
     use crate::{
-        backend::mlx::realtime::{MlxRealtimeInput, RealtimeModelKind},
-        core::realtime::{RealtimeSampling, RealtimeScheduler},
+        backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput, RealtimeModelKind},
+        core::realtime::{
+            load_realtime_model, load_realtime_model_with_options, RealtimeSampling,
+            RealtimeScheduler,
+        },
         RequestId, SchedulerLimits,
     };
     use safemlx::{Array, Device, DeviceType, ExecutionContext};
@@ -536,13 +539,12 @@ mod tests {
             .expect("SAFEMLX_PERSONAPLEX_DIR must point to a PersonaPlex model directory");
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let model = crate::api::realtime::load_model_with_options(
+        let model = load_realtime_model_with_options(
+            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
             &model_dir,
             crate::backend::mlx::ModelLoadOptions::with_quantization(
                 crate::runtime::checkpoint::quantization::AffineQuantization::default(),
             ),
-            gpu.stream(),
-            cpu.stream(),
         )
         .unwrap();
         assert_eq!(model.model().args().quantization.unwrap().bits(), 4);
@@ -555,8 +557,11 @@ mod tests {
         let model_dir = std::env::var("SAFEMLX_PERSONAPLEX_DIR")
             .expect("SAFEMLX_PERSONAPLEX_DIR must point to a PersonaPlex model directory");
         let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let mut model =
-            crate::api::realtime::load_model(&model_dir, ctx.stream(), ctx.stream()).unwrap();
+        let mut model = load_realtime_model(
+            MlxRealtimeBackend::new(ctx.stream(), ctx.stream()),
+            &model_dir,
+        )
+        .unwrap();
         assert_eq!(model.model().kind(), RealtimeModelKind::PersonaPlex);
         let stream = ctx.stream();
         let request = RequestId::new(1);

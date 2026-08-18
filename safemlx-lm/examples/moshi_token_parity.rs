@@ -5,8 +5,9 @@ use safemlx::{
     ExecutionContext,
 };
 use safemlx_lm::{
-    api::realtime::{generate_encoded_greedy, load_model as load_realtime_model},
     architectures::moshi::model as moshi,
+    backend::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend},
+    load_realtime_model,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -133,7 +134,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut model = load_realtime_model(&model_dir, stream, cpu.stream())?;
+    let mut model = load_realtime_model(MlxRealtimeBackend::new(stream, cpu.stream()), &model_dir)?;
     let generated =
         generate_encoded_greedy(&mut model, required(&fixture, "generation.input_audio")?)?;
     compare_tokens(

@@ -99,6 +99,10 @@ path = "tests/backend_generic_text.rs"
 required-features = ["mlx"]
 
 [[test]]
+name = "backend_generic_realtime"
+path = "tests/backend_generic_realtime.rs"
+
+[[test]]
 name = "core_types"
 path = "tests/core_types.rs"
 

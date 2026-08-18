@@ -2083,10 +2083,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        api::realtime::{generate_encoded_greedy, RealtimeSampling, RealtimeScheduler},
         architectures::moshi::model as eager,
-        backend::mlx::realtime::MlxRealtimeModel,
+        backend::mlx::realtime::{generate_encoded_greedy, MlxRealtimeModel},
         backend::mlx::ModelLoadOptions,
+        core::realtime::{
+            load_realtime_model, load_realtime_model_with_options, RealtimeSampling,
+            RealtimeScheduler,
+        },
         core::residency::{MemoryTier, OffloadConfig},
         runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
         runtime::execution::layerwise::{
@@ -2278,15 +2281,17 @@ mod tests {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let source = fixture(&gpu);
-        let resident =
-            crate::api::realtime::load_model(source.path(), gpu.stream(), cpu.stream()).unwrap();
-        let layerwise = crate::api::realtime::load_model_with_options(
+        let resident = load_realtime_model(
+            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
+            source.path(),
+        )
+        .unwrap();
+        let layerwise = load_realtime_model_with_options(
+            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
             source.path(),
             ModelLoadOptions::default().with_weight_residency(WeightResidency::layerwise_host(
                 LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
             )),
-            gpu.stream(),
-            cpu.stream(),
         )
         .unwrap();
 
@@ -2315,8 +2320,11 @@ mod tests {
         let last = weights.last_mut().unwrap();
         *last ^= 1;
         fs::write(changed.path().join("model.safetensors"), weights).unwrap();
-        let changed_model =
-            crate::api::realtime::load_model(changed.path(), gpu.stream(), cpu.stream()).unwrap();
+        let changed_model = load_realtime_model(
+            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
+            changed.path(),
+        )
+        .unwrap();
         let mut changed_scheduler =
             RealtimeScheduler::new(&changed_model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
         let error = changed_scheduler
@@ -2473,15 +2481,14 @@ mod tests {
             "depth_codebook_slices"
         );
 
-        let loaded = crate::api::realtime::load_model_with_options(
+        let loaded = load_realtime_model_with_options(
+            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
             dir.path(),
             crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(
                 crate::runtime::execution::layerwise::WeightResidency::layerwise_host(
                     LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
                 ),
             ),
-            gpu.stream(),
-            cpu.stream(),
         )
         .unwrap();
         assert!(matches!(
@@ -2594,13 +2601,12 @@ mod tests {
         let report = streamed.dense_stream_report().unwrap().unwrap();
         assert!(report.decode_forwards() >= 3);
 
-        let loaded = crate::api::realtime::load_model_with_options(
+        let loaded = load_realtime_model_with_options(
+            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
             dir.path(),
             crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(
                 crate::runtime::execution::layerwise::WeightResidency::dense_disk_stream(dense),
             ),
-            gpu.stream(),
-            cpu.stream(),
         )
         .unwrap();
         assert!(matches!(
@@ -2632,11 +2638,11 @@ mod tests {
         .unwrap();
         let input = Array::from_slice(&[1i32, 2, 3, 4, 5, 6], &[1, 2, 3]);
         let mut resident = RealtimeModel::new(
-            MlxRealtimeBackend::new(gpu.stream()),
+            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
             MlxRealtimeModel::Moshi(resident),
         );
         let mut layerwise = RealtimeModel::new(
-            MlxRealtimeBackend::new(gpu.stream()),
+            MlxRealtimeBackend::new(gpu.stream(), cpu.stream()),
             MlxRealtimeModel::Moshi(layerwise),
         );
         let expected = generate_encoded_greedy(&mut resident, &input).unwrap();

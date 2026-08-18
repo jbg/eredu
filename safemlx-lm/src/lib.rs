@@ -35,14 +35,17 @@ pub use safemlx_lm_core::generation::{
     ResolvedGenerationConfig, SemanticEvent,
 };
 pub use safemlx_lm_core::{
-    load_model, Backend, BackendCapabilities, BackendDescriptor, BackendError, BackendSession,
-    CollectiveScope, Completion, ControlledTextGeneration, ControlledTextGenerationError,
-    ControlledToken, DeviceDescriptor, DistributedBackend, DistributedCapabilities,
-    DistributedSession, DistributedSessionDescriptor, ModelLoadError, ModelLoadingBackend,
-    ModelRuntime, MtpCapability, MtpCheckpointKind, ParallelAxis, ParallelCoordinates,
-    ParallelRankTopology, ParallelTopology, PreparedModel, SubgroupMembership, Submission,
-    TextGeneration, TextGenerationBackend, TextGenerationConfig, TokenFilter,
-    TokenFilterController, TokenFilterError, TokenOutput, TopologyPreflightReport, ValueDescriptor,
+    load_model, load_realtime_model, load_realtime_model_with_options, Backend,
+    BackendCapabilities, BackendDescriptor, BackendError, BackendSession, CollectiveScope,
+    Completion, ControlledTextGeneration, ControlledTextGenerationError, ControlledToken,
+    DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
+    DistributedSessionDescriptor, ModelLoadError, ModelLoadingBackend, ModelRuntime, MtpCapability,
+    MtpCheckpointKind, ParallelAxis, ParallelCoordinates, ParallelRankTopology, ParallelTopology,
+    PreparedModel, RealtimeBackend, RealtimeCompletedStep, RealtimeConfigError, RealtimeError,
+    RealtimeModel, RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler,
+    RealtimeSession, RealtimeSpeechConfig, SubgroupMembership, Submission, TextGeneration,
+    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenFilterController,
+    TokenFilterError, TokenOutput, TopologyPreflightReport, ValueDescriptor,
 };
 #[cfg(all(test, feature = "mlx"))]
 mod test_utils;
@@ -74,12 +77,6 @@ mod distributed_qwen3_vl_pipeline_ring;
 mod distributed_tensor_parallel_ring;
 
 #[cfg(feature = "mlx")]
-pub use api::realtime::{
-    load_model as load_realtime_model, load_model_with_options as load_realtime_model_with_options,
-    RealtimeCompletedStep, RealtimeSampling, RealtimeScheduler, RealtimeSchedulerCapabilities,
-    RealtimeSchedulerReport, RealtimeSession, RealtimeSpeechConfig,
-};
-#[cfg(feature = "mlx")]
 pub use api::{
     discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
     AllocatorTelemetry, ArtifactKind, ArtifactModality, ArtifactTensorEncoding,
@@ -96,9 +93,9 @@ pub use api::{
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
 #[cfg(feature = "mlx")]
 pub use backend::mlx::realtime::{
-    MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput,
-    MlxRealtimeModel, MlxRealtimeModelIdentity, MlxRealtimeOutput, MlxRealtimeSession,
-    RealtimeModelKind,
+    generate_encoded_greedy, MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeCompletion,
+    MlxRealtimeInput, MlxRealtimeModel, MlxRealtimeModelIdentity, MlxRealtimeOutput,
+    MlxRealtimeSession, RealtimeModelKind,
 };
 #[cfg(feature = "mlx")]
 pub use backend::mlx::{DeviceAssignment, MlxParallelContext};
@@ -151,7 +148,6 @@ pub use safemlx_lm_core::cache::{
     StateResidencyClass, StateTensorDimension, StateTensorDtype, StateTensorOwner,
     StateTensorPolicy, StateTensorPresence, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
 };
-pub use safemlx_lm_core::realtime::{RealtimeBackend, RealtimeError, RealtimeModel};
 pub use safemlx_lm_core::residency::{
     AllocatorMemoryMetrics, BackgroundPrefetchReport, CacheEvictionPolicy, EvictionMetrics,
     MemoryTier, OffloadConfig, OffloadError, OffloadPlan, OffloadReport, OffloadTelemetry,
@@ -165,6 +161,10 @@ pub use safemlx_lm_core::scheduler::{
     CancellationCause, RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,
     SchedulerLimits, SchedulerProgress, SchedulerReport, SemanticStateTransaction,
     TransitionOutput, WorkDescriptor, WorkId, WorkLifecycle,
+};
+pub use safemlx_lm_core::scheduler::{
+    SchedulerCapabilities as RealtimeSchedulerCapabilities,
+    SchedulerReport as RealtimeSchedulerReport,
 };
 
 #[cfg(feature = "mlx")]

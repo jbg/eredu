@@ -88,17 +88,6 @@ pub(crate) use crate::architectures::kimi_linear::model as kimi_linear;
 pub(crate) use crate::architectures::lfm2::model as lfm2;
 /// Llama decoder-only model support.
 pub(crate) use crate::architectures::llama::model as llama;
-/// Moshi token language-model support.
-///
-/// This module operates on pre-tokenized Mimi streams. It intentionally does
-/// not implement audio encoding, decoding, or realtime device I/O.
-pub(crate) use crate::architectures::moshi::model as moshi;
-/// PersonaPlex realtime speech-to-speech token model support.
-///
-/// This module operates on pre-tokenized Mimi streams and hybrid prompt tokens.
-/// It intentionally does not implement audio encoding, decoding, or realtime
-/// device I/O.
-pub(crate) use crate::architectures::moshi::personaplex;
 /// Meta Muse-Glimmer dense multimodal decoder support.
 pub(crate) use crate::architectures::muse_glimmer;
 /// Nemotron-H hybrid Mamba2/attention/MoE config support.
@@ -280,10 +269,6 @@ impl PreparedChatSpeculativeBackend for crate::backend::mlx::MlxBackend<'static>
         model.execute_prepared_chat_mtp_batch_mlx(request)
     }
 }
-
-/// Codec-free realtime speech-to-speech token APIs.
-#[path = "realtime.rs"]
-pub mod realtime;
 
 #[path = "loaded.rs"]
 mod loaded;

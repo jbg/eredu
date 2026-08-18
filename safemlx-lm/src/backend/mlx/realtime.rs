@@ -1,21 +1,35 @@
-//! MLX implementation of the backend-neutral realtime session contract.
+//! MLX implementation of backend-neutral realtime loading and execution.
+
+use std::path::Path;
 
 use safemlx::{
+    ops::{indexing::TryIndexOp, stack_axis},
     random::{self, RandomState},
     transforms::async_eval_with_event,
     Array, Dtype, Event, Stream,
 };
 use safemlx_lm_core::{
     backend::{Completion, Submission},
-    realtime::{RealtimeBackend, RealtimeSampling, RealtimeSpeechConfig},
-    scheduler::{SemanticStateTransaction, WorkDescriptor},
+    realtime::{
+        RealtimeBackend, RealtimeError, RealtimeModel, RealtimeModelLoadingBackend,
+        RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig,
+    },
+    scheduler::{RequestId, SchedulerLimits, SemanticStateTransaction, WorkDescriptor},
 };
+use serde::Deserialize;
 
 use crate::{
-    architectures::moshi::{layerwise::MoshiLayerwiseModel, model as moshi},
+    architectures::moshi::{
+        layerwise::{self, MoshiLayerwiseModel},
+        model as moshi, personaplex,
+    },
+    backend::mlx::{ensure_replicated_load_options, ModelLoadOptions},
     error::Error,
     runtime::{
-        checkpoint::{artifact::LoadedArtifactIdentity, quantization::WeightQuantization},
+        checkpoint::{
+            artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
+            quantization::WeightQuantization,
+        },
         generation::sampler::DefaultSampler,
     },
 };
@@ -37,6 +51,61 @@ impl RealtimeModelKind {
             Self::PersonaPlex => "personaplex",
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RealtimeModelMetadata {
+    #[serde(default)]
+    model_type: Option<String>,
+}
+
+fn realtime_model_kind(model_dir: &Path) -> Result<RealtimeModelKind, Error> {
+    let config_path = model_dir.join("config.json");
+    if !config_path.exists() {
+        return Ok(RealtimeModelKind::Moshi);
+    }
+
+    let metadata: RealtimeModelMetadata =
+        serde_json::from_reader(std::fs::File::open(config_path)?)?;
+    match metadata.model_type.as_deref() {
+        None | Some("moshi") => Ok(RealtimeModelKind::Moshi),
+        Some("personaplex") => Ok(RealtimeModelKind::PersonaPlex),
+        Some(other) => Err(Error::UnsupportedArchitecture(format!(
+            "{other} is not a realtime speech-to-speech token model"
+        ))),
+    }
+}
+
+fn realtime_artifact_identity(
+    model_dir: &Path,
+    kind: RealtimeModelKind,
+) -> Result<LoadedArtifactIdentity, Error> {
+    let index = model_dir.join("model.safetensors.index.json");
+    let weight_files = if index.exists() {
+        crate::runtime::checkpoint::load::safetensors_files(model_dir)?
+    } else {
+        match kind {
+            RealtimeModelKind::Moshi => {
+                let args = moshi::get_model_args(model_dir)?;
+                vec![model_dir.join(args.moshi_name.as_deref().unwrap_or("model.safetensors"))]
+            }
+            RealtimeModelKind::PersonaPlex => {
+                vec![model_dir.join(personaplex::MODEL_SAFETENSORS)]
+            }
+        }
+    };
+    let files = weight_files
+        .into_iter()
+        .map(|path| {
+            let logical_name = path
+                .strip_prefix(model_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            ArtifactFile::new(logical_name, path)
+        })
+        .collect::<Vec<_>>();
+    fingerprint_artifact(kind.model_type(), files)
 }
 
 /// Loaded MLX realtime speech-to-speech token model.
@@ -268,13 +337,15 @@ fn validate_generation_state(
 #[derive(Clone)]
 pub struct MlxRealtimeBackend {
     stream: Stream,
+    weights_stream: Stream,
 }
 
 impl MlxRealtimeBackend {
-    /// Selects the MLX stream used by all sessions of one loaded model.
-    pub fn new(stream: &Stream) -> Self {
+    /// Selects execution and weight-materialization streams for one backend.
+    pub fn new(stream: &Stream, weights_stream: &Stream) -> Self {
         Self {
             stream: stream.clone(),
+            weights_stream: weights_stream.clone(),
         }
     }
 
@@ -282,6 +353,135 @@ impl MlxRealtimeBackend {
     pub const fn stream(&self) -> &Stream {
         &self.stream
     }
+
+    /// Selected MLX checkpoint materialization stream.
+    pub const fn weights_stream(&self) -> &Stream {
+        &self.weights_stream
+    }
+}
+
+impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
+    type LoadOptions = ModelLoadOptions;
+
+    fn prepare_realtime_model(
+        &self,
+        artifact: &Path,
+        options: Self::LoadOptions,
+    ) -> Result<Self::Model, Self::Error> {
+        materialize_realtime_model(artifact, options, &self.stream, &self.weights_stream)
+    }
+}
+
+fn materialize_realtime_model(
+    model_dir: &Path,
+    options: ModelLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MlxRealtimeModel, Error> {
+    ensure_replicated_load_options(options)?;
+    let kind = realtime_model_kind(model_dir)?;
+    if options.weight_residency.expert_cache().is_some() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{} does not contain routed experts",
+            kind.model_type()
+        )));
+    }
+    let execution = options.weight_residency.layers();
+    let model = if let Some(quantization) = options.quantization {
+        let transformed = match kind {
+            RealtimeModelKind::Moshi => {
+                moshi::load_model_quantized(model_dir, quantization, stream, weights_stream)?
+            }
+            RealtimeModelKind::PersonaPlex => {
+                personaplex::load_model_quantized(model_dir, quantization, stream, weights_stream)?
+            }
+        };
+        layerwise::execute_transformed_model(transformed, stream, weights_stream)?
+    } else {
+        match kind {
+            RealtimeModelKind::Moshi => {
+                layerwise::load_moshi_layerwise_model(model_dir, execution, stream, weights_stream)?
+            }
+            RealtimeModelKind::PersonaPlex => layerwise::load_personaplex_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        }
+    };
+    let model = model.with_artifact_identity(realtime_artifact_identity(model_dir, kind)?);
+    Ok(match kind {
+        RealtimeModelKind::Moshi => MlxRealtimeModel::Moshi(model),
+        RealtimeModelKind::PersonaPlex => MlxRealtimeModel::PersonaPlex(model),
+    })
+}
+
+/// Greedily generates delay-aligned codec tokens through the canonical scheduler.
+///
+/// Input and output use `[batch, codebooks, frames]` layout. This helper does
+/// not append encoded silence, so delayed tail frames are not flushed after the
+/// supplied input ends.
+pub fn generate_encoded_greedy(
+    model: &mut RealtimeModel<MlxRealtimeBackend>,
+    input_audio_tokens: &Array,
+) -> Result<MlxEncodedAudioOutput, Error> {
+    let stream = model.backend().stream().clone();
+    let config = model.speech_config();
+    let input_audio_codebooks = config.input_audio_codebooks() as i32;
+    let generated_audio_codebooks = config.generated_audio_codebooks() as i32;
+    if input_audio_tokens.shape().len() != 3 || input_audio_tokens.dim(1) != input_audio_codebooks {
+        return Err(Error::Parallel(format!(
+            "encoded input sequence must have shape [batch, {}, frames], got {:?}",
+            input_audio_codebooks,
+            input_audio_tokens.shape()
+        )));
+    }
+
+    let batch = input_audio_tokens.dim(0);
+    let request = RequestId::new(0);
+    let mut scheduler =
+        RealtimeScheduler::new(model, SchedulerLimits::new(1, 1)?).map_err(realtime_error)?;
+    scheduler
+        .register_request(model, request, RealtimeSampling::greedy())
+        .map_err(realtime_error)?;
+    let mut text = Vec::with_capacity(input_audio_tokens.dim(2) as usize);
+    let mut audio = Vec::new();
+    for frame in 0..input_audio_tokens.dim(2) {
+        let input = input_audio_tokens.try_index_device((.., .., frame), &stream)?;
+        scheduler
+            .enqueue(model, request, MlxRealtimeInput::encoded_audio(&input))
+            .map_err(realtime_error)?;
+        let output = loop {
+            if let Some(completed) = scheduler.run_queued(model).map_err(realtime_error)?.pop() {
+                break completed.into_parts().1;
+            }
+            std::thread::yield_now();
+        };
+        text.push(output.text_token.squeeze_axes(&[-1], &stream)?);
+        if let Some(tokens) = output.output_audio_tokens {
+            audio.push(tokens);
+        }
+    }
+    scheduler.finish_request(request).map_err(realtime_error)?;
+    let text_tokens = if text.is_empty() {
+        Array::zeros::<i32>(&[batch, 0], &stream)?
+    } else {
+        stack_axis(&text, 1, &stream)?
+    };
+    let audio_tokens = if audio.is_empty() {
+        Array::zeros::<i32>(&[batch, generated_audio_codebooks, 0], &stream)?
+    } else {
+        stack_axis(&audio, 2, &stream)?
+    };
+    Ok(MlxEncodedAudioOutput {
+        text_tokens,
+        audio_tokens,
+    })
+}
+
+fn realtime_error(error: RealtimeError<Error>) -> Error {
+    Error::Parallel(error.to_string())
 }
 
 /// Complete artifact and execution identity for MLX realtime state handoff.
@@ -570,5 +770,78 @@ impl RealtimeBackend for MlxRealtimeBackend {
 
     fn retained_resources(&self, completion: &Self::Completion) -> usize {
         completion.retained_resources()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_args() -> moshi::ModelArgs {
+        serde_json::from_value(serde_json::json!({
+            "model_type": "moshi",
+            "dim": 16,
+            "text_card": 32,
+            "n_q": 4,
+            "dep_q": 2,
+            "card": 8,
+            "num_heads": 4,
+            "num_layers": 2,
+            "dim_feedforward": 32,
+            "causal": true,
+            "context": 16,
+            "max_period": 10000.0,
+            "positional_embedding": "rope",
+            "depformer_dim": 8,
+            "depformer_dim_feedforward": 16,
+            "depformer_num_heads": 2,
+            "depformer_num_layers": 2,
+            "depformer_context": 2,
+            "depformer_pos_emb": "none",
+            "delays": [0, 0, 1, 0, 1]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn execution_identity_normalizes_defaults_and_tracks_quantization() {
+        let mut implicit = tiny_args();
+        implicit.dim_feedforward = None;
+        implicit.depformer_dim_feedforward = None;
+        implicit.depformer_context = None;
+        implicit.depformer_max_period = None;
+        let mut explicit = implicit.clone();
+        explicit.dim_feedforward = Some(explicit.dim * 4);
+        explicit.depformer_dim_feedforward = Some(explicit.depformer_dim * 4);
+        explicit.depformer_context = Some(explicit.dep_q);
+        explicit.depformer_max_period = Some(8.0);
+        assert_eq!(
+            MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &implicit),
+            MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)
+        );
+
+        explicit.quantization =
+            Some(crate::runtime::checkpoint::quantization::AffineQuantization::default().into());
+        assert_ne!(
+            MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &implicit),
+            MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)
+        );
+    }
+
+    #[test]
+    fn model_identity_rejects_equal_geometry_from_another_artifact() {
+        let execution = MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &tiny_args());
+        let expected = MlxRealtimeModelIdentity {
+            artifact: LoadedArtifactIdentity::in_memory(),
+            execution: execution.clone(),
+        };
+        let actual = MlxRealtimeModelIdentity {
+            artifact: LoadedArtifactIdentity::in_memory(),
+            execution,
+        };
+        assert_eq!(
+            expected.mismatch(&actual),
+            Some("checkpoint artifact fingerprint")
+        );
     }
 }

@@ -131,6 +131,13 @@ backend sampler objects, random state, and execution queues are not public
 request fields. The production Moshi/PersonaPlex path uses this generic
 scheduler rather than a separate MLX coordinator.
 
+Realtime loading follows the same backend-selection rule.
+`load_realtime_model[_with_options]` accepts a complete selected backend and
+calls its `RealtimeModelLoadingBackend` implementation. MLX callers construct
+`MlxRealtimeBackend` with execution and weight-materialization streams; neither
+stream appears in the generic loading signature. The former MLX-only
+`api::realtime` loader namespace was deleted rather than retained as a wrapper.
+
 `DistributedBackend` is the optional extension for model sessions which
 communicate across ranks. It exposes the `DistributedSession` attached to the
 selected model session; communicator construction is not a second independent
@@ -439,9 +446,9 @@ The current boundary leaves these components MLX-coupled:
   stop/EOS precedence, and decoding now have one backend-generic client
   surface. Multimodal request orchestration is generic through the opaque
   backend prompt, while concrete media decoding and tensor preprocessing remain
-  backend implementations. Realtime request/session orchestration is generic,
-  while codec-token arrays and Moshi/PersonaPlex model math remain MLX adapter
-  types. Prepared-chat speculative requests no longer expose samplers, random
+  backend implementations. Realtime loading and request/session orchestration
+  are generic, while codec-token arrays and Moshi/PersonaPlex model math remain
+  MLX adapter types. Prepared-chat speculative requests no longer expose samplers, random
   arrays, streams, or cache objects, and their drafter field is generic. The
   public methods live on `LoadedModel<B>` behind the production-used
   `PreparedChatSpeculativeBackend` capability. `MtpCapability` and

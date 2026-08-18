@@ -5,10 +5,9 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    api::realtime::{RealtimeSampling, RealtimeScheduler},
     architectures::moshi::{layerwise, model as moshi, personaplex},
     LayerWeightResidency, MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel, RealtimeModel,
-    RequestId, SchedulerLimits,
+    RealtimeSampling, RealtimeScheduler, RequestId, SchedulerLimits,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -40,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     let expected_output_audio = required(&fixture, "expected.output_audio")?;
 
     let mut model = RealtimeModel::new(
-        MlxRealtimeBackend::new(stream),
+        MlxRealtimeBackend::new(stream, cpu.stream()),
         MlxRealtimeModel::PersonaPlex(model),
     );
     let generated_audio_codebooks = model.speech_config().generated_audio_codebooks() as i32;

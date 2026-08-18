@@ -2,12 +2,12 @@ use std::{path::PathBuf, time::Instant};
 
 use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_lm::{
-    api::realtime::{RealtimeSampling, RealtimeScheduler},
     architectures::moshi::personaplex,
-    backend::mlx::ModelLoadOptions,
+    backend::mlx::{realtime::MlxRealtimeBackend, ModelLoadOptions},
     load_realtime_model, load_realtime_model_with_options,
     runtime::checkpoint::quantization::AffineQuantization,
-    MlxRealtimeBackend, MlxRealtimeInput, RealtimeModel, RequestId, SchedulerLimits,
+    MlxRealtimeInput, RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId,
+    SchedulerLimits,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,10 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         safemlx::memory::reset_peak_memory()?;
         let load_start = Instant::now();
         let mut model = load_realtime_model_with_options(
+            MlxRealtimeBackend::new(stream, weights_stream),
             &model_dir,
             ModelLoadOptions::with_quantization(AffineQuantization::default()),
-            stream,
-            weights_stream,
         )?;
         stream.synchronize()?;
         println!("load_s={:.3}", load_start.elapsed().as_secs_f64());
@@ -52,7 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         safemlx::memory::reset_peak_memory()?;
         let load_start = Instant::now();
-        let mut model = load_realtime_model(&model_dir, stream, weights_stream)?;
+        let mut model =
+            load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), &model_dir)?;
         stream.synchronize()?;
         println!("load_s={:.3}", load_start.elapsed().as_secs_f64());
         report_memory()?;

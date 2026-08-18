@@ -9,7 +9,7 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, time::Instant};
+use std::{fmt::Debug, path::Path, time::Instant};
 
 /// Static codec-token geometry shared by every session of one realtime model.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -315,6 +315,44 @@ pub trait RealtimeBackend {
     fn retained_resources(&self, _completion: &Self::Completion) -> usize {
         0
     }
+}
+
+/// Model preparation contract for a complete realtime backend.
+///
+/// Artifact interpretation and materialization belong to the selected backend;
+/// callers use the same loading function regardless of the concrete runtime.
+pub trait RealtimeModelLoadingBackend: RealtimeBackend + Sized {
+    /// Backend-specific materialization policy.
+    type LoadOptions;
+
+    /// Prepares one backend-owned realtime model from an artifact directory.
+    fn prepare_realtime_model(
+        &self,
+        artifact: &Path,
+        options: Self::LoadOptions,
+    ) -> Result<Self::Model, Self::Error>;
+}
+
+/// Loads a realtime model on the selected backend using default load policy.
+pub fn load_realtime_model<B>(
+    backend: B,
+    artifact: impl AsRef<Path>,
+) -> Result<RealtimeModel<B>, B::Error>
+where
+    B: RealtimeModelLoadingBackend,
+    B::LoadOptions: Default,
+{
+    load_realtime_model_with_options(backend, artifact, B::LoadOptions::default())
+}
+
+/// Loads a realtime model on the selected backend using explicit load policy.
+pub fn load_realtime_model_with_options<B: RealtimeModelLoadingBackend>(
+    backend: B,
+    artifact: impl AsRef<Path>,
+    options: B::LoadOptions,
+) -> Result<RealtimeModel<B>, B::Error> {
+    let model = backend.prepare_realtime_model(artifact.as_ref(), options)?;
+    Ok(RealtimeModel::new(backend, model))
 }
 
 /// Selected realtime backend and its loaded model.
@@ -873,6 +911,25 @@ mod tests {
                 completion: Done,
             })
         }
+    }
+
+    impl RealtimeModelLoadingBackend for MockBackend {
+        type LoadOptions = u64;
+
+        fn prepare_realtime_model(
+            &self,
+            _: &Path,
+            identity: Self::LoadOptions,
+        ) -> Result<Self::Model, Self::Error> {
+            Ok(identity)
+        }
+    }
+
+    #[test]
+    fn selected_backend_owns_realtime_model_preparation() {
+        let model = load_realtime_model_with_options(MockBackend, "unused", 37).unwrap();
+        assert_eq!(*model.model(), 37);
+        assert_eq!(model.backend().name(), "mock-realtime");
     }
 
     #[test]

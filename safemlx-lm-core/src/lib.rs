@@ -66,7 +66,8 @@ pub use generation::{
     TokenTerminalSignals,
 };
 pub use realtime::{
-    RealtimeBackend, RealtimeCompletedStep, RealtimeConfigError, RealtimeError, RealtimeModel,
+    load_realtime_model, load_realtime_model_with_options, RealtimeBackend, RealtimeCompletedStep,
+    RealtimeConfigError, RealtimeError, RealtimeModel, RealtimeModelLoadingBackend,
     RealtimeSampling, RealtimeScheduler, RealtimeSession, RealtimeSpeechConfig,
 };
 pub use residency::{
