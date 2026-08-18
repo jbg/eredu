@@ -780,7 +780,6 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     else {
         panic!("expected canonical Qwen3.5 model");
     };
-    let tokenizer_fingerprint = super::tokenizer_vocabulary_fingerprint(&tokenizer);
     let runtime = safemlx_lm_core::ModelRuntime::from_prepared(
         crate::backend::mlx::MlxBackend::new(stream, stream),
         safemlx_lm_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(
@@ -788,17 +787,17 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         )),
     )
     .unwrap();
-    let mut model = LoadedModel {
+    let mut model = LoadedModel::from_runtime(
         runtime,
         tokenizer,
-        tokenizer_fingerprint,
-        chat_template: None,
-        model_type: "qwen3_5_text".into(),
-        model_id: "prepared-embedded-batch-test".into(),
-        eos_token_ids: vec![2],
-        checkpoint_generation_config: None,
-        constraint_compiler: compiler,
-    };
+        crate::api::LoadedTextModelConfig {
+            chat_template: None,
+            model_type: "qwen3_5_text".into(),
+            model_id: "prepared-embedded-batch-test".into(),
+            eos_token_ids: vec![2],
+            checkpoint_generation_config: None,
+        },
+    );
 
     let output = model
         .generate_prepared_chat_mtp_batch(PreparedChatMtpBatchRequest {

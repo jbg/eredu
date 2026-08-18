@@ -1,23 +1,26 @@
-//! Language-model loading and generation with the MLX backend enabled by default.
+//! Backend-neutral language-model loading and generation facade.
 //!
-//! [`api`] provides high-level loading and generation. Model-family
-//! implementations live under [`architectures`], reusable neural components
-//! under [`nn`], and execution infrastructure under [`runtime`]. Portable
-//! contracts and orchestration are defined by [`core`].
+//! [`api`] and [`core`] remain available without an execution backend. The
+//! default `mlx` feature adds the MLX model implementations and runtime.
 
 #![warn(missing_docs)]
 
 /// High-level model loading, dispatch, and request APIs.
 pub mod api;
 /// Model-family implementations and architecture-specific adapters.
+#[cfg(feature = "mlx")]
 pub mod architectures;
 /// MLX implementation of the backend-neutral execution contract.
+#[cfg(feature = "mlx")]
 pub mod backend;
 /// Error types returned by the language-model runtime.
+#[cfg(feature = "mlx")]
 pub mod error;
 /// Reusable MLX neural-network building blocks.
+#[cfg(feature = "mlx")]
 pub mod nn;
 /// Facade execution infrastructure, including MLX-specific implementations.
+#[cfg(feature = "mlx")]
 pub mod runtime;
 /// Canonical backend-neutral runtime types.
 pub use safemlx_lm_core as core;
@@ -41,40 +44,42 @@ pub use safemlx_lm_core::{
     TextGeneration, TextGenerationBackend, TextGenerationConfig, TokenFilter,
     TokenFilterController, TokenFilterError, TokenOutput, TopologyPreflightReport, ValueDescriptor,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 mod test_utils;
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 extern crate self as safemlx_lm;
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_cartesian_ring.rs"]
 mod distributed_cartesian_ring;
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_expert_exchange_ring.rs"]
 mod distributed_expert_exchange_ring;
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_expert_parallel_ring.rs"]
 mod distributed_expert_parallel_ring;
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_gemma4_multimodal_pipeline_ring.rs"]
 mod distributed_gemma4_multimodal_pipeline_ring;
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_partition_ring.rs"]
 mod distributed_partition_ring;
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_pipeline_ring.rs"]
 mod distributed_pipeline_ring;
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_qwen3_vl_pipeline_ring.rs"]
 mod distributed_qwen3_vl_pipeline_ring;
-#[cfg(test)]
+#[cfg(all(test, feature = "mlx"))]
 #[path = "../tests/distributed_tensor_parallel_ring.rs"]
 mod distributed_tensor_parallel_ring;
 
+#[cfg(feature = "mlx")]
 pub use api::realtime::{
     load_model as load_realtime_model, load_model_with_options as load_realtime_model_with_options,
     RealtimeCompletedStep, RealtimeModelKind, RealtimeSampling, RealtimeScheduler,
     RealtimeSchedulerCapabilities, RealtimeSchedulerReport, RealtimeSession, RealtimeSpeechConfig,
 };
+#[cfg(feature = "mlx")]
 pub use api::{
     discover_hardware, execution_plan_load_options, inspect_model, plan_automatic_execution,
     AllocatorTelemetry, ArtifactKind, ArtifactModality, ArtifactTensorEncoding,
@@ -88,30 +93,39 @@ pub use api::{
     ResidencyPlan, ResidencyTelemetry, TimingTelemetry, TransferTelemetry,
     WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
+#[cfg(feature = "mlx")]
 pub use architectures::llama::layerwise::{LlamaCache, LlamaModel};
+#[cfg(feature = "mlx")]
 pub use backend::mlx::realtime::{
     MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput,
     MlxRealtimeModel, MlxRealtimeModelIdentity, MlxRealtimeOutput, MlxRealtimeSession,
 };
+#[cfg(feature = "mlx")]
 pub use backend::mlx::{DeviceAssignment, MlxParallelContext};
+#[cfg(feature = "mlx")]
 pub use backend::mlx::{
     MlxBackend, MlxDistributedSession, MlxModel, MlxModelInput, MlxModelOutput, MlxModelSession,
     MlxSessionCompletion, MlxTextCompletion, MlxTextGenerationState, MlxTextToken,
 };
-pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
+#[cfg(feature = "mlx")]
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyError,
     CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, LiveCacheDiskPolicy,
     PagedCacheOptions, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
+#[cfg(feature = "mlx")]
 pub use runtime::cache::PagedKeyValueCache;
+#[cfg(feature = "mlx")]
 pub use runtime::distributed::completion::DistributedCompletion;
+#[cfg(feature = "mlx")]
 pub use runtime::distributed::parallel::{
     LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelBuildContext,
     ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
     ParameterRole, ShardingPolicy, SynchronizedToken,
 };
+#[cfg(feature = "mlx")]
 pub use runtime::distributed::topology::{PlacementPlan, RankPartition, TensorPlacement};
+#[cfg(feature = "mlx")]
 pub use runtime::execution::layerwise::{
     load_layerwise_model, ArchitectureAdapter, DenseCacheMetrics, DenseDiskStreamReport,
     DenseExecutionGroupReport, DensePassReport, DenseTierResidencyReport, ExecutionResidency,
@@ -119,8 +133,11 @@ pub use runtime::execution::layerwise::{
     LayerwiseModel, LayerwiseModelMetadata, NonExpertWeightResidency, ParallelModelInfo,
     SharedWeightStore, WeightResidency,
 };
+#[cfg(feature = "mlx")]
 pub use runtime::residency::dense_stream::{DenseDiskStreamLoadOptions, DenseStreamError};
+#[cfg(feature = "mlx")]
 pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
+pub use safemlx_lm_core::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use safemlx_lm_core::cache::{
     CacheBlockId, CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation,
     CacheHostPromotion, CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
@@ -150,11 +167,14 @@ pub use safemlx_lm_core::scheduler::{
     TransitionOutput, WorkDescriptor, WorkId, WorkLifecycle,
 };
 
+#[cfg(feature = "mlx")]
 use safemlx::Array;
 
+#[cfg(feature = "mlx")]
 use crate::architectures::qwen::dense as resident_dense_qwen;
 
 /// Builder passed to [`ModelInput`] implementations during generic generation.
+#[cfg(feature = "mlx")]
 pub struct ModelInputBuilder<'a, C, T> {
     /// Token ids or prompt ids for the current model step.
     pub y: &'a Array,
@@ -165,11 +185,13 @@ pub struct ModelInputBuilder<'a, C, T> {
 }
 
 /// Converts generic generation state into a model-specific input value.
+#[cfg(feature = "mlx")]
 pub trait ModelInput<'a, C, T> {
     /// Builds the concrete model input expected by a [`safemlx::module::Module`].
     fn from_model_input_builder(builder: ModelInputBuilder<'a, C, T>) -> Self;
 }
 
+#[cfg(feature = "mlx")]
 impl<'a, C> ModelInput<'a, C, Option<Array>> for resident_dense_qwen::ModelInput<'a, C> {
     fn from_model_input_builder(builder: ModelInputBuilder<'a, C, Option<Array>>) -> Self {
         let ModelInputBuilder { y, cache, state } = builder;
@@ -183,11 +205,13 @@ impl<'a, C> ModelInput<'a, C, Option<Array>> for resident_dense_qwen::ModelInput
 }
 
 /// Output type that exposes logits for token sampling.
+#[cfg(feature = "mlx")]
 pub trait ModelOutput {
     /// Returns the logits tensor for the current generation step.
     fn logits(&self) -> &Array;
 }
 
+#[cfg(feature = "mlx")]
 impl ModelOutput for Array {
     fn logits(&self) -> &Array {
         self

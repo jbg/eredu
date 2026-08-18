@@ -3156,7 +3156,7 @@ mod tests {
 
     #[test]
     fn qwen2_runtime_state_splits_full_and_sliding_gqa_layers() {
-        let args = crate::api::dense_qwen::config_from_hf_value(&json!({
+        let args = crate::architectures::qwen::dense::config_from_hf_value(&json!({
             "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 6,
             "intermediate_size": 32, "num_attention_heads": 4,
             "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
@@ -3187,7 +3187,7 @@ mod tests {
 
     #[test]
     fn qwen2_runtime_state_groups_arbitrary_distinct_windows_exactly() {
-        let mut args = crate::api::dense_qwen::config_from_hf_value(&json!({
+        let mut args = crate::architectures::qwen::dense::config_from_hf_value(&json!({
             "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 4,
             "intermediate_size": 32, "num_attention_heads": 4,
             "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,

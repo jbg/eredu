@@ -2,24 +2,6 @@
 
 use super::*;
 
-/// A model directory or GGUF file loaded together with its tokenizer and chat template.
-///
-/// This is the most convenient entry point for text generation: it owns the
-/// selected backend runtime, tokenizer, optional chat template, model id
-/// used by the template renderer, and EOS token ids collected from checkpoint
-/// and sidecar metadata.
-pub struct LoadedModel<B: safemlx_lm_core::TextGenerationBackend> {
-    pub(super) runtime: safemlx_lm_core::ModelRuntime<B>,
-    pub(super) tokenizer: ChatTokenizer,
-    pub(super) tokenizer_fingerprint: [u8; 32],
-    pub(super) chat_template: Option<ModelChatTemplate>,
-    pub(super) model_type: String,
-    pub(super) model_id: String,
-    pub(super) eos_token_ids: Vec<u32>,
-    pub(super) checkpoint_generation_config: Option<CheckpointGenerationConfig>,
-    pub(super) constraint_compiler: Result<ConstraintCompiler, String>,
-}
-
 /// Failure while assembling a tokenizer-aware model around a selected backend.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadedModelLoadError<E: std::error::Error + Send + Sync + 'static> {
@@ -32,20 +14,6 @@ pub enum LoadedModelLoadError<E: std::error::Error + Send + Sync + 'static> {
     /// Portable tokenizer, chat-template, or generation sidecar loading failed.
     #[error(transparent)]
     Metadata(#[from] TextMetadataError),
-}
-
-/// Backend-neutral tokenizer and chat metadata attached to a prepared runtime.
-pub struct LoadedTextModelConfig {
-    /// Normalized architecture identity reported to clients.
-    pub model_type: String,
-    /// Model identity supplied to chat-template rendering.
-    pub model_id: String,
-    /// Optional checkpoint chat template or named-template collection.
-    pub chat_template: Option<ModelChatTemplate>,
-    /// Checkpoint EOS vocabulary ids.
-    pub eos_token_ids: Vec<u32>,
-    /// Optional checkpoint sampling recommendations.
-    pub checkpoint_generation_config: Option<CheckpointGenerationConfig>,
 }
 
 fn map_prepared_chat_setup_error<E>(error: PreparedChatSetupError) -> PreparedChatError<E>
@@ -103,56 +71,6 @@ where
 }
 
 impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
-    /// Combines any prepared backend runtime with portable tokenizer metadata.
-    pub fn from_runtime(
-        runtime: safemlx_lm_core::ModelRuntime<B>,
-        tokenizer: ChatTokenizer,
-        config: LoadedTextModelConfig,
-    ) -> Self {
-        let tokenizer_fingerprint = crate::api::tokenizer_vocabulary_fingerprint(&tokenizer);
-        let constraint_compiler =
-            ConstraintCompiler::from_tokenizer(&tokenizer, &config.eos_token_ids);
-        Self {
-            runtime,
-            tokenizer,
-            tokenizer_fingerprint,
-            chat_template: config.chat_template,
-            model_type: config.model_type,
-            model_id: config.model_id,
-            eos_token_ids: config.eos_token_ids,
-            checkpoint_generation_config: config.checkpoint_generation_config,
-            constraint_compiler,
-        }
-    }
-
-    /// Borrows the selected backend and its session owner.
-    pub const fn runtime(&self) -> &safemlx_lm_core::ModelRuntime<B> {
-        &self.runtime
-    }
-
-    /// Mutably borrows the selected backend and its session owner.
-    pub fn runtime_mut(&mut self) -> &mut safemlx_lm_core::ModelRuntime<B> {
-        &mut self.runtime
-    }
-
-    /// Returns the effective runtime model type.
-    pub fn model_type(&self) -> &str {
-        &self.model_type
-    }
-
-    /// Returns sampling values declared by `generation_config.json`, if present.
-    pub fn checkpoint_generation_config(&self) -> Option<&CheckpointGenerationConfig> {
-        self.checkpoint_generation_config.as_ref()
-    }
-
-    /// Resolves request overrides over checkpoint recommendations and fallbacks.
-    pub fn resolve_generation_config(
-        &self,
-        overrides: GenerationConfigOverrides,
-    ) -> Result<ResolvedGenerationConfig, crate::core::generation::GenerationError> {
-        resolve_generation_config(self.checkpoint_generation_config.as_ref(), overrides)
-    }
-
     fn resolve_text_generation_settings(
         &self,
         settings: PreparedChatGenerationSettings,
@@ -172,15 +90,6 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
             safemlx_lm_core::TextGenerationConfig::new(resolved).with_seed(settings.seed),
             max_tokens,
         ))
-    }
-
-    /// Starts portable asynchronous text generation from tokenizer ids.
-    pub fn generate_tokens(
-        &mut self,
-        prompt_token_ids: Vec<u32>,
-        config: safemlx_lm_core::TextGenerationConfig,
-    ) -> Result<safemlx_lm_core::TextGeneration<'_, B>, B::Error> {
-        safemlx_lm_core::TextGeneration::new(&mut self.runtime, prompt_token_ids, config)
     }
 
     /// Generates one constrained semantic response through the selected backend.
@@ -295,11 +204,6 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
         &self.model_id
     }
 
-    /// Returns whether a chat template is available for this model.
-    pub fn has_chat_template(&self) -> bool {
-        self.chat_template.is_some()
-    }
-
     /// Returns the stable identity of the template selected for `tools`.
     pub fn selected_chat_template_identity(
         &self,
@@ -339,12 +243,14 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
             .chat_template
             .clone()
             .ok_or(TextModelError::MissingChatTemplate)?;
+        let constraint_compiler =
+            ConstraintCompiler::from_tokenizer(&self.tokenizer, &self.eos_token_ids);
         prepare_chat_from_parts(
             &mut self.tokenizer,
             template,
             &self.model_id,
             &self.eos_token_ids,
-            Some(&self.constraint_compiler),
+            Some(&constraint_compiler),
             request,
         )
     }
@@ -426,43 +332,6 @@ impl<B: safemlx_lm_core::TextGenerationBackend> LoadedModel<B> {
             template_kwargs,
         )?;
         Ok(rendered.into_iter().next())
-    }
-
-    /// Encodes text to tokenizer ids.
-    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, TextModelError> {
-        Ok(self
-            .tokenizer
-            .encode(text, add_special_tokens)?
-            .get_ids()
-            .to_vec())
-    }
-
-    /// Decodes tokenizer ids back to text.
-    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, TextModelError> {
-        self.tokenizer
-            .decode(ids, skip_special_tokens)
-            .map_err(TextModelError::Tokenizer)
-    }
-
-    /// Creates an independent stateful decoder for streaming generated tokens.
-    pub fn text_decoder(&self, skip_special_tokens: bool) -> TextDecoder {
-        TextDecoder {
-            tokenizer: (*self.tokenizer).clone(),
-            skip_special_tokens,
-            ids: Vec::new(),
-            prefix: String::new(),
-            prefix_index: 0,
-        }
-    }
-
-    /// Returns EOS token ids collected from checkpoint metadata.
-    pub fn eos_token_ids(&self) -> &[u32] {
-        &self.eos_token_ids
-    }
-
-    /// Returns true when `id` is a configured EOS token id.
-    pub fn is_eos_token(&self, id: u32) -> bool {
-        self.eos_token_ids.contains(&id)
     }
 }
 

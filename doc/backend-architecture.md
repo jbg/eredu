@@ -1,22 +1,28 @@
 # Language-model backend architecture
 
 `safemlx-lm-core` is the backend-neutral foundation of the language-model
-runtime. `safemlx-lm` remains the public facade and contains the MLX
-implementation. Applications continue to depend on `safemlx-lm` unless they
-are implementing or testing orchestration without an accelerator runtime.
+runtime. `safemlx-lm` is the public facade and contains an optional MLX
+implementation. Its default `mlx` feature preserves MLX as the standard
+backend; `default-features = false` provides the same canonical
+`LoadedModel<B>` and core contracts without compiling or linking MLX.
 
 The dependency direction is one way:
 
 ```text
 safemlx-lm-core
       ↑
-  safemlx-lm (MLX adapter and model implementations)
+  safemlx-lm portable facade
+      ↑ optional `mlx` feature
+  MLX adapter and model implementations
       ↑
 applications and examples
 ```
 
-`safemlx-lm-core` has no dependency on `safemlx`, `safemlx-sys`, Metal, CUDA,
-or another tensor runtime. Its dependency-graph test enforces that property.
+Neither `safemlx-lm-core` nor the feature-disabled `safemlx-lm` facade has a
+dependency on `safemlx`, `safemlx-sys`, Metal, CUDA, or another tensor runtime.
+Separate dependency-graph tests enforce both properties. Native architecture,
+array, stream, cache, sampler, residency, and distributed modules exist only
+when `mlx` is enabled; they are not placeholder types in the portable API.
 
 ## Core and backend responsibilities
 

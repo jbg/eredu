@@ -2,65 +2,6 @@
 
 use super::*;
 
-/// Stateful tokenizer decoder for incrementally generated token ids.
-///
-/// Unlike decoding each token independently, this preserves tokenizer context
-/// and buffers incomplete byte-fallback sequences until they form valid text.
-#[derive(Clone)]
-pub struct TextDecoder {
-    pub(super) tokenizer: Tokenizer,
-    pub(super) skip_special_tokens: bool,
-    pub(super) ids: Vec<u32>,
-    pub(super) prefix: String,
-    pub(super) prefix_index: usize,
-}
-
-impl TextDecoder {
-    /// Decodes one token, returning text only when the token completes a chunk.
-    pub fn step(&mut self, id: u32) -> Result<Option<String>, TextDecoderError> {
-        tokenizers::tokenizer::step_decode_stream(
-            &self.tokenizer,
-            vec![id],
-            self.skip_special_tokens,
-            &mut self.ids,
-            &mut self.prefix,
-            &mut self.prefix_index,
-        )
-        .map_err(TextDecoderError::Tokenizer)
-    }
-}
-
-/// Failure while incrementally decoding tokenizer output.
-#[derive(Debug, thiserror::Error)]
-pub enum TextDecoderError {
-    /// The checkpoint tokenizer rejected the token stream.
-    #[error(transparent)]
-    Tokenizer(#[from] Box<dyn std::error::Error + Send + Sync>),
-    /// Decoding ended with a partial byte-fallback sequence.
-    #[error("generated token stream ended with an incomplete tokenizer byte sequence")]
-    IncompleteByteSequence,
-}
-
-/// Backend-independent failure from tokenizer-aware text facade operations.
-#[derive(Debug, thiserror::Error)]
-pub enum TextModelError {
-    /// Portable generation configuration was invalid.
-    #[error(transparent)]
-    Generation(#[from] crate::core::generation::GenerationError),
-    /// Chat-template selection, inspection, or rendering failed.
-    #[error(transparent)]
-    Template(#[from] safemlx_lm_utils::error::Error),
-    /// Tokenizer encoding or decoding failed.
-    #[error(transparent)]
-    Tokenizer(#[from] Box<dyn std::error::Error + Send + Sync>),
-    /// The loaded checkpoint does not provide a chat template.
-    #[error("the loaded model does not provide a chat template")]
-    MissingChatTemplate,
-    /// A native tool definition or its generation grammar is invalid.
-    #[error("native tool constraint error: {0}")]
-    ToolConstraint(String),
-}
-
 /// Model sampling and stopping settings for one prepared chat generation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PreparedChatGenerationSettings {
