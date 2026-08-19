@@ -1086,10 +1086,12 @@ mod tests {
                     end: 2,
                 },
             ),
-            Err(WeightRecipeError::SelectionPushdownUnsupported {
-                operation: "view",
-                ..
-            })
+            Err(
+                eredu_checkpoint::recipe::RecipeError::SelectionPushdownUnsupported {
+                    operation: "view",
+                    ..
+                }
+            )
         ));
     }
 
