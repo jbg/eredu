@@ -1,7 +1,7 @@
 //! Kimi Linear hybrid KDA/MLA causal language model.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -678,6 +678,11 @@ pub(crate) fn prompt_cache_layer_layout(
     )
 }
 
+pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Error> {
+    StateLayout::new(prompt_cache_layer_layout(args)?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 /// Rank-local state geometry for one Kimi hybrid layer. MLA stores its
 /// compressed latent before head expansion, while KDA state follows the
 /// planner-owned head partition.
@@ -855,9 +860,18 @@ impl LayerCache {
     }
 }
 
+impl RuntimeLayerState<crate::backend::mlx::nn::shared::MlxBackend> for LayerCache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        self.retained_arrays().into_iter()
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Heterogeneous KDA/MLA generation cache.
 pub struct Cache {
+    layout: StateLayout,
     /// One cache per decoder layer.
     pub layers: Vec<LayerCache>,
 }
@@ -866,6 +880,7 @@ impl Cache {
     /// Creates an empty cache matching the configured hybrid layout.
     pub fn new(args: &ModelArgs) -> Self {
         Self {
+            layout: state_layout(args).expect("validated Kimi Linear state geometry"),
             layers: args
                 .layer_schedule
                 .iter()
@@ -921,7 +936,10 @@ impl Cache {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { layers })
+        Ok(Self {
+            layout: state_layout(args).map_err(|error| Exception::custom(error.to_string()))?,
+            layers,
+        })
     }
 
     fn residency_manager(&self) -> Option<&CacheResidencyManager> {
@@ -987,6 +1005,34 @@ impl Cache {
             }
         }
         Ok(())
+    }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() != 0 {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: 1,
+            });
+        }
+        self.layers
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.layers.len(),
+            })
+            .map(RuntimeLayerState::retained_values)
     }
 }
 
