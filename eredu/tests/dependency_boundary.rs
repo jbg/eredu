@@ -273,6 +273,32 @@ fn immutable_weight_residency_policy_is_runtime_owned() {
 }
 
 #[test]
+fn execution_group_orchestration_is_runtime_owned() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let runtime = std::fs::read_to_string(workspace.join("eredu-runtime/src/execution.rs"))
+        .expect("runtime execution scheduler must be readable");
+    assert!(runtime.contains("pub struct ExecutionGroupSchedule"));
+    assert!(runtime.contains("remaining_consumers"));
+
+    let mlx = std::fs::read_to_string(
+        workspace.join("eredu/src/backend/mlx/runtime/execution/layerwise.rs"),
+    )
+    .expect("MLX layerwise realization must be readable");
+    for runtime_owned in [
+        "ExecutionGroupReadySet",
+        "let mut remaining_consumers",
+        ".consumer_counts()",
+    ] {
+        assert!(
+            !mlx.contains(runtime_owned),
+            "MLX layerwise realization retained scheduler algorithm {runtime_owned}"
+        );
+    }
+}
+
+#[test]
 fn llama_hot_path_remains_statically_dispatched_and_device_native() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

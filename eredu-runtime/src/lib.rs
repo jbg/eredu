@@ -45,7 +45,7 @@ pub use cache::{
 };
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,
-    ExecutionGroupSpec, ReadyGroupState,
+    ExecutionGroupSchedule, ExecutionGroupSpec, ExecutionScheduleError, ReadyGroupState,
 };
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,

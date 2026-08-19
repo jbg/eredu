@@ -1459,7 +1459,7 @@ pub struct LayerwiseForwardState<C> {
     pub context: C,
 }
 
-use eredu_runtime::{ExecutionGraph, ExecutionGroupReadySet};
+use eredu_runtime::{ExecutionGraph, ExecutionGroupSchedule};
 
 /// Architecture contract for resident, bounded-residency, and distributed
 /// execution.
@@ -2817,9 +2817,8 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             .map(GroupExecutionState::new)
             .collect::<Vec<GroupExecutionState<A::Layer>>>();
         let batch_resident_groups = batch_resident_groups && self.resident_layers.is_some();
-        let mut ready_set = ExecutionGroupReadySet::new(&self.graph);
+        let mut schedule = ExecutionGroupSchedule::new(&self.graph);
         let mut group_outputs: Vec<Option<Array>> = vec![None; self.graph.groups().len()];
-        let mut remaining_consumers = self.graph.consumer_counts();
 
         while states.iter().any(|state| !state.completed) {
             let mut progressed = false;
@@ -2875,15 +2874,14 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             // Record waits for every newly ready group before constructing any
             // consumer graph. Dependency output order is the adapter declaration
             // order, independent of producer completion order.
-            let newly_ready = ready_set.ready_groups().collect::<Vec<_>>();
+            let newly_ready = schedule.startable_groups().collect::<Vec<_>>();
             for group_index in newly_ready {
                 if states[group_index].started {
                     continue;
                 }
-                let dependency_slots = self
-                    .graph
+                let dependency_slots = schedule
                     .dependencies(group_index)
-                    .unwrap_or_default()
+                    .expect("execution schedule uses the validated graph")
                     .to_vec();
                 if dependency_slots.is_empty() {
                     initial_completion.wait_on(&states[group_index].stream)?;
@@ -2922,7 +2920,9 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                 ) {
                     Ok(hidden) => hidden,
                     Err(error) => {
-                        ready_set.fail(group_index);
+                        schedule
+                            .fail(group_index)
+                            .expect("ready group belongs to the validated schedule");
                         return Err(error);
                     }
                 };
@@ -2930,11 +2930,11 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                 states[group_index].started = true;
                 states[group_index].execute =
                     self.adapter.should_execute_group(group_index, &context);
-                for dependency in dependency_slots {
-                    remaining_consumers[dependency] -= 1;
-                    if remaining_consumers[dependency] == 0 {
-                        group_outputs[dependency] = None;
-                    }
+                for dependency in schedule
+                    .started(group_index)
+                    .map_err(|error| Error::Parallel(error.to_string()))?
+                {
+                    group_outputs[dependency] = None;
                 }
                 progressed = true;
             }
@@ -2983,7 +2983,9 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                     states[group_index].completion = Some(completion);
                     states[group_index].ordered = true;
                     group_outputs[group_index] = Some(hidden);
-                    ready_set.ordered(group_index);
+                    schedule
+                        .ordered(group_index)
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
                     progressed = true;
                     continue;
                 }
@@ -3085,7 +3087,9 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                     // the final output synchronization covers the whole graph.
                     states[group_index].completed = true;
                     group_outputs[group_index] = Some(hidden);
-                    ready_set.ordered(group_index);
+                    schedule
+                        .ordered(group_index)
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
                     progressed = true;
                     continue;
                 }
@@ -3259,7 +3263,9 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                 if final_layer {
                     states[group_index].ordered = true;
                     group_outputs[group_index] = Some(hidden);
-                    ready_set.ordered(group_index);
+                    schedule
+                        .ordered(group_index)
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
                 }
                 progressed = true;
             }

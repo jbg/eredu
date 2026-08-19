@@ -253,6 +253,139 @@ pub struct ExecutionGroupReadySet<'a> {
     ready: BTreeSet<usize>,
 }
 
+/// Backend-neutral execution-group orchestration and dependency-output lifetime tracking.
+#[derive(Debug)]
+pub struct ExecutionGroupSchedule<'a> {
+    graph: &'a ExecutionGraph,
+    ready: ExecutionGroupReadySet<'a>,
+    started: Vec<bool>,
+    remaining_consumers: Vec<usize>,
+}
+
+impl<'a> ExecutionGroupSchedule<'a> {
+    /// Creates a schedule for one validated execution graph.
+    pub fn new(graph: &'a ExecutionGraph) -> Self {
+        Self {
+            graph,
+            ready: ExecutionGroupReadySet::new(graph),
+            started: vec![false; graph.groups.len()],
+            remaining_consumers: graph.consumer_counts(),
+        }
+    }
+
+    /// Returns ready groups which have not begun architecture setup.
+    pub fn startable_groups(&self) -> impl Iterator<Item = usize> + '_ {
+        self.ready
+            .ready_groups()
+            .filter(|&group| !self.started[group])
+    }
+
+    /// Returns dependency slots in architecture declaration order.
+    pub fn dependencies(&self, group: usize) -> Result<&[usize], ExecutionScheduleError> {
+        self.graph
+            .dependencies(group)
+            .ok_or(ExecutionScheduleError::UnknownGroup {
+                group,
+                count: self.started.len(),
+            })
+    }
+
+    /// Commits successful architecture setup and returns producer outputs whose final
+    /// consumer has now captured them.
+    pub fn started(&mut self, group: usize) -> Result<Vec<usize>, ExecutionScheduleError> {
+        let count = self.started.len();
+        let started = self
+            .started
+            .get_mut(group)
+            .ok_or(ExecutionScheduleError::UnknownGroup { group, count })?;
+        if *started {
+            return Err(ExecutionScheduleError::AlreadyStarted { group });
+        }
+        if !self.ready.ready.contains(&group) {
+            return Err(ExecutionScheduleError::DependenciesPending { group });
+        }
+        *started = true;
+        let mut releasable = Vec::new();
+        for &dependency in &self.graph.dependencies[group] {
+            self.remaining_consumers[dependency] -= 1;
+            if self.remaining_consumers[dependency] == 0 {
+                releasable.push(dependency);
+            }
+        }
+        Ok(releasable)
+    }
+
+    /// Commits a successfully ordered group and unlocks its dependents.
+    pub fn ordered(&mut self, group: usize) -> Result<(), ExecutionScheduleError> {
+        match self.started.get(group).copied() {
+            None => Err(ExecutionScheduleError::UnknownGroup {
+                group,
+                count: self.started.len(),
+            }),
+            Some(false) => Err(ExecutionScheduleError::NotStarted { group }),
+            Some(true) if self.ready.state(group) == Some(ReadyGroupState::Pending) => {
+                self.ready.ordered(group);
+                Ok(())
+            }
+            Some(true) => Err(ExecutionScheduleError::AlreadyOrdered { group }),
+        }
+    }
+
+    /// Closes a failed group and its dependent subgraph.
+    pub fn fail(&mut self, group: usize) -> Result<(), ExecutionScheduleError> {
+        if group >= self.started.len() {
+            return Err(ExecutionScheduleError::UnknownGroup {
+                group,
+                count: self.started.len(),
+            });
+        }
+        self.ready.fail(group);
+        Ok(())
+    }
+
+    /// Returns one group's ordering state.
+    pub fn state(&self, group: usize) -> Option<ReadyGroupState> {
+        self.ready.state(group)
+    }
+}
+
+/// Invalid transition in backend-neutral execution-group orchestration.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum ExecutionScheduleError {
+    /// The group slot is outside the validated graph.
+    #[error("execution group {group} is outside the {count}-group schedule")]
+    UnknownGroup {
+        /// Requested group slot.
+        group: usize,
+        /// Number of groups in the schedule.
+        count: usize,
+    },
+    /// Architecture setup was committed more than once.
+    #[error("execution group {group} was already started")]
+    AlreadyStarted {
+        /// Conflicting group slot.
+        group: usize,
+    },
+    /// Architecture setup was attempted before every dependency was ordered.
+    #[error("execution group {group} still has unordered dependencies")]
+    DependenciesPending {
+        /// Premature group slot.
+        group: usize,
+    },
+    /// Ordering was committed without successful architecture setup.
+    #[error("execution group {group} was ordered before it started")]
+    NotStarted {
+        /// Invalid group slot.
+        group: usize,
+    },
+    /// Ordering was committed more than once or after closure.
+    #[error("execution group {group} was already ordered or closed")]
+    AlreadyOrdered {
+        /// Conflicting group slot.
+        group: usize,
+    },
+}
+
 impl<'a> ExecutionGroupReadySet<'a> {
     /// Creates a ready set with all root groups ready.
     pub fn new(graph: &'a ExecutionGraph) -> Self {
@@ -408,6 +541,33 @@ mod tests {
         assert_eq!(ready.ready_groups().collect::<Vec<_>>(), vec![0]);
         ready.ordered(0);
         assert_eq!(ready.ready_groups().collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn schedule_releases_dependency_outputs_after_their_final_consumer_starts() {
+        let graph = ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("root"),
+                ExecutionGroupSpec::with_dependencies("left", ["root"]),
+                ExecutionGroupSpec::with_dependencies("right", ["root"]),
+                ExecutionGroupSpec::with_dependencies("output", ["left", "right"]),
+            ],
+            "output",
+        )
+        .unwrap();
+        let mut schedule = ExecutionGroupSchedule::new(&graph);
+        assert_eq!(schedule.startable_groups().collect::<Vec<_>>(), vec![0]);
+        assert!(schedule.started(1).is_err());
+        assert!(schedule.started(0).unwrap().is_empty());
+        schedule.ordered(0).unwrap();
+        assert_eq!(schedule.startable_groups().collect::<Vec<_>>(), vec![1, 2]);
+        assert!(schedule.started(1).unwrap().is_empty());
+        assert_eq!(schedule.started(2).unwrap(), vec![0]);
+        schedule.ordered(1).unwrap();
+        schedule.ordered(2).unwrap();
+        assert_eq!(schedule.started(3).unwrap(), vec![1, 2]);
+        assert!(schedule.ordered(3).is_ok());
+        assert_eq!(schedule.state(3), Some(ReadyGroupState::Ordered));
     }
 
     #[test]
