@@ -196,6 +196,9 @@ pub trait CheckpointSource: Send + Sync {
     }
 }
 
+/// Shared ownership of one backend-neutral checkpoint source.
+pub type SharedCheckpointSource = Arc<dyn CheckpointSource>;
+
 /// A checkpoint source restricted to one resolved architecture contract.
 ///
 /// The wrapper is cold-path policy only: it filters catalog inspection and

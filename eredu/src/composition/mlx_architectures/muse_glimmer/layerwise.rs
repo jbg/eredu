@@ -69,7 +69,7 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, ArchitectureAdapter, LayerwiseModel,
-        LoadTimeQuantizableAdapter, SharedWeightStore,
+        LoadTimeQuantizableAdapter,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -81,6 +81,7 @@ use crate::{
         PromptCacheOptions, PromptCacheTopology,
     },
 };
+use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
 
 use eredu_runtime::ResidencyReport;
@@ -882,7 +883,7 @@ pub(crate) fn prepare_gguf_pipeline_source(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     max_mapped_shards: usize,
-) -> Result<(DecoderConfig, SharedWeightStore), Error> {
+) -> Result<(DecoderConfig, SharedCheckpointSource), Error> {
     let mmproj = open_mmproj_for_checkpoint(checkpoint)?;
     let (mut args, _) =
         resident::prepare_gguf_checkpoint(checkpoint, metadata, "muse-glimmer", false)?;

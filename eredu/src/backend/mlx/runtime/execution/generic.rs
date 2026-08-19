@@ -1,5 +1,6 @@
 //! SafeMLX realization of the backend-neutral layerwise unit policy.
 
+use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::{DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata};
 
 use std::{
@@ -19,7 +20,7 @@ use crate::backend::mlx::{
         execution::layerwise::{
             validate_device_budget, validate_host_budget, validate_unused, DensePreparedTransfer,
             DenseStreamController, DenseStreamForwardGuard, DenseStreamGroupGuard,
-            DenseTransferWindow, SharedWeightStore,
+            DenseTransferWindow,
         },
         residency::manager::{
             host_capacity_upper_bound_for_bindings, ResidencyManager, ResidentTransfer,
@@ -59,7 +60,7 @@ impl<U> std::ops::DerefMut for MlxUnitLease<U> {
 /// Exact-completion MLX policy over generic parameterized execution units.
 pub(crate) struct MlxLayerwisePolicy<U, F> {
     residency: ResidencyManager,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     unit_ids: Vec<OffloadUnitId>,
     window_depth: usize,
     build: F,
@@ -81,7 +82,7 @@ struct MlxDenseExecution {
 pub(crate) struct MlxResidentPolicy<U> {
     units: Vec<Option<MlxModule<U>>>,
     residency: ResidencyManager,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     _transfer: ResidentTransfer,
 }
 
@@ -123,7 +124,7 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
     /// Creates a bounded policy over validated ordered residency units.
     pub(crate) fn new(
         residency: ResidencyManager,
-        store: SharedWeightStore,
+        store: SharedCheckpointSource,
         unit_ids: Vec<OffloadUnitId>,
         window_depth: usize,
         build: F,
@@ -405,7 +406,7 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
 /// Builds a generic MLX layerwise policy from neutral parameter topologies.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_layerwise_policy<SM, U, F, I>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     static_modules: &mut SM,
     build: F,
     layer_count: usize,
@@ -445,7 +446,7 @@ where
 /// algorithm used by replicated execution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_layerwise_policy_with_bindings<SM, U, F, I, SB, UB>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     static_modules: &mut SM,
     mut build: F,
     layer_count: usize,

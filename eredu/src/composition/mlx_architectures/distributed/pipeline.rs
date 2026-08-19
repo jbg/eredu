@@ -85,7 +85,7 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
         ArchitectureAdapter, DenseStreamController, DenseTransferWindow,
-        LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection, SharedWeightStore,
+        LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection,
     },
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
@@ -137,6 +137,7 @@ use crate::{
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
 };
+use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::DenseDiskStreamReport;
 use eredu_runtime::{
     CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
@@ -162,7 +163,7 @@ fn new_llama_block(
 }
 
 fn build_pipeline_expert_cache(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     entries: Vec<ExpertCatalogEntry>,
     options: Option<ExpertCacheLoadOptions>,
     quantization: Option<WeightQuantization>,
@@ -7780,7 +7781,7 @@ fn pipeline_binding_units<A: ArchitectureAdapter>(
 
 #[allow(clippy::too_many_arguments)]
 fn build_pipeline_layer_storage<L, F, B>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     range: Range<usize>,
     options: PipelineLayerLoadOptions,
     static_device_bytes: u64,
@@ -8150,7 +8151,7 @@ pub(crate) fn load_pipeline_model_with_options(
                         &prepared.args,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
                     deepseek_v4::translate_gguf_weight_name,
@@ -8176,7 +8177,7 @@ pub(crate) fn load_pipeline_model_with_options(
                 )?;
                 let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
                     eredu_architectures::llama::translate_gguf_weight_name,
@@ -8225,7 +8226,7 @@ pub(crate) fn load_pipeline_model_with_options(
                         &prepared.args,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
                     deepseek_v3::translate_gguf_weight_name,
@@ -8302,7 +8303,7 @@ pub(crate) fn load_pipeline_model_with_options(
                         &args, variant,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
                     move |name| dense_qwen::translate_gguf_weight_name(name, is_moe),
@@ -8357,7 +8358,7 @@ pub(crate) fn load_pipeline_model_with_options(
                         &prepared.args,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
                     gpt_oss::translate_gguf_weight_name,
@@ -8383,7 +8384,7 @@ pub(crate) fn load_pipeline_model_with_options(
                     &prepared.args,
                 )
                 .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
                     move |name| lfm2::translate_gguf_weight_name(name, is_moe),
@@ -8412,7 +8413,7 @@ pub(crate) fn load_pipeline_model_with_options(
                         &prepared.args,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
                     nemotron_h::translate_gguf_weight_name,
@@ -8487,7 +8488,7 @@ pub(crate) fn load_pipeline_model_with_options(
                         &prepared.args,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
                     kimi_linear::translate_gguf_weight_name,
@@ -8895,7 +8896,7 @@ fn pipeline_gguf_architecture(
 
 fn load_llama_pipeline(
     source_args: LlamaModelArgs,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -10207,7 +10208,7 @@ impl LlamaStage {
 #[allow(clippy::too_many_arguments)]
 fn load_dense_qwen_pipeline(
     source_args: dense_qwen::DecoderConfig,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -10581,7 +10582,7 @@ fn load_dense_qwen_pipeline(
 #[allow(clippy::too_many_arguments)]
 fn load_muse_glimmer_pipeline(
     source_args: muse_glimmer::DecoderConfig,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -10913,7 +10914,7 @@ fn load_muse_glimmer_pipeline(
 #[allow(clippy::too_many_arguments)]
 fn load_qwen3_vl_pipeline(
     source_args: qwen3_vl::ModelArgs,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -12724,7 +12725,7 @@ fn execute_pipeline_cached_gpt_oss(
 #[allow(clippy::too_many_arguments)]
 fn load_gpt_oss_pipeline(
     source_args: gpt_oss::ModelArgs,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -13690,7 +13691,7 @@ impl GptOssStage {
 #[allow(clippy::too_many_arguments)]
 fn load_lfm2_pipeline(
     source_args: lfm2::ModelArgs,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -15205,7 +15206,7 @@ impl GemmaStage {
 #[allow(clippy::too_many_arguments)]
 fn load_nemotron_h_pipeline(
     source_args: nemotron_h::ModelArgs,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -16497,7 +16498,7 @@ fn load_qwen_hybrid_pipeline(
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
     vision_config: Option<crate::composition::mlx_architectures::qwen::vl::vision::VisionConfig>,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -18064,7 +18065,7 @@ impl QwenHybridStage {
 #[allow(clippy::too_many_arguments)]
 fn load_kimi_linear_pipeline(
     source_args: kimi_linear::ModelArgs,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -19152,7 +19153,7 @@ impl KimiLinearStage {
 #[allow(clippy::too_many_arguments)]
 fn load_inkling_pipeline(
     args: inkling::ModelArgs,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -20662,7 +20663,7 @@ struct GemmaPipelineConfig {
 #[allow(clippy::too_many_arguments)]
 fn load_gemma_pipeline(
     source: GemmaPipelineConfig,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -22316,7 +22317,7 @@ impl GemmaStage {
 #[allow(clippy::too_many_arguments)]
 fn load_deepseek_pipeline(
     source_args: deepseek_v3::ModelArgs,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
@@ -22713,7 +22714,7 @@ fn load_deepseek_pipeline(
 #[allow(clippy::too_many_arguments)]
 fn load_deepseek_v4_pipeline(
     source_args: deepseek_v4::ModelArgs,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,

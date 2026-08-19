@@ -6,7 +6,7 @@
 //! [`crate::backend::mlx::runtime::execution::layerwise::ArchitectureAdapter`].
 
 use eredu_checkpoint::{
-    store::{CheckpointSource, ResolvedCheckpointSource, WeightStoreBackend},
+    store::{ResolvedCheckpointSource, SharedCheckpointSource, WeightStoreBackend},
     WeightQuantization,
 };
 use eredu_runtime::{
@@ -55,13 +55,10 @@ use eredu_runtime::PagedCacheOptions;
 
 use eredu_runtime::{ResidencyReport, ResidentLayerGroup, WeightMaterializationReport};
 
-/// Type-erased checkpoint store accepted by the generalized execution engine.
-pub type SharedWeightStore = Arc<dyn CheckpointSource>;
-
 pub(crate) fn resolve_checkpoint_store<A: ArchitectureAdapter>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     adapter: &A,
-) -> Result<SharedWeightStore, Error> {
+) -> Result<SharedCheckpointSource, Error> {
     if store.is_checkpoint_contract_resolved()
         || store.source_diagnostics()?.backend != WeightStoreBackend::Safetensors
     {
@@ -81,7 +78,7 @@ pub(crate) fn resolve_checkpoint_store<A: ArchitectureAdapter>(
 pub(crate) fn open_safetensors_weight_store(
     model_dir: &Path,
     max_mapped_shards: usize,
-) -> Result<SharedWeightStore, Error> {
+) -> Result<SharedCheckpointSource, Error> {
     Ok(Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     ))
@@ -1088,7 +1085,7 @@ pub(crate) trait LoadTimeQuantizableAdapter: ArchitectureAdapter {
 pub struct LayerwiseModel<A: ArchitectureAdapter> {
     adapter: A,
     graph: ExecutionGraph,
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     residency: ResidencyManager,
     groups: Vec<ResidentLayerGroup>,
     static_leases: Vec<ResidentUnitLease>,
@@ -1202,7 +1199,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     pub fn new(
         adapter: A,
         graph: ExecutionGraph,
-        store: SharedWeightStore,
+        store: SharedCheckpointSource,
         residency: ResidencyManager,
         groups: Vec<ResidentLayerGroup>,
         static_leases: Vec<ResidentUnitLease>,
@@ -1502,7 +1499,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     }
 
     /// Returns a shared handle to the persistent checkpoint store.
-    pub(crate) fn checkpoint_store_arc(&self) -> SharedWeightStore {
+    pub(crate) fn checkpoint_store_arc(&self) -> SharedCheckpointSource {
         Arc::clone(&self.store)
     }
 
@@ -2580,12 +2577,12 @@ fn packed_weight_companion_dtypes(module: &impl ModuleParameters) -> BTreeMap<St
 }
 
 fn quantize_layerwise_store<A>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     source_adapter: &A,
     target_adapter: &A,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<(SharedWeightStore, WeightMaterializationReport), Error>
+) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
 where
     A: ArchitectureAdapter,
 {
@@ -2690,7 +2687,7 @@ where
         stream,
     )?);
     let report = transformed.report().clone();
-    let transformed: SharedWeightStore = transformed;
+    let transformed: SharedCheckpointSource = transformed;
     Ok((transformed, report))
 }
 
@@ -2699,7 +2696,7 @@ where
 /// Architecture composition supplies unloaded source and target modules; this
 /// backend capability only inspects their stable parameter slots and recipes.
 pub(crate) fn quantize_parameterized_store<SM, U, SF, TF>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     source_static: &SM,
     target_static: &SM,
     mut source_unit: SF,
@@ -2707,7 +2704,7 @@ pub(crate) fn quantize_parameterized_store<SM, U, SF, TF>(
     unit_count: usize,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<(SharedWeightStore, WeightMaterializationReport), Error>
+) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
 where
     SM: Clone + eredu_nn::Parameterized<Array>,
     U: eredu_nn::Parameterized<Array>,
@@ -2794,7 +2791,7 @@ where
         stream,
     )?);
     let report = transformed.report().clone();
-    let transformed: SharedWeightStore = transformed;
+    let transformed: SharedCheckpointSource = transformed;
     Ok((transformed, report))
 }
 
@@ -2805,7 +2802,7 @@ where
 /// bindings through the adapter; residency sees only the resulting packed
 /// store and therefore budgets packed bytes rather than dense source bytes.
 pub(crate) fn load_layerwise_model_with_quantization<A, O>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     source_adapter: A,
     options: O,
     quantization: Option<WeightQuantization>,
@@ -2840,7 +2837,7 @@ where
 /// Loads a tensor-parallel adapter directly or through the same bounded packed
 /// overlay used by non-distributed residency.
 pub(crate) fn load_tensor_parallel_layerwise_model_with_quantization<A, O>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     source_adapter: A,
     options: O,
     quantization: Option<WeightQuantization>,
@@ -2923,13 +2920,13 @@ impl<'a> PipelineStageQuantizationSelection<'a> {
 }
 
 pub(crate) fn quantize_pipeline_stage_store<A>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     source_adapter: &A,
     target_adapter: &A,
     selection: PipelineStageQuantizationSelection<'_>,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<(SharedWeightStore, WeightMaterializationReport), Error>
+) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
 where
     A: ArchitectureAdapter,
 {
@@ -3043,7 +3040,7 @@ where
         stream,
     )?);
     let report = transformed.report().clone();
-    let transformed: SharedWeightStore = transformed;
+    let transformed: SharedCheckpointSource = transformed;
     Ok((transformed, report))
 }
 
@@ -3134,7 +3131,7 @@ fn bounded_quantization_working_set(
 
 /// Builds a generalized layerwise model from an already cataloged checkpoint.
 pub fn load_layerwise_model<A, O>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     mut adapter: A,
     options: O,
     stream: &Stream,
@@ -3362,7 +3359,7 @@ where
 }
 
 pub(crate) fn load_tensor_parallel_layerwise_model<A, O>(
-    store: SharedWeightStore,
+    store: SharedCheckpointSource,
     mut adapter: A,
     options: O,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,

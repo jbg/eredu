@@ -523,6 +523,22 @@ fn weight_lease_ownership_is_runtime_owned() {
 }
 
 #[test]
+fn shared_checkpoint_source_is_checkpoint_owned() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let checkpoint = std::fs::read_to_string(workspace.join("eredu-checkpoint/src/store.rs"))
+        .expect("checkpoint source definitions must be readable");
+    assert!(checkpoint.contains("pub type SharedCheckpointSource = Arc<dyn CheckpointSource>;"));
+
+    let mlx = std::fs::read_to_string(
+        workspace.join("eredu/src/backend/mlx/runtime/execution/layerwise.rs"),
+    )
+    .expect("MLX layerwise realization must be readable");
+    assert!(!mlx.contains("pub type SharedCheckpointSource"));
+}
+
+#[test]
 fn weight_transfer_ownership_is_runtime_owned() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
