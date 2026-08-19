@@ -11,8 +11,31 @@ use eredu_nn::NeuralBackend;
 pub trait SubmissionBackend: NeuralBackend {
     /// Backend executor, queue, stream, or equivalent submission context.
     type Executor: ?Sized;
+    /// Owned executor used for an independently schedulable graph lane.
+    type OwnedExecutor: std::borrow::Borrow<Self::Executor>;
     /// Exact completion object for one submission.
     type Completion: Completion;
+
+    /// Creates independently schedulable executors on the same backend device.
+    fn fork_executors(
+        executor: &Self::Executor,
+        count: usize,
+    ) -> Result<Vec<Self::OwnedExecutor>, <Self::Completion as Completion>::Error>;
+
+    /// Submits evaluation of backend-native values on one executor.
+    fn submit<'a, I>(
+        executor: &Self::Executor,
+        values: I,
+    ) -> Result<Self::Completion, <Self::Completion as Completion>::Error>
+    where
+        Self::Tensor: 'a,
+        I: IntoIterator<Item = &'a Self::Tensor>;
+
+    /// Orders future work on `executor` after an exact producer completion.
+    fn order_after(
+        completion: &Self::Completion,
+        executor: &Self::Executor,
+    ) -> Result<(), <Self::Completion as Completion>::Error>;
 
     /// Retains an owned value until `completion` has completed exactly.
     fn retain_until_complete<T: Send + 'static>(

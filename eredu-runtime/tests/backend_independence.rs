@@ -301,7 +301,21 @@ impl Completion for Done {
 
 impl SubmissionBackend for FakeBackend {
     type Executor = ();
+    type OwnedExecutor = ();
     type Completion = Done;
+    fn fork_executors(_: &(), count: usize) -> Result<Vec<Self::OwnedExecutor>, Infallible> {
+        Ok(vec![(); count])
+    }
+    fn submit<'a, I>(_: &(), _: I) -> Result<Self::Completion, Infallible>
+    where
+        FakeTensor: 'a,
+        I: IntoIterator<Item = &'a FakeTensor>,
+    {
+        Ok(Done)
+    }
+    fn order_after(_: &Done, _: &()) -> Result<(), Infallible> {
+        Ok(())
+    }
     fn retain_until_complete<T: Send + 'static>(_: &(), _: &Done, _: T) -> Result<(), Infallible> {
         Ok(())
     }
@@ -398,6 +412,12 @@ fn runtime_capabilities_compile_and_run_without_mlx() {
     assert_eq!(parameter, host);
     FakeBackend::bind(&mut parameter, FakeTensor(vec![3, 2])).unwrap();
     FakeBackend::retain_until_complete(&(), &transfer, parameter).unwrap();
+
+    let lanes = FakeBackend::fork_executors(&(), 2).unwrap();
+    assert_eq!(lanes.len(), 2);
+    let output = FakeTensor(vec![1, 1]);
+    let completion = FakeBackend::submit(&lanes[0], [&output]).unwrap();
+    FakeBackend::order_after(&completion, &lanes[1]).unwrap();
 }
 
 #[test]

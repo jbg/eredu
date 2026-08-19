@@ -605,7 +605,41 @@ impl Drop for MlxSubmissionCompletion {
 
 impl SubmissionBackend for MlxBackend {
     type Executor = Stream;
+    type OwnedExecutor = Stream;
     type Completion = MlxSubmissionCompletion;
+
+    fn fork_executors(
+        executor: &Self::Executor,
+        count: usize,
+    ) -> Result<Vec<Self::OwnedExecutor>, safemlx::error::Exception> {
+        if count <= 1 {
+            return Ok((0..count).map(|_| executor.clone()).collect());
+        }
+        let device = executor.get_device()?;
+        Ok((0..count)
+            .map(|_| Stream::new_with_device(&device))
+            .collect())
+    }
+
+    fn submit<'a, I>(
+        _executor: &Self::Executor,
+        values: I,
+    ) -> Result<Self::Completion, safemlx::error::Exception>
+    where
+        Array: 'a,
+        I: IntoIterator<Item = &'a Array>,
+    {
+        Ok(MlxSubmissionCompletion::new(
+            safemlx::transforms::async_eval_with_event(values)?,
+        ))
+    }
+
+    fn order_after(
+        completion: &Self::Completion,
+        executor: &Self::Executor,
+    ) -> Result<(), safemlx::error::Exception> {
+        completion.wait_on(executor)
+    }
 
     fn retain_until_complete<T: Send + 'static>(
         _executor: &Self::Executor,
