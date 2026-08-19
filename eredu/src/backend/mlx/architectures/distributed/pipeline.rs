@@ -950,7 +950,7 @@ impl PipelineLayerCache {
 
 struct LlamaStage {
     args: LlamaModelArgs,
-    layer_adapter: crate::composition::llama::LlamaLayerwiseAdapter,
+    layer_adapter: crate::composition::llama::LlamaParallelComposition,
     range: Range<usize>,
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
@@ -8926,7 +8926,7 @@ fn load_llama_pipeline(
         source_args.hidden_size,
     );
     let binding_adapter =
-        crate::composition::llama::LlamaLayerwiseAdapter::new(source_args.clone(), stream)?;
+        crate::composition::llama::LlamaParallelComposition::new(source_args.clone(), stream)?;
     let mut stage = LlamaStage::new(target_args.clone(), range, &info, stream)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
@@ -9197,7 +9197,7 @@ impl LlamaStage {
         stream: &Stream,
     ) -> Result<Self, Error> {
         let layer_adapter =
-            crate::composition::llama::LlamaLayerwiseAdapter::new(args.clone(), stream)?;
+            crate::composition::llama::LlamaParallelComposition::new(args.clone(), stream)?;
         let make_embedding = || {
             linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,

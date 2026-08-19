@@ -1078,6 +1078,114 @@ impl<B: NeuralBackend> LayeredModel<B> {
     pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
         &mut self.static_modules
     }
+
+    /// Prepares architecture-owned mask state after an execution policy has
+    /// produced embeddings, including vocabulary-parallel embeddings.
+    pub fn begin_embedded<S>(
+        &mut self,
+        hidden: B::Tensor,
+        supplied_mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: RuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        let expected = state_layout(&self.args)?;
+        if state.layout() != &expected {
+            return Err(Error::backend(format!(
+                "Llama runtime state layout {:?} does not match architecture layout {expected:?}",
+                state.layout()
+            )));
+        }
+        let sequence = hidden.dim(1);
+        let mask = if let Some(mask) = supplied_mask {
+            Some(mask.clone())
+        } else if sequence > 1 {
+            let cache = state.layer(0).map_err(Error::backend)?;
+            let window = cache.max_size();
+            let offset = window.map_or(cache.offset(), |window| cache.offset().min(window));
+            Some(B::causal_mask(sequence, offset, window, context)?)
+        } else {
+            None
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                mask,
+                allow_sliding_prefill: supplied_mask.is_none(),
+            },
+        })
+    }
+
+    /// Executes one replicated block using architecture-owned forward state.
+    pub fn forward_block<S>(
+        &mut self,
+        index: usize,
+        block: &mut TransformerBlock<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: RuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        let cache = state.layer(index).map_err(Error::backend)?;
+        block.forward(
+            AttentionInput {
+                hidden,
+                mask: forward.mask.as_ref(),
+                cache: Some(cache),
+                allow_sliding_prefill: forward.allow_sliding_prefill,
+            },
+            context,
+        )
+    }
+
+    /// Executes one tensor-parallel block using the same architecture-owned
+    /// mask and state semantics as replicated execution.
+    pub fn forward_block_parallel<S>(
+        &mut self,
+        index: usize,
+        block: &mut TransformerBlock<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: RuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        let cache = state.layer(index).map_err(Error::backend)?;
+        block.forward_tensor_parallel(
+            AttentionInput {
+                hidden,
+                mask: forward.mask.as_ref(),
+                cache: Some(cache),
+                allow_sliding_prefill: forward.allow_sliding_prefill,
+            },
+            parallel,
+            context,
+        )
+    }
+
+    /// Applies final normalization and the tied or untied output projection.
+    pub fn finish_hidden(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = self.static_modules.norm.forward(hidden, context)?;
+        match &mut self.static_modules.lm_head {
+            Some(head) => head.forward(&hidden, context),
+            None => self.static_modules.embeddings.as_linear(&hidden, context),
+        }
+    }
 }
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
@@ -1140,35 +1248,11 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = state_layout(&self.args)?;
-        if state.layout() != &expected {
-            return Err(Error::backend(format!(
-                "Llama runtime state layout {:?} does not match architecture layout {expected:?}",
-                state.layout()
-            )));
-        }
         let hidden = self
             .static_modules
             .embeddings
             .forward(input.tokens, context)?;
-        let sequence = hidden.dim(1);
-        let mask = if let Some(mask) = input.mask {
-            Some(mask.clone())
-        } else if sequence > 1 {
-            let cache = state.layer(0).map_err(Error::backend)?;
-            let window = cache.max_size();
-            let offset = window.map_or(cache.offset(), |window| cache.offset().min(window));
-            Some(B::causal_mask(sequence, offset, window, context)?)
-        } else {
-            None
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                mask,
-                allow_sliding_prefill: input.mask.is_none(),
-            },
-        })
+        self.begin_embedded(hidden, input.mask, state, context)
     }
 
     fn forward_unit(
@@ -1180,16 +1264,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let cache = state.layer(index).map_err(Error::backend)?;
-        unit.forward(
-            AttentionInput {
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-            },
-            context,
-        )
+        self.forward_block(index, unit, hidden, state, forward, context)
     }
 
     fn finish_forward(
@@ -1199,11 +1274,7 @@ where
         _forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let hidden = self.static_modules.norm.forward(hidden, context)?;
-        match &mut self.static_modules.lm_head {
-            Some(head) => head.forward(&hidden, context),
-            None => self.static_modules.embeddings.as_linear(&hidden, context),
-        }
+        self.finish_hidden(hidden, context)
     }
 
     fn retained_context_values<'a>(

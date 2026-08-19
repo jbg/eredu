@@ -10,10 +10,7 @@ use std::{
 };
 
 use eredu_architectures::llama::ModelArgs;
-use eredu_nn::{
-    EmbeddingOperator, EmbeddingSpec, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationOperator, NormalizationSpec, ParameterSpec,
-};
+use eredu_nn::{EmbeddingOperator, NormalizationOperator};
 use safemlx::{
     error::Exception,
     ops::indexing::TryIndexOp,
@@ -28,11 +25,8 @@ use crate::core::cache::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxModule, MlxRmsNorm},
-    backend::mlx::nn::{
-        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
-        tensor::{create_attention_mask_from_cache, AttentionMask},
-    },
+    backend::mlx::nn::parallel::{VocabParallelEmbedding, VocabParallelLmHead},
+    backend::mlx::nn::shared::{MlxBackend, MlxModule},
     backend::mlx::runtime::cache::residency::{
         open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
     },
@@ -63,7 +57,6 @@ const EMBEDDING_UNIT: &str = "llama.static.embedding";
 const NORM_UNIT: &str = "llama.static.norm";
 const HEAD_UNIT: &str = "llama.static.output";
 
-type AttentionInput<'a, C> = eredu_architectures::llama::AttentionInput<'a, Array, C>;
 type TransformerBlock = MlxModule<eredu_architectures::llama::TransformerBlock<MlxBackend>>;
 type NeutralBlock = eredu_architectures::llama::TransformerBlock<MlxBackend>;
 
@@ -96,7 +89,7 @@ type NeutralLayerwiseRuntime = LayerwiseRuntime<
 enum LlamaExecution {
     Resident(NeutralResidentRuntime),
     Layerwise(NeutralLayerwiseRuntime),
-    TensorParallel(Box<LayerwiseModel<LlamaLayerwiseAdapter>>),
+    TensorParallel(Box<LayerwiseModel<LlamaParallelComposition>>),
 }
 
 fn new_transformer_block(
@@ -687,7 +680,7 @@ pub(crate) fn load_llama_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     let args = load_model_args(model_dir)?;
-    let adapter = LlamaLayerwiseAdapter::new(args.clone(), stream)?;
+    let adapter = LlamaParallelComposition::new(args.clone(), stream)?;
     let execution = load_tensor_parallel_layerwise_model(
         open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
         adapter,
@@ -727,7 +720,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
             options.max_mapped_shards(),
         )?);
     let args = prepared.args;
-    let adapter = LlamaLayerwiseAdapter::new(args.clone(), stream)?;
+    let adapter = LlamaParallelComposition::new(args.clone(), stream)?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
         adapter,
@@ -791,63 +784,20 @@ pub(crate) fn load_llama_gguf_model(
 }
 
 /// Llama implementation of the generic layerwise model-family contract.
-pub struct LlamaLayerwiseAdapter {
-    args: ModelArgs,
-    embedding: MlxEmbedding,
-    norm: MlxRmsNorm,
-    lm_head: Option<MlxLinear>,
+pub struct LlamaParallelComposition {
+    architecture: NeutralArchitecture,
     parallel_embedding: Option<VocabParallelEmbedding>,
     parallel_lm_head: Option<VocabParallelLmHead>,
     parallel_kv_heads: Option<Vec<i32>>,
 }
 
-impl LlamaLayerwiseAdapter {
+impl LlamaParallelComposition {
     /// Creates metadata-only static modules for a normalized Llama configuration.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        let embedding = <MlxBackend as NeuralBackend>::embedding(
-            EmbeddingSpec {
-                vocabulary: args.vocab_size,
-                dimensions: args.hidden_size,
-                weight: ParameterSpec::trainable("model.embed_tokens.weight")
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                quantization: args.weight_quantization_for("model.embed_tokens.weight"),
-            },
-            stream,
-        )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let norm = <MlxBackend as NeuralBackend>::rms_norm(
-            NormalizationSpec {
-                dimensions: args.hidden_size,
-                epsilon: args.rms_norm_eps,
-                weight: ParameterSpec::trainable("model.norm.weight")
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            },
-            stream,
-        )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let lm_head = if args.tie_word_embeddings {
-            None
-        } else {
-            Some(
-                <MlxBackend as NeuralBackend>::linear(
-                    LinearSpec {
-                        input: args.hidden_size,
-                        output: args.vocab_size,
-                        weight: ParameterSpec::trainable("lm_head.weight")
-                            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                        bias: None,
-                        quantization: args.weight_quantization_for("lm_head.weight"),
-                    },
-                    stream,
-                )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            )
-        };
+        let architecture = NeutralArchitecture::new(args, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         Ok(Self {
-            args,
-            embedding,
-            norm,
-            lm_head,
+            architecture,
             parallel_embedding: None,
             parallel_lm_head: None,
             parallel_kv_heads: None,
@@ -856,29 +806,23 @@ impl LlamaLayerwiseAdapter {
 
     /// Returns normalized Llama arguments.
     pub const fn args(&self) -> &ModelArgs {
-        &self.args
+        self.architecture.args()
     }
 }
 
-impl LoadTimeQuantizableAdapter for LlamaLayerwiseAdapter {
+impl LoadTimeQuantizableAdapter for LlamaParallelComposition {
     fn load_time_quantized(
         &self,
         quantization: WeightQuantization,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let mut args = self.args.clone();
+        let mut args = self.args().clone();
         args.quantization = Some(quantization);
         args.quantization_config = None;
         args.quantized_weights = None;
         args.quantized_weight_configs = None;
         Self::new(args, stream)
     }
-}
-
-/// Llama mask state shared by every temporary decoder block.
-pub struct LlamaForwardContext {
-    mask: Option<Array>,
-    allow_sliding_prefill: bool,
 }
 
 /// Borrowed tokens and optional mask consumed by the canonical Llama adapter.
@@ -889,37 +833,37 @@ pub struct LlamaAdapterInput<'a> {
     pub mask: Option<&'a Array>,
 }
 
-impl ArchitectureAdapter for LlamaLayerwiseAdapter {
+impl ArchitectureAdapter for LlamaParallelComposition {
     type Input<'a> = LlamaAdapterInput<'a>;
     type Cache = MlxKeyValueState;
     type Layer = TransformerBlock;
-    type ForwardContext = LlamaForwardContext;
+    type ForwardContext = eredu_architectures::llama::ForwardContext<Array>;
 
     fn model_type(&self) -> &str {
-        &self.args.model_type
+        &self.args().model_type
     }
 
     fn safetensors_checkpoint_plan(
         &self,
     ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
     {
-        eredu_architectures::llama::safetensors_plan(&self.args)
+        eredu_architectures::llama::safetensors_plan(self.args())
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
             .map(Into::into)
     }
 
     fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.args.weight_quantization()
+        self.args().weight_quantization()
     }
 
     fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let layer_count = usize::try_from(self.args.num_hidden_layers)
+        let layer_count = usize::try_from(self.args().num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
         let local_kv_heads = match topology {
-            None => vec![self.args.num_key_value_heads; layer_count],
+            None => vec![self.args().num_key_value_heads; layer_count],
             Some(_) => self.parallel_kv_heads.clone().ok_or_else(|| {
                 Error::Parallel(
                     "Llama parallel cache identity requested before local layout configuration"
@@ -934,15 +878,15 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
             )));
         }
         let layer_layout = eredu_architectures::llama::cache_layout_with_key_value_heads(
-            &self.args,
+            self.args(),
             local_kv_heads,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(PromptCacheModelIdentity {
             model_family: "llama".into(),
-            effective_model_type: self.args.model_type.clone(),
+            effective_model_type: self.args().model_type.clone(),
             architecture_fingerprint:
-                eredu_architectures::llama::prompt_cache_architecture_fingerprint(&self.args),
+                eredu_architectures::llama::prompt_cache_architecture_fingerprint(self.args()),
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
@@ -984,7 +928,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 .map_err(|error| Exception::custom(error.to_string()))?;
         let rank = identity.topology.cache_rank_identity();
         let state = MlxKeyValueState::paged(
-            eredu_architectures::llama::state_layout(&self.args)
+            eredu_architectures::llama::state_layout(self.args())
                 .map_err(|error| Exception::custom(error.to_string()))?,
             manager,
             rank,
@@ -1005,11 +949,12 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
+        let static_modules = self.architecture.static_modules();
         if select(EMBEDDING_UNIT) {
             units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
                 build_module_binding_plan_with_recipes(
-                    &self.embedding,
+                    &static_modules.embeddings,
                     "",
                     store,
                     BTreeMap::new(),
@@ -1020,12 +965,17 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_binding_plan_with_recipes(&self.norm, "", store, BTreeMap::new())?
-                    .build_bindings(store)?,
+                build_module_binding_plan_with_recipes(
+                    &static_modules.norm,
+                    "",
+                    store,
+                    BTreeMap::new(),
+                )?
+                .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
-            if let Some(head) = &self.lm_head {
+            if let Some(head) = &static_modules.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
                     build_module_binding_plan_with_recipes(head, "", store, BTreeMap::new())?
@@ -1037,7 +987,11 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     }
 
     fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = if self.lm_head.is_some() { 3 } else { 2 };
+        let expected = if self.architecture.static_modules().lm_head.is_some() {
+            3
+        } else {
+            2
+        };
         if leases.len() != expected {
             return Err(Exception::custom(format!(
                 "Llama adapter received {} static leases, expected {expected}",
@@ -1048,19 +1002,22 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         if let Some(embedding) = &mut self.parallel_embedding {
             populate_module_from_lease(embedding.inner_mut(), &leases[0])?;
         } else {
-            populate_module_from_lease(&mut self.embedding, &leases[0])?;
+            populate_module_from_lease(
+                &mut self.architecture.static_modules_mut().embeddings,
+                &leases[0],
+            )?;
         }
-        populate_module_from_lease(&mut self.norm, &leases[1])?;
+        populate_module_from_lease(&mut self.architecture.static_modules_mut().norm, &leases[1])?;
         if let Some(head) = &mut self.parallel_lm_head {
             populate_module_from_lease(head.inner_mut(), &leases[2])?;
-        } else if let Some(head) = &mut self.lm_head {
+        } else if let Some(head) = &mut self.architecture.static_modules_mut().lm_head {
             populate_module_from_lease(head, &leases[2])?;
         }
         Ok(())
     }
 
     fn validate_cache(&self, cache: &mut Self::Cache) -> Result<(), Error> {
-        let expected = eredu_architectures::llama::state_layout(&self.args)
+        let expected = eredu_architectures::llama::state_layout(self.args())
             .map_err(|error| Exception::custom(error.to_string()))?;
         if cache.layout() != &expected {
             return Err(Exception::custom(format!(
@@ -1078,18 +1035,18 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
-        let hidden = self.embedding.forward(input.inputs, stream)?;
-        let allow_sliding_prefill = input.mask.is_none();
-        let mask = match input.mask {
-            Some(mask) => Some(mask.clone()),
-            None => llama_attention_mask(&hidden, cache.as_ref(), stream)?,
-        };
+        let hidden = self
+            .architecture
+            .static_modules_mut()
+            .embeddings
+            .forward(input.inputs, stream)?;
+        let prepared = self
+            .architecture
+            .begin_embedded(hidden, input.mask, cache, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         Ok(LayerwiseForwardState {
-            hidden,
-            context: LlamaForwardContext {
-                mask,
-                allow_sliding_prefill,
-            },
+            hidden: prepared.hidden,
+            context: prepared.context,
         })
     }
 
@@ -1105,17 +1062,13 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
             return self.begin_forward(input, cache, execution.stream());
         };
         let hidden = embedding.forward(input.inputs, execution)?;
-        let allow_sliding_prefill = input.mask.is_none();
-        let mask = match input.mask {
-            Some(mask) => Some(mask.clone()),
-            None => llama_attention_mask(&hidden, cache.as_ref(), execution.stream())?,
-        };
+        let prepared = self
+            .architecture
+            .begin_embedded(hidden, input.mask, cache, execution.stream())
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         Ok(LayerwiseForwardState {
-            hidden,
-            context: LlamaForwardContext {
-                mask,
-                allow_sliding_prefill,
-            },
+            hidden: prepared.hidden,
+            context: prepared.context,
         })
     }
 
@@ -1129,9 +1082,9 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 "Llama has no group {group}"
             )));
         }
-        usize::try_from(self.args.num_hidden_layers).map_err(|_| {
+        usize::try_from(self.args().num_hidden_layers).map_err(|_| {
             LlamaModelError::InvalidLayerCount {
-                count: self.args.num_hidden_layers,
+                count: self.args().num_hidden_layers,
             }
             .into()
         })
@@ -1143,7 +1096,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 "Llama has no group {group}"
             )));
         }
-        new_transformer_block(&self.args, index, stream)
+        new_transformer_block(self.args(), index, stream)
     }
 
     fn register_parallel_parameters(
@@ -1152,18 +1105,19 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
+        let static_modules = self.architecture.static_modules();
         for group in eredu_architectures::llama::static_parallel_parameter_groups::<MlxBackend>(
-            &self.embedding,
-            &self.norm,
-            self.lm_head.as_ref(),
+            &static_modules.embeddings,
+            &static_modules.norm,
+            static_modules.lm_head.as_ref(),
         )? {
             planner.register(group)?;
         }
-        for index in 0..self.args.num_hidden_layers as usize {
-            let layer = new_transformer_block(&self.args, index, stream)?;
+        for index in 0..self.args().num_hidden_layers as usize {
+            let layer = new_transformer_block(self.args(), index, stream)?;
             for group in eredu_architectures::llama::layer_parallel_parameter_groups::<MlxBackend>(
                 &layer.inner,
-                &self.args,
+                self.args(),
                 index,
             )? {
                 planner.register(group)?;
@@ -1179,22 +1133,22 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_kv_heads = Some(
-            eredu_architectures::llama::local_key_value_heads(&self.args, layout)
+            eredu_architectures::llama::local_key_value_heads(self.args(), layout)
                 .map_err(|error| Error::Parallel(error.to_string()))?,
         );
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
-            self.args.vocab_size as usize,
-            self.args.hidden_size,
-            self.args
+            self.args().vocab_size as usize,
+            self.args().hidden_size,
+            self.args()
                 .weight_quantization_for("model.embed_tokens.weight"),
             context,
             stream,
         )?);
-        if self.lm_head.is_some() {
+        if self.architecture.static_modules().lm_head.is_some() {
             self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
-                self.args.hidden_size,
-                self.args.vocab_size as usize,
-                self.args.weight_quantization_for("lm_head.weight"),
+                self.args().hidden_size,
+                self.args().vocab_size as usize,
+                self.args().weight_quantization_for("lm_head.weight"),
                 context,
                 stream,
             )?);
@@ -1214,7 +1168,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 "Llama has no group {group}"
             )));
         }
-        let args = eredu_architectures::llama::local_block_args(&self.args, index, layout)
+        let args = eredu_architectures::llama::local_block_args(self.args(), index, layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         new_transformer_block(&args, index, stream)
     }
@@ -1268,21 +1222,9 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         context: &mut Self::ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let layer_state = cache
-            .layer(index)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        Ok(layer
-            .inner
-            .forward(
-                AttentionInput {
-                    hidden,
-                    mask: context.mask.as_ref(),
-                    cache: Some(layer_state),
-                    allow_sliding_prefill: context.allow_sliding_prefill,
-                },
-                stream,
-            )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?)
+        self.architecture
+            .forward_block(index, &mut layer.inner, hidden, cache, context, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     fn forward_layer_with_execution(
@@ -1308,22 +1250,17 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 execution.stream(),
             );
         };
-        let layer_state = cache
-            .layer(index)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        Ok(layer
-            .inner
-            .forward_tensor_parallel(
-                AttentionInput {
-                    hidden,
-                    mask: context.mask.as_ref(),
-                    cache: Some(layer_state),
-                    allow_sliding_prefill: context.allow_sliding_prefill,
-                },
+        self.architecture
+            .forward_block_parallel(
+                index,
+                &mut layer.inner,
+                hidden,
+                cache,
+                context,
                 tp_group,
                 execution.stream(),
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     fn retained_arrays<'a>(
@@ -1346,16 +1283,9 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         _context: &Self::ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let hidden = self.norm.forward(hidden, stream)?;
-        match &mut self.lm_head {
-            Some(head) => head
-                .forward(&hidden, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
-            None => self
-                .embedding
-                .as_linear(&hidden, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
-        }
+        self.architecture
+            .finish_hidden(hidden, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     fn finish_with_execution(
@@ -1370,7 +1300,11 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.finish(hidden, cache, context, execution.stream());
         };
-        let hidden = self.norm.forward(hidden, execution.stream())?;
+        let hidden = self
+            .architecture
+            .static_modules_mut()
+            .norm
+            .forward(hidden, execution.stream())?;
         let logits = match &mut self.parallel_lm_head {
             Some(head) => head.forward(&hidden, execution)?,
             None => embedding.project_logits(&hidden, execution)?,
@@ -1380,21 +1314,6 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn ignores_checkpoint_key(&self, key: &str) -> bool {
         key.starts_with("rope_freqs.") || key.ends_with(".rotary_emb.inv_freq")
-    }
-}
-
-fn llama_attention_mask<C: KeyValueCache>(
-    hidden: &Array,
-    cache: &[C],
-    stream: &Stream,
-) -> Result<Option<Array>, Error> {
-    match create_attention_mask_from_cache(hidden, cache.first(), Some(true), stream)? {
-        Some(AttentionMask::Array(mask)) => Ok(Some(mask)),
-        Some(AttentionMask::Causal) => Err(Exception::custom(
-            "Llama-compatible decoders require an explicit attention mask",
-        )
-        .into()),
-        None => Ok(None),
     }
 }
 
