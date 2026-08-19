@@ -1,14 +1,16 @@
 use std::convert::Infallible;
 
-use eredu_core::Completion;
+use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, Completion, LayerSchedule};
 use eredu_nn::{
     AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec,
     NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterVisitor,
     ParameterVisitorMut, Parameterized, RotaryOperator, RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, CollectiveBackend, ParameterBackend,
-    SubmissionBackend, TransferBackend, WeightBinding,
+    bind_materialized_unit, materialize_bindings, CollectiveBackend, DeviceState, ExecutionGraph,
+    ExecutionGroupSpec, LayeredArchitecture, LayeredForwardState, LayerwiseRuntime,
+    ParameterBackend, ResidentUnitWindow, RuntimeLayerState, StateLayout, SubmissionBackend,
+    TransferBackend, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -429,4 +431,187 @@ fn neutral_loader_materializes_and_binds_the_fake_backend() {
     };
     bind_materialized_unit::<FakeBackend, _>(&mut module, unit).unwrap();
     assert_eq!(module.weight, FakeTensor(vec![2, 2]));
+}
+
+#[derive(Debug)]
+struct FakeLayerState;
+
+impl RuntimeLayerState<FakeBackend> for FakeLayerState {
+    type RetainedValues<'a> = std::iter::Empty<&'a FakeTensor>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        std::iter::empty()
+    }
+}
+
+#[derive(Debug)]
+struct FakeUnit {
+    marker: i32,
+}
+
+impl Parameterized<FakeTensor> for FakeUnit {
+    fn visit_parameters<'a, V>(&'a self, _visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, FakeTensor>,
+    {
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, _visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, FakeTensor>,
+    {
+    }
+
+    fn set_trainable(&mut self, _trainable: bool) {}
+}
+
+struct GroupedFixture {
+    static_modules: FakeOperator,
+    trace: Vec<(usize, usize)>,
+}
+
+impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> for GroupedFixture {
+    type Input<'a> = ();
+    type StaticModules = FakeOperator;
+    type Unit = FakeUnit;
+    type ForwardContext = ();
+    type RetainedContextValues<'a> = std::iter::Empty<&'a FakeTensor>;
+    type Error = Error;
+
+    fn model_identity(&self) -> &str {
+        "grouped-fixture"
+    }
+
+    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
+        ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("vision"),
+                ExecutionGroupSpec::root("audio"),
+                ExecutionGroupSpec::with_dependencies("text", ["vision", "audio"]),
+            ],
+            "text",
+        )
+        .map_err(Error::backend)
+    }
+
+    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+        [1, 1, 2]
+            .get(group)
+            .copied()
+            .ok_or_else(|| Error::backend(format!("unknown fixture group {group}")))
+    }
+
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
+        Ok(format!("group.{group}.unit.{index}"))
+    }
+
+    fn static_modules(&self) -> &Self::StaticModules {
+        &self.static_modules
+    }
+
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        &mut self.static_modules
+    }
+
+    fn build_unit(&self, group: usize, index: usize, _: &()) -> Result<Self::Unit, Self::Error> {
+        Ok(FakeUnit {
+            marker: i32::try_from(group * 10 + index).unwrap(),
+        })
+    }
+
+    fn begin_forward<'a>(
+        &mut self,
+        _: Self::Input<'a>,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
+        Ok(LayeredForwardState {
+            hidden: FakeTensor(vec![0]),
+            context: (),
+        })
+    }
+
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        _: &FakeTensor,
+        dependencies: &[&FakeTensor],
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &mut Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        match group {
+            0 if dependencies.is_empty() => Ok(FakeTensor(vec![10])),
+            1 if dependencies.is_empty() => Ok(FakeTensor(vec![20])),
+            2 if dependencies == [&FakeTensor(vec![10, 0]), &FakeTensor(vec![20, 10])] => {
+                Ok(FakeTensor(vec![30]))
+            }
+            _ => Err(Error::backend("invalid fixture dependency inputs")),
+        }
+    }
+
+    fn forward_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &FakeTensor,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &mut Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        self.trace.push((group, index));
+        let mut output = hidden.clone();
+        output.0.push(unit.marker);
+        Ok(output)
+    }
+
+    fn finish_forward(
+        &mut self,
+        hidden: &FakeTensor,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        Ok(hidden.clone())
+    }
+
+    fn retained_context_values<'a>(
+        &'a self,
+        _: &'a Self::ForwardContext,
+        _: usize,
+        _: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::empty()
+    }
+}
+
+#[test]
+fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
+    let policies = (0..4)
+        .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap())
+        .collect();
+    let layout = StateLayout::new(LayerSchedule::new(4, policies).unwrap()).unwrap();
+    let mut state = DeviceState::<FakeBackend, FakeLayerState>::create(layout, |_, _| {
+        Ok::<_, Infallible>(FakeLayerState)
+    })
+    .unwrap();
+    let architecture = GroupedFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+    };
+    let units = [0, 10, 20, 21]
+        .into_iter()
+        .map(|marker| FakeUnit { marker })
+        .collect();
+    let mut runtime =
+        LayerwiseRuntime::<_, FakeBackend, _, _>::new(architecture, ResidentUnitWindow::new(units));
+
+    let output = runtime.forward((), &mut state, &()).unwrap();
+
+    assert_eq!(output, FakeTensor(vec![30, 20, 21]));
+    assert_eq!(
+        runtime.architecture().trace,
+        vec![(0, 0), (1, 0), (2, 0), (2, 1)]
+    );
 }

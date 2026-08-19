@@ -1,6 +1,7 @@
 //! Validated execution-group dependency graphs and ready-set scheduling.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 /// Stable non-empty identity for one architecture execution group.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -74,6 +75,107 @@ pub struct ExecutionGraph {
     dependents: Vec<Vec<usize>>,
     execution_order: Vec<usize>,
     output: usize,
+}
+
+/// Stable architecture-group and group-local address of one flattened execution unit.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ExecutionUnitAddress {
+    group: usize,
+    index: usize,
+}
+
+impl ExecutionUnitAddress {
+    /// Returns the architecture execution-group slot.
+    pub const fn group(self) -> usize {
+        self.group
+    }
+
+    /// Returns the unit's group-local index.
+    pub const fn index(self) -> usize {
+        self.index
+    }
+}
+
+/// Validated mapping between architecture groups and the flat residency-unit order.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExecutionUnitLayout {
+    group_ranges: Vec<Range<usize>>,
+    addresses: Vec<ExecutionUnitAddress>,
+}
+
+impl ExecutionUnitLayout {
+    /// Builds a stable group-major unit order for one validated execution graph.
+    pub fn new(
+        graph: &ExecutionGraph,
+        group_unit_counts: impl IntoIterator<Item = usize>,
+    ) -> Result<Self, ExecutionUnitLayoutError> {
+        let counts = group_unit_counts.into_iter().collect::<Vec<_>>();
+        if counts.len() != graph.groups().len() {
+            return Err(ExecutionUnitLayoutError::GroupCountMismatch {
+                graph_groups: graph.groups().len(),
+                declared_groups: counts.len(),
+            });
+        }
+        let mut group_ranges = Vec::with_capacity(counts.len());
+        let mut addresses = Vec::new();
+        for (group, count) in counts.into_iter().enumerate() {
+            let start = addresses.len();
+            let end = start
+                .checked_add(count)
+                .ok_or(ExecutionUnitLayoutError::UnitCountOverflow)?;
+            addresses.reserve(count);
+            addresses.extend((0..count).map(|index| ExecutionUnitAddress { group, index }));
+            group_ranges.push(start..end);
+        }
+        Ok(Self {
+            group_ranges,
+            addresses,
+        })
+    }
+
+    /// Returns the total number of execution units in group-major order.
+    pub fn len(&self) -> usize {
+        self.addresses.len()
+    }
+
+    /// Returns whether the architecture declares no executable units.
+    pub fn is_empty(&self) -> bool {
+        self.addresses.is_empty()
+    }
+
+    /// Returns the group-major flat range for one architecture group.
+    pub fn group_range(&self, group: usize) -> Option<Range<usize>> {
+        self.group_ranges.get(group).cloned()
+    }
+
+    /// Resolves one flat residency-unit slot to its architecture address.
+    pub fn address(&self, ordinal: usize) -> Option<ExecutionUnitAddress> {
+        self.addresses.get(ordinal).copied()
+    }
+
+    /// Resolves one architecture address to its flat residency-unit slot.
+    pub fn ordinal(&self, group: usize, index: usize) -> Option<usize> {
+        let range = self.group_ranges.get(group)?;
+        (index < range.len()).then_some(range.start + index)
+    }
+}
+
+/// Invalid architecture execution-unit grouping.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum ExecutionUnitLayoutError {
+    /// The architecture did not provide exactly one unit count per graph group.
+    #[error(
+        "execution graph contains {graph_groups} groups but the architecture declared {declared_groups} group counts"
+    )]
+    GroupCountMismatch {
+        /// Validated graph group count.
+        graph_groups: usize,
+        /// Architecture-declared group count.
+        declared_groups: usize,
+    },
+    /// The total number of units exceeded the addressable range.
+    #[error("execution-unit count overflowed usize")]
+    UnitCountOverflow,
 }
 
 impl ExecutionGraph {
@@ -568,6 +670,39 @@ mod tests {
         assert_eq!(schedule.started(3).unwrap(), vec![1, 2]);
         assert!(schedule.ordered(3).is_ok());
         assert_eq!(schedule.state(3), Some(ReadyGroupState::Ordered));
+    }
+
+    #[test]
+    fn execution_unit_layout_preserves_group_major_residency_order() {
+        let graph = ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("vision"),
+                ExecutionGroupSpec::with_dependencies("text", ["vision"]),
+            ],
+            "text",
+        )
+        .unwrap();
+        let layout = ExecutionUnitLayout::new(&graph, [2, 3]).unwrap();
+
+        assert_eq!(layout.len(), 5);
+        assert_eq!(layout.group_range(0), Some(0..2));
+        assert_eq!(layout.group_range(1), Some(2..5));
+        assert_eq!(layout.address(3).unwrap().group(), 1);
+        assert_eq!(layout.address(3).unwrap().index(), 1);
+        assert_eq!(layout.ordinal(1, 2), Some(4));
+        assert_eq!(layout.ordinal(0, 2), None);
+    }
+
+    #[test]
+    fn execution_unit_layout_rejects_graph_count_drift() {
+        let graph = ExecutionGraph::chain(["vision", "text"]).unwrap();
+        assert_eq!(
+            ExecutionUnitLayout::new(&graph, [2]).unwrap_err(),
+            ExecutionUnitLayoutError::GroupCountMismatch {
+                graph_groups: 2,
+                declared_groups: 1,
+            }
+        );
     }
 
     #[test]

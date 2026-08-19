@@ -53,7 +53,8 @@ pub use dense::{
 };
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,
-    ExecutionGroupSchedule, ExecutionGroupSpec, ExecutionScheduleError, ReadyGroupState,
+    ExecutionGroupSchedule, ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress,
+    ExecutionUnitLayout, ExecutionUnitLayoutError, ReadyGroupState,
 };
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,

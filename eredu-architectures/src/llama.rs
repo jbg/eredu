@@ -1230,11 +1230,21 @@ where
         eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Error::backend)
     }
 
-    fn unit_count(&self) -> Result<usize, Self::Error> {
+    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+        if group != 0 {
+            return Err(Error::backend(format!(
+                "Llama execution group {group} is outside the text decoder"
+            )));
+        }
         usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)
     }
 
-    fn unit_path(&self, index: usize) -> Result<String, Self::Error> {
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
+        if group != 0 {
+            return Err(Error::backend(format!(
+                "Llama execution group {group} is outside the text decoder"
+            )));
+        }
         let count = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?;
         if index >= count {
             return Err(Error::backend(format!(
@@ -1254,9 +1264,15 @@ where
 
     fn build_unit(
         &self,
+        group: usize,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
+        if group != 0 {
+            return Err(Error::backend(format!(
+                "Llama execution group {group} is outside the text decoder"
+            )));
+        }
         TransformerBlock::new(&self.args, index, context)
     }
 
@@ -1273,8 +1289,27 @@ where
         self.begin_embedded(hidden, input.mask, state, context)
     }
 
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if group != 0 || !dependencies.is_empty() {
+            return Err(Error::backend(format!(
+                "Llama text decoder group {group} received {} dependencies",
+                dependencies.len()
+            )));
+        }
+        Ok(initial.clone())
+    }
+
     fn forward_unit(
         &mut self,
+        _group: usize,
         index: usize,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
@@ -1298,6 +1333,7 @@ where
     fn retained_context_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
+        _group: usize,
         _index: usize,
     ) -> Self::RetainedContextValues<'a> {
         forward.mask.iter()

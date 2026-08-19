@@ -1215,7 +1215,12 @@ impl LayeredArchitecture<MlxBackend, MlxKeyValueState> for LlamaParallelComposit
         eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
     }
 
-    fn unit_count(&self) -> Result<usize, Self::Error> {
+    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+        if group != 0 {
+            return Err(Error::Parallel(format!(
+                "parallel Llama execution group {group} is outside the decoder"
+            )));
+        }
         usize::try_from(self.args().num_hidden_layers).map_err(|_| {
             LlamaModelError::InvalidLayerCount {
                 count: self.args().num_hidden_layers,
@@ -1224,8 +1229,8 @@ impl LayeredArchitecture<MlxBackend, MlxKeyValueState> for LlamaParallelComposit
         })
     }
 
-    fn unit_path(&self, index: usize) -> Result<String, Self::Error> {
-        if index >= self.unit_count()? {
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
+        if index >= self.group_unit_count(group)? {
             return Err(Error::Parallel(format!(
                 "parallel Llama unit {index} is outside the decoder"
             )));
@@ -1241,7 +1246,17 @@ impl LayeredArchitecture<MlxBackend, MlxKeyValueState> for LlamaParallelComposit
         self
     }
 
-    fn build_unit(&self, index: usize, stream: &Stream) -> Result<Self::Unit, Self::Error> {
+    fn build_unit(
+        &self,
+        group: usize,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<Self::Unit, Self::Error> {
+        if group != 0 {
+            return Err(Error::Parallel(format!(
+                "parallel Llama execution group {group} is outside the decoder"
+            )));
+        }
         let args = self
             .local_args
             .as_ref()
@@ -1266,6 +1281,7 @@ impl LayeredArchitecture<MlxBackend, MlxKeyValueState> for LlamaParallelComposit
 
     fn forward_unit(
         &mut self,
+        _group: usize,
         _index: usize,
         _unit: &mut Self::Unit,
         _hidden: &Array,
@@ -1276,6 +1292,24 @@ impl LayeredArchitecture<MlxBackend, MlxKeyValueState> for LlamaParallelComposit
         Err(Error::Parallel(
             "parallel Llama composition requires a collective context".into(),
         ))
+    }
+
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial: &Array,
+        dependencies: &[&Array],
+        _state: &mut MlxKeyValueState,
+        _forward: &mut Self::ForwardContext,
+        _stream: &Stream,
+    ) -> Result<Array, Self::Error> {
+        if group != 0 || !dependencies.is_empty() {
+            return Err(Error::Parallel(format!(
+                "parallel Llama decoder group {group} received {} dependencies",
+                dependencies.len()
+            )));
+        }
+        Ok(initial.clone())
     }
 
     fn finish_forward(
@@ -1293,11 +1327,13 @@ impl LayeredArchitecture<MlxBackend, MlxKeyValueState> for LlamaParallelComposit
     fn retained_context_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
+        group: usize,
         index: usize,
     ) -> Self::RetainedContextValues<'a> {
         <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::retained_context_values(
             &self.architecture,
             forward,
+            group,
             index,
         )
     }
@@ -1325,6 +1361,7 @@ impl ParallelLayeredArchitecture<MlxBackend, MlxKeyValueState> for LlamaParallel
 
     fn forward_unit_parallel(
         &mut self,
+        _group_index: usize,
         index: usize,
         unit: &mut Self::Unit,
         hidden: &Array,

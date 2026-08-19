@@ -2,7 +2,7 @@
 
 use eredu_nn::{NeuralBackend, Parameterized};
 
-use crate::{ExecutionGraph, RuntimeState};
+use crate::{ExecutionGraph, ExecutionGroupSchedule, ExecutionUnitLayout, RuntimeState};
 
 /// Backend-native activation and architecture-owned forward context.
 pub struct LayeredForwardState<T, C> {
@@ -46,11 +46,11 @@ where
     /// Declares the dependency graph between ordered execution groups.
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error>;
 
-    /// Returns the total number of ordered execution units.
-    fn unit_count(&self) -> Result<usize, Self::Error>;
+    /// Returns the number of ordered execution units in one graph group.
+    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error>;
 
-    /// Returns the stable architecture-owned path of one execution unit.
-    fn unit_path(&self, index: usize) -> Result<String, Self::Error>;
+    /// Returns the stable architecture-owned path of one group-local execution unit.
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error>;
 
     /// Borrows pinned modules for parameter discovery and binding.
     fn static_modules(&self) -> &Self::StaticModules;
@@ -61,6 +61,7 @@ where
     /// Builds one unloaded execution unit using backend-native operators.
     fn build_unit(
         &self,
+        group: usize,
         index: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error>;
@@ -73,9 +74,26 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
 
+    /// Selects or merges the activation consumed by one ready execution group.
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+
+    /// Returns whether one ready group is needed for this forward pass.
+    fn should_execute_group(&self, _group: usize, _forward: &Self::ForwardContext) -> bool {
+        true
+    }
+
     /// Executes one ordered unit against its concrete mutable layer state.
     fn forward_unit(
         &mut self,
+        group: usize,
         index: usize,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
@@ -83,6 +101,18 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+
+    /// Converts a completed group's output into its dependency-facing value.
+    fn complete_execution_group(
+        &mut self,
+        _group: usize,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(hidden.clone())
+    }
 
     /// Applies final normalization and output projection.
     fn finish_forward(
@@ -97,6 +127,7 @@ where
     fn retained_context_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
+        group: usize,
         index: usize,
     ) -> Self::RetainedContextValues<'a>;
 }
@@ -123,6 +154,7 @@ where
     /// Executes one rank-local unit and its required collectives.
     fn forward_unit_parallel(
         &mut self,
+        group_index: usize,
         index: usize,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
@@ -131,6 +163,33 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+
+    /// Selects or merges a ready group's activation under a parallel context.
+    fn begin_execution_group_parallel(
+        &mut self,
+        group_index: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.begin_execution_group(group_index, initial, dependencies, state, forward, context)
+    }
+
+    /// Converts a completed group's output under a parallel context.
+    fn complete_execution_group_parallel(
+        &mut self,
+        group_index: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.complete_execution_group(group_index, hidden, state, forward, context)
+    }
 
     /// Applies the rank-local output projection and returns complete logits.
     fn finish_forward_parallel(
@@ -151,7 +210,8 @@ where
     A: LayeredArchitecture<B, S>,
 {
     architecture: A,
-    units: Vec<A::Unit>,
+    graph: ExecutionGraph,
+    units: Vec<Vec<A::Unit>>,
     backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
 
@@ -166,12 +226,19 @@ where
         architecture: A,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self, A::Error> {
-        let count = architecture.unit_count()?;
-        let units = (0..count)
-            .map(|index| architecture.build_unit(index, context))
-            .collect::<Result<Vec<_>, _>>()?;
+        let graph = architecture.execution_graph()?;
+        let mut units = Vec::with_capacity(graph.groups().len());
+        for group in 0..graph.groups().len() {
+            let count = architecture.group_unit_count(group)?;
+            units.push(
+                (0..count)
+                    .map(|index| architecture.build_unit(group, index, context))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
         Ok(Self {
             architecture,
+            graph,
             units,
             backend: std::marker::PhantomData,
         })
@@ -184,19 +251,71 @@ where
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, A::Error> {
-        let mut forward = self.architecture.begin_forward(input, state, context)?;
-        for (index, unit) in self.units.iter_mut().enumerate() {
-            forward.hidden = self.architecture.forward_unit(
-                index,
-                unit,
-                &forward.hidden,
+        let forward = self.architecture.begin_forward(input, state, context)?;
+        let initial = forward.hidden;
+        let mut forward_context = forward.context;
+        let mut schedule = ExecutionGroupSchedule::new(&self.graph);
+        let mut outputs: Vec<Option<B::Tensor>> = vec![None; self.graph.groups().len()];
+        for &group in self.graph.execution_order() {
+            let dependencies = schedule
+                .dependencies(group)
+                .expect("validated execution order contains a known group")
+                .iter()
+                .map(|&dependency| {
+                    outputs[dependency]
+                        .as_ref()
+                        .expect("topological dependency has completed")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+            let mut hidden = self.architecture.begin_execution_group(
+                group,
+                &initial,
+                &dependency_refs,
                 state,
-                &mut forward.context,
+                &mut forward_context,
                 context,
             )?;
+            for dependency in schedule
+                .started(group)
+                .expect("topological execution starts only ready groups")
+            {
+                outputs[dependency] = None;
+            }
+            if self
+                .architecture
+                .should_execute_group(group, &forward_context)
+            {
+                for (index, unit) in self.units[group].iter_mut().enumerate() {
+                    hidden = self.architecture.forward_unit(
+                        group,
+                        index,
+                        unit,
+                        &hidden,
+                        state,
+                        &mut forward_context,
+                        context,
+                    )?;
+                }
+            }
+            hidden = self.architecture.complete_execution_group(
+                group,
+                &hidden,
+                state,
+                &mut forward_context,
+                context,
+            )?;
+            outputs[group] = Some(hidden);
+            schedule
+                .ordered(group)
+                .expect("started group can be ordered exactly once");
         }
+        let hidden = outputs[self.graph.output()]
+            .take()
+            .expect("validated graph output completed");
         self.architecture
-            .finish_forward(&forward.hidden, state, &forward.context, context)
+            .finish_forward(&hidden, state, &forward_context, context)
     }
 
     /// Borrows the architecture and its pinned parameter topology.
@@ -210,18 +329,21 @@ where
     }
 
     /// Borrows resident execution units for loading or inspection.
-    pub fn units(&self) -> &[A::Unit] {
+    pub fn units(&self) -> &[Vec<A::Unit>] {
         &self.units
     }
 
     /// Mutably borrows resident execution units for parameter binding.
-    pub fn units_mut(&mut self) -> &mut [A::Unit] {
+    pub fn units_mut(&mut self) -> &mut [Vec<A::Unit>] {
         &mut self.units
     }
 
     /// Decomposes the runtime without cloning backend-native values.
     pub fn into_parts(self) -> (A, Vec<A::Unit>) {
-        (self.architecture, self.units)
+        (
+            self.architecture,
+            self.units.into_iter().flatten().collect(),
+        )
     }
 }
 
@@ -285,6 +407,9 @@ where
     /// Invalid access to architecture-declared mutable state.
     #[error(transparent)]
     State(#[from] crate::StateError),
+    /// Architecture execution groups did not map to one stable residency-unit order.
+    #[error(transparent)]
+    Layout(#[from] crate::ExecutionUnitLayoutError),
     /// Unit acquisition or exact-completion failure.
     #[error("layerwise execution policy failed: {0}")]
     Policy(P),
@@ -348,53 +473,120 @@ where
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>> {
-        let count = self
+        let graph = self
             .architecture
-            .unit_count()
+            .execution_graph()
             .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut forward = self
+        let counts = (0..graph.groups().len())
+            .map(|group| {
+                self.architecture
+                    .group_unit_count(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let layout = ExecutionUnitLayout::new(&graph, counts)?;
+        let forward = self
             .architecture
             .begin_forward(input, state, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
         self.policy
             .begin(&forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
-        for index in 0..count {
-            let mut lease = self
-                .policy
-                .acquire(index, context)
-                .map_err(LayerwiseRuntimeError::Policy)?;
-            forward.hidden = self
+        let initial = forward.hidden;
+        let mut forward_context = forward.context;
+        let mut schedule = ExecutionGroupSchedule::new(&graph);
+        let mut outputs: Vec<Option<B::Tensor>> = vec![None; graph.groups().len()];
+        for &group in graph.execution_order() {
+            let dependencies = schedule
+                .dependencies(group)
+                .expect("validated execution order contains a known group")
+                .iter()
+                .map(|&dependency| {
+                    outputs[dependency]
+                        .as_ref()
+                        .expect("topological dependency has completed")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+            let mut hidden = self
                 .architecture
-                .forward_unit(
-                    index,
-                    &mut lease,
-                    &forward.hidden,
+                .begin_execution_group(
+                    group,
+                    &initial,
+                    &dependency_refs,
                     state,
-                    &mut forward.context,
+                    &mut forward_context,
                     context,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            let state_values = state
-                .retained_values(index)
-                .map_err(LayerwiseRuntimeError::State)?;
-            let context_values = self
+            for dependency in schedule
+                .started(group)
+                .expect("topological execution starts only ready groups")
+            {
+                outputs[dependency] = None;
+            }
+            if self
                 .architecture
-                .retained_context_values(&forward.context, index);
-            self.policy
-                .complete(
-                    index,
-                    lease,
-                    &forward.hidden,
-                    state_values,
-                    context_values,
-                    context,
-                )
-                .map_err(LayerwiseRuntimeError::Policy)?;
+                .should_execute_group(group, &forward_context)
+            {
+                for index in 0..layout
+                    .group_range(group)
+                    .expect("layout covers every graph group")
+                    .len()
+                {
+                    let ordinal = layout
+                        .ordinal(group, index)
+                        .expect("group-local unit belongs to the layout");
+                    let mut lease = self
+                        .policy
+                        .acquire(ordinal, context)
+                        .map_err(LayerwiseRuntimeError::Policy)?;
+                    hidden = self
+                        .architecture
+                        .forward_unit(
+                            group,
+                            index,
+                            &mut lease,
+                            &hidden,
+                            state,
+                            &mut forward_context,
+                            context,
+                        )
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
+                    let state_values = state
+                        .retained_values(ordinal)
+                        .map_err(LayerwiseRuntimeError::State)?;
+                    let context_values =
+                        self.architecture
+                            .retained_context_values(&forward_context, group, index);
+                    self.policy
+                        .complete(
+                            ordinal,
+                            lease,
+                            &hidden,
+                            state_values,
+                            context_values,
+                            context,
+                        )
+                        .map_err(LayerwiseRuntimeError::Policy)?;
+                }
+            }
+            hidden = self
+                .architecture
+                .complete_execution_group(group, &hidden, state, &mut forward_context, context)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            outputs[group] = Some(hidden);
+            schedule
+                .ordered(group)
+                .expect("started group can be ordered exactly once");
         }
+        let hidden = outputs[graph.output()]
+            .take()
+            .expect("validated graph output completed");
         let output = self
             .architecture
-            .finish_forward(&forward.hidden, state, &forward.context, context)
+            .finish_forward(&hidden, state, &forward_context, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
         self.policy
             .finish(&output, context)
@@ -413,54 +605,129 @@ where
     where
         A: ParallelLayeredArchitecture<B, S>,
     {
-        let count = self
+        let graph = self
             .architecture
-            .unit_count()
+            .execution_graph()
             .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut forward = self
+        let counts = (0..graph.groups().len())
+            .map(|group| {
+                self.architecture
+                    .group_unit_count(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let layout = ExecutionUnitLayout::new(&graph, counts)?;
+        let forward = self
             .architecture
             .begin_forward_parallel(input, state, parallel, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
         self.policy
             .begin(&forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
-        for index in 0..count {
-            let mut lease = self
-                .policy
-                .acquire(index, context)
-                .map_err(LayerwiseRuntimeError::Policy)?;
-            forward.hidden = self
+        let initial = forward.hidden;
+        let mut forward_context = forward.context;
+        let mut schedule = ExecutionGroupSchedule::new(&graph);
+        let mut outputs: Vec<Option<B::Tensor>> = vec![None; graph.groups().len()];
+        for &group in graph.execution_order() {
+            let dependencies = schedule
+                .dependencies(group)
+                .expect("validated execution order contains a known group")
+                .iter()
+                .map(|&dependency| {
+                    outputs[dependency]
+                        .as_ref()
+                        .expect("topological dependency has completed")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+            let mut hidden = self
                 .architecture
-                .forward_unit_parallel(
-                    index,
-                    &mut lease,
-                    &forward.hidden,
+                .begin_execution_group_parallel(
+                    group,
+                    &initial,
+                    &dependency_refs,
                     state,
-                    &mut forward.context,
+                    &mut forward_context,
                     parallel,
                     context,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            let state_values = state
-                .retained_values(index)
-                .map_err(LayerwiseRuntimeError::State)?;
-            let context_values = self
+            for dependency in schedule
+                .started(group)
+                .expect("topological execution starts only ready groups")
+            {
+                outputs[dependency] = None;
+            }
+            if self
                 .architecture
-                .retained_context_values(&forward.context, index);
-            self.policy
-                .complete(
-                    index,
-                    lease,
-                    &forward.hidden,
-                    state_values,
-                    context_values,
+                .should_execute_group(group, &forward_context)
+            {
+                for index in 0..layout
+                    .group_range(group)
+                    .expect("layout covers every graph group")
+                    .len()
+                {
+                    let ordinal = layout
+                        .ordinal(group, index)
+                        .expect("group-local unit belongs to the layout");
+                    let mut lease = self
+                        .policy
+                        .acquire(ordinal, context)
+                        .map_err(LayerwiseRuntimeError::Policy)?;
+                    hidden = self
+                        .architecture
+                        .forward_unit_parallel(
+                            group,
+                            index,
+                            &mut lease,
+                            &hidden,
+                            state,
+                            &mut forward_context,
+                            parallel,
+                            context,
+                        )
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
+                    let state_values = state
+                        .retained_values(ordinal)
+                        .map_err(LayerwiseRuntimeError::State)?;
+                    let context_values =
+                        self.architecture
+                            .retained_context_values(&forward_context, group, index);
+                    self.policy
+                        .complete(
+                            ordinal,
+                            lease,
+                            &hidden,
+                            state_values,
+                            context_values,
+                            context,
+                        )
+                        .map_err(LayerwiseRuntimeError::Policy)?;
+                }
+            }
+            hidden = self
+                .architecture
+                .complete_execution_group_parallel(
+                    group,
+                    &hidden,
+                    state,
+                    &mut forward_context,
+                    parallel,
                     context,
                 )
-                .map_err(LayerwiseRuntimeError::Policy)?;
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            outputs[group] = Some(hidden);
+            schedule
+                .ordered(group)
+                .expect("started group can be ordered exactly once");
         }
+        let hidden = outputs[graph.output()]
+            .take()
+            .expect("validated graph output completed");
         let output = self
             .architecture
-            .finish_forward_parallel(&forward.hidden, state, &forward.context, parallel, context)
+            .finish_forward_parallel(&hidden, state, &forward_context, parallel, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
         self.policy
             .finish(&output, context)
@@ -480,61 +747,128 @@ where
     where
         F: FnMut(&str, &B::Tensor, &B::Tensor) -> Result<Option<B::Tensor>, A::Error>,
     {
-        let count = self
+        let graph = self
             .architecture
-            .unit_count()
+            .execution_graph()
             .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut forward = self
+        let counts = (0..graph.groups().len())
+            .map(|group| {
+                self.architecture
+                    .group_unit_count(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let layout = ExecutionUnitLayout::new(&graph, counts)?;
+        let forward = self
             .architecture
             .begin_forward(input, state, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
         self.policy
             .begin(&forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
-        for index in 0..count {
-            let path = self
+        let initial = forward.hidden;
+        let mut forward_context = forward.context;
+        let mut schedule = ExecutionGroupSchedule::new(&graph);
+        let mut outputs: Vec<Option<B::Tensor>> = vec![None; graph.groups().len()];
+        for &group in graph.execution_order() {
+            let dependencies = schedule
+                .dependencies(group)
+                .expect("validated execution order contains a known group")
+                .iter()
+                .map(|&dependency| {
+                    outputs[dependency]
+                        .as_ref()
+                        .expect("topological dependency has completed")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+            let mut hidden = self
                 .architecture
-                .unit_path(index)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            let mut lease = self
-                .policy
-                .acquire(index, context)
-                .map_err(LayerwiseRuntimeError::Policy)?;
-            let input = forward.hidden.clone();
-            let output = self
-                .architecture
-                .forward_unit(
-                    index,
-                    &mut lease,
-                    &input,
+                .begin_execution_group(
+                    group,
+                    &initial,
+                    &dependency_refs,
                     state,
-                    &mut forward.context,
+                    &mut forward_context,
                     context,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            forward.hidden = hook(&path, &input, &output)
-                .map_err(LayerwiseRuntimeError::Architecture)?
-                .unwrap_or(output);
-            let state_values = state
-                .retained_values(index)
-                .map_err(LayerwiseRuntimeError::State)?;
-            let context_values = self
+            for dependency in schedule
+                .started(group)
+                .expect("topological execution starts only ready groups")
+            {
+                outputs[dependency] = None;
+            }
+            if self
                 .architecture
-                .retained_context_values(&forward.context, index);
-            self.policy
-                .complete(
-                    index,
-                    lease,
-                    &forward.hidden,
-                    state_values,
-                    context_values,
-                    context,
-                )
-                .map_err(LayerwiseRuntimeError::Policy)?;
+                .should_execute_group(group, &forward_context)
+            {
+                for index in 0..layout
+                    .group_range(group)
+                    .expect("layout covers every graph group")
+                    .len()
+                {
+                    let ordinal = layout
+                        .ordinal(group, index)
+                        .expect("group-local unit belongs to the layout");
+                    let path = self
+                        .architecture
+                        .unit_path(group, index)
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
+                    let mut lease = self
+                        .policy
+                        .acquire(ordinal, context)
+                        .map_err(LayerwiseRuntimeError::Policy)?;
+                    let unit_input = hidden.clone();
+                    let output = self
+                        .architecture
+                        .forward_unit(
+                            group,
+                            index,
+                            &mut lease,
+                            &unit_input,
+                            state,
+                            &mut forward_context,
+                            context,
+                        )
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
+                    hidden = hook(&path, &unit_input, &output)
+                        .map_err(LayerwiseRuntimeError::Architecture)?
+                        .unwrap_or(output);
+                    let state_values = state
+                        .retained_values(ordinal)
+                        .map_err(LayerwiseRuntimeError::State)?;
+                    let context_values =
+                        self.architecture
+                            .retained_context_values(&forward_context, group, index);
+                    self.policy
+                        .complete(
+                            ordinal,
+                            lease,
+                            &hidden,
+                            state_values,
+                            context_values,
+                            context,
+                        )
+                        .map_err(LayerwiseRuntimeError::Policy)?;
+                }
+            }
+            hidden = self
+                .architecture
+                .complete_execution_group(group, &hidden, state, &mut forward_context, context)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            outputs[group] = Some(hidden);
+            schedule
+                .ordered(group)
+                .expect("started group can be ordered exactly once");
         }
+        let hidden = outputs[graph.output()]
+            .take()
+            .expect("validated graph output completed");
         let output = self
             .architecture
-            .finish_forward(&forward.hidden, state, &forward.context, context)
+            .finish_forward(&hidden, state, &forward_context, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
         self.policy
             .finish(&output, context)

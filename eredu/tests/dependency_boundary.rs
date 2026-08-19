@@ -346,6 +346,9 @@ fn execution_group_orchestration_is_runtime_owned() {
     let layered = std::fs::read_to_string(workspace.join("eredu-runtime/src/layered.rs"))
         .expect("runtime layered execution must be readable");
     assert!(layered.contains("pub struct LayeredForwardState"));
+    assert!(layered.contains("fn group_unit_count"));
+    assert!(layered.contains("fn begin_execution_group"));
+    assert!(layered.contains("ExecutionGroupSchedule::new"));
 
     let mlx = std::fs::read_to_string(
         workspace.join("eredu/src/backend/mlx/runtime/execution/layerwise.rs"),
