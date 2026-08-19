@@ -1625,6 +1625,60 @@ fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
 }
 
 #[test]
+fn tiny_dense_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let dir = temp_model_dir(
+        r#"{
+              "model_type":"qwen3","hidden_size":16,"num_hidden_layers":2,
+              "intermediate_size":24,"num_attention_heads":4,"num_key_value_heads":2,
+              "head_dim":4,"rms_norm_eps":0.00001,"vocab_size":24,
+              "max_position_embeddings":64,"rope_theta":10000.0,
+              "tie_word_embeddings":false,"rope_scaling":null
+            }"#,
+    );
+    let args = dense_qwen::load_config(&dir).unwrap();
+    save_zero_checkpoint(&dense_qwen::Model::new(args, stream).unwrap(), &dir, stream);
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+
+    let mut resident =
+        crate::composition::mlx_architectures::qwen::dense::layerwise::load_safetensors(
+            &dir,
+            eredu_runtime::LayerWeightResidency::FullyResident,
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+    let mut resident_cache = resident.new_cache();
+    let resident_logits = resident
+        .forward(&tokens, None, &mut resident_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&resident_logits]).unwrap();
+    assert_eq!(resident_logits.shape(), &[1, 2, 24]);
+
+    let mut bounded =
+        crate::composition::mlx_architectures::qwen::dense::layerwise::load_safetensors(
+            &dir,
+            eredu_runtime::LayerwiseLoadOptions::default(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+    let mut bounded_cache = bounded.new_cache();
+    let bounded_logits = bounded
+        .forward(&tokens, None, &mut bounded_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    assert_eq!(bounded_logits.shape(), resident_logits.shape());
+    assert!(bounded.residency_report().unwrap().initialized());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn tiny_lfm2_moe_neutral_runtime_executes_independent_expert_cache() {
     let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));

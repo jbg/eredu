@@ -1241,12 +1241,18 @@ fn with_dense_qwen_cache<T>(
     };
     let result = execute(&mut owned);
     match (cache, owned) {
-        (ModelCache::KeyValue(values), DenseQwenLayerwiseCache::Concat { caches: restored, .. }) => {
-            *values = restored
-        }
-        (ModelCache::PagedKeyValue(values), DenseQwenLayerwiseCache::Paged { caches: restored, .. }) => {
-            *values = restored
-        }
+        (
+            ModelCache::KeyValue(values),
+            DenseQwenLayerwiseCache::Concat {
+                caches: restored, ..
+            },
+        ) => *values = restored,
+        (
+            ModelCache::PagedKeyValue(values),
+            DenseQwenLayerwiseCache::Paged {
+                caches: restored, ..
+            },
+        ) => *values = restored,
         _ => unreachable!("dense Qwen tensor-parallel cache wrapper changed variants"),
     }
     result

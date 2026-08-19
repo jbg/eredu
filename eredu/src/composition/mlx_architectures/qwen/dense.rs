@@ -699,7 +699,7 @@ impl Attention {
         input: AttentionInput<'_, C>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut dyn ActivationObserver,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache,
@@ -1039,7 +1039,7 @@ impl SparseMoeBlock {
         hidden_states: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut dyn ActivationObserver,
     ) -> Result<Array, Exception> {
         let shape = hidden_states.shape();
         let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
@@ -1218,7 +1218,7 @@ impl FeedForward {
         input: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut dyn ActivationObserver,
     ) -> Result<Array, Exception> {
         match self {
             Self::Dense(mlp) => mlp.forward_with_observer(input, stream, prefix, observer),
@@ -1414,7 +1414,7 @@ impl TransformerBlock {
         input: AttentionInput<'_, C>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut dyn ActivationObserver,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache,
@@ -2200,7 +2200,7 @@ impl Decoder {
         &mut self,
         input: ModelInput<'_, C>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut dyn ActivationObserver,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache + Default,
@@ -2383,7 +2383,7 @@ impl Model {
         &mut self,
         input: ModelInput<'_, C>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut dyn ActivationObserver,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache + Default,
