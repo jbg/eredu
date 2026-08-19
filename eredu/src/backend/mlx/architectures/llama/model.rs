@@ -25,7 +25,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::tensor::{
         create_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
+        rope::{initialize_rope, validate_rope_scaling_config, FloatOrString, RopeVariant},
         AttentionMask,
     },
     backend::mlx::nn::{
@@ -1294,6 +1294,7 @@ fn validate_model_args(model_args: &ModelArgs) -> Result<(), Error> {
             )));
         }
     }
+    validate_rope_scaling_config(&model_args.rope_scaling)?;
     Ok(())
 }
 

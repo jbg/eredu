@@ -51,7 +51,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::tensor::{
         create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
+        rope::{initialize_rope, validate_rope_scaling_config, FloatOrString, RopeVariant},
     },
     backend::mlx::nn::{
         self as common,
@@ -5288,6 +5288,7 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
 }
 
 pub(super) fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
+    validate_rope_scaling_config(&args.rope_scaling)?;
     for (name, value) in [
         ("hidden_size", args.hidden_size),
         ("num_hidden_layers", args.num_hidden_layers),

@@ -17,6 +17,8 @@ use safemlx::{
 };
 use serde::Deserialize;
 
+use crate::backend::mlx::error::Error;
+
 #[derive(Debug, Clone, PartialEq)]
 /// Borrowed scalar value from a RoPE scaling config.
 pub enum FloatOrStr<'a> {
@@ -72,6 +74,36 @@ fn get_numeric_from_config(
             .parse::<f32>()
             .map_err(|_| Exception::custom(format!(r#"key "{key}" is not a valid number"#))),
         FloatOrStr::Bool(_) => Err(Exception::custom(format!(r#"key "{key}" is not numeric"#))),
+    }
+}
+
+/// Rejects RoPE scaling modes that the shared MLX initializer cannot execute.
+///
+/// Model configuration paths call this before allocating model state so an
+/// unsupported mode is reported as an architecture error rather than reaching
+/// backend construction.
+pub(crate) fn validate_rope_scaling_config(
+    scaling_config: &Option<HashMap<String, FloatOrString>>,
+) -> Result<(), Error> {
+    let Some(config) = scaling_config else {
+        return Ok(());
+    };
+    let Some(rope_type) = config.get("type").or_else(|| config.get("rope_type")) else {
+        return Ok(());
+    };
+    let FloatOrString::String(rope_type) = rope_type else {
+        return Err(Error::UnsupportedArchitecture(
+            "RoPE scaling field type or rope_type must be a string".into(),
+        ));
+    };
+    match rope_type.as_str() {
+        "default" | "linear" | "llama3" | "proportional" | "yarn" => Ok(()),
+        "longrope" => Err(Error::UnsupportedArchitecture(
+            "RoPE scaling type \"longrope\" is unsupported; LongRoPE is not implemented".into(),
+        )),
+        other => Err(Error::UnsupportedArchitecture(format!(
+            "RoPE scaling type {other:?} is unsupported"
+        ))),
     }
 }
 
@@ -555,6 +587,8 @@ pub fn initialize_rope(
     _max_position_embeddings: i32,
     stream: &Stream,
 ) -> Result<RopeVariant, Exception> {
+    validate_rope_scaling_config(scaling_config)
+        .map_err(|error| Exception::custom(error.to_string()))?;
     let rope_type = scaling_config
         .as_ref()
         .and_then(|config| {
@@ -656,8 +690,6 @@ pub fn initialize_rope(
             value_or("mscale_all_dim", 0.0)?,
             truncate,
         )));
-    } else if rope_type == FloatOrStr::Str("longrope") {
-        todo!()
     }
 
     Err(Exception::custom(format!(
@@ -667,7 +699,40 @@ pub fn initialize_rope(
 
 #[cfg(test)]
 mod tests {
-    use super::{proportional_frequency_values, proportional_rotary_dims, yarn_frequency_values};
+    use std::collections::HashMap;
+
+    use safemlx::{Device, DeviceType, Stream};
+
+    use super::{
+        initialize_rope, proportional_frequency_values, proportional_rotary_dims,
+        validate_rope_scaling_config, yarn_frequency_values, FloatOrString,
+    };
+    use crate::backend::mlx::error::Error;
+
+    fn longrope_config() -> Option<HashMap<String, FloatOrString>> {
+        Some(HashMap::from([(
+            "rope_type".into(),
+            FloatOrString::String("longrope".into()),
+        )]))
+    }
+
+    #[test]
+    fn longrope_is_a_structured_unsupported_architecture_error() {
+        let error = validate_rope_scaling_config(&longrope_config()).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UnsupportedArchitecture(detail)
+                if detail == "RoPE scaling type \"longrope\" is unsupported; LongRoPE is not implemented"
+        ));
+    }
+
+    #[test]
+    fn longrope_initializer_returns_instead_of_panicking() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let error =
+            initialize_rope(64, 10_000.0, false, &longrope_config(), 4096, &stream).unwrap_err();
+        assert!(error.to_string().contains("LongRoPE is not implemented"));
+    }
 
     #[test]
     fn proportional_rope_uses_full_half_head_frequency_layout() {

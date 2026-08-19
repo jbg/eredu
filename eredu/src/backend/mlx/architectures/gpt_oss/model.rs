@@ -32,7 +32,7 @@ use crate::{
         generation::CausalLm,
         tensor::{
             create_causal_mask,
-            rope::{initialize_rope, FloatOrString, RopeVariant},
+            rope::{initialize_rope, validate_rope_scaling_config, FloatOrString, RopeVariant},
         },
     },
     backend::mlx::runtime::cache::residency::{
@@ -246,6 +246,7 @@ impl ModelArgs {
                 )));
             }
         }
+        validate_rope_scaling_config(&self.rope_scaling)?;
         Ok(())
     }
 }

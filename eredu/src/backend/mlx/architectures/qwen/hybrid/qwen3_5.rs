@@ -50,7 +50,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::tensor::{
         create_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
+        rope::{initialize_rope, validate_rope_scaling_config, FloatOrString, RopeVariant},
         AttentionMask,
     },
     backend::mlx::nn::{
@@ -6381,6 +6381,7 @@ pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> 
 }
 
 pub(crate) fn validate_text_model_args(args: &ModelArgs, architecture: &str) -> Result<(), Error> {
+    validate_rope_scaling_config(&args.rope_config())?;
     for (name, value) in [
         ("vocab_size", args.vocab_size),
         ("hidden_size", args.hidden_size),
