@@ -10,12 +10,12 @@ use eredu_checkpoint::{
     WeightQuantization,
 };
 use eredu_runtime::{
-    DenseDiskStreamLoadOptions, ExecutionResidency, LayerWeightResidency, LayerwiseLoadOptions,
-    OffloadUnit, WeightBinding, DENSE_TRANSFER_WINDOW,
+    DenseDiskStreamLoadOptions, DenseTransferSchedule, ExecutionResidency, LayerWeightResidency,
+    LayerwiseLoadOptions, OffloadUnit, WeightBinding, DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     ops::Range,
     path::Path,
     sync::{Arc, Mutex},
@@ -753,29 +753,24 @@ impl DenseStreamController {
         indices: impl IntoIterator<Item = usize>,
         prefill: bool,
     ) -> Result<DenseTransferWindow, Error> {
-        let indices = indices.into_iter().collect::<VecDeque<_>>();
-        let mut prior = None;
-        for &index in &indices {
-            if index >= units.len() || prior.is_some_and(|prior| prior >= index) {
-                return Err(LayerwiseModelError::InvalidDenseTransferWindow {
-                    index,
-                    unit_count: units.len(),
-                }
-                .into());
+        let indices = indices.into_iter().collect::<Vec<_>>();
+        if let Some(&index) = indices.iter().find(|&&index| index >= units.len()) {
+            return Err(LayerwiseModelError::InvalidDenseTransferWindow {
+                index,
+                unit_count: units.len(),
             }
-            prior = Some(index);
+            .into());
         }
         let mut window = DenseTransferWindow {
             controller: Arc::clone(self),
             manager: manager.clone(),
             group: group.into(),
             units: units.to_vec(),
-            pending: indices,
-            ready: VecDeque::new(),
+            schedule: DenseTransferSchedule::new(indices, DENSE_TRANSFER_WINDOW)?,
             prefill,
         };
         if let Err(error) = window.refill() {
-            if window.ready.is_empty() || !is_temporary_residency_contention(&error) {
+            if !window.schedule.has_ready() || !is_temporary_residency_contention(&error) {
                 return Err(error);
             }
         }
@@ -1121,28 +1116,28 @@ pub(crate) struct DenseTransferWindow {
     manager: ResidencyManager,
     group: String,
     units: Vec<OffloadUnitId>,
-    pending: VecDeque<usize>,
-    ready: VecDeque<DensePreparedTransfer>,
+    schedule: DenseTransferSchedule<DensePreparedTransfer>,
     prefill: bool,
 }
 
 impl DenseTransferWindow {
     fn has_ready(&self) -> bool {
-        !self.ready.is_empty()
+        self.schedule.has_ready()
     }
 
     fn is_exhausted(&self) -> bool {
-        self.ready.is_empty() && self.pending.is_empty()
+        self.schedule.is_exhausted()
     }
 
     /// Takes the next transfer after ordering `consumer` behind its event.
     pub(crate) fn next(&mut self, consumer: &Stream) -> Result<DensePreparedTransfer, Error> {
-        let transfer = self.ready.pop_front().ok_or({
+        let (index, transfer) = self.schedule.pop_ready().ok_or({
             LayerwiseModelError::InvalidDenseTransferWindow {
                 index: self.units.len(),
                 unit_count: self.units.len(),
             }
         })?;
+        debug_assert_eq!(transfer.index(), index);
         transfer.transfer.wait_on(consumer)?;
         Ok(transfer)
     }
@@ -1152,20 +1147,10 @@ impl DenseTransferWindow {
     /// The completed [`DensePreparedTransfer`] must be dropped before this is
     /// called so the fixed two-layer device budget can admit the replacement.
     pub(crate) fn refill(&mut self) -> Result<(), Error> {
-        let device_indices = self
-            .ready
-            .iter()
-            .map(DensePreparedTransfer::index)
-            .chain(self.pending.iter().copied())
-            .take(DENSE_TRANSFER_WINDOW)
-            .collect::<Vec<_>>();
+        let device_indices = self.schedule.desired_indices(DENSE_TRANSFER_WINDOW);
         let host_indices = if self.controller.background.is_some() {
-            self.ready
-                .iter()
-                .map(DensePreparedTransfer::index)
-                .chain(self.pending.iter().copied())
-                .take(self.controller.options.host_lookahead)
-                .collect::<Vec<_>>()
+            self.schedule
+                .desired_indices(self.controller.options.host_lookahead)
         } else {
             Vec::new()
         };
@@ -1192,8 +1177,8 @@ impl DenseTransferWindow {
                 background.submit(id)?;
             }
         }
-        while self.ready.len() < DENSE_TRANSFER_WINDOW {
-            let Some(&index) = self.pending.front() else {
+        while self.schedule.can_admit() {
+            let Some(index) = self.schedule.next_pending() else {
                 break;
             };
             let id = &self.units[index];
@@ -1209,9 +1194,8 @@ impl DenseTransferWindow {
             let transfer = self
                 .manager
                 .acquire_many_with_transfer(&[(id.clone(), 1)], MemoryTier::Device)?;
-            self.pending.pop_front();
-            self.ready
-                .push_back(DensePreparedTransfer { index, transfer });
+            self.schedule
+                .admit(index, DensePreparedTransfer { index, transfer })?;
         }
         self.controller
             .observe_group(&self.manager, &self.group, self.prefill)?;

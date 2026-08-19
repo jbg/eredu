@@ -1,5 +1,7 @@
 //! Backend-neutral immutable-weight residency policy.
 
+use std::collections::VecDeque;
+
 use eredu_core::{
     residency::{CacheEvictionPolicy, OffloadConfig, OffloadError},
     DEFAULT_MAX_MAPPED_SHARDS,
@@ -7,6 +9,133 @@ use eredu_core::{
 
 /// Current plus next unit retained by dense streamed execution.
 pub const DENSE_TRANSFER_WINDOW: usize = 2;
+
+/// Ordered bounded transfer cursor used by dense streamed execution.
+#[derive(Debug)]
+pub struct DenseTransferSchedule<T> {
+    capacity: usize,
+    pending: VecDeque<usize>,
+    ready: VecDeque<(usize, T)>,
+}
+
+impl<T> DenseTransferSchedule<T> {
+    /// Creates a cursor over the remaining unit indices.
+    pub fn new(
+        pending: impl IntoIterator<Item = usize>,
+        capacity: usize,
+    ) -> Result<Self, DenseTransferScheduleError> {
+        if capacity == 0 {
+            return Err(DenseTransferScheduleError::ZeroCapacity);
+        }
+        let pending = pending.into_iter().collect::<VecDeque<_>>();
+        let mut previous = None;
+        for &index in &pending {
+            if previous.is_some_and(|previous| previous >= index) {
+                return Err(DenseTransferScheduleError::UnorderedPending {
+                    previous: previous.expect("an invalid pair has a previous index"),
+                    actual: index,
+                });
+            }
+            previous = Some(index);
+        }
+        Ok(Self {
+            capacity,
+            pending,
+            ready: VecDeque::new(),
+        })
+    }
+
+    /// Returns whether at least one submitted transfer is ready for consumption.
+    pub fn has_ready(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
+    /// Returns whether no ready or pending units remain.
+    pub fn is_exhausted(&self) -> bool {
+        self.ready.is_empty() && self.pending.is_empty()
+    }
+
+    /// Returns whether another transfer may be admitted into the bounded ready window.
+    pub fn can_admit(&self) -> bool {
+        self.ready.len() < self.capacity && !self.pending.is_empty()
+    }
+
+    /// Returns the next unit which must be submitted.
+    pub fn next_pending(&self) -> Option<usize> {
+        self.pending.front().copied()
+    }
+
+    /// Returns the current ready indices followed by future indices, truncated to lookahead.
+    pub fn desired_indices(&self, lookahead: usize) -> Vec<usize> {
+        self.ready
+            .iter()
+            .map(|(index, _)| *index)
+            .chain(self.pending.iter().copied())
+            .take(lookahead)
+            .collect()
+    }
+
+    /// Commits one successfully submitted transfer in exact pending order.
+    pub fn admit(&mut self, index: usize, transfer: T) -> Result<(), DenseTransferScheduleError> {
+        if self.ready.len() >= self.capacity {
+            return Err(DenseTransferScheduleError::CapacityExceeded {
+                capacity: self.capacity,
+            });
+        }
+        let expected = self
+            .pending
+            .front()
+            .copied()
+            .ok_or(DenseTransferScheduleError::NoPendingUnit)?;
+        if expected != index {
+            return Err(DenseTransferScheduleError::OutOfOrder {
+                expected,
+                actual: index,
+            });
+        }
+        self.pending.pop_front();
+        self.ready.push_back((index, transfer));
+        Ok(())
+    }
+
+    /// Removes the oldest ready transfer for execution.
+    pub fn pop_ready(&mut self) -> Option<(usize, T)> {
+        self.ready.pop_front()
+    }
+}
+
+/// Invalid transition in a bounded dense transfer schedule.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum DenseTransferScheduleError {
+    /// A transfer window cannot have zero capacity.
+    #[error("dense transfer window capacity must be nonzero")]
+    ZeroCapacity,
+    /// Pending units were not supplied in strictly increasing order.
+    #[error("dense transfer pending unit {actual} does not follow {previous}")]
+    UnorderedPending {
+        /// Previous index.
+        previous: usize,
+        /// Invalid next index.
+        actual: usize,
+    },
+    /// Admission was attempted while the ready window was full.
+    #[error("dense transfer window exceeds its capacity of {capacity}")]
+    CapacityExceeded {
+        /// Configured ready capacity.
+        capacity: usize,
+    },
+    /// Admission was attempted after all pending units were submitted.
+    #[error("dense transfer schedule has no pending unit")]
+    NoPendingUnit,
+    /// A backend submitted transfers in a different order from the architecture sequence.
+    #[error("dense transfer schedule expected unit {expected}, received {actual}")]
+    OutOfOrder {
+        /// Required next index.
+        expected: usize,
+        /// Submitted index.
+        actual: usize,
+    },
+}
 
 /// Loader controls for a host-backed layerwise execution engine.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -289,5 +418,30 @@ mod tests {
         assert_eq!(offload.device_budget_bytes(), Some(32));
         assert_eq!(offload.host_budget_bytes(), Some(64));
         assert_eq!(offload.prefetch_depth(), 3);
+    }
+
+    #[test]
+    fn dense_transfer_schedule_preserves_order_and_bounded_lookahead() {
+        let mut schedule = DenseTransferSchedule::new(3..7, 2).unwrap();
+        assert_eq!(schedule.desired_indices(3), vec![3, 4, 5]);
+        assert_eq!(
+            schedule.admit(4, "wrong"),
+            Err(DenseTransferScheduleError::OutOfOrder {
+                expected: 3,
+                actual: 4,
+            })
+        );
+        schedule.admit(3, "three").unwrap();
+        schedule.admit(4, "four").unwrap();
+        assert!(!schedule.can_admit());
+        assert_eq!(schedule.desired_indices(3), vec![3, 4, 5]);
+        assert_eq!(schedule.pop_ready(), Some((3, "three")));
+        schedule.admit(5, "five").unwrap();
+        assert_eq!(schedule.desired_indices(4), vec![4, 5, 6]);
+        assert_eq!(schedule.pop_ready(), Some((4, "four")));
+        assert_eq!(schedule.pop_ready(), Some((5, "five")));
+        schedule.admit(6, "six").unwrap();
+        assert_eq!(schedule.pop_ready(), Some((6, "six")));
+        assert!(schedule.is_exhausted());
     }
 }

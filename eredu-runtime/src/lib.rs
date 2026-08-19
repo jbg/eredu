@@ -76,8 +76,9 @@ pub use state::{
     StateLayout, StateResidencyPlan,
 };
 pub use weight_residency::{
-    DenseDiskStreamLoadOptions, ExecutionResidency, LayerWeightResidency, LayerwiseLoadOptions,
-    WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
+    DenseDiskStreamLoadOptions, DenseTransferSchedule, DenseTransferScheduleError,
+    ExecutionResidency, LayerWeightResidency, LayerwiseLoadOptions, WeightResidencyPolicyError,
+    DENSE_TRANSFER_WINDOW,
 };
 
 /// Inspectable architecture/runtime topology without backend-native values.

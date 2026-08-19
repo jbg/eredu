@@ -43,6 +43,10 @@ pub enum Error {
     #[error(transparent)]
     WeightResidencyPolicy(#[from] eredu_runtime::WeightResidencyPolicyError),
 
+    /// Invalid backend-neutral dense transfer-window transition.
+    #[error(transparent)]
+    DenseTransferSchedule(#[from] eredu_runtime::DenseTransferScheduleError),
+
     /// Invalid composed architecture configuration or state usage.
     #[error("architecture model error: {0}")]
     ArchitectureModel(String),

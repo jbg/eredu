@@ -243,6 +243,7 @@ fn immutable_weight_residency_policy_is_runtime_owned() {
     for runtime_owned in [
         "pub struct LayerwiseLoadOptions",
         "pub struct DenseDiskStreamLoadOptions",
+        "pub struct DenseTransferSchedule",
         "pub enum LayerWeightResidency",
         "pub enum ExecutionResidency",
     ] {
@@ -261,6 +262,8 @@ fn immutable_weight_residency_policy_is_runtime_owned() {
         for runtime_owned in [
             "pub struct LayerwiseLoadOptions",
             "pub struct DenseDiskStreamLoadOptions",
+            "pending: VecDeque<usize>",
+            "ready: VecDeque<DensePreparedTransfer>",
             "pub enum LayerWeightResidency",
             "pub enum ExecutionResidency",
         ] {
