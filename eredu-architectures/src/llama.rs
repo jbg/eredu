@@ -19,6 +19,7 @@ use eredu_nn::{
     NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterSpec, RotaryOperator,
     RotarySpec, Tensor,
 };
+use eredu_runtime::{ModelStateIdentity, StateLayout};
 
 /// Geometry consumed by the shared Llama implementation.
 pub trait Config {
@@ -61,6 +62,41 @@ pub fn cache_layout<C: Config>(config: &C) -> Result<LayerSchedule<LayerCachePol
             config.attention_schedule().len(),
         ),
     )
+}
+
+/// Declares the complete mutable-state geometry consumed by either resident
+/// or bounded-residency execution.
+pub fn state_layout<C: Config>(config: &C) -> Result<StateLayout, Error> {
+    StateLayout::new(cache_layout(config)?).map_err(Error::backend)
+}
+
+/// Declares Llama's cache compatibility identity independently of its state
+/// storage backend.
+pub fn state_identity(
+    args: &ModelArgs,
+    layout: &StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+) -> Result<ModelStateIdentity, Error> {
+    let global_layer_end = global_layer_start
+        .checked_add(layout.len())
+        .ok_or_else(|| Error::backend("Llama owned layer range overflowed"))?;
+    let layer_count = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    if global_layer_end > layer_count {
+        return Err(Error::backend(format!(
+            "Llama owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
+        )));
+    }
+    Ok(ModelStateIdentity {
+        model_family: "llama".into(),
+        effective_model_type: args.model_type.clone(),
+        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+        layer_count,
+        global_layer_start,
+        sink_tokens: 0,
+        layer_prefix_offsets: vec![0; layout.len()],
+        topology,
+    })
 }
 
 /// Derives a cache layout with backend/distribution-local key/value head counts.

@@ -9,11 +9,15 @@ use safemlx::{
 };
 
 use crate::{
+    backend::mlx::nn::shared::MlxBackend,
     backend::mlx::runtime::cache::residency::{
         CacheBlockArrays, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,
     },
     core::cache::{CacheBlockId, CacheRankIdentity, CacheRepresentation},
 };
+
+type RetainedArrayIter<'a> =
+    std::iter::Chain<std::option::Iter<'a, Array>, std::option::Iter<'a, Array>>;
 
 // TODO: somehow move quantized methods to a separate trait?
 /// A per-layer attention key/value cache.
@@ -2150,6 +2154,14 @@ impl KeyValueCache for PagedKeyValueCache {
     }
 }
 
+impl eredu_runtime::RuntimeLayerState<MlxBackend> for PagedKeyValueCache {
+    type RetainedValues<'a> = RetainedArrayIter<'a>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        self.tail_keys.iter().chain(self.tail_values.iter())
+    }
+}
+
 pub(crate) struct KeyValueAttentionBlock {
     pub(crate) start: i64,
     pub(crate) end: i64,
@@ -2913,6 +2925,14 @@ impl KeyValueCache for ConcatKeyValueCache {
             .try_index_mut_device((.., .., self.length..required, ..), &values, stream)?;
         self.length = required;
         self.logical_arrays(stream)
+    }
+}
+
+impl eredu_runtime::RuntimeLayerState<MlxBackend> for ConcatKeyValueCache {
+    type RetainedValues<'a> = RetainedArrayIter<'a>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        self.keys.iter().chain(self.values.iter())
     }
 }
 

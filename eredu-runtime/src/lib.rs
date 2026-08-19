@@ -13,6 +13,8 @@ pub mod execution;
 pub mod parameter;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
 pub mod residency;
+/// Architecture-declared mutable state and concrete runtime realizations.
+pub mod state;
 
 pub use backend::{CollectiveBackend, ParameterBackend, SubmissionBackend, TransferBackend};
 pub use execution::{
@@ -27,6 +29,10 @@ pub use residency::{
     ResidencyDeclarationError, ResidencyReport, ResidencyWindowError, ResidencyWindowManager,
     ResidentLayerGroup, ResidentLayerGroupReport, WeightBinding, WeightBindingSelectionError,
     WeightMaterializationReport,
+};
+pub use state::{
+    DeviceState, ModelStateIdentity, PagedStatePlan, RuntimeLayerState, RuntimeState, StateError,
+    StateLayout, StateResidencyPlan,
 };
 
 /// Inspectable architecture/runtime topology without backend-native values.
