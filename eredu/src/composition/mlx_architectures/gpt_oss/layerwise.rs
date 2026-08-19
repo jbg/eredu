@@ -40,7 +40,7 @@ use crate::{
     },
     backend::mlx::nn::{self as common},
     backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
-    backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
+    backend::mlx::runtime::cache::{KeyValueCache, PagedKeyValueCache},
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes_excluding, build_module_bindings,
         populate_module_from_lease, populate_module_from_lease_excluding,
@@ -139,20 +139,7 @@ impl GptOssLayerwiseModel {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Exception::custom(error.to_string()))?;
                 let rank = self.execution.prompt_cache_rank_identity();
-                let layers = adapter
-                    .attention_schedule
-                    .iter()
-                    .enumerate()
-                    .map(|(layer, policy)| {
-                        let window = policy.window().map(|window| {
-                            i32::try_from(window.get())
-                                .expect("validated GPT-OSS sliding window fits i32")
-                        });
-                        PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
-                            .map(LayerCache::Paged)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Cache { layers })
+                Cache::new_paged(adapter.args(), manager, rank).map_err(Into::into)
             }
         }
     }
@@ -217,7 +204,13 @@ impl GptOssLayerwiseModel {
                 PagedKeyValueCache::new(manager.clone(), layer, window).map(LayerCache::Paged)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((Cache { layers }, manifest))
+        Ok((
+            Cache {
+                layout: Some(resident::state_layout(args)?),
+                layers,
+            },
+            manifest,
+        ))
     }
 
     /// Persists a prefix through the generalized execution contract.
@@ -750,21 +743,7 @@ impl GptOssLayerwiseAdapter {
     }
 
     fn new_cache(&self) -> Cache {
-        Cache {
-            layers: self
-                .attention_schedule
-                .iter()
-                .map(|policy| match policy.window() {
-                    Some(window) => {
-                        LayerCache::Sliding(ConcatKeyValueCache::new_for_sliding_attention(
-                            i32::try_from(window.get())
-                                .expect("validated GPT-OSS sliding window fits i32"),
-                        ))
-                    }
-                    None => LayerCache::Full(ConcatKeyValueCache::new()),
-                })
-                .collect(),
-        }
+        Cache::new_device(&self.args).expect("validated GPT-OSS cache geometry remains valid")
     }
 
     fn layer_recipes(
@@ -1062,11 +1041,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
             open_prompt_cache(directory, expected, identity, prefix_token_ids, options)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         Ok((
-            Cache::new_paged(
-                &self.args.attention_schedule,
-                manager,
-                identity.topology.cache_rank_identity(),
-            )?,
+            Cache::new_paged(&self.args, manager, identity.topology.cache_rank_identity())?,
             manifest,
         ))
     }

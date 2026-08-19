@@ -4777,7 +4777,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let mut state = MlxKeyValueState::paged(layout, manager.clone(), None).unwrap();
+        let mut state = MlxKeyValueState::paged(layout.clone(), manager.clone(), None).unwrap();
         assert!(state.clear().is_err());
         assert_eq!(manager.lock().unwrap().blocks.len(), 1);
 
@@ -4797,6 +4797,7 @@ mod tests {
 
         let manager = manager_with_leased_block();
         let gpt_cache = || GptOssCache {
+            layout: Some(layout.clone()),
             layers: vec![GptOssLayerCache::Paged(
                 PagedKeyValueCache::new(manager.clone(), 0, None).unwrap(),
             )],

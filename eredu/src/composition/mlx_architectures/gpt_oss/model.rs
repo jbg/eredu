@@ -2,7 +2,7 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
 use std::{collections::HashMap, path::Path};
 
@@ -1174,6 +1174,14 @@ pub enum LayerCache {
     Paged(PagedKeyValueCache),
 }
 
+impl RuntimeLayerState<crate::backend::mlx::nn::shared::MlxBackend> for LayerCache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        KeyValueCache::retained_arrays(self).into_iter()
+    }
+}
+
 impl LayerCache {
     pub(crate) fn attention_policy(&self) -> Result<AttentionPolicy, Exception> {
         fn sliding(window: i32) -> Result<AttentionPolicy, Exception> {
@@ -1271,17 +1279,44 @@ impl KeyValueCache for LayerCache {
 /// Heterogeneous generation cache for GPT-OSS.
 #[derive(Debug, Clone, Default)]
 pub struct Cache {
+    pub(crate) layout: Option<StateLayout>,
     /// One cache per decoder block.
     pub layers: Vec<LayerCache>,
 }
 
 impl Cache {
-    pub(crate) fn new_paged(
+    pub(crate) fn new_device(args: &ModelArgs) -> Result<Self, Exception> {
+        Self::new_device_with_layout(&args.attention_schedule, state_layout(args)?)
+    }
+
+    fn new_device_with_layout(
         attention_schedule: &LayerSchedule<AttentionPolicy>,
+        layout: StateLayout,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            layout: Some(layout),
+            layers: attention_schedule
+                .iter()
+                .map(|policy| match policy.window() {
+                    Some(window) => {
+                        LayerCache::Sliding(ConcatKeyValueCache::new_for_sliding_attention(
+                            i32::try_from(window.get())
+                                .expect("validated GPT-OSS sliding window fits i32"),
+                        ))
+                    }
+                    None => LayerCache::Full(ConcatKeyValueCache::new()),
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn new_paged(
+        args: &ModelArgs,
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
-        let layers = attention_schedule
+        let layers = args
+            .attention_schedule
             .iter()
             .enumerate()
             .map(|(layer, policy)| {
@@ -1292,7 +1327,10 @@ impl Cache {
                     .map(LayerCache::Paged)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { layers })
+        Ok(Self {
+            layout: Some(state_layout(args)?),
+            layers,
+        })
     }
 
     pub(crate) fn reset(&mut self) -> Result<(), Exception> {
@@ -1351,10 +1389,62 @@ impl Cache {
     }
 }
 
+pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Exception> {
+    let policies = args
+        .attention_schedule
+        .iter()
+        .copied()
+        .map(|attention| {
+            eredu_core::cache::LayerCachePolicy::key_value(
+                attention,
+                args.num_key_value_heads,
+                args.head_dim,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    StateLayout::new(
+        eredu_core::LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| Exception::custom(error.to_string()))?,
+    )
+    .map_err(|error| Exception::custom(error.to_string()))
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        self.layout
+            .as_ref()
+            .expect("GPT-OSS cache is initialized before runtime state inspection")
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() != 0 {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: 1,
+            });
+        }
+        self.layers
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.layers.len(),
+            })
+            .map(|layer| RuntimeLayerState::retained_values(layer))
+    }
+}
+
 /// GPT-OSS transformer body.
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct GptOssModel {
     attention_schedule: LayerSchedule<AttentionPolicy>,
+    cache_layout: StateLayout,
     #[param]
     /// Token embedding table.
     pub embed_tokens: MaybeQuantized<nn::Embedding>,
@@ -1370,6 +1460,7 @@ impl GptOssModel {
     fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             attention_schedule: args.attention_schedule.clone(),
+            cache_layout: state_layout(args)?,
             embed_tokens: common::linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
                 args.hidden_size,
@@ -1389,21 +1480,8 @@ impl GptOssModel {
     }
 
     fn new_cache(&self) -> Cache {
-        Cache {
-            layers: self
-                .attention_schedule
-                .iter()
-                .map(|policy| match policy.window() {
-                    Some(window) => {
-                        LayerCache::Sliding(ConcatKeyValueCache::new_for_sliding_attention(
-                            i32::try_from(window.get())
-                                .expect("validated GPT-OSS sliding window fits i32"),
-                        ))
-                    }
-                    None => LayerCache::Full(ConcatKeyValueCache::new()),
-                })
-                .collect(),
-        }
+        Cache::new_device_with_layout(&self.attention_schedule, self.cache_layout.clone())
+            .expect("validated GPT-OSS cache geometry remains valid")
     }
 
     fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
@@ -1422,7 +1500,22 @@ impl GptOssModel {
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Cache, Exception> {
-        Cache::new_paged(&self.attention_schedule, manager, rank)
+        let layers = self
+            .attention_schedule
+            .iter()
+            .enumerate()
+            .map(|(layer, policy)| {
+                let window = policy.window().map(|window| {
+                    i32::try_from(window.get()).expect("validated GPT-OSS sliding window fits i32")
+                });
+                PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
+                    .map(LayerCache::Paged)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Cache {
+            layout: Some(self.cache_layout.clone()),
+            layers,
+        })
     }
 
     pub(crate) fn forward(

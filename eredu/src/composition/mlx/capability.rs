@@ -2620,6 +2620,24 @@ mod tests {
             ],
         )
         .unwrap();
+        let state_layout = gpt_oss::state_layout(&args).unwrap();
+        assert_eq!(state_layout.len(), 4);
+        for (layer, attention) in args.attention_schedule.iter().copied().enumerate() {
+            assert_eq!(
+                state_layout.layer(layer),
+                Some(
+                    &eredu_core::cache::LayerCachePolicy::key_value(
+                        attention,
+                        args.num_key_value_heads,
+                        args.head_dim,
+                    )
+                    .unwrap()
+                )
+            );
+        }
+        let cache = gpt_oss::Cache::new_device(&args).unwrap();
+        assert_eq!(cache.layout.as_ref(), Some(&state_layout));
+        assert_eq!(cache.layers.len(), state_layout.len());
         let (_, _, strategy, _, estimate) = gpt_oss_spec(&args).unwrap();
         assert_eq!(
             strategy,
