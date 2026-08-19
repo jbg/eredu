@@ -3,9 +3,7 @@
 use eredu_checkpoint::AffineQuantization;
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
-use eredu_runtime::{
-    CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout,
-};
+use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
 use safemlx::{
     builder::Builder,
@@ -1210,9 +1208,19 @@ pub struct Cache {
 impl Cache {
     /// Creates an empty cache matching the layer pattern in `args`.
     pub fn new(args: &ModelArgs) -> Result<Self, Error> {
+        Self::new_with_geometry(args, None)
+    }
+
+    pub(crate) fn new_with_geometry(
+        args: &ModelArgs,
+        geometry: Option<&[ParallelLayerGeometry]>,
+    ) -> Result<Self, Error> {
         validate_text_model_args(args, "Qwen hybrid cache")?;
         Ok(Self {
-            layout: state_layout(args)?,
+            layout: match geometry {
+                Some(geometry) => state_layout_with_geometry(args, geometry)?,
+                None => state_layout(args)?,
+            },
             decoder_group: 0,
             layers: args
                 .layer_schedule
@@ -1241,6 +1249,15 @@ impl Cache {
         args: &ModelArgs,
         options: PagedCacheOptions,
         rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        Self::new_paged_with_geometry(args, options, rank, None)
+    }
+
+    pub(crate) fn new_paged_with_geometry(
+        args: &ModelArgs,
+        options: PagedCacheOptions,
+        rank: Option<CacheRankIdentity>,
+        geometry: Option<&[ParallelLayerGeometry]>,
     ) -> Result<Self, Exception> {
         validate_text_model_args(args, "Qwen hybrid paged cache")
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -1272,8 +1289,11 @@ impl Cache {
             })
             .collect::<Result<Vec<_>, Exception>>()?;
         Ok(Self {
-            layout: state_layout(args)
-                .map_err(|error| Exception::custom(error.to_string()))?,
+            layout: match geometry {
+                Some(geometry) => state_layout_with_geometry(args, geometry),
+                None => state_layout(args),
+            }
+            .map_err(|error| Exception::custom(error.to_string()))?,
             decoder_group: 0,
             layers,
             mtp_layers,
