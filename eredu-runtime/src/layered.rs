@@ -493,9 +493,76 @@ where
         input: A::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), A::Error>,
+    {
+        self.forward_with_unit_executor_and_context_hook(
+            input,
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context| {
+                architecture.forward_unit(group, index, unit, hidden, state, forward, context)
+            },
+            hook,
+        )
+    }
+
+    /// Runs one pass with a statically dispatched architecture-unit executor.
+    ///
+    /// Composition can use this cold API to inject routed expert execution or
+    /// observation while the runtime retains graph traversal, residency, and
+    /// exact completion ownership.
+    pub fn forward_with_unit_executor<'a, E>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        execute: E,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+    {
+        self.forward_with_unit_executor_and_context_hook(
+            input,
+            state,
+            context,
+            execute,
+            |_, _, _| Ok(()),
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Runs one pass with both a custom unit executor and post-unit context hook.
+    pub fn forward_with_unit_executor_and_context_hook<'a, E, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
         mut hook: H,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), A::Error>,
     {
         let graph = self
@@ -597,18 +664,17 @@ where
                         .policy
                         .acquire(ordinal, address, executor)
                         .map_err(LayerwiseRuntimeError::Policy)?;
-                    hidden = self
-                        .architecture
-                        .forward_unit(
-                            group,
-                            index,
-                            &mut lease,
-                            &hidden,
-                            state,
-                            &mut forward_context,
-                            executor,
-                        )
-                        .map_err(LayerwiseRuntimeError::Architecture)?;
+                    hidden = execute(
+                        &mut self.architecture,
+                        group,
+                        index,
+                        &mut lease,
+                        &hidden,
+                        state,
+                        &mut forward_context,
+                        executor,
+                    )
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
                     hook(group, index, &mut forward_context)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let state_values = state
@@ -689,10 +755,83 @@ where
         state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), A::Error>,
+    {
+        self.forward_parallel_with_unit_executor_and_context_hook(
+            input,
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
+                architecture.forward_unit_parallel(
+                    group, index, unit, hidden, state, forward, parallel, context,
+                )
+            },
+            hook,
+        )
+    }
+
+    /// Runs one parallel pass with a custom statically dispatched unit executor.
+    pub fn forward_parallel_with_unit_executor<'a, E>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        execute: E,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+    {
+        self.forward_parallel_with_unit_executor_and_context_hook(
+            input,
+            state,
+            parallel,
+            context,
+            execute,
+            |_, _, _| Ok(()),
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Runs one parallel pass with custom unit execution and a post-unit hook.
+    pub fn forward_parallel_with_unit_executor_and_context_hook<'a, E, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
         mut hook: H,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
         A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), A::Error>,
     {
         let graph = self
@@ -795,19 +934,18 @@ where
                         .policy
                         .acquire(ordinal, address, executor)
                         .map_err(LayerwiseRuntimeError::Policy)?;
-                    hidden = self
-                        .architecture
-                        .forward_unit_parallel(
-                            group,
-                            index,
-                            &mut lease,
-                            &hidden,
-                            state,
-                            &mut forward_context,
-                            parallel,
-                            executor,
-                        )
-                        .map_err(LayerwiseRuntimeError::Architecture)?;
+                    hidden = execute(
+                        &mut self.architecture,
+                        group,
+                        index,
+                        &mut lease,
+                        &hidden,
+                        state,
+                        &mut forward_context,
+                        parallel,
+                        executor,
+                    )
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
                     hook(group, index, &mut forward_context)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let state_values = state

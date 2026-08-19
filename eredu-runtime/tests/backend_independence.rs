@@ -737,3 +737,44 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     assert_eq!(SUBMIT_COUNT.load(Ordering::Relaxed), 4);
     assert_eq!(ORDER_COUNT.load(Ordering::Relaxed), 5);
 }
+
+#[test]
+fn neutral_layerwise_runtime_accepts_a_static_unit_executor() {
+    let policies = (0..4)
+        .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap())
+        .collect();
+    let layout = StateLayout::new(LayerSchedule::new(4, policies).unwrap()).unwrap();
+    let mut state = DeviceState::<FakeBackend, FakeLayerState>::create(layout, |_, _| {
+        Ok::<_, Infallible>(FakeLayerState)
+    })
+    .unwrap();
+    let architecture = GroupedFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+    };
+    let units = [0, 10, 20, 21]
+        .into_iter()
+        .map(|marker| FakeUnit { marker })
+        .collect();
+    let mut runtime =
+        LayerwiseRuntime::<_, FakeBackend, _, _>::new(architecture, RecordingPolicy::new(units));
+    let mut trace = Vec::new();
+
+    let output = runtime
+        .forward_with_unit_executor(
+            (),
+            &mut state,
+            &(),
+            |_architecture, group, index, unit, hidden, _state, _forward, _context| {
+                trace.push((group, index));
+                let mut output = hidden.clone();
+                output.0.push(unit.marker);
+                Ok(output)
+            },
+        )
+        .unwrap();
+
+    assert_eq!(output, FakeTensor(vec![30, 20, 21]));
+    assert_eq!(trace, vec![(0, 0), (1, 0), (2, 0), (2, 1)]);
+    assert!(runtime.architecture().trace.is_empty());
+}
