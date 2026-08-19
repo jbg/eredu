@@ -77,22 +77,23 @@ impl<'a> MuseGlimmerMtpExecutor<'a> {
 
     fn with_cache<T>(
         cache: &mut ModelCache,
+        layout: eredu_runtime::StateLayout,
         f: impl FnOnce(&mut MuseGlimmerLayerwiseCache) -> Result<T, Exception>,
     ) -> Result<T, Exception> {
         match cache {
             ModelCache::KeyValue(values) => {
-                let mut owned = MuseGlimmerLayerwiseCache::Concat(std::mem::take(values));
+                let mut owned = MuseGlimmerLayerwiseCache::concat(layout, std::mem::take(values));
                 let result = f(&mut owned);
-                let MuseGlimmerLayerwiseCache::Concat(owned) = owned else {
+                let MuseGlimmerLayerwiseCache::Concat { caches: owned, .. } = owned else {
                     unreachable!()
                 };
                 *values = owned;
                 result
             }
             ModelCache::PagedKeyValue(values) => {
-                let mut owned = MuseGlimmerLayerwiseCache::Paged(std::mem::take(values));
+                let mut owned = MuseGlimmerLayerwiseCache::paged(layout, std::mem::take(values));
                 let result = f(&mut owned);
-                let MuseGlimmerLayerwiseCache::Paged(owned) = owned else {
+                let MuseGlimmerLayerwiseCache::Paged { caches: owned, .. } = owned else {
                     unreachable!()
                 };
                 *values = owned;
@@ -359,7 +360,11 @@ impl SpeculativeExecutor for MuseGlimmerMtpExecutor<'_> {
         let stream = streams.target();
         input.with_borrowed(|input| {
             let target_layers = self.assistant.config.target_layer_ids.clone();
-            let output = Self::with_cache(cache, |cache| {
+            let layout = self
+                .target
+                .state_layout()
+                .map_err(|error| Exception::custom(error.to_string()))?;
+            let output = Self::with_cache(cache, layout, |cache| {
                 self.target
                     .prefill_dflash(input, cache, &target_layers, stream)
             })?;
@@ -429,7 +434,11 @@ impl SpeculativeExecutor for MuseGlimmerMtpExecutor<'_> {
         }
         let input_len = input_tokens.len();
         let target_layers = self.assistant.config.target_layer_ids.clone();
-        let output = Self::with_cache(cache, |cache| {
+        let layout = self
+            .target
+            .state_layout()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let output = Self::with_cache(cache, layout, |cache| {
             self.target.verify_dflash(
                 &inputs,
                 cache,

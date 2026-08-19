@@ -1260,15 +1260,18 @@ fn with_dense_qwen_cache<T>(
 
 fn with_muse_cache<T>(
     cache: &mut ModelCache,
+    layout: eredu_runtime::StateLayout,
     execute: impl FnOnce(
         &mut crate::composition::mlx_architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache,
     ) -> Result<T, Error>,
 ) -> Result<T, Error> {
     use crate::composition::mlx_architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache;
     let mut owned = match cache {
-        ModelCache::KeyValue(values) => MuseGlimmerLayerwiseCache::Concat(std::mem::take(values)),
+        ModelCache::KeyValue(values) => {
+            MuseGlimmerLayerwiseCache::concat(layout.clone(), std::mem::take(values))
+        }
         ModelCache::PagedKeyValue(values) => {
-            MuseGlimmerLayerwiseCache::Paged(std::mem::take(values))
+            MuseGlimmerLayerwiseCache::paged(layout, std::mem::take(values))
         }
         _ => {
             return Err(Error::UnsupportedArchitecture(
@@ -1278,12 +1281,18 @@ fn with_muse_cache<T>(
     };
     let result = execute(&mut owned);
     match (cache, owned) {
-        (ModelCache::KeyValue(values), MuseGlimmerLayerwiseCache::Concat(restored)) => {
-            *values = restored
-        }
-        (ModelCache::PagedKeyValue(values), MuseGlimmerLayerwiseCache::Paged(restored)) => {
-            *values = restored
-        }
+        (
+            ModelCache::KeyValue(values),
+            MuseGlimmerLayerwiseCache::Concat {
+                caches: restored, ..
+            },
+        ) => *values = restored,
+        (
+            ModelCache::PagedKeyValue(values),
+            MuseGlimmerLayerwiseCache::Paged {
+                caches: restored, ..
+            },
+        ) => *values = restored,
         _ => unreachable!("Muse-Glimmer tensor-parallel cache wrapper changed variants"),
     }
     result
@@ -1319,7 +1328,7 @@ fn prefill_model_tensor_parallel(
         (
             Model::MuseGlimmer(model),
             cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
-        ) => with_muse_cache(cache, |cache| {
+        ) => with_muse_cache(cache, model.state_layout()?, |cache| {
             model.prefill_tensor_parallel(input, cache, group, stream)
         })?,
         (model, cache) => {
@@ -1388,7 +1397,7 @@ fn forward_model_tensor_parallel(
         (
             Model::MuseGlimmer(model),
             cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
-        ) => with_muse_cache(cache, |cache| {
+        ) => with_muse_cache(cache, model.state_layout()?, |cache| {
             model.forward_tensor_parallel(input, None, cache, group, stream)
         }),
         (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))

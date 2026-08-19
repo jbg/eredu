@@ -1,8 +1,10 @@
 //! Bounded layer execution for the shared Muse-Glimmer decoder.
 
 use eredu_runtime::{
-    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
-    NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
+    ExecutionGraph, ExecutionUnitLayout, ExpertCacheLoadOptions, ExpertIdentity, ExpertPass,
+    LayerWeightResidency, LayeredArchitecture, LayeredForwardState, LayerwiseRuntime,
+    NonExpertWeightResidency, ParallelLayeredArchitecture, RuntimeState, StateError, StateLayout,
+    StaticUnitBindings, WeightResidency,
 };
 
 use eredu_checkpoint::WeightQuantization;
@@ -20,6 +22,7 @@ use std::{
 
 use safemlx::{
     error::Exception,
+    macros::ModuleParameters,
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::indexing::{NewAxis, TryIndexOp},
@@ -35,6 +38,7 @@ use super::{
 use crate::composition::mlx_architectures::muse_glimmer as resident;
 use crate::{
     backend::mlx::error::Error,
+    backend::mlx::nn::shared::{MlxBackend, MlxParameterTree},
     backend::mlx::nn::{
         attention::AttentionInput,
         linear::{
@@ -54,11 +58,12 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     },
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
-        populate_module_from_lease, populate_module_from_lease_excluding,
+        binding_bytes, build_module_binding_plan_with_recipes,
+        build_module_binding_plan_with_recipes_excluding, populate_module_from_lease,
+        populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-    backend::mlx::runtime::checkpoint::store::TensorSelection,
+    backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStoreBackend},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
@@ -66,10 +71,15 @@ use crate::{
         aligned_partition_units, array_parameter_member, register_replicated_module,
         ParallelPlanBuilder,
     },
-    backend::mlx::runtime::execution::layerwise::{
-        load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, ArchitectureAdapter, LayerwiseModel,
-        LoadTimeQuantizableAdapter,
+    backend::mlx::runtime::execution::{
+        generic::{
+            prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+            MlxUnitFactory,
+        },
+        layerwise::{
+            open_safetensors_weight_store, quantize_module_store_with_bindings,
+            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+        },
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -77,8 +87,8 @@ use crate::{
     },
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
     core::cache::{
-        LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheTopology,
+        validate_prompt_cache_model_identity, LayerCachePolicy, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     },
 };
 use eredu_checkpoint::store::SharedCheckpointSource;
@@ -125,22 +135,716 @@ fn vision_static_bindings(
     )
 }
 
+type MuseGlimmerUnit = MlxParameterTree<MuseGlimmerLayer>;
+type MuseGlimmerStatic = MlxParameterTree<MuseGlimmerStaticModules>;
+type MuseGlimmerResidentRuntime = LayerwiseRuntime<
+    MuseGlimmerArchitecture,
+    MlxBackend,
+    MuseGlimmerLayerwiseCache,
+    MlxResidentPolicy<MuseGlimmerUnit>,
+>;
+type MuseGlimmerBoundedRuntime = LayerwiseRuntime<
+    MuseGlimmerArchitecture,
+    MlxBackend,
+    MuseGlimmerLayerwiseCache,
+    MlxLayerwisePolicy<MuseGlimmerUnit, MuseGlimmerUnitFactory>,
+>;
+
+enum MuseGlimmerRuntime {
+    Resident(MuseGlimmerResidentRuntime),
+    Layerwise(MuseGlimmerBoundedRuntime),
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct MuseGlimmerReplicatedStatic {
+    #[param]
+    vision: Option<VisionStatic>,
+    #[param]
+    embedding: MaybeQuantized<nn::Embedding>,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct MuseGlimmerParallelStatic {
+    #[param]
+    vision: Option<VisionStatic>,
+    #[param]
+    embedding: VocabParallelEmbedding,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: Option<VocabParallelLmHead>,
+}
+
+#[derive(Debug, Clone)]
+enum MuseGlimmerStaticModules {
+    Replicated(MuseGlimmerReplicatedStatic),
+    Parallel(MuseGlimmerParallelStatic),
+}
+
+macro_rules! muse_glimmer_static_parameters {
+    ($self:ident, $method:ident $(, $arg:expr)?) => {
+        match $self {
+            MuseGlimmerStaticModules::Replicated(module) => module.$method($($arg)?),
+            MuseGlimmerStaticModules::Parallel(module) => module.$method($($arg)?),
+        }
+    };
+}
+
+impl ModuleParameters for MuseGlimmerStaticModules {
+    fn num_parameters(&self) -> usize {
+        muse_glimmer_static_parameters!(self, num_parameters)
+    }
+
+    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        muse_glimmer_static_parameters!(self, parameters)
+    }
+
+    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+        muse_glimmer_static_parameters!(self, parameters_mut)
+    }
+
+    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        muse_glimmer_static_parameters!(self, trainable_parameters)
+    }
+
+    fn freeze_parameters(&mut self, recursive: bool) {
+        muse_glimmer_static_parameters!(self, freeze_parameters, recursive)
+    }
+
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        muse_glimmer_static_parameters!(self, unfreeze_parameters, recursive)
+    }
+
+    fn all_frozen(&self) -> Option<bool> {
+        muse_glimmer_static_parameters!(self, all_frozen)
+    }
+
+    fn any_frozen(&self) -> Option<bool> {
+        muse_glimmer_static_parameters!(self, any_frozen)
+    }
+}
+
+struct MuseGlimmerUnitFactory {
+    adapter: MuseGlimmerLayerwiseAdapter,
+    vision_units: usize,
+    parallel_layout: Option<Arc<eredu_runtime::LocalModelLayout>>,
+}
+
+impl MlxUnitFactory<MuseGlimmerUnit> for MuseGlimmerUnitFactory {
+    fn build(&mut self, ordinal: usize, stream: &Stream) -> Result<MuseGlimmerUnit, Error> {
+        let (group, index) = if ordinal < self.vision_units {
+            (0, ordinal)
+        } else {
+            (1, ordinal - self.vision_units)
+        };
+        let layer = match self.parallel_layout.as_deref() {
+            Some(layout) => self
+                .adapter
+                .new_parallel_layer(group, index, layout, stream)?,
+            None => self.adapter.new_layer(group, index, stream)?,
+        };
+        let sparse = self.adapter.sparse_expert_cache && group == 1;
+        MlxParameterTree::new_filtered(layer, "", |name| !sparse || !name.starts_with("experts."))
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+}
+
+struct MuseGlimmerArchitecture {
+    adapter: MuseGlimmerLayerwiseAdapter,
+    static_modules: MuseGlimmerStatic,
+    parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
+}
+
+impl MuseGlimmerArchitecture {
+    fn from_adapter(adapter: MuseGlimmerLayerwiseAdapter) -> Result<Self, Error> {
+        let modules = match (&adapter.parallel_embedding, &adapter.parallel_lm_head) {
+            (Some(embedding), head) => {
+                MuseGlimmerStaticModules::Parallel(MuseGlimmerParallelStatic {
+                    vision: adapter.vision.clone(),
+                    embedding: embedding.clone(),
+                    norm: adapter.norm.clone(),
+                    lm_head: head.clone(),
+                })
+            }
+            (None, _) => MuseGlimmerStaticModules::Replicated(MuseGlimmerReplicatedStatic {
+                vision: adapter.vision.clone(),
+                embedding: adapter.embedding.clone(),
+                norm: adapter.norm.clone(),
+                lm_head: adapter.lm_head.clone(),
+            }),
+        };
+        Ok(Self {
+            static_modules: MlxParameterTree::new(modules, "")
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+            adapter,
+            parallel_topology: None,
+        })
+    }
+
+    fn sync_adapter_static(&mut self) {
+        match &*self.static_modules {
+            MuseGlimmerStaticModules::Replicated(modules) => {
+                self.adapter.vision = modules.vision.clone();
+                self.adapter.embedding = modules.embedding.clone();
+                self.adapter.norm = modules.norm.clone();
+                self.adapter.lm_head = modules.lm_head.clone();
+            }
+            MuseGlimmerStaticModules::Parallel(modules) => {
+                self.adapter.vision = modules.vision.clone();
+                self.adapter.parallel_embedding = Some(modules.embedding.clone());
+                self.adapter.norm = modules.norm.clone();
+                self.adapter.parallel_lm_head = modules.lm_head.clone();
+            }
+        }
+    }
+}
+
+impl LayeredArchitecture<MlxBackend, MuseGlimmerLayerwiseCache> for MuseGlimmerArchitecture {
+    type Input<'a> = MuseGlimmerAdapterInput<'a>;
+    type StaticModules = MuseGlimmerStatic;
+    type Unit = MuseGlimmerUnit;
+    type ForwardContext = MuseGlimmerForwardContext;
+    type RetainedContextValues<'a> = std::vec::IntoIter<&'a Array>;
+    type Error = Error;
+
+    fn model_identity(&self) -> &str {
+        &self.adapter.args.model_type
+    }
+
+    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+        self.adapter.execution_graph()
+    }
+
+    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
+        self.adapter.layer_count(group)
+    }
+
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+        if index >= self.group_unit_count(group)? {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Muse-Glimmer group {group} has no unit {index}"
+            )));
+        }
+        Ok(self.adapter.layer_checkpoint_prefix(group, index))
+    }
+
+    fn static_modules(&self) -> &Self::StaticModules {
+        &self.static_modules
+    }
+
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        &mut self.static_modules
+    }
+
+    fn build_unit(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Unit, Error> {
+        let layer = self.adapter.new_layer(group, index, stream)?;
+        let sparse = self.adapter.sparse_expert_cache && group == 1;
+        MlxParameterTree::new_filtered(layer, "", |name| !sparse || !name.starts_with("experts."))
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.sync_adapter_static();
+        self.adapter.validate_cache(cache)?;
+        self.adapter.begin_forward(input, cache, stream)
+    }
+
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial: &Array,
+        dependencies: &[&Array],
+        cache: &mut MuseGlimmerLayerwiseCache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let dependencies = dependencies
+            .iter()
+            .map(|value| (*value).clone())
+            .collect::<Vec<_>>();
+        self.adapter
+            .begin_execution_group(group, initial, &dependencies, cache, forward, stream)
+    }
+
+    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        self.adapter.should_execute_group(group, forward)
+    }
+
+    fn forward_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter
+            .forward_layer(group, index, &mut **unit, hidden, cache, forward, stream)
+    }
+
+    fn complete_execution_group(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter
+            .complete_execution_group(group, hidden, cache, forward, stream)
+    }
+
+    fn finish_forward(
+        &mut self,
+        hidden: &Array,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        forward: &Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter.finish(hidden, cache, forward, stream)
+    }
+
+    fn retained_context_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _group: usize,
+        _index: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        forward
+            .mask
+            .iter()
+            .chain(forward.requested_mask.iter())
+            .chain(forward.parts.iter().filter_map(|part| match part {
+                MusePreparedPart::Text(value) => Some(value),
+                MusePreparedPart::Visual(_) => None,
+            }))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+impl ParallelLayeredArchitecture<MlxBackend, MuseGlimmerLayerwiseCache>
+    for MuseGlimmerArchitecture
+{
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.sync_adapter_static();
+        self.adapter.validate_cache(cache)?;
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Muse-Glimmer parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter
+            .begin_forward_with_execution(input, cache, &execution)
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group_index: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        forward: &mut Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Muse-Glimmer parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter.forward_layer_with_execution(
+            group_index,
+            index,
+            &mut **unit,
+            hidden,
+            cache,
+            forward,
+            &execution,
+        )
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &Array,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        forward: &Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Muse-Glimmer parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter
+            .finish_with_execution(hidden, cache, forward, &execution)
+    }
+}
+
 /// Architecture-owned KV cache accepted by the canonical Muse-Glimmer adapter.
 pub enum MuseGlimmerLayerwiseCache {
     /// Append-only device KV caches.
-    Concat(Vec<Option<ConcatKeyValueCache>>),
+    Concat {
+        layout: StateLayout,
+        caches: Vec<Option<ConcatKeyValueCache>>,
+    },
     /// Sliding device KV caches used by expert-parallel execution.
-    Sliding(Vec<Option<SlidingKeyValueCache>>),
+    Sliding {
+        layout: StateLayout,
+        caches: Vec<Option<SlidingKeyValueCache>>,
+    },
     /// Paged KV caches used by expert-parallel execution.
-    Paged(Vec<Option<PagedKeyValueCache>>),
+    Paged {
+        layout: StateLayout,
+        caches: Vec<Option<PagedKeyValueCache>>,
+    },
+}
+
+impl MuseGlimmerLayerwiseCache {
+    pub(crate) fn concat(layout: StateLayout, caches: Vec<Option<ConcatKeyValueCache>>) -> Self {
+        Self::Concat { layout, caches }
+    }
+
+    pub(crate) fn sliding(layout: StateLayout, caches: Vec<Option<SlidingKeyValueCache>>) -> Self {
+        Self::Sliding { layout, caches }
+    }
+
+    pub(crate) fn paged(layout: StateLayout, caches: Vec<Option<PagedKeyValueCache>>) -> Self {
+        Self::Paged { layout, caches }
+    }
+}
+
+impl RuntimeState<MlxBackend> for MuseGlimmerLayerwiseCache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        match self {
+            Self::Concat { layout, .. }
+            | Self::Sliding { layout, .. }
+            | Self::Paged { layout, .. } => layout,
+        }
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() == 0 {
+            return Ok(Vec::new().into_iter());
+        }
+        if address.group() != 1 {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: 2,
+            });
+        }
+        let index = address.index();
+        let count = self.layout().len();
+        if index >= count {
+            return Err(StateError::UnknownLayer {
+                layer: index,
+                count,
+            });
+        }
+        let caches = match self {
+            Self::Concat { caches, .. } => retained_cache_arrays(caches, index),
+            Self::Sliding { caches, .. } => retained_cache_arrays(caches, index),
+            Self::Paged { caches, .. } => retained_cache_arrays(caches, index),
+        };
+        Ok(caches.into_iter())
+    }
+}
+
+struct MuseGlimmerExecution {
+    runtime: MuseGlimmerRuntime,
+    metadata: eredu_runtime::LayerwiseModelMetadata,
+    parallel_info:
+        Option<eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    topology: Option<crate::backend::mlx::MlxParallelContext>,
+}
+
+impl MuseGlimmerExecution {
+    fn architecture(&self) -> &MuseGlimmerArchitecture {
+        match &self.runtime {
+            MuseGlimmerRuntime::Resident(runtime) => runtime.architecture(),
+            MuseGlimmerRuntime::Layerwise(runtime) => runtime.architecture(),
+        }
+    }
+
+    fn architecture_mut(&mut self) -> &mut MuseGlimmerArchitecture {
+        match &mut self.runtime {
+            MuseGlimmerRuntime::Resident(runtime) => runtime.architecture_mut(),
+            MuseGlimmerRuntime::Layerwise(runtime) => runtime.architecture_mut(),
+        }
+    }
+
+    fn adapter(&self) -> &MuseGlimmerLayerwiseAdapter {
+        &self.architecture().adapter
+    }
+
+    fn adapter_mut(&mut self) -> &mut MuseGlimmerLayerwiseAdapter {
+        &mut self.architecture_mut().adapter
+    }
+
+    fn metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
+        &self.metadata
+    }
+
+    fn parallel_info(
+        &self,
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+        self.parallel_info.as_ref()
+    }
+
+    fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
+        match &self.runtime {
+            MuseGlimmerRuntime::Resident(runtime) => runtime.policy().checkpoint_store(),
+            MuseGlimmerRuntime::Layerwise(runtime) => runtime.policy().checkpoint_store(),
+        }
+    }
+
+    fn checkpoint_store_arc(&self) -> SharedCheckpointSource {
+        match &self.runtime {
+            MuseGlimmerRuntime::Resident(runtime) => runtime.policy().checkpoint_store_arc(),
+            MuseGlimmerRuntime::Layerwise(runtime) => runtime.policy().checkpoint_store_arc(),
+        }
+    }
+
+    fn residency_report(&self) -> Result<ResidencyReport, Error> {
+        match &self.runtime {
+            MuseGlimmerRuntime::Resident(runtime) => runtime.policy().residency_report(),
+            MuseGlimmerRuntime::Layerwise(runtime) => runtime.policy().residency_report(),
+        }
+    }
+
+    fn dense_stream_report(&self) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
+        match &self.runtime {
+            MuseGlimmerRuntime::Resident(_) => Ok(None),
+            MuseGlimmerRuntime::Layerwise(runtime) => runtime.policy().dense_stream_report(),
+        }
+    }
+
+    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.adapter().prompt_cache_model_identity(self.topology)
+    }
+
+    fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+
+    fn prompt_cache_rank_identity(&self) -> Option<crate::core::cache::CacheRankIdentity> {
+        self.topology
+            .map(crate::backend::mlx::cache::prompt_cache_topology)
+            .and_then(|topology| topology.cache_rank_identity())
+    }
+
+    fn prompt_cache_directory(&self, root: &Path) -> std::path::PathBuf {
+        match self.topology {
+            Some(topology) => root.join(format!("rank-{:05}", topology.global_rank)),
+            None => root.to_path_buf(),
+        }
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        self.adapter().save_prompt_cache(
+            cache,
+            &self.prompt_cache_directory(destination.as_ref()),
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(MuseGlimmerLayerwiseCache, PromptCacheManifest), Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        self.adapter().load_prompt_cache(
+            &self.prompt_cache_directory(directory.as_ref()),
+            expected,
+            &identity,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    fn forward(
+        &mut self,
+        input: MuseGlimmerAdapterInput<'_>,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match &mut self.runtime {
+            MuseGlimmerRuntime::Resident(runtime) => runtime
+                .forward(input, cache, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            MuseGlimmerRuntime::Layerwise(runtime) => runtime
+                .forward(input, cache, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        input: MuseGlimmerAdapterInput<'_>,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match &mut self.runtime {
+            MuseGlimmerRuntime::Resident(runtime) => runtime
+                .forward_parallel(input, cache, group, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            MuseGlimmerRuntime::Layerwise(runtime) => runtime
+                .forward_parallel(input, cache, group, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+
+    fn forward_with_layer_executor<E>(
+        &mut self,
+        input: MuseGlimmerAdapterInput<'_>,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<Array, Error>
+    where
+        E: FnMut(
+            &mut MuseGlimmerLayerwiseAdapter,
+            usize,
+            usize,
+            &mut MuseGlimmerLayer,
+            &Array,
+            &mut MuseGlimmerLayerwiseCache,
+            &mut MuseGlimmerForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+    {
+        let execute = |architecture: &mut MuseGlimmerArchitecture,
+                       group,
+                       index,
+                       unit: &mut MuseGlimmerUnit,
+                       hidden: &Array,
+                       cache: &mut MuseGlimmerLayerwiseCache,
+                       forward: &mut MuseGlimmerForwardContext,
+                       stream: &Stream| {
+            execute(
+                &mut architecture.adapter,
+                group,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                stream,
+            )
+        };
+        match &mut self.runtime {
+            MuseGlimmerRuntime::Resident(runtime) => runtime
+                .forward_with_unit_executor(input, cache, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            MuseGlimmerRuntime::Layerwise(runtime) => runtime
+                .forward_with_unit_executor(input, cache, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+
+    fn forward_with_observer(
+        &mut self,
+        input: MuseGlimmerAdapterInput<'_>,
+        cache: &mut MuseGlimmerLayerwiseCache,
+        stream: &Stream,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+    ) -> Result<Array, Error> {
+        let mut observer =
+            crate::backend::mlx::runtime::execution::inspection::ActivationObserverProxy(observer);
+        self.forward_with_layer_executor(
+            input,
+            cache,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, stream| {
+                adapter.forward_layer_with_observer(
+                    group,
+                    index,
+                    layer,
+                    hidden,
+                    cache,
+                    context,
+                    stream,
+                    &mut observer,
+                )
+            },
+        )
+    }
+
+    fn clear_device_group(&self, name: &str) -> Result<(), Error> {
+        let graph = self.architecture().execution_graph()?;
+        let group = graph
+            .groups()
+            .iter()
+            .find(|group| group.id() == name)
+            .ok_or_else(|| Error::Parallel(format!("unknown Muse-Glimmer group {name}")))?;
+        match &self.runtime {
+            MuseGlimmerRuntime::Resident(runtime) => {
+                runtime.policy().clear_device_group(group.id())
+            }
+            MuseGlimmerRuntime::Layerwise(runtime) => {
+                runtime.policy().clear_device_group(group.id())
+            }
+        }
+    }
 }
 
 /// Host-backed Muse-Glimmer causal LM.
 pub struct LayerwiseDecoder {
-    execution: LayerwiseModel<MuseGlimmerLayerwiseAdapter>,
+    execution: MuseGlimmerExecution,
 }
 
 impl LayerwiseDecoder {
+    pub(crate) fn state_layout(&self) -> Result<StateLayout, Error> {
+        StateLayout::new(self.prompt_cache_layer_layout()?)
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
     /// Returns the normalized decoder configuration.
     pub fn args(&self) -> &DecoderConfig {
         self.execution.adapter().args()
@@ -272,7 +976,10 @@ impl LayerwiseDecoder {
         policy: CacheResidencyPolicy,
     ) -> Result<MuseGlimmerLayerwiseCache, Error> {
         match policy {
-            CacheResidencyPolicy::Device => Ok(MuseGlimmerLayerwiseCache::Concat(self.new_cache())),
+            CacheResidencyPolicy::Device => Ok(MuseGlimmerLayerwiseCache::concat(
+                self.state_layout()?,
+                self.new_cache(),
+            )),
             CacheResidencyPolicy::Paged(options) => {
                 let manager =
                     crate::backend::mlx::runtime::cache::residency::CacheResidencyManager::new(
@@ -284,7 +991,10 @@ impl LayerwiseDecoder {
                     manager,
                     self.execution.prompt_cache_rank_identity(),
                 )?;
-                Ok(MuseGlimmerLayerwiseCache::Paged(caches))
+                Ok(MuseGlimmerLayerwiseCache::paged(
+                    self.state_layout()?,
+                    caches,
+                ))
             }
         }
     }
@@ -295,16 +1005,15 @@ impl LayerwiseDecoder {
         cache: &MuseGlimmerLayerwiseCache,
     ) -> Result<Option<CacheResidencyReport>, Error> {
         match cache {
-            MuseGlimmerLayerwiseCache::Paged(caches) => caches
+            MuseGlimmerLayerwiseCache::Paged { caches, .. } => caches
                 .iter()
                 .flatten()
                 .next()
                 .map(PagedKeyValueCache::report)
                 .transpose()
                 .map_err(Into::into),
-            MuseGlimmerLayerwiseCache::Concat(_) | MuseGlimmerLayerwiseCache::Sliding(_) => {
-                Ok(None)
-            }
+            MuseGlimmerLayerwiseCache::Concat { .. }
+            | MuseGlimmerLayerwiseCache::Sliding { .. } => Ok(None),
         }
     }
 
@@ -347,7 +1056,8 @@ impl LayerwiseDecoder {
         options: &PromptCacheOptions,
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
-        let mut owned = MuseGlimmerLayerwiseCache::Concat(std::mem::take(cache));
+        let mut owned =
+            MuseGlimmerLayerwiseCache::concat(self.state_layout()?, std::mem::take(cache));
         let result = self.execution.save_prompt_cache(
             &mut owned,
             destination,
@@ -356,7 +1066,7 @@ impl LayerwiseDecoder {
             options,
             stream,
         );
-        let MuseGlimmerLayerwiseCache::Concat(owned) = owned else {
+        let MuseGlimmerLayerwiseCache::Concat { caches: owned, .. } = owned else {
             unreachable!("Muse-Glimmer prompt-cache wrapper changed variants")
         };
         *cache = owned;
@@ -379,7 +1089,7 @@ impl LayerwiseDecoder {
             options,
             stream,
         )?;
-        let MuseGlimmerLayerwiseCache::Concat(cache) = cache else {
+        let MuseGlimmerLayerwiseCache::Concat { caches: cache, .. } = cache else {
             return Err(Error::Parallel(
                 "Muse-Glimmer prompt-cache restore returned a non-concat representation".into(),
             ));
@@ -455,13 +1165,14 @@ impl LayerwiseDecoder {
         cache: &mut Vec<Option<ConcatKeyValueCache>>,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let mut owned = MuseGlimmerLayerwiseCache::Concat(std::mem::take(cache));
+        let mut owned =
+            MuseGlimmerLayerwiseCache::concat(self.state_layout()?, std::mem::take(cache));
         let result = self.execution.forward(
             MuseGlimmerAdapterInput::Decode { inputs, mask },
             &mut owned,
             stream,
         );
-        let MuseGlimmerLayerwiseCache::Concat(owned) = owned else {
+        let MuseGlimmerLayerwiseCache::Concat { caches: owned, .. } = owned else {
             unreachable!("Muse-Glimmer concat cache wrapper changed variants")
         };
         *cache = owned;
@@ -477,14 +1188,15 @@ impl LayerwiseDecoder {
         stream: &Stream,
         observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
-        let mut owned = MuseGlimmerLayerwiseCache::Concat(std::mem::take(cache));
+        let mut owned =
+            MuseGlimmerLayerwiseCache::concat(self.state_layout()?, std::mem::take(cache));
         let result = self.execution.forward_with_observer(
             MuseGlimmerAdapterInput::Decode { inputs, mask },
             &mut owned,
             stream,
             observer,
         );
-        let MuseGlimmerLayerwiseCache::Concat(owned) = owned else {
+        let MuseGlimmerLayerwiseCache::Concat { caches: owned, .. } = owned else {
             unreachable!("Muse-Glimmer concat cache wrapper changed variants")
         };
         *cache = owned;
@@ -500,14 +1212,15 @@ impl LayerwiseDecoder {
         stream: &Stream,
         observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
-        let mut owned = MuseGlimmerLayerwiseCache::Paged(std::mem::take(cache));
+        let mut owned =
+            MuseGlimmerLayerwiseCache::paged(self.state_layout()?, std::mem::take(cache));
         let result = self.execution.forward_with_observer(
             MuseGlimmerAdapterInput::Decode { inputs, mask },
             &mut owned,
             stream,
             observer,
         );
-        let MuseGlimmerLayerwiseCache::Paged(owned) = owned else {
+        let MuseGlimmerLayerwiseCache::Paged { caches: owned, .. } = owned else {
             unreachable!("Muse-Glimmer paged cache wrapper changed variants")
         };
         *cache = owned;
@@ -522,13 +1235,14 @@ impl LayerwiseDecoder {
         cache: &mut Vec<Option<PagedKeyValueCache>>,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let mut owned = MuseGlimmerLayerwiseCache::Paged(std::mem::take(cache));
+        let mut owned =
+            MuseGlimmerLayerwiseCache::paged(self.state_layout()?, std::mem::take(cache));
         let result = self.execution.forward(
             MuseGlimmerAdapterInput::Decode { inputs, mask },
             &mut owned,
             stream,
         );
-        let MuseGlimmerLayerwiseCache::Paged(owned) = owned else {
+        let MuseGlimmerLayerwiseCache::Paged { caches: owned, .. } = owned else {
             unreachable!("Muse-Glimmer paged cache wrapper changed variants")
         };
         *cache = owned;
@@ -576,13 +1290,17 @@ impl CausalModel<Vec<Option<ConcatKeyValueCache>>> for LayerwiseDecoder {
         cache: &mut Vec<Option<ConcatKeyValueCache>>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let mut owned = MuseGlimmerLayerwiseCache::Concat(std::mem::take(cache));
+        let mut owned = MuseGlimmerLayerwiseCache::concat(
+            self.state_layout()
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            std::mem::take(cache),
+        );
         let result = self
             .execution
             .forward(MuseGlimmerAdapterInput::Prefill(input), &mut owned, stream)
             .map_err(|error| Exception::custom(error.to_string()))?
             .try_index_device((.., -1, ..), stream);
-        let MuseGlimmerLayerwiseCache::Concat(owned) = owned else {
+        let MuseGlimmerLayerwiseCache::Concat { caches: owned, .. } = owned else {
             unreachable!("Muse-Glimmer concat cache wrapper changed variants")
         };
         *cache = owned;
@@ -612,13 +1330,17 @@ impl CausalModel<Vec<Option<PagedKeyValueCache>>> for LayerwiseDecoder {
         cache: &mut Vec<Option<PagedKeyValueCache>>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let mut owned = MuseGlimmerLayerwiseCache::Paged(std::mem::take(cache));
+        let mut owned = MuseGlimmerLayerwiseCache::paged(
+            self.state_layout()
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            std::mem::take(cache),
+        );
         let result = self
             .execution
             .forward(MuseGlimmerAdapterInput::Prefill(input), &mut owned, stream)
             .map_err(|error| Exception::custom(error.to_string()))?
             .try_index_device((.., -1, ..), stream);
-        let MuseGlimmerLayerwiseCache::Paged(owned) = owned else {
+        let MuseGlimmerLayerwiseCache::Paged { caches: owned, .. } = owned else {
             unreachable!("Muse-Glimmer paged cache wrapper changed variants")
         };
         *cache = owned;
@@ -635,6 +1357,383 @@ impl CausalModel<Vec<Option<PagedKeyValueCache>>> for LayerwiseDecoder {
             .map_err(|error| Exception::custom(error.to_string()))?
             .try_index_device((.., -1, ..), stream)
     }
+}
+
+fn muse_glimmer_execution_layout(
+    adapter: &MuseGlimmerLayerwiseAdapter,
+) -> Result<ExecutionUnitLayout, Error> {
+    let graph = adapter.execution_graph()?;
+    let counts = (0..graph.groups().len())
+        .map(|group| adapter.layer_count(group))
+        .collect::<Result<Vec<_>, _>>()?;
+    ExecutionUnitLayout::new(&graph, counts).map_err(|error| Error::Parallel(error.to_string()))
+}
+
+fn muse_glimmer_static_bindings(
+    adapter: &MuseGlimmerLayerwiseAdapter,
+    modules: &MuseGlimmerStaticModules,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    let qualify =
+        |prefix: &str, bindings: Vec<WeightBinding>| -> Result<Vec<WeightBinding>, Error> {
+            bindings
+                .into_iter()
+                .map(|binding| {
+                    let name = format!("{prefix}.{}", binding.name());
+                    binding.with_name(name).map_err(Into::into)
+                })
+                .collect()
+        };
+    let MuseGlimmerStaticModules::Replicated(modules) = modules else {
+        return Err(Error::Parallel(
+            "global Muse-Glimmer bindings require replicated static modules".into(),
+        ));
+    };
+    let root = adapter.language_model_root();
+    let mut bindings = Vec::new();
+    if let Some(vision) = &modules.vision {
+        bindings.extend(qualify("vision", vision_static_bindings(vision, store)?)?);
+    }
+    bindings.extend(qualify(
+        "embedding",
+        build_module_binding_plan_with_recipes(
+            &modules.embedding,
+            &format!("{root}.embed_tokens"),
+            store,
+            BTreeMap::new(),
+        )?
+        .build_bindings(store)?,
+    )?);
+    bindings.extend(qualify(
+        "norm",
+        build_module_binding_plan_with_recipes(
+            &modules.norm,
+            &format!("{root}.norm"),
+            store,
+            BTreeMap::new(),
+        )?
+        .build_bindings(store)?,
+    )?);
+    if let Some(head) = &modules.lm_head {
+        bindings.extend(qualify(
+            "lm_head",
+            build_module_binding_plan_with_recipes(head, "lm_head", store, BTreeMap::new())?
+                .build_bindings(store)?,
+        )?);
+    }
+    Ok(bindings)
+}
+
+fn muse_glimmer_ordinal(adapter: &MuseGlimmerLayerwiseAdapter, ordinal: usize) -> (usize, usize) {
+    let vision_units = adapter
+        .args
+        .vision_config
+        .as_ref()
+        .map_or(0, VisionConfig::layer_count);
+    if ordinal < vision_units {
+        (0, ordinal)
+    } else {
+        (1, ordinal - vision_units)
+    }
+}
+
+fn muse_glimmer_raw_unit(
+    adapter: &MuseGlimmerLayerwiseAdapter,
+    ordinal: usize,
+    stream: &Stream,
+) -> Result<MuseGlimmerLayer, Error> {
+    let (group, index) = muse_glimmer_ordinal(adapter, ordinal);
+    adapter.new_layer(group, index, stream)
+}
+
+fn muse_glimmer_raw_unit_bindings(
+    adapter: &MuseGlimmerLayerwiseAdapter,
+    ordinal: usize,
+    unit: &MuseGlimmerLayer,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    let (group, index) = muse_glimmer_ordinal(adapter, ordinal);
+    adapter.layer_bindings(group, index, unit, store)
+}
+
+fn muse_glimmer_unit_bindings(
+    adapter: &MuseGlimmerLayerwiseAdapter,
+    ordinal: usize,
+    unit: &MuseGlimmerUnit,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    muse_glimmer_raw_unit_bindings(adapter, ordinal, unit, store)
+}
+
+fn replicated_muse_glimmer_static(
+    adapter: &MuseGlimmerLayerwiseAdapter,
+) -> MuseGlimmerStaticModules {
+    MuseGlimmerStaticModules::Replicated(MuseGlimmerReplicatedStatic {
+        vision: adapter.vision.clone(),
+        embedding: adapter.embedding.clone(),
+        norm: adapter.norm.clone(),
+        lm_head: adapter.lm_head.clone(),
+    })
+}
+
+fn fresh_muse_glimmer_adapter(
+    source: &MuseGlimmerLayerwiseAdapter,
+    stream: &Stream,
+) -> Result<MuseGlimmerLayerwiseAdapter, Error> {
+    let mut adapter = if source.sparse_expert_cache {
+        MuseGlimmerLayerwiseAdapter::new_external_experts(source.args.clone(), stream)?
+    } else {
+        MuseGlimmerLayerwiseAdapter::new(source.args.clone(), stream)?
+    };
+    adapter.parallel_kv_heads = source.parallel_kv_heads.clone();
+    Ok(adapter)
+}
+
+fn resolve_muse_glimmer_store(
+    store: SharedCheckpointSource,
+    adapter: &MuseGlimmerLayerwiseAdapter,
+) -> Result<SharedCheckpointSource, Error> {
+    if store.is_checkpoint_contract_resolved()
+        || store.source_diagnostics()?.backend != WeightStoreBackend::Safetensors
+    {
+        return Ok(store);
+    }
+    let plan = adapter.safetensors_checkpoint_plan()?;
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "Muse-Glimmer checkpoint contract did not resolve: {validation:?}"
+            ))
+        })?;
+    Ok(Arc::new(
+        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
+    ))
+}
+
+fn quantize_muse_glimmer_store(
+    store: SharedCheckpointSource,
+    source: &MuseGlimmerLayerwiseAdapter,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<
+    (
+        SharedCheckpointSource,
+        MuseGlimmerLayerwiseAdapter,
+        eredu_runtime::WeightMaterializationReport,
+    ),
+    Error,
+> {
+    let target = source.load_time_quantized(quantization, stream)?;
+    let source_static = replicated_muse_glimmer_static(source);
+    let target_static = replicated_muse_glimmer_static(&target);
+    let source_units = fresh_muse_glimmer_adapter(source, stream)?;
+    let target_units = fresh_muse_glimmer_adapter(&target, stream)?;
+    let static_binding_adapter = fresh_muse_glimmer_adapter(source, stream)?;
+    let unit_binding_adapter = fresh_muse_glimmer_adapter(source, stream)?;
+    let unit_count = muse_glimmer_execution_layout(source)?.len();
+    let (store, report) = quantize_module_store_with_bindings(
+        store,
+        &source_static,
+        &target_static,
+        move |ordinal, stream| muse_glimmer_raw_unit(&source_units, ordinal, stream),
+        move |ordinal, stream| muse_glimmer_raw_unit(&target_units, ordinal, stream),
+        unit_count,
+        quantization,
+        stream,
+        move |modules, store| muse_glimmer_static_bindings(&static_binding_adapter, modules, store),
+        move |ordinal, unit, store| {
+            muse_glimmer_raw_unit_bindings(&unit_binding_adapter, ordinal, unit, store)
+        },
+    )?;
+    Ok((store, target, report))
+}
+
+fn load_muse_glimmer_with_store(
+    store: SharedCheckpointSource,
+    adapter: MuseGlimmerLayerwiseAdapter,
+    options: LayerWeightResidency,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MuseGlimmerExecution, Error> {
+    let store = resolve_muse_glimmer_store(store, &adapter)?;
+    let (store, adapter, materialization) = match quantization {
+        Some(quantization) => {
+            let (store, adapter, report) =
+                quantize_muse_glimmer_store(store, &adapter, quantization, stream)?;
+            (store, adapter, Some(report))
+        }
+        None => (store, adapter, None),
+    };
+    let layout = muse_glimmer_execution_layout(&adapter)?;
+    let vision_units = adapter
+        .args
+        .vision_config
+        .as_ref()
+        .map_or(0, VisionConfig::layer_count);
+    let factory = MuseGlimmerUnitFactory {
+        adapter: fresh_muse_glimmer_adapter(&adapter, stream)?,
+        vision_units,
+        parallel_layout: None,
+    };
+    let static_binding_adapter = fresh_muse_glimmer_adapter(&adapter, stream)?;
+    let unit_binding_adapter = fresh_muse_glimmer_adapter(&adapter, stream)?;
+    let sparse = adapter.sparse_expert_cache;
+    let model_type = adapter.args.model_type.clone();
+    let quantization = adapter.args.weight_quantization();
+    let mut architecture = MuseGlimmerArchitecture::from_adapter(adapter)?;
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        layout,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse && key.contains(".mlp.experts."),
+        move |modules, store| {
+            muse_glimmer_static_bindings(&static_binding_adapter, &**modules, store)
+        },
+        move |ordinal, unit, store, _| {
+            muse_glimmer_unit_bindings(&unit_binding_adapter, ordinal, &unit, store)
+        },
+    )?;
+    metadata.set_model_type(model_type);
+    metadata.set_quantization(quantization);
+    metadata.set_materialization(materialization);
+    let runtime = if options.is_fully_resident() {
+        MuseGlimmerRuntime::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        MuseGlimmerRuntime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(MuseGlimmerExecution {
+        runtime,
+        metadata,
+        parallel_info: None,
+        topology: None,
+    })
+}
+
+fn load_muse_glimmer_parallel_with_store(
+    store: SharedCheckpointSource,
+    mut adapter: MuseGlimmerLayerwiseAdapter,
+    options: LayerWeightResidency,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MuseGlimmerExecution, Error> {
+    let store = resolve_muse_glimmer_store(store, &adapter)?;
+    let mut planner = build.planner();
+    adapter.register_parallel_parameters(build, &mut planner, stream)?;
+    let (_, local_layout) = planner.finish()?;
+    adapter.configure_parallel_static(build, &local_layout, stream)?;
+
+    let global_adapter = MuseGlimmerLayerwiseAdapter::new(adapter.args.clone(), stream)?;
+    let global_static = replicated_muse_glimmer_static(&global_adapter);
+    let static_bindings =
+        muse_glimmer_static_bindings(&global_adapter, &global_static, store.as_ref())?;
+    let mut global_parameter_bytes = binding_bytes(&static_bindings)?;
+    let unit_count = muse_glimmer_execution_layout(&global_adapter)?.len();
+    for ordinal in 0..unit_count {
+        let unit = muse_glimmer_raw_unit(&global_adapter, ordinal, stream)?;
+        global_parameter_bytes = global_parameter_bytes
+            .checked_add(binding_bytes(&muse_glimmer_raw_unit_bindings(
+                &global_adapter,
+                ordinal,
+                &unit,
+                store.as_ref(),
+            )?)?)
+            .ok_or_else(|| {
+                Error::Parallel("Muse-Glimmer global parameter bytes overflowed".into())
+            })?;
+    }
+
+    let shared_layout = Arc::new(local_layout);
+    let mut factory_adapter = fresh_muse_glimmer_adapter(&adapter, stream)?;
+    factory_adapter.configure_parallel_static(build, &shared_layout, stream)?;
+    let vision_units = adapter
+        .args
+        .vision_config
+        .as_ref()
+        .map_or(0, VisionConfig::layer_count);
+    let factory = MuseGlimmerUnitFactory {
+        adapter: factory_adapter,
+        vision_units,
+        parallel_layout: Some(Arc::clone(&shared_layout)),
+    };
+    let static_layout = Arc::clone(&shared_layout);
+    let unit_layout = Arc::clone(&shared_layout);
+    let unit_binding_adapter = global_adapter;
+    let sparse = adapter.sparse_expert_cache;
+    let model_type = adapter.args.model_type.clone();
+    let quantization = adapter.args.weight_quantization();
+    let layout = muse_glimmer_execution_layout(&adapter)?;
+    let mut architecture = MuseGlimmerArchitecture::from_adapter(adapter)?;
+    architecture.parallel_topology = Some(build.topology());
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        layout,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse && key.contains(".mlp.experts."),
+        move |_, store| shard_layer_bindings(static_bindings, "", store, &static_layout),
+        move |ordinal, _local, store, stream| {
+            let global = muse_glimmer_raw_unit(&unit_binding_adapter, ordinal, stream)?;
+            let (group, index) = muse_glimmer_ordinal(&unit_binding_adapter, ordinal);
+            shard_layer_bindings(
+                unit_binding_adapter.layer_bindings(group, index, &global, store)?,
+                &unit_binding_adapter.layer_checkpoint_prefix(group, index),
+                store,
+                &unit_layout,
+            )
+        },
+    )?;
+    metadata.set_model_type(model_type.clone());
+    metadata.set_quantization(quantization);
+    let local_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.layer_parameter_bytes())
+        .ok_or_else(|| Error::Parallel("Muse-Glimmer local parameter bytes overflowed".into()))?;
+    let maximum_device_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.maximum_device_layer_bytes())
+        .ok_or_else(|| Error::Parallel("Muse-Glimmer device parameter bytes overflowed".into()))?;
+    let info = eredu_runtime::ParallelModelInfo::new(
+        build.topology(),
+        model_type,
+        shared_layout
+            .tensors()
+            .map(|(target, _)| target.to_string())
+            .collect(),
+        local_parameter_bytes,
+        global_parameter_bytes,
+        if options.is_fully_resident() {
+            local_parameter_bytes
+        } else {
+            metadata.static_device_bytes()
+        },
+        maximum_device_parameter_bytes,
+    );
+    let runtime = if options.is_fully_resident() {
+        MuseGlimmerRuntime::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        MuseGlimmerRuntime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(MuseGlimmerExecution {
+        runtime,
+        metadata,
+        parallel_info: Some(info),
+        topology: Some(build.topology()),
+    })
 }
 
 /// Loads Qwen2/Qwen2.5 or Qwen3 through the generalized residency engine.
@@ -658,7 +1757,7 @@ pub fn load_safetensors(
         .flatten();
     let source_adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
-        execution: load_layerwise_model_with_quantization(
+        execution: load_muse_glimmer_with_store(
             store,
             source_adapter,
             options,
@@ -713,7 +1812,7 @@ pub(crate) fn load_tensor_parallel_model(
     let args = resident::load_config(model_dir)?;
     let adapter = MuseGlimmerLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
-        execution: load_tensor_parallel_layerwise_model(
+        execution: load_muse_glimmer_parallel_with_store(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
@@ -752,7 +1851,7 @@ pub(crate) fn load_gguf_tensor_parallel_model(
         &args,
         options.max_mapped_shards(),
     )?;
-    let execution = load_tensor_parallel_layerwise_model(
+    let execution = load_muse_glimmer_parallel_with_store(
         store,
         MuseGlimmerLayerwiseAdapter::new(args, stream)?,
         options,
@@ -795,7 +1894,7 @@ pub(crate) fn load_gguf_checkpoint(
             "Muse-Glimmer is dense and does not support sparse expert-cache residency".into(),
         ));
     }
-    let execution = load_layerwise_model_with_quantization(
+    let execution = load_muse_glimmer_with_store(
         store,
         MuseGlimmerLayerwiseAdapter::new(args, stream)?,
         residency.layers(),
@@ -921,10 +2020,10 @@ pub fn load_qwen3_expert_cache_model(
         .flatten();
     let source_adapter = MuseGlimmerLayerwiseAdapter::new_external_experts(args.clone(), stream)?;
     let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
-    let mut execution = load_layerwise_model_with_quantization(
+    let mut execution = load_muse_glimmer_with_store(
         store,
         source_adapter,
-        non_expert,
+        non_expert.into(),
         quantize_on_load,
         stream,
         weights_stream,
@@ -1045,7 +2144,13 @@ impl MuseGlimmerLayerwiseAdapter {
     }
 
     fn pipeline_cache(&self) -> MuseGlimmerLayerwiseCache {
-        MuseGlimmerLayerwiseCache::Concat(
+        MuseGlimmerLayerwiseCache::concat(
+            StateLayout::new(
+                self.prompt_cache_model_identity(None)
+                    .expect("validated Muse-Glimmer pipeline cache identity")
+                    .layer_layout,
+            )
+            .expect("validated Muse-Glimmer pipeline state layout"),
             self.args
                 .attention_schedule
                 .iter()
@@ -1739,7 +2844,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
         match cache {
-            MuseGlimmerLayerwiseCache::Concat(cache) => resident::save_prompt_cache(
+            MuseGlimmerLayerwiseCache::Concat { caches: cache, .. } => resident::save_prompt_cache(
                 &self.args,
                 cache,
                 destination,
@@ -1749,7 +2854,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
                 stream,
             )
             .map_err(Into::into),
-            MuseGlimmerLayerwiseCache::Paged(caches) => {
+            MuseGlimmerLayerwiseCache::Paged { caches, .. } => {
                 for cache in caches.iter_mut().flatten() {
                     cache.finalize()?;
                 }
@@ -1762,7 +2867,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
                     .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
                     .map_err(|error| Error::Parallel(error.to_string()))
             }
-            MuseGlimmerLayerwiseCache::Sliding(_) => Err(Error::Parallel(
+            MuseGlimmerLayerwiseCache::Sliding { .. } => Err(Error::Parallel(
                 "Muse-Glimmer sliding-cache persistence is unsupported; use concat or paged cache state".into(),
             )),
         }
@@ -1785,7 +2890,14 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             identity,
             stream,
         )?;
-        Ok((MuseGlimmerLayerwiseCache::Concat(cache), manifest))
+        Ok((
+            MuseGlimmerLayerwiseCache::concat(
+                StateLayout::new(identity.layer_layout.clone())
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
+                cache,
+            ),
+            manifest,
+        ))
     }
 
     fn validate_cache(&self, cache: &mut Self::Cache) -> Result<(), Error> {
@@ -1796,7 +2908,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             ))
         })?;
         match cache {
-            MuseGlimmerLayerwiseCache::Concat(caches) => {
+            MuseGlimmerLayerwiseCache::Concat { caches, .. } => {
                 if caches.is_empty() {
                     *caches = self
                         .args
@@ -1815,10 +2927,10 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
                 }
                 validate_muse_glimmer_cache(caches, expected)
             }
-            MuseGlimmerLayerwiseCache::Sliding(caches) => {
+            MuseGlimmerLayerwiseCache::Sliding { caches, .. } => {
                 validate_muse_glimmer_cache(caches, expected)
             }
-            MuseGlimmerLayerwiseCache::Paged(caches) => {
+            MuseGlimmerLayerwiseCache::Paged { caches, .. } => {
                 validate_muse_glimmer_cache(caches, expected)
             }
         }
@@ -2443,7 +3555,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             )));
         };
         match cache {
-            MuseGlimmerLayerwiseCache::Concat(caches) => self.forward_cached_layer(
+            MuseGlimmerLayerwiseCache::Concat { caches, .. } => self.forward_cached_layer(
                 index,
                 layer,
                 hidden,
@@ -2453,7 +3565,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
                 context,
                 stream,
             ),
-            MuseGlimmerLayerwiseCache::Sliding(caches) => self.forward_cached_layer(
+            MuseGlimmerLayerwiseCache::Sliding { caches, .. } => self.forward_cached_layer(
                 index,
                 layer,
                 hidden,
@@ -2463,7 +3575,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
                 context,
                 stream,
             ),
-            MuseGlimmerLayerwiseCache::Paged(caches) => self.forward_cached_layer(
+            MuseGlimmerLayerwiseCache::Paged { caches, .. } => self.forward_cached_layer(
                 index,
                 layer,
                 hidden,
@@ -2513,7 +3625,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             )));
         };
         Ok(match cache {
-            MuseGlimmerLayerwiseCache::Concat(caches) => layer.forward_with_observer(
+            MuseGlimmerLayerwiseCache::Concat { caches, .. } => layer.forward_with_observer(
                 AttentionInput {
                     x: hidden,
                     mask: context.mask.as_ref(),
@@ -2527,7 +3639,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
                 &prefix,
                 observer,
             )?,
-            MuseGlimmerLayerwiseCache::Sliding(caches) => layer.forward_with_observer(
+            MuseGlimmerLayerwiseCache::Sliding { caches, .. } => layer.forward_with_observer(
                 AttentionInput {
                     x: hidden,
                     mask: context.mask.as_ref(),
@@ -2541,7 +3653,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
                 &prefix,
                 observer,
             )?,
-            MuseGlimmerLayerwiseCache::Paged(caches) => layer.forward_with_observer(
+            MuseGlimmerLayerwiseCache::Paged { caches, .. } => layer.forward_with_observer(
                 AttentionInput {
                     x: hidden,
                     mask: context.mask.as_ref(),
@@ -2609,21 +3721,22 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             )));
         };
         match cache {
-            MuseGlimmerLayerwiseCache::Concat(caches) => Ok(layer.forward_tensor_parallel(
+            MuseGlimmerLayerwiseCache::Concat { caches, .. } => Ok(layer.forward_tensor_parallel(
                 hidden,
                 context.mask.as_ref(),
                 caches[index].as_mut(),
                 tp_group,
                 execution.stream(),
             )?),
-            MuseGlimmerLayerwiseCache::Sliding(caches) => Ok(layer.forward_tensor_parallel(
-                hidden,
-                context.mask.as_ref(),
-                caches[index].as_mut(),
-                tp_group,
-                execution.stream(),
-            )?),
-            MuseGlimmerLayerwiseCache::Paged(caches) => Ok(layer.forward_tensor_parallel(
+            MuseGlimmerLayerwiseCache::Sliding { caches, .. } => Ok(layer
+                .forward_tensor_parallel(
+                    hidden,
+                    context.mask.as_ref(),
+                    caches[index].as_mut(),
+                    tp_group,
+                    execution.stream(),
+                )?),
+            MuseGlimmerLayerwiseCache::Paged { caches, .. } => Ok(layer.forward_tensor_parallel(
                 hidden,
                 context.mask.as_ref(),
                 caches[index].as_mut(),
@@ -2643,9 +3756,13 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             return Vec::new();
         }
         match cache {
-            MuseGlimmerLayerwiseCache::Concat(caches) => retained_cache_arrays(caches, index),
-            MuseGlimmerLayerwiseCache::Sliding(caches) => retained_cache_arrays(caches, index),
-            MuseGlimmerLayerwiseCache::Paged(caches) => retained_cache_arrays(caches, index),
+            MuseGlimmerLayerwiseCache::Concat { caches, .. } => {
+                retained_cache_arrays(caches, index)
+            }
+            MuseGlimmerLayerwiseCache::Sliding { caches, .. } => {
+                retained_cache_arrays(caches, index)
+            }
+            MuseGlimmerLayerwiseCache::Paged { caches, .. } => retained_cache_arrays(caches, index),
         }
     }
 
@@ -2727,19 +3844,19 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             }
         }
         context.mask = match cache {
-            MuseGlimmerLayerwiseCache::Concat(caches) => muse_glimmer_attention_mask(
+            MuseGlimmerLayerwiseCache::Concat { caches, .. } => muse_glimmer_attention_mask(
                 &hidden,
                 context.requested_mask.as_ref(),
                 caches,
                 stream,
             )?,
-            MuseGlimmerLayerwiseCache::Sliding(caches) => muse_glimmer_attention_mask(
+            MuseGlimmerLayerwiseCache::Sliding { caches, .. } => muse_glimmer_attention_mask(
                 &hidden,
                 context.requested_mask.as_ref(),
                 caches,
                 stream,
             )?,
-            MuseGlimmerLayerwiseCache::Paged(caches) => muse_glimmer_attention_mask(
+            MuseGlimmerLayerwiseCache::Paged { caches, .. } => muse_glimmer_attention_mask(
                 &hidden,
                 context.requested_mask.as_ref(),
                 caches,
@@ -3391,4 +4508,140 @@ fn split_expert_key(
                 projections
             ))
         })
+}
+
+#[cfg(test)]
+mod neutral_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn production_model_and_loaders_use_the_neutral_layerwise_runtime() {
+        let source = include_str!("layerwise.rs");
+        let production = source
+            .split("/// Host-backed Muse-Glimmer causal LM.")
+            .nth(1)
+            .expect("production wrapper marker");
+        let production = production
+            .split("/// Dense-Qwen adapter sharing one complete-block execution path.")
+            .next()
+            .expect("legacy adapter marker");
+        assert!(production.contains("execution: MuseGlimmerExecution"));
+        assert!(production.contains("load_muse_glimmer_with_store("));
+        assert!(production.contains("load_muse_glimmer_parallel_with_store("));
+        assert!(!production.contains("LayerwiseModel<"));
+        assert!(!production.contains("load_layerwise_model_with_quantization("));
+        assert!(!production.contains("load_tensor_parallel_layerwise_model("));
+    }
+
+    #[test]
+    fn tiny_muse_glimmer_executes_resident_and_bounded_text_layers() {
+        let context =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let weights_context =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let weights_stream = weights_context.stream();
+        let config = serde_json::json!({
+            "architectures": ["MuseGlimmerForConditionalGeneration"],
+            "model_type": "muse_glimmer",
+            "image_token_id": 22,
+            "video_token_id": 23,
+            "out_hidden_size": 32,
+            "projector_hidden_size": 16,
+            "text_config": {
+                "model_type": "muse_glimmer_text",
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "intermediate_size": 24,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "rms_norm_eps": 0.00001,
+                "post_norm_eps": 0.00001,
+                "vocab_size": 24,
+                "max_position_embeddings": 64,
+                "rope_theta": 10000.0,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "layer_rope_theta": [10000.0, 0.0],
+                "sliding_window": 8,
+                "tie_word_embeddings": false,
+                "hidden_act": "silu",
+                "attention_dropout": 0.0,
+                "qk_scale_factor": 1.0,
+                "output_multiplier": 1.0,
+                "final_logit_softcapping": 30.0
+            },
+            "vision_config": {
+                "model_type": "muse_glimmer_vision",
+                "hidden_size": 8,
+                "intermediate_size": 12,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 1,
+                "patch_size": 2,
+                "patch_temporal": 1,
+                "merge_size": 2,
+                "pos_emb_height": 2,
+                "pos_emb_width": 2,
+                "max_position_embeddings": 4,
+                "layer_norm_eps": 0.00001,
+                "hidden_act": "gelu",
+                "layer_types": ["full_attention"],
+                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+            }
+        });
+        let args = resident::config_from_hf_value(&config).unwrap();
+        let adapter = MuseGlimmerLayerwiseAdapter::new(args.clone(), stream).unwrap();
+        let mut arrays = BTreeMap::<String, Array>::new();
+        let mut insert_module = |prefix: &str, module: &dyn ModuleParameters| {
+            for (name, parameter) in module.parameters().flatten() {
+                arrays.insert(
+                    format!("{prefix}.{name}"),
+                    zeros_dtype(parameter.shape(), parameter.dtype(), stream).unwrap(),
+                );
+            }
+        };
+        if let Some(vision) = &adapter.vision {
+            insert_module("model", vision);
+        }
+        insert_module("model.language_model.embed_tokens", &adapter.embedding);
+        insert_module("model.language_model.norm", &adapter.norm);
+        insert_module("lm_head", adapter.lm_head.as_ref().unwrap());
+        for group in 0..2 {
+            for index in 0..adapter.layer_count(group).unwrap() {
+                let layer = adapter.new_layer(group, index, stream).unwrap();
+                insert_module(&adapter.layer_checkpoint_prefix(group, index), &layer);
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        Array::save_safetensors(
+            arrays.iter().map(|(name, array)| (name.as_str(), array)),
+            None,
+            directory.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+
+        for residency in [
+            LayerWeightResidency::FullyResident,
+            eredu_runtime::LayerwiseLoadOptions::default().into(),
+        ] {
+            let store =
+                open_safetensors_weight_store(directory.path(), residency.max_mapped_shards())
+                    .unwrap();
+            let execution = load_muse_glimmer_with_store(
+                store,
+                MuseGlimmerLayerwiseAdapter::new(args.clone(), stream).unwrap(),
+                residency,
+                None,
+                stream,
+                weights_stream,
+            )
+            .unwrap();
+            let mut model = LayerwiseDecoder { execution };
+            let mut cache = model.new_cache();
+            let logits = model.forward(&tokens, None, &mut cache, stream).unwrap();
+            safemlx::transforms::eval([&logits]).unwrap();
+            assert_eq!(logits.shape(), &[1, 2, 24]);
+        }
+    }
 }

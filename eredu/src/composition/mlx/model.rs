@@ -940,7 +940,7 @@ impl Model {
                 Self::MuseGlimmer(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .and_then(|cache| match cache {
-                        crate::composition::mlx_architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache::Paged(caches) => Ok(ModelCache::PagedKeyValue(caches)),
+                        crate::composition::mlx_architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache::Paged { caches, .. } => Ok(ModelCache::PagedKeyValue(caches)),
                         _ => Err(Error::UnsupportedArchitecture(
                             "Muse-Glimmer paged cache construction returned device state".into(),
                         )),
