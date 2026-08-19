@@ -2,7 +2,7 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -1190,9 +1190,18 @@ impl LayerCache {
     }
 }
 
+impl RuntimeLayerState<crate::backend::mlx::nn::shared::MlxBackend> for LayerCache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        self.retained_arrays().into_iter()
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Heterogeneous LFM2 generation cache.
 pub struct Cache {
+    layout: StateLayout,
     /// Per-layer operator caches.
     pub layers: Vec<LayerCache>,
 }
@@ -1200,6 +1209,7 @@ pub struct Cache {
 impl Cache {
     pub(crate) fn new(args: &ModelArgs) -> Result<Self, Error> {
         Ok(Self {
+            layout: state_layout(args)?,
             layers: args
                 .layer_schedule
                 .iter()
@@ -1217,6 +1227,7 @@ impl Cache {
         let manager = CacheResidencyManager::new(options)
             .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(Self {
+            layout: state_layout(args).map_err(|error| Exception::custom(error.to_string()))?,
             layers: args
                 .layer_schedule
                 .iter()
@@ -1278,6 +1289,53 @@ impl Cache {
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Error> {
+    let geometry = args
+        .layer_schedule
+        .iter()
+        .map(|policy| match policy.operator {
+            OperatorPolicy::CausalConvolution => Lfm2LayerCacheGeometry {
+                kv_heads: None,
+                convolution_channels: Some(args.hidden_size),
+            },
+            OperatorPolicy::SelfAttention(_) => Lfm2LayerCacheGeometry {
+                kv_heads: Some(args.num_key_value_heads),
+                convolution_channels: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    StateLayout::new(prompt_cache_layer_layout_with_geometry(args, &geometry)?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() != 0 {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: 1,
+            });
+        }
+        self.layers
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.layers.len(),
+            })
+            .map(RuntimeLayerState::retained_values)
     }
 }
 
