@@ -12,7 +12,16 @@ use eredu_core::generation::{
 use eredu_core::{MtpCapability, MtpCheckpointKind, MtpStats, SpeculativeSemanticState};
 use safemlx::{error::Exception, Array, Stream};
 
-use crate::backend::mlx::architectures::{
+use crate::backend::mlx::error::Error;
+use crate::backend::mlx::runtime::cache::residency::{
+    CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+};
+use crate::backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache};
+use crate::backend::mlx::runtime::execution::inspection::ActivationObserver;
+use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
+use crate::backend::mlx::runtime::media::input;
+use crate::backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
+use crate::composition::mlx_architectures::{
     deepseek_v3::model as deepseek_v3,
     deepseek_v4::model as deepseek_v4,
     gemma4::assistant as gemma4_assistant,
@@ -29,59 +38,56 @@ use crate::backend::mlx::architectures::{
         vl::{model as qwen3_vl, moe as qwen3_vl_moe},
     },
 };
-use crate::backend::mlx::error::Error;
-use crate::backend::mlx::runtime::cache::residency::{
-    CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-};
-use crate::backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache};
-use crate::backend::mlx::runtime::execution::inspection::ActivationObserver;
-use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
-use crate::backend::mlx::runtime::media::input;
-use crate::backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
 use crate::{LayerCachePolicy, LayerSchedule};
 
 /// Loaded model value for any architecture supported by this crate.
 pub enum Model {
     /// DeepSeek-V3/R1 model.
     DeepSeekV3(
-        crate::backend::mlx::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel,
+        crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel,
     ),
     /// DeepSeek-V4 target model.
-    DeepSeekV4(Box<crate::backend::mlx::architectures::deepseek_v4::model::Model>),
+    DeepSeekV4(Box<crate::composition::mlx_architectures::deepseek_v4::model::Model>),
     /// DeepSeek-V4 model using generalized bounded residency.
     DeepSeekV4Layerwise(
-        Box<crate::backend::mlx::architectures::deepseek_v4::layerwise::DeepSeekV4LayerwiseModel>,
+        Box<
+            crate::composition::mlx_architectures::deepseek_v4::layerwise::DeepSeekV4LayerwiseModel,
+        >,
     ),
     /// Gemma 4 text and multimodal model.
-    Gemma4(Box<crate::backend::mlx::architectures::gemma4::layerwise::Gemma4LayerwiseModel>),
+    Gemma4(Box<crate::composition::mlx_architectures::gemma4::layerwise::Gemma4LayerwiseModel>),
     /// OpenAI GPT-OSS model.
-    GptOss(crate::backend::mlx::architectures::gpt_oss::layerwise::GptOssLayerwiseModel),
+    GptOss(crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseModel),
     /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder.
     KimiLinear(
-        crate::backend::mlx::architectures::kimi_linear::layerwise::KimiLinearLayerwiseModel,
+        crate::composition::mlx_architectures::kimi_linear::layerwise::KimiLinearLayerwiseModel,
     ),
     /// Thinking Machines Lab Inkling multimodal model.
-    Inkling(crate::backend::mlx::architectures::inkling::layerwise::InklingLayerwiseModel),
+    Inkling(crate::composition::mlx_architectures::inkling::layerwise::InklingLayerwiseModel),
     /// Llama-compatible dense model.
     Llama(crate::composition::llama::LlamaModel),
     /// Meta Muse-Glimmer dense multimodal model.
-    MuseGlimmer(crate::backend::mlx::architectures::muse_glimmer::layerwise::LayerwiseDecoder),
+    MuseGlimmer(crate::composition::mlx_architectures::muse_glimmer::layerwise::LayerwiseDecoder),
     /// Liquid AI LFM2/LFM2.5 model.
-    Lfm2(crate::backend::mlx::architectures::lfm2::layerwise::Lfm2LayerwiseModel),
+    Lfm2(crate::composition::mlx_architectures::lfm2::layerwise::Lfm2LayerwiseModel),
     /// Nemotron-H hybrid model.
-    NemotronH(crate::backend::mlx::architectures::nemotron_h::layerwise::NemotronHLayerwiseModel),
+    NemotronH(
+        crate::composition::mlx_architectures::nemotron_h::layerwise::NemotronHLayerwiseModel,
+    ),
     /// Dense Qwen2/Qwen2.5/Qwen3 model.
-    DenseQwen(crate::backend::mlx::architectures::qwen::dense::layerwise::LayerwiseDecoder),
+    DenseQwen(crate::composition::mlx_architectures::qwen::dense::layerwise::LayerwiseDecoder),
     /// Qwen3-Next model.
     Qwen3Next(
-        crate::backend::mlx::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel,
+        crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel,
     ),
     /// Qwen3-VL multimodal model.
-    Qwen3Vl(crate::backend::mlx::architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
+    Qwen3Vl(crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
     /// Qwen3-VL-MoE multimodal model.
-    Qwen3VlMoe(crate::backend::mlx::architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
+    Qwen3VlMoe(crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
     /// Qwen3.5 dense or MoE model, optionally multimodal.
-    Qwen35(crate::backend::mlx::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel),
+    Qwen35(
+        crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel,
+    ),
 }
 
 impl Model {
@@ -165,7 +171,7 @@ impl Model {
                 let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut executor =
-                    crate::backend::mlx::architectures::gemma4::mtp::Gemma4MtpExecutor::new(
+                    crate::composition::mlx_architectures::gemma4::mtp::Gemma4MtpExecutor::new(
                         target, assistant,
                     );
                 crate::backend::mlx::speculative::scheduler::generate_semantic(
@@ -185,7 +191,7 @@ impl Model {
             Self::MuseGlimmer(target) => {
                 let assistant = drafter.muse_glimmer_mut();
                 let mut backend =
-                    crate::backend::mlx::architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
+                    crate::composition::mlx_architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
                         target, assistant,
                     );
                 crate::backend::mlx::speculative::scheduler::generate_semantic(
@@ -260,7 +266,7 @@ impl Model {
         let result = match (self, cache) {
             (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
                 let mut target =
-                    crate::backend::mlx::architectures::deepseek_v3::layerwise::DeepSeekTensorMtpTarget::new(
+                    crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekTensorMtpTarget::new(
                         model,
                         tensor_group,
                     );
@@ -282,7 +288,7 @@ impl Model {
             }
             (Self::Inkling(model), ModelCache::Inkling(cache)) => {
                 let mut target =
-                    crate::backend::mlx::architectures::inkling::layerwise::InklingTensorMtpTarget::new(
+                    crate::composition::mlx_architectures::inkling::layerwise::InklingTensorMtpTarget::new(
                         model,
                         tensor_group,
                     );
@@ -304,7 +310,7 @@ impl Model {
             }
             (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
                 let mut target =
-                    crate::backend::mlx::architectures::nemotron_h::layerwise::NemotronHTensorMtpTarget::new(
+                    crate::composition::mlx_architectures::nemotron_h::layerwise::NemotronHTensorMtpTarget::new(
                         model,
                         tensor_group,
                     );
@@ -327,7 +333,7 @@ impl Model {
             (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
                 let mut target =
-                    crate::backend::mlx::architectures::qwen::hybrid::layerwise::QwenHybridTensorMtpTarget::new(
+                    crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridTensorMtpTarget::new(
                         model,
                         tensor_group,
                     );
@@ -913,7 +919,7 @@ impl Model {
                 Self::DenseQwen(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .and_then(|cache| match cache {
-                        crate::backend::mlx::architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache::Paged(caches) => Ok(ModelCache::PagedKeyValue(caches)),
+                        crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache::Paged(caches) => Ok(ModelCache::PagedKeyValue(caches)),
                         _ => Err(Error::UnsupportedArchitecture(
                             "dense-Qwen paged cache construction returned device state".into(),
                         )),
@@ -922,7 +928,7 @@ impl Model {
                 Self::MuseGlimmer(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .and_then(|cache| match cache {
-                        crate::backend::mlx::architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache::Paged(caches) => Ok(ModelCache::PagedKeyValue(caches)),
+                        crate::composition::mlx_architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache::Paged(caches) => Ok(ModelCache::PagedKeyValue(caches)),
                         _ => Err(Error::UnsupportedArchitecture(
                             "Muse-Glimmer paged cache construction returned device state".into(),
                         )),
@@ -1267,7 +1273,7 @@ pub enum ModelCache {
     /// Compressed latent MLA cache for DeepSeek-V3/R1.
     DeepSeekV3(deepseek_v3::Cache),
     /// Local and compressed attention caches for DeepSeek-V4.
-    DeepSeekV4(crate::backend::mlx::architectures::deepseek_v4::model::Cache),
+    DeepSeekV4(crate::composition::mlx_architectures::deepseek_v4::model::Cache),
     /// Gemma 4 generation cache.
     Gemma4(gemma4::Cache),
     /// GPT-OSS cache following its canonical per-layer attention schedule.
@@ -1391,7 +1397,7 @@ mod gemma4_drafter_compatibility_tests {
     use safemlx::{Device, DeviceType, Stream};
 
     use super::validate_gemma4_drafter;
-    use crate::backend::mlx::architectures::gemma4::{
+    use crate::composition::mlx_architectures::gemma4::{
         assistant::{Gemma4AssistantConfig, Gemma4AssistantDraftModel},
         model::{model_args_from_config_value, ModelArgs},
     };

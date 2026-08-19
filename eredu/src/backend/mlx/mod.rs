@@ -1,7 +1,5 @@
 //! MLX backend adapter.
 
-/// MLX model-family tensor implementations.
-pub mod architectures;
 /// MLX hardware discovery, planning admission, and plan realization.
 pub mod automatic;
 /// Prompt-cache topology conversion for MLX distributed execution.
@@ -74,10 +72,10 @@ use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Strea
 #[cfg(feature = "mlx-media")]
 use crate::backend::mlx::runtime::media::ModelProcessor;
 use crate::{
-    backend::mlx::architectures::distributed::{
+    backend::mlx::error::Error,
+    composition::mlx_architectures::distributed::{
         expert::ExpertParallelModel, pipeline::PipelineModel,
     },
-    backend::mlx::error::Error,
 };
 
 /// Opaque MLX executable selected for one complete model session.

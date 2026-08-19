@@ -20,15 +20,15 @@ use crate::{
 /// Shared PCM waveform validation and spectral operations.
 #[cfg(feature = "mlx-audio")]
 pub mod audio;
-use crate::backend::mlx::architectures::gemma4::processor as gemma4;
+use crate::composition::mlx_architectures::gemma4::processor as gemma4;
 /// Shared decoded-image operations.
 #[cfg(feature = "mlx-image")]
 pub mod image;
-use crate::backend::mlx::architectures::inkling::processor as inkling;
+use crate::composition::mlx_architectures::inkling::processor as inkling;
 #[cfg(feature = "mlx-image")]
-use crate::backend::mlx::architectures::muse_glimmer::processor as muse_glimmer;
+use crate::composition::mlx_architectures::muse_glimmer::processor as muse_glimmer;
 #[cfg(feature = "mlx-image")]
-use crate::backend::mlx::architectures::qwen::vl::processor as qwen;
+use crate::composition::mlx_architectures::qwen::vl::processor as qwen;
 /// Shared decoded-video validation, sampling, and timing operations.
 #[cfg(feature = "mlx-image")]
 pub mod video;

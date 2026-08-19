@@ -22,16 +22,16 @@ use safemlx::{
 };
 
 use crate::{
-    backend::mlx::architectures::gemma4::assistant::{
-        load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
-        Gemma4AssistantDraftModel,
-    },
-    backend::mlx::architectures::muse_glimmer::assistant::{
-        self as muse_dflash, MuseGlimmerDFlash,
-    },
     backend::mlx::error::Error,
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::{ModelCache, ModelLoadOptions},
+    composition::mlx_architectures::gemma4::assistant::{
+        load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
+        Gemma4AssistantDraftModel,
+    },
+    composition::mlx_architectures::muse_glimmer::assistant::{
+        self as muse_dflash, MuseGlimmerDFlash,
+    },
 };
 
 /// Architecture-dispatched MLX draft model with its fixed execution placement.

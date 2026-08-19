@@ -10,8 +10,10 @@ use serde_json::Value;
 use eredu_core::{GgufArchitecture, ModelKind};
 
 use super::ModelLoadOptions;
-use crate::backend::mlx::{
-    architectures::{
+use crate::backend::mlx::{error::Error, runtime::checkpoint::store::SafetensorsWeightStore};
+use crate::composition::{
+    llama_checkpoint,
+    mlx_architectures::{
         deepseek_v3::checkpoint as deepseek_v3_checkpoint,
         deepseek_v4::checkpoint as deepseek_v4_checkpoint,
         gemma4::{checkpoint as gemma4_checkpoint, model as gemma4},
@@ -27,10 +29,7 @@ use crate::backend::mlx::{
             hybrid::checkpoint as qwen_hybrid_checkpoint, vl::checkpoint as qwen_vl_checkpoint,
         },
     },
-    error::Error,
-    runtime::checkpoint::store::SafetensorsWeightStore,
 };
-use crate::composition::llama_checkpoint;
 
 pub(crate) use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
@@ -450,7 +449,7 @@ mod dense_qwen_tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::backend::mlx::architectures::qwen::dense;
+    use crate::composition::mlx_architectures::qwen::dense;
 
     fn qwen2_args(tied: bool) -> dense::DecoderConfig {
         dense::config_from_hf_value(&serde_json::json!({

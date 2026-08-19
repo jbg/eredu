@@ -6427,14 +6427,14 @@ mod tests {
     #[test]
     fn model_reset_surfaces_propagate_paged_clear_failures() {
         use crate::{
-            backend::mlx::architectures::distributed::{
+            backend::mlx::runtime::cache::{state::MlxKeyValueState, PagedKeyValueCache},
+            composition::mlx_architectures::distributed::{
                 expert::ExpertParallelCache,
                 pipeline::{PipelineCache, PipelineKeyValueCache, PipelineLayerCache},
             },
-            backend::mlx::architectures::gpt_oss::model::{
+            composition::mlx_architectures::gpt_oss::model::{
                 Cache as GptOssCache, LayerCache as GptOssLayerCache,
             },
-            backend::mlx::runtime::cache::{state::MlxKeyValueState, PagedKeyValueCache},
         };
 
         let manager = manager_with_leased_block();

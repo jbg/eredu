@@ -10,16 +10,16 @@ use eredu_core::{
 use safemlx::{error::Exception, Array};
 
 use super::{
-    architectures::{
-        deepseek_v3::model as deepseek_v3, gemma4::model as gemma4, inkling::model as inkling,
-        nemotron_h::model as nemotron_h, qwen::hybrid::qwen3_5,
-    },
     error::Error,
     runtime::generation::sampler::{ConstrainedSampler, GenerationSampler},
     speculative::{
         scheduler::MlxMtpScheduler, MlxDrafter, MlxDrafterKind, MlxMtpCache, MtpExecutionStreams,
     },
     validate_gemma4_drafter, MlxBackend, MlxModelInput, Model, ModelCache,
+};
+use crate::composition::mlx_architectures::{
+    deepseek_v3::model as deepseek_v3, gemma4::model as gemma4, inkling::model as inkling,
+    nemotron_h::model as nemotron_h, qwen::hybrid::qwen3_5,
 };
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
@@ -356,7 +356,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 let assistant = drafter.gemma4_mut();
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut backend =
-                    crate::backend::mlx::architectures::gemma4::mtp::Gemma4MtpExecutor::new(
+                    crate::composition::mlx_architectures::gemma4::mtp::Gemma4MtpExecutor::new(
                         target, assistant,
                     );
                 run_speculative_batch(
@@ -372,7 +372,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             Model::MuseGlimmer(target) => {
                 let assistant = drafter.muse_glimmer_mut();
                 let mut backend =
-                    crate::backend::mlx::architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
+                    crate::composition::mlx_architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
                         target, assistant,
                     );
                 run_speculative_batch(

@@ -2,7 +2,8 @@
 
 use serde_json::Value;
 
-use crate::backend::mlx::architectures::{
+use crate::backend::mlx::error::Error;
+use crate::composition::mlx_architectures::{
     deepseek_v3::model as deepseek_v3,
     deepseek_v4::model as deepseek_v4,
     gemma4::model as gemma4,
@@ -19,7 +20,6 @@ use crate::backend::mlx::architectures::{
         vl::{model as qwen3_vl, moe as qwen3_vl_moe},
     },
 };
-use crate::backend::mlx::error::Error;
 
 /// Canonical resolution of a model configuration supported by MLX.
 #[derive(Debug, Clone, Eq, PartialEq)]

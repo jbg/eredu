@@ -14,7 +14,8 @@ use safemlx::{Array, Stream};
 
 use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
 use crate::{
-    backend::mlx::architectures::{
+    backend::mlx::runtime::media::input::{self, InputPayload, Modality},
+    composition::mlx_architectures::{
         deepseek_v3::model as deepseek_v3,
         deepseek_v4,
         gemma4::model as gemma4,
@@ -27,7 +28,6 @@ use crate::{
         qwen::dense as dense_qwen,
         qwen::hybrid::qwen3_5::{self, LayerPolicy as QwenHybridLayerPolicy},
     },
-    backend::mlx::runtime::media::input::{self, InputPayload, Modality},
     core::attention::AttentionPolicy,
     core::residency::MemoryTier,
 };
@@ -1264,7 +1264,7 @@ fn gemma_valid_patch_count(positions: &Array, architecture: &str) -> Result<u64,
 }
 
 fn qwen_vision_workspace(
-    config: &crate::backend::mlx::architectures::qwen::vl::vision::VisionConfig,
+    config: &crate::composition::mlx_architectures::qwen::vl::vision::VisionConfig,
     modality: Modality,
     payload: &Array,
     metadata: input::InputMetadata<'_>,
@@ -1325,11 +1325,13 @@ fn qwen_vision_workspace(
             reason: "prepared Qwen media has no grid_thw metadata".into(),
         })
         .and_then(|grid| {
-            crate::backend::mlx::architectures::qwen::vl::vision::grid_thw_from_array(grid, stream)
-                .map_err(|error| CapabilityError::UnsupportedInput {
-                    architecture: architecture.into(),
-                    reason: error.to_string(),
-                })
+            crate::composition::mlx_architectures::qwen::vl::vision::grid_thw_from_array(
+                grid, stream,
+            )
+            .map_err(|error| CapabilityError::UnsupportedInput {
+                architecture: architecture.into(),
+                reason: error.to_string(),
+            })
         })?;
     let described_patches = grid.iter().try_fold(0u64, |total, (time, height, width)| {
         let item_patches = checked_mul(
@@ -1364,7 +1366,7 @@ fn qwen_vision_workspace(
             .filter(|policy| {
                 matches!(
                     policy.attention,
-                    crate::backend::mlx::architectures::qwen::vl::vision::VisionAttentionPolicy::Full
+                    crate::composition::mlx_architectures::qwen::vl::vision::VisionAttentionPolicy::Full
                 )
             })
             .count(),
@@ -1459,7 +1461,7 @@ fn qwen_vision_workspace(
 }
 
 fn gemma_vision_workspace(
-    config: &crate::backend::mlx::architectures::gemma4::vision::Gemma4VisionConfig,
+    config: &crate::composition::mlx_architectures::gemma4::vision::Gemma4VisionConfig,
     text_hidden: u64,
     payload: &Array,
     metadata: input::InputMetadata<'_>,
@@ -1570,7 +1572,7 @@ fn gemma_vision_workspace(
 }
 
 fn gemma_audio_workspace(
-    config: &crate::backend::mlx::architectures::gemma4::audio::Gemma4AudioConfig,
+    config: &crate::composition::mlx_architectures::gemma4::audio::Gemma4AudioConfig,
     text_hidden: u64,
     payload: &Array,
     metadata: input::InputMetadata<'_>,
@@ -2490,15 +2492,16 @@ mod tests {
 
     #[test]
     fn qwen2_runtime_state_splits_full_and_sliding_gqa_layers() {
-        let args = crate::backend::mlx::architectures::qwen::dense::config_from_hf_value(&json!({
-            "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 6,
-            "intermediate_size": 32, "num_attention_heads": 4,
-            "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
-            "max_position_embeddings": 128, "rope_theta": 10000.0,
-            "tie_word_embeddings": false, "use_sliding_window": true,
-            "sliding_window": 8, "max_window_layers": 4
-        }))
-        .unwrap();
+        let args =
+            crate::composition::mlx_architectures::qwen::dense::config_from_hf_value(&json!({
+                "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 6,
+                "intermediate_size": 32, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
+                "max_position_embeddings": 128, "rope_theta": 10000.0,
+                "tie_word_embeddings": false, "use_sliding_window": true,
+                "sliding_window": 8, "max_window_layers": 4
+            }))
+            .unwrap();
         let (_, _, strategy, _, estimate) = dense_qwen_spec(&args, false).unwrap();
         assert_eq!(
             strategy,
@@ -2522,7 +2525,7 @@ mod tests {
     #[test]
     fn qwen2_runtime_state_groups_arbitrary_distinct_windows_exactly() {
         let mut args =
-            crate::backend::mlx::architectures::qwen::dense::config_from_hf_value(&json!({
+            crate::composition::mlx_architectures::qwen::dense::config_from_hf_value(&json!({
                 "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 4,
                 "intermediate_size": 32, "num_attention_heads": 4,
                 "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
@@ -3000,7 +3003,7 @@ mod tests {
     #[test]
     fn gemma4_prepared_media_bounds_vision_and_audio_workspaces() {
         let vision_config =
-            crate::backend::mlx::architectures::gemma4::vision::Gemma4VisionConfig {
+            crate::composition::mlx_architectures::gemma4::vision::Gemma4VisionConfig {
                 hidden_size: 8,
                 intermediate_size: 16,
                 num_hidden_layers: 2,
@@ -3029,22 +3032,23 @@ mod tests {
         assert_eq!(vision_positions, 1);
         assert!(vision_workspace > array_bytes(&vision, "test vision bytes").unwrap());
 
-        let audio_config = crate::backend::mlx::architectures::gemma4::audio::Gemma4AudioConfig {
-            hidden_size: 8,
-            num_hidden_layers: 2,
-            num_attention_heads: 2,
-            output_proj_dims: 8,
-            conv_kernel_size: 3,
-            attention_chunk_size: 4,
-            attention_context_left: 3,
-            attention_context_right: 0,
-            attention_invalid_logits_value: -1e9,
-            attention_logit_cap: 50.0,
-            residual_weight: 1.0,
-            rms_norm_eps: 1e-5,
-            subsampling_conv_channels: vec![4, 8],
-            weight_quantization: None,
-        };
+        let audio_config =
+            crate::composition::mlx_architectures::gemma4::audio::Gemma4AudioConfig {
+                hidden_size: 8,
+                num_hidden_layers: 2,
+                num_attention_heads: 2,
+                output_proj_dims: 8,
+                conv_kernel_size: 3,
+                attention_chunk_size: 4,
+                attention_context_left: 3,
+                attention_context_right: 0,
+                attention_invalid_logits_value: -1e9,
+                attention_logit_cap: 50.0,
+                residual_weight: 1.0,
+                rms_norm_eps: 1e-5,
+                subsampling_conv_channels: vec![4, 8],
+                weight_quantization: None,
+            };
         let audio = Array::from_slice(&[0.0f32; 8 * 128], &[1, 8, 128]);
         let audio_mask =
             Array::from_slice(&[true, true, true, true, true, true, false, false], &[1, 8]);
@@ -3062,18 +3066,18 @@ mod tests {
 
     #[test]
     fn qwen_prepared_grid_bounds_vision_workspace() {
-        let config = crate::backend::mlx::architectures::qwen::vl::vision::VisionConfig {
+        let config = crate::composition::mlx_architectures::qwen::vl::vision::VisionConfig {
             layer_schedule: crate::core::attention::LayerSchedule::new(
                 2,
                 vec![
-                    crate::backend::mlx::architectures::qwen::vl::vision::VisionLayerPolicy {
+                    crate::composition::mlx_architectures::qwen::vl::vision::VisionLayerPolicy {
                         attention:
-                            crate::backend::mlx::architectures::qwen::vl::vision::VisionAttentionPolicy::Windowed,
+                            crate::composition::mlx_architectures::qwen::vl::vision::VisionAttentionPolicy::Windowed,
                         deepstack_merger: Some(0),
                     },
-                    crate::backend::mlx::architectures::qwen::vl::vision::VisionLayerPolicy {
+                    crate::composition::mlx_architectures::qwen::vl::vision::VisionLayerPolicy {
                         attention:
-                            crate::backend::mlx::architectures::qwen::vl::vision::VisionAttentionPolicy::Full,
+                            crate::composition::mlx_architectures::qwen::vl::vision::VisionAttentionPolicy::Full,
                         deepstack_merger: None,
                     },
                 ],
@@ -3136,7 +3140,9 @@ mod tests {
 
     #[test]
     fn inkling_runtime_state_groups_the_exact_ordered_schedule() {
-        use crate::backend::mlx::architectures::inkling::model::{FeedForwardPolicy, LayerPolicy};
+        use crate::composition::mlx_architectures::inkling::model::{
+            FeedForwardPolicy, LayerPolicy,
+        };
         use crate::core::attention::LayerSchedule;
 
         let mut args = tiny_inkling();

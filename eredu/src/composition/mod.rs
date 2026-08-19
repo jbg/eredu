@@ -6,3 +6,5 @@ pub(crate) mod llama;
 pub(crate) mod llama_checkpoint;
 #[cfg(feature = "mlx")]
 pub(crate) mod llama_mlx;
+#[cfg(feature = "mlx")]
+pub(crate) mod mlx_architectures;

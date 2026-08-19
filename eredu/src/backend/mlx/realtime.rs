@@ -21,16 +21,16 @@ use safemlx::{
 use serde::Deserialize;
 
 use crate::{
-    backend::mlx::architectures::moshi::{
-        layerwise::{self, MoshiLayerwiseModel},
-        model as moshi, personaplex,
-    },
     backend::mlx::error::Error,
     backend::mlx::runtime::{
         checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
         generation::sampler::DefaultSampler,
     },
     backend::mlx::{ensure_replicated_load_options, ModelLoadOptions},
+    composition::mlx_architectures::moshi::{
+        layerwise::{self, MoshiLayerwiseModel},
+        model as moshi, personaplex,
+    },
 };
 
 /// Supported MLX realtime speech-to-speech model-family dispatch target.

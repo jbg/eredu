@@ -5,13 +5,8 @@ use eredu_checkpoint::WeightQuantization;
 use super::*;
 
 use crate::api::{LoadedModel, PreparedChatInput, PreparedChatMtpBatchRequest, SpeculativeDraft};
-use crate::backend::mlx::architectures::gemma4::model as gemma4;
+use crate::composition::mlx_architectures::gemma4::model as gemma4;
 use crate::{
-    backend::mlx::architectures::{
-        gpt_oss::model as gpt_oss,
-        qwen::dense as dense_qwen,
-        qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
-    },
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
     backend::mlx::runtime::execution::inspection::ActivationRecorder,
@@ -20,6 +15,11 @@ use crate::{
     backend::mlx::{
         resolve_model_config, validate_gguf_quantization_source, Model, ModelLoadOptions,
         ResolvedModelConfig,
+    },
+    composition::mlx_architectures::{
+        gpt_oss::model as gpt_oss,
+        qwen::dense as dense_qwen,
+        qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
     },
     core::generation::MtpSchedulerOptions,
     core::{ModelKind, SpeculativeExecutionTopology},
@@ -1805,7 +1805,8 @@ fn resolve_model_config_validates_qwen2_sliding_window() {
         invalid["sliding_window"] = invalid_window;
         assert_eq!(
             resolve_model_config(&invalid).is_ok(),
-            crate::backend::mlx::architectures::qwen::dense::config_from_hf_value(&invalid).is_ok(),
+            crate::composition::mlx_architectures::qwen::dense::config_from_hf_value(&invalid)
+                .is_ok(),
             "inspection and load normalization diverged for {invalid}"
         );
     }

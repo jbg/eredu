@@ -20,11 +20,11 @@ use serde_json::Value;
 
 use super::*;
 use crate::{
-    backend::mlx::architectures::{
+    backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
+    composition::mlx_architectures::{
         gemma4::model as gemma4, inkling::model as inkling, muse_glimmer,
         qwen::vl::model as qwen3_vl,
     },
-    backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
 };
 
 /// Options applied while inspecting a model artifact.
@@ -575,7 +575,7 @@ fn inspect_gguf_projector(
             }
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
-            match crate::backend::mlx::architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(
+            match crate::composition::mlx_architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(
                 path,
             ) {
                 Ok(Some(mmproj)) => {

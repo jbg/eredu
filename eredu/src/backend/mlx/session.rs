@@ -17,14 +17,14 @@ use std::path::Path;
 use crate::backend::mlx::runtime::media::{ModelProcessor, PreparedModelInput};
 use crate::core::generation::MtpConfig;
 use crate::{
-    backend::mlx::architectures::distributed::{
-        expert::ExpertParallelCache,
-        pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
-    },
     backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     backend::mlx::runtime::media::input,
     backend::mlx::{error::Error, CacheResidencyPolicy, PagedCacheOptions},
+    composition::mlx_architectures::distributed::{
+        expert::ExpertParallelCache,
+        pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
+    },
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
 };
 use eredu_core::MtpStats;
@@ -237,11 +237,11 @@ pub struct MlxModelSession<'a> {
 enum MlxSessionKind {
     Complete(Model, ModelCache),
     Pipeline(
-        crate::backend::mlx::architectures::distributed::pipeline::PipelineModel,
+        crate::composition::mlx_architectures::distributed::pipeline::PipelineModel,
         PipelineCache,
     ),
     Expert(
-        crate::backend::mlx::architectures::distributed::expert::ExpertParallelModel,
+        crate::composition::mlx_architectures::distributed::expert::ExpertParallelModel,
         ExpertParallelCache,
     ),
 }
@@ -1224,10 +1224,10 @@ fn last_token_logits(logits: Array, stream: &Stream) -> Result<Array, Error> {
 fn with_dense_qwen_cache<T>(
     cache: &mut ModelCache,
     execute: impl FnOnce(
-        &mut crate::backend::mlx::architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache,
+        &mut crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache,
     ) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    use crate::backend::mlx::architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache;
+    use crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache;
     let mut owned = match cache {
         ModelCache::KeyValue(values) => DenseQwenLayerwiseCache::Concat(std::mem::take(values)),
         ModelCache::PagedKeyValue(values) => DenseQwenLayerwiseCache::Paged(std::mem::take(values)),
@@ -1253,10 +1253,10 @@ fn with_dense_qwen_cache<T>(
 fn with_muse_cache<T>(
     cache: &mut ModelCache,
     execute: impl FnOnce(
-        &mut crate::backend::mlx::architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache,
+        &mut crate::composition::mlx_architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache,
     ) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    use crate::backend::mlx::architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache;
+    use crate::composition::mlx_architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache;
     let mut owned = match cache {
         ModelCache::KeyValue(values) => MuseGlimmerLayerwiseCache::Concat(std::mem::take(values)),
         ModelCache::PagedKeyValue(values) => {
