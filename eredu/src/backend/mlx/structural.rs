@@ -30,7 +30,7 @@ use crate::backend::mlx::{
     error::Error,
     runtime::checkpoint::store::SafetensorsWeightStore,
 };
-use crate::integrations::llama_mlx::checkpoint as llama_checkpoint;
+use crate::composition::llama_checkpoint;
 
 pub(crate) use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,

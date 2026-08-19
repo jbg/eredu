@@ -9,6 +9,7 @@
 pub mod api;
 /// Execution-backend implementations selected by crate features.
 pub mod backend;
+mod composition;
 mod integrations;
 /// Backend-independent chat and committed-generation orchestration.
 pub mod runtime;

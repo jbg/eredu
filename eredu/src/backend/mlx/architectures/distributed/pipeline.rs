@@ -127,6 +127,7 @@ use crate::{
     },
     backend::mlx::MlxParallelContext,
     backend::mlx::ModelLoadOptions,
+    composition::llama_mlx as llama,
     core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
     core::generation::MtpConfig,
     core::residency::{
@@ -135,7 +136,6 @@ use crate::{
     core::ModelKind,
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
-    integrations::llama_mlx::model as llama,
 };
 
 use eredu_core::MtpStats;

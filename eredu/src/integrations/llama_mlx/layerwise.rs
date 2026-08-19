@@ -52,7 +52,7 @@ use crate::{
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
-    integrations::llama_mlx::model as resident,
+    composition::llama_mlx as resident,
 };
 
 use eredu_runtime::ResidencyReport;

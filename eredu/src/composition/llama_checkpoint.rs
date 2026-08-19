@@ -11,7 +11,7 @@ use eredu_checkpoint::schema::SafetensorsTensorConstraint;
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
 
-use super::model;
+use super::llama_mlx as model;
 use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
 use eredu_checkpoint::store::WeightStore;
 use eredu_checkpoint::validation;

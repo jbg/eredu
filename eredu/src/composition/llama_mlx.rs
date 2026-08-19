@@ -1,4 +1,4 @@
-//! MLX configuration, checkpoint integration, and resident binding for shared Llama.
+//! Cold-path MLX checkpoint composition for the shared Llama architecture.
 
 use eredu_checkpoint::WeightQuantization;
 
