@@ -15,7 +15,9 @@ use crate::backend::mlx::{
     runtime::{
         checkpoint::binding::{binding_bytes, build_module_bindings, populate_module_from_lease},
         execution::layerwise::{
-            validate_device_budget, validate_host_budget, validate_unused, LayerWeightResidency,
+            validate_device_budget, validate_host_budget, validate_unused, DenseDiskStreamReport,
+            DensePreparedTransfer, DenseStreamController, DenseStreamForwardGuard,
+            DenseStreamGroupGuard, DenseTransferWindow, LayerWeightResidency,
             LayerwiseModelMetadata, SharedWeightStore,
         },
         residency::manager::{
@@ -31,7 +33,12 @@ use crate::core::residency::{
 /// One populated MLX unit retained with its residency transfer.
 pub(crate) struct MlxUnitLease<U> {
     unit: MlxModule<U>,
-    _transfer: ResidentTransfer,
+    _transfer: MlxUnitTransfer,
+}
+
+enum MlxUnitTransfer {
+    Ordinary { _transfer: ResidentTransfer },
+    Dense { _transfer: DensePreparedTransfer },
 }
 
 impl<U> std::ops::Deref for MlxUnitLease<U> {
@@ -57,6 +64,14 @@ pub(crate) struct MlxLayerwisePolicy<U, F> {
     build: F,
     _static_leases: Vec<ResidentUnitLease>,
     pending: VecDeque<(Event, MlxUnitLease<U>)>,
+    dense: Option<MlxDenseExecution>,
+}
+
+struct MlxDenseExecution {
+    controller: Arc<DenseStreamController>,
+    window: Option<DenseTransferWindow>,
+    forward: Option<DenseStreamForwardGuard>,
+    group: Option<DenseStreamGroupGuard>,
 }
 
 /// Permanently populated MLX units used by fully resident execution.
@@ -110,6 +125,7 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         window_depth: usize,
         build: F,
         static_leases: Vec<ResidentUnitLease>,
+        dense: Option<Arc<DenseStreamController>>,
     ) -> Result<Self, Error> {
         if unit_ids.is_empty() {
             return Err(Error::Parallel(
@@ -129,6 +145,12 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
             build,
             _static_leases: static_leases,
             pending: VecDeque::new(),
+            dense: dense.map(|controller| MlxDenseExecution {
+                controller,
+                window: None,
+                forward: None,
+                group: None,
+            }),
         })
     }
 
@@ -165,6 +187,13 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
 
     pub(crate) fn residency_report(&self) -> Result<eredu_runtime::ResidencyReport, Error> {
         self.residency.report().map_err(Into::into)
+    }
+
+    pub(crate) fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
+        self.dense
+            .as_ref()
+            .map(|dense| dense.controller.report(&self.residency))
+            .transpose()
     }
 
     pub(crate) fn static_lease_count(&self) -> usize {
@@ -221,6 +250,10 @@ impl<U> MlxResidentPolicy<U> {
 impl<U> LayerwisePolicy<MlxBackend, U> for MlxResidentPolicy<U> {
     type Lease = MlxResidentUnit<U>;
     type Error = Error;
+
+    fn begin(&mut self, _initial: &Array, _stream: &Stream) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     fn acquire(&mut self, index: usize, _stream: &Stream) -> Result<Self::Lease, Self::Error> {
         let count = self.units.len();
@@ -474,6 +507,20 @@ where
         device_layer_capacity: depth,
         materialization: None,
     };
+    let dense_controller = dense
+        .map(|options| {
+            DenseStreamController::new(
+                &residency,
+                options,
+                layer_count,
+                layer_parameter_bytes,
+                maximum_host_bytes,
+                static_bytes,
+                [("model".to_string(), unit_ids.clone())],
+            )
+            .map(Arc::new)
+        })
+        .transpose()?;
     let policy = MlxLayerwisePolicy::new(
         residency,
         Arc::clone(&store),
@@ -481,6 +528,7 @@ where
         depth,
         build,
         vec![static_lease],
+        dense_controller,
     )?;
     Ok((policy, metadata))
 }
@@ -493,8 +541,68 @@ where
     type Lease = MlxUnitLease<U>;
     type Error = Error;
 
+    fn begin(&mut self, initial: &Array, _stream: &Stream) -> Result<(), Self::Error> {
+        let Some(dense) = &mut self.dense else {
+            return Ok(());
+        };
+        if dense.window.is_some() || dense.forward.is_some() || dense.group.is_some() {
+            return Err(Error::Parallel(
+                "dense MLX policy began a forward while another remained active".into(),
+            ));
+        }
+        let prefill = initial.dim(1) > 1;
+        let forward = dense.controller.forward_guard(prefill, &self.residency)?;
+        let group = dense.controller.group_guard(&self.residency, "model");
+        let window = dense.controller.transfer_window(
+            &self.residency,
+            "model",
+            &self.unit_ids,
+            0..self.unit_ids.len(),
+            prefill,
+        )?;
+        dense.forward = Some(forward);
+        dense.group = Some(group);
+        dense.window = Some(window);
+        Ok(())
+    }
+
     fn acquire(&mut self, index: usize, stream: &Stream) -> Result<Self::Lease, Self::Error> {
         self.reap_completed()?;
+        if self.dense.is_some() {
+            loop {
+                let refill = self
+                    .dense
+                    .as_mut()
+                    .and_then(|dense| dense.window.as_mut())
+                    .expect("dense forward begins before acquisition")
+                    .refill();
+                match refill {
+                    Ok(()) => break,
+                    Err(_) if !self.pending.is_empty() => self.drain_one()?,
+                    Err(error) => return Err(error),
+                }
+            }
+            let transfer = self
+                .dense
+                .as_mut()
+                .and_then(|dense| dense.window.as_mut())
+                .expect("dense forward begins before acquisition")
+                .next(stream)?;
+            if transfer.index() != index {
+                return Err(Error::Parallel(format!(
+                    "dense transfer returned unit {}, expected {index}",
+                    transfer.index()
+                )));
+            }
+            let mut unit = MlxModule::new(self.build.build(index, stream)?);
+            populate_module_from_lease(&mut unit, transfer.lease())?;
+            return Ok(MlxUnitLease {
+                unit,
+                _transfer: MlxUnitTransfer::Dense {
+                    _transfer: transfer,
+                },
+            });
+        }
         let end = index
             .saturating_add(self.window_depth)
             .min(self.unit_ids.len());
@@ -518,7 +626,9 @@ where
         populate_module_from_lease(&mut unit, &transfer.leases()[0])?;
         Ok(MlxUnitLease {
             unit,
-            _transfer: transfer,
+            _transfer: MlxUnitTransfer::Ordinary {
+                _transfer: transfer,
+            },
         })
     }
 
@@ -547,7 +657,17 @@ where
 
     fn finish(&mut self, output: &Array, _stream: &Stream) -> Result<(), Self::Error> {
         async_eval_with_event([output])?.synchronize()?;
-        self.drain()
+        self.drain()?;
+        if let Some(dense) = &mut self.dense {
+            dense.window.take();
+            if let Some(group) = dense.group.take() {
+                group.complete()?;
+            }
+            if let Some(forward) = dense.forward.take() {
+                forward.complete()?;
+            }
+        }
+        Ok(())
     }
 }
 

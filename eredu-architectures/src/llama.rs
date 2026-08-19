@@ -686,6 +686,58 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
     Ok(vec![attention, mlp, input_norm, post_attention_norm])
 }
 
+/// Derives the rank-local construction geometry of one tensor-parallel block
+/// from the neutral placement layout.
+pub fn local_block_args(
+    args: &ModelArgs,
+    layer: usize,
+    layout: &eredu_runtime::LocalModelLayout,
+) -> Result<ModelArgs, ParallelPlanError> {
+    let prefix = format!("model.layers.{layer}");
+    let tensor = |suffix: &str| {
+        layout
+            .tensor(&format!("{prefix}.{suffix}.weight"))
+            .or_else(|| layout.tensor(&format!("{prefix}.{suffix}.inner.weight")))
+            .ok_or_else(|| {
+                ParallelPlanError::InvalidTensor(format!(
+                    "missing local layout for {prefix}.{suffix}.weight"
+                ))
+            })
+    };
+    let query = tensor("self_attn.q_proj")?;
+    let key = tensor("self_attn.k_proj")?;
+    let gate = tensor("mlp.gate_proj")?;
+    let query_width = i32::try_from(query.local_shape()[0]).map_err(|_| {
+        ParallelPlanError::InvalidTensor("local Llama query width exceeds i32".into())
+    })?;
+    let key_width = i32::try_from(key.local_shape()[0]).map_err(|_| {
+        ParallelPlanError::InvalidTensor("local Llama key width exceeds i32".into())
+    })?;
+    if query_width % args.head_dim != 0 || key_width % args.head_dim != 0 {
+        return Err(ParallelPlanError::InvalidTensor(format!(
+            "local Llama attention widths q={query_width}, k={key_width} split head dimension {}",
+            args.head_dim
+        )));
+    }
+    let mut local = args.clone();
+    local.num_attention_heads = query_width / args.head_dim;
+    local.num_key_value_heads = key_width / args.head_dim;
+    local.intermediate_size = i32::try_from(gate.local_shape()[0]).map_err(|_| {
+        ParallelPlanError::InvalidTensor("local Llama MLP width exceeds i32".into())
+    })?;
+    Ok(local)
+}
+
+/// Returns the rank-local key/value head count for every decoder layer.
+pub fn local_key_value_heads(
+    args: &ModelArgs,
+    layout: &eredu_runtime::LocalModelLayout,
+) -> Result<Vec<i32>, ParallelPlanError> {
+    (0..args.num_hidden_layers as usize)
+        .map(|layer| Ok(local_block_args(args, layer, layout)?.num_key_value_heads))
+        .collect()
+}
+
 /// Declares embedding, final normalization, and output-head placement groups.
 pub fn static_parallel_parameter_groups<B: NeuralBackend>(
     embeddings: &B::Embedding,

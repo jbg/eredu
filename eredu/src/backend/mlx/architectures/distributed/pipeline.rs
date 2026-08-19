@@ -8935,12 +8935,10 @@ fn load_llama_pipeline(
         let mut planner = build.planner();
         binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
         let (_, layout) = planner.finish()?;
-        stage.parallel_kv_heads = Some(planned_kv_head_layout(
-            &layout,
-            source_args.attention_schedule.len(),
-            source_args.head_dim,
-            "model.layers",
-        )?);
+        stage.parallel_kv_heads = Some(
+            eredu_architectures::llama::local_key_value_heads(&source_args, &layout)
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+        );
         stage.parallel_embedding = info
             .is_first
             .then(|| {

@@ -193,6 +193,13 @@ where
     /// Concrete acquisition or completion failure.
     type Error;
 
+    /// Starts one forward after architecture input preparation.
+    fn begin(
+        &mut self,
+        initial: &B::Tensor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), Self::Error>;
+
     /// Acquires one populated unit for exclusive execution.
     fn acquire(
         &mut self,
@@ -307,6 +314,9 @@ where
             .architecture
             .begin_forward(input, state, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
+        self.policy
+            .begin(&forward.hidden, context)
+            .map_err(LayerwiseRuntimeError::Policy)?;
         for index in 0..count {
             let mut lease = self
                 .policy
@@ -370,6 +380,9 @@ where
             .architecture
             .begin_forward(input, state, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
+        self.policy
+            .begin(&forward.hidden, context)
+            .map_err(LayerwiseRuntimeError::Policy)?;
         for index in 0..count {
             let path = self
                 .architecture
@@ -462,6 +475,14 @@ where
 {
     type Lease = ResidentUnitLease<U>;
     type Error = ResidentUnitWindowError;
+
+    fn begin(
+        &mut self,
+        _initial: &B::Tensor,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     fn acquire(
         &mut self,

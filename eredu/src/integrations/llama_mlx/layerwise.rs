@@ -30,7 +30,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxModule, MlxRmsNorm},
     backend::mlx::nn::{
-        parallel::{planned_kv_head_layout, VocabParallelEmbedding, VocabParallelLmHead},
+        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
         tensor::{create_attention_mask_from_cache, AttentionMask},
     },
     backend::mlx::runtime::cache::residency::{
@@ -284,7 +284,8 @@ impl LlamaModel {
     pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
         match &self.execution {
             LlamaExecution::TensorParallel(execution) => execution.dense_stream_report(),
-            LlamaExecution::Resident(_) | LlamaExecution::Layerwise(_) => Ok(None),
+            LlamaExecution::Layerwise(execution) => execution.policy().dense_stream_report(),
+            LlamaExecution::Resident(_) => Ok(None),
         }
     }
 
@@ -1177,12 +1178,10 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
-        self.parallel_kv_heads = Some(planned_kv_head_layout(
-            layout,
-            self.args.num_hidden_layers as usize,
-            self.args.head_dim,
-            "model.layers",
-        )?);
+        self.parallel_kv_heads = Some(
+            eredu_architectures::llama::local_key_value_heads(&self.args, layout)
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+        );
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
             self.args.vocab_size as usize,
             self.args.hidden_size,
@@ -1215,34 +1214,8 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 "Llama has no group {group}"
             )));
         }
-        let prefix = format!("model.layers.{index}");
-        let q = layout
-            .tensor(&format!("{prefix}.self_attn.q_proj.weight"))
-            .or_else(|| layout.tensor(&format!("{prefix}.self_attn.q_proj.inner.weight")))
-            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} query")))?;
-        let k = layout
-            .tensor(&format!("{prefix}.self_attn.k_proj.weight"))
-            .or_else(|| layout.tensor(&format!("{prefix}.self_attn.k_proj.inner.weight")))
-            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} key")))?;
-        let gate = layout
-            .tensor(&format!("{prefix}.mlp.gate_proj.weight"))
-            .or_else(|| layout.tensor(&format!("{prefix}.mlp.gate_proj.inner.weight")))
-            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLP")))?;
-        let mut args = self.args.clone();
-        let query_width = i32::try_from(q.local_shape()[0])
-            .map_err(|_| Error::Parallel("local Llama query width exceeds i32".into()))?;
-        let key_width = i32::try_from(k.local_shape()[0])
-            .map_err(|_| Error::Parallel("local Llama key width exceeds i32".into()))?;
-        if query_width % args.head_dim != 0 || key_width % args.head_dim != 0 {
-            return Err(Error::Parallel(format!(
-                "local Llama attention widths q={query_width}, k={key_width} split head dimension {}",
-                args.head_dim
-            )));
-        }
-        args.num_attention_heads = query_width / args.head_dim;
-        args.num_key_value_heads = key_width / args.head_dim;
-        args.intermediate_size = i32::try_from(gate.local_shape()[0])
-            .map_err(|_| Error::Parallel("local Llama MLP width exceeds i32".into()))?;
+        let args = eredu_architectures::llama::local_block_args(&self.args, index, layout)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         new_transformer_block(&args, index, stream)
     }
 
