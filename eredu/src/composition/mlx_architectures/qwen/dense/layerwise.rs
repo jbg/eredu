@@ -42,7 +42,6 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    backend::mlx::runtime::cache::residency::CacheResidencyReport,
     backend::mlx::runtime::cache::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     },
@@ -77,7 +76,7 @@ use crate::{
         PromptCacheOptions, PromptCacheTopology,
     },
 };
-use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
 
 use eredu_runtime::ResidencyReport;
 

@@ -60,7 +60,7 @@ use crate::{
     },
     backend::mlx::runtime::cache::residency::{
         load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
-        CacheResidencyReport, PromptCacheStateArray,
+        PromptCacheStateArray,
     },
     backend::mlx::runtime::cache::{
         CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -137,7 +137,7 @@ use crate::{
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
 };
-use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
 
 use eredu_core::MtpStats;
 use eredu_runtime::ExecutionGroupReadySet;

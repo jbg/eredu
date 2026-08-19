@@ -158,6 +158,20 @@ fn cache_execution_algorithms_are_runtime_owned() {
     assert!(runtime.contains("mod lifecycle;"));
     assert!(runtime.contains("mod persistence;"));
     assert!(runtime.contains("mod storage;"));
+    assert!(runtime.contains("mod telemetry;"));
+
+    let telemetry = std::fs::read_to_string(workspace.join("eredu-runtime/src/cache/telemetry.rs"))
+        .expect("runtime cache telemetry must be readable");
+    for runtime_owned in [
+        "pub struct CacheLayerResidencyStats",
+        "pub struct CacheLayerResidencyReport",
+        "pub struct CacheResidencyReport",
+    ] {
+        assert!(
+            telemetry.contains(runtime_owned),
+            "runtime does not own cache telemetry schema {runtime_owned}"
+        );
+    }
 
     let persistence =
         std::fs::read_to_string(workspace.join("eredu-runtime/src/cache/persistence.rs"))
@@ -181,6 +195,9 @@ fn cache_execution_algorithms_are_runtime_owned() {
         "pub enum CacheResidencyPolicy",
         "pub enum LiveCacheDiskPolicy",
         "pub struct PagedCacheOptions",
+        "pub struct CacheLayerResidencyStats",
+        "pub struct CacheLayerResidencyReport",
+        "pub struct CacheResidencyReport",
         "fn inspect_prompt_cache",
         "fn validate_prompt_cache_manifest",
         "fn hash_prompt_cache_shard_payload",

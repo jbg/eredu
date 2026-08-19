@@ -13,7 +13,6 @@ use eredu_core::{MtpCapability, MtpCheckpointKind, MtpStats, SpeculativeSemantic
 use safemlx::{error::Exception, Array, Stream};
 
 use crate::backend::mlx::error::Error;
-use crate::backend::mlx::runtime::cache::residency::CacheResidencyReport;
 use crate::backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache};
 use crate::backend::mlx::runtime::execution::inspection::ActivationObserver;
 use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
@@ -37,6 +36,7 @@ use crate::composition::mlx_architectures::{
     },
 };
 use crate::{LayerCachePolicy, LayerSchedule};
+use eredu_runtime::CacheResidencyReport;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 /// Loaded model value for any architecture supported by this crate.

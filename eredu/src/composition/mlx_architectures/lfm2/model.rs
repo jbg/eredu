@@ -49,8 +49,7 @@ use crate::{
     backend::mlx::runtime::cache::{
         residency::{
             open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            CacheResidencyManager, CacheResidencyReport, PromptCacheSnapshotBlock,
-            PromptCacheStateArray,
+            CacheResidencyManager, PromptCacheSnapshotBlock, PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
@@ -64,7 +63,7 @@ use crate::{
     },
 };
 use eredu_runtime::CacheResidencyPool;
-use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
 
 fn default_true() -> bool {
     true

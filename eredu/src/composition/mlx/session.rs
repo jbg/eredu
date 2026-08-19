@@ -470,8 +470,7 @@ impl<'a> MlxModelSession<'a> {
     /// Returns aggregate cache-residency telemetry for this session.
     pub fn cache_residency_report(
         &self,
-    ) -> Result<Option<crate::backend::mlx::runtime::cache::residency::CacheResidencyReport>, Error>
-    {
+    ) -> Result<Option<eredu_runtime::CacheResidencyReport>, Error> {
         match &self.inner {
             MlxSessionKind::Complete(_, cache) => cache
                 .residency_report()

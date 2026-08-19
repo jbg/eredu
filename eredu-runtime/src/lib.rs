@@ -31,11 +31,13 @@ pub use cache::{
     CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion,
     CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
     CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
-    CacheIoPreparation, CacheIoStartDisposition, CacheLifecycleError, CachePoolError,
-    CachePoolLimits, CachePoolMembership, CachePoolReport, CachePoolReservation, CachePoolResource,
-    CachePoolUsage, CacheResidencyConfigurationError, CacheResidencyPolicy, CacheResidencyPool,
-    CacheStorageError, CacheStoragePhase, LiveCacheDiskPolicy, MutableCacheTail, PagedCacheOptions,
-    PromptCachePersistenceError, PromptCachePublication, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
+    CacheIoPreparation, CacheIoStartDisposition, CacheLayerResidencyReport,
+    CacheLayerResidencyStats, CacheLifecycleError, CachePoolError, CachePoolLimits,
+    CachePoolMembership, CachePoolReport, CachePoolReservation, CachePoolResource, CachePoolUsage,
+    CacheResidencyConfigurationError, CacheResidencyPolicy, CacheResidencyPool,
+    CacheResidencyReport, CacheStorageError, CacheStoragePhase, LiveCacheDiskPolicy,
+    MutableCacheTail, PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication,
+    CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
     PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
 };
 pub use execution::{

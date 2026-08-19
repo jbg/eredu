@@ -14,7 +14,7 @@ use std::{
         mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use memmap2::{Mmap, MmapOptions};
@@ -42,11 +42,12 @@ use eredu_runtime::{
     resolve_prompt_cache_root, safe_prompt_cache_shard_path, CacheBlockLifecycle,
     CacheBlockStorage, CacheHostDemotionOperation, CacheIoAdmission, CacheIoCompletionDisposition,
     CacheIoExecutionState, CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey,
-    CacheIoOperationKind, CacheIoPreparation, CacheIoStartDisposition, CacheLifecycleError,
-    CachePoolError, CachePoolMembership, CachePoolReservation, CachePoolResource, CachePoolUsage,
-    CacheResidencyConfigurationError, CacheResidencyPool, CacheStorageError, CacheStoragePhase,
+    CacheIoOperationKind, CacheIoPreparation, CacheIoStartDisposition, CacheLayerResidencyReport,
+    CacheLayerResidencyStats, CacheLifecycleError, CachePoolError, CachePoolMembership,
+    CachePoolReservation, CachePoolResource, CachePoolUsage, CacheResidencyConfigurationError,
+    CacheResidencyPool, CacheResidencyReport, CacheStorageError, CacheStoragePhase,
     LiveCacheDiskPolicy, MutableCacheTail, PagedCacheOptions, PromptCachePersistenceError,
-    PromptCachePublication,
+    PromptCachePublication, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 
 pub(crate) const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
@@ -1283,120 +1284,6 @@ impl CacheBlockRecord {
     }
 }
 
-/// Maximum number of individually identified layers in a residency report.
-///
-/// Additional active layers are folded into
-/// [`CacheResidencyReport::per_layer_overflow`], so report size is independent
-/// of caller-provided layer identifiers and remains bounded.
-pub const CACHE_RESIDENCY_LAYER_REPORT_LIMIT: usize = 128;
-
-/// Current residency and cumulative activity attributable to one layer or a
-/// bounded overflow group of layers.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct CacheLayerResidencyStats {
-    /// Logical cached tokens. For an overflow aggregate this is the sum of the
-    /// per-layer logical token counts rather than a shared sequence length.
-    pub logical_cached_tokens: u64,
-    /// Sealed key/value blocks.
-    pub key_value_blocks: u64,
-    /// Sealed compressed-latent/rotary blocks.
-    pub compressed_latent_blocks: u64,
-    /// Blocks cataloged on the execution device.
-    pub device_blocks: u64,
-    /// Blocks cataloged in host memory.
-    pub host_blocks: u64,
-    /// Blocks cataloged on disk.
-    pub disk_blocks: u64,
-    /// Current logical device bytes, including mutable tails.
-    pub current_device_bytes: u64,
-    /// Current physical host allocation capacity, including in-flight ownership.
-    pub current_host_bytes: u64,
-    /// Current logical disk bytes.
-    pub current_disk_bytes: u64,
-    /// Current bytes in mutable tails.
-    pub mutable_tail_bytes: u64,
-    /// Blocks whose host buffers are owned by background disk writes.
-    pub in_flight_write_blocks: u64,
-    /// Physical host allocation capacity owned by background disk writes.
-    pub in_flight_write_bytes: u64,
-    /// Blocks retaining both device and host allocations during demotion.
-    pub in_flight_host_demotion_blocks: u64,
-    /// Physical host allocation capacity charged during device demotion.
-    pub in_flight_host_demotion_bytes: u64,
-    /// Recent device blocks protected from demotion.
-    pub protected_recent_blocks: u64,
-    /// Prefix or sink blocks protected for attention.
-    pub protected_prefix_blocks: u64,
-    /// Cumulative host promotions submitted through completion events.
-    pub host_promotions: u64,
-    /// Cumulative disk promotions submitted after their host read completes.
-    pub disk_promotions: u64,
-    /// Cumulative device demotions completed through exact-output event waits.
-    pub host_demotions: u64,
-    /// Cumulative demotions to disk.
-    pub disk_demotions: u64,
-    /// Cumulative logical bytes transferred between tiers.
-    pub transfer_bytes: u64,
-    /// Cumulative host time at layer-attributable disk and CPU ownership boundaries.
-    pub transfer_wait: Duration,
-    /// Cumulative demand accesses already resident on the execution device.
-    pub demand_hits: u64,
-    /// Cumulative demand accesses that required promotion.
-    pub demand_misses: u64,
-    /// Cumulative waits that joined or awaited an in-flight disk operation.
-    pub in_flight_waits: u64,
-    /// Cumulative layer-attributable residency or transfer failures.
-    pub failures: u64,
-    /// Sealed and mutable blocks scanned by full attention during prefill.
-    pub prefill_full_attention_blocks: u64,
-    /// Logical bytes scanned by full attention during prefill.
-    pub prefill_full_attention_bytes: u64,
-    /// Sealed and mutable blocks scanned by full attention during decode.
-    pub decode_full_attention_blocks: u64,
-    /// Logical bytes scanned by full attention during decode.
-    pub decode_full_attention_bytes: u64,
-    /// Peak logical scratch bytes used by this layer's attention.
-    pub attention_scratch_peak_bytes: u64,
-}
-
-impl CacheLayerResidencyStats {
-    fn accumulate(&mut self, other: &Self) {
-        self.logical_cached_tokens += other.logical_cached_tokens;
-        self.key_value_blocks += other.key_value_blocks;
-        self.compressed_latent_blocks += other.compressed_latent_blocks;
-        self.device_blocks += other.device_blocks;
-        self.host_blocks += other.host_blocks;
-        self.disk_blocks += other.disk_blocks;
-        self.current_device_bytes += other.current_device_bytes;
-        self.current_host_bytes += other.current_host_bytes;
-        self.current_disk_bytes += other.current_disk_bytes;
-        self.mutable_tail_bytes += other.mutable_tail_bytes;
-        self.in_flight_write_blocks += other.in_flight_write_blocks;
-        self.in_flight_write_bytes += other.in_flight_write_bytes;
-        self.in_flight_host_demotion_blocks += other.in_flight_host_demotion_blocks;
-        self.in_flight_host_demotion_bytes += other.in_flight_host_demotion_bytes;
-        self.protected_recent_blocks += other.protected_recent_blocks;
-        self.protected_prefix_blocks += other.protected_prefix_blocks;
-        self.host_promotions += other.host_promotions;
-        self.disk_promotions += other.disk_promotions;
-        self.host_demotions += other.host_demotions;
-        self.disk_demotions += other.disk_demotions;
-        self.transfer_bytes += other.transfer_bytes;
-        self.transfer_wait += other.transfer_wait;
-        self.demand_hits += other.demand_hits;
-        self.demand_misses += other.demand_misses;
-        self.in_flight_waits += other.in_flight_waits;
-        self.failures += other.failures;
-        self.prefill_full_attention_blocks += other.prefill_full_attention_blocks;
-        self.prefill_full_attention_bytes += other.prefill_full_attention_bytes;
-        self.decode_full_attention_blocks += other.decode_full_attention_blocks;
-        self.decode_full_attention_bytes += other.decode_full_attention_bytes;
-        self.attention_scratch_peak_bytes = self
-            .attention_scratch_peak_bytes
-            .max(other.attention_scratch_peak_bytes);
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 struct CacheLayerActivityCounters {
     stats: CacheLayerResidencyStats,
@@ -1422,130 +1309,6 @@ impl CacheLayerActivityCounters {
             .attention_scratch_peak_bytes
             .max(self.stats.attention_scratch_peak_bytes);
     }
-}
-
-/// Bounded, individually identified per-layer residency observations.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct CacheLayerResidencyReport {
-    /// Global model layer identifier.
-    pub global_layer: usize,
-    /// Current residency and cumulative activity for this layer.
-    pub stats: CacheLayerResidencyStats,
-}
-
-/// Aggregated logical device/disk and physical host residency observations.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct CacheResidencyReport {
-    /// Absolute token count represented by the longest layer.
-    pub logical_cached_tokens: u64,
-    /// Sealed key/value blocks.
-    pub key_value_blocks: u64,
-    /// Sealed compressed-latent/rotary blocks.
-    pub compressed_latent_blocks: u64,
-    /// Blocks cataloged on the execution device.
-    pub device_blocks: u64,
-    /// Blocks cataloged in host memory.
-    pub host_blocks: u64,
-    /// Blocks cataloged on disk.
-    pub disk_blocks: u64,
-    /// Current logical device bytes, including mutable tails.
-    pub current_device_bytes: u64,
-    /// Peak successfully admitted logical device bytes.
-    pub peak_device_bytes: u64,
-    /// Current physical host allocation capacity, including in-flight ownership.
-    pub current_host_bytes: u64,
-    /// Peak successfully admitted physical host allocation capacity.
-    pub peak_host_bytes: u64,
-    /// Current logical disk bytes.
-    pub current_disk_bytes: u64,
-    /// Peak successfully admitted logical disk bytes.
-    pub peak_disk_bytes: u64,
-    /// Blocks whose host buffers are owned by background disk writes.
-    pub in_flight_write_blocks: u64,
-    /// Physical host capacity owned by disk writes (included in current host bytes).
-    pub in_flight_write_bytes: u64,
-    /// Peak physical host capacity owned by background disk writes.
-    pub peak_in_flight_write_bytes: u64,
-    /// Blocks retaining both device and host allocations during demotion.
-    pub in_flight_host_demotion_blocks: u64,
-    /// Physical host capacity charged during device demotion.
-    pub in_flight_host_demotion_bytes: u64,
-    /// Peak physical host capacity charged during device demotion.
-    pub peak_in_flight_host_demotion_bytes: u64,
-    /// Current bytes in mutable tails.
-    pub mutable_tail_bytes: u64,
-    /// Recent blocks protected from device demotion.
-    pub protected_recent_blocks: u64,
-    /// Prefix or sink blocks protected for attention.
-    pub protected_prefix_blocks: u64,
-    /// Current residency and cumulative per-layer activity, sorted by global
-    /// layer and capped by [`CACHE_RESIDENCY_LAYER_REPORT_LIMIT`].
-    pub per_layer: Vec<CacheLayerResidencyReport>,
-    /// Number of active layers folded into `per_layer_overflow`.
-    pub per_layer_overflow_layers: u64,
-    /// Exact current aggregate of active omitted layers plus cumulative
-    /// activity for every layer without an identified row.
-    pub per_layer_overflow: CacheLayerResidencyStats,
-    /// Host-to-device promotions submitted through completion events.
-    pub host_promotions: u64,
-    /// Disk-to-device promotions submitted after their host read completes.
-    pub disk_promotions: u64,
-    /// Device-to-host demotions completed through exact-output event waits.
-    pub host_demotions: u64,
-    /// Completed resident-to-disk demotions using existing or newly written backing.
-    pub disk_demotions: u64,
-    /// Logical bytes copied by promotion and demotion operations.
-    pub transfer_bytes: u64,
-    /// Host time spent on disk operations and CPU ownership boundaries.
-    pub transfer_wait: Duration,
-    /// Blocks evicted because all configured tiers were exhausted.
-    pub evictions: u64,
-    /// Sliding-window blocks discarded as semantically invisible.
-    pub discarded_sliding_blocks: u64,
-    /// Completed block seals.
-    pub block_seals: u64,
-    /// Mutable tail allocations.
-    pub tail_allocations: u64,
-    /// Requests served by an already device-cataloged block.
-    pub demand_hits: u64,
-    /// Requests requiring host or disk promotion.
-    pub demand_misses: u64,
-    /// Requests that joined an existing transfer.
-    pub in_flight_waits: u64,
-    /// Effective bounded disk request queue capacity.
-    pub queue_capacity: usize,
-    /// Peak observed queue occupancy.
-    pub queue_peak_occupancy: usize,
-    /// Requests delayed by queue capacity.
-    pub queue_backpressure: u64,
-    /// Requests canceled by reset or truncation.
-    pub cancellations: u64,
-    /// Cache transfer or persistence failures.
-    pub failures: u64,
-    /// Blocks scanned by full attention during prefill.
-    pub prefill_full_attention_blocks: u64,
-    /// Logical bytes scanned by full attention during prefill.
-    pub prefill_full_attention_bytes: u64,
-    /// Blocks scanned by full attention during decode.
-    pub decode_full_attention_blocks: u64,
-    /// Logical bytes scanned by full attention during decode.
-    pub decode_full_attention_bytes: u64,
-    /// Peak logical scratch bytes used by attention.
-    pub attention_scratch_peak_bytes: u64,
-    /// Successful prompt-cache saves.
-    pub prompt_cache_saves: u64,
-    /// Successful prompt-cache loads.
-    pub prompt_cache_loads: u64,
-    /// Logical bytes written or cataloged for prompt caches.
-    pub prompt_cache_bytes: u64,
-    /// Imported persistent shard count.
-    pub imported_mapped_shards: u64,
-    /// Optional peak process resident-set size sampled from the operating system.
-    pub process_rss_bytes: Option<u64>,
-    /// Optional cumulative minor page faults.
-    pub process_minor_page_faults: Option<u64>,
-    /// Optional cumulative major page faults.
-    pub process_major_page_faults: Option<u64>,
 }
 
 #[derive(Debug, Default)]

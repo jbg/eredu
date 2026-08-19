@@ -40,7 +40,7 @@ use crate::{
     backend::mlx::nn::hyper_connections::{expand, HyperConnection, HyperHead},
     backend::mlx::runtime::cache::residency::{
         load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
-        CacheBlockArrays, CacheResidencyManager, CacheResidencyReport, PromptCacheSnapshotBlock,
+        CacheBlockArrays, CacheResidencyManager, PromptCacheSnapshotBlock,
     },
     backend::mlx::runtime::checkpoint::load::gguf_quantization_configs,
     backend::mlx::runtime::media::input as runtime_input,
@@ -53,7 +53,7 @@ use crate::{
         StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
     },
 };
-use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
 
 use super::{
     attention::{Attention, AttentionCache},

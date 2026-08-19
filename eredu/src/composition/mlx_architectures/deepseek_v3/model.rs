@@ -46,7 +46,7 @@ use crate::{
         rope::{initialize_rope, RopeVariant},
     },
     backend::mlx::runtime::cache::residency::{
-        open_prompt_cache, CacheBlockArrays, CacheResidencyManager, CacheResidencyReport,
+        open_prompt_cache, CacheBlockArrays, CacheResidencyManager,
     },
     backend::mlx::runtime::cache::{
         BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock,
@@ -66,7 +66,7 @@ use crate::{
         QwenLinear as Linear, QwenWeightFormat as WeightFormat,
     },
 };
-use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
 type ObserverOption<'a> = Option<&'a mut dyn ActivationObserver>;
 
 fn activation_name(prefix: &str, suffix: &str) -> String {

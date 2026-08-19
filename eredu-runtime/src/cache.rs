@@ -12,6 +12,7 @@ mod lifecycle;
 mod persistence;
 mod policy;
 mod storage;
+mod telemetry;
 
 pub use lifecycle::{CacheBlockLifecycle, CacheLifecycleError, MutableCacheTail};
 pub use persistence::{
@@ -26,6 +27,10 @@ pub use policy::{
 pub use storage::{
     CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion, CacheIoOperation,
     CacheIoOperationKey, CacheIoOperationKind, CacheStorageError, CacheStoragePhase,
+};
+pub use telemetry::{
+    CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyReport,
+    CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 
 use serde::{Deserialize, Serialize};

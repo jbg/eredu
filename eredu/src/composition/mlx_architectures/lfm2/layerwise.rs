@@ -41,7 +41,7 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    backend::mlx::runtime::cache::{residency::CacheResidencyReport, KeyValueCache},
+    backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         populate_module_from_lease, populate_module_from_lease_excluding,
@@ -73,7 +73,7 @@ use crate::{
         OperatorPolicy,
     },
 };
-use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
 
 use eredu_runtime::ResidencyReport;
 

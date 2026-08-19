@@ -47,8 +47,7 @@ use crate::{
     },
     backend::mlx::runtime::cache::residency::{
         open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-        CacheResidencyManager, CacheResidencyReport, PromptCacheSnapshotBlock,
-        PromptCacheStateArray,
+        CacheResidencyManager, PromptCacheSnapshotBlock, PromptCacheStateArray,
     },
     backend::mlx::runtime::cache::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -62,7 +61,7 @@ use crate::{
         StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
 };
-use eredu_runtime::PagedCacheOptions;
+use eredu_runtime::{CacheResidencyReport, PagedCacheOptions};
 
 fn default_model_type() -> String {
     "inkling_mm_model".into()

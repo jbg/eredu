@@ -10,12 +10,10 @@ use safemlx::{
 
 use crate::{
     backend::mlx::nn::shared::MlxBackend,
-    backend::mlx::runtime::cache::residency::{
-        CacheBlockArrays, CacheResidencyManager, CacheResidencyReport,
-    },
+    backend::mlx::runtime::cache::residency::{CacheBlockArrays, CacheResidencyManager},
     core::cache::{CacheBlockId, CacheRankIdentity, CacheRepresentation},
 };
-use eredu_runtime::PagedCacheOptions;
+use eredu_runtime::{CacheResidencyReport, PagedCacheOptions};
 
 pub(crate) type RetainedArrayIter<'a> =
     std::iter::Chain<std::option::Iter<'a, Array>, std::option::Iter<'a, Array>>;

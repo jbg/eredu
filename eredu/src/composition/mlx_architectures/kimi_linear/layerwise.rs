@@ -434,8 +434,7 @@ impl KimiLinearLayerwiseModel {
     pub fn cache_residency_report(
         &self,
         cache: &Cache,
-    ) -> Result<Option<crate::backend::mlx::runtime::cache::residency::CacheResidencyReport>, Error>
-    {
+    ) -> Result<Option<eredu_runtime::CacheResidencyReport>, Error> {
         cache.residency_report().map_err(Into::into)
     }
 

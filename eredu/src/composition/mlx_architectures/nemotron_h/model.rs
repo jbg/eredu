@@ -47,8 +47,8 @@ use crate::{
     backend::mlx::runtime::cache::{
         residency::{
             load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
-            CacheBlockArrays, CacheResidencyManager, CacheResidencyReport,
-            PromptCacheSnapshotBlock, PromptCacheStateArray,
+            CacheBlockArrays, CacheResidencyManager, PromptCacheSnapshotBlock,
+            PromptCacheStateArray,
         },
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
@@ -60,7 +60,7 @@ use crate::{
         StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
 };
-use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
 
 /// Executable operator and state policy for one Nemotron-H decoder layer.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]

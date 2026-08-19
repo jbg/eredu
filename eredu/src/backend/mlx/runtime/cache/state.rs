@@ -5,7 +5,9 @@ use std::path::Path;
 use eredu_core::cache::{
     LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
 };
-use eredu_runtime::{RuntimeLayerState, RuntimeState, StateError, StateLayout};
+use eredu_runtime::{
+    CacheResidencyReport, RuntimeLayerState, RuntimeState, StateError, StateLayout,
+};
 use safemlx::{error::Exception, Array, Stream};
 
 use crate::{
@@ -13,7 +15,7 @@ use crate::{
         nn::shared::MlxBackend,
         runtime::cache::{
             kv::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, RetainedArrayIter},
-            residency::{CacheResidencyManager, CacheResidencyReport},
+            residency::CacheResidencyManager,
         },
     },
     core::cache::CacheRankIdentity,
