@@ -11,7 +11,7 @@
 //! transfer.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
     time::Instant,
 };
@@ -509,7 +509,7 @@ impl ResidencyManager {
             .collect::<Vec<_>>();
         for (id, tier) in assignments {
             if tier != MemoryTier::Disk {
-                ensure_resident(&mut state, self.inner.store.as_ref(), &id, tier)?;
+                ensure_resident(&mut state, self.inner.store.as_ref(), &id, tier, true)?;
             }
         }
         state.control.ledger_mut().mark_initialized();
@@ -670,6 +670,7 @@ impl ResidencyManager {
             &ids,
             tier,
             return_transfer,
+            false,
         );
         if missing > 0 {
             state
@@ -1008,7 +1009,7 @@ fn prefetch_locked(
         PrefetchOutcome::Miss
     };
     state.control.ledger_mut().record_prefetch(tier, outcome);
-    ensure_resident(state, store, id, tier)?;
+    ensure_resident(state, store, id, tier, false)?;
     Ok(outcome)
 }
 
@@ -1017,9 +1018,17 @@ fn ensure_resident(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     id: &OffloadUnitId,
     tier: MemoryTier,
+    initializing: bool,
 ) -> Result<bool, ResidencyError> {
-    ensure_many_resident(state, store, std::slice::from_ref(id), tier, false)
-        .map(|(created, _)| created[0])
+    ensure_many_resident(
+        state,
+        store,
+        std::slice::from_ref(id),
+        tier,
+        false,
+        initializing,
+    )
+    .map(|(created, _)| created[0])
 }
 
 fn ensure_many_resident(
@@ -1028,32 +1037,24 @@ fn ensure_many_resident(
     ids: &[OffloadUnitId],
     tier: MemoryTier,
     return_transfer: bool,
+    initializing: bool,
 ) -> Result<(Vec<bool>, Option<SubmittedResidentTransfer>), ResidencyError> {
     validate_target(tier, "residency transition")?;
     if ids.is_empty() {
         return Ok((Vec::new(), None));
     }
-    state.control.ledger_mut().validate_batch(ids, tier)?;
-    let created = ids
-        .iter()
-        .map(|id| {
-            state
-                .control
-                .ledger_mut()
-                .is_resident(id, tier)
-                .map(|resident| !resident)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if created.iter().all(|value| !value) {
-        for id in ids {
-            state.control.ledger_mut().touch(id, tier)?;
-        }
+    let acquisition = if initializing {
+        state.control.plan_initialization_acquisition(ids, tier)?
+    } else {
+        state.control.plan_acquisition(ids, tier)?
+    };
+    let created = acquisition.missing().to_vec();
+    if acquisition.is_hit() {
+        state.control.touch_acquisition_hits(&acquisition, tier)?;
         return Ok((created, None));
     }
 
-    let temporary_protection = ids.iter().cloned().collect::<BTreeSet<_>>();
     let started = Instant::now();
-    let mut reserved = Vec::new();
     let result = (|| {
         let mut reservations = Vec::new();
         for (id, is_missing) in ids.iter().zip(&created) {
@@ -1068,13 +1069,10 @@ fn ensure_many_resident(
                 .bindings();
             let required = resident_capacity_requirement(bindings, planned, tier)?;
             reservations.push((id.clone(), required));
-            reserved.push(id.clone());
         }
-        let evicted = state.control.ledger_mut().reserve_copies(
-            &reservations,
-            tier,
-            &temporary_protection,
-        )?;
+        let evicted = state
+            .control
+            .reserve_acquisition(&acquisition, &reservations, tier)?;
         release_backend_copies(state, &evicted)?;
 
         if tier == MemoryTier::Host {
@@ -1132,11 +1130,7 @@ fn ensure_many_resident(
                     started.elapsed(),
                 );
             }
-            for (id, is_missing) in ids.iter().zip(&created) {
-                if !is_missing {
-                    state.control.ledger_mut().touch(id, tier)?;
-                }
-            }
+            state.control.touch_acquisition_hits(&acquisition, tier)?;
             return Ok((created.clone(), None));
         }
 
@@ -1288,11 +1282,7 @@ fn ensure_many_resident(
                 .ledger_mut()
                 .record_transfer(item.direction, actual, started.elapsed());
         }
-        for (id, is_missing) in ids.iter().zip(&created) {
-            if !is_missing {
-                state.control.ledger_mut().touch(id, tier)?;
-            }
-        }
+        state.control.touch_acquisition_hits(&acquisition, tier)?;
         let submitted = return_transfer.then_some(SubmittedResidentTransfer {
             event,
             retained,
@@ -1303,9 +1293,7 @@ fn ensure_many_resident(
     })();
 
     if result.is_err() {
-        for id in &reserved {
-            state.control.ledger_mut().rollback_reserved(id, tier)?;
-        }
+        state.control.rollback_acquisition(&acquisition, tier)?;
     }
     result
 }

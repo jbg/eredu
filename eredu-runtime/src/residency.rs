@@ -7,8 +7,8 @@ use eredu_checkpoint::{
     store::{TensorSelection, WeightStoreDiagnostics},
 };
 use eredu_core::residency::{
-    MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId, PrefetchOutcome, ResidencyLedger,
-    UnitResidencyReport,
+    EvictedResidencyCopy, MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId, PrefetchOutcome,
+    ResidencyLedger, ResidencyLedgerError, UnitResidencyReport,
 };
 
 /// Deterministic telemetry from one bounded weight-materialization pass.
@@ -268,6 +268,42 @@ pub struct ResidencyController {
     units: BTreeMap<OffloadUnitId, OffloadUnit>,
 }
 
+/// One validated immutable-weight acquisition batch and its initial hit/miss state.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResidencyAcquisition {
+    ids: Vec<OffloadUnitId>,
+    missing: Vec<bool>,
+}
+
+impl ResidencyAcquisition {
+    /// Returns requested units in caller order.
+    pub fn ids(&self) -> &[OffloadUnitId] {
+        &self.ids
+    }
+
+    /// Returns one flag per requested unit; `true` requires backend realization.
+    pub fn missing(&self) -> &[bool] {
+        &self.missing
+    }
+
+    /// Returns whether every requested copy was already resident.
+    pub fn is_hit(&self) -> bool {
+        self.missing.iter().all(|missing| !missing)
+    }
+
+    /// Returns missing units in caller order.
+    pub fn missing_ids(&self) -> impl Iterator<Item = &OffloadUnitId> {
+        self.ids
+            .iter()
+            .zip(&self.missing)
+            .filter_map(|(id, &missing)| missing.then_some(id))
+    }
+
+    fn temporary_protection(&self) -> BTreeSet<OffloadUnitId> {
+        self.ids.iter().cloned().collect()
+    }
+}
+
 impl ResidencyController {
     /// Validates declarations against checkpoint metadata and an explicit plan.
     pub fn new<C: RecipeCatalog + ?Sized>(
@@ -358,6 +394,78 @@ impl ResidencyController {
     /// Returns mutable ownership, capacity, and telemetry state.
     pub fn ledger_mut(&mut self) -> &mut ResidencyLedger {
         &mut self.ledger
+    }
+
+    /// Validates one batch and snapshots which requested copies need realization.
+    pub fn plan_acquisition(
+        &mut self,
+        ids: &[OffloadUnitId],
+        tier: MemoryTier,
+    ) -> Result<ResidencyAcquisition, ResidencyLedgerError> {
+        self.ledger.require_initialized()?;
+        self.plan_acquisition_inner(ids, tier)
+    }
+
+    /// Validates a batch while the manager is realizing its initial planned tiers.
+    pub fn plan_initialization_acquisition(
+        &mut self,
+        ids: &[OffloadUnitId],
+        tier: MemoryTier,
+    ) -> Result<ResidencyAcquisition, ResidencyLedgerError> {
+        self.plan_acquisition_inner(ids, tier)
+    }
+
+    fn plan_acquisition_inner(
+        &mut self,
+        ids: &[OffloadUnitId],
+        tier: MemoryTier,
+    ) -> Result<ResidencyAcquisition, ResidencyLedgerError> {
+        self.ledger.validate_batch(ids, tier)?;
+        let missing = ids
+            .iter()
+            .map(|id| self.ledger.is_resident(id, tier).map(|resident| !resident))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ResidencyAcquisition {
+            ids: ids.to_vec(),
+            missing,
+        })
+    }
+
+    /// Reserves backend-supplied physical capacities while protecting the complete batch.
+    pub fn reserve_acquisition(
+        &mut self,
+        acquisition: &ResidencyAcquisition,
+        reservations: &[(OffloadUnitId, u64)],
+        tier: MemoryTier,
+    ) -> Result<Vec<EvictedResidencyCopy>, ResidencyLedgerError> {
+        self.ledger
+            .reserve_copies(reservations, tier, &acquisition.temporary_protection())
+    }
+
+    /// Updates recency for copies which were hits when the batch began.
+    pub fn touch_acquisition_hits(
+        &mut self,
+        acquisition: &ResidencyAcquisition,
+        tier: MemoryTier,
+    ) -> Result<(), ResidencyLedgerError> {
+        for (id, &missing) in acquisition.ids.iter().zip(&acquisition.missing) {
+            if !missing {
+                self.ledger.touch(id, tier)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rolls back every missing copy which remains an unpublished reservation.
+    pub fn rollback_acquisition(
+        &mut self,
+        acquisition: &ResidencyAcquisition,
+        tier: MemoryTier,
+    ) -> Result<(), ResidencyLedgerError> {
+        for id in acquisition.missing_ids() {
+            self.ledger.rollback_reserved(id, tier)?;
+        }
+        Ok(())
     }
 
     /// Replaces one protected window and selects unique bounded lookahead in caller order.
@@ -1072,6 +1180,56 @@ mod tests {
             controller.ledger().active_window(),
             BTreeSet::from([ids[0].clone()])
         );
+    }
+
+    #[test]
+    fn controller_owns_acquisition_reservation_and_rollback() {
+        let ids = ["a", "b"].map(|name| OffloadUnitId::new(format!("layer.{name}")).unwrap());
+        let catalog = Catalog(BTreeMap::from([
+            ("a".into(), metadata("a", vec![1])),
+            ("b".into(), metadata("b", vec![1])),
+        ]));
+        let units = ids.iter().zip(["a", "b"]).map(|(id, key)| {
+            OffloadUnit::new(
+                id.clone(),
+                [WeightBinding::new("weight", key, TensorSelection::Full, 4).unwrap()],
+            )
+            .unwrap()
+        });
+        let plan = OffloadPlan::new(
+            OffloadConfig::new(Some(8), Some(8), 1).unwrap(),
+            ids.iter().map(|id| {
+                OffloadUnitSpec::new(id.clone(), 4, ResidencyPolicy::Cacheable, MemoryTier::Disk)
+                    .unwrap()
+            }),
+        )
+        .unwrap();
+        let mut controller = ResidencyController::new(&catalog, plan, units).unwrap();
+        controller.ledger_mut().mark_initialized();
+
+        let acquisition = controller
+            .plan_acquisition(&ids, MemoryTier::Device)
+            .unwrap();
+        assert_eq!(acquisition.missing(), &[true, true]);
+        assert!(controller
+            .reserve_acquisition(
+                &acquisition,
+                &[(ids[0].clone(), 4), (ids[1].clone(), 4)],
+                MemoryTier::Device,
+            )
+            .unwrap()
+            .is_empty());
+        controller
+            .rollback_acquisition(&acquisition, MemoryTier::Device)
+            .unwrap();
+        assert!(!controller
+            .ledger()
+            .is_resident(&ids[0], MemoryTier::Device)
+            .unwrap());
+        assert!(!controller
+            .ledger()
+            .is_resident(&ids[1], MemoryTier::Device)
+            .unwrap());
     }
 
     #[test]

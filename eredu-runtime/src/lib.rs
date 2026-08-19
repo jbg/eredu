@@ -69,10 +69,10 @@ pub use parameter::{
 };
 pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use residency::{
-    DeviceLayerWindow, OffloadUnit, ResidencyController, ResidencyControllerError,
-    ResidencyDeclarationError, ResidencyReport, ResidencyWindowError, ResidencyWindowManager,
-    ResidentLayerGroup, ResidentLayerGroupReport, WeightBinding, WeightBindingSelectionError,
-    WeightMaterializationReport,
+    DeviceLayerWindow, OffloadUnit, ResidencyAcquisition, ResidencyController,
+    ResidencyControllerError, ResidencyDeclarationError, ResidencyReport, ResidencyWindowError,
+    ResidencyWindowManager, ResidentLayerGroup, ResidentLayerGroupReport, WeightBinding,
+    WeightBindingSelectionError, WeightMaterializationReport,
 };
 pub use state::{
     DeviceState, ModelStateIdentity, PagedStatePlan, RuntimeLayerState, RuntimeState, StateError,
