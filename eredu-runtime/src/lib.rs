@@ -9,7 +9,7 @@
 pub mod backend;
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
-/// Backend-neutral causal-model session contracts.
+/// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;
 /// Statically dispatched layered architecture lifecycle and resident policy.
 pub mod layered;
@@ -27,7 +27,10 @@ pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,
     ExecutionGroupSpec, ReadyGroupState,
 };
-pub use generation::CausalModel;
+pub use generation::{
+    CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
+    PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,
+};
 pub use layered::{
     LayeredArchitecture, LayeredForwardState, LayerwisePolicy, LayerwiseRuntime,
     LayerwiseRuntimeError, ParallelLayeredArchitecture, ResidentRuntime, ResidentUnitWindow,

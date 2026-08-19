@@ -101,6 +101,30 @@ fn mlx_backend_contains_no_llama_knowledge() {
 }
 
 #[test]
+fn mlx_sampling_contains_only_backend_primitives() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sampler =
+        std::fs::read_to_string(root.join("src/backend/mlx/runtime/generation/sampler.rs"))
+            .expect("MLX sampling facade must be readable");
+    for runtime_owned in [
+        "pub struct DefaultSampler",
+        "pub struct GenerationSampler",
+        "pub struct MirostatV2Sampler",
+        "pub struct ConstrainedSampler",
+    ] {
+        assert!(
+            !sampler.contains(runtime_owned),
+            "backend reimplemented runtime sampling policy {runtime_owned:?}"
+        );
+    }
+
+    let backend =
+        std::fs::read_to_string(root.join("src/backend/mlx/runtime/generation/backend.rs"))
+            .expect("MLX sampling capabilities must be readable");
+    assert!(backend.contains("impl SamplingBackend for MlxSamplingBackend"));
+}
+
+#[test]
 fn llama_hot_path_remains_statically_dispatched_and_device_native() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

@@ -1,66 +1,74 @@
-use safemlx::{
-    argmax_axis, array,
-    error::Exception,
-    ops::indexing::TryIndexOp,
-    random::{self, RandomState},
-    Array, Stream,
+//! Backend-neutral sampling policies specialized to SafeMLX primitives.
+
+use eredu_runtime::{
+    Sampler as RuntimeSampler, SamplingBackend, SpeculativeSampler as RuntimeSpeculativeSampler,
 };
+use safemlx::{error::Exception, random::RandomState, Array, Stream};
 
-use crate::core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController};
+pub(crate) use super::backend::MlxSamplingBackend;
+use crate::core::TokenFilter;
 
-/// Sampling policy suitable for lossless speculative decoding.
-///
-/// Unlike [`Sampler`], this interface separates logits processing, sampling,
-/// and history commitment.  A speculative decoder can therefore inspect the
-/// exact target and draft distributions without recording rejected tokens.
-pub trait SpeculativeSampler {
-    /// Whether loaded checkpoint sampling defaults should wrap this policy.
-    ///
-    /// The built-in [`DefaultSampler`] opts in. Custom policies are treated as
-    /// explicit overrides unless they choose to opt in themselves.
+pub use eredu_runtime::{ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler};
+
+/// SafeMLX-specialized token selection policy.
+pub trait Sampler {
+    /// Whether loaded checkpoint defaults should wrap this policy.
     fn uses_checkpoint_defaults(&self) -> bool {
         false
     }
 
-    /// Returns whether optimistic draft work is an exact, discardable fork.
-    ///
-    /// Returning `true` guarantees that draft-side [`Self::process_logits`] and
-    /// [`Self::sample_processed`] depend only on raw logits, the supplied
-    /// logical history, immutable configuration, and the supplied PRNG state.
-    /// Calling them on a clone must not mutate state that a later canonical
-    /// target commit observes. This permits a scheduler to compute processed
-    /// draft distributions before target resolution, then promote them after
-    /// proving that their entire assumed prefix is canonical.
-    ///
-    /// Adaptive processors whose next draft distribution depends on
-    /// target-committed state must keep the default `false`.
+    /// Selects one token from raw MLX logits.
+    fn sample(
+        &mut self,
+        logits: &Array,
+        temperature: f32,
+        random: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception>;
+}
+
+impl<T> Sampler for T
+where
+    T: RuntimeSampler<MlxSamplingBackend>,
+{
+    fn uses_checkpoint_defaults(&self) -> bool {
+        RuntimeSampler::<MlxSamplingBackend>::uses_checkpoint_defaults(self)
+    }
+
+    fn sample(
+        &mut self,
+        logits: &Array,
+        temperature: f32,
+        random: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        RuntimeSampler::<MlxSamplingBackend>::sample(self, logits, temperature, random, stream)
+    }
+}
+
+/// SafeMLX-specialized lossless speculative sampling policy.
+pub trait SpeculativeSampler {
+    /// Whether loaded checkpoint defaults should wrap this policy.
+    fn uses_checkpoint_defaults(&self) -> bool {
+        false
+    }
+
+    /// Whether optimistic draft work is an exact discardable fork.
     fn supports_exact_optimistic_promotion(&self) -> bool {
         false
     }
 
-    /// Returns whether a committed generation grammar accepts the current
-    /// logical prefix.
-    ///
-    /// Unconstrained samplers keep the default `false`. Constraint-aware
-    /// wrappers override this so speculative schedulers can stop at the same
-    /// committed token as ordinary generation.
+    /// Whether the committed generation grammar is complete.
     fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
         Ok(false)
     }
 
-    /// Returns whether the generation grammar accepts `history` as a complete
-    /// logical prefix without committing it.
-    ///
-    /// Speculative schedulers use this query while drafting so a proposal block
-    /// stops at the same grammar boundary as canonical generation. The supplied
-    /// history always includes the sampler's committed prefix. Unconstrained
-    /// samplers keep the default `false`.
+    /// Whether an uncommitted logical prefix completes the grammar.
     fn prefix_is_complete(&self, _history: &[u32]) -> Result<bool, Exception> {
         Ok(false)
     }
 
-    /// Applies penalties, filters, and temperature using the supplied logical
-    /// token history, returning canonical-vocabulary logits.
+    /// Applies penalties, filters, and temperature.
     fn process_logits(
         &mut self,
         logits: &Array,
@@ -69,31 +77,18 @@ pub trait SpeculativeSampler {
         stream: &Stream,
     ) -> Result<Array, Exception>;
 
-    /// Samples from logits returned by [`SpeculativeSampler::process_logits`].
+    /// Selects from already processed logits.
     fn sample_processed(
         &self,
         logits: &Array,
         temperature: f32,
-        prng_state: Option<&mut RandomState>,
+        random: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        match temperature {
-            0.0 => argmax_axis!(logits, -1, stream = stream),
-            _ => {
-                let prng_state = prng_state.ok_or_else(|| {
-                    Exception::custom("random operations require an explicit PRNG key")
-                })?;
-                let key = prng_state.next_key(stream)?;
-                random::categorical(logits, None, None, &key, stream)
-            }
-        }
+        MlxSamplingBackend::sample_processed(logits, temperature, random, stream)
     }
 
     /// Commits an emitted token from a processed target distribution.
-    ///
-    /// Stateless policies may use the default no-op. Adaptive policies update
-    /// state here only after speculative verification accepts a proposal or
-    /// chooses its replacement.
     fn commit_token(
         &mut self,
         _processed_logits: &Array,
@@ -104,112 +99,24 @@ pub trait SpeculativeSampler {
     }
 }
 
-/// Strategy for choosing a token from model logits.
-pub trait Sampler {
-    /// Whether loaded checkpoint sampling defaults should wrap this policy.
-    fn uses_checkpoint_defaults(&self) -> bool {
-        false
-    }
-
-    /// Samples one token id from `logits`.
-    ///
-    /// Implementations may use `temp` and `prng_state`; stochastic samplers
-    /// should return an error when randomness is required but no PRNG state is
-    /// supplied.
-    fn sample(
-        &mut self,
-        logits: &Array,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception>;
-}
-
-/// A grammar-aware wrapper around an existing sampling policy.
-///
-/// The wrapper masks raw vocabulary logits before delegating penalties,
-/// filtering, temperature scaling, and token selection to the wrapped policy.
-/// Grammar state advances only when a selected token is committed. For
-/// [`ToolChoice::Auto`], masking starts only after the plan's exact activation
-/// trigger has been committed; [`ToolChoice::None`] masks that trigger from
-/// otherwise unconstrained output; [`ToolChoice::Required`] masks the first token.
-///
-/// The standard policies in this module implement [`Clone`], which lets the
-/// MTP scheduler fork delegated adaptive state together with grammar state.
-pub(crate) struct ConstrainedSampler<S, C> {
-    policy: S,
-    controller: C,
-}
-
-struct ConstraintCheckpoint<S, C> {
-    policy: S,
-    controller: C,
-}
-
-impl<S: Clone, C: Clone> Clone for ConstrainedSampler<S, C> {
-    fn clone(&self) -> Self {
-        Self {
-            policy: self.policy.clone(),
-            controller: self.controller.clone(),
-        }
-    }
-}
-
-impl<S, C> ConstrainedSampler<S, C> {
-    /// Wraps `policy` with a portable canonical constraint controller.
-    pub(crate) fn new(policy: S, controller: C) -> Self {
-        Self { policy, controller }
-    }
-
-    /// Returns the wrapped sampling policy.
-    #[cfg(test)]
-    pub(crate) fn policy(&self) -> &S {
-        &self.policy
-    }
-
-    /// Returns the portable constraint controller.
-    #[cfg(test)]
-    pub(crate) fn controller(&self) -> &C {
-        &self.controller
-    }
-
-    /// Returns the portable constraint controller mutably.
-    #[cfg(test)]
-    pub(crate) fn controller_mut(&mut self) -> &mut C {
-        &mut self.controller
-    }
-}
-
-impl<S: Clone, C: Clone> ConstrainedSampler<S, C> {
-    fn checkpoint(&self) -> ConstraintCheckpoint<S, C> {
-        ConstraintCheckpoint {
-            policy: self.policy.clone(),
-            controller: self.controller.clone(),
-        }
-    }
-}
-
-impl<S, C> SpeculativeSampler for ConstrainedSampler<S, C>
+impl<T> SpeculativeSampler for T
 where
-    S: SpeculativeSampler + Clone,
-    C: SpeculativeTokenFilterController,
+    T: RuntimeSpeculativeSampler<MlxSamplingBackend>,
 {
+    fn uses_checkpoint_defaults(&self) -> bool {
+        RuntimeSpeculativeSampler::<MlxSamplingBackend>::uses_checkpoint_defaults(self)
+    }
+
     fn supports_exact_optimistic_promotion(&self) -> bool {
-        // Constraint processing below reconstructs a private runtime from the
-        // durable prefix and supplied history. That fork is pure and
-        // discardable, so exact promotion is limited only by the wrapped
-        // policy's capability.
-        self.policy.supports_exact_optimistic_promotion()
+        RuntimeSpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(self)
     }
 
     fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
-        self.controller.is_complete().map_err(constraint_exception)
+        RuntimeSpeculativeSampler::<MlxSamplingBackend>::grammar_is_complete(self)
     }
 
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
-        self.controller
-            .prefix_is_complete(history)
-            .map_err(constraint_exception)
+        RuntimeSpeculativeSampler::<MlxSamplingBackend>::prefix_is_complete(self, history)
     }
 
     fn process_logits(
@@ -219,24 +126,29 @@ where
         history: &[u32],
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let filter = self
-            .controller
-            .filter_at(history)
-            .map_err(constraint_exception)?;
-        let masked = apply_token_filter(logits, &filter, stream)?;
-        self.policy
-            .process_logits(&masked, temperature, history, stream)
+        RuntimeSpeculativeSampler::<MlxSamplingBackend>::process_logits(
+            self,
+            logits,
+            temperature,
+            history,
+            stream,
+        )
     }
 
     fn sample_processed(
         &self,
         logits: &Array,
         temperature: f32,
-        prng_state: Option<&mut RandomState>,
+        random: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        self.policy
-            .sample_processed(logits, temperature, prng_state, stream)
+        RuntimeSpeculativeSampler::<MlxSamplingBackend>::sample_processed(
+            self,
+            logits,
+            temperature,
+            random,
+            stream,
+        )
     }
 
     fn commit_token(
@@ -245,679 +157,12 @@ where
         token: u32,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        let checkpoint = self.checkpoint();
-        if let Err(error) = self
-            .policy
-            .commit_token(processed_logits, token, stream)
-            .and_then(|()| {
-                self.controller
-                    .commit_token(token)
-                    .map_err(constraint_exception)
-            })
-        {
-            self.policy = checkpoint.policy;
-            self.controller = checkpoint.controller;
-            return Err(error);
-        }
-        Ok(())
-    }
-}
-
-impl<S, C> Sampler for ConstrainedSampler<S, C>
-where
-    S: Sampler + Clone,
-    C: TokenFilterController + Clone,
-{
-    fn sample(
-        &mut self,
-        logits: &Array,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let checkpoint = self.checkpoint();
-        let filter = self
-            .controller
-            .current_filter()
-            .map_err(constraint_exception)?;
-        let masked = apply_token_filter(logits, &filter, stream)?;
-        let token = self.policy.sample(&masked, temp, prng_state, stream)?;
-        let token_id = token.clone().item::<u32>(stream);
-        if let Err(error) = self.controller.commit_token(token_id) {
-            self.policy = checkpoint.policy;
-            self.controller = checkpoint.controller;
-            return Err(constraint_exception(error));
-        }
-        Ok(token)
-    }
-}
-
-fn constraint_exception(error: impl std::fmt::Display) -> Exception {
-    Exception::custom(error.to_string())
-}
-
-/// Default sampler used by generation helpers.
-///
-/// A temperature of `0.0` uses greedy argmax sampling. Non-zero temperatures
-/// sample from a categorical distribution and require a PRNG key.
-#[derive(Debug, Clone, Copy)]
-pub struct DefaultSampler;
-
-impl SpeculativeSampler for DefaultSampler {
-    fn uses_checkpoint_defaults(&self) -> bool {
-        true
-    }
-
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        true
-    }
-
-    fn process_logits(
-        &mut self,
-        logits: &Array,
-        temperature: f32,
-        _history: &[u32],
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        if temperature == 0.0 {
-            Ok(logits.clone())
-        } else {
-            logits.multiply(array!(1.0 / temperature), stream)
-        }
-    }
-}
-
-impl Sampler for DefaultSampler {
-    fn uses_checkpoint_defaults(&self) -> bool {
-        true
-    }
-
-    fn sample(
-        &mut self,
-        logits: &Array,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        match temp {
-            0.0 => argmax_axis!(logits, -1, stream = stream),
-            _ => {
-                let prng_state = prng_state.ok_or_else(|| {
-                    Exception::custom("random operations require an explicit PRNG key")
-                })?;
-                let key = prng_state.next_key(stream)?;
-                let logits = logits.multiply(array!(1.0 / temp), stream)?;
-                random::categorical(&logits, None, None, &key, stream)
-            }
-        }
-    }
-}
-
-/// Adaptive Mirostat V2 sampler for single-sequence text generation.
-///
-/// Mirostat V2 targets a configurable surprise value instead of applying a
-/// fixed top-k or top-p cutoff. On each step it:
-///
-/// 1. applies repetition, frequency, and presence penalties;
-/// 2. computes the temperature-scaled token probabilities;
-/// 3. retains tokens with surprise no greater than the adaptive value `mu`;
-/// 4. samples from the retained tokens; and
-/// 5. adjusts `mu` toward the target surprise `tau` using learning rate `eta`.
-///
-/// The initial `mu` is `2 * tau`, as in the reference algorithm. This sampler
-/// is stateful and currently supports one sequence at a time. Under
-/// [`SpeculativeSampler`], `mu` advances only from committed target
-/// distributions; rejected draft tokens never update adaptive state.
-#[derive(Debug, Clone)]
-pub struct MirostatV2Sampler {
-    tau: f32,
-    eta: f32,
-    mu: f32,
-    penalties: GenerationSampler,
-}
-
-impl Default for MirostatV2Sampler {
-    fn default() -> Self {
-        Self {
-            tau: 5.0,
-            eta: 0.1,
-            mu: 10.0,
-            penalties: GenerationSampler::new().top_k(0).top_p(1.0).min_p(0.0),
-        }
-    }
-}
-
-impl MirostatV2Sampler {
-    /// Creates a Mirostat V2 sampler with initial adaptive value `2 * tau`.
-    ///
-    /// `tau` is the target surprise in bits and `eta` is the adaptation rate.
-    /// Both values must be finite and greater than zero.
-    pub fn new(tau: f32, eta: f32) -> Result<Self, Exception> {
-        validate_positive_finite("Mirostat V2 tau", tau)?;
-        validate_positive_finite("Mirostat V2 eta", eta)?;
-        Ok(Self {
-            tau,
-            eta,
-            mu: 2.0 * tau,
-            penalties: GenerationSampler::new().top_k(0).top_p(1.0).min_p(0.0),
-        })
-    }
-
-    /// Sets repetition, frequency, and presence penalties applied before
-    /// Mirostat truncation.
-    pub fn penalties(
-        mut self,
-        repeat_penalty: f32,
-        repeat_last_n: i32,
-        frequency_penalty: f32,
-        presence_penalty: f32,
-    ) -> Self {
-        self.penalties = self.penalties.penalties(
-            repeat_penalty,
-            repeat_last_n,
-            frequency_penalty,
-            presence_penalty,
-        );
-        self
-    }
-
-    /// Returns the target surprise in bits.
-    pub const fn tau(&self) -> f32 {
-        self.tau
-    }
-
-    /// Returns the adaptation rate.
-    pub const fn eta(&self) -> f32 {
-        self.eta
-    }
-
-    /// Returns the current adaptive surprise limit.
-    pub const fn mu(&self) -> f32 {
-        self.mu
-    }
-
-    /// Returns generated token ids already accepted by this sampler.
-    pub fn generated_tokens(&self) -> &[u32] {
-        self.penalties.generated_tokens()
-    }
-
-    /// Records a token accepted outside this sampler and updates adaptive state.
-    ///
-    /// `probability` must be the token's probability after Mirostat truncation
-    /// and renormalization.
-    pub fn accept_token(&mut self, token_id: u32, probability: f32) -> Result<(), Exception> {
-        if !probability.is_finite() || probability <= 0.0 || probability > 1.0 {
-            return Err(Exception::custom(
-                "accepted Mirostat V2 token probability must be finite and in (0, 1]",
-            ));
-        }
-        self.update_mu(-probability.log2());
-        self.penalties.accept_token(token_id);
-        Ok(())
-    }
-
-    /// Resets adaptive state and accepted-token history.
-    pub fn reset(&mut self) {
-        self.mu = 2.0 * self.tau;
-        self.penalties.clear_generated_tokens();
-    }
-
-    fn update_mu(&mut self, observed_surprise: f32) {
-        self.mu -= self.eta * (observed_surprise - self.tau);
-    }
-
-    fn process_logits_for(
-        &self,
-        logits: &Array,
-        temperature: f32,
-        history: &[u32],
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        if !temperature.is_finite() || temperature <= 0.0 {
-            return Err(Exception::custom(
-                "Mirostat V2 requires a finite temperature greater than zero",
-            ));
-        }
-        let vocab_size = logits.dim(-1) as usize;
-        if vocab_size == 0 || logits.size() / vocab_size != 1 {
-            return Err(Exception::custom(
-                "Mirostat V2 currently requires logits for exactly one sequence",
-            ));
-        }
-
-        let logits = self
-            .penalties
-            .apply_penalties_for(logits, history, stream)?;
-        let scaled_logits = logits.multiply(array!(1.0 / temperature), stream)?;
-        let probabilities = safemlx::ops::softmax_axis(&scaled_logits, -1, true, stream)?;
-
-        // A token's surprise is -log2(p), so surprise <= mu is equivalent to
-        // p >= 2^-mu. If mu is temporarily below every surprise, retain only
-        // the first argmax token, matching the reference algorithm's fallback.
-        let cutoff_probability = Array::from_f32((-self.mu).exp2());
-        let maximum_probability = probabilities.max_axis(-1, true, stream)?;
-        let cutoff_mask = probabilities.lt(&cutoff_probability, stream)?;
-        let best_token =
-            argmax_axis!(&probabilities, -1, stream = stream)?.expand_dims_axes(&[-1], stream)?;
-        let fallback_mask = Array::full::<bool>(logits.shape(), Array::from_bool(true), stream)?;
-        let keep_best = Array::full::<bool>(best_token.shape(), Array::from_bool(false), stream)?;
-        let fallback_mask = safemlx::ops::indexing::put_along_axis(
-            &fallback_mask,
-            &best_token,
-            &keep_best,
-            -1,
+        RuntimeSpeculativeSampler::<MlxSamplingBackend>::commit_token(
+            self,
+            processed_logits,
+            token,
             stream,
-        )?;
-        let needs_fallback = cutoff_probability.gt(maximum_probability, stream)?;
-        let mask = safemlx::ops::r#where(needs_fallback, fallback_mask, cutoff_mask, stream)?;
-        mask_logits(mask, scaled_logits, stream)
-    }
-
-    fn commit_processed_token(
-        &mut self,
-        processed_logits: &Array,
-        token: u32,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        let vocab_size = processed_logits.dim(-1) as usize;
-        if token as usize >= vocab_size {
-            return Err(Exception::custom(format!(
-                "sampled token {token} exceeds vocabulary size {vocab_size}"
-            )));
-        }
-        let probabilities = safemlx::ops::softmax_axis(processed_logits, -1, true, stream)?;
-        let selected = match probabilities.ndim() {
-            1 => probabilities.try_index_device(token as i32, stream)?,
-            2 => probabilities.try_index_device((0, token as i32), stream)?,
-            3 => probabilities.try_index_device((0, 0, token as i32), stream)?,
-            rank => {
-                return Err(Exception::custom(format!(
-                    "Mirostat V2 processed logits must have rank 1, 2, or 3, got rank {rank}"
-                )))
-            }
-        };
-        self.accept_token(token, selected.item::<f32>(stream))
-    }
-}
-
-impl Sampler for MirostatV2Sampler {
-    fn sample(
-        &mut self,
-        logits: &Array,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let processed_logits =
-            self.process_logits_for(logits, temp, self.penalties.generated_tokens(), stream)?;
-        let prng_state = prng_state
-            .ok_or_else(|| Exception::custom("random operations require an explicit PRNG key"))?;
-        let key = prng_state.next_key(stream)?;
-        let token = random::categorical(&processed_logits, None, None, &key, stream)?;
-        self.commit_processed_token(&processed_logits, token.clone().item::<u32>(stream), stream)?;
-        Ok(token)
-    }
-}
-
-impl SpeculativeSampler for MirostatV2Sampler {
-    fn process_logits(
-        &mut self,
-        logits: &Array,
-        temperature: f32,
-        history: &[u32],
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        self.process_logits_for(logits, temperature, history, stream)
-    }
-
-    fn commit_token(
-        &mut self,
-        processed_logits: &Array,
-        token: u32,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        self.commit_processed_token(processed_logits, token, stream)
-    }
-}
-
-/// Configurable sampler for text generation.
-///
-/// The sampler mirrors a common autoregressive sampling chain:
-/// repetition/frequency/presence penalties, then top-k, top-p, min-p,
-/// temperature, and finally greedy or categorical token selection.
-#[derive(Debug, Clone)]
-pub struct GenerationSampler {
-    /// Keep only the `top_k` highest-logit tokens when positive.
-    pub top_k: i32,
-    /// Keep the smallest prefix of tokens whose probability mass reaches `top_p`.
-    pub top_p: f32,
-    /// Keep tokens whose probability is at least `min_p * max_probability`.
-    pub min_p: f32,
-    /// Repetition penalty applied to recently generated tokens. `1.0` disables it.
-    pub repeat_penalty: f32,
-    /// Number of generated tokens considered by repetition penalties. Negative means all.
-    pub repeat_last_n: i32,
-    /// Frequency penalty subtracted once per generated occurrence.
-    pub frequency_penalty: f32,
-    /// Presence penalty subtracted once for any generated occurrence.
-    pub presence_penalty: f32,
-    generated_tokens: Vec<u32>,
-}
-
-impl Default for GenerationSampler {
-    fn default() -> Self {
-        Self {
-            top_k: 40,
-            top_p: 0.95,
-            min_p: 0.05,
-            repeat_penalty: 1.0,
-            repeat_last_n: 64,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
-            generated_tokens: Vec::new(),
-        }
-    }
-}
-
-impl GenerationSampler {
-    /// Creates a sampler with default generation settings.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Materializes backend-neutral sampling filters for MLX logits.
-    pub fn from_resolved(config: crate::core::generation::ResolvedGenerationConfig) -> Self {
-        Self::new()
-            .top_k(config.top_k)
-            .top_p(config.top_p)
-            .min_p(config.min_p)
-            .penalties(
-                config.repetition_penalty,
-                config.repeat_last_n,
-                config.frequency_penalty,
-                config.presence_penalty,
-            )
-    }
-
-    /// Creates a sampler with an initial accepted-token history.
-    ///
-    /// The history is used by repetition, frequency, and presence penalties.
-    /// This is useful when resuming generation or when tokens were accepted by
-    /// a caller outside of [`Sampler::sample`].
-    pub fn with_generated_tokens(mut self, token_ids: impl IntoIterator<Item = u32>) -> Self {
-        self.generated_tokens = token_ids.into_iter().collect();
-        self
-    }
-
-    /// Sets top-k filtering.
-    pub fn top_k(mut self, top_k: i32) -> Self {
-        self.top_k = top_k;
-        self
-    }
-
-    /// Sets top-p filtering.
-    pub fn top_p(mut self, top_p: f32) -> Self {
-        self.top_p = top_p;
-        self
-    }
-
-    /// Sets min-p filtering.
-    pub fn min_p(mut self, min_p: f32) -> Self {
-        self.min_p = min_p;
-        self
-    }
-
-    /// Sets repetition, frequency, and presence penalties.
-    pub fn penalties(
-        mut self,
-        repeat_penalty: f32,
-        repeat_last_n: i32,
-        frequency_penalty: f32,
-        presence_penalty: f32,
-    ) -> Self {
-        self.repeat_penalty = repeat_penalty;
-        self.repeat_last_n = repeat_last_n;
-        self.frequency_penalty = frequency_penalty;
-        self.presence_penalty = presence_penalty;
-        self
-    }
-
-    /// Returns generated token ids already accepted by this sampler.
-    pub fn generated_tokens(&self) -> &[u32] {
-        &self.generated_tokens
-    }
-
-    /// Replaces the accepted-token history used by repetition penalties.
-    pub fn set_generated_tokens(&mut self, token_ids: impl IntoIterator<Item = u32>) {
-        self.generated_tokens = token_ids.into_iter().collect();
-    }
-
-    /// Records a token accepted by the caller.
-    ///
-    /// [`Sampler::sample`] records sampled tokens automatically. Call this only
-    /// for tokens chosen outside the sampler, for example a constrained token
-    /// or an externally selected branch token.
-    pub fn accept_token(&mut self, token_id: u32) {
-        self.generated_tokens.push(token_id);
-    }
-
-    /// Clears accepted-token history.
-    pub fn clear_generated_tokens(&mut self) {
-        self.generated_tokens.clear();
-    }
-
-    fn apply_penalties_for(
-        &self,
-        logits: &Array,
-        generated_tokens: &[u32],
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        if generated_tokens.is_empty()
-            || (self.repeat_penalty == 1.0
-                && self.frequency_penalty == 0.0
-                && self.presence_penalty == 0.0)
-        {
-            return Ok(logits.clone());
-        }
-
-        let vocab_size = logits.dim(-1) as usize;
-        if vocab_size == 0 {
-            return Ok(logits.clone());
-        }
-        let row_count = logits.size() / vocab_size;
-        let mut repeat_mask = vec![false; logits.size()];
-        let mut penalties = vec![0.0f32; logits.size()];
-
-        let start = if self.repeat_last_n < 0 {
-            0
-        } else {
-            generated_tokens
-                .len()
-                .saturating_sub(self.repeat_last_n as usize)
-        };
-        let mut counts = std::collections::HashMap::<u32, usize>::new();
-        for &token_id in &generated_tokens[start..] {
-            *counts.entry(token_id).or_default() += 1;
-        }
-
-        for (token_id, count) in counts {
-            let token_index = token_id as usize;
-            if token_index >= vocab_size {
-                continue;
-            }
-            for row in 0..row_count {
-                let index = row * vocab_size + token_index;
-                repeat_mask[index] = true;
-                penalties[index] = self.frequency_penalty * count as f32 + self.presence_penalty;
-            }
-        }
-
-        let mut adjusted = logits.clone();
-        if self.repeat_penalty != 1.0 {
-            let mask = Array::from_slice(&repeat_mask, logits.shape());
-            let positive = adjusted.divide(array!(self.repeat_penalty), stream)?;
-            let negative = adjusted.multiply(array!(self.repeat_penalty), stream)?;
-            let penalized = safemlx::ops::r#where(
-                adjusted.gt(Array::from_f32(0.0), stream)?,
-                positive,
-                negative,
-                stream,
-            )?;
-            adjusted = safemlx::ops::r#where(mask, penalized, adjusted, stream)?;
-        }
-
-        if self.frequency_penalty != 0.0 || self.presence_penalty != 0.0 {
-            adjusted = adjusted.subtract(Array::from_slice(&penalties, logits.shape()), stream)?;
-        }
-
-        Ok(adjusted)
-    }
-
-    fn apply_penalties(&self, logits: &Array, stream: &Stream) -> Result<Array, Exception> {
-        self.apply_penalties_for(logits, &self.generated_tokens, stream)
-    }
-
-    fn apply_top_k(&self, logits: Array, stream: &Stream) -> Result<Array, Exception> {
-        let vocab_size = logits.dim(-1);
-        if self.top_k <= 0 || self.top_k >= vocab_size {
-            return Ok(logits);
-        }
-
-        let top_values = safemlx::ops::indexing::topk_axis(&logits, self.top_k, -1, stream)?;
-        let threshold = top_values.min_axis(-1, true, stream)?;
-        mask_logits(logits.lt(threshold, stream)?, logits, stream)
-    }
-
-    fn apply_min_p(&self, logits: Array, stream: &Stream) -> Result<Array, Exception> {
-        if self.min_p <= 0.0 {
-            return Ok(logits);
-        }
-
-        let probabilities = safemlx::ops::softmax_axis(&logits, -1, true, stream)?;
-        let max_probability = probabilities.max_axis(-1, true, stream)?;
-        let threshold = max_probability.multiply(Array::from_f32(self.min_p), stream)?;
-        mask_logits(probabilities.lt(threshold, stream)?, logits, stream)
-    }
-
-    fn sample_filtered(
-        &mut self,
-        logits: &Array,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let token = match temp {
-            0.0 => argmax_axis!(logits, -1, stream = stream)?,
-            _ => {
-                let prng_state = prng_state.ok_or_else(|| {
-                    Exception::custom("random operations require an explicit PRNG key")
-                })?;
-                let key = prng_state.next_key(stream)?;
-                let logits = logits.multiply(array!(1.0 / temp), stream)?;
-                random::categorical(&logits, None, None, &key, stream)?
-            }
-        };
-        self.generated_tokens
-            .push(token.clone().item::<u32>(stream));
-        Ok(token)
-    }
-
-    fn sample_top_p(
-        &mut self,
-        logits: Array,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        if self.top_p >= 1.0 {
-            let logits = self.apply_min_p(logits, stream)?;
-            return self.sample_filtered(&logits, temp, prng_state, stream);
-        }
-
-        let descending_indices = safemlx::ops::argsort_axis(logits.negative(stream)?, -1, stream)?;
-        let sorted_logits =
-            safemlx::ops::indexing::take_along_axis(&logits, &descending_indices, -1, stream)?;
-        let probabilities = safemlx::ops::softmax_axis(&sorted_logits, -1, true, stream)?;
-        let cumulative_probabilities = probabilities.cumsum(-1, None, None, stream)?;
-        let cumulative_before_token = cumulative_probabilities.subtract(probabilities, stream)?;
-        let mask = cumulative_before_token.gt(Array::from_f32(self.top_p.max(0.0)), stream)?;
-        let sorted_logits = mask_logits(mask, sorted_logits, stream)?;
-        let sorted_logits = self.apply_min_p(sorted_logits, stream)?;
-        let sorted_token = self.sample_filtered(&sorted_logits, temp, prng_state, stream)?;
-        let token = safemlx::ops::indexing::take_along_axis(
-            descending_indices,
-            &sorted_token.expand_dims_axes(&[-1], stream)?,
-            -1,
-            stream,
-        )?
-        .squeeze_axes(&[-1], stream)?;
-        if let Some(last) = self.generated_tokens.last_mut() {
-            *last = token.clone().item::<u32>(stream);
-        }
-        Ok(token)
-    }
-}
-
-impl SpeculativeSampler for GenerationSampler {
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        true
-    }
-
-    fn process_logits(
-        &mut self,
-        logits: &Array,
-        temperature: f32,
-        history: &[u32],
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let logits = self.apply_penalties_for(logits, history, stream)?;
-        let logits = self.apply_top_k(logits, stream)?;
-        let logits = if self.top_p >= 1.0 {
-            self.apply_min_p(logits, stream)?
-        } else {
-            let descending_indices =
-                safemlx::ops::argsort_axis(logits.negative(stream)?, -1, stream)?;
-            let sorted_logits =
-                safemlx::ops::indexing::take_along_axis(&logits, &descending_indices, -1, stream)?;
-            let probabilities = safemlx::ops::softmax_axis(&sorted_logits, -1, true, stream)?;
-            let cumulative = probabilities.cumsum(-1, None, None, stream)?;
-            let before = cumulative.subtract(probabilities, stream)?;
-            let mask = before.gt(Array::from_f32(self.top_p.max(0.0)), stream)?;
-            let sorted_logits = mask_logits(mask, sorted_logits, stream)?;
-            let sorted_logits = self.apply_min_p(sorted_logits, stream)?;
-            let fill = Array::full::<f32>(
-                logits.shape(),
-                Array::from_f32(logits.dtype().finfo_min()? as f32),
-                stream,
-            )?
-            .as_dtype(logits.dtype(), stream)?;
-            safemlx::ops::indexing::put_along_axis(
-                &fill,
-                &descending_indices,
-                &sorted_logits,
-                -1,
-                stream,
-            )?
-        };
-        if temperature == 0.0 {
-            Ok(logits)
-        } else {
-            logits.multiply(array!(1.0 / temperature), stream)
-        }
-    }
-}
-
-impl Sampler for GenerationSampler {
-    fn sample(
-        &mut self,
-        logits: &Array,
-        temp: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let logits = self.apply_penalties(logits, stream)?;
-        let logits = self.apply_top_k(logits, stream)?;
-        self.sample_top_p(logits, temp, prng_state, stream)
+        )
     }
 }
 
@@ -927,37 +172,7 @@ pub(crate) fn apply_token_filter(
     filter: &TokenFilter,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let Some(allowed) = filter.allowed_mask() else {
-        return Ok(logits.clone());
-    };
-    let vocab_size = logits.dim(-1) as usize;
-    if allowed.len() != vocab_size {
-        return Err(Exception::custom(format!(
-            "token filter vocabulary size {} does not match logits vocabulary size {vocab_size}",
-            allowed.len()
-        )));
-    }
-    let row_count = logits.size() / vocab_size;
-    let invalid = (0..row_count)
-        .flat_map(|_| allowed.iter().map(|allowed| !allowed))
-        .collect::<Vec<_>>();
-    let invalid = Array::from_slice(&invalid, logits.shape());
-    mask_logits(invalid, logits.clone(), stream)
-}
-
-fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exception> {
-    let min_value = Array::from_f32(logits.dtype().finfo_min()? as f32);
-    safemlx::ops::r#where(mask, min_value, logits, stream)
-}
-
-fn validate_positive_finite(name: &str, value: f32) -> Result<(), Exception> {
-    if value.is_finite() && value > 0.0 {
-        Ok(())
-    } else {
-        Err(Exception::custom(format!(
-            "{name} must be finite and greater than zero"
-        )))
-    }
+    MlxSamplingBackend::apply_token_filter(logits, filter, stream)
 }
 
 #[cfg(test)]
@@ -969,8 +184,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler,
-        SpeculativeSampler,
+        ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
+        MlxSamplingBackend, Sampler, SpeculativeSampler,
     };
     use crate::runtime::chat::constraints::{
         advance_trigger_prefix, completes_trigger, ConstraintController, ConstraintError,
@@ -1042,7 +257,7 @@ mod tests {
         commits: usize,
     }
 
-    impl SpeculativeSampler for CountingPolicy {
+    impl eredu_runtime::SpeculativeSampler<MlxSamplingBackend> for CountingPolicy {
         fn process_logits(
             &mut self,
             logits: &Array,
