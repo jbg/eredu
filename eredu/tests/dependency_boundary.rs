@@ -179,6 +179,7 @@ fn cache_execution_algorithms_are_runtime_owned() {
             .expect("runtime prompt-cache persistence must be readable");
     for runtime_owned in [
         "pub struct PromptCachePublication",
+        "pub struct LiveCacheBlockPublication",
         "pub fn inspect_prompt_cache",
         "pub fn validate_prompt_cache_manifest",
         "pub fn hash_prompt_cache_shard_payload",
@@ -204,6 +205,9 @@ fn cache_execution_algorithms_are_runtime_owned() {
         "fn validate_prompt_cache_manifest",
         "fn hash_prompt_cache_shard_payload",
         "fn publish_prompt_cache_generation",
+        "fn live_block_paths",
+        "fn publish_live_block_file",
+        "struct TemporaryFileGuard",
     ] {
         assert!(
             !mlx.contains(runtime_owned),

@@ -1,16 +1,23 @@
 //! Backend-neutral prompt-cache catalog validation and durable publication.
 
 use eredu_core::cache::{
-    PromptCacheBlock, PromptCacheError, PromptCacheManifest, PromptCacheStateTensor,
-    PROMPT_CACHE_SCHEMA_VERSION,
+    CacheBlockId, CacheRepresentation, PromptCacheBlock, PromptCacheError, PromptCacheManifest,
+    PromptCacheStateTensor, PROMPT_CACHE_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static NEXT_LIVE_CACHE_PUBLICATION_ID: AtomicU64 = AtomicU64::new(1);
+static LIVE_CACHE_PROCESS_NAMESPACE: OnceLock<String> = OnceLock::new();
 
 /// Maximum accepted safetensors metadata header size for a prompt-cache shard.
 pub const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
@@ -62,6 +69,109 @@ pub enum PromptCachePersistenceError {
     /// The destination exists and explicit replacement was not requested.
     #[error("prompt cache destination already exists: {0}")]
     PromptCacheExists(PathBuf),
+}
+
+/// Filesystem failure while publishing one ephemeral live-cache block.
+#[derive(Debug, thiserror::Error)]
+pub enum LiveCachePublicationError {
+    /// A filesystem operation failed.
+    #[error("failed to {action} at {path}: {source}")]
+    Io {
+        /// Filesystem action that failed.
+        action: &'static str,
+        /// Path involved in the failed action.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Runtime-owned unique staging and atomic publication for one live-cache block.
+#[derive(Debug)]
+pub struct LiveCacheBlockPublication {
+    destination: PathBuf,
+    staging: PathBuf,
+    committed: bool,
+}
+
+impl LiveCacheBlockPublication {
+    /// Reserves unique paths derived from the complete block and rank identity.
+    pub fn begin(directory: &Path, id: &CacheBlockId) -> Self {
+        let process_namespace = LIVE_CACHE_PROCESS_NAMESPACE.get_or_init(|| {
+            let started = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("p{:08x}-t{started:032x}", std::process::id())
+        });
+        let publication_id = NEXT_LIVE_CACHE_PUBLICATION_ID.fetch_add(1, Ordering::Relaxed);
+        let representation = match id.representation {
+            CacheRepresentation::KeyValue => "kv",
+            CacheRepresentation::CompressedLatentRotary => "mla",
+        };
+        let rank_component =
+            |rank: Option<usize>| rank.map_or_else(|| "x".to_string(), |rank| rank.to_string());
+        let rank = id.rank.map_or_else(
+            || "rank-px-tx-ex".to_string(),
+            |rank| {
+                format!(
+                    "rank-p{}-t{}-e{}",
+                    rank_component(rank.pipeline_rank),
+                    rank_component(rank.tensor_parallel_rank),
+                    rank_component(rank.expert_parallel_rank)
+                )
+            },
+        );
+        let base = format!(
+            "live-{process_namespace}-w{publication_id:016x}-s{:016x}-layer-{:05}-{representation}-{rank}-{}-{}",
+            id.session_id, id.global_layer, id.start, id.end
+        );
+        Self {
+            destination: directory.join(format!("{base}.safetensors")),
+            staging: directory.join(format!(".{base}.tmp.safetensors")),
+            committed: false,
+        }
+    }
+
+    /// Unique temporary path into which the backend serializes native storage.
+    pub fn staging_path(&self) -> &Path {
+        &self.staging
+    }
+
+    /// Final unique path used by the live-cache catalog.
+    pub fn destination_path(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Atomically publishes the staged file without replacing an existing path.
+    pub fn commit(mut self) -> Result<PathBuf, LiveCachePublicationError> {
+        fs::hard_link(&self.staging, &self.destination).map_err(|source| {
+            LiveCachePublicationError::Io {
+                action: "publish uniquely named live cache block",
+                path: self.destination.clone(),
+                source,
+            }
+        })?;
+        if let Err(source) = fs::remove_file(&self.staging) {
+            let _ = fs::remove_file(&self.destination);
+            return Err(LiveCachePublicationError::Io {
+                action: "remove published live cache temporary file",
+                path: self.staging.clone(),
+                source,
+            });
+        }
+        self.committed = true;
+        Ok(self.destination.clone())
+    }
+}
+
+impl Drop for LiveCacheBlockPublication {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.staging);
+        }
+    }
 }
 
 /// A runtime-owned staging directory that publishes one immutable cache atomically.
@@ -862,5 +972,58 @@ mod tests {
             hash_prompt_cache_shard_payload(&path),
             Err(PromptCachePersistenceError::MalformedShard { .. })
         ));
+    }
+
+    #[test]
+    fn live_cache_publication_is_unique_rank_aware_and_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = CacheBlockId {
+            session_id: 7,
+            global_layer: 3,
+            representation: CacheRepresentation::KeyValue,
+            start: 4,
+            end: 8,
+            rank: Some(eredu_core::cache::CacheRankIdentity {
+                pipeline_rank: Some(1),
+                tensor_parallel_rank: Some(2),
+                expert_parallel_rank: None,
+            }),
+        };
+        let first = LiveCacheBlockPublication::begin(directory.path(), &id);
+        let second = LiveCacheBlockPublication::begin(directory.path(), &id);
+        assert_ne!(first.destination_path(), second.destination_path());
+        assert!(first
+            .destination_path()
+            .to_string_lossy()
+            .contains("layer-00003-kv-rank-p1-t2-ex-4-8"));
+
+        fs::write(first.staging_path(), b"block").unwrap();
+        let destination = first.commit().unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"block");
+    }
+
+    #[test]
+    fn live_cache_publication_cleans_staging_and_never_replaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = CacheBlockId {
+            session_id: 1,
+            global_layer: 0,
+            representation: CacheRepresentation::CompressedLatentRotary,
+            start: 0,
+            end: 1,
+            rank: None,
+        };
+        let abandoned = LiveCacheBlockPublication::begin(directory.path(), &id);
+        let abandoned_path = abandoned.staging_path().to_path_buf();
+        fs::write(&abandoned_path, b"temporary").unwrap();
+        drop(abandoned);
+        assert!(!abandoned_path.exists());
+
+        let colliding = LiveCacheBlockPublication::begin(directory.path(), &id);
+        fs::write(colliding.staging_path(), b"new").unwrap();
+        fs::write(colliding.destination_path(), b"existing").unwrap();
+        let destination = colliding.destination_path().to_path_buf();
+        assert!(colliding.commit().is_err());
+        assert_eq!(fs::read(destination).unwrap(), b"existing");
     }
 }

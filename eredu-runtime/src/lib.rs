@@ -36,10 +36,10 @@ pub use cache::{
     CachePoolMembership, CachePoolReport, CachePoolReservation, CachePoolResource, CachePoolUsage,
     CacheResidencyConfigurationError, CacheResidencyPolicy, CacheResidencyPool,
     CacheResidencyReport, CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase,
-    LiveCacheDiskPolicy, MutableCacheTail, PagedCacheOptions, PromptCachePersistenceError,
-    PromptCachePublication, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
-    MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
-    PROMPT_CACHE_GENERATIONS_DIRECTORY,
+    LiveCacheBlockPublication, LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail,
+    PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication,
+    CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
+    PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
 };
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,

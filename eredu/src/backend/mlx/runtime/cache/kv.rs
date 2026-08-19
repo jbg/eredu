@@ -4163,7 +4163,9 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let directory = tempfile::tempdir().unwrap();
-        let options = PagedCacheOptions::new(2, 64, 32, 1)
+        // MLX host-transfer buffers are page-aligned; permit one physical
+        // allocation while keeping the logical device budget at two blocks.
+        let options = PagedCacheOptions::new(2, 64, 32 * 1024, 1)
             .unwrap()
             .with_full_attention(true)
             .with_live_disk(directory.path(), 4096, 2)

@@ -14,7 +14,7 @@ use std::{
         mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
     },
     thread::{self, JoinHandle},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 use memmap2::{Mmap, MmapOptions};
@@ -46,16 +46,14 @@ use eredu_runtime::{
     CacheLifecycleError, CachePoolError, CachePoolMembership, CachePoolReservation,
     CachePoolResource, CachePoolUsage, CacheResidencyConfigurationError, CacheResidencyPool,
     CacheResidencyReport, CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase,
-    LiveCacheDiskPolicy, MutableCacheTail, PagedCacheOptions, PromptCachePersistenceError,
-    PromptCachePublication,
+    LiveCacheBlockPublication, LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail,
+    PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication,
 };
 
 pub(crate) const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_LIVE_SHARD_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_WRITE_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_DEMOTION_ID: AtomicU64 = AtomicU64::new(1);
-static LIVE_PROCESS_NAMESPACE: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub(crate) enum CacheBlockArrays {
@@ -3736,12 +3734,10 @@ fn write_live_block(
     id: &CacheBlockId,
     block: &HostCacheBlock,
 ) -> Result<DiskLocation, CacheResidencyError> {
-    let (path, temporary) = live_block_paths(directory, id);
-    let mut temporary_guard = TemporaryFileGuard::new(temporary);
-    save_host_cache_block(temporary_guard.path(), block)?;
-    sync_file(temporary_guard.path())?;
-    publish_live_block_file(temporary_guard.path(), &path)?;
-    temporary_guard.disarm();
+    let publication = LiveCacheBlockPublication::begin(directory, id);
+    save_host_cache_block(publication.staging_path(), block)?;
+    sync_file(publication.staging_path())?;
+    let path = publication.commit()?;
     let names = array_names(id.representation);
     Ok(DiskLocation {
         path,
@@ -3752,91 +3748,6 @@ fn write_live_block(
         payload_sha256: None,
         payload_verification: Arc::new(OnceLock::new()),
     })
-}
-
-fn publish_live_block_file(
-    temporary: &Path,
-    destination: &Path,
-) -> Result<(), CacheResidencyError> {
-    // A hard-link publication is atomic and fails if a destination somehow
-    // collides, whereas rename would silently replace another process's shard.
-    fs::hard_link(temporary, destination).map_err(|source| CacheResidencyError::Io {
-        action: "publish uniquely named live cache block",
-        path: destination.to_path_buf(),
-        source,
-    })?;
-    if let Err(source) = fs::remove_file(temporary) {
-        let _ = fs::remove_file(destination);
-        return Err(CacheResidencyError::Io {
-            action: "remove published live cache temporary file",
-            path: temporary.to_path_buf(),
-            source,
-        });
-    }
-    Ok(())
-}
-
-fn live_block_paths(directory: &Path, id: &CacheBlockId) -> (PathBuf, PathBuf) {
-    let process_namespace = LIVE_PROCESS_NAMESPACE.get_or_init(|| {
-        let started = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!("p{:08x}-t{started:032x}", std::process::id())
-    });
-    let write_id = NEXT_LIVE_SHARD_ID.fetch_add(1, Ordering::Relaxed);
-    let representation = match id.representation {
-        CacheRepresentation::KeyValue => "kv",
-        CacheRepresentation::CompressedLatentRotary => "mla",
-    };
-    let rank_component =
-        |rank: Option<usize>| rank.map_or_else(|| "x".to_string(), |rank| rank.to_string());
-    let rank = id.rank.map_or_else(
-        || "rank-px-tx-ex".to_string(),
-        |rank| {
-            format!(
-                "rank-p{}-t{}-e{}",
-                rank_component(rank.pipeline_rank),
-                rank_component(rank.tensor_parallel_rank),
-                rank_component(rank.expert_parallel_rank)
-            )
-        },
-    );
-    let base = format!(
-        "live-{process_namespace}-w{write_id:016x}-s{:016x}-layer-{:05}-{representation}-{rank}-{}-{}",
-        id.session_id, id.global_layer, id.start, id.end
-    );
-    (
-        directory.join(format!("{base}.safetensors")),
-        directory.join(format!(".{base}.tmp.safetensors")),
-    )
-}
-
-struct TemporaryFileGuard {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl TemporaryFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TemporaryFileGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
 }
 
 fn save_block_arrays(path: &Path, arrays: &CacheBlockArrays) -> Result<(), CacheResidencyError> {
@@ -4168,6 +4079,9 @@ pub enum CacheResidencyError {
     /// Backend-neutral prompt-cache filesystem or publication operation failed.
     #[error(transparent)]
     Persistence(#[from] PromptCachePersistenceError),
+    /// Backend-neutral live-cache file publication failed.
+    #[error(transparent)]
+    LivePublication(#[from] LiveCachePublicationError),
     /// Paged options were contradictory or unbounded.
     #[error("invalid paged cache options: {0}")]
     InvalidOptions(String),
@@ -4245,15 +4159,14 @@ pub enum CacheResidencyError {
 mod tests {
     use super::{
         cpu_stream, hash_prompt_cache_shard_payload, host_cache_capacity_upper_bound,
-        inspect_prompt_cache, live_block_paths, map_prompt_cache_shard, open_prompt_cache,
-        publish_live_block_file, verify_disk_payload, CacheBlockArrays, CacheBlockId,
-        CacheBlockRecord, CacheIoOperationKey, CacheIoOperationKind, CacheLayerResidencyStats,
-        CacheManagerState, CachePoolError, CachePoolResource, CacheRankIdentity,
-        CacheRepresentation, CacheResidencyError, CacheResidencyManager, CacheResidencyPool,
-        CacheStoragePhase, CacheTier, DiskLocation, DiskResult, DiskTask, DiskWorker,
-        DiskWriteCommit, HostCacheBlock, HostDemotionCompletion, HostDemotionTicket,
-        HostWriteReservation, MlxCacheBlockStorage, MlxCacheIoOperation, PagedCacheOptions,
-        StateTensorOwner, StateTensorRole, TemporaryFileGuard,
+        inspect_prompt_cache, map_prompt_cache_shard, open_prompt_cache, verify_disk_payload,
+        CacheBlockArrays, CacheBlockId, CacheBlockRecord, CacheIoOperationKey,
+        CacheIoOperationKind, CacheLayerResidencyStats, CacheManagerState, CachePoolError,
+        CachePoolResource, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
+        CacheResidencyManager, CacheResidencyPool, CacheStoragePhase, CacheTier, DiskLocation,
+        DiskResult, DiskTask, DiskWorker, DiskWriteCommit, HostCacheBlock, HostDemotionCompletion,
+        HostDemotionTicket, HostWriteReservation, MlxCacheBlockStorage, MlxCacheIoOperation,
+        PagedCacheOptions, StateTensorOwner, StateTensorRole,
     };
     use crate::core::cache::{
         prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, LayerCachePolicy,
@@ -4947,71 +4860,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("does not match its policy"));
-    }
-
-    #[test]
-    fn live_shard_paths_include_process_representation_rank_and_unique_write_identity() {
-        let directory = tempfile::tempdir().unwrap();
-        let id = disk_test_id(0);
-        let (first, first_temporary) = live_block_paths(directory.path(), &id);
-        let (second, _) = live_block_paths(directory.path(), &id);
-        assert_ne!(first, second);
-        let first_name = first.file_name().unwrap().to_string_lossy();
-        assert!(first_name.contains("live-p"));
-        assert!(first_name.contains("-kv-rank-px-tx-ex-"));
-        assert!(first_temporary
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .ends_with(".tmp.safetensors"));
-
-        let mut ranked = id;
-        ranked.representation = CacheRepresentation::CompressedLatentRotary;
-        ranked.rank = Some(CacheRankIdentity {
-            pipeline_rank: Some(1),
-            tensor_parallel_rank: Some(2),
-            expert_parallel_rank: Some(3),
-        });
-        let (ranked_path, _) = live_block_paths(directory.path(), &ranked);
-        assert!(ranked_path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .contains("-mla-rank-p1-t2-e3-"));
-    }
-
-    #[test]
-    fn temporary_file_guard_removes_failed_and_panicking_writes() {
-        let directory = tempfile::tempdir().unwrap();
-        let failed = directory.path().join("failed.tmp.safetensors");
-        {
-            let _guard = TemporaryFileGuard::new(failed.clone());
-            fs::write(&failed, b"partial").unwrap();
-        }
-        assert!(!failed.exists());
-
-        let panicking = directory.path().join("panicking.tmp.safetensors");
-        let _ = std::panic::catch_unwind(|| {
-            let _guard = TemporaryFileGuard::new(panicking.clone());
-            fs::write(&panicking, b"partial").unwrap();
-            panic!("injected write panic");
-        });
-        assert!(!panicking.exists());
-    }
-
-    #[test]
-    fn live_shard_publication_never_clobbers_an_existing_destination() {
-        let directory = tempfile::tempdir().unwrap();
-        let destination = directory.path().join("live.safetensors");
-        let temporary = directory.path().join(".live.tmp.safetensors");
-        fs::write(&destination, b"first process").unwrap();
-        {
-            let _guard = TemporaryFileGuard::new(temporary.clone());
-            fs::write(&temporary, b"second process").unwrap();
-            assert!(publish_live_block_file(&temporary, &destination).is_err());
-        }
-        assert_eq!(fs::read(&destination).unwrap(), b"first process");
-        assert!(!temporary.exists());
     }
 
     #[test]
