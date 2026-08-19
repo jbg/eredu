@@ -6,8 +6,9 @@
 //! decoder used to map between PCM and Mimi codebook tokens.
 
 use eredu_nn::{
-    parameter_name, AttentionMask, Index, LayerNorm, Linear, ModuleParameters, PadMode, Parameter,
-    Rope, Tensor,
+    AttentionMask, Index, LayerNorm, Linear, LinearSpec, PadMode, Parameter, ParameterId,
+    ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, Rope,
+    Tensor,
 };
 use std::collections::HashMap;
 
@@ -23,6 +24,57 @@ use std::{fs::File, path::Path};
 use crate::{AudioTokenizer, AudioTokenizerConfig, Error};
 
 const EPSILON: f32 = 1e-5;
+
+fn parameter_name(prefix: &str, field: &str) -> String {
+    if prefix.is_empty() {
+        field.to_owned()
+    } else {
+        format!("{prefix}.{field}")
+    }
+}
+
+fn parameter_spec(id: &str) -> ParameterSpec {
+    ParameterSpec::trainable(id).expect("Mimi parameter identities are non-empty")
+}
+
+fn unloaded_parameter<T: Tensor>(
+    shape: &[i32],
+    context: &T::Context,
+) -> Result<Parameter<T>, eredu_nn::Error> {
+    Parameter::unloaded(parameter_spec("value"), shape, context)
+}
+
+fn unloaded_linear<T: Tensor>(
+    input: i32,
+    output: i32,
+    bias: bool,
+    context: &T::Context,
+) -> Result<Linear<T>, eredu_nn::Error> {
+    Linear::unloaded(
+        LinearSpec {
+            input,
+            output,
+            weight: parameter_spec("weight"),
+            bias: bias.then(|| parameter_spec("bias")),
+            quantization: None,
+        },
+        context,
+    )
+}
+
+fn unloaded_layer_norm<T: Tensor>(
+    dimensions: i32,
+    epsilon: f32,
+    context: &T::Context,
+) -> Result<LayerNorm<T>, eredu_nn::Error> {
+    LayerNorm::unloaded(
+        dimensions,
+        epsilon,
+        Some(parameter_spec("weight")),
+        Some(parameter_spec("bias")),
+        context,
+    )
+}
 
 /// Default released Mimi checkpoint filename used by PersonaPlex.
 pub const PERSONAPLEX_MIMI_SAFETENSORS: &str = "tokenizer-e351c8d8-checkpoint125.safetensors";
@@ -167,16 +219,19 @@ impl<T: Tensor> Mimi<T> {
         let mut parameters = parameters.into_iter().collect::<HashMap<_, _>>();
         let mut missing = Vec::new();
         let mut mismatch = None;
-        self.visit_parameters("", &mut |key, parameter| match parameters.get(key) {
-            None => missing.push(key.to_owned()),
-            Some(value) if value.shape() != parameter.shape() => {
-                mismatch = Some(format!(
-                    "Mimi checkpoint tensor {key} has shape {:?}, expected {:?}",
-                    value.shape(),
-                    parameter.shape()
-                ));
+        self.visit_mimi_parameters("", &mut |metadata, parameter| {
+            let key = metadata.id.as_str();
+            match parameters.get(key) {
+                None => missing.push(key.to_owned()),
+                Some(value) if value.shape() != parameter.shape() => {
+                    mismatch = Some(format!(
+                        "Mimi checkpoint tensor {key} has shape {:?}, expected {:?}",
+                        value.shape(),
+                        parameter.shape()
+                    ));
+                }
+                Some(_) => {}
             }
-            Some(_) => {}
         });
         if let Some(mismatch) = mismatch {
             return Err(Error::InvalidShape(mismatch));
@@ -189,12 +244,10 @@ impl<T: Tensor> Mimi<T> {
                 missing.join(", ")
             )));
         }
-        self.visit_parameters_mut("", &mut |key, parameter| {
-            parameter.replace(
-                parameters
-                    .remove(key)
-                    .expect("checkpoint presence was validated before parameter update"),
-            );
+        self.visit_mimi_parameters_mut("", &mut |metadata, parameter| {
+            *parameter = parameters
+                .remove(metadata.id.as_str())
+                .expect("checkpoint presence was validated before parameter update");
         });
         Ok(())
     }
@@ -660,8 +713,8 @@ struct MimiTransformerLayer<T: Tensor> {
 impl<T: Tensor> MimiTransformerLayer<T> {
     fn unloaded(context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            norm1: LayerNorm::unloaded(512, 1e-5, context)?,
-            norm2: LayerNorm::unloaded(512, 1e-5, context)?,
+            norm1: unloaded_layer_norm(512, 1e-5, context)?,
+            norm2: unloaded_layer_norm(512, 1e-5, context)?,
             self_attn: MimiSelfAttention::unloaded(context)?,
             mlp: MimiMlp::unloaded(context)?,
             layer_scale_1: LayerScale::unloaded(512, context)?,
@@ -712,7 +765,7 @@ struct LayerScale<T: Tensor> {
 impl<T: Tensor> LayerScale<T> {
     fn unloaded(dim: i32, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            scale: Parameter::unloaded(&[dim], context)?,
+            scale: unloaded_parameter(&[dim], context)?,
         })
     }
 }
@@ -726,8 +779,8 @@ struct MimiMlp<T: Tensor> {
 impl<T: Tensor> MimiMlp<T> {
     fn unloaded(context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            linear1: Linear::unloaded(512, 2048, false, context)?,
-            linear2: Linear::unloaded(2048, 512, false, context)?,
+            linear1: unloaded_linear(512, 2048, false, context)?,
+            linear2: unloaded_linear(2048, 512, false, context)?,
         })
     }
 
@@ -755,8 +808,8 @@ impl<T: Tensor> MimiSelfAttention<T> {
     fn unloaded(context: &T::Context) -> Result<Self, Error> {
         let head_dim = 64;
         Ok(Self {
-            in_proj: Linear::unloaded(512, 1536, false, context)?,
-            out_proj: Linear::unloaded(512, 512, false, context)?,
+            in_proj: unloaded_linear(512, 1536, false, context)?,
+            out_proj: unloaded_linear(512, 512, false, context)?,
             rope: Rope::new(head_dim, true, 10_000.0, 1.0),
             num_heads: 8,
             head_dim,
@@ -1163,9 +1216,9 @@ impl<T: Tensor> StreamableConv1d<T> {
         context: &T::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            weight: Parameter::unloaded(&[out_channels, kernel_size, in_channels], context)?,
+            weight: unloaded_parameter(&[out_channels, kernel_size, in_channels], context)?,
             bias: bias
-                .then(|| Parameter::unloaded(&[out_channels], context))
+                .then(|| unloaded_parameter(&[out_channels], context))
                 .transpose()?,
             stride,
             dilation: 1,
@@ -1276,12 +1329,12 @@ impl<T: Tensor> StreamableConvTranspose1d<T> {
         context: &T::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            weight: Parameter::unloaded(
+            weight: unloaded_parameter(
                 &[out_channels, kernel_size, in_channels / groups],
                 context,
             )?,
             bias: bias
-                .then(|| Parameter::unloaded(&[out_channels], context))
+                .then(|| unloaded_parameter(&[out_channels], context))
                 .transpose()?,
             kernel_size,
             stride,
@@ -1579,9 +1632,9 @@ pub struct EuclideanCodebook<T: Tensor> {
 impl<T: Tensor> EuclideanCodebook<T> {
     fn unloaded(dim: i32, bins: i32, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            _initialized: Parameter::unloaded(&[1], context)?,
-            cluster_usage: Parameter::unloaded(&[bins], context)?,
-            embedding_sum: Parameter::unloaded(&[bins, dim], context)?,
+            _initialized: unloaded_parameter(&[1], context)?,
+            cluster_usage: unloaded_parameter(&[bins], context)?,
+            embedding_sum: unloaded_parameter(&[bins, dim], context)?,
         })
     }
 
@@ -1643,7 +1696,7 @@ pub struct Conv1x1NoBias<T: Tensor> {
 impl<T: Tensor> Conv1x1NoBias<T> {
     fn unloaded(in_channels: i32, out_channels: i32, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            weight: Parameter::unloaded(&[out_channels, in_channels, 1], context)?,
+            weight: unloaded_parameter(&[out_channels, in_channels, 1], context)?,
         })
     }
 
@@ -1660,29 +1713,218 @@ impl<T: Tensor> Conv1x1NoBias<T> {
     }
 }
 
+trait MimiModuleParameters<T: Tensor> {
+    fn visit_mimi_parameters<'a>(
+        &'a self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
+    );
+    fn visit_mimi_parameters_mut<'a>(
+        &'a mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
+    );
+    fn set_mimi_trainable(&mut self, trainable: bool);
+}
+
+struct PrefixVisitor<'a, F: ?Sized> {
+    prefix: &'a str,
+    visitor: &'a mut F,
+    exact: bool,
+}
+
+impl<'a, 'value, T, F: ?Sized> ParameterVisitor<'value, T> for PrefixVisitor<'a, F>
+where
+    T: 'value,
+    F: FnMut(ParameterMetadata, &'value T),
+{
+    fn visit(&mut self, mut metadata: ParameterMetadata, value: &'value T) {
+        let id = if self.exact {
+            self.prefix.to_owned()
+        } else {
+            parameter_name(self.prefix, metadata.id.as_str())
+        };
+        metadata.id = ParameterId::new(id).expect("Mimi parameter identities are non-empty");
+        (self.visitor)(metadata, value);
+    }
+}
+
+struct PrefixVisitorMut<'a, F: ?Sized> {
+    prefix: &'a str,
+    visitor: &'a mut F,
+    exact: bool,
+}
+
+impl<'a, 'value, T, F: ?Sized> ParameterVisitorMut<'value, T> for PrefixVisitorMut<'a, F>
+where
+    T: 'value,
+    F: FnMut(ParameterMetadata, &'value mut T),
+{
+    fn visit_mut(&mut self, mut metadata: ParameterMetadata, value: &'value mut T) {
+        let id = if self.exact {
+            self.prefix.to_owned()
+        } else {
+            parameter_name(self.prefix, metadata.id.as_str())
+        };
+        metadata.id = ParameterId::new(id).expect("Mimi parameter identities are non-empty");
+        (self.visitor)(metadata, value);
+    }
+}
+
+impl<T: Tensor> MimiModuleParameters<T> for Parameter<T> {
+    fn visit_mimi_parameters<'a>(
+        &'a self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
+    ) {
+        self.visit_parameters(&mut PrefixVisitor {
+            prefix,
+            visitor,
+            exact: true,
+        });
+    }
+
+    fn visit_mimi_parameters_mut<'a>(
+        &'a mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
+    ) {
+        self.visit_parameters_mut(&mut PrefixVisitorMut {
+            prefix,
+            visitor,
+            exact: true,
+        });
+    }
+
+    fn set_mimi_trainable(&mut self, trainable: bool) {
+        self.set_trainable(trainable);
+    }
+}
+
+macro_rules! structured_leaf_parameters {
+    ($type:ty) => {
+        impl<T: Tensor> MimiModuleParameters<T> for $type {
+            fn visit_mimi_parameters<'a>(
+                &'a self,
+                prefix: &str,
+                visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
+            ) {
+                self.visit_parameters(&mut PrefixVisitor {
+                    prefix,
+                    visitor,
+                    exact: false,
+                });
+            }
+
+            fn visit_mimi_parameters_mut<'a>(
+                &'a mut self,
+                prefix: &str,
+                visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
+            ) {
+                self.visit_parameters_mut(&mut PrefixVisitorMut {
+                    prefix,
+                    visitor,
+                    exact: false,
+                });
+            }
+
+            fn set_mimi_trainable(&mut self, trainable: bool) {
+                self.set_trainable(trainable);
+            }
+        }
+    };
+}
+
+structured_leaf_parameters!(Linear<T>);
+structured_leaf_parameters!(LayerNorm<T>);
+
+impl<T: Tensor, M: MimiModuleParameters<T>> MimiModuleParameters<T> for Vec<M> {
+    fn visit_mimi_parameters<'a>(
+        &'a self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
+    ) {
+        for (index, module) in self.iter().enumerate() {
+            module.visit_mimi_parameters(&parameter_name(prefix, &index.to_string()), visitor);
+        }
+    }
+
+    fn visit_mimi_parameters_mut<'a>(
+        &'a mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
+    ) {
+        for (index, module) in self.iter_mut().enumerate() {
+            module.visit_mimi_parameters_mut(&parameter_name(prefix, &index.to_string()), visitor);
+        }
+    }
+
+    fn set_mimi_trainable(&mut self, trainable: bool) {
+        for module in self {
+            module.set_mimi_trainable(trainable);
+        }
+    }
+}
+
+impl<T: Tensor, M: MimiModuleParameters<T>> MimiModuleParameters<T> for Option<M> {
+    fn visit_mimi_parameters<'a>(
+        &'a self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
+    ) {
+        if let Some(module) = self {
+            module.visit_mimi_parameters(prefix, visitor);
+        }
+    }
+
+    fn visit_mimi_parameters_mut<'a>(
+        &'a mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
+    ) {
+        if let Some(module) = self {
+            module.visit_mimi_parameters_mut(prefix, visitor);
+        }
+    }
+
+    fn set_mimi_trainable(&mut self, trainable: bool) {
+        if let Some(module) = self {
+            module.set_mimi_trainable(trainable);
+        }
+    }
+}
+
 macro_rules! module_parameters {
     ($module:ident { $($field:ident),+ $(,)? }) => {
-        impl<T: Tensor> ModuleParameters<T> for $module<T> {
-            fn visit_parameters(&self, prefix: &str, visitor: &mut dyn FnMut(&str, &T)) {
+        impl<T: Tensor> MimiModuleParameters<T> for $module<T> {
+            fn visit_mimi_parameters<'a>(
+                &'a self,
+                prefix: &str,
+                visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
+            ) {
                 $(
-                    self.$field.visit_parameters(
+                    self.$field.visit_mimi_parameters(
                         &parameter_name(prefix, stringify!($field)),
                         visitor,
                     );
                 )+
             }
 
-            fn visit_parameters_mut(
-                &mut self,
+            fn visit_mimi_parameters_mut<'a>(
+                &'a mut self,
                 prefix: &str,
-                visitor: &mut dyn FnMut(&str, &mut Parameter<T>),
+                visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
             ) {
                 $(
-                    self.$field.visit_parameters_mut(
+                    self.$field.visit_mimi_parameters_mut(
                         &parameter_name(prefix, stringify!($field)),
                         visitor,
                     );
                 )+
+            }
+
+            fn set_mimi_trainable(&mut self, trainable: bool) {
+                $(self.$field.set_mimi_trainable(trainable);)+
             }
         }
     };
@@ -1748,6 +1990,30 @@ module_parameters!(EuclideanCodebook {
 });
 module_parameters!(Conv1x1NoBias { weight });
 
+impl<T: Tensor> Parameterized<T> for Mimi<T> {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, T>,
+    {
+        self.visit_mimi_parameters("", &mut |metadata, value| {
+            visitor.visit(metadata, value);
+        });
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, T>,
+    {
+        self.visit_mimi_parameters_mut("", &mut |metadata, value| {
+            visitor.visit_mut(metadata, value);
+        });
+    }
+
+    fn set_trainable(&mut self, trainable: bool) {
+        self.set_mimi_trainable(trainable);
+    }
+}
+
 fn validate_latent<T: Tensor>(latent: &T) -> Result<(), Error> {
     if latent.shape().len() != 3 || latent.dim(1) != 512 {
         return Err(Error::InvalidShape(format!(
@@ -1780,10 +2046,10 @@ fn validate_codes<T: Tensor>(codes: &T, max_codebooks: i32) -> Result<(), Error>
 
 #[cfg(all(test, feature = "mlx"))]
 mod tests {
-    use super::{transform_decoder_key, AudioTokenizer, Config, Mimi};
-    use eredu_nn::{
-        AttentionMask, Error as ComputeError, Index, ModuleParameters, PadMode, Tensor,
+    use super::{
+        transform_decoder_key, AudioTokenizer, Config, Mimi, MimiModuleParameters,
     };
+    use eredu_nn::{AttentionMask, Error as ComputeError, Index, PadMode, Tensor};
     use safemlx::{
         ops::{concatenate_axis, indexing::TryIndexOp},
         transforms::eval,
@@ -1989,7 +2255,9 @@ mod tests {
     fn parameter_names_are_unique_and_cover_checkpoint_mapping() {
         let model = Mimi::<ShapeTensor>::new(Config::v0_1(Some(8)), &()).unwrap();
         let mut names = Vec::new();
-        model.visit_parameters("", &mut |name, _| names.push(name.to_owned()));
+        model.visit_mimi_parameters("", &mut |metadata, _| {
+            names.push(metadata.id.as_str().to_owned());
+        });
 
         let mut unique = names.clone();
         unique.sort();
