@@ -7,7 +7,7 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
 use std::{collections::HashMap, path::Path};
 
@@ -757,6 +757,7 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
 /// One compressed MLA cache per decoder layer.
 #[derive(Debug, Clone)]
 pub struct Cache {
+    layout: StateLayout,
     /// Per-layer compressed latent state.
     pub layers: Vec<CompressedLatentCache>,
     /// Compressed latent state owned by checkpoint-embedded prediction layers.
@@ -764,9 +765,11 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub(crate) fn new(layer_schedule: &LayerSchedule<LayerPolicy>) -> Self {
+    pub(crate) fn new(args: &ModelArgs) -> Self {
         Self {
-            layers: layer_schedule
+            layout: state_layout(args).expect("validated DeepSeek-V3 state geometry"),
+            layers: args
+                .layer_schedule
                 .iter()
                 .map(|_| CompressedLatentCache::new())
                 .collect(),
@@ -803,36 +806,37 @@ impl Cache {
     }
 
     pub(crate) fn new_with_options(
-        layer_schedule: &LayerSchedule<LayerPolicy>,
+        args: &ModelArgs,
         policy: CacheResidencyPolicy,
     ) -> Result<Self, Exception> {
-        Self::new_with_options_and_rank(layer_schedule, policy, None)
+        Self::new_with_options_and_rank(args, policy, None)
     }
 
     pub(crate) fn new_with_options_and_rank(
-        layer_schedule: &LayerSchedule<LayerPolicy>,
+        args: &ModelArgs,
         policy: CacheResidencyPolicy,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
         match policy {
-            CacheResidencyPolicy::Device => Ok(Self::new(layer_schedule)),
+            CacheResidencyPolicy::Device => Ok(Self::new(args)),
             CacheResidencyPolicy::Paged(options) => {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Exception::custom(error.to_string()))?;
-                Self::new_with_manager(layer_schedule, manager, rank)
+                Self::new_with_manager(args, manager, rank)
             }
         }
     }
 
     fn new_with_manager(
-        layer_schedule: &LayerSchedule<LayerPolicy>,
+        args: &ModelArgs,
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
-        let layers = (0..layer_schedule.len())
+        let layers = (0..args.layer_schedule.len())
             .map(|layer| CompressedLatentCache::new_paged(manager.clone(), layer, rank))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            layout: state_layout(args).map_err(|error| Exception::custom(error.to_string()))?,
             layers,
             mtp_layers: Vec::new(),
         })
@@ -917,7 +921,7 @@ impl Cache {
 
     /// Catalogs compatible compressed prefix blocks without eager array loading.
     pub(crate) fn load_prompt_cache(
-        layer_schedule: &LayerSchedule<LayerPolicy>,
+        args: &ModelArgs,
         directory: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         model: &PromptCacheModelIdentity,
@@ -928,14 +932,48 @@ impl Cache {
             open_prompt_cache(directory, expected, model, prefix_token_ids, options)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         Ok((
-            Self::new_with_manager(
-                layer_schedule,
-                manager,
-                model.topology.cache_rank_identity(),
-            )?,
+            Self::new_with_manager(args, manager, model.topology.cache_rank_identity())?,
             manifest,
         ))
     }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() != 0 {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: 1,
+            });
+        }
+        self.layers
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.layers.len(),
+            })
+            .map(RuntimeLayerState::retained_values)
+    }
+}
+
+pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Error> {
+    let layers = PromptCacheModelIdentity::compressed_layouts(
+        args.layer_schedule.len(),
+        args.kv_lora_rank,
+        args.qk_rope_head_dim,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    StateLayout::new(layers).map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -3076,12 +3114,12 @@ impl Model {
 
     /// Returns an empty compressed cache.
     pub fn new_cache(&self) -> Cache {
-        Cache::new(&self.args.layer_schedule)
+        Cache::new(&self.args)
     }
 
     /// Creates a device-resident or explicitly bounded paged compressed cache.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
-        Cache::new_with_options(&self.args.layer_schedule, policy)
+        Cache::new_with_options(&self.args, policy)
     }
 
     /// Lazily catalogs a compatible persisted compressed prefix.
@@ -3113,7 +3151,7 @@ impl Model {
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
         Cache::load_prompt_cache(
-            &self.args.layer_schedule,
+            &self.args,
             directory,
             expected,
             &identity,

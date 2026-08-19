@@ -484,6 +484,17 @@ impl CompressedLatentCache {
         Some((self.latent.as_ref()?, self.rotary_key.as_ref()?))
     }
 
+    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
+        match self.paged.as_deref() {
+            Some(paged) => paged
+                .tail_latent
+                .iter()
+                .chain(paged.tail_rotary.iter())
+                .collect(),
+            None => self.latent.iter().chain(self.rotary_key.iter()).collect(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn restore_resident(
         &mut self,
@@ -686,6 +697,14 @@ impl CompressedLatentCache {
                 .expect("rotary-key cache initialized")
                 .clone(),
         ))
+    }
+}
+
+impl eredu_runtime::RuntimeLayerState<MlxBackend> for CompressedLatentCache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        self.retained_arrays().into_iter()
     }
 }
 

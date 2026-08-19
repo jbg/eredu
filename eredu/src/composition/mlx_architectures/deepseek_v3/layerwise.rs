@@ -460,7 +460,7 @@ impl DeepSeekV3LayerwiseModel {
     /// Creates ordinary or paged compressed attention state independently of weight residency.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
         let rank = self.execution.prompt_cache_rank_identity();
-        Cache::new_with_options_and_rank(&self.args().layer_schedule, policy.clone(), rank)
+        Cache::new_with_options_and_rank(self.args(), policy.clone(), rank)
             .and_then(|cache| match policy {
                 CacheResidencyPolicy::Device => Ok(cache.with_mtp_layers(self.mtp_len())),
                 CacheResidencyPolicy::Paged(_) => cache.with_paged_mtp_layers(self.mtp_len(), rank),
@@ -508,7 +508,7 @@ impl DeepSeekV3LayerwiseModel {
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
         Cache::load_prompt_cache(
-            &self.args().layer_schedule,
+            self.args(),
             directory,
             expected,
             &identity,
@@ -1475,8 +1475,7 @@ impl DeepSeekV3LayerwiseAdapter {
     }
 
     fn new_cache(&self) -> Cache {
-        Cache::new(&self.args.layer_schedule)
-            .with_mtp_layers(self.mtp.as_ref().map_or(0, DeepSeekMtpModule::len))
+        Cache::new(&self.args).with_mtp_layers(self.mtp.as_ref().map_or(0, DeepSeekMtpModule::len))
     }
 
     fn recipes_for_layer(
@@ -2011,7 +2010,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         _stream: &Stream,
     ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
         Cache::load_prompt_cache(
-            &self.args.layer_schedule,
+            &self.args,
             directory,
             expected,
             identity,
