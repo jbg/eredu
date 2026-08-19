@@ -199,8 +199,8 @@ impl ResolvedCheckpointPlan {
         &self.unclaimed_keys
     }
 
-    #[cfg(test)]
     /// Creates a resolved plan for store contract tests.
+    #[doc(hidden)]
     pub fn for_test(
         identity: impl Into<String>,
         source_keys: impl IntoIterator<Item = impl Into<String>>,

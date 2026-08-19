@@ -247,7 +247,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
             report.requested_load = InspectionReadiness::Invalid;
             let missing = matches!(
                 error,
-                crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::MissingShard { .. }
+                eredu_checkpoint::store::StoreError::MissingShard { .. }
             );
             report.issue(
                 if missing {

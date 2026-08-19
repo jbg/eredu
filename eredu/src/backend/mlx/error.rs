@@ -162,6 +162,14 @@ impl From<eredu_checkpoint::validation::StrictLoadFailure> for Error {
     }
 }
 
+impl From<eredu_checkpoint::store::StoreError> for Error {
+    fn from(error: eredu_checkpoint::store::StoreError) -> Self {
+        Self::WeightStore(
+            crate::backend::mlx::runtime::checkpoint::store::neutral_store_error(error),
+        )
+    }
+}
+
 impl From<eredu_checkpoint::Error> for Error {
     fn from(error: eredu_checkpoint::Error) -> Self {
         Self::Quantization(error.to_string())

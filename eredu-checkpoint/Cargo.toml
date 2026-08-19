@@ -10,5 +10,11 @@ description = "Backend-neutral checkpoint contracts and storage encodings for Er
 
 [dependencies]
 eredu-gguf.workspace = true
+memmap2 = "0.9"
 serde.workspace = true
+serde_json.workspace = true
+safetensors = "0.8"
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

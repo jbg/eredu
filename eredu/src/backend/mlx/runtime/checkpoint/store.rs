@@ -6,21 +6,26 @@
 //! consumer stream without blocking the host, or synchronize the exact
 //! materialization before taking its independently owned output.
 
-use eredu_checkpoint::StoredDtype;
+pub use eredu_checkpoint::store::{
+    ReadPolicy as WeightReadPolicy, SafetensorsWeightStore, TensorSelection, WeightStoreBackend,
+    WeightStoreDiagnostics,
+};
+use eredu_checkpoint::{
+    store::{EncodedTensorLease, SafetensorsLease as NeutralSafetensorsLease, TensorReadRequest},
+    StoredDtype,
+};
 
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
-    fs::File,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard, Weak,
+        Arc, Mutex, Weak,
     },
 };
 
 use eredu_core::DEFAULT_MAX_MAPPED_SHARDS;
-use memmap2::{Mmap, MmapOptions};
 use safemlx::{
     ops::{
         indexing::TryIndexOp, GgufCheckpoint, GgufDenseTensorSpan, GgufDenseTensorSpanPlan,
@@ -30,33 +35,38 @@ use safemlx::{
     transforms::async_eval_with_event,
     Array, Event, Stream,
 };
-use safetensors::{
-    tensor::{Dtype, Metadata, TensorInfo, TensorView},
-    SafeTensors,
-};
-use serde::{de::MapAccess, Deserialize, Deserializer};
+use safetensors::tensor::{Dtype, TensorView};
 
-fn stored_dtype_from_safetensors(value: Dtype) -> StoredDtype {
+fn safetensors_dtype(key: &str, value: &StoredDtype) -> Result<Dtype, WeightStoreError> {
     match value {
-        Dtype::BOOL => StoredDtype::Bool,
-        Dtype::U8 => StoredDtype::U8,
-        Dtype::I8 => StoredDtype::I8,
-        Dtype::I16 => StoredDtype::I16,
-        Dtype::U16 => StoredDtype::U16,
-        Dtype::F16 => StoredDtype::F16,
-        Dtype::BF16 => StoredDtype::BF16,
-        Dtype::I32 => StoredDtype::I32,
-        Dtype::U32 => StoredDtype::U32,
-        Dtype::F32 => StoredDtype::F32,
-        Dtype::F64 => StoredDtype::F64,
-        Dtype::I64 => StoredDtype::I64,
-        Dtype::U64 => StoredDtype::U64,
-        Dtype::C64 => StoredDtype::C64,
-        Dtype::F8_E4M3 => StoredDtype::F8E4M3,
-        Dtype::F4 => StoredDtype::F4,
-        Dtype::F8_E8M0 => StoredDtype::F8E8M0,
-        Dtype::F8_E5M2 => StoredDtype::F8E5M2,
-        other => StoredDtype::Other(format!("{other:?}")),
+        StoredDtype::Bool => Ok(Dtype::BOOL),
+        StoredDtype::U8 => Ok(Dtype::U8),
+        StoredDtype::I8 => Ok(Dtype::I8),
+        StoredDtype::I16 => Ok(Dtype::I16),
+        StoredDtype::U16 => Ok(Dtype::U16),
+        StoredDtype::F16 => Ok(Dtype::F16),
+        StoredDtype::BF16 => Ok(Dtype::BF16),
+        StoredDtype::I32 => Ok(Dtype::I32),
+        StoredDtype::U32 => Ok(Dtype::U32),
+        StoredDtype::F32 => Ok(Dtype::F32),
+        StoredDtype::F64 => Ok(Dtype::F64),
+        StoredDtype::I64 => Ok(Dtype::I64),
+        StoredDtype::U64 => Ok(Dtype::U64),
+        StoredDtype::C64 => Err(WeightStoreError::UnsupportedStoredDtype {
+            key: key.into(),
+            dtype: value.clone(),
+        }),
+        StoredDtype::F8E4M3 => Ok(Dtype::F8_E4M3),
+        StoredDtype::F4 => Ok(Dtype::F4),
+        StoredDtype::F8E8M0 => Ok(Dtype::F8_E8M0),
+        StoredDtype::F8E5M2 => Err(WeightStoreError::UnsupportedStoredDtype {
+            key: key.into(),
+            dtype: value.clone(),
+        }),
+        StoredDtype::Other(_) => Err(WeightStoreError::UnsupportedStoredDtype {
+            key: key.into(),
+            dtype: value.clone(),
+        }),
     }
 }
 
@@ -73,90 +83,6 @@ pub struct WeightMetadata {
     pub logical_byte_len: usize,
     /// Payload shard that backs the tensor, when the backend is sharded.
     pub backing_shard: Option<PathBuf>,
-}
-
-/// A requested logical subset of a checkpoint tensor.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum TensorSelection {
-    /// Select the complete tensor.
-    Full,
-    /// Select a non-empty contiguous range on one axis.
-    Range {
-        /// Axis to select.
-        axis: usize,
-        /// Inclusive start index.
-        start: usize,
-        /// Exclusive end index.
-        end: usize,
-    },
-    /// Select indices on one axis in caller-supplied order.
-    Indices {
-        /// Axis to select.
-        axis: usize,
-        /// Non-empty ordered source indices.
-        indices: Vec<usize>,
-    },
-    /// Select one physically contiguous row-major scalar span and expose it
-    /// with an explicit logical shape.
-    ///
-    /// Semantic recipe pushdown constructs this form when independent axis
-    /// ranges (for example one expert and a subset of its rows) collapse to a
-    /// single storage interval. Callers do not need to calculate checkpoint
-    /// byte offsets.
-    Contiguous {
-        /// Scalar offset from the start of the logical tensor.
-        offset_elements: usize,
-        /// Non-empty output geometry for the selected scalar span.
-        shape: Vec<usize>,
-    },
-}
-
-/// Whether a selected tensor may be obtained by decoding its complete source.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum WeightReadPolicy {
-    /// Acquisition fails unless the backend can physically restrict payload I/O
-    /// and decoding to the requested selection.
-    RequireBounded,
-    /// The backend may read and decode the complete tensor before selecting.
-    ///
-    /// This is intended for explicit tooling and diagnostics, not distributed
-    /// or residency-managed execution.
-    AllowFullTensorRead,
-}
-
-/// Deterministic mapped-shard cache statistics.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct WeightStoreDiagnostics {
-    /// Storage backend represented by this snapshot.
-    pub backend: WeightStoreBackend,
-    /// Successful acquisitions that reused an existing mapping.
-    pub mapping_hits: u64,
-    /// Acquisition attempts that required a new mapping.
-    pub mapping_misses: u64,
-    /// Unleased mappings removed to honor the configured bound.
-    pub evictions: u64,
-    /// Number of mappings currently retained by the store cache.
-    pub currently_mapped_shards: usize,
-    /// Successfully mapped shard paths, in stable path order.
-    pub touched_shard_paths: Vec<PathBuf>,
-    /// Physical GGUF tensor or selected-region reads.
-    pub physical_reads: u64,
-    /// Encoded GGUF payload bytes requested by physical reads.
-    pub physical_read_bytes: u64,
-    /// Logical outputs served from an already converted physical group.
-    pub coalesced_group_hits: u64,
-}
-
-/// Persistent checkpoint backend reported by [`WeightStoreDiagnostics`].
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum WeightStoreBackend {
-    /// Memory-mapped SafeTensors payload shards.
-    Safetensors,
-    /// Seekable GGUF payload shards.
-    Gguf,
-    /// Immutable arrays used by checkpoint materialization tests.
-    #[cfg(test)]
-    Memory,
 }
 
 /// Structured failures from checkpoint catalog, mapping, and materialization.
@@ -1339,340 +1265,7 @@ fn stored_dtype_for_logical(dtype: GgufLogicalDtype) -> StoredDtype {
     }
 }
 
-#[derive(Debug)]
-struct MappedShard {
-    path: PathBuf,
-    mmap: Mmap,
-    metadata: Metadata,
-    payload_offset: usize,
-}
-
-#[derive(Debug)]
-struct CacheEntry {
-    shard: Arc<MappedShard>,
-    last_used: u64,
-}
-
-#[derive(Debug, Default)]
-struct CacheState {
-    entries: BTreeMap<PathBuf, CacheEntry>,
-    touched: BTreeSet<PathBuf>,
-    tick: u64,
-    hits: u64,
-    misses: u64,
-    evictions: u64,
-}
-
-#[derive(Debug, Clone)]
-struct CatalogEntry {
-    shard: PathBuf,
-    indexed: bool,
-}
-
-/// Safetensors-backed persistent checkpoint catalog and mapped-shard cache.
-#[derive(Debug)]
-pub struct SafetensorsWeightStore {
-    canonical_root: PathBuf,
-    catalog: BTreeMap<String, CatalogEntry>,
-    metadata: Mutex<BTreeMap<String, WeightMetadata>>,
-    cache: Mutex<CacheState>,
-    max_mapped_shards: usize,
-}
-
-impl SafetensorsWeightStore {
-    /// Opens a checkpoint with [`DEFAULT_MAX_MAPPED_SHARDS`].
-    ///
-    /// `path` may be a direct `.safetensors` file, an indexed Hugging Face
-    /// directory, or a directory containing `model.safetensors`.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, WeightStoreError> {
-        Self::open_with_max_mapped_shards(path, DEFAULT_MAX_MAPPED_SHARDS)
-    }
-
-    /// Opens a checkpoint with an explicit nonzero per-store mapping bound.
-    ///
-    /// The bound counts cache-owned mappings. Because a live lease pins its
-    /// cache entry, a new mapping returns [`WeightStoreError::CapacityExhausted`]
-    /// when no unleased entry can be evicted.
-    pub fn open_with_max_mapped_shards(
-        path: impl AsRef<Path>,
-        max_mapped_shards: usize,
-    ) -> Result<Self, WeightStoreError> {
-        if max_mapped_shards == 0 {
-            return Err(WeightStoreError::InvalidMappedShardLimit);
-        }
-        let path = path.as_ref();
-        if !path.exists() {
-            return Err(WeightStoreError::MissingShard {
-                path: path.to_path_buf(),
-            });
-        }
-
-        if path.is_dir() {
-            let root = path.to_path_buf();
-            let canonical_root = canonical_checkpoint_access_root(path)?;
-            let index_path = root.join("model.safetensors.index.json");
-            if index_path.exists() {
-                let raw = std::fs::read_to_string(&index_path).map_err(|source| {
-                    WeightStoreError::Io {
-                        path: index_path.clone(),
-                        source,
-                    }
-                })?;
-                let index: SafetensorsIndex = serde_json::from_str(&raw).map_err(|error| {
-                    WeightStoreError::MalformedIndex {
-                        path: index_path.clone(),
-                        message: error.to_string(),
-                    }
-                })?;
-                if index.weight_map.0.is_empty() {
-                    return Err(WeightStoreError::MalformedIndex {
-                        path: index_path,
-                        message: "weight_map must not be empty".into(),
-                    });
-                }
-                let mut catalog = BTreeMap::new();
-                for (key, relative) in index.weight_map.0 {
-                    if key.is_empty() {
-                        return Err(WeightStoreError::MalformedIndex {
-                            path: index_path.clone(),
-                            message: "tensor names must not be empty".into(),
-                        });
-                    }
-                    let relative = validate_relative_shard_path(Path::new(&relative))?;
-                    catalog.insert(
-                        key,
-                        CatalogEntry {
-                            shard: root.join(relative),
-                            indexed: true,
-                        },
-                    );
-                }
-                return Ok(Self {
-                    canonical_root,
-                    catalog,
-                    metadata: Mutex::new(BTreeMap::new()),
-                    cache: Mutex::new(CacheState::default()),
-                    max_mapped_shards,
-                });
-            }
-            return Self::from_single_file(
-                root.join("model.safetensors"),
-                canonical_root,
-                max_mapped_shards,
-            );
-        }
-
-        let file = path.to_path_buf();
-        let root = file
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let canonical_root = canonicalize(root)?;
-        Self::from_single_file(file, canonical_root, max_mapped_shards)
-    }
-
-    fn from_single_file(
-        file: PathBuf,
-        canonical_root: PathBuf,
-        max_mapped_shards: usize,
-    ) -> Result<Self, WeightStoreError> {
-        if !file.exists() {
-            return Err(WeightStoreError::MissingShard { path: file });
-        }
-        let discovered = inspect_file(&file)?;
-        let catalog = discovered
-            .keys()
-            .map(|key| {
-                (
-                    key.clone(),
-                    CatalogEntry {
-                        shard: file.clone(),
-                        indexed: false,
-                    },
-                )
-            })
-            .collect();
-        Ok(Self {
-            canonical_root,
-            catalog,
-            metadata: Mutex::new(discovered),
-            cache: Mutex::new(CacheState::default()),
-            max_mapped_shards,
-        })
-    }
-
-    fn catalog_entry(&self, key: &str) -> Result<&CatalogEntry, WeightStoreError> {
-        self.catalog
-            .get(key)
-            .ok_or_else(|| WeightStoreError::UnknownTensor {
-                key: key.to_string(),
-            })
-    }
-
-    fn lock_cache(&self) -> Result<MutexGuard<'_, CacheState>, WeightStoreError> {
-        self.cache
-            .lock()
-            .map_err(|_| WeightStoreError::CachePoisoned)
-    }
-
-    fn acquire_shard(&self, entry: &CatalogEntry) -> Result<Arc<MappedShard>, WeightStoreError> {
-        let canonical_path = self.validate_access_path(entry)?;
-        let mut cache = self.lock_cache()?;
-        cache.tick = cache.tick.saturating_add(1);
-        let tick = cache.tick;
-        if let Some(shard) = cache
-            .entries
-            .get(&canonical_path)
-            .map(|existing| Arc::clone(&existing.shard))
-        {
-            cache.hits = cache.hits.saturating_add(1);
-            if let Some(existing) = cache.entries.get_mut(&canonical_path) {
-                existing.last_used = tick;
-            }
-            return Ok(shard);
-        }
-
-        cache.misses = cache.misses.saturating_add(1);
-        if cache.entries.len() >= self.max_mapped_shards {
-            let victim = cache
-                .entries
-                .iter()
-                .filter(|(_, candidate)| Arc::strong_count(&candidate.shard) == 1)
-                .min_by(|(left_path, left), (right_path, right)| {
-                    (left.last_used, *left_path).cmp(&(right.last_used, *right_path))
-                })
-                .map(|(path, _)| path.clone());
-            if let Some(victim) = victim {
-                cache.entries.remove(&victim);
-                cache.evictions = cache.evictions.saturating_add(1);
-            } else {
-                let leased_shards = cache
-                    .entries
-                    .values()
-                    .map(|entry| entry.shard.path.clone())
-                    .collect();
-                return Err(WeightStoreError::CapacityExhausted {
-                    max_mapped_shards: self.max_mapped_shards,
-                    leased_shards,
-                });
-            }
-        }
-
-        let file = File::open(&canonical_path).map_err(|source| WeightStoreError::Io {
-            path: entry.shard.clone(),
-            source,
-        })?;
-        // SAFETY: MappedShard owns the Mmap, and every public data access is
-        // mediated by a WeightLease holding an Arc<MappedShard>.
-        let mmap =
-            unsafe { MmapOptions::new().map(&file) }.map_err(|source| WeightStoreError::Mmap {
-                path: entry.shard.clone(),
-                source,
-            })?;
-        let (header_len, metadata) = SafeTensors::read_metadata(&mmap).map_err(|error| {
-            WeightStoreError::MalformedSafetensors {
-                path: entry.shard.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        let payload_offset =
-            8usize
-                .checked_add(header_len)
-                .ok_or_else(|| WeightStoreError::Overflow {
-                    context: format!("payload offset for shard {}", entry.shard.display()),
-                })?;
-        let shard = Arc::new(MappedShard {
-            path: entry.shard.clone(),
-            mmap,
-            metadata,
-            payload_offset,
-        });
-        cache.touched.insert(entry.shard.clone());
-        cache.entries.insert(
-            canonical_path,
-            CacheEntry {
-                shard: Arc::clone(&shard),
-                last_used: tick,
-            },
-        );
-        Ok(shard)
-    }
-
-    fn validate_access_path(&self, entry: &CatalogEntry) -> Result<PathBuf, WeightStoreError> {
-        if !entry.shard.exists() {
-            return Err(WeightStoreError::MissingShard {
-                path: entry.shard.clone(),
-            });
-        }
-        let canonical = canonicalize(&entry.shard)?;
-        if entry.indexed && !canonical.starts_with(&self.canonical_root) {
-            return Err(WeightStoreError::UnsafeShardPath {
-                path: entry.shard.clone(),
-            });
-        }
-        Ok(canonical)
-    }
-
-    fn metadata_from_shard(
-        &self,
-        key: &str,
-        entry: &CatalogEntry,
-        shard: &MappedShard,
-    ) -> Result<WeightMetadata, WeightStoreError> {
-        if let Some(metadata) = self
-            .metadata
-            .lock()
-            .map_err(|_| WeightStoreError::CachePoisoned)?
-            .get(key)
-            .cloned()
-        {
-            return Ok(metadata);
-        }
-        shard.metadata.info(key).ok_or_else(|| {
-            if entry.indexed {
-                WeightStoreError::ContradictoryIndexMapping {
-                    key: key.to_string(),
-                    path: shard.path.clone(),
-                }
-            } else {
-                WeightStoreError::UnknownTensor {
-                    key: key.to_string(),
-                }
-            }
-        })?;
-
-        // Safetensors metadata is one JSON header for the whole shard. Large
-        // split-expert checkpoints may ask for thousands of tensor records;
-        // reparsing that header once per tensor dominates layerwise startup.
-        // Cache every index-confirmed tensor from this parse in one pass.
-        let mut discovered = BTreeMap::new();
-        for name in shard.metadata.offset_keys() {
-            if self
-                .catalog
-                .get(&name)
-                .is_some_and(|candidate| candidate.shard == shard.path)
-            {
-                let info = shard
-                    .metadata
-                    .info(&name)
-                    .expect("name came from the same safetensors metadata");
-                discovered.insert(name.clone(), metadata_for_info(&name, &shard.path, info)?);
-            }
-        }
-        let metadata = discovered.get(key).cloned().ok_or_else(|| {
-            WeightStoreError::ContradictoryIndexMapping {
-                key: key.to_string(),
-                path: shard.path.clone(),
-            }
-        })?;
-        self.metadata
-            .lock()
-            .map_err(|_| WeightStoreError::CachePoisoned)?
-            .extend(discovered);
-        Ok(metadata)
-    }
-}
-
+/// Adapts the neutral SafeTensors store to the existing MLX materialization boundary.
 impl WeightStore for SafetensorsWeightStore {
     fn backend(&self) -> WeightStoreBackend {
         WeightStoreBackend::Safetensors
@@ -1683,84 +1276,212 @@ impl WeightStore for SafetensorsWeightStore {
     }
 
     fn keys(&self) -> Vec<String> {
-        self.catalog.keys().cloned().collect()
+        eredu_checkpoint::store::WeightStore::keys(self)
     }
 
     fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
-        if let Some(metadata) = self
-            .metadata
-            .lock()
-            .map_err(|_| WeightStoreError::CachePoisoned)?
-            .get(key)
-            .cloned()
-        {
-            return Ok(metadata);
-        }
-        let entry = self.catalog_entry(key)?;
-        let shard = self.acquire_shard(entry)?;
-        self.metadata_from_shard(key, entry, &shard)
+        eredu_checkpoint::store::WeightStore::metadata(self, key)
+            .map(neutral_metadata)
+            .map_err(neutral_store_error)
     }
 
     fn acquire_with_policy(
         &self,
         key: &str,
         selection: TensorSelection,
-        _policy: WeightReadPolicy,
+        policy: WeightReadPolicy,
     ) -> Result<WeightLease, WeightStoreError> {
-        let entry = self.catalog_entry(key)?;
-        let shard = self.acquire_shard(entry)?;
-        let metadata = self.metadata_from_shard(key, entry, &shard)?;
-        let output_shape = validate_selection(key, &metadata.shape, &selection)?;
-        let selected_byte_len = selected_byte_len(key, &metadata, &selection, &output_shape)?;
+        let lease = eredu_checkpoint::store::WeightStore::acquire(
+            self,
+            TensorReadRequest {
+                key: key.into(),
+                selection: selection.clone(),
+                policy,
+            },
+        )
+        .map_err(neutral_store_error)?;
+        let metadata = neutral_metadata(lease.metadata().clone());
+        let selected_byte_len =
+            usize::try_from(lease.bounded_read_proof().length_bytes).map_err(|_| {
+                WeightStoreError::Overflow {
+                    context: format!("selected byte length for tensor {key:?}"),
+                }
+            })?;
         Ok(WeightLease {
-            key: key.to_string(),
+            key: key.into(),
             metadata,
             selection,
-            output_shape,
+            output_shape: lease.output_shape().to_vec(),
             selected_byte_len,
-            source: WeightLeaseSource::Safetensors(shard),
+            source: WeightLeaseSource::Safetensors(lease),
         })
     }
 
     fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
-        let cache = self.lock_cache()?;
-        Ok(WeightStoreDiagnostics {
-            backend: WeightStoreBackend::Safetensors,
-            mapping_hits: cache.hits,
-            mapping_misses: cache.misses,
-            evictions: cache.evictions,
-            currently_mapped_shards: cache.entries.len(),
-            touched_shard_paths: cache.touched.iter().cloned().collect(),
-            physical_reads: 0,
-            physical_read_bytes: 0,
-            coalesced_group_hits: 0,
+        eredu_checkpoint::store::WeightStore::diagnostics(self).map_err(neutral_store_error)
+    }
+}
+
+fn validate_selection(
+    key: &str,
+    shape: &[usize],
+    selection: &TensorSelection,
+) -> Result<Vec<usize>, WeightStoreError> {
+    let element_count = |dimensions: &[usize], context: &str| {
+        dimensions.iter().try_fold(1usize, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .ok_or_else(|| WeightStoreError::Overflow {
+                    context: format!("{context} for tensor {key:?}"),
+                })
         })
+    };
+    let full_elements = element_count(shape, "element count")?;
+    let mut output = shape.to_vec();
+    match selection {
+        TensorSelection::Full => {}
+        TensorSelection::Range { axis, start, end } => {
+            let dimension = shape
+                .get(*axis)
+                .ok_or_else(|| WeightStoreError::InvalidSelection {
+                    key: key.into(),
+                    message: format!("axis {axis} is outside rank {}", shape.len()),
+                })?;
+            if start >= end || *end > *dimension {
+                return Err(WeightStoreError::InvalidSelection {
+                    key: key.into(),
+                    message: format!(
+                        "range {start}..{end} is invalid for axis {axis} dimension {dimension}"
+                    ),
+                });
+            }
+            output[*axis] = end - start;
+        }
+        TensorSelection::Indices { axis, indices } => {
+            let dimension = shape
+                .get(*axis)
+                .ok_or_else(|| WeightStoreError::InvalidSelection {
+                    key: key.into(),
+                    message: format!("axis {axis} is outside rank {}", shape.len()),
+                })?;
+            if indices.is_empty() || indices.iter().any(|index| *index >= *dimension) {
+                return Err(WeightStoreError::InvalidSelection {
+                    key: key.into(),
+                    message: "indices are empty or outside the selected dimension".into(),
+                });
+            }
+            output[*axis] = indices.len();
+        }
+        TensorSelection::Contiguous {
+            offset_elements,
+            shape: selected,
+        } => {
+            if selected.is_empty() || selected.contains(&0) {
+                return Err(WeightStoreError::InvalidSelection {
+                    key: key.into(),
+                    message: "contiguous selection shape must be non-empty and nonzero".into(),
+                });
+            }
+            let selected_elements = element_count(selected, "contiguous selection size")?;
+            let end = offset_elements
+                .checked_add(selected_elements)
+                .ok_or_else(|| WeightStoreError::Overflow {
+                    context: format!("contiguous selection end for tensor {key:?}"),
+                })?;
+            if end > full_elements {
+                return Err(WeightStoreError::InvalidSelection {
+                    key: key.into(),
+                    message: "contiguous selection exceeds the tensor".into(),
+                });
+            }
+            output = selected.clone();
+        }
+    }
+    element_count(&output, "selected element count")?;
+    Ok(output)
+}
+
+fn selected_byte_len(
+    key: &str,
+    metadata: &WeightMetadata,
+    selection: &TensorSelection,
+    output_shape: &[usize],
+) -> Result<usize, WeightStoreError> {
+    if matches!(selection, TensorSelection::Full) {
+        return Ok(metadata.logical_byte_len);
+    }
+    let count = |shape: &[usize], context: &str| {
+        shape.iter().try_fold(1usize, |value, dimension| {
+            value
+                .checked_mul(*dimension)
+                .ok_or_else(|| WeightStoreError::Overflow {
+                    context: format!("{context} for tensor {key:?}"),
+                })
+        })
+    };
+    let full_elements = count(&metadata.shape, "element count")?;
+    let selected_elements = count(output_shape, "selected element count")?;
+    let scaled = metadata
+        .logical_byte_len
+        .checked_mul(selected_elements)
+        .ok_or_else(|| WeightStoreError::Overflow {
+            context: format!("selected byte length for tensor {key:?}"),
+        })?;
+    if full_elements == 0 || !scaled.is_multiple_of(full_elements) {
+        return Err(WeightStoreError::InvalidSelection {
+            key: key.into(),
+            message: "selection does not have a whole-byte encoded length".into(),
+        });
+    }
+    Ok(scaled / full_elements)
+}
+
+fn neutral_metadata(metadata: eredu_checkpoint::store::TensorMetadata) -> WeightMetadata {
+    WeightMetadata {
+        name: metadata.name,
+        shape: metadata.logical_shape,
+        stored_dtype: metadata.stored_dtype,
+        logical_byte_len: usize::try_from(metadata.encoded_byte_len).unwrap_or(usize::MAX),
+        backing_shard: metadata.backing_shard,
     }
 }
 
-impl eredu_checkpoint::validation::SafetensorsCatalog for SafetensorsWeightStore {
-    fn keys(&self) -> Vec<String> {
-        WeightStore::keys(self)
-    }
-
-    fn metadata(
-        &self,
-        key: &str,
-    ) -> Result<eredu_checkpoint::validation::CatalogTensorMetadata, String> {
-        WeightStore::metadata(self, key)
-            .map(
-                |metadata| eredu_checkpoint::validation::CatalogTensorMetadata {
-                    shape: metadata.shape,
-                    stored_dtype: metadata.stored_dtype,
-                },
-            )
-            .map_err(|error| error.to_string())
+pub(crate) fn neutral_store_error(error: eredu_checkpoint::store::StoreError) -> WeightStoreError {
+    use eredu_checkpoint::store::StoreError;
+    match error {
+        StoreError::InvalidMappedShardLimit => WeightStoreError::InvalidMappedShardLimit,
+        StoreError::UnknownTensor { key } => WeightStoreError::UnknownTensor { key },
+        StoreError::MissingShard { path } => WeightStoreError::MissingShard { path },
+        StoreError::MalformedIndex { path, message } => {
+            WeightStoreError::MalformedIndex { path, message }
+        }
+        StoreError::MalformedSafetensors { path, message } => {
+            WeightStoreError::MalformedSafetensors { path, message }
+        }
+        StoreError::UnsafeShardPath { path } => WeightStoreError::UnsafeShardPath { path },
+        StoreError::ContradictoryIndexMapping { key, path } => {
+            WeightStoreError::ContradictoryIndexMapping { key, path }
+        }
+        StoreError::InvalidSelection { key, message } => {
+            WeightStoreError::InvalidSelection { key, message }
+        }
+        StoreError::BoundedSelectionUnavailable { key, message } => {
+            WeightStoreError::BoundedSelectionUnavailable { key, message }
+        }
+        StoreError::Overflow { context } => WeightStoreError::Overflow { context },
+        StoreError::CapacityExhausted { maximum, leased } => WeightStoreError::CapacityExhausted {
+            max_mapped_shards: maximum,
+            leased_shards: leased,
+        },
+        StoreError::Io { path, message } => {
+            WeightStoreError::MalformedSafetensors { path, message }
+        }
+        StoreError::Internal(_) => WeightStoreError::CachePoisoned,
     }
 }
-
 #[derive(Debug, Clone)]
 enum WeightLeaseSource {
-    Safetensors(Arc<MappedShard>),
+    Safetensors(NeutralSafetensorsLease),
     Gguf(Box<GgufLeaseSource>),
     #[cfg(test)]
     Memory(MemoryLeaseSource),
@@ -1829,7 +1550,9 @@ impl WeightLease {
     /// Returns the path of the pinned payload shard.
     pub fn backing_shard(&self) -> &Path {
         match &self.source {
-            WeightLeaseSource::Safetensors(shard) => &shard.path,
+            WeightLeaseSource::Safetensors(lease) => lease
+                .backing_path()
+                .expect("SafeTensors leases are file-backed"),
             WeightLeaseSource::Gguf(source) => source
                 .entry
                 .metadata
@@ -1961,112 +1684,38 @@ impl WeightLease {
 
     fn prepare_borrowed_safetensors(
         self,
-        shard: Arc<MappedShard>,
+        source: NeutralSafetensorsLease,
         source_stream: &Stream,
     ) -> Result<PendingWeightMaterialization, WeightStoreError> {
-        let info = shard.metadata.info(&self.key).ok_or_else(|| {
-            WeightStoreError::ContradictoryIndexMapping {
-                key: self.key.clone(),
-                path: shard.path.clone(),
-            }
-        })?;
-        if !is_supported_execution_dtype(info.dtype) {
-            return Err(WeightStoreError::UnsupportedStoredDtype {
-                key: self.key.clone(),
-                dtype: stored_dtype_from_safetensors(info.dtype),
-            });
-        }
-        let payload_start = shard
-            .payload_offset
-            .checked_add(info.data_offsets.0)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("payload start for tensor {:?}", self.key),
-            })?;
-        let payload_end = shard
-            .payload_offset
-            .checked_add(info.data_offsets.1)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("payload end for tensor {:?}", self.key),
-            })?;
-        let data = shard.mmap.get(payload_start..payload_end).ok_or_else(|| {
+        let dtype = safetensors_dtype(&self.key, &self.metadata.stored_dtype)?;
+        let data =
+            source
+                .encoded_bytes()
+                .ok_or_else(|| WeightStoreError::MalformedSafetensors {
+                    path: source
+                        .backing_path()
+                        .unwrap_or_else(|| Path::new("<unknown>"))
+                        .to_path_buf(),
+                    message: format!("tensor {:?} lease has no encoded bytes", self.key),
+                })?;
+        let view = TensorView::new(dtype, self.output_shape.clone(), data).map_err(|error| {
             WeightStoreError::MalformedSafetensors {
-                path: shard.path.clone(),
-                message: format!("tensor {:?} payload is outside the mapped shard", self.key),
-            }
-        })?;
-        let (shape, selected_data) = match &self.selection {
-            TensorSelection::Full => (info.shape.clone(), data),
-            TensorSelection::Range {
-                axis: 0,
-                start,
-                end,
-            } => {
-                let outer = info.shape[0];
-                let row_bytes = data
-                    .len()
-                    .checked_div(outer)
-                    .filter(|_| data.len() % outer == 0)
-                    .ok_or_else(|| WeightStoreError::MalformedSafetensors {
-                        path: shard.path.clone(),
-                        message: format!(
-                            "tensor {:?} payload is not divisible by its outer dimension",
-                            self.key
-                        ),
-                    })?;
-                let start = start.checked_mul(row_bytes).ok_or_else(|| {
-                    WeightStoreError::Overflow {
-                        context: format!("borrowed byte start for tensor {:?}", self.key),
-                    }
-                })?;
-                let end = end.checked_mul(row_bytes).ok_or_else(|| WeightStoreError::Overflow {
-                    context: format!("borrowed byte end for tensor {:?}", self.key),
-                })?;
-                let selected = data.get(start..end).ok_or_else(|| {
-                    WeightStoreError::MalformedSafetensors {
-                        path: shard.path.clone(),
-                        message: format!(
-                            "borrowed selection for tensor {:?} is outside its payload",
-                            self.key
-                        ),
-                    }
-                })?;
-                (self.output_shape.clone(), selected)
-            }
-            TensorSelection::Contiguous {
-                offset_elements,
-                shape,
-            } => (
-                shape.clone(),
-                contiguous_safetensors_data(&self.key, &shard.path, &info.shape, data, *offset_elements, shape)?,
-            ),
-            selection => {
-                return Err(WeightStoreError::BoundedSelectionUnavailable {
-                    key: self.key.clone(),
-                    message: format!(
-                        "zero-copy conversion requires a full tensor, contiguous axis-zero range, or contiguous scalar span, got {selection:?}"
-                    ),
-                })
-            }
-        };
-        let view = TensorView::new(info.dtype, shape, selected_data).map_err(|error| {
-            WeightStoreError::MalformedSafetensors {
-                path: shard.path.clone(),
+                path: source
+                    .backing_path()
+                    .unwrap_or_else(|| Path::new("<unknown>"))
+                    .to_path_buf(),
                 message: format!("tensor {:?}: {error}", self.key),
             }
         })?;
-        let aligned = (selected_data.as_ptr() as usize)
-            .is_multiple_of(safetensors_dtype_alignment(info.dtype));
+        let aligned = (data.as_ptr() as usize).is_multiple_of(safetensors_dtype_alignment(dtype));
         let source_value = if aligned {
             unsafe { Array::try_from_borrowed_safetensors(view) }
         } else {
-            // SafeTensors permits tensor payloads whose offset is not aligned
-            // for their scalar dtype. Keep conversion bounded to this selected
-            // tile by using MLX's copying constructor in that case.
             Array::try_from(view)
         }
-        .map_err(|source| WeightStoreError::MlxConversion {
+        .map_err(|conversion| WeightStoreError::MlxConversion {
             key: self.key.clone(),
-            source,
+            source: conversion,
         })?;
         Ok(PendingWeightMaterialization {
             output: source_value.clone(),
@@ -2082,242 +1731,38 @@ impl WeightLease {
 
     fn prepare_safetensors(
         self,
-        shard: Arc<MappedShard>,
+        source: NeutralSafetensorsLease,
         source_stream: &Stream,
         execution_stream: &Stream,
     ) -> Result<PendingWeightMaterialization, WeightStoreError> {
-        let info = shard.metadata.info(&self.key).ok_or_else(|| {
-            WeightStoreError::ContradictoryIndexMapping {
-                key: self.key.clone(),
-                path: shard.path.clone(),
-            }
-        })?;
-        if !is_supported_execution_dtype(info.dtype) {
-            return Err(WeightStoreError::UnsupportedStoredDtype {
-                key: self.key.clone(),
-                dtype: stored_dtype_from_safetensors(info.dtype),
-            });
-        }
-
-        let start = shard
-            .payload_offset
-            .checked_add(info.data_offsets.0)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("payload start for tensor {:?}", self.key),
-            })?;
-        let end = shard
-            .payload_offset
-            .checked_add(info.data_offsets.1)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("payload end for tensor {:?}", self.key),
-            })?;
+        let dtype = safetensors_dtype(&self.key, &self.metadata.stored_dtype)?;
         let data =
-            shard
-                .mmap
-                .get(start..end)
+            source
+                .encoded_bytes()
                 .ok_or_else(|| WeightStoreError::MalformedSafetensors {
-                    path: shard.path.clone(),
-                    message: format!("tensor {:?} payload is outside the mapped shard", self.key),
+                    path: source
+                        .backing_path()
+                        .unwrap_or_else(|| Path::new("<unknown>"))
+                        .to_path_buf(),
+                    message: format!("tensor {:?} lease has no encoded bytes", self.key),
                 })?;
-
-        if let TensorSelection::Contiguous {
-            offset_elements,
-            shape,
-        } = &self.selection
-        {
-            let selected_data = contiguous_safetensors_data(
-                &self.key,
-                &shard.path,
-                &info.shape,
-                data,
-                *offset_elements,
-                shape,
-            )?;
-            let view =
-                TensorView::new(info.dtype, shape.clone(), selected_data).map_err(|error| {
-                    WeightStoreError::MalformedSafetensors {
-                        path: shard.path.clone(),
-                        message: format!("tensor {:?}: {error}", self.key),
-                    }
-                })?;
-            let source_value =
-                Array::try_from(view).map_err(|source| WeightStoreError::MlxConversion {
-                    key: self.key.clone(),
-                    source,
-                })?;
-            let materialized = source_value
-                .copy(execution_stream)
-                .map_err(|source| self.mlx_error("copy", source))?;
-            return Ok(PendingWeightMaterialization {
-                output: materialized,
-                _source: source_value,
-                _gguf_group: None,
-                lease: Some(self),
-                source_stream: source_stream.clone(),
-                execution_stream: execution_stream.clone(),
-                borrowed_source: false,
-                completed: false,
-            });
-        }
-
-        // Materialize non-contiguous logical selections directly from encoded
-        // rows. This bounds both host and device memory for TP/EP shards and,
-        // unlike selecting an MLX array afterwards, also understands packed
-        // FP4's two logical values per byte.
-        if matches!(
-            &self.selection,
-            TensorSelection::Range { axis, .. } if *axis != 0
-        ) || matches!(&self.selection, TensorSelection::Indices { .. })
-        {
-            let selected_data = select_encoded_safetensors_data(
-                &self.key,
-                &shard.path,
-                info.dtype,
-                &info.shape,
-                data,
-                &self.selection,
-                &self.output_shape,
-            )?;
-            let view = TensorView::new(info.dtype, self.output_shape.clone(), &selected_data)
-                .map_err(|error| WeightStoreError::MalformedSafetensors {
-                    path: shard.path.clone(),
-                    message: format!("tensor {:?}: {error}", self.key),
-                })?;
-            let source_value =
-                Array::try_from(view).map_err(|source| WeightStoreError::MlxConversion {
-                    key: self.key.clone(),
-                    source,
-                })?;
-            let materialized = source_value
-                .copy(execution_stream)
-                .map_err(|source| self.mlx_error("copy", source))?;
-            return Ok(PendingWeightMaterialization {
-                output: materialized,
-                _source: source_value,
-                _gguf_group: None,
-                lease: Some(self),
-                source_stream: source_stream.clone(),
-                execution_stream: execution_stream.clone(),
-                borrowed_source: false,
-                completed: false,
-            });
-        }
-
-        // Axis-zero ranges are contiguous in safetensors storage. Slice the
-        // mmap bytes before constructing an MLX array: `Array::try_from` copies
-        // its complete `TensorView`, so selecting afterwards would transiently
-        // materialize an entire packed expert bank for every requested expert.
-        if let TensorSelection::Range {
-            axis: 0,
-            start,
-            end,
-        } = &self.selection
-        {
-            let outer = info.shape[0];
-            let row_bytes = data
-                .len()
-                .checked_div(outer)
-                .filter(|_| data.len() % outer == 0)
-                .ok_or_else(|| WeightStoreError::MalformedSafetensors {
-                    path: shard.path.clone(),
-                    message: format!(
-                        "tensor {:?} payload is not divisible by its outer dimension",
-                        self.key
-                    ),
-                })?;
-            let selected_start =
-                start
-                    .checked_mul(row_bytes)
-                    .ok_or_else(|| WeightStoreError::Overflow {
-                        context: format!("axis-zero byte start for tensor {:?}", self.key),
-                    })?;
-            let selected_end =
-                end.checked_mul(row_bytes)
-                    .ok_or_else(|| WeightStoreError::Overflow {
-                        context: format!("axis-zero byte end for tensor {:?}", self.key),
-                    })?;
-            let selected_data = data.get(selected_start..selected_end).ok_or_else(|| {
-                WeightStoreError::MalformedSafetensors {
-                    path: shard.path.clone(),
-                    message: format!(
-                        "axis-zero selection for tensor {:?} is outside its payload",
-                        self.key
-                    ),
-                }
-            })?;
-            let view = TensorView::new(info.dtype, self.output_shape.clone(), selected_data)
-                .map_err(|error| WeightStoreError::MalformedSafetensors {
-                    path: shard.path.clone(),
-                    message: format!("tensor {:?}: {error}", self.key),
-                })?;
-            let source_value =
-                Array::try_from(view).map_err(|source| WeightStoreError::MlxConversion {
-                    key: self.key.clone(),
-                    source,
-                })?;
-            let materialized = source_value
-                .copy(execution_stream)
-                .map_err(|source| self.mlx_error("copy", source))?;
-            return Ok(PendingWeightMaterialization {
-                output: materialized,
-                _source: source_value,
-                _gguf_group: None,
-                lease: Some(self),
-                source_stream: source_stream.clone(),
-                execution_stream: execution_stream.clone(),
-                borrowed_source: false,
-                completed: false,
-            });
-        }
-
-        let view = TensorView::new(info.dtype, info.shape.clone(), data).map_err(|error| {
+        let view = TensorView::new(dtype, self.output_shape.clone(), data).map_err(|error| {
             WeightStoreError::MalformedSafetensors {
-                path: shard.path.clone(),
+                path: source
+                    .backing_path()
+                    .unwrap_or_else(|| Path::new("<unknown>"))
+                    .to_path_buf(),
                 message: format!("tensor {:?}: {error}", self.key),
             }
         })?;
-
-        // This mmap-derived array never leaves this method. The lease pins the
-        // mmap until selection, copy, evaluation, and synchronization finish.
         let source_value =
-            Array::try_from(view).map_err(|source| WeightStoreError::MlxConversion {
+            Array::try_from(view).map_err(|conversion| WeightStoreError::MlxConversion {
                 key: self.key.clone(),
-                source,
+                source: conversion,
             })?;
-        let materialized = match &self.selection {
-            TensorSelection::Full => source_value
-                .copy(execution_stream)
-                .map_err(|source| self.mlx_error("copy", source)),
-            TensorSelection::Range { axis, start, end } => materialize_range(
-                &self.key,
-                source_value.clone(),
-                &self.metadata.shape,
-                *axis,
-                *start,
-                *end,
-                source_stream,
-                execution_stream,
-            ),
-            TensorSelection::Indices { axis, indices } => materialize_indices(
-                &self.key,
-                &source_value,
-                *axis,
-                indices,
-                source_stream,
-                execution_stream,
-            ),
-            TensorSelection::Contiguous {
-                offset_elements,
-                shape,
-            } => materialize_contiguous(
-                &self.key,
-                &source_value,
-                *offset_elements,
-                shape,
-                source_stream,
-                execution_stream,
-            ),
-        }?;
+        let materialized = source_value
+            .copy(execution_stream)
+            .map_err(|error| self.mlx_error("copy", error))?;
         Ok(PendingWeightMaterialization {
             output: materialized,
             _source: source_value,
@@ -2329,7 +1774,6 @@ impl WeightLease {
             completed: false,
         })
     }
-
     fn prepare_gguf(
         self,
         source: GgufLeaseSource,
@@ -2466,7 +1910,7 @@ impl WeightLease {
         // unknowable. Permanently retaining one Arc is conservative and avoids
         // releasing bytes that submitted MLX work may still reference.
         if let WeightLeaseSource::Safetensors(shard) = &self.source {
-            std::mem::forget(Arc::clone(shard));
+            std::mem::forget(shard.clone());
         }
     }
 }
@@ -2668,479 +2112,6 @@ impl Drop for PendingWeightMaterialization {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SafetensorsIndex {
-    weight_map: UniqueWeightMap,
-}
-
-#[derive(Debug)]
-struct UniqueWeightMap(BTreeMap<String, String>);
-
-impl<'de> Deserialize<'de> for UniqueWeightMap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = UniqueWeightMap;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a tensor-to-shard object with unique tensor names")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut values = BTreeMap::new();
-                while let Some((key, shard)) = map.next_entry::<String, String>()? {
-                    if values.insert(key.clone(), shard).is_some() {
-                        return Err(serde::de::Error::custom(format!(
-                            "duplicate tensor mapping for {key:?}"
-                        )));
-                    }
-                }
-                Ok(UniqueWeightMap(values))
-            }
-        }
-
-        deserializer.deserialize_map(Visitor)
-    }
-}
-
-fn validate_relative_shard_path(path: &Path) -> Result<PathBuf, WeightStoreError> {
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(WeightStoreError::UnsafeShardPath {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(path.to_path_buf())
-}
-
-fn canonicalize(path: &Path) -> Result<PathBuf, WeightStoreError> {
-    std::fs::canonicalize(path).map_err(|source| WeightStoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn canonical_checkpoint_access_root(path: &Path) -> Result<PathBuf, WeightStoreError> {
-    let canonical_root = canonicalize(path)?;
-    let Some(snapshots) = canonical_root.parent() else {
-        return Ok(canonical_root);
-    };
-    if snapshots.file_name().and_then(|name| name.to_str()) != Some("snapshots") {
-        return Ok(canonical_root);
-    }
-    let Some(repository_root) = snapshots.parent() else {
-        return Ok(canonical_root);
-    };
-    if !repository_root.join("blobs").is_dir() {
-        return Ok(canonical_root);
-    }
-
-    // Hugging Face snapshots store ordinary relative shard names in the index,
-    // but materialize those names as symlinks into the repository-local blobs
-    // directory. Treat that repository cache directory as the containment
-    // boundary while preserving the model-directory boundary elsewhere.
-    canonicalize(repository_root)
-}
-
-fn inspect_file(path: &Path) -> Result<BTreeMap<String, WeightMetadata>, WeightStoreError> {
-    let file = File::open(path).map_err(|source| WeightStoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    // SAFETY: the mapping is retained until all metadata-only TensorViews have
-    // been converted into owned WeightMetadata values below.
-    let mmap =
-        unsafe { MmapOptions::new().map(&file) }.map_err(|source| WeightStoreError::Mmap {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let checkpoint = SafeTensors::deserialize(&mmap).map_err(|error| {
-        WeightStoreError::MalformedSafetensors {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        }
-    })?;
-    let mut metadata = BTreeMap::new();
-    for (key, view) in checkpoint.iter() {
-        metadata.insert(key.to_string(), metadata_for_view(key, path, &view)?);
-    }
-    Ok(metadata)
-}
-
-fn metadata_for_view(
-    key: &str,
-    path: &Path,
-    view: &safetensors::tensor::TensorView<'_>,
-) -> Result<WeightMetadata, WeightStoreError> {
-    metadata_for_parts(key, path, view.dtype(), view.shape(), view.data().len())
-}
-
-fn metadata_for_info(
-    key: &str,
-    path: &Path,
-    info: &TensorInfo,
-) -> Result<WeightMetadata, WeightStoreError> {
-    let payload_len = info
-        .data_offsets
-        .1
-        .checked_sub(info.data_offsets.0)
-        .ok_or_else(|| WeightStoreError::MalformedSafetensors {
-            path: path.to_path_buf(),
-            message: format!("tensor {key:?} has descending payload offsets"),
-        })?;
-    metadata_for_parts(key, path, info.dtype, &info.shape, payload_len)
-}
-
-fn metadata_for_parts(
-    key: &str,
-    path: &Path,
-    dtype: Dtype,
-    shape: &[usize],
-    payload_len: usize,
-) -> Result<WeightMetadata, WeightStoreError> {
-    let elements = shape.iter().try_fold(1usize, |count, dimension| {
-        count
-            .checked_mul(*dimension)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("element count for tensor {key:?}"),
-            })
-    })?;
-    let bits = elements
-        .checked_mul(dtype.bitsize())
-        .ok_or_else(|| WeightStoreError::Overflow {
-            context: format!("encoded bit length for tensor {key:?}"),
-        })?;
-    if bits % 8 != 0 {
-        return Err(WeightStoreError::MalformedSafetensors {
-            path: path.to_path_buf(),
-            message: format!("tensor {key:?} has a non-byte-aligned payload"),
-        });
-    }
-    let logical_byte_len = bits / 8;
-    if logical_byte_len != payload_len {
-        return Err(WeightStoreError::MalformedSafetensors {
-            path: path.to_path_buf(),
-            message: format!("tensor {key:?} payload length contradicts its shape and dtype"),
-        });
-    }
-    Ok(WeightMetadata {
-        name: key.to_string(),
-        shape: shape.to_vec(),
-        stored_dtype: stored_dtype_from_safetensors(dtype),
-        logical_byte_len,
-        backing_shard: Some(path.to_path_buf()),
-    })
-}
-
-fn validate_selection(
-    key: &str,
-    shape: &[usize],
-    selection: &TensorSelection,
-) -> Result<Vec<usize>, WeightStoreError> {
-    // Validate the complete shape with an explicit checked element count even
-    // though the safetensors parser performs its own bounds validation.
-    shape.iter().try_fold(1usize, |count, dimension| {
-        count
-            .checked_mul(*dimension)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("shape for tensor {key:?}"),
-            })
-    })?;
-    let mut output = shape.to_vec();
-    match selection {
-        TensorSelection::Full => {}
-        TensorSelection::Range { axis, start, end } => {
-            let Some(dimension) = shape.get(*axis) else {
-                return Err(WeightStoreError::InvalidSelection {
-                    key: key.to_string(),
-                    message: format!(
-                        "axis {axis} is outside rank {} shape {shape:?}",
-                        shape.len()
-                    ),
-                });
-            };
-            if start >= end || *end > *dimension {
-                return Err(WeightStoreError::InvalidSelection {
-                    key: key.to_string(),
-                    message: format!(
-                        "range {start}..{end} is invalid for axis {axis} dimension {dimension}"
-                    ),
-                });
-            }
-            output[*axis] = end - start;
-        }
-        TensorSelection::Indices { axis, indices } => {
-            let Some(dimension) = shape.get(*axis) else {
-                return Err(WeightStoreError::InvalidSelection {
-                    key: key.to_string(),
-                    message: format!(
-                        "axis {axis} is outside rank {} shape {shape:?}",
-                        shape.len()
-                    ),
-                });
-            };
-            if indices.is_empty() {
-                return Err(WeightStoreError::InvalidSelection {
-                    key: key.to_string(),
-                    message: "index selection must be non-empty".into(),
-                });
-            }
-            if let Some(index) = indices.iter().find(|index| **index >= *dimension) {
-                return Err(WeightStoreError::InvalidSelection {
-                    key: key.to_string(),
-                    message: format!("index {index} is outside axis {axis} dimension {dimension}"),
-                });
-            }
-            output[*axis] = indices.len();
-        }
-        TensorSelection::Contiguous {
-            offset_elements,
-            shape: selected,
-        } => {
-            if selected.is_empty() || selected.contains(&0) {
-                return Err(WeightStoreError::InvalidSelection {
-                    key: key.to_string(),
-                    message: "contiguous selection shape must be non-empty and nonzero".into(),
-                });
-            }
-            let full_elements = shape.iter().try_fold(1usize, |count, dimension| {
-                count
-                    .checked_mul(*dimension)
-                    .ok_or_else(|| WeightStoreError::Overflow {
-                        context: format!("element count for tensor {key:?}"),
-                    })
-            })?;
-            let selected_elements = selected.iter().try_fold(1usize, |count, dimension| {
-                count
-                    .checked_mul(*dimension)
-                    .ok_or_else(|| WeightStoreError::Overflow {
-                        context: format!("contiguous selection size for tensor {key:?}"),
-                    })
-            })?;
-            let end = offset_elements
-                .checked_add(selected_elements)
-                .ok_or_else(|| WeightStoreError::Overflow {
-                    context: format!("contiguous selection end for tensor {key:?}"),
-                })?;
-            if end > full_elements {
-                return Err(WeightStoreError::InvalidSelection {
-                    key: key.to_string(),
-                    message: format!(
-                        "contiguous scalar span {offset_elements}..{end} exceeds {full_elements} elements"
-                    ),
-                });
-            }
-            output = selected.clone();
-        }
-    }
-    output.iter().try_fold(1usize, |count, dimension| {
-        count
-            .checked_mul(*dimension)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("selected shape for tensor {key:?}"),
-            })
-    })?;
-    Ok(output)
-}
-
-fn selected_byte_len(
-    key: &str,
-    metadata: &WeightMetadata,
-    selection: &TensorSelection,
-    output_shape: &[usize],
-) -> Result<usize, WeightStoreError> {
-    if matches!(selection, TensorSelection::Full) {
-        return Ok(metadata.logical_byte_len);
-    }
-    let full_elements = metadata.shape.iter().try_fold(1usize, |count, dimension| {
-        count
-            .checked_mul(*dimension)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("element count for tensor {key:?}"),
-            })
-    })?;
-    let selected_elements = output_shape.iter().try_fold(1usize, |count, dimension| {
-        count
-            .checked_mul(*dimension)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("selected element count for tensor {key:?}"),
-            })
-    })?;
-    let scaled = metadata
-        .logical_byte_len
-        .checked_mul(selected_elements)
-        .ok_or_else(|| WeightStoreError::Overflow {
-            context: format!("selected byte length for tensor {key:?}"),
-        })?;
-    if full_elements == 0 || scaled % full_elements != 0 {
-        return Err(WeightStoreError::InvalidSelection {
-            key: key.to_string(),
-            message: "selection does not have a whole-byte encoded length".into(),
-        });
-    }
-    Ok(scaled / full_elements)
-}
-
-fn contiguous_safetensors_data<'a>(
-    key: &str,
-    path: &Path,
-    full_shape: &[usize],
-    data: &'a [u8],
-    offset_elements: usize,
-    selected_shape: &[usize],
-) -> Result<&'a [u8], WeightStoreError> {
-    let full_elements = full_shape.iter().try_fold(1usize, |count, dimension| {
-        count
-            .checked_mul(*dimension)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("safetensors element count for tensor {key:?}"),
-            })
-    })?;
-    let scalar_bytes = data
-        .len()
-        .checked_div(full_elements)
-        .filter(|_| full_elements > 0 && data.len().is_multiple_of(full_elements))
-        .ok_or_else(|| WeightStoreError::MalformedSafetensors {
-            path: path.to_path_buf(),
-            message: format!("tensor {key:?} payload has no integral scalar width"),
-        })?;
-    let selected_elements = selected_shape.iter().try_fold(1usize, |count, dimension| {
-        count
-            .checked_mul(*dimension)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("contiguous selection size for tensor {key:?}"),
-            })
-    })?;
-    let byte_start =
-        offset_elements
-            .checked_mul(scalar_bytes)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("contiguous byte start for tensor {key:?}"),
-            })?;
-    let byte_end = selected_elements
-        .checked_mul(scalar_bytes)
-        .and_then(|bytes| byte_start.checked_add(bytes))
-        .ok_or_else(|| WeightStoreError::Overflow {
-            context: format!("contiguous byte end for tensor {key:?}"),
-        })?;
-    data.get(byte_start..byte_end)
-        .ok_or_else(|| WeightStoreError::MalformedSafetensors {
-            path: path.to_path_buf(),
-            message: format!("contiguous selection for tensor {key:?} is outside its payload"),
-        })
-}
-
-fn select_encoded_safetensors_data(
-    key: &str,
-    path: &Path,
-    dtype: Dtype,
-    full_shape: &[usize],
-    data: &[u8],
-    selection: &TensorSelection,
-    output_shape: &[usize],
-) -> Result<Vec<u8>, WeightStoreError> {
-    let (axis, indices): (usize, Vec<usize>) = match selection {
-        TensorSelection::Range { axis, start, end } => (*axis, (*start..*end).collect()),
-        TensorSelection::Indices { axis, indices } => (*axis, indices.clone()),
-        _ => {
-            return Err(WeightStoreError::InvalidSelection {
-                key: key.into(),
-                message: "encoded row selection requires an axis range or indices".into(),
-            })
-        }
-    };
-    let axis_len = full_shape[axis];
-    let outer = full_shape[..axis].iter().product::<usize>();
-    let inner = full_shape[axis + 1..].iter().product::<usize>();
-    let bits = dtype.bitsize();
-    let selected_elements = output_shape.iter().product::<usize>();
-    let selected_bits =
-        selected_elements
-            .checked_mul(bits)
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("encoded selection bit length for tensor {key:?}"),
-            })?;
-    if selected_bits % 8 != 0 {
-        return Err(WeightStoreError::BoundedSelectionUnavailable {
-            key: key.into(),
-            message: "selected packed payload is not byte aligned".into(),
-        });
-    }
-    let mut output = Vec::with_capacity(selected_bits / 8);
-    if bits == 4 {
-        // V4 dimensions and partition boundaries are even. Requiring aligned
-        // blocks preserves the checkpoint's nibble order without decoding.
-        if inner % 2 != 0 || indices.iter().any(|index| index * inner % 2 != 0) {
-            return Err(WeightStoreError::BoundedSelectionUnavailable {
-                key: key.into(),
-                message: "FP4 axis selection crosses a packed nibble boundary".into(),
-            });
-        }
-        let block_bytes = inner / 2;
-        for outer_index in 0..outer {
-            for index in &indices {
-                let element = (outer_index * axis_len + index) * inner;
-                let start = element / 2;
-                let end = start + block_bytes;
-                output.extend_from_slice(data.get(start..end).ok_or_else(|| {
-                    WeightStoreError::MalformedSafetensors {
-                        path: path.to_path_buf(),
-                        message: format!(
-                            "encoded FP4 selection for tensor {key:?} exceeds payload"
-                        ),
-                    }
-                })?);
-            }
-        }
-    } else {
-        if !bits.is_multiple_of(8) {
-            return Err(WeightStoreError::UnsupportedStoredDtype {
-                key: key.into(),
-                dtype: stored_dtype_from_safetensors(dtype),
-            });
-        }
-        let scalar_bytes = bits / 8;
-        let block_bytes =
-            inner
-                .checked_mul(scalar_bytes)
-                .ok_or_else(|| WeightStoreError::Overflow {
-                    context: format!("encoded selection block for tensor {key:?}"),
-                })?;
-        for outer_index in 0..outer {
-            for index in &indices {
-                let start = (outer_index * axis_len + index)
-                    .checked_mul(block_bytes)
-                    .ok_or_else(|| WeightStoreError::Overflow {
-                        context: format!("encoded selection offset for tensor {key:?}"),
-                    })?;
-                let end = start + block_bytes;
-                output.extend_from_slice(data.get(start..end).ok_or_else(|| {
-                    WeightStoreError::MalformedSafetensors {
-                        path: path.to_path_buf(),
-                        message: format!("encoded selection for tensor {key:?} exceeds payload"),
-                    }
-                })?);
-            }
-        }
-    }
-    debug_assert_eq!(output.len(), selected_bits / 8);
-    Ok(output)
-}
-
 fn materialize_contiguous(
     key: &str,
     source: &Array,
@@ -3286,28 +2257,6 @@ fn mlx_error(
         operation,
         source,
     }
-}
-
-fn is_supported_execution_dtype(dtype: Dtype) -> bool {
-    matches!(
-        dtype,
-        Dtype::BOOL
-            | Dtype::U8
-            | Dtype::I8
-            | Dtype::I16
-            | Dtype::U16
-            | Dtype::F16
-            | Dtype::BF16
-            | Dtype::I32
-            | Dtype::U32
-            | Dtype::F32
-            | Dtype::F64
-            | Dtype::I64
-            | Dtype::U64
-            | Dtype::F8_E4M3
-            | Dtype::F4
-            | Dtype::F8_E8M0
-    )
 }
 
 fn safetensors_dtype_alignment(dtype: Dtype) -> usize {
@@ -3492,14 +2441,6 @@ mod tests {
         let completion = async_eval_with_event([&consumed]).unwrap();
         drop(materialization);
         completion.synchronize().unwrap();
-    }
-
-    fn safetensors_shard(lease: &WeightLease) -> &Arc<MappedShard> {
-        match &lease.source {
-            WeightLeaseSource::Safetensors(shard) => shard,
-            WeightLeaseSource::Gguf(_) => panic!("expected safetensors lease"),
-            WeightLeaseSource::Memory(_) => panic!("expected safetensors lease"),
-        }
     }
 
     fn write_index(dir: &Path, mappings: &[(&str, &str)]) {
@@ -4101,21 +3042,6 @@ mod tests {
     }
 
     #[test]
-    fn one_metadata_lookup_caches_the_complete_shard_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("model.safetensors");
-        write_two_i32(&path);
-        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
-
-        store.metadata("a_tensor").unwrap();
-
-        let cached = store.metadata.lock().unwrap();
-        assert_eq!(cached.len(), 2);
-        assert!(cached.contains_key("a_tensor"));
-        assert!(cached.contains_key("z_tensor"));
-    }
-
-    #[test]
     fn rejects_malformed_indexes_and_unsafe_shard_paths() {
         let malformed = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -4125,7 +3051,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             SafetensorsWeightStore::open(malformed.path()),
-            Err(WeightStoreError::MalformedIndex { .. })
+            Err(eredu_checkpoint::store::StoreError::MalformedIndex { .. })
         ));
 
         let duplicate = tempfile::tempdir().unwrap();
@@ -4136,7 +3062,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             SafetensorsWeightStore::open(duplicate.path()),
-            Err(WeightStoreError::MalformedIndex { .. })
+            Err(eredu_checkpoint::store::StoreError::MalformedIndex { .. })
         ));
 
         for shard in ["../escape.safetensors", "/absolute.safetensors"] {
@@ -4144,7 +3070,7 @@ mod tests {
             write_index(dir.path(), &[("weight", shard)]);
             assert!(matches!(
                 SafetensorsWeightStore::open(dir.path()),
-                Err(WeightStoreError::UnsafeShardPath { .. })
+                Err(eredu_checkpoint::store::StoreError::UnsafeShardPath { .. })
             ));
         }
     }
@@ -4170,10 +3096,7 @@ mod tests {
         let store = SafetensorsWeightStore::open(dir.path()).unwrap();
         let first = store.acquire("a_tensor", TensorSelection::Full).unwrap();
         let second = store.acquire("z_tensor", TensorSelection::Full).unwrap();
-        assert!(Arc::ptr_eq(
-            safetensors_shard(&first),
-            safetensors_shard(&second)
-        ));
+        assert_eq!(first.backing_shard(), second.backing_shard());
         let diagnostics = store.diagnostics().unwrap();
         assert_eq!(diagnostics.currently_mapped_shards, 1);
         assert_eq!(diagnostics.mapping_misses, 1);
@@ -4526,24 +3449,6 @@ mod tests {
     }
 
     #[test]
-    fn mappings_release_after_store_and_lease_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        write_i32(
-            &dir.path().join("model.safetensors"),
-            "weight",
-            &[1],
-            vec![1],
-        );
-        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
-        let lease = store.acquire("weight", TensorSelection::Full).unwrap();
-        let mapping = Arc::downgrade(safetensors_shard(&lease));
-        drop(store);
-        assert!(mapping.upgrade().is_some());
-        drop(lease);
-        assert!(mapping.upgrade().is_none());
-    }
-
-    #[test]
     fn returned_array_survives_lease_and_store_drop() {
         let dir = tempfile::tempdir().unwrap();
         write_i32(
@@ -4563,45 +3468,6 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(value.evaluated().unwrap().as_slice::<i32>(), &[7, 8, 9]);
-    }
-
-    #[test]
-    fn encoded_axis_selection_bounds_dense_and_fp4_payloads() {
-        let dense = (0u8..24).collect::<Vec<_>>();
-        let selected = select_encoded_safetensors_data(
-            "dense",
-            Path::new("dense.safetensors"),
-            Dtype::U8,
-            &[2, 3, 4],
-            &dense,
-            &TensorSelection::Range {
-                axis: 1,
-                start: 1,
-                end: 3,
-            },
-            &[2, 2, 4],
-        )
-        .unwrap();
-        assert_eq!(selected, [&dense[4..12], &dense[16..24]].concat());
-
-        // Logical [2, 4, 2] occupies eight bytes. Selecting axis-1 rows 1..3
-        // copies only their packed bytes from each outer row.
-        let fp4 = (0u8..8).collect::<Vec<_>>();
-        let selected = select_encoded_safetensors_data(
-            "fp4",
-            Path::new("fp4.safetensors"),
-            Dtype::F4,
-            &[2, 4, 2],
-            &fp4,
-            &TensorSelection::Range {
-                axis: 1,
-                start: 1,
-                end: 3,
-            },
-            &[2, 2, 2],
-        )
-        .unwrap();
-        assert_eq!(selected, vec![1, 2, 5, 6]);
     }
 
     #[cfg(target_os = "macos")]
