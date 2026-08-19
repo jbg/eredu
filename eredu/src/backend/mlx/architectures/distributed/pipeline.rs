@@ -12,7 +12,9 @@
 
 use eredu_architectures::llama::ModelArgs as LlamaModelArgs;
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::{OffloadUnit, ResidencyReport, WeightBinding, WeightMaterializationReport};
+use eredu_runtime::{
+    OffloadUnit, ResidencyReport, ShardingPolicy, WeightBinding, WeightMaterializationReport,
+};
 
 mod placement;
 
@@ -102,7 +104,7 @@ use crate::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     backend::mlx::runtime::distributed::parallel::{
-        ParallelBuildContext, ParallelExecutionContext, ShardingPolicy,
+        ParallelBuildContext, ParallelExecutionContext,
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
@@ -946,7 +948,7 @@ struct LlamaStage {
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     parallel_kv_heads: Option<Vec<i32>>,
 }
 
@@ -962,7 +964,7 @@ struct DeepSeekStage {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -974,7 +976,7 @@ struct DeepSeekV4Stage {
     range: Range<usize>,
     layers: Vec<deepseek_v4::DecoderLayer>,
     dense_layers: Option<PipelineLayerStorage>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -1005,7 +1007,7 @@ struct GemmaStage {
     parallel_per_layer_vocabulary: Option<Range<usize>>,
     parallel_per_layer_projection: Option<crate::backend::mlx::nn::parallel::ParallelLinear>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_cache: Option<ExpertCache>,
     routing_statistics: RoutingStatistics,
@@ -1030,7 +1032,7 @@ struct DenseQwenStage {
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_cache: Option<ExpertCache>,
     routing_statistics: RoutingStatistics,
@@ -1044,7 +1046,7 @@ struct MuseGlimmerStage {
     vision_layers: Vec<MuseGlimmerLayer>,
     layers: Vec<MuseGlimmerLayer>,
     dense_layers: Option<PipelineLayerStorage>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
 }
 
 struct Qwen3VlStage {
@@ -1057,7 +1059,7 @@ struct Qwen3VlStage {
     dense_layers: Option<PipelineLayerStorage>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -1074,7 +1076,7 @@ struct GptOssStage {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     parallel_kv_heads: Option<Vec<i32>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_cache: Option<ExpertCache>,
@@ -1113,7 +1115,7 @@ struct Lfm2Stage {
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     parallel_cache_geometry: Option<Vec<lfm2::Lfm2LayerCacheGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
@@ -1133,7 +1135,7 @@ struct NemotronHStage {
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     parallel_geometry: Option<Vec<nemotron_h::ParallelLayerGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
@@ -1157,7 +1159,7 @@ struct QwenHybridStage {
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     parallel_geometry: Option<Vec<qwen_hybrid::ParallelLayerGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
@@ -1177,7 +1179,7 @@ struct KimiLinearStage {
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     parallel_cache_geometry: Option<Vec<kimi_linear::KimiLayerCacheGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
@@ -1200,7 +1202,7 @@ struct InklingStage {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -3900,7 +3902,7 @@ fn qwen3_vl_forward_pipeline_block<C: KeyValueCache>(
     assignment: Option<&ExpertAssignment>,
     expert_cache: Option<&ExpertCache>,
     args: &dense_qwen::DecoderConfig,
-    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
     pass: ExpertPass,
     statistics: &mut RoutingStatistics,
     global_layer: usize,
@@ -7727,7 +7729,7 @@ fn pipeline_cartesian_static_bindings(
     units: &[StaticUnitBindings],
     role: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
 ) -> Result<Vec<WeightBinding>, Error> {
     let bindings = pipeline_static_bindings(units, role)?.to_vec();
     match layout {
@@ -12369,7 +12371,7 @@ impl DenseQwenStage {
 #[allow(clippy::too_many_arguments)]
 fn qwen_pipeline_local_expert_args(
     args: &dense_qwen::DecoderConfig,
-    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
     global_layer: usize,
     layer_root: &str,
 ) -> Result<dense_qwen::DecoderConfig, Error> {

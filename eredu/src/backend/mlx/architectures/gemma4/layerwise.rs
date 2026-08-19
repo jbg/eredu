@@ -2,7 +2,10 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
-use eredu_runtime::{OffloadUnit, WeightBinding};
+use eredu_runtime::{
+    MemberSharding, OffloadUnit, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    WeightBinding,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -61,8 +64,7 @@ use crate::{
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
         register_partitioned_projection_group, register_projection_module,
-        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
-        ParameterMemberSpec, ParameterRole, ProjectionSharding,
+        register_replicated_module, ParallelPlanBuilder, ProjectionSharding,
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
@@ -1240,7 +1242,7 @@ pub(crate) fn gemma4_expert_catalog_for_layers(
     args: &ModelArgs,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     layers: impl IntoIterator<Item = usize>,
-    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let global_experts = usize::try_from(args.num_experts.ok_or_else(|| {
         Error::UnsupportedArchitecture("Gemma 4 MoE config has no expert count".into())
@@ -1728,7 +1730,7 @@ impl Gemma4LayerwiseAdapter {
     pub(crate) fn new_cartesian_text_layer(
         &self,
         index: usize,
-        layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
         assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<TransformerBlock, Error> {
@@ -1752,7 +1754,7 @@ impl Gemma4LayerwiseAdapter {
         index: usize,
         _layer: &TransformerBlock,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_cartesian_text_layer(index, None, None, stream)?;
@@ -3589,7 +3591,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
     fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         let local_semantic = |targets: &[String], global: i32| -> Result<i32, Error> {
@@ -3845,7 +3847,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let local_semantic = |target: &str, global: i32| -> Result<i32, Error> {
@@ -3964,7 +3966,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
@@ -4118,7 +4120,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;

@@ -1752,8 +1752,7 @@ pub trait ArchitectureAdapter: Sized {
     fn parallel_parameter_groups(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-    ) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error>
-    {
+    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
         Err(Error::Parallel(format!(
             "architecture adapter {} has not declared tensor-parallel parameter roles",
             std::any::type_name::<Self>()
@@ -1783,7 +1782,7 @@ pub trait ArchitectureAdapter: Sized {
     fn configure_parallel_static(
         &mut self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        _layout: &eredu_runtime::LocalModelLayout,
         _stream: &Stream,
     ) -> Result<(), Error> {
         Ok(())
@@ -1794,7 +1793,7 @@ pub trait ArchitectureAdapter: Sized {
         &self,
         _group: usize,
         _index: usize,
-        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        _layout: &eredu_runtime::LocalModelLayout,
         _stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         Err(Error::Parallel(format!(
@@ -1830,7 +1829,7 @@ pub trait ArchitectureAdapter: Sized {
         &self,
         _group: usize,
         _index: usize,
-        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        _layout: &eredu_runtime::LocalModelLayout,
         _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         _stream: &Stream,
     ) -> Result<Self::Layer, Error> {
@@ -1869,7 +1868,7 @@ pub trait ArchitectureAdapter: Sized {
         &self,
         group: usize,
         index: usize,
-        layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
         assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
@@ -1923,7 +1922,7 @@ pub trait ArchitectureAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         _stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         build_parallel_module_bindings(
@@ -1966,7 +1965,7 @@ pub trait ArchitectureAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1989,7 +1988,7 @@ pub trait ArchitectureAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
         assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -2255,7 +2254,7 @@ pub struct LayerwiseModel<A: ArchitectureAdapter> {
     sample_mlx_memory: bool,
     sample_process_memory: bool,
     metadata: LayerwiseModelMetadata,
-    parallel_layout: Option<crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
     parallel_info: Option<ParallelModelInfo>,
     execution_streams: Vec<Stream>,
@@ -2507,9 +2506,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     }
 
     /// Returns the exact typed rank-local parameter layout, when parallel.
-    pub const fn parallel_layout(
-        &self,
-    ) -> Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout> {
+    pub const fn parallel_layout(&self) -> Option<&eredu_runtime::LocalModelLayout> {
         self.parallel_layout.as_ref()
     }
 
@@ -4699,11 +4696,11 @@ fn packed_semantic_weight_name(name: &str) -> Option<String> {
 }
 
 fn stored_tensor_selection(
-    tensor: &crate::backend::mlx::runtime::distributed::parallel::LocalTensorLayout,
+    tensor: &eredu_runtime::LocalTensorLayout,
     stored_shape: &[usize],
 ) -> Result<crate::backend::mlx::runtime::checkpoint::store::TensorSelection, Error> {
     use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
-    use crate::backend::mlx::runtime::distributed::topology::TensorPlacement;
+    use eredu_runtime::TensorPlacement;
 
     let scale_boundary = |axis: usize, boundary: usize| -> Result<usize, Error> {
         let semantic = tensor.global_shape()[axis];
@@ -4768,7 +4765,7 @@ pub(crate) fn shard_layer_bindings(
     bindings: Vec<WeightBinding>,
     prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+    layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, Error> {
     use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
 
@@ -4877,7 +4874,7 @@ fn build_parallel_module_bindings(
     module: &impl ModuleParameters,
     prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+    layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, Error> {
     use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
     let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();

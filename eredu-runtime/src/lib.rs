@@ -11,6 +11,8 @@ pub mod backend;
 pub mod execution;
 /// Backend-neutral causal-model session contracts.
 pub mod generation;
+/// Architecture-declared parallel parameter semantics and local layouts.
+pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.
 pub mod parameter;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
@@ -24,6 +26,10 @@ pub use execution::{
     ExecutionGroupSpec, ReadyGroupState,
 };
 pub use generation::CausalModel;
+pub use parallel::{
+    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec,
+    ParameterMemberSpec, ParameterRole, ShardingPolicy, TensorPlacement,
+};
 pub use parameter::{
     bind_materialized_unit, materialize_bindings, MaterializedUnit, ParameterOrchestrationError,
 };

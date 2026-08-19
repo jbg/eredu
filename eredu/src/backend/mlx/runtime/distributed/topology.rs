@@ -10,6 +10,7 @@ use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest};
 use eredu_core::{
     balanced_contiguous_range, ParallelAxis, ParallelRankTopology, SubgroupMembership,
 };
+use eredu_runtime::TensorPlacement;
 use safemlx::{distributed::Group, Array, Stream};
 
 use crate::{
@@ -313,58 +314,6 @@ impl TensorSlice {
         shape[self.axis] = self.end - self.start;
         shape
     }
-}
-
-/// Typed placement decision for one target tensor.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum TensorPlacement {
-    /// Materialize the complete tensor on every rank.
-    Replicated,
-    /// Materialize the complete tensor on this rank.
-    Local,
-    /// Intentionally omit this tensor on this rank.
-    Omit,
-    /// Materialize the complete tensor only on one global rank.
-    Rank {
-        /// Owning global rank.
-        rank: usize,
-    },
-    /// Materialize the complete tensor only on one pipeline stage.
-    PipelineStage {
-        /// Owning pipeline-stage coordinate.
-        stage: usize,
-    },
-    /// Materialize an equal contiguous source-tensor slice.
-    Shard {
-        /// Source tensor axis being sharded.
-        axis: usize,
-        /// Shard index.
-        index: usize,
-        /// Total shard count.
-        parts: usize,
-    },
-    /// Materialize an explicit contiguous source-tensor range.
-    ///
-    /// Unlike [`Self::Shard`], ranges may be uneven. They are intended for
-    /// balanced vocabulary partitions and other validated nonuniform layouts.
-    Range {
-        /// Source tensor axis being sliced.
-        axis: usize,
-        /// Inclusive element offset on `axis`.
-        start: usize,
-        /// Exclusive element offset on `axis`.
-        end: usize,
-    },
-    /// Materialize selected source-tensor indices in the supplied order.
-    ///
-    /// This supports non-contiguous ownership layouts without loading the
-    /// enclosing range or retaining unowned rows in the local partition.
-    Indices {
-        /// Source tensor axis being selected.
-        axis: usize,
-        /// Distinct source indices, ordered as they should appear locally.
-        indices: Vec<usize>,
-    },
 }
 
 #[derive(Debug, Clone)]

@@ -3082,7 +3082,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
@@ -3148,11 +3148,10 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
     fn parallel_parameter_groups(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-    ) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error>
-    {
-        use crate::backend::mlx::runtime::distributed::parallel::{
-            aligned_partition_units, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
-            ParameterRole,
+    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
+        use crate::backend::mlx::runtime::distributed::parallel::aligned_partition_units;
+        use eredu_runtime::{
+            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
         };
         let text = &self.args.text_config;
         let mut groups = vec![
@@ -3223,7 +3222,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
     fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         let text = &self.args.text_config;
@@ -3451,7 +3450,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if self.execution_group_name(group)? != "vision_encoder" {
@@ -3567,7 +3566,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;

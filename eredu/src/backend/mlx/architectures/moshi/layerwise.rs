@@ -1464,9 +1464,8 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
     fn parallel_parameter_groups(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-    ) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error>
-    {
-        use crate::backend::mlx::runtime::distributed::parallel::{
+    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
+        use eredu_runtime::{
             MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
         };
         use safemlx::ops::quantized_packed_dimension;
@@ -1642,7 +1641,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
     fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        _layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.static_modules =
@@ -1654,7 +1653,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let (prefix, dim, heads, feed_forward) = if group == 0 {
@@ -1759,7 +1758,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;

@@ -4,9 +4,11 @@
 //! members. This module converts those descriptions into rank-local placement
 //! and shape information without inspecting checkpoint-name substrings.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::Range,
+use std::ops::Range;
+
+use eredu_runtime::{
+    LocalModelLayout, LocalTensorLayout, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, ShardingPolicy, TensorPlacement,
 };
 
 use safemlx::{
@@ -20,8 +22,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::binding::is_materialized_module_parameter,
     backend::mlx::runtime::distributed::{
-        completion::synchronize_outputs,
-        topology::{PlacementPlan, TensorPlacement},
+        completion::synchronize_outputs, topology::PlacementPlan,
     },
     backend::mlx::runtime::generation::sampler::Sampler,
     backend::mlx::MlxParallelContext,
@@ -129,72 +130,6 @@ pub(crate) fn aligned_partition_units(
     Ok(semantic_units / units_per_partition)
 }
 
-/// Semantic role of a logical parameter group.
-///
-/// Roles are diagnostic and policy inputs. Exact tensor axes remain explicit
-/// on each [`ParameterMemberSpec`], so packed weights and their companions do
-/// not rely on naming conventions.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ParameterRole {
-    /// Small or otherwise non-partitioned state.
-    Replicated,
-    /// Projection whose output features are rank-local.
-    ColumnProjection,
-    /// Projection whose input features are rank-local and whose output is reduced.
-    RowProjection,
-    /// Token embedding or output projection partitioned by vocabulary.
-    Vocabulary,
-    /// Query, key, or value heads.
-    AttentionHeads,
-    /// Dense feed-forward intermediate channels shared by input and output projections.
-    FeedForwardIntermediate,
-    /// Routed or shared expert intermediate channels.
-    ExpertIntermediate,
-    /// State-space, convolution, or recurrent channels.
-    Channels,
-    /// A fused tensor containing independently partitioned segments.
-    Segmented,
-}
-
-/// Rank-local selection rule for one physical checkpoint tensor.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum MemberSharding {
-    /// Materialize the complete member on every tensor-parallel rank.
-    Replicated,
-    /// Split an axis into equal contiguous shards.
-    Equal {
-        /// Source tensor axis to partition.
-        axis: usize,
-    },
-    /// Split an axis into balanced, potentially uneven contiguous ranges.
-    Balanced {
-        /// Source tensor axis to partition.
-        axis: usize,
-    },
-    /// Map the group's logical partition onto one physical tensor axis.
-    Partitioned {
-        /// Source tensor axis to partition.
-        axis: usize,
-    },
-    /// Map the same group-level logical range into each supplied source
-    /// segment and concatenate the selected indices in segment order.
-    PartitionedSegments {
-        /// Source tensor axis containing the fused segments.
-        axis: usize,
-        /// Ordered, non-overlapping physical source ranges. Every segment
-        /// represents the group's complete logical domain.
-        segments: Vec<Range<usize>>,
-    },
-    /// Partition each supplied source range independently and concatenate the
-    /// rank-local indices in segment order.
-    Segmented {
-        /// Source tensor axis containing the fused segments.
-        axis: usize,
-        /// Ordered, non-overlapping source ranges partitioned independently.
-        segments: Vec<Range<usize>>,
-    },
-}
-
 /// Sharding contract for an architecture-native projection module.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProjectionSharding {
@@ -215,7 +150,7 @@ pub(crate) fn module_parameter_group(
     sharding: impl Fn(&str, &[i32]) -> Result<MemberSharding, Error>,
 ) -> Result<ParameterGroupSpec, Error> {
     let parameters = module.parameters().flatten();
-    ParameterGroupSpec::new(
+    Ok(ParameterGroupSpec::new(
         logical_name,
         role,
         parameters
@@ -242,7 +177,7 @@ pub(crate) fn module_parameter_group(
                 ))
             })
             .collect::<Result<Vec<_>, Error>>()?,
-    )
+    )?)
 }
 
 /// Registers every parameter in a module as replicated.
@@ -457,259 +392,12 @@ pub(crate) fn array_parameter_member(
     Ok(ParameterMemberSpec::new(target, shape, sharding))
 }
 
-/// One physical tensor belonging to a logical parameter group.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ParameterMemberSpec {
-    target: String,
-    global_shape: Vec<usize>,
-    sharding: MemberSharding,
-}
-
-impl ParameterMemberSpec {
-    /// Creates a member with an exact pre-selection checkpoint shape.
-    pub fn new(
-        target: impl Into<String>,
-        global_shape: impl Into<Vec<usize>>,
-        sharding: MemberSharding,
-    ) -> Self {
-        Self {
-            target: target.into(),
-            global_shape: global_shape.into(),
-            sharding,
-        }
-    }
-
-    /// Returns the rewritten checkpoint target.
-    pub fn target(&self) -> &str {
-        &self.target
-    }
-
-    /// Returns the complete source shape.
-    pub fn global_shape(&self) -> &[usize] {
-        &self.global_shape
-    }
-
-    /// Returns the requested rank-local selection.
-    pub const fn sharding(&self) -> &MemberSharding {
-        &self.sharding
-    }
-}
-
-/// Atomic logical parameter and all of its physical checkpoint companions.
-///
-/// If permissive planning must fall back, every member in the group is
-/// replicated together. This prevents a packed weight, scales, quantization
-/// biases, and ordinary post-projection bias from acquiring incompatible
-/// layouts.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ParameterGroupSpec {
-    logical_name: String,
-    role: ParameterRole,
-    partition_units: Option<usize>,
-    members: Vec<ParameterMemberSpec>,
-}
-
-impl ParameterGroupSpec {
-    /// Creates a non-empty logical group.
-    pub fn new(
-        logical_name: impl Into<String>,
-        role: ParameterRole,
-        members: impl IntoIterator<Item = ParameterMemberSpec>,
-    ) -> Result<Self, Error> {
-        Self::build(logical_name.into(), role, None, members)
-    }
-
-    /// Creates a group whose partitioned members share one logical domain.
-    pub fn partitioned(
-        logical_name: impl Into<String>,
-        role: ParameterRole,
-        units: usize,
-        members: impl IntoIterator<Item = ParameterMemberSpec>,
-    ) -> Result<Self, Error> {
-        if units == 0 {
-            return Err(Error::Parallel(
-                "parallel logical partition must contain at least one unit".into(),
-            ));
-        }
-        Self::build(logical_name.into(), role, Some(units), members)
-    }
-
-    fn build(
-        logical_name: String,
-        role: ParameterRole,
-        partition_units: Option<usize>,
-        members: impl IntoIterator<Item = ParameterMemberSpec>,
-    ) -> Result<Self, Error> {
-        if logical_name.trim().is_empty() {
-            return Err(Error::Parallel(
-                "parallel parameter logical name must not be empty".into(),
-            ));
-        }
-        let members = members.into_iter().collect::<Vec<_>>();
-        if members.is_empty() {
-            return Err(Error::Parallel(format!(
-                "parallel parameter group {logical_name:?} must contain at least one tensor"
-            )));
-        }
-        let mut targets = BTreeSet::new();
-        let mut has_partitioned_member = false;
-        for member in &members {
-            if member.target.trim().is_empty() {
-                return Err(Error::Parallel(format!(
-                    "parallel parameter group {logical_name:?} contains an empty tensor target"
-                )));
-            }
-            if !targets.insert(member.target.clone()) {
-                return Err(Error::Parallel(format!(
-                    "parallel parameter group {logical_name:?} repeats tensor target {:?}",
-                    member.target
-                )));
-            }
-            has_partitioned_member |= matches!(
-                member.sharding,
-                MemberSharding::Partitioned { .. } | MemberSharding::PartitionedSegments { .. }
-            );
-        }
-        if has_partitioned_member != partition_units.is_some() {
-            return Err(Error::Parallel(format!(
-                "parallel parameter group {logical_name:?} must declare exactly one group-level logical partition for its partitioned members"
-            )));
-        }
-        Ok(Self {
-            logical_name,
-            role,
-            partition_units,
-            members,
-        })
-    }
-
-    /// Returns the stable logical name.
-    pub fn logical_name(&self) -> &str {
-        &self.logical_name
-    }
-
-    /// Returns the semantic role.
-    pub const fn role(&self) -> ParameterRole {
-        self.role
-    }
-
-    /// Returns the shared logical-unit count, when the group is partitioned.
-    pub const fn partition_units(&self) -> Option<usize> {
-        self.partition_units
-    }
-
-    /// Returns physical checkpoint members.
-    pub fn members(&self) -> &[ParameterMemberSpec] {
-        &self.members
-    }
-}
-
-/// Behavior when a requested shard is not legal for the current TP size.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub enum ShardingPolicy {
-    /// Reject the complete plan with a precise shape/alignment error.
-    #[default]
-    Require,
-    /// Replicate the complete logical parameter group.
-    ReplicateUnsupported,
-}
-
-/// Rank-local shape and placement for one planned physical tensor.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LocalTensorLayout {
-    logical_name: String,
-    role: ParameterRole,
-    global_shape: Vec<usize>,
-    local_shape: Vec<usize>,
-    placement: TensorPlacement,
-    logical_units: Option<usize>,
-    logical_range: Option<Range<usize>>,
-    fell_back_to_replication: bool,
-}
-
-impl LocalTensorLayout {
-    /// Returns the logical parameter group name.
-    pub fn logical_name(&self) -> &str {
-        &self.logical_name
-    }
-
-    /// Returns the semantic parameter role.
-    pub const fn role(&self) -> ParameterRole {
-        self.role
-    }
-
-    /// Returns the checkpoint-global shape.
-    pub fn global_shape(&self) -> &[usize] {
-        &self.global_shape
-    }
-
-    /// Returns the shape materialized on this rank.
-    pub fn local_shape(&self) -> &[usize] {
-        &self.local_shape
-    }
-
-    /// Returns the exact checkpoint placement.
-    pub const fn placement(&self) -> &TensorPlacement {
-        &self.placement
-    }
-
-    /// Returns the rank-local range in the parameter group's semantic domain.
-    ///
-    /// Physical packed weights and their quantization companions can use
-    /// different element ranges while still representing the same heads or
-    /// channels. This range is therefore the authoritative source for local
-    /// execution geometry.
-    pub fn logical_range(&self) -> Option<&Range<usize>> {
-        self.logical_range.as_ref()
-    }
-
-    /// Returns the size of the complete semantic partition domain.
-    pub const fn logical_units(&self) -> Option<usize> {
-        self.logical_units
-    }
-
-    /// Returns whether permissive planning replicated an unsupported shard.
-    pub const fn fell_back_to_replication(&self) -> bool {
-        self.fell_back_to_replication
-    }
-}
-
-/// Complete rank-local model geometry produced alongside checkpoint placement.
-#[derive(Debug, Clone, Default)]
-pub struct LocalModelLayout {
-    tensors: BTreeMap<String, LocalTensorLayout>,
-}
-
-impl LocalModelLayout {
-    /// Returns one physical tensor layout by rewritten target name.
-    pub fn tensor(&self, target: &str) -> Option<&LocalTensorLayout> {
-        self.tensors.get(target)
-    }
-
-    /// Iterates physical layouts in deterministic target-name order.
-    pub fn tensors(&self) -> impl Iterator<Item = (&str, &LocalTensorLayout)> {
-        self.tensors
-            .iter()
-            .map(|(target, layout)| (target.as_str(), layout))
-    }
-
-    /// Returns the number of planned physical tensors.
-    pub fn len(&self) -> usize {
-        self.tensors.len()
-    }
-
-    /// Returns whether no physical tensors were planned.
-    pub fn is_empty(&self) -> bool {
-        self.tensors.is_empty()
-    }
-}
-
 /// Builds checkpoint placement and local model geometry from typed roles.
 pub struct ParallelPlanBuilder {
     topology: MlxParallelContext,
     policy: ShardingPolicy,
     placement: PlacementPlan,
-    local: LocalModelLayout,
+    local: LocalModelLayout<TensorPlacement>,
 }
 
 impl ParallelPlanBuilder {
@@ -731,38 +419,38 @@ impl ParallelPlanBuilder {
     /// Registers one atomic logical parameter group.
     pub fn register(&mut self, group: ParameterGroupSpec) -> Result<(), Error> {
         if let Some(member) = group
-            .members
+            .members()
             .iter()
-            .find(|member| self.local.tensors.contains_key(&member.target))
+            .find(|member| self.local.contains(member.target()))
         {
             return Err(Error::Parallel(format!(
                 "parallel placement target {:?} was registered more than once",
-                member.target
+                member.target()
             )));
         }
         let requested = group
-            .members
+            .members()
             .iter()
-            .map(|member| self.resolve_member(member, group.partition_units))
+            .map(|member| self.resolve_member(member, group.partition_units()))
             .collect::<Result<Vec<_>, _>>();
         let (resolved, fell_back) = match requested {
             Ok(resolved) => (resolved, false),
             Err(_error) if self.policy == ShardingPolicy::ReplicateUnsupported => (
                 group
-                    .members
+                    .members()
                     .iter()
-                    .map(|member| (TensorPlacement::Replicated, member.global_shape.clone()))
+                    .map(|member| (TensorPlacement::Replicated, member.global_shape().to_vec()))
                     .collect(),
                 true,
             ),
             Err(error) => {
                 return Err(Error::Parallel(format!(
                     "logical parameter {:?}: {error}",
-                    group.logical_name
+                    group.logical_name()
                 )))
             }
         };
-        let logical_range = match (group.partition_units, fell_back) {
+        let logical_range = match (group.partition_units(), fell_back) {
             (Some(units), false) => Some(
                 balanced_contiguous_range(
                     units,
@@ -776,31 +464,31 @@ impl ParallelPlanBuilder {
             (None, _) => None,
         };
 
-        for (member, (placement, local_shape)) in group.members.iter().zip(resolved) {
+        for (member, (placement, local_shape)) in group.members().iter().zip(resolved) {
             self.placement.insert_expected(
-                member.target.clone(),
-                member.global_shape.clone(),
+                member.target().to_owned(),
+                member.global_shape().to_vec(),
                 placement.clone(),
             )?;
-            self.local.tensors.insert(
-                member.target.clone(),
-                LocalTensorLayout {
-                    logical_name: group.logical_name.clone(),
-                    role: group.role,
-                    global_shape: member.global_shape.clone(),
+            self.local.insert(
+                member.target().to_owned(),
+                LocalTensorLayout::new(
+                    group.logical_name(),
+                    group.role(),
+                    member.global_shape().to_vec(),
                     local_shape,
                     placement,
-                    logical_units: group.partition_units,
-                    logical_range: logical_range.clone(),
-                    fell_back_to_replication: fell_back,
-                },
+                    group.partition_units(),
+                    logical_range.clone(),
+                    fell_back,
+                ),
             );
         }
         Ok(())
     }
 
     /// Completes planning and validates every generated placement.
-    pub fn finish(self) -> Result<(PlacementPlan, LocalModelLayout), Error> {
+    pub fn finish(self) -> Result<(PlacementPlan, LocalModelLayout<TensorPlacement>), Error> {
         self.placement.validate()?;
         Ok((self.placement, self.local))
     }
@@ -815,19 +503,19 @@ impl ParallelPlanBuilder {
         if parts == 0 || rank >= parts {
             return Err(format!("invalid TP coordinate {rank}/{parts}"));
         }
-        match &member.sharding {
+        match member.sharding() {
             MemberSharding::Replicated => {
-                Ok((TensorPlacement::Replicated, member.global_shape.clone()))
+                Ok((TensorPlacement::Replicated, member.global_shape().to_vec()))
             }
             MemberSharding::Equal { axis } => {
                 let dimension = checked_axis(member, *axis)?;
                 if dimension % parts != 0 {
                     return Err(format!(
                         "tensor {:?} dimension {dimension} on axis {axis} is not divisible by TP size {parts}",
-                        member.target
+                        member.target()
                     ));
                 }
-                let mut local_shape = member.global_shape.clone();
+                let mut local_shape = member.global_shape().to_vec();
                 local_shape[*axis] = dimension / parts;
                 Ok((
                     TensorPlacement::Shard {
@@ -842,7 +530,7 @@ impl ParallelPlanBuilder {
                 let dimension = checked_axis(member, *axis)?;
                 let range = balanced_contiguous_range(dimension, parts, rank, false)
                     .map_err(|error| error.to_string())?;
-                let mut local_shape = member.global_shape.clone();
+                let mut local_shape = member.global_shape().to_vec();
                 local_shape[*axis] = range.len();
                 Ok((
                     TensorPlacement::Range {
@@ -857,21 +545,21 @@ impl ParallelPlanBuilder {
                 let units = partition_units.ok_or_else(|| {
                     format!(
                         "tensor {:?} has no group-level logical partition",
-                        member.target
+                        member.target()
                     )
                 })?;
                 let dimension = checked_axis(member, *axis)?;
                 if dimension % units != 0 {
                     return Err(format!(
                         "tensor {:?} dimension {dimension} on axis {axis} does not contain {units} integral logical units",
-                        member.target
+                        member.target()
                     ));
                 }
                 let logical = balanced_contiguous_range(units, parts, rank, false)
                     .map_err(|error| error.to_string())?;
                 let elements_per_unit = dimension / units;
                 let range = (logical.start * elements_per_unit)..(logical.end * elements_per_unit);
-                let mut local_shape = member.global_shape.clone();
+                let mut local_shape = member.global_shape().to_vec();
                 local_shape[*axis] = range.len();
                 Ok((
                     TensorPlacement::Range {
@@ -886,14 +574,14 @@ impl ParallelPlanBuilder {
                 let units = partition_units.ok_or_else(|| {
                     format!(
                         "tensor {:?} has no group-level logical partition",
-                        member.target
+                        member.target()
                     )
                 })?;
                 let dimension = checked_axis(member, *axis)?;
                 if segments.is_empty() {
                     return Err(format!(
                         "tensor {:?} partitioned placement has no segments",
-                        member.target
+                        member.target()
                     ));
                 }
                 let logical = balanced_contiguous_range(units, parts, rank, false)
@@ -904,20 +592,20 @@ impl ParallelPlanBuilder {
                     if segment.start >= segment.end || segment.end > dimension {
                         return Err(format!(
                             "tensor {:?} segment {:?} is invalid for axis-{axis} dimension {dimension}",
-                            member.target, segment
+                            member.target(), segment
                         ));
                     }
                     if segment.start < previous_end {
                         return Err(format!(
                             "tensor {:?} partitioned ranges overlap or are out of order",
-                            member.target
+                            member.target()
                         ));
                     }
                     previous_end = segment.end;
                     if !segment.len().is_multiple_of(units) {
                         return Err(format!(
                             "tensor {:?} segment {:?} does not contain {units} integral logical units",
-                            member.target, segment
+                            member.target(), segment
                         ));
                     }
                     let elements_per_unit = segment.len() / units;
@@ -926,7 +614,7 @@ impl ParallelPlanBuilder {
                             ..(segment.start + logical.end * elements_per_unit),
                     );
                 }
-                let mut local_shape = member.global_shape.clone();
+                let mut local_shape = member.global_shape().to_vec();
                 local_shape[*axis] = indices.len();
                 Ok((
                     TensorPlacement::Indices {
@@ -941,7 +629,7 @@ impl ParallelPlanBuilder {
                 if segments.is_empty() {
                     return Err(format!(
                         "tensor {:?} segmented placement has no segments",
-                        member.target
+                        member.target()
                     ));
                 }
                 let mut indices = Vec::new();
@@ -950,13 +638,13 @@ impl ParallelPlanBuilder {
                     if segment.start >= segment.end || segment.end > dimension {
                         return Err(format!(
                             "tensor {:?} segment {:?} is invalid for axis-{axis} dimension {dimension}",
-                            member.target, segment
+                            member.target(), segment
                         ));
                     }
                     if segment.start < previous_end {
                         return Err(format!(
                             "tensor {:?} segmented ranges overlap or are out of order",
-                            member.target
+                            member.target()
                         ));
                     }
                     previous_end = segment.end;
@@ -967,10 +655,10 @@ impl ParallelPlanBuilder {
                 if indices.is_empty() {
                     return Err(format!(
                         "tensor {:?} has no local segmented indices on TP rank {rank}",
-                        member.target
+                        member.target()
                     ));
                 }
-                let mut local_shape = member.global_shape.clone();
+                let mut local_shape = member.global_shape().to_vec();
                 local_shape[*axis] = indices.len();
                 Ok((
                     TensorPlacement::Indices {
@@ -985,10 +673,11 @@ impl ParallelPlanBuilder {
 }
 
 fn checked_axis(member: &ParameterMemberSpec, axis: usize) -> Result<usize, String> {
-    member.global_shape.get(axis).copied().ok_or_else(|| {
+    member.global_shape().get(axis).copied().ok_or_else(|| {
         format!(
             "tensor {:?} axis {axis} is outside shape {:?}",
-            member.target, member.global_shape
+            member.target(),
+            member.global_shape()
         )
     })
 }

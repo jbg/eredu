@@ -2685,7 +2685,7 @@ impl Gemma4Embedding {
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         prefix: &str,
     ) -> Result<(), Error> {
-        use crate::backend::mlx::runtime::distributed::parallel::{
+        use eredu_runtime::{
             MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
         };
         let mut members = vec![ParameterMemberSpec::new(

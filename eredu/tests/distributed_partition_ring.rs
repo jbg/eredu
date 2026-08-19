@@ -11,8 +11,9 @@ use std::{
 use eredu::{
     backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
     backend::mlx::runtime::distributed::topology::load_safetensors_partition,
-    backend::mlx::{DeviceAssignment, MlxParallelContext, PlacementPlan, TensorPlacement},
+    backend::mlx::{DeviceAssignment, MlxParallelContext, PlacementPlan},
 };
+use eredu_runtime::TensorPlacement;
 use safemlx::{
     distributed::{self, Backend},
     DeviceType, Stream,

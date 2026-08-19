@@ -1115,7 +1115,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_kv_heads = Some(planned_kv_head_layout(
@@ -1148,7 +1148,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if group != 0 {
@@ -1218,7 +1218,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;

@@ -190,6 +190,12 @@ impl From<eredu_checkpoint::recipe::RecipeError> for Error {
     }
 }
 
+impl From<eredu_runtime::ParallelPlanError> for Error {
+    fn from(error: eredu_runtime::ParallelPlanError) -> Self {
+        Self::Parallel(error.to_string())
+    }
+}
+
 impl From<eredu_checkpoint::Error> for Error {
     fn from(error: eredu_checkpoint::Error) -> Self {
         Self::Quantization(error.to_string())

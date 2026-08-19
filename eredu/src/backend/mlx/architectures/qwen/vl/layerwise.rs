@@ -1814,8 +1814,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
     fn parallel_parameter_groups(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-    ) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error>
-    {
+    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
         let mut groups = vec![vocab_embedding_parameter_group(
             &self.embedding,
             "model.language_model.embed_tokens",
@@ -1838,7 +1837,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
     fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         let config = &self.args.text_config;
@@ -1899,7 +1898,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if group != 0 {
@@ -1993,7 +1992,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
@@ -2107,7 +2106,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;

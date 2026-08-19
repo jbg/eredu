@@ -2,7 +2,9 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
-use eredu_runtime::{OffloadUnit, WeightBinding};
+use eredu_runtime::{
+    MemberSharding, OffloadUnit, ParameterGroupSpec, ParameterRole, WeightBinding,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -60,7 +62,7 @@ use crate::{
     },
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, register_replicated_module,
-        MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
+        ParallelPlanBuilder,
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
@@ -2128,7 +2130,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
     fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_kv_heads = Some(planned_kv_head_layout(
@@ -2161,7 +2163,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         if group == 0 {
@@ -2254,7 +2256,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         &self,
         _group: usize,
         _index: usize,
-        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        _layout: &eredu_runtime::LocalModelLayout,
         _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         _stream: &Stream,
     ) -> Result<Self::Layer, Error> {
@@ -2355,7 +2357,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -3190,7 +3192,7 @@ pub(crate) fn qwen3_expert_catalog_cartesian(
     args: &DecoderConfig,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     layer_root: &str,
-    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();

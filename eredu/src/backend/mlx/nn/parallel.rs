@@ -7,6 +7,9 @@
 //! implementation to execute in replicated and tensor-parallel modes.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{
+    MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ShardingPolicy,
+};
 
 use std::ops::Range;
 
@@ -26,9 +29,8 @@ use crate::{
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, partitioned_projection_members,
         register_partitioned_projection_group, register_projection_module,
-        register_replicated_module, MemberSharding, ParallelBuildContext, ParallelExecutionContext,
-        ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-        ProjectionSharding, ShardingPolicy,
+        register_replicated_module, ParallelBuildContext, ParallelExecutionContext,
+        ParallelPlanBuilder, ProjectionSharding,
     },
     core::balanced_contiguous_range,
 };
@@ -309,7 +311,7 @@ pub(crate) fn register_gated_depthwise_conv_group(
 /// Cache creation and persistence use this planner-derived geometry instead of
 /// reconstructing it from topology scalars.
 pub(crate) fn planned_kv_head_layout(
-    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+    layout: &eredu_runtime::LocalModelLayout,
     layer_count: usize,
     head_dim: i32,
     layer_prefix: &str,
@@ -332,7 +334,7 @@ pub(crate) fn planned_kv_head_layout(
 /// Layers without attention deliberately have no KV entry; their architecture
 /// remains responsible for describing any other recurrent state.
 pub(crate) fn planned_optional_kv_head_layout(
-    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+    layout: &eredu_runtime::LocalModelLayout,
     attention_layers: impl IntoIterator<Item = bool>,
     head_dim: i32,
     layer_prefix: &str,
@@ -351,7 +353,7 @@ pub(crate) fn planned_optional_kv_head_layout(
 /// or convolution channels so cache topology never re-derives partitions from
 /// rank counts.
 pub(crate) fn planned_optional_partition_widths(
-    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+    layout: &eredu_runtime::LocalModelLayout,
     participating_layers: impl IntoIterator<Item = bool>,
     unit_width: i32,
     layer_prefix: &str,
@@ -726,10 +728,10 @@ impl ParallelLinear {
                 }
             }
         }
-        match self.partition_units {
+        Ok(match self.partition_units {
             Some(units) => ParameterGroupSpec::partitioned(prefix, role, units, members),
             None => ParameterGroupSpec::new(prefix, role, members),
-        }
+        }?)
     }
 
     /// Executes the projection and its declared collective.
@@ -1111,7 +1113,7 @@ pub fn vocab_embedding_parameter_group(
             }
         }
     }
-    ParameterGroupSpec::new(prefix, role, members)
+    Ok(ParameterGroupSpec::new(prefix, role, members)?)
 }
 
 /// Untied language-model head sharded by vocabulary rows.
@@ -1338,7 +1340,7 @@ pub fn vocab_lm_head_parameter_group(
             }
         }
     }
-    ParameterGroupSpec::new(prefix, role, members)
+    Ok(ParameterGroupSpec::new(prefix, role, members)?)
 }
 
 /// Array carrying its rank-local axis range.

@@ -1341,11 +1341,11 @@ pub(crate) fn vision_parallel_parameter_groups(
     config: &VisionConfig,
     prefix: &str,
     stream: &Stream,
-) -> Result<Vec<crate::backend::mlx::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
     use crate::backend::mlx::runtime::distributed::parallel::{
-        partitioned_projection_members, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
-        ParameterRole, ProjectionSharding,
+        partitioned_projection_members, ProjectionSharding,
     };
+    use eredu_runtime::{MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole};
     let intermediate = usize::try_from(config.intermediate_size)
         .map_err(|_| Error::Parallel("Qwen vision intermediate size is invalid".into()))?;
     let hidden = usize::try_from(config.hidden_size)
@@ -1478,7 +1478,7 @@ pub(crate) fn vision_parallel_parameter_groups(
 pub(crate) fn configure_vision_parallel_static(
     vision: &mut QwenVisionLayerwiseStatic,
     prefix: &str,
-    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+    layout: &eredu_runtime::LocalModelLayout,
     stream: &Stream,
 ) -> Result<(), Error> {
     let target = format!("{prefix}.merger.linear_fc1");
@@ -1525,7 +1525,7 @@ pub(crate) fn new_parallel_vision_block(
     config: &VisionConfig,
     prefix: &str,
     index: usize,
-    layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+    layout: &eredu_runtime::LocalModelLayout,
     stream: &Stream,
 ) -> Result<QwenVisionBlock, Error> {
     let block = format!("{prefix}.blocks.{index}");

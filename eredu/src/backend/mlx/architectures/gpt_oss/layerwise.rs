@@ -2,7 +2,9 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
-use eredu_runtime::{OffloadUnit, WeightBinding};
+use eredu_runtime::{
+    MemberSharding, OffloadUnit, ParameterGroupSpec, ParameterRole, WeightBinding,
+};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -51,8 +53,7 @@ use crate::{
     },
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, register_projection_module,
-        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
-        ParameterRole, ProjectionSharding,
+        register_replicated_module, ParallelPlanBuilder, ProjectionSharding,
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
@@ -1238,7 +1239,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
@@ -1315,7 +1316,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
     fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
@@ -1345,7 +1346,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         self.layer_count(group)?;
@@ -1415,7 +1416,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         index: usize,
         _layer: &Self::Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -1663,7 +1664,7 @@ pub(crate) fn gpt_oss_expert_catalog(
 pub(crate) fn gpt_oss_expert_catalog_cartesian(
     args: &ModelArgs,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-    layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let mut entries = Vec::new();
     for layer in 0..args.num_hidden_layers as usize {

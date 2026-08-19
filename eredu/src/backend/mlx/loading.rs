@@ -406,7 +406,7 @@ fn materialize_tensor_parallel(
     let execution = options.weight_residency.layers();
     let build = crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
-        crate::backend::mlx::runtime::distributed::parallel::ShardingPolicy::Require,
+        eredu_runtime::ShardingPolicy::Require,
     );
     match kind {
         ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
@@ -661,7 +661,7 @@ fn materialize_gguf_tensor_parallel(
     let residency = options.weight_residency.layers();
     let build = crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
-        crate::backend::mlx::runtime::distributed::parallel::ShardingPolicy::Require,
+        eredu_runtime::ShardingPolicy::Require,
     );
     match architecture {
         GgufArchitecture::KimiLinear => {

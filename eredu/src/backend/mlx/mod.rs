@@ -51,7 +51,7 @@ pub use inspection::{inspect_model, MlxInspectionOptions};
 pub(crate) use model::validate_gemma4_drafter;
 pub use model::{Model, ModelCache};
 pub use runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions};
-pub use runtime::distributed::topology::{PlacementPlan, RankPartition, TensorPlacement};
+pub use runtime::distributed::topology::{PlacementPlan, RankPartition};
 pub use runtime::execution::layerwise::{
     LayerWeightResidency, LayerwiseLoadOptions, NonExpertWeightResidency, ParallelModelInfo,
     WeightResidency,

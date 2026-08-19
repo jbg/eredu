@@ -671,7 +671,7 @@ impl DeepSeekV4LayerwiseAdapter {
     pub(crate) fn configure_cartesian_layout(
         &mut self,
         build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.configure_parallel_static(build, layout, stream)
@@ -1178,7 +1178,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
     fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        _layout: &eredu_runtime::LocalModelLayout,
         _stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_topology = Some(context.topology());
@@ -1189,7 +1189,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<DecoderLayer, Error> {
         self.layer_count(group)?;
@@ -1251,7 +1251,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         &self,
         group: usize,
         index: usize,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<DecoderLayer, Error> {
@@ -1311,7 +1311,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         index: usize,
         _layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
+        layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
@@ -1853,8 +1853,9 @@ fn register_v4_layer_parallel_plan(
 ) -> Result<(), Error> {
     use crate::backend::mlx::runtime::distributed::parallel::{
         array_parameter_member, partitioned_projection_members, register_replicated_module,
-        MemberSharding, ParameterGroupSpec, ParameterRole, ProjectionSharding,
+        ProjectionSharding,
     };
+    use eredu_runtime::{MemberSharding, ParameterGroupSpec, ParameterRole};
 
     let prefix = format!("layers.{index}");
     let attention = &layer.attn;

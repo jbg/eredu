@@ -1938,8 +1938,10 @@ impl DecoderLayer {
     ) -> Result<(), Error> {
         use crate::backend::mlx::runtime::distributed::parallel::{
             aligned_partition_units, array_parameter_member, partitioned_projection_members,
-            register_partitioned_projection_group, MemberSharding, ParameterGroupSpec,
-            ParameterMemberSpec, ParameterRole, ProjectionSharding,
+            register_partitioned_projection_group, ProjectionSharding,
+        };
+        use eredu_runtime::{
+            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
         };
         let attention_prefix = format!("{prefix}.self_attn");
         let q = format!("{attention_prefix}.q_proj");
@@ -2882,7 +2884,7 @@ impl AudioModel {
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         prefix: &str,
     ) -> Result<(), Error> {
-        use crate::backend::mlx::runtime::distributed::parallel::{
+        use eredu_runtime::{
             MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
         };
         let mut members = Vec::new();

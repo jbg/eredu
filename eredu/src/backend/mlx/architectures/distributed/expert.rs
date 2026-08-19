@@ -9,6 +9,7 @@
 //! topology-routed variable-count all-to-all payload exchange.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::ShardingPolicy;
 
 use std::{
     path::{Path, PathBuf},
@@ -56,9 +57,9 @@ use crate::{
     backend::mlx::runtime::checkpoint::store::{
         open_gguf_checkpoint_source, SafetensorsWeightStore,
     },
-    backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
+    backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     backend::mlx::runtime::distributed::topology::{
-        load_partition_from_store_on_streams, PlacementPlan, TensorPlacement,
+        load_partition_from_store_on_streams, PlacementPlan,
     },
     backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
