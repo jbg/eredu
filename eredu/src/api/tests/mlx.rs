@@ -28,6 +28,7 @@ use crate::{
     runtime::chat::PreparedChat,
 };
 use eredu_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
+use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized};
 use safemlx::{
     argmax_axis,
     module::ModuleParameters,
@@ -1195,6 +1196,40 @@ fn save_zero_checkpoint<M: ModuleParameters>(model: &M, dir: &std::path::Path, s
     .unwrap();
 }
 
+fn save_zero_neutral_checkpoint<M: Parameterized<Array>>(
+    model: &M,
+    dir: &std::path::Path,
+    stream: &Stream,
+) {
+    struct ZeroCollector<'a> {
+        stream: &'a Stream,
+        arrays: Vec<(String, Array)>,
+    }
+    impl<'tensor> ParameterVisitor<'tensor, Array> for ZeroCollector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            self.arrays.push((
+                metadata.id.to_string(),
+                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+            ));
+        }
+    }
+
+    let mut collector = ZeroCollector {
+        stream,
+        arrays: Vec::new(),
+    };
+    model.visit_parameters(&mut collector);
+    Array::save_safetensors(
+        collector
+            .arrays
+            .iter()
+            .map(|(name, array)| (name.as_str(), array)),
+        None,
+        dir.join("model.safetensors"),
+    )
+    .unwrap();
+}
+
 #[test]
 fn tiny_text_families_quantize_through_high_level_dispatch() {
     let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -1263,11 +1298,11 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
         match family {
             "llama" | "mistral" => {
                 let args = llama::get_llama_model_args(&dir).unwrap();
-                save_zero_checkpoint(
-                    &llama::ResidentModel::new(args, stream).unwrap(),
-                    &dir,
-                    stream,
-                );
+                let model = eredu_architectures::llama::Model::<
+                    crate::backend::mlx::nn::shared::MlxBackend,
+                >::new(&args, stream)
+                .unwrap();
+                save_zero_neutral_checkpoint(&model, &dir, stream);
             }
             "qwen3" => {
                 let args = dense_qwen::load_config(&dir).unwrap();
