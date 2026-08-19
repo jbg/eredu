@@ -9,7 +9,7 @@ pub mod layerwise;
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, StateLayout};
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -323,19 +323,48 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &DecoderConfig) -> Str
     )
 }
 
-#[cfg(test)]
-fn prompt_cache_layer_layout(
+pub(crate) fn prompt_cache_layer_layout(
     args: &DecoderConfig,
 ) -> Result<LayerSchedule<crate::LayerCachePolicy>, Exception> {
-    PromptCacheModelIdentity::key_value_layouts(
-        args.attention_schedule.iter().map(|policy| {
-            policy.window().map(|window| {
-                i32::try_from(window.get()).expect("validated dense-Qwen window fits i32")
-            })
-        }),
-        args.num_key_value_heads,
-        args.head_dim,
+    prompt_cache_layer_layout_with_kv_heads(
+        args,
+        &vec![args.num_key_value_heads; args.attention_schedule.len()],
     )
+}
+
+pub(crate) fn prompt_cache_layer_layout_with_kv_heads(
+    args: &DecoderConfig,
+    kv_heads: &[i32],
+) -> Result<LayerSchedule<crate::LayerCachePolicy>, Exception> {
+    if kv_heads.len() != args.attention_schedule.len() {
+        return Err(Exception::custom(format!(
+            "dense-Qwen cache geometry has {} layers, expected {}",
+            kv_heads.len(),
+            args.attention_schedule.len()
+        )));
+    }
+    LayerSchedule::new(
+        args.attention_schedule.len(),
+        args.attention_schedule
+            .iter()
+            .zip(kv_heads.iter().copied())
+            .map(|(attention, kv_heads)| {
+                crate::LayerCachePolicy::key_value(*attention, kv_heads, args.head_dim)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| Exception::custom(error.to_string()))?,
+    )
+    .map_err(|error| Exception::custom(error.to_string()))
+}
+
+pub(crate) fn state_layout(
+    args: &DecoderConfig,
+    kv_heads: Option<&[i32]>,
+) -> Result<StateLayout, Exception> {
+    StateLayout::new(match kv_heads {
+        Some(kv_heads) => prompt_cache_layer_layout_with_kv_heads(args, kv_heads)?,
+        None => prompt_cache_layer_layout(args)?,
+    })
     .map_err(|error| Exception::custom(error.to_string()))
 }
 

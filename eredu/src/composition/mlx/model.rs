@@ -931,7 +931,7 @@ impl Model {
                 Self::DenseQwen(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .and_then(|cache| match cache {
-                        crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache::Paged(caches) => Ok(ModelCache::PagedKeyValue(caches)),
+                        crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache::Paged { caches, .. } => Ok(ModelCache::PagedKeyValue(caches)),
                         _ => Err(Error::UnsupportedArchitecture(
                             "dense-Qwen paged cache construction returned device state".into(),
                         )),

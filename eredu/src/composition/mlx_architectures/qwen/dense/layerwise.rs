@@ -2,7 +2,8 @@
 
 use eredu_runtime::{
     ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
-    NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
+    NonExpertWeightResidency, RuntimeState, StateError, StateLayout, StaticUnitBindings,
+    WeightResidency,
 };
 
 use eredu_checkpoint::WeightQuantization;
@@ -87,14 +88,74 @@ const EMBEDDING_UNIT: &str = "dense_qwen.static.embedding";
 const NORM_UNIT: &str = "dense_qwen.static.norm";
 const HEAD_UNIT: &str = "dense_qwen.static.output";
 
-/// Architecture-owned KV cache accepted by the canonical dense-Qwen adapter.
+/// Architecture-owned KV cache accepted by dense-Qwen execution.
+#[derive(Clone)]
 pub enum DenseQwenLayerwiseCache {
     /// Append-only device KV caches.
-    Concat(Vec<Option<ConcatKeyValueCache>>),
+    Concat {
+        layout: StateLayout,
+        caches: Vec<Option<ConcatKeyValueCache>>,
+    },
     /// Sliding device KV caches used by expert-parallel execution.
-    Sliding(Vec<Option<SlidingKeyValueCache>>),
+    Sliding {
+        layout: StateLayout,
+        caches: Vec<Option<SlidingKeyValueCache>>,
+    },
     /// Paged KV caches used by expert-parallel execution.
-    Paged(Vec<Option<PagedKeyValueCache>>),
+    Paged {
+        layout: StateLayout,
+        caches: Vec<Option<PagedKeyValueCache>>,
+    },
+}
+
+impl DenseQwenLayerwiseCache {
+    pub(crate) fn concat(layout: StateLayout, caches: Vec<Option<ConcatKeyValueCache>>) -> Self {
+        Self::Concat { layout, caches }
+    }
+
+    pub(crate) fn sliding(layout: StateLayout, caches: Vec<Option<SlidingKeyValueCache>>) -> Self {
+        Self::Sliding { layout, caches }
+    }
+
+    pub(crate) fn paged(layout: StateLayout, caches: Vec<Option<PagedKeyValueCache>>) -> Self {
+        Self::Paged { layout, caches }
+    }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for DenseQwenLayerwiseCache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        match self {
+            Self::Concat { layout, .. }
+            | Self::Sliding { layout, .. }
+            | Self::Paged { layout, .. } => layout,
+        }
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() != 0 {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: 1,
+            });
+        }
+        let index = address.index();
+        let count = self.layout().len();
+        if index >= count {
+            return Err(StateError::UnknownLayer { layer: index, count });
+        }
+        Ok(match self {
+            Self::Concat { caches, .. } => retained_cache_arrays(caches, index),
+            Self::Sliding { caches, .. } => retained_cache_arrays(caches, index),
+            Self::Paged { caches, .. } => retained_cache_arrays(caches, index),
+        }
+        .into_iter())
+    }
 }
 
 /// Host-backed dense-Qwen causal LM.
@@ -106,6 +167,14 @@ impl LayerwiseDecoder {
     /// Returns the normalized decoder configuration.
     pub fn args(&self) -> &DecoderConfig {
         self.execution.adapter().args()
+    }
+
+    pub(crate) fn cache_layout(&self) -> Result<StateLayout, Error> {
+        resident::state_layout(
+            self.args(),
+            self.execution.adapter().parallel_kv_heads.as_deref(),
+        )
+        .map_err(Into::into)
     }
 
     pub(crate) fn bind_parallel_topology(
@@ -139,7 +208,10 @@ impl LayerwiseDecoder {
         policy: CacheResidencyPolicy,
     ) -> Result<DenseQwenLayerwiseCache, Error> {
         match policy {
-            CacheResidencyPolicy::Device => Ok(DenseQwenLayerwiseCache::Concat(self.new_cache())),
+            CacheResidencyPolicy::Device => Ok(DenseQwenLayerwiseCache::concat(
+                self.cache_layout()?,
+                self.new_cache(),
+            )),
             CacheResidencyPolicy::Paged(options) => {
                 let manager =
                     crate::backend::mlx::runtime::cache::residency::CacheResidencyManager::new(
@@ -151,7 +223,7 @@ impl LayerwiseDecoder {
                     manager,
                     self.execution.prompt_cache_rank_identity(),
                 )?;
-                Ok(DenseQwenLayerwiseCache::Paged(caches))
+                Ok(DenseQwenLayerwiseCache::paged(self.cache_layout()?, caches))
             }
         }
     }
@@ -162,14 +234,15 @@ impl LayerwiseDecoder {
         cache: &DenseQwenLayerwiseCache,
     ) -> Result<Option<CacheResidencyReport>, Error> {
         match cache {
-            DenseQwenLayerwiseCache::Paged(caches) => caches
+            DenseQwenLayerwiseCache::Paged { caches, .. } => caches
                 .iter()
                 .flatten()
                 .next()
                 .map(PagedKeyValueCache::report)
                 .transpose()
                 .map_err(Into::into),
-            DenseQwenLayerwiseCache::Concat(_) | DenseQwenLayerwiseCache::Sliding(_) => Ok(None),
+            DenseQwenLayerwiseCache::Concat { .. }
+            | DenseQwenLayerwiseCache::Sliding { .. } => Ok(None),
         }
     }
 
@@ -212,7 +285,7 @@ impl LayerwiseDecoder {
         options: &PromptCacheOptions,
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
-        let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::concat(self.cache_layout()?, std::mem::take(cache));
         let result = self.execution.save_prompt_cache(
             &mut owned,
             destination,
@@ -221,7 +294,7 @@ impl LayerwiseDecoder {
             options,
             stream,
         );
-        let DenseQwenLayerwiseCache::Concat(owned) = owned else {
+        let DenseQwenLayerwiseCache::Concat { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen prompt-cache wrapper changed variants")
         };
         *cache = owned;
@@ -244,7 +317,7 @@ impl LayerwiseDecoder {
             options,
             stream,
         )?;
-        let DenseQwenLayerwiseCache::Concat(cache) = cache else {
+        let DenseQwenLayerwiseCache::Concat { caches: cache, .. } = cache else {
             return Err(Error::Parallel(
                 "dense-Qwen prompt-cache restore returned a non-concat representation".into(),
             ));
@@ -311,11 +384,11 @@ impl LayerwiseDecoder {
         cache: &mut Vec<Option<ConcatKeyValueCache>>,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::concat(self.cache_layout()?, std::mem::take(cache));
         let result =
             self.execution
                 .forward(DenseQwenAdapterInput { inputs, mask }, &mut owned, stream);
-        let DenseQwenLayerwiseCache::Concat(owned) = owned else {
+        let DenseQwenLayerwiseCache::Concat { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen concat cache wrapper changed variants")
         };
         *cache = owned;
@@ -330,11 +403,11 @@ impl LayerwiseDecoder {
         cache: &mut Vec<Option<SlidingKeyValueCache>>,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::sliding(self.cache_layout()?, std::mem::take(cache));
         let result =
             self.execution
                 .forward(DenseQwenAdapterInput { inputs, mask }, &mut owned, stream);
-        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
+        let DenseQwenLayerwiseCache::Sliding { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen sliding cache wrapper changed variants")
         };
         *cache = owned;
@@ -350,14 +423,14 @@ impl LayerwiseDecoder {
         stream: &Stream,
         observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
-        let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::concat(self.cache_layout()?, std::mem::take(cache));
         let result = self.execution.forward_with_observer(
             DenseQwenAdapterInput { inputs, mask },
             &mut owned,
             stream,
             observer,
         );
-        let DenseQwenLayerwiseCache::Concat(owned) = owned else {
+        let DenseQwenLayerwiseCache::Concat { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen concat cache wrapper changed variants")
         };
         *cache = owned;
@@ -373,14 +446,14 @@ impl LayerwiseDecoder {
         stream: &Stream,
         observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
-        let mut owned = DenseQwenLayerwiseCache::Paged(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::paged(self.cache_layout()?, std::mem::take(cache));
         let result = self.execution.forward_with_observer(
             DenseQwenAdapterInput { inputs, mask },
             &mut owned,
             stream,
             observer,
         );
-        let DenseQwenLayerwiseCache::Paged(owned) = owned else {
+        let DenseQwenLayerwiseCache::Paged { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen paged cache wrapper changed variants")
         };
         *cache = owned;
@@ -395,11 +468,11 @@ impl LayerwiseDecoder {
         cache: &mut Vec<Option<PagedKeyValueCache>>,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let mut owned = DenseQwenLayerwiseCache::Paged(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::paged(self.cache_layout()?, std::mem::take(cache));
         let result =
             self.execution
                 .forward(DenseQwenAdapterInput { inputs, mask }, &mut owned, stream);
-        let DenseQwenLayerwiseCache::Paged(owned) = owned else {
+        let DenseQwenLayerwiseCache::Paged { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen paged cache wrapper changed variants")
         };
         *cache = owned;
@@ -418,10 +491,10 @@ impl LayerwiseDecoder {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::concat(self.cache_layout()?, std::mem::take(cache));
         let result =
             self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
-        let DenseQwenLayerwiseCache::Concat(owned) = owned else {
+        let DenseQwenLayerwiseCache::Concat { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen concat cache wrapper changed variants")
         };
         *cache = owned;
@@ -439,10 +512,10 @@ impl LayerwiseDecoder {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::sliding(self.cache_layout()?, std::mem::take(cache));
         let result =
             self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
-        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
+        let DenseQwenLayerwiseCache::Sliding { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen sliding cache wrapper changed variants")
         };
         *cache = owned;
@@ -460,10 +533,10 @@ impl LayerwiseDecoder {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        let mut owned = DenseQwenLayerwiseCache::Paged(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::paged(self.cache_layout()?, std::mem::take(cache));
         let result =
             self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
-        let DenseQwenLayerwiseCache::Paged(owned) = owned else {
+        let DenseQwenLayerwiseCache::Paged { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen paged cache wrapper changed variants")
         };
         *cache = owned;
@@ -486,7 +559,7 @@ impl LayerwiseDecoder {
             cache,
             stream,
             |_adapter, _group, index, layer, hidden, cache, context, stream| match cache {
-                DenseQwenLayerwiseCache::Concat(cache) => forward_sparse_with_executor(
+                DenseQwenLayerwiseCache::Concat { caches: cache, .. } => forward_sparse_with_executor(
                     layer,
                     hidden,
                     cache[index].as_mut(),
@@ -495,7 +568,7 @@ impl LayerwiseDecoder {
                     execute,
                     stream,
                 ),
-                DenseQwenLayerwiseCache::Sliding(cache) => forward_sparse_with_executor(
+                DenseQwenLayerwiseCache::Sliding { caches: cache, .. } => forward_sparse_with_executor(
                     layer,
                     hidden,
                     cache[index].as_mut(),
@@ -504,7 +577,7 @@ impl LayerwiseDecoder {
                     execute,
                     stream,
                 ),
-                DenseQwenLayerwiseCache::Paged(cache) => forward_sparse_with_executor(
+                DenseQwenLayerwiseCache::Paged { caches: cache, .. } => forward_sparse_with_executor(
                     layer,
                     hidden,
                     cache[index].as_mut(),
@@ -531,7 +604,7 @@ impl LayerwiseDecoder {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::concat(self.cache_layout()?, std::mem::take(cache));
         let result = self.forward_tensor_expert_parallel_cache(
             inputs,
             mask,
@@ -540,7 +613,7 @@ impl LayerwiseDecoder {
             execute,
             stream,
         );
-        let DenseQwenLayerwiseCache::Concat(owned) = owned else {
+        let DenseQwenLayerwiseCache::Concat { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen concat cache wrapper changed variants")
         };
         *cache = owned;
@@ -559,7 +632,7 @@ impl LayerwiseDecoder {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::sliding(self.cache_layout()?, std::mem::take(cache));
         let result = self.forward_tensor_expert_parallel_cache(
             inputs,
             mask,
@@ -568,7 +641,7 @@ impl LayerwiseDecoder {
             execute,
             stream,
         );
-        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
+        let DenseQwenLayerwiseCache::Sliding { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen sliding cache wrapper changed variants")
         };
         *cache = owned;
@@ -587,7 +660,7 @@ impl LayerwiseDecoder {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        let mut owned = DenseQwenLayerwiseCache::Paged(std::mem::take(cache));
+        let mut owned = DenseQwenLayerwiseCache::paged(self.cache_layout()?, std::mem::take(cache));
         let result = self.forward_tensor_expert_parallel_cache(
             inputs,
             mask,
@@ -596,7 +669,7 @@ impl LayerwiseDecoder {
             execute,
             stream,
         );
-        let DenseQwenLayerwiseCache::Paged(owned) = owned else {
+        let DenseQwenLayerwiseCache::Paged { caches: owned, .. } = owned else {
             unreachable!("dense-Qwen paged cache wrapper changed variants")
         };
         *cache = owned;
@@ -625,7 +698,7 @@ impl LayerwiseDecoder {
                     Error::Parallel("TP+EP execution requires an active TP group".into())
                 })?;
                 match cache {
-                    DenseQwenLayerwiseCache::Concat(cache) => forward_sparse_tp_with_executor(
+                    DenseQwenLayerwiseCache::Concat { caches: cache, .. } => forward_sparse_tp_with_executor(
                         layer,
                         hidden,
                         cache[index].as_mut(),
@@ -635,7 +708,7 @@ impl LayerwiseDecoder {
                         &mut execute,
                         execution.stream(),
                     ),
-                    DenseQwenLayerwiseCache::Sliding(cache) => forward_sparse_tp_with_executor(
+                    DenseQwenLayerwiseCache::Sliding { caches: cache, .. } => forward_sparse_tp_with_executor(
                         layer,
                         hidden,
                         cache[index].as_mut(),
@@ -645,7 +718,7 @@ impl LayerwiseDecoder {
                         &mut execute,
                         execution.stream(),
                     ),
-                    DenseQwenLayerwiseCache::Paged(cache) => forward_sparse_tp_with_executor(
+                    DenseQwenLayerwiseCache::Paged { caches: cache, .. } => forward_sparse_tp_with_executor(
                         layer,
                         hidden,
                         cache[index].as_mut(),
@@ -1448,7 +1521,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
         match cache {
-            DenseQwenLayerwiseCache::Concat(cache) => resident::save_prompt_cache(
+            DenseQwenLayerwiseCache::Concat { caches: cache, .. } => resident::save_prompt_cache(
                 &self.args,
                 cache,
                 destination,
@@ -1458,7 +1531,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
                 stream,
             )
             .map_err(Into::into),
-            DenseQwenLayerwiseCache::Paged(caches) => {
+            DenseQwenLayerwiseCache::Paged { caches, .. } => {
                 for cache in caches.iter_mut().flatten() {
                     cache.finalize()?;
                 }
@@ -1471,7 +1544,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
                     .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
                     .map_err(|error| Error::Parallel(error.to_string()))
             }
-            DenseQwenLayerwiseCache::Sliding(_) => Err(Error::Parallel(
+            DenseQwenLayerwiseCache::Sliding { .. } => Err(Error::Parallel(
                 "dense-Qwen sliding-cache persistence is unsupported; use concat or paged cache state".into(),
             )),
         }
@@ -1494,7 +1567,14 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
             identity,
             stream,
         )?;
-        Ok((DenseQwenLayerwiseCache::Concat(cache), manifest))
+        Ok((
+            DenseQwenLayerwiseCache::concat(
+                StateLayout::new(identity.layer_layout.clone())
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
+                cache,
+            ),
+            manifest,
+        ))
     }
 
     fn validate_cache(&self, cache: &mut Self::Cache) -> Result<(), Error> {
@@ -1505,7 +1585,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
             ))
         })?;
         match cache {
-            DenseQwenLayerwiseCache::Concat(caches) => {
+            DenseQwenLayerwiseCache::Concat { caches, .. } => {
                 if caches.is_empty() {
                     *caches = self
                         .args
@@ -1524,8 +1604,8 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
                 }
                 validate_dense_qwen_cache(caches, expected)
             }
-            DenseQwenLayerwiseCache::Sliding(caches) => validate_dense_qwen_cache(caches, expected),
-            DenseQwenLayerwiseCache::Paged(caches) => validate_dense_qwen_cache(caches, expected),
+            DenseQwenLayerwiseCache::Sliding { caches, .. } => validate_dense_qwen_cache(caches, expected),
+            DenseQwenLayerwiseCache::Paged { caches, .. } => validate_dense_qwen_cache(caches, expected),
         }
     }
 
@@ -1537,13 +1617,13 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
     ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let hidden = self.embedding.forward(input.inputs, stream)?;
         let mask = match cache {
-            DenseQwenLayerwiseCache::Concat(caches) => {
+            DenseQwenLayerwiseCache::Concat { caches, .. } => {
                 dense_qwen_attention_mask(&hidden, input.mask, caches, stream)?
             }
-            DenseQwenLayerwiseCache::Sliding(caches) => {
+            DenseQwenLayerwiseCache::Sliding { caches, .. } => {
                 dense_qwen_attention_mask(&hidden, input.mask, caches, stream)?
             }
-            DenseQwenLayerwiseCache::Paged(caches) => {
+            DenseQwenLayerwiseCache::Paged { caches, .. } => {
                 dense_qwen_attention_mask(&hidden, input.mask, caches, stream)?
             }
         };
@@ -1566,13 +1646,13 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         };
         let hidden = embedding.forward(input.inputs, execution)?;
         let mask = match cache {
-            DenseQwenLayerwiseCache::Concat(caches) => {
+            DenseQwenLayerwiseCache::Concat { caches, .. } => {
                 dense_qwen_attention_mask(&hidden, input.mask, caches, execution.stream())?
             }
-            DenseQwenLayerwiseCache::Sliding(caches) => {
+            DenseQwenLayerwiseCache::Sliding { caches, .. } => {
                 dense_qwen_attention_mask(&hidden, input.mask, caches, execution.stream())?
             }
-            DenseQwenLayerwiseCache::Paged(caches) => {
+            DenseQwenLayerwiseCache::Paged { caches, .. } => {
                 dense_qwen_attention_mask(&hidden, input.mask, caches, execution.stream())?
             }
         };
@@ -2039,7 +2119,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Array, Error> {
         match cache {
-            DenseQwenLayerwiseCache::Concat(caches) => self.forward_cached_layer(
+            DenseQwenLayerwiseCache::Concat { caches, .. } => self.forward_cached_layer(
                 index,
                 layer,
                 hidden,
@@ -2047,7 +2127,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
                 context,
                 stream,
             ),
-            DenseQwenLayerwiseCache::Sliding(caches) => self.forward_cached_layer(
+            DenseQwenLayerwiseCache::Sliding { caches, .. } => self.forward_cached_layer(
                 index,
                 layer,
                 hidden,
@@ -2055,7 +2135,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
                 context,
                 stream,
             ),
-            DenseQwenLayerwiseCache::Paged(caches) => self.forward_cached_layer(
+            DenseQwenLayerwiseCache::Paged { caches, .. } => self.forward_cached_layer(
                 index,
                 layer,
                 hidden,
@@ -2090,7 +2170,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         }
         let prefix = self.layer_checkpoint_prefix(group, index);
         Ok(match cache {
-            DenseQwenLayerwiseCache::Concat(caches) => layer.forward_with_observer(
+            DenseQwenLayerwiseCache::Concat { caches, .. } => layer.forward_with_observer(
                 AttentionInput {
                     x: hidden,
                     mask: context.mask.as_ref(),
@@ -2100,7 +2180,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
                 &prefix,
                 observer,
             )?,
-            DenseQwenLayerwiseCache::Sliding(caches) => layer.forward_with_observer(
+            DenseQwenLayerwiseCache::Sliding { caches, .. } => layer.forward_with_observer(
                 AttentionInput {
                     x: hidden,
                     mask: context.mask.as_ref(),
@@ -2110,7 +2190,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
                 &prefix,
                 observer,
             )?,
-            DenseQwenLayerwiseCache::Paged(caches) => layer.forward_with_observer(
+            DenseQwenLayerwiseCache::Paged { caches, .. } => layer.forward_with_observer(
                 AttentionInput {
                     x: hidden,
                     mask: context.mask.as_ref(),
@@ -2147,21 +2227,21 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
             );
         };
         match cache {
-            DenseQwenLayerwiseCache::Concat(caches) => Ok(layer.forward_tensor_parallel(
+            DenseQwenLayerwiseCache::Concat { caches, .. } => Ok(layer.forward_tensor_parallel(
                 hidden,
                 context.mask.as_ref(),
                 caches[index].as_mut(),
                 tp_group,
                 execution.stream(),
             )?),
-            DenseQwenLayerwiseCache::Sliding(caches) => Ok(layer.forward_tensor_parallel(
+            DenseQwenLayerwiseCache::Sliding { caches, .. } => Ok(layer.forward_tensor_parallel(
                 hidden,
                 context.mask.as_ref(),
                 caches[index].as_mut(),
                 tp_group,
                 execution.stream(),
             )?),
-            DenseQwenLayerwiseCache::Paged(caches) => Ok(layer.forward_tensor_parallel(
+            DenseQwenLayerwiseCache::Paged { caches, .. } => Ok(layer.forward_tensor_parallel(
                 hidden,
                 context.mask.as_ref(),
                 caches[index].as_mut(),
@@ -2178,9 +2258,9 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         index: usize,
     ) -> Vec<&'a Array> {
         match cache {
-            DenseQwenLayerwiseCache::Concat(caches) => retained_cache_arrays(caches, index),
-            DenseQwenLayerwiseCache::Sliding(caches) => retained_cache_arrays(caches, index),
-            DenseQwenLayerwiseCache::Paged(caches) => retained_cache_arrays(caches, index),
+            DenseQwenLayerwiseCache::Concat { caches, .. } => retained_cache_arrays(caches, index),
+            DenseQwenLayerwiseCache::Sliding { caches, .. } => retained_cache_arrays(caches, index),
+            DenseQwenLayerwiseCache::Paged { caches, .. } => retained_cache_arrays(caches, index),
         }
     }
 

@@ -1220,14 +1220,19 @@ fn last_token_logits(logits: Array, stream: &Stream) -> Result<Array, Error> {
 
 fn with_dense_qwen_cache<T>(
     cache: &mut ModelCache,
+    layout: eredu_runtime::StateLayout,
     execute: impl FnOnce(
         &mut crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache,
     ) -> Result<T, Error>,
 ) -> Result<T, Error> {
     use crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache;
     let mut owned = match cache {
-        ModelCache::KeyValue(values) => DenseQwenLayerwiseCache::Concat(std::mem::take(values)),
-        ModelCache::PagedKeyValue(values) => DenseQwenLayerwiseCache::Paged(std::mem::take(values)),
+        ModelCache::KeyValue(values) => {
+            DenseQwenLayerwiseCache::concat(layout.clone(), std::mem::take(values))
+        }
+        ModelCache::PagedKeyValue(values) => {
+            DenseQwenLayerwiseCache::paged(layout, std::mem::take(values))
+        }
         _ => {
             return Err(Error::UnsupportedArchitecture(
                 "dense Qwen cache does not match model".into(),
@@ -1236,10 +1241,10 @@ fn with_dense_qwen_cache<T>(
     };
     let result = execute(&mut owned);
     match (cache, owned) {
-        (ModelCache::KeyValue(values), DenseQwenLayerwiseCache::Concat(restored)) => {
+        (ModelCache::KeyValue(values), DenseQwenLayerwiseCache::Concat { caches: restored, .. }) => {
             *values = restored
         }
-        (ModelCache::PagedKeyValue(values), DenseQwenLayerwiseCache::Paged(restored)) => {
+        (ModelCache::PagedKeyValue(values), DenseQwenLayerwiseCache::Paged { caches: restored, .. }) => {
             *values = restored
         }
         _ => unreachable!("dense Qwen tensor-parallel cache wrapper changed variants"),
@@ -1371,7 +1376,7 @@ fn forward_model_tensor_parallel(
         (
             Model::DenseQwen(model),
             cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
-        ) => with_dense_qwen_cache(cache, |cache| {
+        ) => with_dense_qwen_cache(cache, model.cache_layout()?, |cache| {
             model.forward_tensor_parallel(input, None, cache, group, stream)
         }),
         (
