@@ -32,6 +32,11 @@ where
     type Unit: Parameterized<B::Tensor>;
     /// Architecture-owned state retained for one complete forward pass.
     type ForwardContext;
+    /// Allocation-free iterator over transient tensors retained by a unit submission.
+    type RetainedContextValues<'a>: Iterator<Item = &'a B::Tensor>
+    where
+        Self: 'a,
+        B::Tensor: 'a;
     /// Concrete architecture or backend failure.
     type Error;
 
@@ -84,6 +89,13 @@ where
         forward: &Self::ForwardContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+
+    /// Borrows transient forward tensors required by one unit's submission.
+    fn retained_context_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        index: usize,
+    ) -> Self::RetainedContextValues<'a>;
 }
 
 /// Fully resident runtime using the same lifecycle as bounded execution.
@@ -179,4 +191,272 @@ where
     pub fn state_mut(&mut self) -> &mut S {
         &mut self.state
     }
+
+    /// Decomposes the runtime without cloning backend-native values.
+    pub fn into_parts(self) -> (A, Vec<A::Unit>, S) {
+        (self.architecture, self.units, self.state)
+    }
+}
+
+/// Policy controlling acquisition and exact release of one execution unit.
+pub trait LayerwisePolicy<B, U>
+where
+    B: NeuralBackend,
+{
+    /// Concrete lease owning one populated unit and all residency guards.
+    type Lease: std::ops::DerefMut<Target = U>;
+    /// Concrete acquisition or completion failure.
+    type Error;
+
+    /// Acquires one populated unit for exclusive execution.
+    fn acquire(
+        &mut self,
+        index: usize,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Lease, Self::Error>;
+
+    /// Retains the unit and dependent native values through exact completion.
+    fn complete<'a, StateValues, ContextValues>(
+        &mut self,
+        index: usize,
+        lease: Self::Lease,
+        output: &B::Tensor,
+        state_values: StateValues,
+        context_values: ContextValues,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), Self::Error>
+    where
+        B::Tensor: 'a,
+        StateValues: Iterator<Item = &'a B::Tensor>,
+        ContextValues: Iterator<Item = &'a B::Tensor>;
+}
+
+/// Failure from architecture execution or layerwise residency policy.
+#[derive(Debug, thiserror::Error)]
+pub enum LayerwiseRuntimeError<A, P>
+where
+    A: std::fmt::Display,
+    P: std::fmt::Display,
+{
+    /// Architecture construction or forward failure.
+    #[error("layered architecture failed: {0}")]
+    Architecture(A),
+    /// Invalid access to architecture-declared mutable state.
+    #[error(transparent)]
+    State(#[from] crate::StateError),
+    /// Unit acquisition or exact-completion failure.
+    #[error("layerwise execution policy failed: {0}")]
+    Policy(P),
+}
+
+/// Bounded-unit runtime invoking the same architecture lifecycle as resident execution.
+pub struct LayerwiseRuntime<A, B, S, P>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    P: LayerwisePolicy<B, A::Unit>,
+{
+    architecture: A,
+    state: S,
+    policy: P,
+    backend: std::marker::PhantomData<fn() -> B>,
+}
+
+impl<A, B, S, P> LayerwiseRuntime<A, B, S, P>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    P: LayerwisePolicy<B, A::Unit>,
+    A::Error: std::fmt::Display,
+    P::Error: std::fmt::Display,
+{
+    /// Creates a layerwise runtime from concrete architecture, state, and policy.
+    pub const fn new(architecture: A, state: S, policy: P) -> Self {
+        Self {
+            architecture,
+            state,
+            policy,
+            backend: std::marker::PhantomData,
+        }
+    }
+
+    /// Runs one complete prefill or decode pass with exact unit release points.
+    pub fn forward<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>> {
+        let count = self
+            .architecture
+            .unit_count()
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let mut forward = self
+            .architecture
+            .begin_forward(input, &mut self.state, context)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        for index in 0..count {
+            let mut lease = self
+                .policy
+                .acquire(index, context)
+                .map_err(LayerwiseRuntimeError::Policy)?;
+            forward.hidden = self
+                .architecture
+                .forward_unit(
+                    index,
+                    &mut lease,
+                    &forward.hidden,
+                    &mut self.state,
+                    &mut forward.context,
+                    context,
+                )
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            let state_values = self
+                .state
+                .retained_values(index)
+                .map_err(LayerwiseRuntimeError::State)?;
+            let context_values = self
+                .architecture
+                .retained_context_values(&forward.context, index);
+            self.policy
+                .complete(
+                    index,
+                    lease,
+                    &forward.hidden,
+                    state_values,
+                    context_values,
+                    context,
+                )
+                .map_err(LayerwiseRuntimeError::Policy)?;
+        }
+        self.architecture
+            .finish_forward(&forward.hidden, &mut self.state, &forward.context, context)
+            .map_err(LayerwiseRuntimeError::Architecture)
+    }
+
+    /// Mutably borrows the concrete state realization.
+    pub fn state_mut(&mut self) -> &mut S {
+        &mut self.state
+    }
+}
+
+/// Indexed owned unit used by [`ResidentUnitWindow`].
+pub struct ResidentUnitLease<U> {
+    index: usize,
+    unit: U,
+}
+
+impl<U> std::ops::Deref for ResidentUnitLease<U> {
+    type Target = U;
+
+    fn deref(&self) -> &Self::Target {
+        &self.unit
+    }
+}
+
+impl<U> std::ops::DerefMut for ResidentUnitLease<U> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.unit
+    }
+}
+
+/// Minimal one-at-a-time unit window useful for conformance and resident storage.
+pub struct ResidentUnitWindow<U> {
+    units: Vec<Option<U>>,
+}
+
+impl<U> ResidentUnitWindow<U> {
+    /// Creates a window over an ordered set of already populated units.
+    pub fn new(units: Vec<U>) -> Self {
+        Self {
+            units: units.into_iter().map(Some).collect(),
+        }
+    }
+}
+
+impl<B, U> LayerwisePolicy<B, U> for ResidentUnitWindow<U>
+where
+    B: NeuralBackend,
+{
+    type Lease = ResidentUnitLease<U>;
+    type Error = ResidentUnitWindowError;
+
+    fn acquire(
+        &mut self,
+        index: usize,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Lease, Self::Error> {
+        let count = self.units.len();
+        let unit = self
+            .units
+            .get_mut(index)
+            .ok_or(ResidentUnitWindowError::UnknownUnit { index, count })?
+            .take()
+            .ok_or(ResidentUnitWindowError::AlreadyAcquired { index })?;
+        Ok(ResidentUnitLease { index, unit })
+    }
+
+    fn complete<'a, StateValues, ContextValues>(
+        &mut self,
+        index: usize,
+        lease: Self::Lease,
+        _output: &B::Tensor,
+        _state_values: StateValues,
+        _context_values: ContextValues,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), Self::Error>
+    where
+        B::Tensor: 'a,
+        StateValues: Iterator<Item = &'a B::Tensor>,
+        ContextValues: Iterator<Item = &'a B::Tensor>,
+    {
+        if lease.index != index {
+            return Err(ResidentUnitWindowError::MismatchedUnit {
+                expected: index,
+                actual: lease.index,
+            });
+        }
+        let slot = self
+            .units
+            .get_mut(index)
+            .expect("acquired unit index remains in the window");
+        if slot.replace(lease.unit).is_some() {
+            return Err(ResidentUnitWindowError::AlreadyResident { index });
+        }
+        Ok(())
+    }
+}
+
+/// Invalid access to an owned resident-unit window.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum ResidentUnitWindowError {
+    /// The requested unit is outside the ordered window.
+    #[error("unit {index} is outside the {count}-unit window")]
+    UnknownUnit {
+        /// Requested index.
+        index: usize,
+        /// Window size.
+        count: usize,
+    },
+    /// A unit was acquired twice without an intervening completion.
+    #[error("unit {index} is already acquired")]
+    AlreadyAcquired {
+        /// Requested index.
+        index: usize,
+    },
+    /// Completion returned a lease for the wrong unit.
+    #[error("unit completion expected {expected}, received {actual}")]
+    MismatchedUnit {
+        /// Expected unit.
+        expected: usize,
+        /// Lease unit.
+        actual: usize,
+    },
+    /// A completion attempted to overwrite a resident unit.
+    #[error("unit {index} is already resident")]
+    AlreadyResident {
+        /// Conflicting index.
+        index: usize,
+    },
 }

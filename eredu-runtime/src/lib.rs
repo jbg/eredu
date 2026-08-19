@@ -28,7 +28,10 @@ pub use execution::{
     ExecutionGroupSpec, ReadyGroupState,
 };
 pub use generation::CausalModel;
-pub use layered::{LayeredArchitecture, LayeredForwardState, ResidentRuntime};
+pub use layered::{
+    LayeredArchitecture, LayeredForwardState, LayerwisePolicy, LayerwiseRuntime,
+    LayerwiseRuntimeError, ResidentRuntime, ResidentUnitWindow, ResidentUnitWindowError,
+};
 pub use parallel::{
     aligned_partition_units, module_parameter_group, partitioned_projection_group,
     projection_parameter_group, LocalModelLayout, LocalTensorLayout, MemberSharding,

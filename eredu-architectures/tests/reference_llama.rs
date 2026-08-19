@@ -7,8 +7,8 @@ use eredu_nn::{
     RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, DeviceState, ParameterBackend, ResidentRuntime,
-    RuntimeLayerState, RuntimeState, WeightBinding,
+    bind_materialized_unit, materialize_bindings, DeviceState, LayerwiseRuntime, ParameterBackend,
+    ResidentRuntime, ResidentUnitWindow, RuntimeLayerState, RuntimeState, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -642,4 +642,19 @@ fn shared_llama_runs_prefill_and_decode_without_mlx() {
     assert_eq!(logits.shape(), &[1, 1, 32]);
     assert_eq!(runtime.state_mut().layer(0).unwrap().offset(), 4);
     assert_eq!(runtime.state_mut().layer(1).unwrap().offset(), 4);
+
+    let (architecture, units, state) = runtime.into_parts();
+    let mut layerwise = LayerwiseRuntime::new(architecture, state, ResidentUnitWindow::new(units));
+    let logits = layerwise
+        .forward(
+            LayeredInput {
+                tokens: &decode,
+                mask: None,
+            },
+            &(),
+        )
+        .unwrap();
+    assert_eq!(logits.shape(), &[1, 1, 32]);
+    assert_eq!(layerwise.state_mut().layer(0).unwrap().offset(), 5);
+    assert_eq!(layerwise.state_mut().layer(1).unwrap().offset(), 5);
 }

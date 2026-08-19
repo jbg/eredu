@@ -1038,6 +1038,10 @@ where
     type StaticModules = StaticModules<B>;
     type Unit = TransformerBlock<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::option::Iter<'a, B::Tensor>
+    where
+        B::Tensor: 'a;
     type Error = Error;
 
     fn model_identity(&self) -> &str {
@@ -1138,5 +1142,13 @@ where
             Some(head) => head.forward(&hidden, context),
             None => self.static_modules.embeddings.as_linear(&hidden, context),
         }
+    }
+
+    fn retained_context_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _index: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.mask.iter()
     }
 }
