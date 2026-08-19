@@ -176,6 +176,70 @@ pub trait CheckpointSource: Send + Sync {
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError>;
 }
 
+/// A checkpoint source restricted to one resolved architecture contract.
+///
+/// The wrapper is cold-path policy only: it filters catalog inspection and
+/// rejects every lease request not selected by the resolved physical layout.
+pub struct ResolvedCheckpointSource {
+    source: Arc<dyn CheckpointSource>,
+    contract: crate::validation::ResolvedCheckpointPlan,
+}
+
+impl ResolvedCheckpointSource {
+    /// Restricts a source to the physical keys selected by a contract.
+    pub fn new(
+        source: Arc<dyn CheckpointSource>,
+        contract: crate::validation::ResolvedCheckpointPlan,
+    ) -> Self {
+        Self { source, contract }
+    }
+
+    /// Returns the resolved contract identity.
+    pub fn contract_identity(&self) -> &str {
+        self.contract.identity()
+    }
+
+    /// Returns catalog keys admitted but not claimed by the selected layout.
+    pub fn unclaimed_keys(&self) -> &BTreeSet<String> {
+        self.contract.unclaimed_keys()
+    }
+
+    fn authorize(&self, key: &str) -> Result<(), StoreError> {
+        if self.contract.source_keys().contains(key) {
+            Ok(())
+        } else {
+            Err(StoreError::UnauthorizedTensor {
+                contract: self.contract.identity().to_owned(),
+                key: key.to_owned(),
+            })
+        }
+    }
+}
+
+impl CheckpointSource for ResolvedCheckpointSource {
+    fn source_keys(&self) -> Vec<String> {
+        self.source
+            .source_keys()
+            .into_iter()
+            .filter(|key| self.contract.source_keys().contains(key))
+            .collect()
+    }
+
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.authorize(key)?;
+        self.source.source_metadata(key)
+    }
+
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        self.authorize(&request.key)?;
+        self.source.acquire_lease(request)
+    }
+
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        self.source.source_diagnostics()
+    }
+}
+
 /// Persistent checkpoint storage contract with a concrete lease type.
 pub trait WeightStore {
     /// Encoded lease retaining the source lifetime.
@@ -235,6 +299,14 @@ pub enum StoreError {
     #[error("unknown checkpoint tensor {key:?}")]
     UnknownTensor {
         /// Requested logical name.
+        key: String,
+    },
+    /// A resolved architecture contract did not authorize the requested key.
+    #[error("checkpoint contract {contract:?} does not authorize tensor {key:?}")]
+    UnauthorizedTensor {
+        /// Resolved contract identity.
+        contract: String,
+        /// Rejected tensor key.
         key: String,
     },
     /// A checkpoint path or indexed payload shard is absent.
@@ -1299,5 +1371,47 @@ mod tests {
                 policy: ReadPolicy::RequireBounded,
             })
             .is_ok());
+    }
+
+    #[test]
+    fn resolved_source_rejects_unselected_physical_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
+        let file = directory.path().join("model.safetensors");
+        serialize_to_file(
+            [
+                (
+                    "selected",
+                    TensorView::new(Dtype::F32, vec![2], &bytes[..8]).unwrap(),
+                ),
+                (
+                    "unselected",
+                    TensorView::new(Dtype::F32, vec![2], &bytes[8..]).unwrap(),
+                ),
+            ],
+            None,
+            &file,
+        )
+        .unwrap();
+        let source: Arc<dyn CheckpointSource> =
+            Arc::new(SafetensorsWeightStore::open(&file).unwrap());
+        let contract =
+            crate::validation::ResolvedCheckpointPlan::for_test("test architecture", ["selected"]);
+        let source = ResolvedCheckpointSource::new(source, contract);
+
+        assert_eq!(source.source_keys(), ["selected"]);
+        assert!(source.source_metadata("selected").is_ok());
+        assert!(matches!(
+            source.source_metadata("unselected"),
+            Err(StoreError::UnauthorizedTensor { .. })
+        ));
+        assert!(matches!(
+            source.acquire_lease(TensorReadRequest {
+                key: "unselected".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded,
+            }),
+            Err(StoreError::UnauthorizedTensor { .. })
+        ));
     }
 }

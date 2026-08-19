@@ -1031,6 +1031,9 @@ pub(crate) fn neutral_store_error(error: eredu_checkpoint::store::StoreError) ->
     match error {
         StoreError::InvalidMappedShardLimit => WeightStoreError::InvalidMappedShardLimit,
         StoreError::UnknownTensor { key } => WeightStoreError::UnknownTensor { key },
+        StoreError::UnauthorizedTensor { contract, key } => {
+            WeightStoreError::UnauthorizedTensor { contract, key }
+        }
         StoreError::MissingShard { path } => WeightStoreError::MissingShard { path },
         StoreError::MalformedIndex { path, message } => {
             WeightStoreError::MalformedIndex { path, message }
