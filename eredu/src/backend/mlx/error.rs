@@ -63,6 +63,10 @@ pub enum Error {
     #[error(transparent)]
     WeightBindingSelection(#[from] eredu_runtime::WeightBindingSelectionError),
 
+    /// Invalid backend-neutral ordered weight-residency window.
+    #[error(transparent)]
+    ResidencyWindow(#[from] eredu_runtime::ResidencyWindowError),
+
     /// Invalid module-to-checkpoint or resident-lease binding.
     #[error(transparent)]
     ModuleBinding(#[from] crate::backend::mlx::runtime::checkpoint::binding::ModuleBindingError),

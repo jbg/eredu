@@ -119,7 +119,6 @@ use crate::{
     },
     backend::mlx::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyManager, ResidencyReport,
-        ResidentLayerGroup,
     },
     backend::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
@@ -136,8 +135,10 @@ use crate::{
     core::{MtpCapability, MtpCheckpointKind},
     integrations::llama_mlx::model as llama,
 };
+
 use eredu_core::MtpStats;
 use eredu_runtime::ExecutionGroupReadySet;
+use eredu_runtime::ResidentLayerGroup;
 
 #[cfg(test)]
 use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;

@@ -1,12 +1,14 @@
 //! Backend-neutral immutable-weight residency declarations and control state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeCatalog, RecipeError},
     store::TensorSelection,
 };
-use eredu_core::residency::{OffloadPlan, OffloadUnitId, ResidencyLedger};
+use eredu_core::residency::{
+    MemoryTier, OffloadPlan, OffloadUnitId, PrefetchOutcome, ResidencyLedger, UnitResidencyReport,
+};
 
 /// One named checkpoint selection within an atomic resident unit.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -329,6 +331,314 @@ pub enum ResidencyControllerError {
     },
 }
 
+/// Backend-independent operations required by ordered residency windows.
+pub trait ResidencyWindowManager {
+    /// Manager-specific failure including neutral window validation failures.
+    type Error: std::error::Error + From<ResidencyWindowError>;
+
+    /// Replaces the default protected window and prepares bounded lookahead.
+    fn prepare_window(
+        &self,
+        active: &[OffloadUnitId],
+        upcoming: &[OffloadUnitId],
+        tier: MemoryTier,
+    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, Self::Error>;
+
+    /// Replaces one named protected window and prepares bounded lookahead.
+    fn prepare_group_window(
+        &self,
+        group: &str,
+        active: &[OffloadUnitId],
+        upcoming: &[OffloadUnitId],
+        tier: MemoryTier,
+    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, Self::Error>;
+
+    /// Removes one concrete resident copy if present.
+    fn evict(&self, id: &OffloadUnitId, tier: MemoryTier) -> Result<bool, Self::Error>;
+
+    /// Returns logical unit state in stable identifier order.
+    fn unit_reports(&self) -> Result<Vec<UnitResidencyReport>, Self::Error>;
+}
+
+/// Deterministic controller for a bounded ordered device-layer window.
+#[derive(Debug, Clone)]
+pub struct DeviceLayerWindow {
+    units: Vec<OffloadUnitId>,
+    depth: usize,
+}
+
+impl DeviceLayerWindow {
+    /// Creates a controller for a non-empty, duplicate-free unit sequence.
+    pub fn new(
+        units: impl IntoIterator<Item = OffloadUnitId>,
+        depth: usize,
+    ) -> Result<Self, ResidencyWindowError> {
+        let units = units.into_iter().collect::<Vec<_>>();
+        if units.is_empty() {
+            return Err(ResidencyWindowError::EmptyLayerWindow);
+        }
+        if depth == 0 || depth > units.len() {
+            return Err(ResidencyWindowError::OversizedLayerWindow {
+                depth,
+                layer_count: units.len(),
+            });
+        }
+        let unique = units.iter().collect::<BTreeSet<_>>();
+        if unique.len() != units.len() {
+            return Err(ResidencyWindowError::DuplicateLayerWindowUnit {
+                id: units
+                    .iter()
+                    .find(|id| units.iter().filter(|candidate| *candidate == *id).count() > 1)
+                    .expect("duplicate exists")
+                    .clone(),
+            });
+        }
+        Ok(Self { units, depth })
+    }
+
+    /// Returns the maximum number of ordered units kept on the device.
+    pub const fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Returns units in execution order.
+    pub fn units(&self) -> &[OffloadUnitId] {
+        &self.units
+    }
+
+    /// Returns the desired window beginning at `current`.
+    pub fn desired(&self, current: usize) -> Result<&[OffloadUnitId], ResidencyWindowError> {
+        if current >= self.units.len() {
+            return Err(ResidencyWindowError::InvalidLayerIndex {
+                index: current,
+                layer_count: self.units.len(),
+            });
+        }
+        let end = current.saturating_add(self.depth).min(self.units.len());
+        Ok(&self.units[current..end])
+    }
+
+    /// Prepares and trims the default window beginning at `current`.
+    pub fn prepare<M: ResidencyWindowManager>(
+        &self,
+        manager: &M,
+        current: usize,
+    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, M::Error> {
+        let desired = self.desired(current).map_err(M::Error::from)?;
+        let outcomes = manager.prepare_window(desired, desired, MemoryTier::Device)?;
+        self.trim_to(manager, desired)?;
+        Ok(outcomes)
+    }
+
+    /// Explicitly evicts every managed device copy outside `desired`.
+    pub fn trim_to<M: ResidencyWindowManager>(
+        &self,
+        manager: &M,
+        desired: &[OffloadUnitId],
+    ) -> Result<(), M::Error> {
+        let desired = desired.iter().collect::<BTreeSet<_>>();
+        for id in &self.units {
+            if !desired.contains(id) {
+                manager.evict(id, MemoryTier::Device)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clears protection and removes every managed device copy.
+    pub fn clear<M: ResidencyWindowManager>(&self, manager: &M) -> Result<(), M::Error> {
+        manager.prepare_window(&[], &[], MemoryTier::Device)?;
+        self.trim_to(manager, &[])
+    }
+}
+
+/// A named sequential execution stack with an independent device window.
+#[derive(Debug, Clone)]
+pub struct ResidentLayerGroup {
+    id: String,
+    window: DeviceLayerWindow,
+}
+
+impl ResidentLayerGroup {
+    /// Creates a named group over ordered residency units.
+    pub fn new(
+        id: impl Into<String>,
+        units: impl IntoIterator<Item = OffloadUnitId>,
+        depth: usize,
+    ) -> Result<Self, ResidencyWindowError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(ResidencyWindowError::InvalidGroupId);
+        }
+        Ok(Self {
+            id,
+            window: DeviceLayerWindow::new(units, depth)?,
+        })
+    }
+
+    /// Returns the stable group identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns ordered units in this group.
+    pub fn units(&self) -> &[OffloadUnitId] {
+        self.window.units()
+    }
+
+    /// Returns the configured device-unit bound.
+    pub const fn depth(&self) -> usize {
+        self.window.depth()
+    }
+
+    /// Prepares this group's window without replacing another group's window.
+    pub fn prepare<M: ResidencyWindowManager>(
+        &self,
+        manager: &M,
+        current: usize,
+    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, M::Error> {
+        let desired = self.window.desired(current).map_err(M::Error::from)?;
+        let outcomes =
+            manager.prepare_group_window(&self.id, desired, desired, MemoryTier::Device)?;
+        self.window.trim_to(manager, desired)?;
+        Ok(outcomes)
+    }
+
+    /// Trims this group to the desired window.
+    pub fn trim_to<M: ResidencyWindowManager>(
+        &self,
+        manager: &M,
+        desired: &[OffloadUnitId],
+    ) -> Result<(), M::Error> {
+        self.window.trim_to(manager, desired)
+    }
+
+    /// Clears only this group's protection and device copies.
+    pub fn clear<M: ResidencyWindowManager>(&self, manager: &M) -> Result<(), M::Error> {
+        manager.prepare_group_window(&self.id, &[], &[], MemoryTier::Device)?;
+        self.window.trim_to(manager, &[])
+    }
+
+    /// Returns current logical residency attributed to this group's units.
+    pub fn report<M: ResidencyWindowManager>(
+        &self,
+        manager: &M,
+    ) -> Result<ResidentLayerGroupReport, M::Error> {
+        let ids = self.units().iter().collect::<BTreeSet<_>>();
+        let mut host_bytes = 0u64;
+        let mut device_bytes = 0u64;
+        let mut device_units = 0usize;
+        for unit in manager
+            .unit_reports()?
+            .iter()
+            .filter(|unit| ids.contains(unit.id()))
+        {
+            if unit.host_resident() {
+                host_bytes = host_bytes
+                    .checked_add(unit.host_allocated_bytes())
+                    .ok_or(ResidencyWindowError::ArithmeticOverflow {
+                        context: "execution group host bytes",
+                    })
+                    .map_err(M::Error::from)?;
+            }
+            if unit.device_resident() {
+                device_bytes = device_bytes
+                    .checked_add(unit.device_allocated_bytes())
+                    .ok_or(ResidencyWindowError::ArithmeticOverflow {
+                        context: "execution group device bytes",
+                    })
+                    .map_err(M::Error::from)?;
+                device_units += 1;
+            }
+        }
+        Ok(ResidentLayerGroupReport {
+            id: self.id.clone(),
+            ordered_units: self.units().len(),
+            window_depth: self.depth(),
+            host_bytes,
+            device_bytes,
+            device_units,
+        })
+    }
+}
+
+/// Logical residency attributed to one named execution group.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResidentLayerGroupReport {
+    id: String,
+    ordered_units: usize,
+    window_depth: usize,
+    host_bytes: u64,
+    device_bytes: u64,
+    device_units: usize,
+}
+
+impl ResidentLayerGroupReport {
+    /// Returns the group identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    /// Returns the number of ordered units.
+    pub const fn ordered_units(&self) -> usize {
+        self.ordered_units
+    }
+    /// Returns the configured maximum device-unit count.
+    pub const fn window_depth(&self) -> usize {
+        self.window_depth
+    }
+    /// Returns current physical host allocation capacity for group units.
+    pub const fn host_bytes(&self) -> u64 {
+        self.host_bytes
+    }
+    /// Returns current device-resident bytes for group units.
+    pub const fn device_bytes(&self) -> u64 {
+        self.device_bytes
+    }
+    /// Returns current device-resident group units.
+    pub const fn device_units(&self) -> usize {
+        self.device_units
+    }
+}
+
+/// Invalid ordered residency-window configuration or accounting.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum ResidencyWindowError {
+    /// A layer window had no units.
+    #[error("device layer window requires at least one ordered unit")]
+    EmptyLayerWindow,
+    /// A device window depth was zero or exceeded its unit count.
+    #[error("device layer window depth {depth} exceeds {layer_count} ordered units")]
+    OversizedLayerWindow {
+        /// Requested resident-unit bound.
+        depth: usize,
+        /// Available ordered units.
+        layer_count: usize,
+    },
+    /// A requested current unit was outside the sequence.
+    #[error("device layer index {index} is outside {layer_count} ordered units")]
+    InvalidLayerIndex {
+        /// Requested index.
+        index: usize,
+        /// Available ordered units.
+        layer_count: usize,
+    },
+    /// An ordered layer window repeated a unit identifier.
+    #[error("device layer window contains duplicate unit {id}")]
+    DuplicateLayerWindowUnit {
+        /// Duplicated identifier.
+        id: OffloadUnitId,
+    },
+    /// A named execution group had an empty identifier.
+    #[error("residency window group identifiers must not be empty")]
+    InvalidGroupId,
+    /// Checked group accounting overflowed.
+    #[error("residency window arithmetic overflow: {context}")]
+    ArithmeticOverflow {
+        /// Calculation that overflowed.
+        context: &'static str,
+    },
+}
+
 impl OffloadUnit {
     /// Creates a non-empty unit and sorts bindings by local name.
     pub fn new(
@@ -436,12 +746,66 @@ pub enum ResidencyDeclarationError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use eredu_checkpoint::{store::TensorMetadata, StoredDtype};
     use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitSpec, ResidencyPolicy};
 
     use super::*;
 
     struct Catalog(BTreeMap<String, TensorMetadata>);
+
+    #[derive(Default)]
+    struct WindowManager {
+        prepared: RefCell<Vec<(String, Vec<OffloadUnitId>)>>,
+        evicted: RefCell<Vec<OffloadUnitId>>,
+    }
+
+    impl ResidencyWindowManager for WindowManager {
+        type Error = ResidencyWindowError;
+
+        fn prepare_window(
+            &self,
+            active: &[OffloadUnitId],
+            _: &[OffloadUnitId],
+            _: MemoryTier,
+        ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, Self::Error> {
+            self.prepared
+                .borrow_mut()
+                .push(("default".into(), active.to_vec()));
+            Ok(active
+                .iter()
+                .cloned()
+                .map(|id| (id, PrefetchOutcome::Hit))
+                .collect())
+        }
+
+        fn prepare_group_window(
+            &self,
+            group: &str,
+            active: &[OffloadUnitId],
+            _: &[OffloadUnitId],
+            _: MemoryTier,
+        ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, Self::Error> {
+            self.prepared
+                .borrow_mut()
+                .push((group.to_owned(), active.to_vec()));
+            Ok(active
+                .iter()
+                .cloned()
+                .map(|id| (id, PrefetchOutcome::Miss))
+                .collect())
+        }
+
+        fn evict(&self, id: &OffloadUnitId, _: MemoryTier) -> Result<bool, Self::Error> {
+            self.evicted.borrow_mut().push(id.clone());
+            Ok(true)
+        }
+
+        fn unit_reports(&self) -> Result<Vec<UnitResidencyReport>, Self::Error> {
+            Ok(Vec::new())
+        }
+    }
 
     impl RecipeCatalog for Catalog {
         fn tensor_metadata(
@@ -579,5 +943,20 @@ mod tests {
             ResidencyController::new(&catalog, plan(16), [wrong_plan]),
             Err(ResidencyControllerError::UnitByteMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn named_windows_prepare_and_trim_without_backend_types() {
+        let ids = ["layer.0", "layer.1", "layer.2"].map(|id| OffloadUnitId::new(id).unwrap());
+        let group = ResidentLayerGroup::new("decoder", ids.clone(), 2).unwrap();
+        let manager = WindowManager::default();
+
+        assert_eq!(group.prepare(&manager, 1).unwrap().len(), 2);
+        assert_eq!(
+            manager.prepared.borrow()[0],
+            ("decoder".into(), vec![ids[1].clone(), ids[2].clone()])
+        );
+        assert_eq!(manager.evicted.borrow().as_slice(), &[ids[0].clone()]);
+        assert_eq!(group.report(&manager).unwrap().device_units(), 0);
     }
 }

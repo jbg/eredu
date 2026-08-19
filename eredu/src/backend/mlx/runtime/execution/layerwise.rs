@@ -41,7 +41,7 @@ use crate::{
     },
     backend::mlx::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyError, ResidencyManager, ResidencyReport,
-        ResidentLayerGroup, ResidentTransfer, ResidentUnitLease,
+        ResidentTransfer, ResidentUnitLease,
     },
     core::residency::BackgroundPrefetchReport,
     core::residency::{
@@ -49,6 +49,8 @@ use crate::{
         ResidencyLedgerError, ResidencyPolicy, TransferDirection,
     },
 };
+
+use eredu_runtime::ResidentLayerGroup;
 
 #[cfg(test)]
 use crate::backend::mlx::runtime::checkpoint::store::MemoryWeightStore;

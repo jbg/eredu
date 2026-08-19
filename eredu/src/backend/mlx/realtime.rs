@@ -170,10 +170,7 @@ impl MlxRealtimeModel {
     /// Returns per-group residency for the selected parameter policy.
     pub fn execution_group_reports(
         &self,
-    ) -> Result<
-        Option<Vec<crate::backend::mlx::runtime::residency::manager::ResidentLayerGroupReport>>,
-        Error,
-    > {
+    ) -> Result<Option<Vec<eredu_runtime::ResidentLayerGroupReport>>, Error> {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => {
                 model.execution_group_reports().map(Some)

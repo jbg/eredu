@@ -23,8 +23,9 @@ pub use parameter::{
     bind_materialized_unit, materialize_bindings, MaterializedUnit, ParameterOrchestrationError,
 };
 pub use residency::{
-    OffloadUnit, ResidencyController, ResidencyControllerError, ResidencyDeclarationError,
-    WeightBinding, WeightBindingSelectionError,
+    DeviceLayerWindow, OffloadUnit, ResidencyController, ResidencyControllerError,
+    ResidencyDeclarationError, ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup,
+    ResidentLayerGroupReport, WeightBinding, WeightBindingSelectionError,
 };
 
 /// Inspectable architecture/runtime topology without backend-native values.

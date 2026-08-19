@@ -34,11 +34,11 @@ use crate::{
         LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
     },
     backend::mlx::runtime::generation::sampler::Sampler,
-    backend::mlx::runtime::residency::manager::{
-        ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease,
-    },
+    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
     core::realtime::RealtimeSpeechConfig,
 };
+
+use eredu_runtime::ResidentLayerGroupReport;
 
 pub use crate::backend::mlx::architectures::moshi::model::{
     GenerationState, GenerationStepWithLogits, ModelArgs, MoshiCache, SampleStepOutput,
