@@ -208,6 +208,74 @@ pub(crate) fn neutral_parameter_states<M: Parameterized<Array>>(module: &M) -> V
     collector.states
 }
 
+/// SafeMLX module view over any backend-neutral parameterized value.
+///
+/// This is a reusable backend capability: architecture types retain their
+/// neutral parameter identities while legacy SafeMLX loading utilities can
+/// traverse the same native slots without rebuilding a parameter tree.
+#[derive(Debug, Clone)]
+pub struct MlxModule<M> {
+    /// Backend-neutral module specialized to MLX operators.
+    pub(crate) inner: M,
+}
+
+impl<M> MlxModule<M> {
+    /// Wraps a neutral module without changing its storage.
+    pub const fn new(inner: M) -> Self {
+        Self { inner }
+    }
+}
+
+impl<M> std::ops::Deref for MlxModule<M> {
+    type Target = M;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<M> std::ops::DerefMut for MlxModule<M> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<M: Parameterized<Array>> ModuleParameters for MlxModule<M> {
+    fn num_parameters(&self) -> usize {
+        neutral_parameter_refs(&self.inner, false).entries.len()
+    }
+
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        neutral_parameter_refs(&self.inner, false)
+    }
+
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        neutral_parameter_refs_mut(&mut self.inner)
+    }
+
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        neutral_parameter_refs(&self.inner, true)
+    }
+
+    fn freeze_parameters(&mut self, _recursive: bool) {
+        self.inner.set_trainable(false);
+    }
+
+    fn unfreeze_parameters(&mut self, _recursive: bool) {
+        self.inner.set_trainable(true);
+    }
+
+    fn all_frozen(&self) -> Option<bool> {
+        let states = neutral_parameter_states(&self.inner);
+        (!states.is_empty()).then(|| states.iter().all(|trainable| !trainable))
+    }
+
+    fn any_frozen(&self) -> Option<bool> {
+        let states = neutral_parameter_states(&self.inner);
+        (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
+    }
+}
+
 macro_rules! delegate_parameters {
     ($type:ty, $field:tt) => {
         impl ModuleParameters for $type {

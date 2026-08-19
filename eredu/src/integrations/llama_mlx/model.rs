@@ -18,19 +18,19 @@ use crate::{
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
 };
 
-type SharedTransformerBlock =
-    eredu_architectures::llama::TransformerBlock<crate::backend::mlx::nn::shared::MlxBackend>;
 /// MLX specialization of the backend-neutral Llama block input.
 pub type AttentionInput<'a, C> = eredu_architectures::llama::AttentionInput<'a, Array, C>;
 
 /// MLX specialization of one backend-neutral Llama decoder block.
-#[derive(Debug, Clone)]
-pub struct TransformerBlock {
-    /// Shared architecture implementation specialized to MLX operators.
-    pub inner: SharedTransformerBlock,
-}
+pub type TransformerBlock = crate::backend::mlx::nn::shared::MlxModule<
+    eredu_architectures::llama::TransformerBlock<crate::backend::mlx::nn::shared::MlxBackend>,
+>;
 
-impl TransformerBlock {
+impl
+    crate::backend::mlx::nn::shared::MlxModule<
+        eredu_architectures::llama::TransformerBlock<crate::backend::mlx::nn::shared::MlxBackend>,
+    >
+{
     pub(crate) fn new_for_layer(
         args: &ModelArgs,
         layer_index: i32,
@@ -41,7 +41,7 @@ impl TransformerBlock {
         eredu_architectures::llama::TransformerBlock::<crate::backend::mlx::nn::shared::MlxBackend>::new(
             args, layer, stream,
         )
-        .map(|inner| Self { inner })
+        .map(Self::new)
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
@@ -84,37 +84,6 @@ impl TransformerBlock {
                 stream,
             )
             .map_err(|error| Exception::custom(error.to_string()))
-    }
-}
-
-impl safemlx::module::ModuleParameters for TransformerBlock {
-    fn num_parameters(&self) -> usize {
-        crate::backend::mlx::nn::shared::neutral_parameter_refs(&self.inner, false)
-            .entries
-            .len()
-    }
-    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
-        crate::backend::mlx::nn::shared::neutral_parameter_refs(&self.inner, false)
-    }
-    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
-        crate::backend::mlx::nn::shared::neutral_parameter_refs_mut(&mut self.inner)
-    }
-    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
-        crate::backend::mlx::nn::shared::neutral_parameter_refs(&self.inner, true)
-    }
-    fn freeze_parameters(&mut self, _recursive: bool) {
-        eredu_nn::Parameterized::set_trainable(&mut self.inner, false);
-    }
-    fn unfreeze_parameters(&mut self, _recursive: bool) {
-        eredu_nn::Parameterized::set_trainable(&mut self.inner, true);
-    }
-    fn all_frozen(&self) -> Option<bool> {
-        let states = crate::backend::mlx::nn::shared::neutral_parameter_states(&self.inner);
-        (!states.is_empty()).then(|| states.iter().all(|trainable| !trainable))
-    }
-    fn any_frozen(&self) -> Option<bool> {
-        let states = crate::backend::mlx::nn::shared::neutral_parameter_states(&self.inner);
-        (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
     }
 }
 
