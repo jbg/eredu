@@ -8,6 +8,8 @@
 use eredu_gguf::{Endian, GgmlType};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
+/// Backend-neutral logical GGUF storage and portable encoded leases.
+pub mod gguf_store;
 pub mod recipe;
 pub mod schema;
 /// Backend-neutral checkpoint stores, selections, and encoded leases.

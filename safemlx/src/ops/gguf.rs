@@ -180,6 +180,13 @@ pub enum GgufTensor {
 }
 
 impl GgufTensor {
+    /// Converts a backend-neutral portable GGUF group into owned host-backed MLX arrays.
+    pub fn from_portable_host(
+        tensor: eredu_gguf::ConvertedCheckpointTensor,
+    ) -> Result<Self, IoError> {
+        convert_tensor(tensor, true)
+    }
+
     /// Name of the physical tensor in the GGUF file.
     pub fn physical_name(&self) -> &str {
         match self {

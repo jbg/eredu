@@ -249,6 +249,14 @@ pub enum StoreError {
     /// The catalog or mapping cache is internally unavailable.
     #[error("checkpoint store state is unavailable: {0}")]
     Internal(String),
+    /// A GGUF catalog, selection, or payload-read operation failed.
+    #[error("GGUF checkpoint operation failed for tensor {key:?}: {message}")]
+    Gguf {
+        /// Logical tensor involved, or an empty string for store-wide failures.
+        key: String,
+        /// Portable GGUF error detail.
+        message: String,
+    },
 }
 
 /// Default maximum number of simultaneously retained mapped shards.
@@ -759,7 +767,7 @@ fn metadata_for_parts(
     })
 }
 
-fn validate_selection(
+pub(crate) fn validate_selection(
     key: &str,
     shape: &[usize],
     selection: &TensorSelection,

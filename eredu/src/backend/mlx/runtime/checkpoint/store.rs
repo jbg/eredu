@@ -11,31 +11,32 @@ pub use eredu_checkpoint::store::{
     WeightStoreDiagnostics,
 };
 use eredu_checkpoint::{
+    gguf_store::{
+        GgufLease as NeutralGgufLease, GgufWeightStore as NeutralGgufWeightStore,
+        GgufWeightStoreBuilder as NeutralGgufWeightStoreBuilder,
+    },
     store::{EncodedTensorLease, SafetensorsLease as NeutralSafetensorsLease, TensorReadRequest},
     StoredDtype,
 };
 
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, Weak,
-    },
+    sync::{Arc, Mutex, Weak},
 };
 
-use eredu_core::DEFAULT_MAX_MAPPED_SHARDS;
 use safemlx::{
-    ops::{
-        indexing::TryIndexOp, GgufCheckpoint, GgufDenseTensorSpan, GgufDenseTensorSpanPlan,
-        GgufLogicalDtype, GgufMaterializer, GgufTensor, GgufTensorDescriptor, GgufTensorSelection,
-        GgufTensorSelectionPlan,
-    },
+    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufTensor},
     transforms::async_eval_with_event,
     Array, Event, Stream,
 };
 use safetensors::tensor::{Dtype, TensorView};
+
+#[cfg(test)]
+use eredu_checkpoint::gguf_store::GgufPhysicalSelection;
+#[cfg(test)]
+use safemlx::ops::GgufTensorSelection;
 
 fn safetensors_dtype(key: &str, value: &StoredDtype) -> Result<Dtype, WeightStoreError> {
     match value {
@@ -563,85 +564,29 @@ fn stored_dtype_for_array(value: &Array) -> StoredDtype {
     }
 }
 
-#[derive(Debug, Clone)]
-struct GgufCatalogEntry {
-    checkpoint: usize,
-    physical_name: String,
-    original_name: String,
-    metadata: WeightMetadata,
-    physical_descriptor: GgufTensorDescriptor,
-    logical_last_units_per_block: Option<usize>,
-}
-
-#[derive(Debug, Default)]
-struct GgufStoreStatistics {
-    physical_reads: AtomicU64,
-    physical_read_bytes: AtomicU64,
-    coalesced_group_hits: AtomicU64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct GgufGroupCacheKey {
-    checkpoint: usize,
-    physical_name: String,
-    selection: Option<GgufPhysicalSelection>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-enum GgufPhysicalSelection {
-    Axis(GgufTensorSelection),
-    DenseSpan(GgufDenseTensorSpan),
-}
-
 #[derive(Debug)]
 struct CachedGgufGroup {
     arrays: Vec<(String, Array)>,
 }
 
-#[derive(Debug)]
-struct GgufReaderCache {
-    materializers: Vec<GgufMaterializer>,
-    last_used: Vec<u64>,
-    touched: BTreeSet<PathBuf>,
-    tick: u64,
-    hits: u64,
-    misses: u64,
-    evictions: u64,
-}
-
-#[derive(Debug)]
-struct GgufStoreInner {
-    catalog: BTreeMap<String, GgufCatalogEntry>,
-    unclaimed_keys: BTreeSet<String>,
-    readers: Mutex<GgufReaderCache>,
-    max_cached_readers: usize,
-    converted_groups: Mutex<BTreeMap<GgufGroupCacheKey, Weak<CachedGgufGroup>>>,
-    statistics: GgufStoreStatistics,
-}
-
-/// Builder for a logical GGUF store backed by one or more checkpoints.
+/// Builder adapter preserving the MLX loader API while delegating GGUF
+/// inspection and acquisition to the backend-neutral checkpoint crate.
 #[derive(Debug, Default)]
 pub(crate) struct GgufWeightStoreBuilder {
-    checkpoints: Vec<GgufCheckpoint>,
-    catalog: BTreeMap<String, GgufCatalogEntry>,
-    unclaimed_keys: BTreeSet<String>,
-    max_cached_readers: usize,
+    inner: NeutralGgufWeightStoreBuilder,
 }
 
 impl GgufWeightStoreBuilder {
-    /// Sets the nonzero bound shared with mapped-shard loader controls.
     pub(crate) fn max_cached_readers(mut self, maximum: usize) -> Result<Self, WeightStoreError> {
-        if maximum == 0 {
-            return Err(WeightStoreError::InvalidMappedShardLimit);
-        }
-        self.max_cached_readers = maximum;
+        self.inner = self
+            .inner
+            .max_cached_readers(maximum)
+            .map_err(neutral_store_error)?;
         Ok(self)
     }
 
-    /// Resolves one architecture contract, then translates only outputs from
-    /// the selected physical layout into the logical catalog.
     pub(crate) fn add_checkpoint<F>(
-        self,
+        mut self,
         checkpoint: GgufCheckpoint,
         plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
         translate: F,
@@ -649,102 +594,16 @@ impl GgufWeightStoreBuilder {
     where
         F: FnMut(&str) -> String,
     {
-        let resolved = crate::backend::mlx::runtime::checkpoint::validation::resolve_gguf_plan(
-            &checkpoint,
-            plan,
-        )
-        .map_err(|validation| WeightStoreError::Gguf {
-            key: String::new(),
-            message: format!(
-                "checkpoint contract {:?} did not resolve: {validation:?}",
-                plan.identity
-            ),
-        })?;
-        self.add_resolved_checkpoint(checkpoint, &resolved, translate)
-    }
-
-    fn add_resolved_checkpoint<F>(
-        mut self,
-        checkpoint: GgufCheckpoint,
-        resolved: &crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan,
-        mut translate: F,
-    ) -> Result<Self, WeightStoreError>
-    where
-        F: FnMut(&str) -> String,
-    {
-        let checkpoint_index = self.checkpoints.len();
-        for shard in checkpoint.catalog().shards() {
-            for tensor in shard.tensors() {
-                let physical_name = &tensor.descriptor().name;
-                let selected = resolved.source_keys().contains(physical_name);
-                let unclaimed = resolved.unclaimed_keys().contains(physical_name);
-                if !selected && !unclaimed {
-                    continue;
-                }
-                let physical_descriptor = tensor.descriptor().clone();
-                for output in tensor.outputs() {
-                    let name = translate(&output.name);
-                    if unclaimed {
-                        self.unclaimed_keys.insert(name);
-                        continue;
-                    }
-                    if self.catalog.contains_key(&name) {
-                        return Err(WeightStoreError::Gguf {
-                            key: name,
-                            message: "translated logical tensor collides with an existing output"
-                                .into(),
-                        });
-                    }
-                    let shape = output
-                        .shape
-                        .iter()
-                        .map(|dimension| {
-                            usize::try_from(*dimension).map_err(|_| WeightStoreError::Overflow {
-                                context: format!("GGUF logical shape for tensor {:?}", output.name),
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let width = logical_dtype_width(output.dtype);
-                    let logical_byte_len = shape.iter().try_fold(width, |bytes, dimension| {
-                        bytes
-                            .checked_mul(*dimension)
-                            .ok_or_else(|| WeightStoreError::Overflow {
-                                context: format!(
-                                    "GGUF logical byte length for tensor {:?}",
-                                    output.name
-                                ),
-                            })
-                    })?;
-                    let logical_last_units_per_block =
-                        gguf_logical_units_per_block(&output.name, &physical_descriptor, &shape)?;
-                    let metadata = WeightMetadata {
-                        name: name.clone(),
-                        shape,
-                        stored_dtype: stored_dtype_for_logical(output.dtype),
-                        logical_byte_len,
-                        backing_shard: Some(shard.path().to_path_buf()),
-                    };
-                    self.catalog.insert(
-                        name,
-                        GgufCatalogEntry {
-                            checkpoint: checkpoint_index,
-                            physical_name: tensor.descriptor().name.clone(),
-                            original_name: output.name.clone(),
-                            metadata,
-                            physical_descriptor: physical_descriptor.clone(),
-                            logical_last_units_per_block,
-                        },
-                    );
-                }
-            }
-        }
-        self.checkpoints.push(checkpoint);
+        self.inner = self
+            .inner
+            .add_checkpoint(checkpoint.catalog().clone(), plan, translate)
+            .map_err(neutral_store_error)?;
         Ok(self)
     }
 
     #[cfg(test)]
     fn add_checkpoint_for_test<F>(
-        self,
+        mut self,
         checkpoint: GgufCheckpoint,
         translate: F,
     ) -> Result<Self, WeightStoreError>
@@ -759,61 +618,35 @@ impl GgufWeightStoreBuilder {
                     .tensors()
                     .map(|tensor| tensor.descriptor().name.clone()),
             );
-        self.add_resolved_checkpoint(checkpoint, &resolved, translate)
+        self.inner = self
+            .inner
+            .add_resolved_checkpoint(checkpoint.catalog().clone(), &resolved, translate)
+            .map_err(neutral_store_error)?;
+        Ok(self)
     }
 
-    /// Builds a non-empty immutable logical checkpoint store.
     pub(crate) fn build(self) -> Result<GgufWeightStore, WeightStoreError> {
-        if self.catalog.is_empty() {
-            return Err(WeightStoreError::Gguf {
-                key: String::new(),
-                message: "GGUF logical catalog is empty".into(),
-            });
-        }
-        let materializers = self
-            .checkpoints
-            .iter()
-            .map(GgufCheckpoint::materializer)
-            .collect::<Vec<_>>();
-        let materializer_count = materializers.len();
         Ok(GgufWeightStore {
-            inner: Arc::new(GgufStoreInner {
-                catalog: self.catalog,
-                unclaimed_keys: self.unclaimed_keys,
-                readers: Mutex::new(GgufReaderCache {
-                    materializers,
-                    last_used: vec![0; materializer_count],
-                    touched: BTreeSet::new(),
-                    tick: 0,
-                    hits: 0,
-                    misses: 0,
-                    evictions: 0,
-                }),
-                max_cached_readers: if self.max_cached_readers == 0 {
-                    DEFAULT_MAX_MAPPED_SHARDS
-                } else {
-                    self.max_cached_readers
-                },
-                converted_groups: Mutex::new(BTreeMap::new()),
-                statistics: GgufStoreStatistics::default(),
-            }),
+            inner: self.inner.build().map_err(neutral_store_error)?,
+            converted_groups: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 }
 
-/// Persistent logical tensor store backed by one or more GGUF checkpoints.
+/// MLX materialization adapter over the backend-neutral GGUF store.
 #[derive(Debug, Clone)]
 pub(crate) struct GgufWeightStore {
-    inner: Arc<GgufStoreInner>,
+    inner: NeutralGgufWeightStore,
+    converted_groups: Arc<
+        Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
+    >,
 }
 
 impl GgufWeightStore {
-    /// Starts a multi-checkpoint GGUF store builder.
     pub(crate) fn builder() -> GgufWeightStoreBuilder {
         GgufWeightStoreBuilder::default()
     }
 
-    /// Creates a single-checkpoint store with an explicit cached-reader bound.
     pub(crate) fn new_with_max_mapped_shards<F>(
         checkpoint: GgufCheckpoint,
         plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
@@ -837,89 +670,9 @@ impl GgufWeightStore {
     where
         F: FnMut(&str) -> String,
     {
-        let resolved =
-            crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan::for_test(
-                "test GGUF catalog",
-                checkpoint
-                    .catalog()
-                    .tensors()
-                    .map(|tensor| tensor.descriptor().name.clone()),
-            );
         Self::builder()
-            .add_resolved_checkpoint(checkpoint, &resolved, translate)?
+            .add_checkpoint_for_test(checkpoint, translate)?
             .build()
-    }
-}
-
-impl GgufReaderCache {
-    fn materialize(
-        &mut self,
-        checkpoint: usize,
-        physical_name: &str,
-        selection: Option<&GgufPhysicalSelection>,
-        max_cached_readers: usize,
-        logical_key: &str,
-    ) -> Result<GgufTensor, WeightStoreError> {
-        let target_path = self
-            .materializers
-            .get(checkpoint)
-            .ok_or_else(|| WeightStoreError::Gguf {
-                key: logical_key.to_string(),
-                message: "logical catalog references an unknown checkpoint".into(),
-            })?
-            .shard_path_for_tensor(physical_name)
-            .map_err(|error| WeightStoreError::Gguf {
-                key: logical_key.to_string(),
-                message: error.to_string(),
-            })?
-            .to_path_buf();
-        let reader_hit = self.materializers[checkpoint]
-            .open_shard_path()
-            .is_some_and(|path| path == target_path);
-        self.tick = self.tick.saturating_add(1);
-        if reader_hit {
-            self.hits = self.hits.saturating_add(1);
-        } else {
-            self.misses = self.misses.saturating_add(1);
-            if self.materializers[checkpoint].close_reader().is_some() {
-                self.evictions = self.evictions.saturating_add(1);
-            }
-            if self
-                .materializers
-                .iter()
-                .filter(|materializer| materializer.open_shard_path().is_some())
-                .count()
-                >= max_cached_readers
-            {
-                let victim = self
-                    .materializers
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, materializer)| materializer.open_shard_path().is_some())
-                    .min_by_key(|(index, _)| (self.last_used[*index], *index))
-                    .map(|(index, _)| index)
-                    .expect("a reader exists at the configured cache bound");
-                self.materializers[victim].close_reader();
-                self.evictions = self.evictions.saturating_add(1);
-            }
-        }
-        self.last_used[checkpoint] = self.tick;
-        let materializer = &mut self.materializers[checkpoint];
-        let converted = match selection {
-            Some(GgufPhysicalSelection::Axis(selection)) => {
-                materializer.converted_tensor_selected_host(physical_name, selection)
-            }
-            Some(GgufPhysicalSelection::DenseSpan(selection)) => {
-                materializer.converted_dense_tensor_span_host(physical_name, selection)
-            }
-            None => materializer.converted_tensor_host(physical_name),
-        }
-        .map_err(|error| WeightStoreError::Gguf {
-            key: logical_key.to_string(),
-            message: error.to_string(),
-        })?;
-        self.touched.insert(target_path);
-        Ok(converted)
     }
 }
 
@@ -937,21 +690,17 @@ impl WeightStore for GgufWeightStore {
     }
 
     fn keys(&self) -> Vec<String> {
-        self.inner.catalog.keys().cloned().collect()
+        eredu_checkpoint::store::WeightStore::keys(&self.inner)
     }
 
     fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
-        self.inner.unclaimed_keys.iter().cloned().collect()
+        self.inner.unclaimed_checkpoint_keys()
     }
 
     fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
-        self.inner
-            .catalog
-            .get(key)
-            .map(|entry| entry.metadata.clone())
-            .ok_or_else(|| WeightStoreError::UnknownTensor {
-                key: key.to_string(),
-            })
+        eredu_checkpoint::store::WeightStore::metadata(&self.inner, key)
+            .map(neutral_metadata)
+            .map_err(neutral_store_error)
     }
 
     fn acquire_with_policy(
@@ -960,354 +709,36 @@ impl WeightStore for GgufWeightStore {
         selection: TensorSelection,
         policy: WeightReadPolicy,
     ) -> Result<WeightLease, WeightStoreError> {
-        let entry = self.inner.catalog.get(key).cloned().ok_or_else(|| {
-            WeightStoreError::UnknownTensor {
-                key: key.to_string(),
-            }
-        })?;
-        let output_shape = validate_selection(key, &entry.metadata.shape, &selection)?;
-        let selected_byte_len = selected_byte_len(key, &entry.metadata, &selection, &output_shape)?;
-        let physical = match plan_bounded_gguf_selection(key, &entry, &selection) {
-            Ok(plan) => plan,
-            Err(WeightStoreError::BoundedSelectionUnavailable { .. })
-                if policy == WeightReadPolicy::AllowFullTensorRead =>
-            {
-                GgufReadPlan {
-                    physical_selection: None,
-                    physical_byte_len: entry.physical_descriptor.byte_len,
-                    selection_is_materialized: false,
-                }
-            }
-            Err(error) => return Err(error),
-        };
+        let lease = eredu_checkpoint::store::WeightStore::acquire(
+            &self.inner,
+            TensorReadRequest {
+                key: key.into(),
+                selection: selection.clone(),
+                policy,
+            },
+        )
+        .map_err(neutral_store_error)?;
+        let metadata = neutral_metadata(lease.metadata().clone());
+        let selected_byte_len =
+            selected_byte_len(key, &metadata, &selection, lease.output_shape())?;
         Ok(WeightLease {
-            key: key.to_string(),
-            metadata: entry.metadata.clone(),
+            key: key.into(),
+            metadata,
             selection,
-            output_shape,
+            output_shape: lease.output_shape().to_vec(),
             selected_byte_len,
             source: WeightLeaseSource::Gguf(Box::new(GgufLeaseSource {
-                store: Arc::clone(&self.inner),
-                entry,
-                physical_selection: physical.physical_selection,
-                physical_byte_len: physical.physical_byte_len,
-                selection_is_materialized: physical.selection_is_materialized,
+                lease,
+                converted_groups: Arc::clone(&self.converted_groups),
             })),
         })
     }
 
     fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
-        let readers = self
-            .inner
-            .readers
-            .lock()
-            .map_err(|_| WeightStoreError::CachePoisoned)?;
-        Ok(WeightStoreDiagnostics {
-            backend: WeightStoreBackend::Gguf,
-            mapping_hits: readers.hits,
-            mapping_misses: readers.misses,
-            evictions: readers.evictions,
-            currently_mapped_shards: readers
-                .materializers
-                .iter()
-                .filter(|materializer| materializer.open_shard_path().is_some())
-                .count(),
-            touched_shard_paths: readers.touched.iter().cloned().collect(),
-            physical_reads: self.inner.statistics.physical_reads.load(Ordering::Relaxed),
-            physical_read_bytes: self
-                .inner
-                .statistics
-                .physical_read_bytes
-                .load(Ordering::Relaxed),
-            coalesced_group_hits: self
-                .inner
-                .statistics
-                .coalesced_group_hits
-                .load(Ordering::Relaxed),
-        })
+        eredu_checkpoint::store::WeightStore::diagnostics(&self.inner).map_err(neutral_store_error)
     }
 }
 
-struct GgufReadPlan {
-    physical_selection: Option<GgufPhysicalSelection>,
-    physical_byte_len: u64,
-    selection_is_materialized: bool,
-}
-
-fn plan_bounded_gguf_selection(
-    key: &str,
-    entry: &GgufCatalogEntry,
-    selection: &TensorSelection,
-) -> Result<GgufReadPlan, WeightStoreError> {
-    if matches!(selection, TensorSelection::Full) {
-        return Ok(GgufReadPlan {
-            physical_selection: None,
-            physical_byte_len: entry.physical_descriptor.byte_len,
-            selection_is_materialized: true,
-        });
-    }
-    if let TensorSelection::Contiguous {
-        offset_elements,
-        shape,
-    } = selection
-    {
-        let offset_elements =
-            u64::try_from(*offset_elements).map_err(|_| WeightStoreError::Overflow {
-                context: format!("GGUF contiguous offset for tensor {key:?}"),
-            })?;
-        let shape = shape
-            .iter()
-            .map(|dimension| {
-                u64::try_from(*dimension).map_err(|_| WeightStoreError::Overflow {
-                    context: format!("GGUF contiguous shape for tensor {key:?}"),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let selection = GgufDenseTensorSpan::new(offset_elements, shape).map_err(|error| {
-            WeightStoreError::BoundedSelectionUnavailable {
-                key: key.to_string(),
-                message: error.to_string(),
-            }
-        })?;
-        let plan = GgufDenseTensorSpanPlan::new(&entry.physical_descriptor, selection.clone())
-            .map_err(|error| WeightStoreError::BoundedSelectionUnavailable {
-                key: key.to_string(),
-                message: error.to_string(),
-            })?;
-        return Ok(GgufReadPlan {
-            physical_selection: Some(GgufPhysicalSelection::DenseSpan(selection)),
-            physical_byte_len: plan.encoded_byte_len(),
-            selection_is_materialized: true,
-        });
-    }
-    let rank = entry.metadata.shape.len();
-    let logical_axis = match selection {
-        TensorSelection::Full => unreachable!("full selections returned above"),
-        TensorSelection::Range { axis, .. } | TensorSelection::Indices { axis, .. } => *axis,
-        TensorSelection::Contiguous { .. } => unreachable!("rejected above"),
-    };
-    let physical_selection = if logical_axis + 1 != rank {
-        match selection {
-            TensorSelection::Full => unreachable!("full selections returned above"),
-            TensorSelection::Range { axis, start, end } => GgufTensorSelection::Range {
-                axis: *axis,
-                start: *start,
-                end: *end,
-            },
-            TensorSelection::Indices { axis, indices } => GgufTensorSelection::Indices {
-                axis: *axis,
-                indices: indices.clone(),
-            },
-            TensorSelection::Contiguous { .. } => unreachable!("rejected above"),
-        }
-    } else {
-        map_gguf_innermost_selection(key, entry, selection)?
-    };
-    let plan = GgufTensorSelectionPlan::new(&entry.physical_descriptor, physical_selection.clone())
-        .map_err(|error| WeightStoreError::BoundedSelectionUnavailable {
-            key: key.to_string(),
-            message: error.to_string(),
-        })?;
-    Ok(GgufReadPlan {
-        physical_selection: Some(GgufPhysicalSelection::Axis(physical_selection)),
-        physical_byte_len: plan.encoded_byte_len(),
-        selection_is_materialized: true,
-    })
-}
-
-fn map_gguf_innermost_selection(
-    key: &str,
-    entry: &GgufCatalogEntry,
-    selection: &TensorSelection,
-) -> Result<GgufTensorSelection, WeightStoreError> {
-    let logical_units = entry.logical_last_units_per_block.ok_or_else(|| {
-        WeightStoreError::BoundedSelectionUnavailable {
-            key: key.to_string(),
-            message: "scalar GGUF output has no selectable innermost axis".into(),
-        }
-    })?;
-    let (block_values, _) = entry
-        .physical_descriptor
-        .ggml_type
-        .block_and_bytes()
-        .map_err(|error| WeightStoreError::Gguf {
-            key: key.to_string(),
-            message: error.to_string(),
-        })?;
-    let block_values = usize::try_from(block_values).map_err(|_| WeightStoreError::Overflow {
-        context: format!("GGUF block length for tensor {key:?}"),
-    })?;
-    let axis = entry.metadata.shape.len() - 1;
-    match selection {
-        TensorSelection::Range { start, end, .. } => {
-            if start % logical_units != 0 || end % logical_units != 0 {
-                return Err(WeightStoreError::BoundedSelectionUnavailable {
-                    key: key.to_string(),
-                    message: format!(
-                        "logical innermost range {start}..{end} must align to {logical_units} converted units per native GGUF block"
-                    ),
-                });
-            }
-            let physical_start = (start / logical_units)
-                .checked_mul(block_values)
-                .ok_or_else(|| WeightStoreError::Overflow {
-                    context: format!("GGUF physical selection start for tensor {key:?}"),
-                })?;
-            let physical_end =
-                (end / logical_units)
-                    .checked_mul(block_values)
-                    .ok_or_else(|| WeightStoreError::Overflow {
-                        context: format!("GGUF physical selection end for tensor {key:?}"),
-                    })?;
-            Ok(GgufTensorSelection::Range {
-                axis,
-                start: physical_start,
-                end: physical_end,
-            })
-        }
-        TensorSelection::Indices { indices, .. } => {
-            if !indices.len().is_multiple_of(logical_units) {
-                return Err(WeightStoreError::BoundedSelectionUnavailable {
-                    key: key.to_string(),
-                    message: format!(
-                        "logical innermost indices must contain complete {logical_units}-unit converted GGUF blocks"
-                    ),
-                });
-            }
-            let block_count = indices.len() / logical_units;
-            let physical_count = block_count.checked_mul(block_values).ok_or_else(|| {
-                WeightStoreError::Overflow {
-                    context: format!("GGUF physical index count for tensor {key:?}"),
-                }
-            })?;
-            let mut physical_indices = Vec::new();
-            physical_indices
-                .try_reserve_exact(physical_count)
-                .map_err(|_| WeightStoreError::Overflow {
-                    context: format!("GGUF physical indices for tensor {key:?}"),
-                })?;
-            for logical_block in indices.chunks_exact(logical_units) {
-                let logical_start = logical_block[0];
-                if logical_start % logical_units != 0
-                    || logical_block
-                        .iter()
-                        .copied()
-                        .ne(logical_start..logical_start + logical_units)
-                {
-                    return Err(WeightStoreError::BoundedSelectionUnavailable {
-                        key: key.to_string(),
-                        message: format!(
-                            "logical innermost indices must preserve every complete aligned {logical_units}-unit converted GGUF block"
-                        ),
-                    });
-                }
-                let physical_start = (logical_start / logical_units)
-                    .checked_mul(block_values)
-                    .ok_or_else(|| WeightStoreError::Overflow {
-                        context: format!("GGUF physical index start for tensor {key:?}"),
-                    })?;
-                physical_indices.extend(physical_start..physical_start + block_values);
-            }
-            Ok(GgufTensorSelection::Indices {
-                axis,
-                indices: physical_indices,
-            })
-        }
-        TensorSelection::Full => unreachable!("full selections are not mapped"),
-        TensorSelection::Contiguous { .. } => {
-            unreachable!("contiguous selections are rejected before innermost mapping")
-        }
-    }
-}
-
-fn logical_dtype_width(dtype: GgufLogicalDtype) -> usize {
-    match dtype {
-        GgufLogicalDtype::U8 | GgufLogicalDtype::I8 => 1,
-        GgufLogicalDtype::F16 | GgufLogicalDtype::Bf16 | GgufLogicalDtype::I16 => 2,
-        GgufLogicalDtype::F32 | GgufLogicalDtype::U32 | GgufLogicalDtype::I32 => 4,
-        GgufLogicalDtype::I64 | GgufLogicalDtype::F64 => 8,
-    }
-}
-
-fn gguf_logical_units_per_block(
-    logical_name: &str,
-    descriptor: &GgufTensorDescriptor,
-    logical_shape: &[usize],
-) -> Result<Option<usize>, WeightStoreError> {
-    let physical_shape = descriptor
-        .mlx_shape()
-        .into_iter()
-        .map(|dimension| {
-            usize::try_from(dimension).map_err(|_| WeightStoreError::Overflow {
-                context: format!("GGUF physical shape for tensor {logical_name:?}"),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if physical_shape.len() != logical_shape.len()
-        || physical_shape
-            .iter()
-            .zip(logical_shape)
-            .take(physical_shape.len().saturating_sub(1))
-            .any(|(physical, logical)| physical != logical)
-    {
-        return Err(WeightStoreError::Gguf {
-            key: logical_name.to_string(),
-            message: format!(
-                "logical shape {logical_shape:?} is not an innermost-axis projection of physical shape {physical_shape:?}"
-            ),
-        });
-    }
-    let (Some(&physical_last), Some(&logical_last)) = (physical_shape.last(), logical_shape.last())
-    else {
-        return Ok(None);
-    };
-    let (block_values, _) =
-        descriptor
-            .ggml_type
-            .block_and_bytes()
-            .map_err(|error| WeightStoreError::Gguf {
-                key: logical_name.to_string(),
-                message: error.to_string(),
-            })?;
-    let block_values = usize::try_from(block_values).map_err(|_| WeightStoreError::Overflow {
-        context: format!("GGUF block length for tensor {logical_name:?}"),
-    })?;
-    if !physical_last.is_multiple_of(block_values) {
-        return Err(WeightStoreError::Gguf {
-            key: logical_name.to_string(),
-            message: format!(
-                "physical innermost dimension {physical_last} is not divisible by block length {block_values}"
-            ),
-        });
-    }
-    let physical_blocks = physical_last / block_values;
-    if physical_blocks == 0 || !logical_last.is_multiple_of(physical_blocks) {
-        return Err(WeightStoreError::Gguf {
-            key: logical_name.to_string(),
-            message: format!(
-                "logical innermost dimension {logical_last} cannot be mapped across {physical_blocks} physical blocks"
-            ),
-        });
-    }
-    Ok(Some(logical_last / physical_blocks))
-}
-
-fn stored_dtype_for_logical(dtype: GgufLogicalDtype) -> StoredDtype {
-    match dtype {
-        GgufLogicalDtype::F32 => StoredDtype::F32,
-        GgufLogicalDtype::F16 => StoredDtype::F16,
-        GgufLogicalDtype::Bf16 => StoredDtype::BF16,
-        GgufLogicalDtype::U8 => StoredDtype::U8,
-        GgufLogicalDtype::I8 => StoredDtype::I8,
-        GgufLogicalDtype::I16 => StoredDtype::I16,
-        GgufLogicalDtype::U32 => StoredDtype::U32,
-        GgufLogicalDtype::I32 => StoredDtype::I32,
-        GgufLogicalDtype::I64 => StoredDtype::I64,
-        GgufLogicalDtype::F64 => StoredDtype::F64,
-    }
-}
-
-/// Adapts the neutral SafeTensors store to the existing MLX materialization boundary.
 impl WeightStore for SafetensorsWeightStore {
     fn backend(&self) -> WeightStoreBackend {
         WeightStoreBackend::Safetensors
@@ -1364,6 +795,7 @@ impl WeightStore for SafetensorsWeightStore {
     }
 }
 
+#[cfg(test)]
 fn validate_selection(
     key: &str,
     shape: &[usize],
@@ -1519,6 +951,7 @@ pub(crate) fn neutral_store_error(error: eredu_checkpoint::store::StoreError) ->
             WeightStoreError::MalformedSafetensors { path, message }
         }
         StoreError::Internal(_) => WeightStoreError::CachePoisoned,
+        StoreError::Gguf { key, message } => WeightStoreError::Gguf { key, message },
     }
 }
 #[derive(Debug, Clone)]
@@ -1538,11 +971,10 @@ struct MemoryLeaseSource {
 
 #[derive(Debug, Clone)]
 struct GgufLeaseSource {
-    store: Arc<GgufStoreInner>,
-    entry: GgufCatalogEntry,
-    physical_selection: Option<GgufPhysicalSelection>,
-    physical_byte_len: u64,
-    selection_is_materialized: bool,
+    lease: NeutralGgufLease,
+    converted_groups: Arc<
+        Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
+    >,
 }
 
 /// A validated selection that pins its mapped payload shard.
@@ -1596,10 +1028,8 @@ impl WeightLease {
                 .backing_path()
                 .expect("SafeTensors leases are file-backed"),
             WeightLeaseSource::Gguf(source) => source
-                .entry
-                .metadata
-                .backing_shard
-                .as_deref()
+                .lease
+                .backing_path()
                 .expect("GGUF catalog entries always identify their shard"),
             #[cfg(test)]
             WeightLeaseSource::Memory(source) => source.backing.as_path(),
@@ -1823,48 +1253,27 @@ impl WeightLease {
         execution_stream: &Stream,
     ) -> Result<PendingWeightMaterialization, WeightStoreError> {
         let GgufLeaseSource {
-            store,
-            entry,
-            physical_selection,
-            physical_byte_len,
-            selection_is_materialized,
+            lease,
+            converted_groups,
         } = source;
-        let cache_key = GgufGroupCacheKey {
-            checkpoint: entry.checkpoint,
-            physical_name: entry.physical_name.clone(),
-            selection: physical_selection.clone(),
-        };
-        let mut groups = store
-            .converted_groups
+        let cache_key = lease.identity().clone();
+        let selection_is_materialized = lease.selection_is_materialized();
+        let logical_output_name = lease.logical_output_name().to_owned();
+        let mut groups = converted_groups
             .lock()
             .map_err(|_| WeightStoreError::CachePoisoned)?;
         groups.retain(|_, group| group.strong_count() > 0);
         let group = if let Some(cached) = groups.get(&cache_key).and_then(Weak::upgrade) {
-            store
-                .statistics
-                .coalesced_group_hits
-                .fetch_add(1, Ordering::Relaxed);
+            lease.record_coalesced_group_hit();
             cached
         } else {
-            let converted = store
-                .readers
-                .lock()
-                .map_err(|_| WeightStoreError::CachePoisoned)?
-                .materialize(
-                    entry.checkpoint,
-                    &entry.physical_name,
-                    physical_selection.as_ref(),
-                    store.max_cached_readers,
-                    &self.key,
-                )?;
-            store
-                .statistics
-                .physical_reads
-                .fetch_add(1, Ordering::Relaxed);
-            store
-                .statistics
-                .physical_read_bytes
-                .fetch_add(physical_byte_len, Ordering::Relaxed);
+            let portable = lease.materialize_portable().map_err(neutral_store_error)?;
+            let converted = GgufTensor::from_portable_host(portable).map_err(|error| {
+                WeightStoreError::Gguf {
+                    key: self.key.clone(),
+                    message: error.to_string(),
+                }
+            })?;
             let cached = Arc::new(CachedGgufGroup {
                 arrays: converted.into_arrays(),
             });
@@ -1875,12 +1284,11 @@ impl WeightLease {
         let source_value = group
             .arrays
             .iter()
-            .find_map(|(name, value)| (name == &entry.original_name).then(|| value.clone()))
+            .find_map(|(name, value)| (name == &logical_output_name).then(|| value.clone()))
             .ok_or_else(|| WeightStoreError::Gguf {
                 key: self.key.clone(),
                 message: format!(
-                    "physical tensor {:?} did not produce logical output {:?}",
-                    entry.physical_name, entry.original_name
+                    "portable GGUF group did not produce logical output {logical_output_name:?}"
                 ),
             })?;
         let materialized = if selection_is_materialized && source_stream == execution_stream {
@@ -2635,8 +2043,9 @@ mod tests {
         match &lease.source {
             WeightLeaseSource::Gguf(source) => {
                 source
-                    .physical_selection
-                    .as_ref()
+                    .lease
+                    .identity()
+                    .physical_selection()
                     .map(|selection| match selection {
                         GgufPhysicalSelection::Axis(selection) => selection.clone(),
                         GgufPhysicalSelection::DenseSpan(_) => {
@@ -2776,7 +2185,7 @@ mod tests {
             panic!("expected GGUF lease");
         };
         assert!(matches!(
-            source.physical_selection.as_ref(),
+            source.lease.identity().physical_selection(),
             Some(GgufPhysicalSelection::DenseSpan(_))
         ));
 
