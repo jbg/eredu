@@ -39,6 +39,10 @@ pub enum Error {
     #[error(transparent)]
     DenseStream(#[from] crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError),
 
+    /// Invalid backend-neutral dense-stream telemetry lifecycle.
+    #[error(transparent)]
+    DenseStreamTelemetry(#[from] eredu_runtime::DenseStreamTelemetryError),
+
     /// Invalid backend-neutral immutable-weight residency policy.
     #[error(transparent)]
     WeightResidencyPolicy(#[from] eredu_runtime::WeightResidencyPolicyError),

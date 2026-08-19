@@ -308,6 +308,7 @@ fn dense_stream_telemetry_is_runtime_owned() {
         "pub struct DenseExecutionGroupReport",
         "pub struct DensePassReport",
         "pub struct DensePassCounterSnapshot",
+        "pub struct DenseStreamTelemetry",
     ] {
         assert!(
             runtime.contains(runtime_owned),
@@ -316,6 +317,17 @@ fn dense_stream_telemetry_is_runtime_owned() {
         assert!(
             !mlx.contains(runtime_owned),
             "MLX redefined dense-stream telemetry {runtime_owned}"
+        );
+    }
+    for mlx_owned_state in [
+        "struct DensePassState",
+        "struct DensePassActivity",
+        "struct DenseExecutionGroupPlan",
+        "struct DenseExecutionGroupState",
+    ] {
+        assert!(
+            !mlx.contains(mlx_owned_state),
+            "MLX retained dense-stream policy state {mlx_owned_state}"
         );
     }
 }

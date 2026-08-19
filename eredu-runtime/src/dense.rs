@@ -1,7 +1,12 @@
 //! Backend-neutral dense-stream residency telemetry.
 
 use eredu_core::residency::{
-    BackgroundPrefetchReport, MemoryTier, OffloadReport, TransferDirection,
+    BackgroundPrefetchReport, MemoryTier, OffloadReport, OffloadUnitId, ResidencyPolicy,
+    TransferDirection, UnitResidencyReport,
+};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
 };
 
 use crate::{ResidencyReport, WeightMaterializationReport};
@@ -474,9 +479,373 @@ impl DensePassCounterSnapshot {
     }
 }
 
+#[derive(Debug)]
+struct DensePassState {
+    active: Option<DensePassActivity>,
+    prefill: DensePassReport,
+    decode: DensePassReport,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DensePassActivity {
+    prefill: bool,
+    start: DensePassCounterSnapshot,
+    peaks: DensePassReport,
+}
+
+#[derive(Debug, Clone)]
+struct DenseExecutionGroupPlan {
+    id: String,
+    units: Vec<OffloadUnitId>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DenseExecutionGroupState {
+    completed_executions: u64,
+    peak_host_layers: usize,
+    peak_host_bytes: u64,
+    peak_device_layers: usize,
+    peak_device_bytes: u64,
+}
+
+/// Backend-neutral lifecycle and aggregation state for dense-stream telemetry.
+#[derive(Debug)]
+pub struct DenseStreamTelemetry {
+    planned_layer_count: usize,
+    planned_layer_bytes: u64,
+    maximum_host_layer_bytes: u64,
+    pinned_static_device_bytes: u64,
+    transfer_stream_index: i32,
+    groups: Vec<DenseExecutionGroupPlan>,
+    group_activity: Mutex<BTreeMap<String, DenseExecutionGroupState>>,
+    pass: Mutex<DensePassState>,
+}
+
+impl DenseStreamTelemetry {
+    /// Creates telemetry state for a fixed execution-group and residency plan.
+    pub fn new(
+        planned_layer_count: usize,
+        planned_layer_bytes: u64,
+        maximum_host_layer_bytes: u64,
+        pinned_static_device_bytes: u64,
+        transfer_stream_index: i32,
+        groups: impl IntoIterator<Item = (String, Vec<OffloadUnitId>)>,
+    ) -> Self {
+        let groups = groups
+            .into_iter()
+            .map(|(id, units)| DenseExecutionGroupPlan { id, units })
+            .collect::<Vec<_>>();
+        let group_activity = groups
+            .iter()
+            .map(|group| (group.id.clone(), DenseExecutionGroupState::default()))
+            .collect();
+        Self {
+            planned_layer_count,
+            planned_layer_bytes,
+            maximum_host_layer_bytes,
+            pinned_static_device_bytes,
+            transfer_stream_index,
+            groups,
+            group_activity: Mutex::new(group_activity),
+            pass: Mutex::new(DensePassState {
+                active: None,
+                prefill: DensePassReport::default(),
+                decode: DensePassReport::default(),
+            }),
+        }
+    }
+
+    /// Starts attribution for one prefill or decode pass.
+    pub fn begin_forward(
+        &self,
+        prefill: bool,
+        offload: &OffloadReport,
+    ) -> Result<(), DenseStreamTelemetryError> {
+        let mut state = self
+            .pass
+            .lock()
+            .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
+        if state.active.is_some() {
+            return Err(DenseStreamTelemetryError::InvalidForwardState(
+                "a forward is already active",
+            ));
+        }
+        state.active = Some(DensePassActivity {
+            prefill,
+            start: DensePassCounterSnapshot::from_report(offload),
+            peaks: DensePassReport::default(),
+        });
+        Ok(())
+    }
+
+    /// Records current group and whole-plan occupancy during an active pass.
+    pub fn observe_group(
+        &self,
+        group: &str,
+        prefill: bool,
+        units: &[UnitResidencyReport],
+    ) -> Result<(), DenseStreamTelemetryError> {
+        let plan = self
+            .groups
+            .iter()
+            .find(|candidate| candidate.id == group)
+            .ok_or_else(|| DenseStreamTelemetryError::UnknownExecutionGroup(group.to_string()))?;
+        let ids = plan.units.iter().collect::<BTreeSet<_>>();
+        let group_units = units
+            .iter()
+            .filter(|unit| ids.contains(unit.id()))
+            .collect::<Vec<_>>();
+        let (host_layers, host_bytes, device_layers, device_bytes) = occupancy(&group_units);
+        let mut activity = self
+            .group_activity
+            .lock()
+            .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
+        let state = activity
+            .get_mut(group)
+            .ok_or_else(|| DenseStreamTelemetryError::UnknownExecutionGroup(group.to_string()))?;
+        state.peak_host_layers = state.peak_host_layers.max(host_layers);
+        state.peak_host_bytes = state.peak_host_bytes.max(host_bytes);
+        state.peak_device_layers = state.peak_device_layers.max(device_layers);
+        state.peak_device_bytes = state.peak_device_bytes.max(device_bytes);
+        drop(activity);
+
+        let streamed = self
+            .groups
+            .iter()
+            .flat_map(|group| group.units.iter())
+            .collect::<BTreeSet<_>>();
+        let streamed_units = units
+            .iter()
+            .filter(|unit| streamed.contains(unit.id()))
+            .collect::<Vec<_>>();
+        let (host_layers, host_bytes, device_layers, device_bytes) = occupancy(&streamed_units);
+        let mut pass = self
+            .pass
+            .lock()
+            .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
+        let active = pass
+            .active
+            .as_mut()
+            .ok_or(DenseStreamTelemetryError::InvalidForwardState(
+                "residency was observed without an active forward",
+            ))?;
+        if active.prefill != prefill {
+            return Err(DenseStreamTelemetryError::InvalidForwardState(
+                "residency observation changed pass category",
+            ));
+        }
+        active.peaks.set_peaks(
+            active.peaks.peak_host_layers().max(host_layers),
+            active.peaks.peak_host_bytes().max(host_bytes),
+            active.peaks.peak_device_layers().max(device_layers),
+            active.peaks.peak_device_bytes().max(device_bytes),
+        );
+        Ok(())
+    }
+
+    /// Records successful completion of one named execution group.
+    pub fn record_group_execution(&self, group: &str) -> Result<(), DenseStreamTelemetryError> {
+        let mut activity = self
+            .group_activity
+            .lock()
+            .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
+        let state = activity
+            .get_mut(group)
+            .ok_or_else(|| DenseStreamTelemetryError::UnknownExecutionGroup(group.to_string()))?;
+        state.completed_executions = state.completed_executions.saturating_add(1);
+        Ok(())
+    }
+
+    /// Commits counter deltas and occupancy peaks for the active pass.
+    pub fn commit_forward(&self, offload: &OffloadReport) -> Result<(), DenseStreamTelemetryError> {
+        let current = DensePassCounterSnapshot::from_report(offload);
+        let mut state = self
+            .pass
+            .lock()
+            .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
+        let active = state
+            .active
+            .take()
+            .ok_or(DenseStreamTelemetryError::InvalidForwardState(
+                "a forward was committed without being started",
+            ))?;
+        let mut delta = current.delta(active.start);
+        delta.set_peaks(
+            active.peaks.peak_host_layers(),
+            active.peaks.peak_host_bytes(),
+            active.peaks.peak_device_layers(),
+            active.peaks.peak_device_bytes(),
+        );
+        if active.prefill {
+            state.prefill.accumulate(delta);
+        } else {
+            state.decode.accumulate(delta);
+        }
+        Ok(())
+    }
+
+    /// Aborts the active pass without committing partial counter deltas.
+    pub fn abort_forward(&self) {
+        if let Ok(mut state) = self.pass.lock() {
+            state.active = None;
+        }
+    }
+
+    /// Builds a stable report from a coherent residency and worker snapshot.
+    pub fn report(
+        &self,
+        residency: ResidencyReport,
+        background: BackgroundPrefetchReport,
+    ) -> Result<DenseDiskStreamReport, DenseStreamTelemetryError> {
+        let streamed = self
+            .groups
+            .iter()
+            .flat_map(|group| group.units.iter())
+            .collect::<BTreeSet<_>>();
+        let units = residency
+            .units()
+            .iter()
+            .map(|unit| (unit.id(), unit))
+            .collect::<BTreeMap<_, _>>();
+        let pinned_device_bytes = residency
+            .units()
+            .iter()
+            .filter(|unit| unit.policy() == ResidencyPolicy::Pinned && unit.device_resident())
+            .map(UnitResidencyReport::device_allocated_bytes)
+            .sum::<u64>();
+        let pinned_device_count = residency
+            .units()
+            .iter()
+            .filter(|unit| unit.policy() == ResidencyPolicy::Pinned && unit.device_resident())
+            .count();
+        let tier_report = |tier: MemoryTier| {
+            let current = residency
+                .units()
+                .iter()
+                .filter(|unit| streamed.contains(unit.id()))
+                .filter(|unit| match tier {
+                    MemoryTier::Host => unit.host_resident(),
+                    MemoryTier::Device => unit.device_resident(),
+                    MemoryTier::Disk => false,
+                })
+                .collect::<Vec<_>>();
+            let (pinned_bytes, pinned_count) = if tier == MemoryTier::Device {
+                (pinned_device_bytes, pinned_device_count)
+            } else {
+                (0, 0)
+            };
+            DenseTierResidencyReport::new(
+                current.len(),
+                residency
+                    .offload()
+                    .peak_resident_units()
+                    .get(tier)
+                    .saturating_sub(pinned_count),
+                current
+                    .iter()
+                    .map(|unit| match tier {
+                        MemoryTier::Host => unit.host_allocated_bytes(),
+                        MemoryTier::Device => unit.device_allocated_bytes(),
+                        MemoryTier::Disk => 0,
+                    })
+                    .sum(),
+                residency
+                    .offload()
+                    .peak_resident_bytes()
+                    .get(tier)
+                    .saturating_sub(pinned_bytes),
+                DenseCacheMetrics::from_report(residency.offload(), tier),
+            )
+        };
+        let activity = self
+            .group_activity
+            .lock()
+            .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
+        let groups = self
+            .groups
+            .iter()
+            .map(|group| {
+                let group_units = group
+                    .units
+                    .iter()
+                    .filter_map(|id| units.get(id).copied())
+                    .collect::<Vec<_>>();
+                let observed = activity.get(&group.id).copied().unwrap_or_default();
+                let (host_layers, host_bytes, device_layers, device_bytes) =
+                    occupancy(&group_units);
+                DenseExecutionGroupReport::new(
+                    group.id.clone(),
+                    group_units.len(),
+                    group_units.iter().map(|unit| unit.expected_bytes()).sum(),
+                    observed.completed_executions,
+                    host_layers,
+                    host_bytes,
+                    observed.peak_host_layers,
+                    observed.peak_host_bytes,
+                    device_layers,
+                    device_bytes,
+                    observed.peak_device_layers,
+                    observed.peak_device_bytes,
+                )
+            })
+            .collect();
+        let pass = self
+            .pass
+            .lock()
+            .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
+        let host_layers = tier_report(MemoryTier::Host);
+        let device_layers = tier_report(MemoryTier::Device);
+        Ok(DenseDiskStreamReport::new(
+            self.planned_layer_count,
+            self.planned_layer_bytes,
+            self.maximum_host_layer_bytes,
+            self.pinned_static_device_bytes,
+            self.transfer_stream_index,
+            residency,
+            background,
+            host_layers,
+            device_layers,
+            groups,
+            pass.prefill,
+            pass.decode,
+        ))
+    }
+}
+
+fn occupancy(units: &[&UnitResidencyReport]) -> (usize, u64, usize, u64) {
+    let host_layers = units.iter().filter(|unit| unit.host_resident()).count();
+    let host_bytes = units
+        .iter()
+        .filter(|unit| unit.host_resident())
+        .map(|unit| unit.host_allocated_bytes())
+        .sum();
+    let device_layers = units.iter().filter(|unit| unit.device_resident()).count();
+    let device_bytes = units
+        .iter()
+        .filter(|unit| unit.device_resident())
+        .map(|unit| unit.device_allocated_bytes())
+        .sum();
+    (host_layers, host_bytes, device_layers, device_bytes)
+}
+
+/// Invalid dense-stream telemetry lifecycle or execution-group access.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum DenseStreamTelemetryError {
+    /// Shared telemetry state was poisoned.
+    #[error("dense streaming telemetry state is poisoned")]
+    StatePoisoned,
+    /// Forward lifecycle calls were inconsistent.
+    #[error("invalid dense streaming forward telemetry state: {0}")]
+    InvalidForwardState(&'static str),
+    /// The requested execution group was not declared.
+    #[error("unknown dense streaming execution group {0}")]
+    UnknownExecutionGroup(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_core::residency::OffloadTelemetry;
 
     #[test]
     fn pass_accumulation_preserves_maximum_peaks() {
@@ -491,5 +860,27 @@ mod tests {
         assert_eq!(total.peak_host_bytes(), 20);
         assert_eq!(total.peak_device_layers(), 3);
         assert_eq!(total.peak_device_bytes(), 40);
+    }
+
+    #[test]
+    fn telemetry_owns_forward_lifecycle_validation() {
+        let telemetry = DenseStreamTelemetry::new(2, 20, 10, 5, 3, []);
+        let offload = OffloadTelemetry::default().snapshot();
+        telemetry.begin_forward(true, &offload).unwrap();
+        assert_eq!(
+            telemetry.begin_forward(true, &offload),
+            Err(DenseStreamTelemetryError::InvalidForwardState(
+                "a forward is already active"
+            ))
+        );
+        telemetry.abort_forward();
+        telemetry.begin_forward(false, &offload).unwrap();
+        telemetry.commit_forward(&offload).unwrap();
+        assert_eq!(
+            telemetry.commit_forward(&offload),
+            Err(DenseStreamTelemetryError::InvalidForwardState(
+                "a forward was committed without being started"
+            ))
+        );
     }
 }

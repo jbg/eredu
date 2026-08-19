@@ -10,17 +10,16 @@ use eredu_checkpoint::{
     WeightQuantization,
 };
 use eredu_runtime::{
-    DenseCacheMetrics, DenseDiskStreamLoadOptions, DenseDiskStreamReport,
-    DenseExecutionGroupReport, DensePassCounterSnapshot, DensePassReport, DenseTierResidencyReport,
-    DenseTransferSchedule, ExecutionResidency, LayerWeightResidency, LayerwiseModelMetadata,
-    OffloadUnit, WeightBinding, WeightResidency, DENSE_TRANSFER_WINDOW,
+    DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
+    ExecutionResidency, LayerWeightResidency, LayerwiseModelMetadata, OffloadUnit, WeightBinding,
+    WeightResidency, DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use safemlx::{module::ModuleParameters, transforms::async_eval_with_event, Array, Event, Stream};
@@ -131,46 +130,10 @@ pub(crate) fn validate_gguf_layerwise_source(
     Ok(architecture)
 }
 
-#[derive(Debug)]
-struct DensePassState {
-    active: Option<DensePassActivity>,
-    prefill: DensePassReport,
-    decode: DensePassReport,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DensePassActivity {
-    prefill: bool,
-    start: DensePassCounterSnapshot,
-    peaks: DensePassReport,
-}
-
-#[derive(Debug, Clone)]
-struct DenseExecutionGroupPlan {
-    id: String,
-    units: Vec<OffloadUnitId>,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct DenseExecutionGroupState {
-    completed_executions: u64,
-    peak_host_layers: usize,
-    peak_host_bytes: u64,
-    peak_device_layers: usize,
-    peak_device_bytes: u64,
-}
-
 pub(crate) struct DenseStreamController {
     options: DenseDiskStreamLoadOptions,
     background: Option<BackgroundLayerPrefetch>,
-    planned_layer_count: usize,
-    planned_layer_bytes: u64,
-    maximum_host_layer_bytes: u64,
-    pinned_static_device_bytes: u64,
-    transfer_stream_index: i32,
-    groups: Vec<DenseExecutionGroupPlan>,
-    group_activity: Mutex<BTreeMap<String, DenseExecutionGroupState>>,
-    pass: Mutex<DensePassState>,
+    telemetry: DenseStreamTelemetry,
 }
 
 impl DenseStreamController {
@@ -188,29 +151,18 @@ impl DenseStreamController {
                 BackgroundLayerPrefetch::new(manager.clone(), options.background_queue_capacity)
             })
             .transpose()?;
-        let groups = groups
-            .into_iter()
-            .map(|(id, units)| DenseExecutionGroupPlan { id, units })
-            .collect::<Vec<_>>();
-        let group_activity = groups
-            .iter()
-            .map(|group| (group.id.clone(), DenseExecutionGroupState::default()))
-            .collect();
+        let transfer_stream_index = manager.device_stream_index()?;
         Ok(Self {
             options,
             background,
-            planned_layer_count,
-            planned_layer_bytes,
-            maximum_host_layer_bytes,
-            pinned_static_device_bytes,
-            transfer_stream_index: manager.device_stream_index()?,
-            groups,
-            group_activity: Mutex::new(group_activity),
-            pass: Mutex::new(DensePassState {
-                active: None,
-                prefill: DensePassReport::default(),
-                decode: DensePassReport::default(),
-            }),
+            telemetry: DenseStreamTelemetry::new(
+                planned_layer_count,
+                planned_layer_bytes,
+                maximum_host_layer_bytes,
+                pinned_static_device_bytes,
+                transfer_stream_index,
+                groups,
+            ),
         })
     }
 
@@ -252,107 +204,13 @@ impl DenseStreamController {
         group: &str,
         prefill: bool,
     ) -> Result<(), Error> {
-        let plan = self
-            .groups
-            .iter()
-            .find(|candidate| candidate.id == group)
-            .ok_or_else(|| LayerwiseModelError::UnknownExecutionGroup(group.to_string()))?;
-        let ids = plan.units.iter().collect::<BTreeSet<_>>();
         let (_, _, units, _) = manager.telemetry_snapshot()?;
-        let group_units = units
-            .iter()
-            .filter(|unit| ids.contains(unit.id()))
-            .collect::<Vec<_>>();
-        let host_layers = group_units
-            .iter()
-            .filter(|unit| unit.host_resident())
-            .count();
-        let host_bytes = group_units
-            .iter()
-            .filter(|unit| unit.host_resident())
-            .map(|unit| unit.host_allocated_bytes())
-            .sum();
-        let device_layers = group_units
-            .iter()
-            .filter(|unit| unit.device_resident())
-            .count();
-        let device_bytes = group_units
-            .iter()
-            .filter(|unit| unit.device_resident())
-            .map(|unit| unit.device_allocated_bytes())
-            .sum();
-        let mut activity = self.group_activity.lock().map_err(|_| {
-            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
-        })?;
-        let state = activity
-            .get_mut(group)
-            .ok_or_else(|| LayerwiseModelError::UnknownExecutionGroup(group.to_string()))?;
-        state.peak_host_layers = state.peak_host_layers.max(host_layers);
-        state.peak_host_bytes = state.peak_host_bytes.max(host_bytes);
-        state.peak_device_layers = state.peak_device_layers.max(device_layers);
-        state.peak_device_bytes = state.peak_device_bytes.max(device_bytes);
-        drop(activity);
-
-        let streamed = self
-            .groups
-            .iter()
-            .flat_map(|group| group.units.iter())
-            .collect::<BTreeSet<_>>();
-        let streamed_units = units
-            .iter()
-            .filter(|unit| streamed.contains(unit.id()))
-            .collect::<Vec<_>>();
-        let host_layers = streamed_units
-            .iter()
-            .filter(|unit| unit.host_resident())
-            .count();
-        let host_bytes = streamed_units
-            .iter()
-            .filter(|unit| unit.host_resident())
-            .map(|unit| unit.host_allocated_bytes())
-            .sum();
-        let device_layers = streamed_units
-            .iter()
-            .filter(|unit| unit.device_resident())
-            .count();
-        let device_bytes = streamed_units
-            .iter()
-            .filter(|unit| unit.device_resident())
-            .map(|unit| unit.device_allocated_bytes())
-            .sum();
-        let mut pass = self.pass.lock().map_err(|_| {
-            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
-        })?;
-        let active = pass.active.as_mut().ok_or(
-            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
-                "residency was observed without an active forward",
-            ),
-        )?;
-        if active.prefill != prefill {
-            return Err(
-                crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
-                    "residency observation changed pass category",
-                )
-                .into(),
-            );
-        }
-        active.peaks.set_peaks(
-            active.peaks.peak_host_layers().max(host_layers),
-            active.peaks.peak_host_bytes().max(host_bytes),
-            active.peaks.peak_device_layers().max(device_layers),
-            active.peaks.peak_device_bytes().max(device_bytes),
-        );
+        self.telemetry.observe_group(group, prefill, &units)?;
         Ok(())
     }
 
     fn record_group_execution(&self, group: &str) -> Result<(), Error> {
-        let mut activity = self.group_activity.lock().map_err(|_| {
-            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
-        })?;
-        let state = activity
-            .get_mut(group)
-            .ok_or_else(|| LayerwiseModelError::UnknownExecutionGroup(group.to_string()))?;
-        state.completed_executions = state.completed_executions.saturating_add(1);
+        self.telemetry.record_group_execution(group)?;
         Ok(())
     }
 
@@ -371,22 +229,7 @@ impl DenseStreamController {
         manager: &ResidencyManager,
     ) -> Result<DenseStreamForwardGuard, Error> {
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
-        let mut state = self.pass.lock().map_err(|_| {
-            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
-        })?;
-        if state.active.is_some() {
-            return Err(
-                crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
-                    "a forward is already active",
-                )
-                .into(),
-            );
-        }
-        state.active = Some(DensePassActivity {
-            prefill,
-            start: DensePassCounterSnapshot::from_report(&offload),
-            peaks: DensePassReport::default(),
-        });
+        self.telemetry.begin_forward(prefill, &offload)?;
         Ok(DenseStreamForwardGuard {
             controller: Arc::clone(self),
             manager: manager.clone(),
@@ -402,34 +245,12 @@ impl DenseStreamController {
             )?;
         }
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
-        let current = DensePassCounterSnapshot::from_report(&offload);
-        let mut state = self.pass.lock().map_err(|_| {
-            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
-        })?;
-        let active = state.active.take().ok_or(
-            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
-                "a forward was committed without being started",
-            ),
-        )?;
-        let mut delta = current.delta(active.start);
-        delta.set_peaks(
-            active.peaks.peak_host_layers(),
-            active.peaks.peak_host_bytes(),
-            active.peaks.peak_device_layers(),
-            active.peaks.peak_device_bytes(),
-        );
-        if active.prefill {
-            state.prefill.accumulate(delta);
-        } else {
-            state.decode.accumulate(delta);
-        }
+        self.telemetry.commit_forward(&offload)?;
         Ok(())
     }
 
     fn abort_forward(&self) {
-        if let Ok(mut state) = self.pass.lock() {
-            state.active = None;
-        }
+        self.telemetry.abort_forward();
     }
 
     pub(crate) fn group_guard(
@@ -450,138 +271,15 @@ impl DenseStreamController {
         manager: &ResidencyManager,
     ) -> Result<DenseDiskStreamReport, Error> {
         let residency = manager.report()?;
-        let streamed = self
-            .groups
-            .iter()
-            .flat_map(|group| group.units.iter())
-            .collect::<BTreeSet<_>>();
-        let units = residency
-            .units()
-            .iter()
-            .map(|unit| (unit.id(), unit))
-            .collect::<BTreeMap<_, _>>();
-        let pinned_device_bytes = residency
-            .units()
-            .iter()
-            .filter(|unit| unit.policy() == ResidencyPolicy::Pinned && unit.device_resident())
-            .map(|unit| unit.device_allocated_bytes())
-            .sum::<u64>();
-        let pinned_device_count = residency
-            .units()
-            .iter()
-            .filter(|unit| unit.policy() == ResidencyPolicy::Pinned && unit.device_resident())
-            .count();
-        let tier_report = |tier: MemoryTier| {
-            let current = residency
-                .units()
-                .iter()
-                .filter(|unit| streamed.contains(unit.id()))
-                .filter(|unit| match tier {
-                    MemoryTier::Host => unit.host_resident(),
-                    MemoryTier::Device => unit.device_resident(),
-                    MemoryTier::Disk => false,
-                })
-                .collect::<Vec<_>>();
-            let (pinned_bytes, pinned_count) = if tier == MemoryTier::Device {
-                (pinned_device_bytes, pinned_device_count)
-            } else {
-                (0, 0)
-            };
-            DenseTierResidencyReport::new(
-                current.len(),
-                residency
-                    .offload()
-                    .peak_resident_units()
-                    .get(tier)
-                    .saturating_sub(pinned_count),
-                current
-                    .iter()
-                    .map(|unit| match tier {
-                        MemoryTier::Host => unit.host_allocated_bytes(),
-                        MemoryTier::Device => unit.device_allocated_bytes(),
-                        MemoryTier::Disk => 0,
-                    })
-                    .sum(),
-                residency
-                    .offload()
-                    .peak_resident_bytes()
-                    .get(tier)
-                    .saturating_sub(pinned_bytes),
-                DenseCacheMetrics::from_report(residency.offload(), tier),
-            )
-        };
-        let activity = self.group_activity.lock().map_err(|_| {
-            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
-        })?;
-        let groups = self
-            .groups
-            .iter()
-            .map(|group| {
-                let group_units = group
-                    .units
-                    .iter()
-                    .filter_map(|id| units.get(id).copied())
-                    .collect::<Vec<_>>();
-                let observed = activity.get(&group.id).copied().unwrap_or_default();
-                DenseExecutionGroupReport::new(
-                    group.id.clone(),
-                    group_units.len(),
-                    group_units.iter().map(|unit| unit.expected_bytes()).sum(),
-                    observed.completed_executions,
-                    group_units
-                        .iter()
-                        .filter(|unit| unit.host_resident())
-                        .count(),
-                    group_units
-                        .iter()
-                        .filter(|unit| unit.host_resident())
-                        .map(|unit| unit.host_allocated_bytes())
-                        .sum(),
-                    observed.peak_host_layers,
-                    observed.peak_host_bytes,
-                    group_units
-                        .iter()
-                        .filter(|unit| unit.device_resident())
-                        .count(),
-                    group_units
-                        .iter()
-                        .filter(|unit| unit.device_resident())
-                        .map(|unit| unit.device_allocated_bytes())
-                        .sum(),
-                    observed.peak_device_layers,
-                    observed.peak_device_bytes,
-                )
-            })
-            .collect();
-        let pass = self.pass.lock().map_err(|_| {
-            crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
-        })?;
-        let host_layers = tier_report(MemoryTier::Host);
-        let device_layers = tier_report(MemoryTier::Device);
-        Ok(DenseDiskStreamReport::new(
-            self.planned_layer_count,
-            self.planned_layer_bytes,
-            self.maximum_host_layer_bytes,
-            self.pinned_static_device_bytes,
-            self.transfer_stream_index,
-            residency,
-            self.background
-                .as_ref()
-                .map(BackgroundLayerPrefetch::report)
-                .transpose()?
-                .unwrap_or_default(),
-            host_layers,
-            device_layers,
-            groups,
-            pass.prefill,
-            pass.decode,
-        ))
+        let background = self
+            .background
+            .as_ref()
+            .map(BackgroundLayerPrefetch::report)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(self.telemetry.report(residency, background)?)
     }
 }
-
-/// Caller-thread transfer window retaining the current and next dense unit.
-///
-/// Entries own [`ResidentTransfer`] guards and therefore remain on the host
 /// thread supported by MLX events. A window submits at most two device copies.
 /// Callers consume one entry, evaluate and synchronize its compute work, drop
 /// that entry, and then call [`Self::refill`] to submit the following layer.

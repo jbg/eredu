@@ -49,7 +49,7 @@ pub use cache::{
 };
 pub use dense::{
     DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassCounterSnapshot,
-    DensePassReport, DenseTierResidencyReport,
+    DensePassReport, DenseStreamTelemetry, DenseStreamTelemetryError, DenseTierResidencyReport,
 };
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,
