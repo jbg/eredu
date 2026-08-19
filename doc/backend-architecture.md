@@ -2,24 +2,24 @@
 
 This guide defines the boundary between the portable language-model runtime
 and an execution backend. It is intended for backend authors and maintainers of
-`safemlx-lm`.
+`eredu`.
 
 ## Dependency direction
 
 ```text
 applications
     ↓
-safemlx-lm facade
+eredu facade
     ↓
-safemlx-lm-core
+eredu-core
 
-backend implementations ──→ safemlx-lm-core
+backend implementations ──→ eredu-core
 ```
 
-`safemlx-lm-core` contains no native accelerator dependency. The
-`safemlx-lm` facade is also portable when built with
+`eredu-core` contains no native accelerator dependency. The
+`eredu` facade is also portable when built with
 `default-features = false`. Its default `mlx` feature adds the MLX adapter and
-model implementations under `safemlx_lm::backend::mlx`.
+model implementations under `eredu::backend::mlx`.
 
 The facade root and `api` namespace expose portable application concepts.
 Backend-native types remain in their backend namespace.
@@ -76,7 +76,7 @@ Artifact loading has three stages:
 be paired with a cache or session created by another backend.
 
 `ModelRuntime<B>` owns the selected backend and its sole session. Applications
-normally use `safemlx_lm::api::LoadedModel<B>`, which combines that runtime
+normally use `eredu::api::LoadedModel<B>`, which combines that runtime
 with tokenizer, EOS, generation-default, and chat-template metadata.
 
 Automatic planning produces a portable `ExecutionPlan`. An
@@ -179,7 +179,7 @@ collective tensor math remain backend-specific.
 
 ## MLX adapter
 
-The default MLX implementation lives under `safemlx_lm::backend::mlx`:
+The default MLX implementation lives under `eredu::backend::mlx`:
 
 - `MlxBackend` owns execution and weight-materialization streams.
 - `MlxModelSession` owns the executable model, cache, processor state, and
@@ -219,7 +219,7 @@ remain associated implementation types.
 
 Tests verify that:
 
-- the core dependency graph contains no SafeMLX or native accelerator runtime;
+- the core dependency graph contains no `safemlx` or native accelerator runtime;
 - the feature-disabled facade compiles and exercises loading, generation,
   capabilities, multimodal preparation, speculative execution, realtime,
   distributed sessions, planning, and residency through a mock backend; and

@@ -1,6 +1,6 @@
 # Cancellation and bounded execution
 
-SafeMLX schedulers cancel cooperatively at submission and publication
+Eredu schedulers cancel cooperatively at submission and publication
 boundaries. They do not claim to interrupt an executing kernel or a committed
 Metal, CUDA, CPU, or distributed operation.
 

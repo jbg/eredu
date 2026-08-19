@@ -1,0 +1,1711 @@
+//! Private constrained-decoding implementation for native tool plans.
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::{BTreeSet, HashSet},
+    num::NonZeroUsize,
+    sync::Arc,
+};
+
+use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
+use llguidance::{
+    toktrie::{SimpleVob, TokEnv, TokenId},
+    Matcher, ParserFactory,
+};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use toktrie_hf_tokenizers::ByteTokenizer;
+
+use crate::{
+    core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController},
+    runtime::chat::dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
+    runtime::chat::{
+        GenerationConstraint, GenerationRuntimePlan, GenerationRuntimePlanParts,
+        ParallelToolCallPolicy, ToolChoice,
+    },
+};
+
+const MAX_SCHEMA_DEPTH: usize = 64;
+
+/// Portable failure reported by prepared-chat constraint state.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct ConstraintError {
+    message: String,
+}
+
+impl ConstraintError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Canonical backend-independent grammar and activation state.
+pub(crate) struct ConstraintController {
+    runtime: ConstraintRuntime,
+    committed_tokens: Vec<u32>,
+}
+
+enum ConstraintRuntime {
+    Forbidden {
+        vocabulary: Arc<Vec<Vec<u8>>>,
+        trigger: Vec<u8>,
+        pending: Vec<u8>,
+    },
+    Auto {
+        grammar: GrammarState,
+        vocabulary: Arc<Vec<Vec<u8>>>,
+        trigger: Vec<u8>,
+        pending: Vec<u8>,
+    },
+    Active(GrammarState),
+}
+
+impl Clone for ConstraintRuntime {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Forbidden {
+                vocabulary,
+                trigger,
+                pending,
+            } => Self::Forbidden {
+                vocabulary: Arc::clone(vocabulary),
+                trigger: trigger.clone(),
+                pending: pending.clone(),
+            },
+            Self::Auto {
+                grammar,
+                vocabulary,
+                trigger,
+                pending,
+            } => Self::Auto {
+                grammar: grammar.fork(),
+                vocabulary: Arc::clone(vocabulary),
+                trigger: trigger.clone(),
+                pending: pending.clone(),
+            },
+            Self::Active(grammar) => Self::Active(grammar.fork()),
+        }
+    }
+}
+
+impl Clone for ConstraintController {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            committed_tokens: self.committed_tokens.clone(),
+        }
+    }
+}
+
+impl ConstraintController {
+    /// Creates canonical constraint state from one prepared-chat plan.
+    pub(crate) fn from_generation_plan(
+        plan: &GenerationRuntimePlan,
+    ) -> Result<Self, ConstraintError> {
+        let constraint = plan.generation_constraint().clone();
+        let runtime = if !plan.has_tool_surface() {
+            ConstraintRuntime::Active(constraint.grammar_state())
+        } else {
+            match plan.tool_choice() {
+                ToolChoice::None => {
+                    let trigger =
+                        required_tool_call_trigger(plan.tool_call_trigger(), "forbidden")?;
+                    let vocabulary = constraint
+                        .grammar_state()
+                        .token_vocabulary()
+                        .map_err(constraint_error)?;
+                    ConstraintRuntime::Forbidden {
+                        vocabulary: Arc::new(vocabulary),
+                        trigger,
+                        pending: Vec::new(),
+                    }
+                }
+                ToolChoice::Auto => {
+                    let trigger =
+                        required_tool_call_trigger(plan.auto_activation_trigger(), "automatic")?;
+                    let grammar = constraint.grammar_state();
+                    let vocabulary = grammar.token_vocabulary().map_err(constraint_error)?;
+                    ConstraintRuntime::Auto {
+                        grammar,
+                        vocabulary: Arc::new(vocabulary),
+                        trigger,
+                        pending: Vec::new(),
+                    }
+                }
+                ToolChoice::Required => ConstraintRuntime::Active(constraint.grammar_state()),
+            }
+        };
+        Ok(Self {
+            runtime,
+            committed_tokens: Vec::new(),
+        })
+    }
+
+    #[cfg(all(test, feature = "mlx"))]
+    pub(crate) fn constraint_is_active(&self) -> bool {
+        matches!(self.runtime, ConstraintRuntime::Active(_))
+    }
+
+    pub(crate) fn grammar_is_complete(&mut self) -> Result<bool, ConstraintError> {
+        match &mut self.runtime {
+            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
+        }
+    }
+
+    pub(crate) fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, ConstraintError> {
+        match &mut self.runtime_at(history)? {
+            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
+        }
+    }
+
+    fn runtime_at(&self, history: &[u32]) -> Result<ConstraintRuntime, ConstraintError> {
+        if !history.starts_with(&self.committed_tokens) {
+            return Err(ConstraintError::new(
+                "constrained sampler history diverges from its committed logical prefix",
+            ));
+        }
+        let mut runtime = self.runtime.clone();
+        for &token in &history[self.committed_tokens.len()..] {
+            commit_runtime_token(&mut runtime, token)?;
+        }
+        Ok(runtime)
+    }
+
+    pub(crate) fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, ConstraintError> {
+        token_filter_at_runtime(&mut self.runtime_at(history)?)
+    }
+
+    pub(crate) fn commit(&mut self, token: u32) -> Result<(), ConstraintError> {
+        commit_runtime_token(&mut self.runtime, token)?;
+        self.committed_tokens.push(token);
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "mlx"))]
+    pub(crate) fn valid_token_ids(&mut self) -> Result<Option<Vec<u32>>, ConstraintError> {
+        match &mut self.runtime {
+            ConstraintRuntime::Active(grammar) => grammar
+                .allowed_tokens()
+                .map(|mask| Some(mask.iter().collect()))
+                .map_err(constraint_error),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(None),
+        }
+    }
+}
+
+impl TokenFilterController for ConstraintController {
+    type Error = ConstraintError;
+
+    fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+        token_filter_at_runtime(&mut self.runtime)
+    }
+
+    fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
+        self.commit(token_id)
+    }
+
+    fn is_complete(&mut self) -> Result<bool, Self::Error> {
+        self.grammar_is_complete()
+    }
+}
+
+impl SpeculativeTokenFilterController for ConstraintController {
+    fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
+        ConstraintController::filter_at(self, history)
+    }
+
+    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {
+        ConstraintController::prefix_is_complete(self, history)
+    }
+}
+
+fn token_filter_at_runtime(
+    runtime: &mut ConstraintRuntime,
+) -> Result<TokenFilter, ConstraintError> {
+    let allowed = match runtime {
+        ConstraintRuntime::Active(grammar) => {
+            let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
+            (0..allowed.len())
+                .map(|token| allowed.is_allowed(token as u32))
+                .collect::<Vec<_>>()
+        }
+        ConstraintRuntime::Forbidden {
+            vocabulary,
+            trigger,
+            pending,
+        } => vocabulary
+            .iter()
+            .map(|bytes| !completes_trigger(pending, bytes, trigger))
+            .collect(),
+        ConstraintRuntime::Auto {
+            grammar,
+            vocabulary,
+            trigger,
+            pending,
+        } => vocabulary
+            .iter()
+            .enumerate()
+            .map(|(token, bytes)| {
+                let Some(activation) = trigger_activation_bytes(pending, bytes, trigger) else {
+                    return Ok(true);
+                };
+                let mut candidate = grammar.fork();
+                if activation.starts_at_token_boundary {
+                    candidate.try_commit(token as u32)
+                } else {
+                    candidate.try_commit_bytes(&activation.bytes)
+                }
+                .map_err(constraint_error)
+            })
+            .collect::<Result<Vec<_>, ConstraintError>>()?,
+    };
+    TokenFilter::allowed(allowed).map_err(|error| ConstraintError::new(error.to_string()))
+}
+
+fn commit_runtime_token(
+    runtime: &mut ConstraintRuntime,
+    token: u32,
+) -> Result<(), ConstraintError> {
+    match runtime {
+        ConstraintRuntime::Forbidden {
+            vocabulary,
+            trigger,
+            pending,
+        } => {
+            let bytes = vocabulary.get(token as usize).ok_or_else(|| {
+                ConstraintError::new(format!(
+                    "token {token} is outside constraint vocabulary {}",
+                    vocabulary.len()
+                ))
+            })?;
+            if completes_trigger(pending, bytes, trigger) {
+                return Err(ConstraintError::new(
+                    "token would emit a tool-call activation trigger while tool_choice is None",
+                ));
+            }
+            advance_trigger_prefix(pending, bytes, trigger);
+            Ok(())
+        }
+        ConstraintRuntime::Active(grammar) => grammar.commit(token).map_err(constraint_error),
+        ConstraintRuntime::Auto {
+            grammar,
+            vocabulary,
+            trigger,
+            pending,
+        } => {
+            let bytes = vocabulary.get(token as usize).ok_or_else(|| {
+                ConstraintError::new(format!(
+                    "token {token} is outside constraint vocabulary {}",
+                    vocabulary.len()
+                ))
+            })?;
+            if let Some(activation) = trigger_activation_bytes(pending, bytes, trigger) {
+                let mut active = grammar.fork();
+                let valid = if activation.starts_at_token_boundary {
+                    active.try_commit(token)
+                } else {
+                    active.try_commit_bytes(&activation.bytes)
+                };
+                if !valid.map_err(constraint_error)? {
+                    return Err(ConstraintError::new(
+                        "token crosses the tool-call activation boundary with bytes that are not allowed by the tool grammar",
+                    ));
+                }
+                *runtime = ConstraintRuntime::Active(active);
+            } else {
+                advance_trigger_prefix(pending, bytes, trigger);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn required_tool_call_trigger(
+    trigger: Option<&str>,
+    mode: &str,
+) -> Result<Vec<u8>, ConstraintError> {
+    let trigger = trigger.ok_or_else(|| {
+        ConstraintError::new(format!(
+            "{mode} tool-call sampling requires an exact activation trigger"
+        ))
+    })?;
+    if trigger.is_empty() {
+        return Err(ConstraintError::new(format!(
+            "{mode} tool-call sampling requires a non-empty activation trigger"
+        )));
+    }
+    Ok(trigger.as_bytes().to_vec())
+}
+
+pub(crate) fn completes_trigger(pending: &[u8], bytes: &[u8], trigger: &[u8]) -> bool {
+    trigger_activation_bytes(pending, bytes, trigger).is_some()
+}
+
+struct TriggerActivation {
+    bytes: Vec<u8>,
+    starts_at_token_boundary: bool,
+}
+
+fn trigger_activation_bytes(
+    pending: &[u8],
+    bytes: &[u8],
+    trigger: &[u8],
+) -> Option<TriggerActivation> {
+    for start in 0..pending.len() {
+        let pending_suffix = &pending[start..];
+        if pending_suffix.len() + bytes.len() < trigger.len()
+            || !pending_suffix
+                .iter()
+                .chain(bytes)
+                .take(trigger.len())
+                .eq(trigger)
+        {
+            continue;
+        }
+        let trigger_bytes_in_token = trigger.len() - pending_suffix.len();
+        let mut activation = Vec::with_capacity(trigger.len() + bytes.len());
+        activation.extend_from_slice(trigger);
+        activation.extend_from_slice(&bytes[trigger_bytes_in_token..]);
+        return Some(TriggerActivation {
+            bytes: activation,
+            starts_at_token_boundary: false,
+        });
+    }
+    let start = bytes
+        .windows(trigger.len())
+        .position(|window| window == trigger)?;
+    Some(TriggerActivation {
+        bytes: bytes[start..].to_vec(),
+        starts_at_token_boundary: start == 0,
+    })
+}
+
+pub(crate) fn advance_trigger_prefix(pending: &mut Vec<u8>, bytes: &[u8], trigger: &[u8]) {
+    pending.extend_from_slice(bytes);
+    let keep = (0..=pending.len().min(trigger.len().saturating_sub(1)))
+        .rev()
+        .find(|&length| pending.ends_with(&trigger[..length]))
+        .unwrap_or(0);
+    let discard = pending.len() - keep;
+    pending.drain(..discard);
+}
+
+fn constraint_error(error: String) -> ConstraintError {
+    ConstraintError::new(error)
+}
+
+/// Tokenizer-wide llguidance data. A `LoadedModel` constructs exactly one and
+/// every request grammar shares it.
+pub(crate) struct ConstraintCompiler {
+    factory: Arc<ParserFactory>,
+    eos_token_ids: Vec<u32>,
+    #[cfg(test)]
+    tokenizer_analysis_runs: usize,
+    #[cfg(test)]
+    schema_compilation_runs: AtomicUsize,
+}
+
+#[allow(dead_code)]
+pub(crate) struct ConstraintBlueprint {
+    matcher: Matcher,
+}
+
+#[allow(dead_code)]
+pub(crate) struct GrammarState {
+    matcher: Matcher,
+    terminal_eos_alias_committed: bool,
+}
+
+impl ConstraintCompiler {
+    pub(crate) fn from_tokenizer(
+        tokenizer: &ChatTokenizer,
+        eos_token_ids: &[u32],
+    ) -> Result<Self, String> {
+        let serialized = tokenizer
+            .to_string(false)
+            .map_err(|error| format!("failed to serialize tokenizer: {error}"))?;
+        let mut byte_tokenizer = ByteTokenizer::from_json_bytes(serialized.as_bytes())
+            .map_err(|error| format!("failed to analyze tokenizer vocabulary: {error}"))?;
+        if !eos_token_ids.is_empty() {
+            let vocab_size = byte_tokenizer.tokrx_info().vocab_size;
+            if let Some(id) = eos_token_ids.iter().find(|&&id| id >= vocab_size) {
+                return Err(format!(
+                    "EOS token ID {id} is outside tokenizer vocabulary {vocab_size}"
+                ));
+            }
+            byte_tokenizer.set_eos_tokens(eos_token_ids);
+        }
+        let token_env = byte_tokenizer
+            .into_tok_env(Some(tokenizer.get_vocab_size(true)))
+            .map_err(|error| format!("failed to build tokenizer trie: {error}"))?;
+        Self::from_tok_env(token_env, eos_token_ids.to_vec())
+    }
+
+    fn from_tok_env(token_env: TokEnv, eos_token_ids: Vec<u32>) -> Result<Self, String> {
+        let mut factory = ParserFactory::new_simple(&token_env)
+            .map_err(|error| format!("failed to analyze tokenizer trie: {error}"))?;
+        factory.quiet();
+        Ok(Self {
+            factory: Arc::new(factory),
+            eos_token_ids,
+            #[cfg(test)]
+            tokenizer_analysis_runs: 1,
+            #[cfg(test)]
+            schema_compilation_runs: AtomicUsize::new(0),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_tests() -> Self {
+        Self::from_tok_env(
+            llguidance::toktrie::ApproximateTokEnv::single_byte_env(),
+            vec![255],
+        )
+        .expect("single-byte tokenizer must support llguidance")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_with_eos_aliases_for_tests(eos_token_ids: &[u32]) -> Self {
+        use llguidance::toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
+
+        let words = (0..=255).map(|byte| vec![byte]).collect::<Vec<_>>();
+        let info = TokRxInfo {
+            vocab_size: words.len() as u32,
+            tok_eos: eos_token_ids[0],
+            tok_bos: None,
+            tok_pad: None,
+            tok_unk: None,
+            tok_end_of_turn: None,
+        };
+        let trie = TokTrie::from(&info, &words).with_eos_tokens(eos_token_ids);
+        let environment = Arc::new(ApproximateTokEnv::new(trie));
+        Self::from_tok_env(environment, eos_token_ids.to_vec())
+            .expect("single-byte tokenizer with EOS aliases must support llguidance")
+    }
+
+    #[cfg(all(test, feature = "mlx"))]
+    pub(crate) fn synthetic_with_tokens_for_tests(extra_tokens: &[&[u8]]) -> Self {
+        use llguidance::toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
+
+        let mut words = (0..=255).map(|byte| vec![byte]).collect::<Vec<_>>();
+        words.extend(
+            [
+                b"\xFF<|tool|>".as_slice(),
+                b"\xFF<|/tool|>",
+                b"\xFF<|user|>",
+                b"\xFF<|system|>",
+                b"\xFF<|assistant|>",
+                b"\xFF<|end|>",
+            ]
+            .into_iter()
+            .map(<[u8]>::to_vec),
+        );
+        let eos = words.len() as u32 - 1;
+        words.extend(extra_tokens.iter().map(|token| token.to_vec()));
+        let info = TokRxInfo {
+            vocab_size: words.len() as u32,
+            tok_eos: eos,
+            tok_bos: None,
+            tok_pad: None,
+            tok_unk: None,
+            tok_end_of_turn: None,
+        };
+        let environment = Arc::new(ApproximateTokEnv::new(TokTrie::from(&info, &words)));
+        Self::from_tok_env(environment, vec![eos])
+            .expect("synthetic tokenizer must support llguidance")
+    }
+
+    pub(crate) fn compile_generation_plan(
+        &self,
+        dialect: &'static dyn FormatDialect,
+        parameters: DialectParameters,
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        parallel_tool_calls: ParallelToolCallPolicy,
+        runtime_structural_token_spellings: Vec<String>,
+        resolved_structural_token_ids: Vec<u32>,
+        runtime_stop_sequences: Vec<String>,
+        tool_surface: bool,
+    ) -> Result<GenerationRuntimePlan, String> {
+        #[cfg(test)]
+        self.schema_compilation_runs.fetch_add(1, Ordering::Relaxed);
+
+        let grammar_structural_token_spellings = dialect.required_structural_tokens(parameters)?;
+        if runtime_structural_token_spellings.len() != resolved_structural_token_ids.len()
+            || runtime_structural_token_spellings.len() < grammar_structural_token_spellings.len()
+            || !runtime_structural_token_spellings
+                .iter()
+                .zip(grammar_structural_token_spellings)
+                .all(|(runtime, grammar)| runtime == grammar)
+        {
+            return Err(format!(
+                "format dialect declares {} leading structural tokens but {} runtime spellings and {} tokenizer IDs were resolved",
+                grammar_structural_token_spellings.len(),
+                runtime_structural_token_spellings.len(),
+                resolved_structural_token_ids.len()
+            ));
+        }
+        let grammar_structural_token_ids =
+            &resolved_structural_token_ids[..grammar_structural_token_spellings.len()];
+        dialect.incremental_parser_state_with_tools(parameters, tools)?;
+        let configuration = if tool_surface {
+            dialect.constraint_configuration(
+                parameters,
+                tools,
+                tool_choice,
+                parallel_tool_calls,
+                grammar_structural_token_ids,
+            )?
+        } else {
+            dialect.semantic_constraint_configuration(
+                parameters,
+                grammar_structural_token_ids,
+                &self.eos_token_ids,
+            )?
+        };
+        let fingerprint: [u8; 32] = Sha256::digest(
+            serde_json::to_vec(&configuration.grammar).expect("grammar configuration serializes"),
+        )
+        .into();
+        let parser = self
+            .factory
+            .create_parser(configuration.grammar)
+            .map_err(|error| format!("failed to compile tool grammar: {error}"))?;
+        let mut matcher = Matcher::new(Ok(parser));
+        if let Some(error) = matcher.get_error() {
+            return Err(format!("failed to compile tool grammar: {error}"));
+        }
+        let warnings = matcher.grammar_warnings();
+        if !warnings.is_empty() {
+            return Err(format!(
+                "tool grammar produced unsupported warnings: {}",
+                warnings.join("; ")
+            ));
+        }
+        Ok(GenerationRuntimePlan::new(GenerationRuntimePlanParts {
+            tool_choice,
+            tool_surface,
+            generation_constraint: GenerationConstraint::new(
+                fingerprint,
+                ConstraintBlueprint { matcher },
+            ),
+            tool_call_trigger: if matches!(tool_choice, ToolChoice::None | ToolChoice::Auto) {
+                dialect
+                    .auto_activation_trigger(parameters)?
+                    .map(str::to_owned)
+            } else {
+                None
+            },
+            dialect,
+            dialect_parameters: parameters,
+            tools: tools.to_vec(),
+            structural_token_spellings: runtime_structural_token_spellings,
+            resolved_structural_token_ids,
+            profile_stop_sequences: runtime_stop_sequences,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compile_tool_plan(
+        &self,
+        dialect: &'static dyn FormatDialect,
+        parameters: DialectParameters,
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        parallel_tool_calls: ParallelToolCallPolicy,
+        resolved_structural_token_ids: Vec<u32>,
+    ) -> Result<GenerationRuntimePlan, String> {
+        let structural_token_spellings = dialect
+            .required_structural_tokens(parameters)?
+            .iter()
+            .map(|spelling| (*spelling).to_owned())
+            .collect();
+        let stop_sequences = dialect
+            .stop_sequences(parameters)?
+            .iter()
+            .map(|sequence| (*sequence).to_owned())
+            .collect();
+        self.compile_generation_plan(
+            dialect,
+            parameters,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
+            structural_token_spellings,
+            resolved_structural_token_ids,
+            stop_sequences,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_analysis_counts(&self) -> (usize, usize) {
+        (
+            self.tokenizer_analysis_runs,
+            self.schema_compilation_runs.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[allow(dead_code)]
+impl ConstraintBlueprint {
+    fn state(&self) -> GrammarState {
+        GrammarState {
+            matcher: self.matcher.deep_clone(),
+            terminal_eos_alias_committed: false,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl GrammarState {
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            matcher: self.matcher.deep_clone(),
+            terminal_eos_alias_committed: self.terminal_eos_alias_committed,
+        }
+    }
+
+    pub(crate) fn allowed_tokens(&mut self) -> Result<SimpleVob, String> {
+        self.matcher
+            .compute_mask_or_eos()
+            .map_err(|error| format!("failed to compute grammar token mask: {error}"))
+    }
+
+    pub(crate) fn commit(&mut self, token: TokenId) -> Result<(), String> {
+        if self.terminal_eos_alias_committed {
+            return Err("generation grammar already committed its terminal EOS token".into());
+        }
+        if self.try_commit(token)? {
+            return Ok(());
+        }
+
+        // llguidance treats the first configured EOS token as canonical, but
+        // secondary EOS aliases cannot be consumed as explicit structural
+        // literals. Checkpoint protocols can legitimately use such an alias
+        // as their required turn terminator (Muse ATEM's <|eot|> is one).
+        // Preserve mask/commit consistency by accepting an EOS alias only
+        // when the grammar mask allowed that exact token at this prefix.
+        if self.is_eos_token(token)? && self.allowed_tokens()?.is_allowed(token) {
+            self.terminal_eos_alias_committed = true;
+            return Ok(());
+        }
+
+        Err(format!(
+            "token {token} is not allowed by the generation grammar"
+        ))
+    }
+
+    pub(crate) fn try_commit(&mut self, token: TokenId) -> Result<bool, String> {
+        let consumed = self
+            .matcher
+            .try_consume_tokens(&[token])
+            .map_err(|error| format!("failed to commit grammar token: {error}"))?;
+        Ok(consumed == 1)
+    }
+
+    pub(crate) fn try_commit_bytes(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        let token_env = self
+            .matcher
+            .tok_env()
+            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
+        let tokens = token_env.tokenize_bytes(bytes);
+        let trie = token_env.tok_trie();
+        let round_trip = tokens
+            .iter()
+            .flat_map(|&token| trie.token(token).iter().copied())
+            .collect::<Vec<_>>();
+        if round_trip != bytes {
+            return Err("grammar tokenizer could not represent activation bytes exactly".into());
+        }
+        let consumed = self
+            .matcher
+            .try_consume_tokens(&tokens)
+            .map_err(|error| format!("failed to commit grammar bytes: {error}"))?;
+        Ok(consumed == tokens.len())
+    }
+
+    pub(crate) fn is_complete(&mut self) -> Result<bool, String> {
+        if self.terminal_eos_alias_committed {
+            return Ok(true);
+        }
+        self.matcher
+            .is_accepting()
+            .map_err(|error| format!("failed to inspect grammar completion: {error}"))
+    }
+
+    pub(crate) fn rollback(&mut self, token_count: usize) -> Result<(), String> {
+        let token_count = if self.terminal_eos_alias_committed && token_count > 0 {
+            self.terminal_eos_alias_committed = false;
+            token_count - 1
+        } else {
+            token_count
+        };
+        if token_count == 0 {
+            return Ok(());
+        }
+        self.matcher
+            .rollback(token_count)
+            .map_err(|error| format!("failed to roll back grammar state: {error}"))
+    }
+
+    fn is_eos_token(&self, token: TokenId) -> Result<bool, String> {
+        let token_env = self
+            .matcher
+            .tok_env()
+            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
+        Ok(token_env.tok_trie().eos_tokens().contains(&token))
+    }
+
+    pub(crate) fn token_bytes(&self, token: TokenId) -> Result<Vec<u8>, String> {
+        let token_env = self
+            .matcher
+            .tok_env()
+            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
+        let trie = token_env.tok_trie();
+        if token as usize >= trie.vocab_size() {
+            return Err(format!(
+                "token {token} is outside grammar vocabulary {}",
+                trie.vocab_size()
+            ));
+        }
+        Ok(trie.token(token).to_vec())
+    }
+
+    pub(crate) fn token_vocabulary(&self) -> Result<Vec<Vec<u8>>, String> {
+        let token_env = self
+            .matcher
+            .tok_env()
+            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
+        let trie = token_env.tok_trie();
+        Ok((0..trie.vocab_size() as TokenId)
+            .map(|token| trie.token(token).to_vec())
+            .collect())
+    }
+}
+
+impl GenerationConstraint {
+    pub(crate) fn new(fingerprint: [u8; 32], inner: ConstraintBlueprint) -> Self {
+        Self {
+            fingerprint,
+            inner: Arc::new(inner),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn grammar_state(&self) -> GrammarState {
+        self.inner.state()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ToolDefinition {
+    pub(crate) name: String,
+    pub(crate) parameters: Value,
+}
+
+pub(crate) fn tool_call_bounds(
+    tool_choice: ToolChoice,
+    parallel_tool_calls: ParallelToolCallPolicy,
+    tools: &[Value],
+) -> Result<(usize, Option<usize>), String> {
+    if tool_choice == ToolChoice::Required && tools.is_empty() {
+        return Err("tool_choice is required but no tools were supplied".into());
+    }
+
+    let (min_calls, max_calls) = match tool_choice {
+        ToolChoice::None => (0, Some(0)),
+        ToolChoice::Auto => (
+            0,
+            match parallel_tool_calls {
+                ParallelToolCallPolicy::Disabled => Some(1),
+                ParallelToolCallPolicy::Enabled { max_calls } => max_calls.map(NonZeroUsize::get),
+            },
+        ),
+        ToolChoice::Required => (
+            1,
+            match parallel_tool_calls {
+                ParallelToolCallPolicy::Disabled => Some(1),
+                ParallelToolCallPolicy::Enabled { max_calls } => max_calls.map(NonZeroUsize::get),
+            },
+        ),
+    };
+    if max_calls.is_some_and(|maximum| maximum < min_calls) {
+        return Err("parallel tool-call limit cannot satisfy tool_choice".into());
+    }
+    Ok((min_calls, max_calls))
+}
+
+pub(crate) fn tool_call_schema(
+    tools: &[Value],
+    name_field: &str,
+    arguments_field: &str,
+    call_id: Option<DeclarativeCallId>,
+) -> Result<Value, String> {
+    let tools = parse_tools(tools)?;
+    let item_schema = if tools.is_empty() {
+        json!({"type": "null"})
+    } else {
+        let alternatives = tools
+            .into_iter()
+            .map(|tool| {
+                let mut properties = Map::from_iter([
+                    (
+                        name_field.to_owned(),
+                        json!({"type": "string", "enum": [tool.name]}),
+                    ),
+                    (arguments_field.to_owned(), tool.parameters),
+                ]);
+                let mut required = vec![
+                    Value::String(name_field.to_owned()),
+                    Value::String(arguments_field.to_owned()),
+                ];
+                if let Some(call_id) = call_id {
+                    let mut id_schema =
+                        Map::from_iter([("type".to_owned(), Value::String("string".to_owned()))]);
+                    if let Some(length) = call_id.length {
+                        id_schema.insert("minLength".to_owned(), json!(length));
+                        id_schema.insert("maxLength".to_owned(), json!(length));
+                    }
+                    properties.insert(call_id.field.to_owned(), Value::Object(id_schema));
+                    required.push(Value::String(call_id.field.to_owned()));
+                }
+                json!({
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": false,
+                })
+            })
+            .collect::<Vec<_>>();
+        if alternatives.len() == 1 {
+            alternatives.into_iter().next().expect("one alternative")
+        } else {
+            json!({"oneOf": alternatives})
+        }
+    };
+
+    Ok(item_schema)
+}
+
+pub(crate) fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String> {
+    let mut names = HashSet::new();
+    tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            let path = format!("tools[{index}]");
+            let object = tool
+                .as_object()
+                .ok_or_else(|| format!("{path} must be an object"))?;
+            reject_unknown_keys(object, &["type", "function"], &path)?;
+            if object.get("type").and_then(Value::as_str) != Some("function") {
+                return Err(format!("{path}.type must be \"function\""));
+            }
+            let function = object
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("{path}.function must be an object"))?;
+            reject_unknown_keys(
+                function,
+                &["name", "description", "parameters"],
+                &format!("{path}.function"),
+            )?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| format!("{path}.function.name must be a non-empty string"))?;
+            validate_function_name(name, &format!("{path}.function.name"))?;
+            let name = name.to_owned();
+            if !names.insert(name.clone()) {
+                return Err(format!("duplicate tool function name {name:?}"));
+            }
+            if function
+                .get("description")
+                .is_some_and(|description| !description.is_string())
+            {
+                return Err(format!("{path}.function.description must be a string"));
+            }
+            let parameters = function
+                .get("parameters")
+                .ok_or_else(|| format!("{path}.function.parameters is required"))?;
+            let parameters =
+                resolve_and_validate_schema(parameters, &format!("{path}.function.parameters"))?;
+            if parameters.get("type").and_then(Value::as_str) != Some("object") {
+                return Err(format!(
+                    "{path}.function.parameters must resolve to an object schema"
+                ));
+            }
+            Ok(ToolDefinition { name, parameters })
+        })
+        .collect()
+}
+
+fn validate_function_name(name: &str, path: &str) -> Result<(), String> {
+    if name.len() > 64 {
+        return Err(format!("{path} must be at most 64 bytes"));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(format!(
+            "{path} must contain only ASCII letters, digits, underscores, or hyphens"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unknown_keys(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    path: &str,
+) -> Result<(), String> {
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("{path} contains unsupported field {key:?}"));
+    }
+    Ok(())
+}
+
+fn resolve_and_validate_schema(schema: &Value, path: &str) -> Result<Value, String> {
+    if !schema.is_object() {
+        return Err(format!("{path} must be a JSON Schema object"));
+    }
+    let mut reference_stack = Vec::new();
+    resolve_schema(schema, schema, path, &mut reference_stack, 0)
+}
+
+fn resolve_schema(
+    schema: &Value,
+    root: &Value,
+    path: &str,
+    reference_stack: &mut Vec<String>,
+    depth: usize,
+) -> Result<Value, String> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(format!("{path} exceeds the supported schema nesting depth"));
+    }
+    let object = schema
+        .as_object()
+        .ok_or_else(|| format!("{path} must be a JSON Schema object"))?;
+    if let Some(reference) = object.get("$ref") {
+        if object.len() != 1 {
+            return Err(format!("{path} cannot combine $ref with sibling keywords"));
+        }
+        let reference = reference
+            .as_str()
+            .ok_or_else(|| format!("{path}.$ref must be a string"))?;
+        if reference_stack.iter().any(|active| active == reference) {
+            return Err(format!(
+                "{path} contains unsupported recursive reference {reference:?}"
+            ));
+        }
+        let target = resolve_local_reference(root, reference, path)?;
+        reference_stack.push(reference.to_owned());
+        let resolved = resolve_schema(target, root, path, reference_stack, depth + 1);
+        reference_stack.pop();
+        return resolved;
+    }
+
+    validate_schema_keywords(object, path)?;
+    let mut resolved = Map::new();
+    for (keyword, value) in object {
+        match keyword.as_str() {
+            "$defs" | "definitions" => {
+                validate_definition_map(value, root, path, reference_stack, depth + 1)?;
+            }
+            "properties" => {
+                let properties = value
+                    .as_object()
+                    .ok_or_else(|| format!("{path}.properties must be an object"))?;
+                let mut output = Map::new();
+                for (name, property) in properties {
+                    output.insert(
+                        name.clone(),
+                        resolve_schema(
+                            property,
+                            root,
+                            &format!("{path}.properties[{name:?}]"),
+                            reference_stack,
+                            depth + 1,
+                        )?,
+                    );
+                }
+                resolved.insert(keyword.clone(), Value::Object(output));
+            }
+            "items" => {
+                resolved.insert(
+                    keyword.clone(),
+                    resolve_schema(
+                        value,
+                        root,
+                        &format!("{path}.items"),
+                        reference_stack,
+                        depth + 1,
+                    )?,
+                );
+            }
+            "additionalProperties" if value.is_object() => {
+                resolved.insert(
+                    keyword.clone(),
+                    resolve_schema(
+                        value,
+                        root,
+                        &format!("{path}.additionalProperties"),
+                        reference_stack,
+                        depth + 1,
+                    )?,
+                );
+            }
+            _ => {
+                resolved.insert(keyword.clone(), value.clone());
+            }
+        }
+    }
+    validate_schema_shape(&resolved, path)?;
+    Ok(Value::Object(resolved))
+}
+
+fn validate_definition_map(
+    definitions: &Value,
+    root: &Value,
+    path: &str,
+    reference_stack: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), String> {
+    let definitions = definitions
+        .as_object()
+        .ok_or_else(|| format!("{path} definitions must be an object"))?;
+    for (name, definition) in definitions {
+        resolve_schema(
+            definition,
+            root,
+            &format!("{path} definition {name:?}"),
+            reference_stack,
+            depth,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_schema_keywords(schema: &Map<String, Value>, path: &str) -> Result<(), String> {
+    const SUPPORTED: &[&str] = &[
+        "$ref",
+        "$defs",
+        "definitions",
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "minItems",
+        "maxItems",
+        "enum",
+        "description",
+        "title",
+        "default",
+    ];
+    if let Some(keyword) = schema
+        .keys()
+        .find(|keyword| !SUPPORTED.contains(&keyword.as_str()))
+    {
+        let kind = if matches!(
+            keyword.as_str(),
+            "allOf" | "anyOf" | "oneOf" | "not" | "if" | "then" | "else"
+        ) {
+            "composition"
+        } else {
+            "keyword"
+        };
+        return Err(format!(
+            "{path} contains unsupported schema {kind} {keyword:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schema_shape(schema: &Map<String, Value>, path: &str) -> Result<(), String> {
+    let schema_type = schema
+        .get("type")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| format!("{path}.type must be one string, not a union"))
+        })
+        .transpose()?;
+    if let Some(schema_type) = schema_type {
+        if !matches!(
+            schema_type,
+            "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+        ) {
+            return Err(format!("{path}.type {schema_type:?} is unsupported"));
+        }
+    }
+
+    let has_object_keywords = schema.contains_key("properties")
+        || schema.contains_key("required")
+        || schema.contains_key("additionalProperties");
+    let has_array_keywords = schema.contains_key("items")
+        || schema.contains_key("minItems")
+        || schema.contains_key("maxItems");
+    if has_object_keywords && has_array_keywords {
+        return Err(format!("{path} mixes object and array keywords"));
+    }
+    let structural_type = if has_object_keywords {
+        Some("object")
+    } else if has_array_keywords {
+        Some("array")
+    } else {
+        None
+    };
+    if let Some(structural_type) = structural_type {
+        if schema_type != Some(structural_type) {
+            return Err(format!(
+                "{path} uses {structural_type} keywords without type {structural_type:?}"
+            ));
+        }
+    }
+
+    if schema_type == Some("object") {
+        let properties = match schema.get("properties") {
+            Some(properties) => properties
+                .as_object()
+                .ok_or_else(|| format!("{path}.properties must be an object"))?,
+            None => {
+                static EMPTY_PROPERTIES: std::sync::LazyLock<Map<String, Value>> =
+                    std::sync::LazyLock::new(Map::new);
+                &EMPTY_PROPERTIES
+            }
+        };
+        if let Some(required) = schema.get("required") {
+            let required = required
+                .as_array()
+                .ok_or_else(|| format!("{path}.required must be an array"))?;
+            let mut seen = BTreeSet::new();
+            for name in required {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| format!("{path}.required entries must be strings"))?;
+                if !seen.insert(name) {
+                    return Err(format!("{path}.required contains duplicate {name:?}"));
+                }
+                if !properties.contains_key(name) {
+                    return Err(format!("{path}.required names unknown property {name:?}"));
+                }
+            }
+        }
+        if let Some(additional) = schema.get("additionalProperties") {
+            if !additional.is_boolean() && !additional.is_object() {
+                return Err(format!(
+                    "{path}.additionalProperties must be a boolean or schema object"
+                ));
+            }
+        }
+    }
+
+    if schema_type == Some("array") {
+        if !schema.get("items").is_some_and(Value::is_object) {
+            return Err(format!("{path}.items must be a schema object"));
+        }
+        let min = schema_usize(schema, "minItems", path)?;
+        let max = schema_usize(schema, "maxItems", path)?;
+        if min.zip(max).is_some_and(|(min, max)| min > max) {
+            return Err(format!("{path}.minItems exceeds maxItems"));
+        }
+    }
+
+    if let Some(values) = schema.get("enum") {
+        let values = values
+            .as_array()
+            .filter(|values| !values.is_empty())
+            .ok_or_else(|| format!("{path}.enum must be a non-empty array"))?;
+        if let Some(schema_type) = schema_type {
+            if let Some(value) = values
+                .iter()
+                .find(|value| !value_matches_type(value, schema_type))
+            {
+                return Err(format!(
+                    "{path}.enum value {value} does not match type {schema_type:?}"
+                ));
+            }
+        }
+    }
+    for annotation in ["description", "title"] {
+        if schema
+            .get(annotation)
+            .is_some_and(|value| !value.is_string())
+        {
+            return Err(format!("{path}.{annotation} must be a string"));
+        }
+    }
+    if schema_type.is_none() && !schema.contains_key("enum") {
+        return Err(format!(
+            "{path} must declare a supported type, enum, or local $ref"
+        ));
+    }
+    Ok(())
+}
+
+fn schema_usize(
+    schema: &Map<String, Value>,
+    keyword: &str,
+    path: &str,
+) -> Result<Option<usize>, String> {
+    schema
+        .get(keyword)
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| format!("{path}.{keyword} must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+fn value_matches_type(value: &Value, schema_type: &str) -> bool {
+    match schema_type {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    }
+}
+
+fn resolve_local_reference<'a>(
+    root: &'a Value,
+    reference: &str,
+    path: &str,
+) -> Result<&'a Value, String> {
+    if !reference.starts_with('#') {
+        return Err(format!(
+            "{path} uses unsupported non-local reference {reference:?}"
+        ));
+    }
+    if reference.contains('%') {
+        return Err(format!(
+            "{path} uses unsupported percent-encoded reference {reference:?}"
+        ));
+    }
+    let pointer = &reference[1..];
+    if pointer.is_empty() {
+        return Ok(root);
+    }
+    if !pointer.starts_with('/') {
+        return Err(format!("{path} has invalid local reference {reference:?}"));
+    }
+    for segment in pointer[1..].split('/') {
+        let bytes = segment.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'~' {
+                if bytes
+                    .get(index + 1)
+                    .is_none_or(|escaped| !matches!(escaped, b'0' | b'1'))
+                {
+                    return Err(format!("{path} has invalid local reference {reference:?}"));
+                }
+                index += 1;
+            }
+            index += 1;
+        }
+    }
+    root.pointer(pointer)
+        .ok_or_else(|| format!("{path} references missing schema {reference:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use llguidance::toktrie::TokenId;
+    use serde_json::json;
+
+    use super::{ConstraintCompiler, ParallelToolCallPolicy, ToolChoice};
+    use crate::runtime::chat::dialect::{
+        DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
+        GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
+    };
+
+    const SYNTHETIC_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
+        envelope: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        name_field: "name",
+        arguments_field: "arguments",
+        call_id: None,
+    };
+
+    const SYNTHETIC_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: true,
+        output: ExactEnvelope {
+            prefix: r#"{"calls":"#,
+            suffix: "}",
+        },
+        call: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        payload_shape: DeclarativePayloadShape::JsonList,
+        json_function: Some(&SYNTHETIC_JSON_FUNCTION),
+        reasoning_channel: None,
+        text_channel: None,
+        raw_text_before_calls: false,
+        call_separator: ",",
+        parallel_layout: ParallelCallLayout::SingleEnvelope,
+        protocol_max_tools: None,
+        protocol_max_calls: None,
+        auto_activation_trigger: Some(r#"{"calls":"#),
+        required_structural_tokens: &[],
+        stop_sequences: &[],
+    };
+
+    const SYNTHETIC_PARAMETERS: DialectParameters = DialectParameters::Declarative(&SYNTHETIC_SPEC);
+
+    fn compiler() -> ConstraintCompiler {
+        ConstraintCompiler::synthetic_for_tests()
+    }
+
+    fn tool(name: &str, parameters: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {"name": name, "parameters": parameters}
+        })
+    }
+
+    fn accepts(
+        plan: &crate::runtime::chat::GenerationRuntimePlan,
+        value: serde_json::Value,
+    ) -> bool {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let mut state = plan.generation_constraint().grammar_state();
+        for byte in bytes {
+            if state.commit(byte as TokenId).is_err() {
+                return false;
+            }
+        }
+        state.is_complete().unwrap()
+    }
+
+    #[test]
+    fn restricts_function_names_and_supports_required_optional_and_nested_values() {
+        let compiler = compiler();
+        let plan = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &[
+                    tool(
+                        "lookup",
+                        json!({
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"},
+                                "options": {
+                                    "type": "object",
+                                    "properties": {
+                                        "limit": {"type": "integer"},
+                                        "exact": {"type": "boolean"}
+                                    },
+                                    "required": ["limit"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "required": ["query"],
+                            "additionalProperties": false
+                        }),
+                    ),
+                    tool(
+                        "ping",
+                        json!({
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }),
+                    ),
+                ],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+
+        assert!(accepts(
+            &plan,
+            json!({"calls": [{
+                "name": "lookup",
+                "arguments": {
+                    "query": "snowman ☃ and \"quotes\"",
+                    "options": {"limit": 3, "exact": true}
+                }
+            }]})
+        ));
+        assert!(accepts(
+            &plan,
+            json!({"calls": [{"name": "lookup", "arguments": {"query": "optional omitted"}}]})
+        ));
+        assert!(!accepts(
+            &plan,
+            json!({"calls": [{"name": "unknown", "arguments": {}}]})
+        ));
+    }
+
+    #[test]
+    fn resolves_local_references_and_supports_arrays_enums_and_scalars() {
+        let compiler = compiler();
+        let plan = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &[tool(
+                    "batch",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "items": {"$ref": "#/$defs/item~1type~0v1"},
+                                "minItems": 1,
+                                "maxItems": 2
+                            },
+                            "mode": {"type": "string", "enum": ["fast", "安全"]},
+                            "ratio": {"type": "number"},
+                            "enabled": {"type": "boolean"},
+                            "nothing": {"type": "null"}
+                        },
+                        "required": ["items", "mode", "ratio", "enabled", "nothing"],
+                        "additionalProperties": false,
+                        "$defs": {
+                            "item/type~v1": {
+                                "type": "object",
+                                "properties": {"value": {"type": "string"}},
+                                "required": ["value"],
+                                "additionalProperties": false
+                            }
+                        }
+                    }),
+                )],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+
+        assert!(accepts(
+            &plan,
+            json!({"calls": [{
+                "name": "batch",
+                "arguments": {
+                    "items": [{"value": "α"}, {"value": "β"}],
+                    "mode": "安全",
+                    "ratio": 1.5,
+                    "enabled": false,
+                    "nothing": null
+                }
+            }]})
+        ));
+        assert!(!accepts(
+            &plan,
+            json!({"calls": [{"name": "batch", "arguments": {
+                "items": [], "mode": "slow", "ratio": 1, "enabled": true, "nothing": null
+            }}]})
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_tool_envelopes_functions_and_names() {
+        let valid_parameters =
+            || json!({"type": "object", "properties": {}, "additionalProperties": false});
+        let invalid = [
+            json!(null),
+            json!({}),
+            json!({"type": "command", "function": {}}),
+            json!({"type": "function", "function": "lookup"}),
+            json!({"type": "function", "function": {
+                "name": "lookup", "parameters": valid_parameters(), "unknown": true
+            }}),
+            json!({"type": "function", "function": {
+                "name": "", "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {
+                "name": "contains space", "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {
+                "name": "slash/name", "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {
+                "name": "x".repeat(65), "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {
+                "name": "lookup", "description": 7, "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {"name": "lookup"}}),
+        ];
+
+        for tool in invalid {
+            let error = compiler()
+                .compile_tool_plan(
+                    &DECLARATIVE_DIALECT,
+                    SYNTHETIC_PARAMETERS,
+                    std::slice::from_ref(&tool),
+                    ToolChoice::Required,
+                    ParallelToolCallPolicy::Disabled,
+                    Vec::new(),
+                )
+                .unwrap_err();
+            assert!(
+                error.contains("tools[0]"),
+                "invalid tool {tool} produced an unscoped diagnostic: {error}"
+            );
+        }
+
+        let duplicate = tool("lookup", valid_parameters());
+        let error = compiler()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &[duplicate.clone(), duplicate],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("duplicate tool function name"));
+    }
+
+    #[test]
+    fn rejects_invalid_references_schemas_keywords_and_compositions() {
+        let compiler = compiler();
+        let invalid = [
+            tool(
+                "missing",
+                json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/nope"}}}),
+            ),
+            tool(
+                "external",
+                json!({"type": "object", "properties": {"x": {"$ref": "https://example.test/schema"}}}),
+            ),
+            tool("malformed", json!({"type": "object", "required": "x"})),
+            tool(
+                "unsupported",
+                json!({"type": "object", "patternProperties": {".*": {"type": "string"}}}),
+            ),
+            tool(
+                "composition",
+                json!({"type": "object", "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "number"}]}}}),
+            ),
+        ];
+        for tool in invalid {
+            let error = compiler
+                .compile_tool_plan(
+                    &DECLARATIVE_DIALECT,
+                    SYNTHETIC_PARAMETERS,
+                    &[tool],
+                    ToolChoice::Required,
+                    ParallelToolCallPolicy::Disabled,
+                    Vec::new(),
+                )
+                .unwrap_err();
+            assert!(
+                error.contains("reference")
+                    || error.contains("required")
+                    || error.contains("unsupported"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforces_single_and_parallel_call_limits() {
+        let compiler = compiler();
+        let tools = [tool(
+            "ping",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        )];
+        let single = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &tools,
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+        let parallel = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &tools,
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Enabled {
+                    max_calls: NonZeroUsize::new(2),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let two = json!({"calls": [
+            {"name": "ping", "arguments": {}},
+            {"name": "ping", "arguments": {}}
+        ]});
+        let three = json!({"calls": [
+            {"name": "ping", "arguments": {}},
+            {"name": "ping", "arguments": {}},
+            {"name": "ping", "arguments": {}}
+        ]});
+        assert!(!accepts(&single, two.clone()));
+        assert!(accepts(&parallel, two));
+        assert!(!accepts(&parallel, three));
+    }
+
+    #[test]
+    fn grammar_state_forks_commits_completes_and_rolls_back() {
+        let compiler = compiler();
+        let plan = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &[tool(
+                    "ping",
+                    json!({"type": "object", "properties": {}, "additionalProperties": false}),
+                )],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+        let bytes =
+            serde_json::to_vec(&json!({"calls": [{"name": "ping", "arguments": {}}]})).unwrap();
+        let split = bytes.len() / 2;
+        let mut state = plan.generation_constraint().grammar_state();
+        for byte in &bytes[..split] {
+            state.commit(*byte as TokenId).unwrap();
+        }
+        let mut fork = state.fork();
+        assert!(!state.allowed_tokens().unwrap().is_empty());
+        for byte in &bytes[split..] {
+            state.commit(*byte as TokenId).unwrap();
+        }
+        assert!(state.is_complete().unwrap());
+        fork.commit(bytes[split] as TokenId).unwrap();
+        fork.rollback(1).unwrap();
+        assert!(!fork.is_complete().unwrap());
+        for byte in &bytes[split..] {
+            fork.commit(*byte as TokenId).unwrap();
+        }
+        assert!(fork.is_complete().unwrap());
+    }
+}

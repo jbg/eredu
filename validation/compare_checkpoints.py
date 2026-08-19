@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare SafeMLX checkpoint-probe artifacts with a reference run."""
+"""Compare Eredu checkpoint-probe artifacts with a reference run."""
 
 import argparse
 import heapq

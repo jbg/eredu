@@ -9,11 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use safemlx::{Device, DeviceType, ExecutionContext};
-use safemlx_lm::{
+use eredu::{
     api::LoadedModel, backend::mlx::MlxBackend, runtime::chat::ChatTemplateRequest,
     GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
+use safemlx::{Device, DeviceType, ExecutionContext};
 
 /// Receives one UTF-8 text fragment. The bytes are valid only during the call.
 pub type TextCallback = unsafe extern "C" fn(*const u8, usize, *mut c_void);
@@ -99,7 +99,7 @@ fn generate(
         })
         .map(|prepared| (prepared.rendered_prompt().to_owned(), false))
         .or_else(|error| {
-            if matches!(error, safemlx_lm::api::TextModelError::MissingChatTemplate) {
+            if matches!(error, eredu::api::TextModelError::MissingChatTemplate) {
                 Ok((prompt.to_owned(), true))
             } else {
                 Err(error)

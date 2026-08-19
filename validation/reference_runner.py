@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a Transformers reference along an exact SafeMLX probe token path."""
+"""Run a Transformers reference along an exact Eredu probe token path."""
 
 import argparse
 import json

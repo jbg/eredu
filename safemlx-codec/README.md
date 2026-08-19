@@ -1,7 +1,7 @@
 # safemlx-codec
 
 `safemlx-codec` provides neural audio codec components built on `safemlx`.
-Codec support is separate from `safemlx-lm`, so applications that operate only
+Codec support is separate from `eredu`, so applications that operate only
 on codec tokens do not need PCM encoding or decoding dependencies.
 
 ## Mimi

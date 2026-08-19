@@ -1,7 +1,7 @@
 //! Neural audio codec components built on `safemlx`.
 //!
 //! This crate keeps codec implementations optional and separate from
-//! `safemlx-lm`. Realtime language models can operate on discrete codec tokens,
+//! `eredu`. Realtime language models can operate on discrete codec tokens,
 //! while applications that need audio encode/decode can depend on this crate.
 
 #![warn(missing_docs)]

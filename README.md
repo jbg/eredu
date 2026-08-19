@@ -1,5 +1,7 @@
 # SafeMLX
 
+> **eredu** *noun, Basque* — “model; pattern.”
+
 SafeMLX is an unofficial Rust workspace for building
 [MLX](https://github.com/ml-explore/mlx) applications and
 running local machine-learning models without a Python runtime. It combines a
@@ -16,15 +18,15 @@ SafeMLX is independent of Apple and is not an official MLX project.
 | Crate | Use it for |
 | --- | --- |
 | [`safemlx`](safemlx/) | Arrays, operations, transforms, neural-network modules, optimizers, streams, and distributed MLX |
-| [`safemlx-lm`](safemlx-lm/) | Loading and running supported text, multimodal, and realtime speech models |
-| [`safemlx-lm-core`](safemlx-lm-core/) | Backend-neutral LM contracts, scheduling, validation, and portable schemas |
-| [`safemlx-gguf`](safemlx-gguf/) | Bounded, framework-independent GGUF reading, writing, and tensor conversion |
+| [`eredu`](eredu/) | Loading and running supported text, multimodal, and realtime speech models |
+| [`eredu-core`](eredu-core/) | Backend-neutral LM contracts, scheduling, validation, and portable schemas |
+| [`eredu-gguf`](eredu-gguf/) | Bounded, framework-independent GGUF reading, writing, and tensor conversion |
 | [`safemlx-codec`](safemlx-codec/) | Neural audio codecs, including Mimi |
-| [`safemlx-lm-utils`](safemlx-lm-utils/) | Tokenizer and chat-template utilities |
+| [`eredu-text`](eredu-text/) | Tokenizer and chat-template utilities |
 | [`safemlx-sys`](safemlx-sys/) | Low-level MLX C bindings and native build integration |
 
 The workspace also contains procedural-macro crates, integration tests, and a
-[`safemlx-lm` command-line example](examples/safemlx-lm-cli/).
+[`eredu` command-line example](examples/eredu-cli/).
 
 ## Quick start
 
@@ -53,7 +55,7 @@ assert_eq!(sum.as_slice::<f32>(), &[5.0, 7.0, 9.0]);
 To try a supported local language model:
 
 ```sh
-cargo run --release -p safemlx-lm-cli -- \
+cargo run --release -p eredu-cli -- \
   --model /path/to/model \
   "Write a Rust function that adds two integers."
 ```
@@ -70,14 +72,14 @@ download models.
 - [Model loading, quantization, and memory](doc/model-loading.md)
 - [Parallel execution](doc/parallel-execution.md)
 - [Platform setup](doc/platforms.md)
-- [CLI guide](examples/safemlx-lm-cli/README.md)
+- [CLI guide](examples/eredu-cli/README.md)
 
 All published crates are pre-1.0, so applications should expect API changes
 between minor releases.
 
 ## License
 
-The SafeMLX crates are available under MIT or Apache-2.0 unless a crate or
+The workspace crates are available under MIT or Apache-2.0 unless a crate or
 vendored component states otherwise. See [`LICENSE-MIT`](LICENSE-MIT),
 [`LICENSE-APACHE`](LICENSE-APACHE), and the notices inside vendored source
 trees.

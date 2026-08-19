@@ -12,7 +12,7 @@ use crate::{
     quantization::Quantizable,
     Array, Dtype, Stream,
 };
-use safemlx_gguf::{Endian as GgufEndian, GgmlType};
+use eredu_gguf::{Endian as GgufEndian, GgmlType};
 use safemlx_macros::ModuleParameters;
 
 use crate::nn::{Embedding, Linear};

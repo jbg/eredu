@@ -840,6 +840,88 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "eredu"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "eredu-core",
+ "eredu-gguf",
+ "eredu-text",
+ "half",
+ "idna_adapter",
+ "image",
+ "lazy_static",
+ "libc",
+ "llguidance",
+ "memmap2",
+ "minijinja",
+ "rustfft",
+ "safemlx",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokenizers 0.23.1",
+ "toktrie_hf_tokenizers",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "eredu-cli"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "eredu",
+ "hf-hub",
+ "safemlx",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "eredu-core"
+version = "0.1.0"
+dependencies = [
+ "eredu-gguf",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "eredu-gguf"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "eredu-text"
+version = "0.1.4"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "eredu-gguf",
+ "minijinja",
+ "minijinja-contrib",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokenizers 0.23.1",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2615,6 +2697,7 @@ version = "0.1.3"
 dependencies = [
  "bytemuck",
  "dyn-clone",
+ "eredu-gguf",
  "float_eq",
  "half",
  "itertools 0.15.0",
@@ -2625,7 +2708,6 @@ dependencies = [
  "parking_lot",
  "paste",
  "pretty_assertions",
- "safemlx-gguf",
  "safemlx-internal-macros",
  "safemlx-macros",
  "safemlx-sys",
@@ -2640,22 +2722,13 @@ dependencies = [
 name = "safemlx-codec"
 version = "0.1.0"
 dependencies = [
+ "eredu",
  "memmap2",
  "safemlx",
- "safemlx-lm",
  "safetensors",
  "sentencepiece-rs",
  "serde",
  "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "safemlx-gguf"
-version = "0.1.0"
-dependencies = [
- "half",
- "tempfile",
  "thiserror",
 ]
 
@@ -2673,82 +2746,9 @@ dependencies = [
 name = "safemlx-ios"
 version = "0.1.0"
 dependencies = [
+ "eredu",
  "safemlx",
- "safemlx-lm",
  "serde_json",
-]
-
-[[package]]
-name = "safemlx-lm"
-version = "0.4.1"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "half",
- "idna_adapter",
- "image",
- "lazy_static",
- "libc",
- "llguidance",
- "memmap2",
- "minijinja",
- "rustfft",
- "safemlx",
- "safemlx-gguf",
- "safemlx-lm-core",
- "safemlx-lm-utils",
- "safetensors",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokenizers 0.23.1",
- "toktrie_hf_tokenizers",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "safemlx-lm-cli"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "clap",
- "hf-hub",
- "safemlx",
- "safemlx-lm",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "safemlx-lm-core"
-version = "0.1.0"
-dependencies = [
- "safemlx-gguf",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "safemlx-lm-utils"
-version = "0.1.4"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "minijinja",
- "minijinja-contrib",
- "safemlx-gguf",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokenizers 0.23.1",
 ]
 
 [[package]]

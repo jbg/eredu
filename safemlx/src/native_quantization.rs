@@ -24,7 +24,7 @@ use crate::{
     transforms::eval,
     Array, Dtype, Stream,
 };
-use safemlx_gguf::{Endian as GgufEndian, GgmlType};
+use eredu_gguf::{Endian as GgufEndian, GgmlType};
 
 const Q4_K_BLOCK_VALUES: i32 = 256;
 const Q4_K_BLOCK_BYTES: i32 = 144;
@@ -807,7 +807,7 @@ impl NativeQuantizedTensor {
                         self.columns as u64,
                     ]
                 };
-                let tensor = safemlx_gguf::IQuantTensor {
+                let tensor = eredu_gguf::IQuantTensor {
                     shape: physical_shape,
                     ggml_type: ty,
                     endian: self.storage.endian,
@@ -985,7 +985,7 @@ fn decode_native_row(
             }
         }
         format => {
-            values = safemlx_gguf::IQuantTensor {
+            values = eredu_gguf::IQuantTensor {
                 shape: vec![1, view.columns as u64],
                 ggml_type: format.ggml_type().expect("IQ format"),
                 endian: view.storage.endian,
@@ -3249,7 +3249,7 @@ fn iq_metal_array<T: std::fmt::LowerHex>(
 }
 
 fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool) -> String {
-    use safemlx_gguf::iquant_tables::{
+    use eredu_gguf::iquant_tables::{
         IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
         KVALUES_IQ4NL,
     };
@@ -3577,8 +3577,7 @@ mod tests {
     #[test]
     fn every_iq_format_executes_direct_packed_linear_embedding_and_grouped() {
         let stream = crate::test_stream();
-        for line in
-            include_str!("../../safemlx-gguf/tests/fixtures/llama-c0bc8591-iq.oracle").lines()
+        for line in include_str!("../../eredu-gguf/tests/fixtures/llama-c0bc8591-iq.oracle").lines()
         {
             let mut fields = line.split('|');
             let ty = GgmlType::from_code(fields.next().unwrap().parse().unwrap());
@@ -3586,7 +3585,7 @@ mod tests {
             let _oracle_f16 = fields.next().unwrap();
             let (block_values, block_bytes) = ty.block_and_bytes().unwrap();
             let raw = &all_raw[..block_bytes as usize];
-            let canonical = safemlx_gguf::IQuantTensor {
+            let canonical = eredu_gguf::IQuantTensor {
                 shape: vec![1, block_values],
                 ggml_type: ty,
                 endian: GgufEndian::Little,
@@ -3700,8 +3699,7 @@ mod tests {
     #[ignore = "requires an accessible Metal device"]
     fn every_iq_format_executes_batched_metal_kernels() {
         let stream = crate::Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
-        for line in
-            include_str!("../../safemlx-gguf/tests/fixtures/llama-c0bc8591-iq.oracle").lines()
+        for line in include_str!("../../eredu-gguf/tests/fixtures/llama-c0bc8591-iq.oracle").lines()
         {
             let mut fields = line.split('|');
             let ty = GgmlType::from_code(fields.next().unwrap().parse().unwrap());
@@ -3874,16 +3872,16 @@ mod tests {
         let actual = actual.evaluated().unwrap();
         let actual = actual.as_slice::<f32>();
 
-        let descriptor = safemlx_gguf::TensorDescriptor {
+        let descriptor = eredu_gguf::TensorDescriptor {
             name: "test.weight".into(),
             dimensions: vec![256, 1],
-            ggml_type: safemlx_gguf::GgmlType::Q4K,
+            ggml_type: eredu_gguf::GgmlType::Q4K,
             relative_offset: 0,
             data_offset: 0,
             byte_len: 144,
         };
         let reference =
-            safemlx_gguf::convert_affine(&descriptor, &raw, safemlx_gguf::Endian::Little).unwrap();
+            eredu_gguf::convert_affine(&descriptor, &raw, eredu_gguf::Endian::Little).unwrap();
         let expected = reference.dequantize();
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(expected) {
@@ -3960,16 +3958,16 @@ mod tests {
         let actual = native.dequantize(&stream).unwrap();
         let actual = actual.evaluated().unwrap();
 
-        let descriptor = safemlx_gguf::TensorDescriptor {
+        let descriptor = eredu_gguf::TensorDescriptor {
             name: "test.weight".into(),
             dimensions: vec![32, 1],
-            ggml_type: safemlx_gguf::GgmlType::Q5_1,
+            ggml_type: eredu_gguf::GgmlType::Q5_1,
             relative_offset: 0,
             data_offset: 0,
             byte_len: raw.len() as u64,
         };
         let reference =
-            safemlx_gguf::convert_affine(&descriptor, &raw, safemlx_gguf::Endian::Little).unwrap();
+            eredu_gguf::convert_affine(&descriptor, &raw, eredu_gguf::Endian::Little).unwrap();
         for (actual, expected) in actual.as_slice::<f32>().iter().zip(reference.dequantize()) {
             assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
         }
@@ -4050,16 +4048,16 @@ mod tests {
         let actual = native.dequantize(&stream).unwrap();
         let actual = actual.evaluated().unwrap();
 
-        let descriptor = safemlx_gguf::TensorDescriptor {
+        let descriptor = eredu_gguf::TensorDescriptor {
             name: "test.weight".into(),
             dimensions: vec![32, 2],
-            ggml_type: safemlx_gguf::GgmlType::Q8_0,
+            ggml_type: eredu_gguf::GgmlType::Q8_0,
             relative_offset: 0,
             data_offset: 0,
             byte_len: raw.len() as u64,
         };
         let reference =
-            safemlx_gguf::convert_affine(&descriptor, &raw, safemlx_gguf::Endian::Little).unwrap();
+            eredu_gguf::convert_affine(&descriptor, &raw, eredu_gguf::Endian::Little).unwrap();
         for (actual, expected) in actual.as_slice::<f32>().iter().zip(reference.dequantize()) {
             assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
         }

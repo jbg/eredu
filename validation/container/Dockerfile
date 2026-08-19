@@ -44,7 +44,7 @@ RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/op
     cd /src; \
     rustc --version | grep -F 'rustc 1.89.0'; \
     cargo build --locked --release \
-        -p safemlx-lm \
+        -p eredu \
         --no-default-features \
         --features cuda,fancy-regex \
         --example checkpoint_probe; \
@@ -86,8 +86,8 @@ ARG BUILD_DATE=unknown
 ARG VCS_REF=unknown
 ARG IMAGE_VERSION=cuda12.9.1-rust1.89.0-torch2.8.0-v1
 
-LABEL org.opencontainers.image.title="SafeMLX CUDA checkpoint validation" \
-      org.opencontainers.image.description="Pinned CUDA environment for SafeMLX checkpoint correctness and performance probes" \
+LABEL org.opencontainers.image.title="Eredu CUDA checkpoint validation" \
+      org.opencontainers.image.description="Pinned CUDA environment for Eredu checkpoint correctness and performance probes" \
       org.opencontainers.image.source="https://github.com/jbg/safemlx" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \

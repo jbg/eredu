@@ -1,0 +1,619 @@
+//! MLX observations and plan realization for neutral automatic planning.
+
+use std::{fs, path::Path};
+
+use eredu_core::{
+    AutomaticPlanningBackend, AutomaticPlanningError, BackendId, BoundedResidencyRequirement,
+    CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
+    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExpertCacheTelemetry,
+    ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
+    HardwareProfile, InspectionSeverity, ModelKind, ModelResourceProfile, ModelRuntime,
+    MtpCapability, MtpCheckpointKind, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics,
+    RealizedDrafting, ResidencyPlan, ResidencyTelemetry, SpeculativeGenerationBackend,
+    TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+};
+use safemlx::{Device, DeviceType, Stream};
+
+use super::{
+    capability::available_memory,
+    inspection::{inspect_model, MlxInspectionOptions},
+    prepared_speculative::validate_external_drafter,
+    speculative::MlxDrafter,
+    MlxBackend, ModelLoadOptions,
+};
+use crate::{
+    backend::mlx::error::Error,
+    backend::mlx::runtime::{
+        checkpoint::quantization::{AffineQuantization, WeightQuantization},
+        execution::layerwise::{
+            LayerwiseLoadOptions, LayerwiseModelError, NonExpertWeightResidency, WeightResidency,
+        },
+        residency::{
+            dense_stream::DenseDiskStreamLoadOptions,
+            expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport},
+            manager::ResidencyReport,
+        },
+    },
+};
+use eredu_core::residency::{MemoryTier, OffloadConfig, TransferDirection};
+
+/// MLX automatic-planning adapter and whole-session backend factory.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MlxBackendFactory {
+    sample_mlx_memory: bool,
+    sample_process_memory: bool,
+}
+
+impl MlxBackendFactory {
+    /// Enables backend allocator and process-memory sampling for bounded residency.
+    pub const fn with_residency_diagnostics(
+        mut self,
+        sample_mlx_memory: bool,
+        sample_process_memory: bool,
+    ) -> Self {
+        self.sample_mlx_memory = sample_mlx_memory;
+        self.sample_process_memory = sample_process_memory;
+        self
+    }
+}
+
+/// Discovers hardware facts visible to the MLX adapter.
+pub fn discover_hardware() -> HardwareProfile {
+    let logical_cpu_count = std::thread::available_parallelism().map_or_else(
+        |error| Observed::unavailable(error.to_string()),
+        |count| Observed::exact(count.get() as u64, "std::thread::available_parallelism"),
+    );
+    let (physical_memory_bytes, available_memory_bytes, semantics) = match available_memory() {
+        Ok(memory) => (
+            memory.physical_memory_bytes,
+            memory.available_memory_bytes,
+            memory_semantics(memory.physical_semantics),
+        ),
+        Err(error) => (
+            Observed::unavailable(error.to_string()),
+            Observed::unavailable(error.to_string()),
+            HardwareMemorySemantics::Unknown,
+        ),
+    };
+    let mut devices = vec![HardwareDeviceProfile {
+        id: "cpu:0".into(),
+        family: "cpu".into(),
+        index: 0,
+        total_memory_bytes: physical_memory_bytes.clone(),
+        available_memory_bytes: available_memory_bytes.clone(),
+    }];
+    let mut details = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        let (available, detail) = match safemlx::metal::is_available() {
+            Ok(available) => (available, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+        if available {
+            let (total, available) = if semantics == HardwareMemorySemantics::Unified {
+                (
+                    physical_memory_bytes.clone(),
+                    available_memory_bytes.clone(),
+                )
+            } else {
+                (
+                    Observed::unavailable("MLX does not expose discrete Metal capacity"),
+                    Observed::unavailable("MLX does not expose discrete Metal availability"),
+                )
+            };
+            devices.push(HardwareDeviceProfile {
+                id: "metal:0".into(),
+                family: "metal".into(),
+                index: 0,
+                total_memory_bytes: total,
+                available_memory_bytes: available,
+            });
+        } else if let Some(detail) = detail {
+            details.push(format!("Metal: {detail}"));
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        let (available, detail) = match safemlx::cuda::is_available() {
+            Ok(available) => (available, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+        if available {
+            devices.push(HardwareDeviceProfile {
+                id: "cuda:0".into(),
+                family: "cuda".into(),
+                index: 0,
+                total_memory_bytes: Observed::unavailable(
+                    "MLX does not expose CUDA device capacity",
+                ),
+                available_memory_bytes: Observed::unavailable(
+                    "MLX does not expose CUDA device availability",
+                ),
+            });
+        } else if let Some(detail) = detail {
+            details.push(format!("CUDA: {detail}"));
+        }
+    }
+
+    HardwareProfile {
+        schema_version: AUTOMATIC_SCHEMA_VERSION,
+        operating_system: std::env::consts::OS.into(),
+        architecture: std::env::consts::ARCH.into(),
+        logical_cpu_count,
+        physical_memory_bytes,
+        available_memory_bytes,
+        physical_memory_semantics: semantics,
+        backends: vec![HardwareBackendProfile {
+            backend: BackendId::new("mlx").expect("MLX is a valid backend identifier"),
+            available: true,
+            detail: (!details.is_empty()).then(|| details.join("; ")),
+            devices,
+        }],
+    }
+}
+
+fn mlx_load_options(
+    factory: &MlxBackendFactory,
+    plan: &ExecutionPlan,
+) -> Result<ModelLoadOptions, Error> {
+    if plan.topology.world_size() != 1 {
+        return Err(Error::AutomaticPlanning(
+            "single-device automatic plans require a 1x1x1 parallel topology".into(),
+        ));
+    }
+    let mut load = match plan.weight_transformation {
+        WeightTransformationPlan::PreserveCheckpoint => ModelLoadOptions::default(),
+        WeightTransformationPlan::Affine { bits, group_size } => {
+            ModelLoadOptions::with_quantization(AffineQuantization::new(group_size, bits)?)
+        }
+        WeightTransformationPlan::MxFp4 => {
+            ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+        }
+    };
+    let residency = match &plan.residency {
+        ResidencyPlan::FullyResident => NonExpertWeightResidency::FullyResident,
+        ResidencyPlan::LayerwiseHost {
+            device_layer_window,
+            device_budget_bytes,
+            host_budget_bytes,
+        } => NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions {
+            offload: OffloadConfig::new(
+                *device_budget_bytes,
+                *host_budget_bytes,
+                *device_layer_window,
+            )?,
+            max_mapped_shards: plan.max_mapped_shards,
+            sample_mlx_memory: factory.sample_mlx_memory,
+            sample_process_memory: factory.sample_process_memory,
+            ..LayerwiseLoadOptions::default()
+        }),
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            host_budget_bytes,
+            host_lookahead,
+            background_queue,
+        } => {
+            let mut options = DenseDiskStreamLoadOptions::new(
+                *device_budget_bytes,
+                *host_budget_bytes,
+                *host_lookahead,
+                *background_queue,
+            )?;
+            options.max_mapped_shards = plan.max_mapped_shards;
+            options.sample_mlx_memory = factory.sample_mlx_memory;
+            options.sample_process_memory = factory.sample_process_memory;
+            NonExpertWeightResidency::DenseDiskStream(options)
+        }
+    };
+    let residency = if let Some(expert) = &plan.expert_cache {
+        WeightResidency::with_expert_cache(
+            residency,
+            ExpertCacheLoadOptions::new(
+                OffloadConfig::new(expert.device_budget_bytes, expert.host_budget_bytes, 1)?
+                    .with_eviction_policy(expert.eviction_policy),
+                expert.scratch_bytes,
+                expert.prefill_bank_bytes,
+            )?,
+        )
+    } else {
+        match residency {
+            NonExpertWeightResidency::FullyResident => WeightResidency::fully_resident(),
+            NonExpertWeightResidency::LayerwiseHost(options) => {
+                WeightResidency::layerwise_host(options)
+            }
+            NonExpertWeightResidency::DenseDiskStream(options) => {
+                WeightResidency::dense_disk_stream(options)
+            }
+        }
+    };
+    load = load.with_weight_residency(residency);
+    Ok(load)
+}
+
+fn mlx_drafter_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions, Error> {
+    match plan.weight_transformation {
+        WeightTransformationPlan::PreserveCheckpoint => Ok(ModelLoadOptions::default()),
+        WeightTransformationPlan::Affine { bits, group_size } => Ok(
+            ModelLoadOptions::with_quantization(AffineQuantization::new(group_size, bits)?),
+        ),
+        WeightTransformationPlan::MxFp4 => Ok(ModelLoadOptions::with_quantization(
+            WeightQuantization::MxFp4,
+        )),
+    }
+}
+
+impl AutomaticPlanningBackend for MlxBackendFactory {
+    fn backend_id(&self) -> BackendId {
+        BackendId::new("mlx").expect("MLX is a valid backend identifier")
+    }
+
+    fn discover_hardware(&self) -> Result<HardwareProfile, AutomaticPlanningError> {
+        Ok(discover_hardware())
+    }
+
+    fn inspect_resources(
+        &self,
+        model_path: &Path,
+    ) -> Result<ModelResourceProfile, AutomaticPlanningError> {
+        inspect_model(model_path, MlxInspectionOptions::default())
+            .map(|report| report.resources)
+            .map_err(|error| planning_backend_error("inspect_resources", error))
+    }
+
+    fn admit_candidate(
+        &self,
+        model_path: &Path,
+        plan: &ExecutionPlan,
+    ) -> Result<CandidateAdmission, AutomaticPlanningError> {
+        let load = mlx_load_options(self, plan)
+            .map_err(|error| planning_backend_error("realize_plan", error))?;
+        let report = inspect_model(model_path, MlxInspectionOptions { load })
+            .map_err(|error| planning_backend_error("admit_candidate", error))?;
+        let supported = report.is_loadable();
+        let rejection = (!supported).then(|| {
+            report
+                .issues
+                .iter()
+                .find(|issue| issue.severity == InspectionSeverity::Error)
+                .map(|issue| issue.detail.clone())
+                .unwrap_or_else(|| {
+                    "checkpoint inspection did not admit this MLX load policy".into()
+                })
+        });
+        Ok(CandidateAdmission {
+            supported,
+            rejection,
+        })
+    }
+
+    fn bounded_residency_requirement(
+        &self,
+        model_path: &Path,
+        plan: &ExecutionPlan,
+    ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
+        let mut probe = plan.clone();
+        probe.expert_cache = None;
+        match &mut probe.residency {
+            ResidencyPlan::LayerwiseHost {
+                device_budget_bytes,
+                ..
+            } => *device_budget_bytes = Some(1),
+            ResidencyPlan::DenseDiskStream {
+                device_budget_bytes,
+                ..
+            } => *device_budget_bytes = 1,
+            ResidencyPlan::FullyResident => {
+                return Err(AutomaticPlanningError::Invalid(
+                    "fully resident execution has no bounded device window".into(),
+                ));
+            }
+        }
+        let stream = Stream::new_with_device(&mlx_device(&probe.device)?);
+        let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let backend = MlxBackend::new(&stream, &weights_stream);
+        let options = mlx_load_options(self, &probe)
+            .map_err(|error| planning_backend_error("realize_probe", error))?;
+        match crate::load_model(&backend, model_path, options) {
+            Err(crate::ModelLoadError::Backend(Error::LayerwiseModel(
+                LayerwiseModelError::DeviceBudgetTooSmall {
+                    static_bytes,
+                    window_bytes,
+                    depth,
+                    required,
+                    ..
+                },
+            ))) => Ok(BoundedResidencyRequirement {
+                static_bytes,
+                window_bytes,
+                required_bytes: required,
+                depth,
+            }),
+            Err(error) => Err(planning_backend_error("bounded_residency_probe", error)),
+            Ok(_) => Ok(BoundedResidencyRequirement {
+                static_bytes: 0,
+                window_bytes: 0,
+                required_bytes: 1,
+                depth: 0,
+            }),
+        }
+    }
+
+    fn embedded_draft_layers(
+        &self,
+        model_path: &Path,
+        model_kind: Option<ModelKind>,
+    ) -> Result<Option<usize>, AutomaticPlanningError> {
+        if !matches!(
+            model_kind,
+            Some(
+                ModelKind::DeepSeekV3
+                    | ModelKind::Inkling
+                    | ModelKind::NemotronH
+                    | ModelKind::Qwen3Next
+                    | ModelKind::Qwen35
+            )
+        ) {
+            return Ok(Some(0));
+        }
+        if !model_path.is_dir() {
+            return Ok(None);
+        }
+        let bytes = fs::read(model_path.join("config.json"))
+            .map_err(|error| planning_backend_error("read_drafting_metadata", error))?;
+        let config: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| planning_backend_error("decode_drafting_metadata", error))?;
+        embedded_mtp_count(&config)
+            .map(|count| {
+                usize::try_from(count).map_err(|_| {
+                    AutomaticPlanningError::Invalid("embedded MTP layer count exceeds usize".into())
+                })
+            })
+            .transpose()
+            .map(|count| Some(count.unwrap_or(0)))
+    }
+}
+
+impl ExecutionPlanBackendFactory for MlxBackendFactory {
+    type Backend = MlxBackend<'static>;
+    type Drafter = MlxDrafter;
+
+    fn realize_target(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
+        let stream = Stream::new_with_device(&mlx_device(&plan.device)?);
+        let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let options = mlx_load_options(self, plan)
+            .map_err(|error| planning_backend_error("realize_execution_plan_target", error))?;
+        Ok(ExecutionPlanTarget::new(
+            MlxBackend::for_execution_plan(&stream, &weights_stream, plan.device.device.clone()),
+            options,
+        ))
+    }
+
+    fn realize_drafting(
+        &self,
+        plan: &ExecutionPlan,
+        target: &ModelRuntime<Self::Backend>,
+        external_artifact: Option<ExternalDraftArtifact>,
+    ) -> Result<RealizedDrafting<MlxDrafter>, AutomaticPlanningError> {
+        let capability =
+            <MlxBackend<'static> as SpeculativeGenerationBackend>::mtp_capability(target);
+        match &plan.drafting {
+            DraftingPlan::Disabled => Ok(RealizedDrafting::Disabled),
+            DraftingPlan::Embedded { .. } => {
+                if capability
+                    != (MtpCapability::Ready {
+                        checkpoint: MtpCheckpointKind::Embedded,
+                    })
+                {
+                    return Err(AutomaticPlanningError::Invalid(format!(
+                        "execution plan selects embedded drafting but target capability is {capability:?}"
+                    )));
+                }
+                Ok(RealizedDrafting::Embedded)
+            }
+            DraftingPlan::External {
+                model, placement, ..
+            } => {
+                if capability
+                    != (MtpCapability::Ready {
+                        checkpoint: MtpCheckpointKind::Separate,
+                    })
+                {
+                    return Err(AutomaticPlanningError::Invalid(format!(
+                        "execution plan selects external drafting but target capability is {capability:?}"
+                    )));
+                }
+                let artifact = external_artifact.ok_or_else(|| {
+                    AutomaticPlanningError::Invalid(
+                        "external drafting is missing tokenizer identities".into(),
+                    )
+                })?;
+                let draft_stream = match placement {
+                    DraftPlacementPlan::Target => target.backend().stream().clone(),
+                    DraftPlacementPlan::Device { device } => {
+                        Stream::new_with_device(&mlx_device(device)?)
+                    }
+                };
+                let options = mlx_drafter_load_options(plan)
+                    .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
+                let drafter = MlxDrafter::load_with_fingerprint(
+                    model,
+                    artifact.draft_tokenizer_fingerprint,
+                    options,
+                    &draft_stream,
+                    target.backend().weights_stream(),
+                )
+                .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
+                validate_external_drafter(target, artifact.target_tokenizer_fingerprint, &drafter)
+                    .map_err(|error| planning_backend_error("validate_external_drafter", error))?;
+                draft_stream.synchronize().map_err(|error| {
+                    planning_backend_error("complete_external_drafter_load", error)
+                })?;
+                Ok(RealizedDrafting::External(drafter))
+            }
+        }
+    }
+}
+
+/// Converts an MLX residency snapshot into neutral telemetry.
+pub fn residency_telemetry(report: &ResidencyReport) -> ResidencyTelemetry {
+    let offload = report.offload();
+    let planned = offload.planned_bytes();
+    let current = offload.resident_bytes();
+    let peak = offload.peak_resident_bytes();
+    let transfers = TransferDirection::ALL
+        .into_iter()
+        .map(|direction| {
+            let metrics = offload.transfer(direction);
+            TransferTelemetry {
+                direction: transfer_direction_name(direction).into(),
+                count: metrics.count(),
+                bytes: metrics.bytes(),
+                seconds: DurationSeconds(metrics.duration().as_secs_f64()),
+            }
+        })
+        .collect();
+    ResidencyTelemetry {
+        planned_disk_bytes: planned.get(MemoryTier::Disk),
+        planned_host_bytes: planned.get(MemoryTier::Host),
+        planned_device_bytes: planned.get(MemoryTier::Device),
+        current_host_bytes: current.get(MemoryTier::Host),
+        current_device_bytes: current.get(MemoryTier::Device),
+        peak_host_bytes: peak.get(MemoryTier::Host),
+        peak_device_bytes: peak.get(MemoryTier::Device),
+        transfers,
+    }
+}
+
+/// Converts an MLX routed-expert cache snapshot into neutral telemetry.
+pub fn expert_cache_telemetry(report: &ExpertCacheReport) -> ExpertCacheTelemetry {
+    ExpertCacheTelemetry {
+        owned_experts: report.owned_experts,
+        owned_bytes: report.owned_bytes,
+        host_resident_experts: report.host_resident_experts,
+        device_resident_experts: report.device_resident_experts,
+        host_resident_bytes: report.host_resident_bytes,
+        device_resident_bytes: report.device_resident_bytes,
+        peak_host_resident_bytes: report.peak_host_resident_bytes,
+        peak_device_resident_bytes: report.peak_device_resident_bytes,
+    }
+}
+
+/// Converts neutral speculative statistics into the stable telemetry document.
+pub fn mtp_telemetry(stats: &MtpStats) -> MtpTelemetry {
+    MtpTelemetry {
+        execution_topology: stats.execution_topology.to_string(),
+        target_tokens: stats.target_tokens,
+        draft_tokens: stats.draft_tokens,
+        accepted_tokens: stats.accepted_tokens,
+        accept_rate: stats.accept_rate(),
+        rounds: stats.rounds,
+        accept_lens: stats.accept_lens.clone(),
+        emitted_tokens: stats.emitted_tokens,
+        optimistic_draft_tokens: stats.optimistic_draft_tokens,
+        reused_optimistic_tokens: stats.reused_optimistic_tokens,
+        discarded_optimistic_tokens: stats.discarded_optimistic_tokens,
+        adaptive_lookahead_disabled: stats.adaptive_lookahead_disabled,
+        optimistic_draft_seconds: stats.optimistic_draft_time.as_secs_f64(),
+        verification_in_flight_seconds: stats.verification_in_flight_time.as_secs_f64(),
+    }
+}
+
+fn memory_semantics(value: PhysicalMemorySemantics) -> HardwareMemorySemantics {
+    match value {
+        PhysicalMemorySemantics::Unified => HardwareMemorySemantics::Unified,
+        PhysicalMemorySemantics::SeparateTiers => HardwareMemorySemantics::SeparateTiers,
+        PhysicalMemorySemantics::Unknown => HardwareMemorySemantics::Unknown,
+    }
+}
+
+fn mlx_device(device: &DevicePlan) -> Result<Device, AutomaticPlanningError> {
+    if device.backend.as_str() != "mlx" {
+        return Err(AutomaticPlanningError::Invalid(format!(
+            "MLX cannot probe backend {}",
+            device.backend
+        )));
+    }
+    let (family, index) = device.device.split_once(':').ok_or_else(|| {
+        AutomaticPlanningError::Invalid(format!(
+            "MLX device identifier {:?} must be family:index",
+            device.device
+        ))
+    })?;
+    let index = i32::try_from(index.parse::<usize>().map_err(|error| {
+        AutomaticPlanningError::Invalid(format!("invalid MLX device index: {error}"))
+    })?)
+    .map_err(|_| AutomaticPlanningError::Invalid("MLX device index exceeds i32".into()))?;
+    let kind = match family {
+        "cpu" => DeviceType::Cpu,
+        "metal" | "cuda" | "gpu" => DeviceType::Gpu,
+        other => {
+            return Err(AutomaticPlanningError::Invalid(format!(
+                "unknown MLX device family {other:?}"
+            )))
+        }
+    };
+    Ok(Device::new(kind, index))
+}
+
+fn embedded_mtp_count(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in ["mtp_num_hidden_layers", "num_nextn_predict_layers"] {
+                if let Some(count) = object.get(key).and_then(serde_json::Value::as_u64) {
+                    return Some(count);
+                }
+            }
+            object.values().find_map(embedded_mtp_count)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(embedded_mtp_count),
+        _ => None,
+    }
+}
+
+fn transfer_direction_name(direction: TransferDirection) -> &'static str {
+    match direction {
+        TransferDirection::DeviceToHost => "device_to_host",
+        TransferDirection::DeviceToDisk => "device_to_disk",
+        TransferDirection::HostToDevice => "host_to_device",
+        TransferDirection::HostToDisk => "host_to_disk",
+        TransferDirection::DiskToDevice => "disk_to_device",
+        TransferDirection::DiskToHost => "disk_to_host",
+    }
+}
+
+fn planning_backend_error(
+    operation: &'static str,
+    error: impl std::fmt::Display,
+) -> AutomaticPlanningError {
+    AutomaticPlanningError::Backend {
+        operation,
+        message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mlx_discovery_always_reports_cpu() {
+        let profile = discover_hardware();
+        assert!(profile.backends.iter().any(|backend| {
+            backend.backend.as_str() == "mlx"
+                && backend.available
+                && backend.devices.iter().any(|device| device.id == "cpu:0")
+        }));
+    }
+
+    #[test]
+    fn plan_realization_rejects_distributed_topology() {
+        let mut plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap());
+        plan.topology = eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap();
+        assert!(mlx_load_options(&MlxBackendFactory::default(), &plan).is_err());
+    }
+}

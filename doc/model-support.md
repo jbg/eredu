@@ -1,6 +1,6 @@
 # Model and checkpoint support
 
-`safemlx-lm` selects an architecture from checkpoint metadata, normalizes its
+`eredu` selects an architecture from checkpoint metadata, normalizes its
 configuration, and validates the complete tensor catalog before loading
 payloads. A compatible family name alone is not sufficient: unsupported layer
 geometry, tensor layout, quantization, tokenizer, processor, or execution
@@ -13,7 +13,7 @@ weights, then apply backend-independent text inspection when tokenizer or chat
 readiness matters:
 
 ```rust,no_run
-use safemlx_lm::{
+use eredu::{
     api::{inspect_text_model, TextInspectionOptions},
     backend::mlx::{inspect_model, MlxInspectionOptions},
     InspectionSeverity,
@@ -30,7 +30,7 @@ if !report.is_loadable() {
         eprintln!("{:?}: {}", issue.code, issue.detail);
     }
 }
-# Ok::<(), safemlx_lm::backend::mlx::error::Error>(())
+# Ok::<(), eredu::backend::mlx::error::Error>(())
 ```
 
 Structural inspection reads configuration and bounded checkpoint headers,
@@ -46,7 +46,7 @@ selected backend options.
 The table describes high-level dispatch. “SafeTensors” means a supported
 Hugging Face-style model directory with the required configuration, tokenizer,
 and processor files. “GGUF” means the canonical architecture metadata and
-tensor layout expected by SafeMLX; multimodal families may require a sibling
+tensor layout expected by Eredu; multimodal families may require a sibling
 projector.
 
 | Family | Inputs | SafeTensors | GGUF | Notable support |
@@ -84,7 +84,7 @@ tensor layout is not implicitly compatible.
 
 ### SafeTensors directories
 
-SafeMLX supports single-file and indexed sharded SafeTensors. It validates every
+Eredu supports single-file and indexed sharded SafeTensors. It validates every
 shard header, tensor name, shape, dtype, and required quantization companion
 before materialization. Tokenizer and chat-template selection use checkpoint
 sidecars. Multimodal models additionally require their processor configuration
@@ -110,7 +110,7 @@ kernel and tensor role. Compatibility is checked per tensor; a file-level
 recipe name such as `UD-Q2_K_XL` is not itself an encoding.
 
 Unsupported tensor types fail explicitly. Packed weights are not expanded into
-a persistent dense copy merely to satisfy loading. See [`safemlx-gguf`](../safemlx-gguf/)
+a persistent dense copy merely to satisfy loading. See [`eredu-gguf`](../eredu-gguf/)
 for the container-level encoding list.
 
 ## Tokenizers, chat, and tools
@@ -154,7 +154,7 @@ rules.
 - On Apple silicon, logical host and device tiers share physical unified memory.
 - Full-attention paging reduces logical device residency but still reads all
   retained history and can be I/O intensive.
-- GGUF and SafeTensors counters describe SafeMLX reads and logical residency;
+- GGUF and SafeTensors counters describe Eredu reads and logical residency;
   operating-system page caching means they are not physical disk-I/O meters.
 - Realtime Moshi and PersonaPlex session state is not represented by decoder
   prompt-cache persistence.

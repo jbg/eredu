@@ -6,12 +6,12 @@ use std::{
     time::Instant,
 };
 
-use safemlx::{random::RandomState, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
-use safemlx_codec::mimi::Mimi;
-use safemlx_lm::{
+use eredu::{
     backend::mlx::architectures::moshi::{model as moshi, personaplex},
     backend::mlx::runtime::generation::sampler::{DefaultSampler, GenerationSampler},
 };
+use safemlx::{random::RandomState, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
+use safemlx_codec::mimi::Mimi;
 use sentencepiece_rs::SentencePieceProcessor;
 use serde::Serialize;
 use serde_json::json;

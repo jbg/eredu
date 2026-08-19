@@ -5,6 +5,7 @@
 
 use std::time::{Duration, Instant};
 
+use eredu_gguf::{ConvertedTensor, GgmlType, Reader, TensorInput, Writer};
 use half::f16;
 use safemlx::{
     memory,
@@ -13,7 +14,6 @@ use safemlx::{
     transforms::eval,
     Array, Device, DeviceType, Dtype, Stream,
 };
-use safemlx_gguf::{ConvertedTensor, GgmlType, Reader, TensorInput, Writer};
 
 fn q8_0_matrix(rows: i32, columns: i32) -> Vec<u8> {
     let blocks = (rows * columns / 32) as usize;

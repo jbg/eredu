@@ -6,7 +6,7 @@ modules, optimizers, quantization helpers, checkpoint I/O, streams, and
 distributed collectives.
 
 Use this crate when you want to build directly on MLX. For a model-oriented
-runtime, use [`safemlx-lm`](../safemlx-lm/).
+runtime, use [`eredu`](../eredu/).
 
 ## Features
 

@@ -1,6 +1,6 @@
 //! Regenerate Stage 0 fixtures through the pure-Rust streaming integration.
+use eredu_gguf::{GgmlType, TensorInput, Writer};
 use safemlx::{ops::GgufCheckpoint, Array, Device, DeviceType, Dtype, Stream};
-use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use std::collections::BTreeMap;
 use std::fs::File;
 

@@ -7,14 +7,14 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
-      - "safemlx-gguf/**"
+      - "eredu-gguf/**"
       - "safemlx/**"
       - "safemlx-sys/**"
-      - "safemlx-lm/**"
-      - "safemlx-lm-utils/**"
+      - "eredu/**"
+      - "eredu-text/**"
       - "safemlx-codec/**"
       - "safemlx-tests/**"
-      - "examples/safemlx-lm-cli/**"
+      - "examples/eredu-cli/**"
   push:
     branches: [main]
   workflow_dispatch:
@@ -48,7 +48,7 @@ jobs:
           ninja --version
           Get-Command cl
       - name: Test the pure-Rust GGUF backend
-        run: cargo test -p safemlx-gguf
+        run: cargo test -p eredu-gguf
       - name: Build and final-link safemlx tests
         run: |
           cargo test -p safemlx --lib --no-run --no-default-features
@@ -135,10 +135,10 @@ jobs:
           cargo test -j 1 -p safemlx --features cuda --test events --no-run --no-default-features
       - name: Build the linked CUDA smoke executable
         run: cargo build -j 1 -p safemlx --features cuda --example cuda_smoke --no-default-features
-      - name: Build and final-link safemlx-lm configurations
-        run: cargo test -j 1 -p safemlx-lm --no-default-features --features "cuda,mlx-image,mlx-audio" --no-run
-      - name: Build the linked safemlx-lm CLI
-        run: cargo build -j 1 -p safemlx-lm-cli --features cuda
+      - name: Build and final-link eredu configurations
+        run: cargo test -j 1 -p eredu --no-default-features --features "cuda,mlx-image,mlx-audio" --no-run
+      - name: Build the linked eredu CLI
+        run: cargo build -j 1 -p eredu-cli --features cuda
       - name: Compile CUDA codec and integration tests
         run: cargo test -j 1 -p safemlx-codec -p safemlx-tests --features cuda --no-run
 
@@ -155,10 +155,10 @@ jobs:
           nvidia-smi
           nvcc --version
       - name: Test the pure-Rust GGUF backend
-        run: cargo test -p safemlx-gguf
+        run: cargo test -p eredu-gguf
       - name: Run safemlx CUDA tests
         run: cargo test -p safemlx --features cuda --lib --no-default-features
       - name: Run CUDA device and numerical smoke test
         run: cargo run --release -p safemlx --features cuda --example cuda_smoke --no-default-features
-      - name: Run safemlx-lm CUDA tests
-        run: cargo test -p safemlx-lm --features cuda
+      - name: Run eredu CUDA tests
+        run: cargo test -p eredu --features cuda

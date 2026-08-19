@@ -1,13 +1,13 @@
 # Parallel execution
 
-`safemlx-lm` supports tensor parallelism (TP), pipeline parallelism (PP), and
+`eredu` supports tensor parallelism (TP), pipeline parallelism (PP), and
 expert parallelism (EP) through one Cartesian topology. Each process has exact
 coordinates and subgroup membership for the axes that apply to its model.
 
 All supported families use the ordinary architecture-erased loader. Build the
-canonical `safemlx_lm::ParallelTopology` in core terms, bind its process rank
+canonical `eredu::ParallelTopology` in core terms, bind its process rank
 to an MLX device with `MlxParallelContext`, and pass that context through
-`safemlx_lm::backend::mlx::ModelLoadOptions::with_parallel`. Unsupported
+`eredu::backend::mlx::ModelLoadOptions::with_parallel`. Unsupported
 combinations fail preflight before checkpoint payloads are materialized; there
 are no public family-specific parallel loaders.
 

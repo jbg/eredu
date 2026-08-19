@@ -22,6 +22,6 @@ memmap2 = "0.9"
 safetensors = "0.8"
 
 [dev-dependencies]
-safemlx-lm.workspace = true
+eredu.workspace = true
 sentencepiece-rs = "0.2.2"
 serde_json.workspace = true

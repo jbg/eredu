@@ -2,7 +2,7 @@
 
 The text-checkpoint path uses three artifacts:
 
-1. `checkpoint_probe` runs SafeMLX and writes JSON metadata plus F32 logits in
+1. `checkpoint_probe` runs Eredu and writes JSON metadata plus F32 logits in
    SafeTensors.
 2. `reference_runner.py` runs Transformers with the probe's exact prompt and
    cache-feed token IDs.
@@ -54,10 +54,10 @@ docker run --rm --gpus all \
 This is an image/runtime qualification check, so individual checkpoint pilots
 do not repeat it.
 
-Run SafeMLX:
+Run Eredu:
 
 ```bash
-cargo run -p safemlx-lm --features cuda --example checkpoint_probe -- \
+cargo run -p eredu --features cuda --example checkpoint_probe -- \
   --model /models/tinyllama \
   --input-ids 1,2,3,4 \
   --teacher-forced-ids 5,6,7,8 \
@@ -97,9 +97,9 @@ modality-specific reference runners.
 `run_pilot_case.py` executes one enabled manifest case end to end:
 
 1. download the checkpoint at its immutable revision;
-2. run SafeMLX and Transformers correctness on the same 16-token decode path;
+2. run Eredu and Transformers correctness on the same 16-token decode path;
 3. compare the logits with the manifest tolerance profile; and
-4. run a SafeMLX 128-token prefill plus 128-token decode performance smoke.
+4. run a Eredu 128-token prefill plus 128-token decode performance smoke.
 
 The pilot uses this immutable image reference:
 

@@ -6,6 +6,7 @@
 
 use std::time::{Duration, Instant};
 
+use eredu_gguf::{convert_affine, Endian, GgmlType, Reader, TensorInput, Writer};
 use half::f16;
 use safemlx::{
     memory,
@@ -16,7 +17,6 @@ use safemlx::{
     transforms::eval,
     Array, Device, DeviceType, Dtype, Stream,
 };
-use safemlx_gguf::{convert_affine, Endian, GgmlType, Reader, TensorInput, Writer};
 
 fn q4k_block(seed: usize) -> Vec<u8> {
     let mut block = vec![0u8; 144];

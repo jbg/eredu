@@ -8,7 +8,7 @@ not sufficient evidence.
 ## Capture evidence
 
 Add the exact selected template body under
-`safemlx-lm/tests/fixtures/chat_templates/`. Record its authoritative source and
+`eredu/tests/fixtures/chat_templates/`. Record its authoritative source and
 immutable source identifier in the test data or fixture name, and preserve all
 meaningful whitespace. When the source lacks a final line feed, document how
 the signature test removes the repository file terminator.

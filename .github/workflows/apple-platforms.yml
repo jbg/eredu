@@ -7,16 +7,16 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
-      - "safemlx-gguf/**"
+      - "eredu-gguf/**"
       - "safemlx/**"
       - "safemlx-sys/**"
       - "safemlx-macros/**"
       - "safemlx-internal-macros/**"
       - "safemlx-tests/**"
-      - "safemlx-lm/**"
-      - "safemlx-lm-utils/**"
+      - "eredu/**"
+      - "eredu-text/**"
       - "safemlx-codec/**"
-      - "examples/safemlx-lm-cli/**"
+      - "examples/eredu-cli/**"
   push:
     branches: [main]
 

@@ -5,7 +5,7 @@ use std::io::{Cursor, Read};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
-pub use safemlx_gguf::{
+pub use eredu_gguf::{
     DenseTensorSpan as GgufDenseTensorSpan, DenseTensorSpanPlan as GgufDenseTensorSpanPlan,
     EncodedSpan as GgufEncodedSpan, Endian as GgufEndian, GgmlType as GgufType,
     LogicalDtype as GgufLogicalDtype, MetadataArray as GgufMetadataArray,
@@ -17,7 +17,7 @@ pub use safemlx_gguf::{
 /// A validated GGUF checkpoint that materializes one physical tensor at a time.
 #[derive(Debug, Clone)]
 pub struct GgufCheckpoint {
-    inner: safemlx_gguf::Checkpoint,
+    inner: eredu_gguf::Checkpoint,
 }
 
 /// One named MLX array produced from a GGUF tensor.
@@ -203,28 +203,28 @@ impl GgufTensor {
 
 /// Fallible iterator over materialized MLX tensor groups.
 pub struct GgufTensorIter<'a> {
-    inner: safemlx_gguf::ConvertedTensorIter<'a>,
+    inner: eredu_gguf::ConvertedTensorIter<'a>,
 }
 
 /// Indexed named-tensor materializer that reuses the current shard reader.
 pub struct GgufMaterializer {
-    inner: safemlx_gguf::TensorMaterializer,
+    inner: eredu_gguf::TensorMaterializer,
 }
 
 /// One physical GGUF tensor retained in its checkpoint-native byte encoding.
 #[derive(Debug)]
 pub struct GgufRawTensor {
-    inner: safemlx_gguf::RawCheckpointTensor,
+    inner: eredu_gguf::RawCheckpointTensor,
 }
 
 impl GgufRawTensor {
     /// Endianness declared by the containing GGUF shard.
-    pub fn endian(&self) -> safemlx_gguf::Endian {
+    pub fn endian(&self) -> eredu_gguf::Endian {
         self.inner.endian()
     }
 
     /// Physical tensor descriptor.
-    pub fn descriptor(&self) -> &safemlx_gguf::TensorDescriptor {
+    pub fn descriptor(&self) -> &eredu_gguf::TensorDescriptor {
         self.inner.descriptor()
     }
 
@@ -271,7 +271,7 @@ impl GgufCheckpoint {
     /// Wrap a checkpoint already inspected by a backend-neutral planner.
     ///
     /// No header is reopened and no tensor payload is read.
-    pub fn from_portable(inner: safemlx_gguf::Checkpoint) -> Self {
+    pub fn from_portable(inner: eredu_gguf::Checkpoint) -> Self {
         Self { inner }
     }
 
@@ -291,7 +291,7 @@ impl GgufCheckpoint {
             return Err(IoError::UnsupportedFormat);
         }
         Ok(Self {
-            inner: safemlx_gguf::Checkpoint::open(path)?,
+            inner: eredu_gguf::Checkpoint::open(path)?,
         })
     }
 
@@ -301,7 +301,7 @@ impl GgufCheckpoint {
     }
 
     /// Validated header-only checkpoint description.
-    pub fn catalog(&self) -> &safemlx_gguf::Checkpoint {
+    pub fn catalog(&self) -> &eredu_gguf::Checkpoint {
         &self.inner
     }
 
@@ -419,22 +419,22 @@ impl GgufMaterializer {
 }
 
 fn convert_tensor(
-    tensor: safemlx_gguf::ConvertedCheckpointTensor,
+    tensor: eredu_gguf::ConvertedCheckpointTensor,
     host_owned: bool,
 ) -> Result<GgufTensor, IoError> {
     let descriptor = tensor.descriptor().clone();
     match tensor.into_converted() {
-        safemlx_gguf::ConvertedTensor::Dense(dense) => {
+        eredu_gguf::ConvertedTensor::Dense(dense) => {
             let shape = mlx_shape_i32(&descriptor.name, &dense.shape)?;
             let dtype = match dense.dtype {
-                safemlx_gguf::DenseDtype::F32 => Dtype::Float32,
-                safemlx_gguf::DenseDtype::F16 => Dtype::Float16,
-                safemlx_gguf::DenseDtype::Bf16 => Dtype::Bfloat16,
-                safemlx_gguf::DenseDtype::I8 => Dtype::Int8,
-                safemlx_gguf::DenseDtype::I16 => Dtype::Int16,
-                safemlx_gguf::DenseDtype::I32 => Dtype::Int32,
-                safemlx_gguf::DenseDtype::I64 => Dtype::Int64,
-                safemlx_gguf::DenseDtype::F64 => Dtype::Float64,
+                eredu_gguf::DenseDtype::F32 => Dtype::Float32,
+                eredu_gguf::DenseDtype::F16 => Dtype::Float16,
+                eredu_gguf::DenseDtype::Bf16 => Dtype::Bfloat16,
+                eredu_gguf::DenseDtype::I8 => Dtype::Int8,
+                eredu_gguf::DenseDtype::I16 => Dtype::Int16,
+                eredu_gguf::DenseDtype::I32 => Dtype::Int32,
+                eredu_gguf::DenseDtype::I64 => Dtype::Int64,
+                eredu_gguf::DenseDtype::F64 => Dtype::Float64,
             };
             let array = array_from_owned_data(dense.data, &shape, dtype, host_owned)?;
             Ok(GgufTensor::Dense(GgufArray {
@@ -442,7 +442,7 @@ fn convert_tensor(
                 array,
             }))
         }
-        safemlx_gguf::ConvertedTensor::IQuant(iquant) => {
+        eredu_gguf::ConvertedTensor::IQuant(iquant) => {
             let packed_shape = mlx_shape_i32(&descriptor.name, &iquant.packed_shape()?)?;
             let logical_shape = mlx_shape_i32(&descriptor.name, &iquant.shape)?;
             let array =
@@ -458,7 +458,7 @@ fn convert_tensor(
                 },
             }))
         }
-        safemlx_gguf::ConvertedTensor::Affine(affine) => {
+        eredu_gguf::ConvertedTensor::Affine(affine) => {
             let weight_shape = mlx_shape_i32(&descriptor.name, &affine.weight_shape)?;
             let scale_shape = mlx_shape_i32(&descriptor.name, &affine.scale_shape)?;
             let weight =
@@ -495,7 +495,7 @@ fn convert_tensor(
                 },
             }))
         }
-        safemlx_gguf::ConvertedTensor::MxFp4(mxfp4) => {
+        eredu_gguf::ConvertedTensor::MxFp4(mxfp4) => {
             let weight_shape = mlx_shape_i32(&descriptor.name, &mxfp4.weight_shape)?;
             let scale_shape = mlx_shape_i32(&descriptor.name, &mxfp4.scale_shape)?;
             let weight =
@@ -566,7 +566,7 @@ impl GgufMetadata {
         if !path.is_file() {
             return Err(IoError::NotFile);
         }
-        let reader = safemlx_gguf::Reader::open(path)?;
+        let reader = eredu_gguf::Reader::open(path)?;
         Ok(Self(
             reader
                 .metadata()
@@ -590,7 +590,7 @@ impl GgufMetadata {
                 "reader exceeds the 2 GiB compatibility limit".into(),
             ));
         }
-        let parsed = safemlx_gguf::Reader::new(Cursor::new(bytes))?;
+        let parsed = eredu_gguf::Reader::new(Cursor::new(bytes))?;
         Ok(Self(
             parsed
                 .metadata()

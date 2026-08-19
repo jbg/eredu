@@ -1,12 +1,12 @@
 use std::{path::PathBuf, time::Instant};
 
-use safemlx::{transforms::eval, Array, Device, DeviceType, ExecutionContext, Stream};
-use safemlx_codec::mimi::Mimi;
-use safemlx_lm::{
+use eredu::{
     backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
     load_realtime_model, RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId,
     SchedulerLimits,
 };
+use safemlx::{transforms::eval, Array, Device, DeviceType, ExecutionContext, Stream};
+use safemlx_codec::mimi::Mimi;
 
 const SAMPLE_RATE: f64 = 24_000.0;
 const FRAME_RATE: f64 = 12.5;

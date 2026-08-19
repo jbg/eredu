@@ -65,8 +65,8 @@ impl From<Infallible> for IoError {
     }
 }
 
-impl From<safemlx_gguf::Error> for IoError {
-    fn from(error: safemlx_gguf::Error) -> Self {
+impl From<eredu_gguf::Error> for IoError {
+    fn from(error: eredu_gguf::Error) -> Self {
         Self::InvalidGguf(error.to_string())
     }
 }

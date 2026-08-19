@@ -154,5 +154,5 @@ safemlx = "0.1.3"
 safemlx = { version = "0.1.3", default-features = false, features = ["cuda"] }
 ```
 
-The `safemlx-lm-cli` example has its own `cuda` feature, which enables CUDA in
-both `safemlx` and `safemlx-lm`.
+The `eredu-cli` example has its own `cuda` feature, which enables CUDA in
+both `safemlx` and `eredu`.

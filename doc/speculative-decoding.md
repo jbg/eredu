@@ -1,6 +1,6 @@
 # Speculative decoding and multi-token prediction
 
-`safemlx-lm` supports lossless multi-token prediction (MTP) with either an
+`eredu` supports lossless multi-token prediction (MTP) with either an
 external assistant model or prediction heads embedded in the target
 checkpoint. The target model always verifies proposals; accepted output has the
 same target distribution as the corresponding non-speculative path.

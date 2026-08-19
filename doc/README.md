@@ -1,7 +1,7 @@
 # SafeMLX documentation
 
 This directory contains the user-facing technical documentation shared by the
-SafeMLX crates. Start with the README for the crate you intend to use, then
+workspace crates. Start with the README for the crate you intend to use, then
 follow the relevant guide here.
 
 ## Models and applications

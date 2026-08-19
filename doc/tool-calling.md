@@ -1,17 +1,17 @@
 # Native tool calling
 
-SafeMLX native tool calling accepts OpenAI-shaped function definitions and
+Eredu native tool calling accepts OpenAI-shaped function definitions and
 emits protocol-neutral semantic events. Applications do not need to build a
 grammar, inspect tokenizer internals, or parse a checkpoint-specific wire
 format.
 
 The entry point is `LoadedModel::prepare_chat`, followed by one of the
 `generate_prepared_chat*` methods. The complete example is
-[`safemlx-lm/examples/native_tool_calling.rs`](../safemlx-lm/examples/native_tool_calling.rs).
+[`eredu/examples/native_tool_calling.rs`](../eredu/examples/native_tool_calling.rs).
 
 ## Capability gating
 
-Tool support is behavioral and fail-closed. SafeMLX selects a template, checks
+Tool support is behavioral and fail-closed. Eredu selects a template, checks
 the tokenizer's required special tokens, renders bounded conversations, and
 independently verifies:
 
@@ -63,7 +63,7 @@ change uncommitted work and diagnostics, but not committed tokens, event order,
 or finish reason.
 
 Multimodal requests bind processed media to the complete placeholder emitted by
-the selected checkpoint template. SafeMLX validates placeholder count and
+the selected checkpoint template. Eredu validates placeholder count and
 order, then lets the architecture processor insert its own boundary tokens and
 media tensors. Applications should not manually insert architecture media token
 IDs into rendered text.
@@ -123,7 +123,7 @@ profile when their observable byte protocol is equivalent.
 
 Qwen3.6 and Qwen3.8 calls contain a tagged function name and one repeated
 `<parameter=name>` block per top-level argument. String values are raw text;
-all other schema types are JSON encoded. SafeMLX retains the request's resolved
+all other schema types are JSON encoded. Eredu retains the request's resolved
 schemas in the parser plan so ambiguous text such as `true` becomes either the
 JSON string `"true"` or boolean `true` according to the selected parameter.
 Arguments are emitted to applications as one canonical JSON object. Unknown or

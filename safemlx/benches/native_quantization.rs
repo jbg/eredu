@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant};
 
+use eredu_gguf::{Endian, GgmlType};
 use safemlx::{
     native_quantization::NativeQuantizedTensor, ops::matmul, transforms::eval, Array, Device,
     DeviceType, Dtype, Stream,
 };
-use safemlx_gguf::{Endian, GgmlType};
 
 fn env_i32(name: &str, default: i32) -> i32 {
     std::env::var(name)

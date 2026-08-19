@@ -1,6 +1,6 @@
 # Model loading, quantization, and memory
 
-`safemlx-lm` separates static weight placement from per-request runtime state.
+`eredu` separates static weight placement from per-request runtime state.
 Choose and budget them independently: moving model layers does not move the KV
 cache, and paging a cache does not change where model weights live.
 
@@ -15,7 +15,7 @@ backend request. Apply `api::inspect_text_model` to that report when admission
 also requires tokenizer, chat-template, EOS, semantic-streaming, or native-tool
 readiness.
 
-The MLX backend's `safemlx_lm::backend::mlx::ModelLoadOptions` contain two
+The MLX backend's `eredu::backend::mlx::ModelLoadOptions` contain two
 independent choices:
 
 - `quantization`: an optional transformation for eligible dense weights; and
@@ -66,7 +66,7 @@ Registered MoE families can combine any supported non-expert policy with a
 separate routed-expert cache. The cache has its own device, host, scratch, and
 prefill-bank budgets and deterministic eviction policy.
 
-Routing has one unavoidable host boundary: SafeMLX reduces the route tensor to
+Routing has one unavoidable host boundary: Eredu reduces the route tensor to
 a compact demand histogram, reads that metadata, and then selects the exact
 checkpoint experts. Route rows and weights remain on-device. Missing experts
 are acquired as one residency batch; the execution stream waits on an
@@ -79,7 +79,7 @@ expert when the requested one is unavailable.
 
 ## Load-time quantization
 
-SafeMLX can convert eligible dense F32/F16/BF16 weights to an affine or MXFP4
+Eredu can convert eligible dense F32/F16/BF16 weights to an affine or MXFP4
 layout while loading. Conversion is driven by the architecture's parameter
 plan, not by blindly quantizing every matrix. Norms, convolutions, routers,
 position tables, and specialized modality parameters remain dense unless that
@@ -165,4 +165,4 @@ separate because they have different budgets and lifetimes.
 Static parameter estimates do not include activations, KV or recurrent state,
 kernel memory, allocator caches, checkpoint mappings, all temporary workspaces,
 or opaque backend-driver allocations. Use MLX allocator statistics and process
-memory observation alongside SafeMLX reports when sizing an application.
+memory observation alongside Eredu reports when sizing an application.

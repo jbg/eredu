@@ -113,7 +113,7 @@ impl Array {
         let inputs = owned
             .iter()
             .map(
-                |(name, dimensions, ggml_type, data)| safemlx_gguf::TensorInput {
+                |(name, dimensions, ggml_type, data)| eredu_gguf::TensorInput {
                     name,
                     dimensions,
                     ggml_type: *ggml_type,
@@ -128,7 +128,7 @@ impl Array {
             .into_iter()
             .collect::<std::collections::BTreeMap<_, _>>();
         let file = std::fs::File::create(path).map_err(|_| IoError::UnableToOpenFile)?;
-        safemlx_gguf::Writer::default().write(file, &typed, &inputs)?;
+        eredu_gguf::Writer::default().write(file, &typed, &inputs)?;
         Ok(())
     }
 
@@ -247,7 +247,7 @@ impl Array {
 
 fn gguf_dense_bytes(
     array: &crate::EvaluatedArray<'_>,
-) -> Result<(safemlx_gguf::GgmlType, Vec<u8>), IoError> {
+) -> Result<(eredu_gguf::GgmlType, Vec<u8>), IoError> {
     macro_rules! bytes {
         ($ty:ty) => {
             array
@@ -258,9 +258,9 @@ fn gguf_dense_bytes(
         };
     }
     Ok(match array.as_array().dtype() {
-        Dtype::Float32 => (safemlx_gguf::GgmlType::F32, bytes!(f32)),
+        Dtype::Float32 => (eredu_gguf::GgmlType::F32, bytes!(f32)),
         Dtype::Float16 => (
-            safemlx_gguf::GgmlType::F16,
+            eredu_gguf::GgmlType::F16,
             array
                 .as_slice::<half::f16>()
                 .iter()
@@ -268,7 +268,7 @@ fn gguf_dense_bytes(
                 .collect(),
         ),
         Dtype::Bfloat16 => (
-            safemlx_gguf::GgmlType::Bf16,
+            eredu_gguf::GgmlType::Bf16,
             array
                 .as_slice::<half::bf16>()
                 .iter()
@@ -276,13 +276,13 @@ fn gguf_dense_bytes(
                 .collect(),
         ),
         Dtype::Int8 => (
-            safemlx_gguf::GgmlType::I8,
+            eredu_gguf::GgmlType::I8,
             array.as_slice::<i8>().iter().map(|v| *v as u8).collect(),
         ),
-        Dtype::Int16 => (safemlx_gguf::GgmlType::I16, bytes!(i16)),
-        Dtype::Int32 => (safemlx_gguf::GgmlType::I32, bytes!(i32)),
-        Dtype::Int64 => (safemlx_gguf::GgmlType::I64, bytes!(i64)),
-        Dtype::Float64 => (safemlx_gguf::GgmlType::F64, bytes!(f64)),
+        Dtype::Int16 => (eredu_gguf::GgmlType::I16, bytes!(i16)),
+        Dtype::Int32 => (eredu_gguf::GgmlType::I32, bytes!(i32)),
+        Dtype::Int64 => (eredu_gguf::GgmlType::I64, bytes!(i64)),
+        Dtype::Float64 => (eredu_gguf::GgmlType::F64, bytes!(f64)),
         dtype => {
             return Err(IoError::InvalidGguf(format!(
                 "dtype {dtype:?} cannot be represented losslessly by GGUF"
@@ -462,25 +462,25 @@ mod tests {
         let (_tmp_dir, test_dir) = unicode_gguf_test_dir();
         let path = test_dir.join("quantized weights.gguf");
         let formats = [
-            ("q4_0.weight", safemlx_gguf::GgmlType::Q4_0),
-            ("q4_1.weight", safemlx_gguf::GgmlType::Q4_1),
-            ("q8_0.weight", safemlx_gguf::GgmlType::Q8_0),
-            ("q2_k.weight", safemlx_gguf::GgmlType::Q2K),
-            ("q3_k.weight", safemlx_gguf::GgmlType::Q3K),
-            ("q4_k.weight", safemlx_gguf::GgmlType::Q4K),
-            ("q5_k.weight", safemlx_gguf::GgmlType::Q5K),
-            ("q6_k.weight", safemlx_gguf::GgmlType::Q6K),
-            ("q5_0.weight", safemlx_gguf::GgmlType::Q5_0),
-            ("q5_1.weight", safemlx_gguf::GgmlType::Q5_1),
-            ("iq2_xxs.weight", safemlx_gguf::GgmlType::IQ2XXS),
-            ("iq2_xs.weight", safemlx_gguf::GgmlType::IQ2XS),
-            ("iq3_xxs.weight", safemlx_gguf::GgmlType::IQ3XXS),
-            ("iq1_s.weight", safemlx_gguf::GgmlType::IQ1S),
-            ("iq4_nl.weight", safemlx_gguf::GgmlType::IQ4NL),
-            ("iq3_s.weight", safemlx_gguf::GgmlType::IQ3S),
-            ("iq2_s.weight", safemlx_gguf::GgmlType::IQ2S),
-            ("iq4_xs.weight", safemlx_gguf::GgmlType::IQ4XS),
-            ("iq1_m.weight", safemlx_gguf::GgmlType::IQ1M),
+            ("q4_0.weight", eredu_gguf::GgmlType::Q4_0),
+            ("q4_1.weight", eredu_gguf::GgmlType::Q4_1),
+            ("q8_0.weight", eredu_gguf::GgmlType::Q8_0),
+            ("q2_k.weight", eredu_gguf::GgmlType::Q2K),
+            ("q3_k.weight", eredu_gguf::GgmlType::Q3K),
+            ("q4_k.weight", eredu_gguf::GgmlType::Q4K),
+            ("q5_k.weight", eredu_gguf::GgmlType::Q5K),
+            ("q6_k.weight", eredu_gguf::GgmlType::Q6K),
+            ("q5_0.weight", eredu_gguf::GgmlType::Q5_0),
+            ("q5_1.weight", eredu_gguf::GgmlType::Q5_1),
+            ("iq2_xxs.weight", eredu_gguf::GgmlType::IQ2XXS),
+            ("iq2_xs.weight", eredu_gguf::GgmlType::IQ2XS),
+            ("iq3_xxs.weight", eredu_gguf::GgmlType::IQ3XXS),
+            ("iq1_s.weight", eredu_gguf::GgmlType::IQ1S),
+            ("iq4_nl.weight", eredu_gguf::GgmlType::IQ4NL),
+            ("iq3_s.weight", eredu_gguf::GgmlType::IQ3S),
+            ("iq2_s.weight", eredu_gguf::GgmlType::IQ2S),
+            ("iq4_xs.weight", eredu_gguf::GgmlType::IQ4XS),
+            ("iq1_m.weight", eredu_gguf::GgmlType::IQ1M),
         ];
         let payloads = formats
             .iter()
@@ -494,16 +494,14 @@ mod tests {
             .iter()
             .zip(&payloads)
             .zip(&dimensions)
-            .map(
-                |(((name, ty), data), dimensions)| safemlx_gguf::TensorInput {
-                    name,
-                    dimensions,
-                    ggml_type: *ty,
-                    data,
-                },
-            )
+            .map(|(((name, ty), data), dimensions)| eredu_gguf::TensorInput {
+                name,
+                dimensions,
+                ggml_type: *ty,
+                data,
+            })
             .collect::<Vec<_>>();
-        safemlx_gguf::Writer::default()
+        eredu_gguf::Writer::default()
             .write(
                 std::fs::File::create(&path).unwrap(),
                 &std::collections::BTreeMap::new(),
