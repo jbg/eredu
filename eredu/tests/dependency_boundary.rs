@@ -352,6 +352,7 @@ fn execution_group_orchestration_is_runtime_owned() {
         "ExecutionGroupReadySet",
         "let mut remaining_consumers",
         ".consumer_counts()",
+        "ArchitectureCheckpointPlan",
     ] {
         assert!(
             !mlx.contains(runtime_owned),

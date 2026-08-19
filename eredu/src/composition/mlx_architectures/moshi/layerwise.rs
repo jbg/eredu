@@ -1236,16 +1236,13 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
 
     fn safetensors_checkpoint_plan(
         &self,
-    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
-    {
+    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
         match self.layout {
             CheckpointLayout::Native => super::checkpoint::safetensors_plan(&self.args)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-                .map(Into::into),
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
             CheckpointLayout::Pytorch => {
                 super::personaplex_checkpoint::safetensors_plan(&self.args)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-                    .map(Into::into)
             }
         }
     }

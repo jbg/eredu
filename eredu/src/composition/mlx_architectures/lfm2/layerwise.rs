@@ -1077,11 +1077,9 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
 
     fn safetensors_checkpoint_plan(
         &self,
-    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
-    {
+    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
         super::checkpoint::safetensors_plan(&self.args, true)
             .map_err(Error::UnsupportedArchitecture)
-            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {

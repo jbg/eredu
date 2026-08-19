@@ -1661,11 +1661,9 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
 
     fn safetensors_checkpoint_plan(
         &self,
-    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
-    {
+    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
         super::checkpoint::safetensors_plan(&self.args)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-            .map(Into::into)
     }
 
     fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {

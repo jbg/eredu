@@ -1377,11 +1377,8 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
 
     fn safetensors_checkpoint_plan(
         &self,
-    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
-    {
-        super::checkpoint::safetensors_plan(&self.args)
-            .map_err(Error::UnsupportedArchitecture)
-            .map(Into::into)
+    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
+        super::checkpoint::safetensors_plan(&self.args).map_err(Error::UnsupportedArchitecture)
     }
 
     fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {

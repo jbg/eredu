@@ -58,18 +58,6 @@ use eredu_runtime::{ResidencyReport, ResidentLayerGroup, WeightMaterializationRe
 /// Type-erased checkpoint store accepted by the generalized execution engine.
 pub type SharedWeightStore = Arc<dyn CheckpointSource>;
 
-/// Opaque architecture-owned SafeTensors contract consumed by the generic
-/// execution engine before it asks an adapter for any runtime binding.
-pub struct ArchitectureCheckpointPlan {
-    plan: eredu_checkpoint::schema::SafetensorsCheckpointPlan,
-}
-
-impl From<eredu_checkpoint::schema::SafetensorsCheckpointPlan> for ArchitectureCheckpointPlan {
-    fn from(plan: eredu_checkpoint::schema::SafetensorsCheckpointPlan) -> Self {
-        Self { plan }
-    }
-}
-
 pub(crate) fn resolve_checkpoint_store<A: ArchitectureAdapter>(
     store: SharedWeightStore,
     adapter: &A,
@@ -80,14 +68,13 @@ pub(crate) fn resolve_checkpoint_store<A: ArchitectureAdapter>(
         return Ok(store);
     }
     let plan = adapter.safetensors_checkpoint_plan()?;
-    let resolved =
-        eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan.plan)
-            .map_err(|validation| {
-                Error::UnsupportedArchitecture(format!(
-                    "{} checkpoint contract did not resolve: {validation:?}",
-                    adapter.model_type()
-                ))
-            })?;
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "{} checkpoint contract did not resolve: {validation:?}",
+                adapter.model_type()
+            ))
+        })?;
     Ok(Arc::new(ResolvedCheckpointSource::new(store, resolved)))
 }
 
@@ -485,7 +472,9 @@ pub trait ArchitectureAdapter: Sized {
 
     /// Returns the architecture-owned physical contract used to resolve the
     /// SafeTensors store before any binding recipe is inferred or materialized.
-    fn safetensors_checkpoint_plan(&self) -> Result<ArchitectureCheckpointPlan, Error>;
+    fn safetensors_checkpoint_plan(
+        &self,
+    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error>;
 
     /// Model-wide checkpoint quantization, when one uniform encoding exists.
     fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
