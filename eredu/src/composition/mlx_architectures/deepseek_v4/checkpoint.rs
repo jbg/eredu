@@ -54,7 +54,12 @@ pub(crate) fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpoint
     let hidden = dimension(args.hidden_size, "hidden size")?;
     let intermediate = dimension(args.moe_intermediate_size, "MoE intermediate size")?;
     let experts = dimension(args.n_routed_experts, "expert count")?;
-    for layer in 0..dimension(args.num_hidden_layers, "layer count")? {
+    let target_layers = dimension(args.num_hidden_layers, "layer count")?;
+    let draft_layers = count(args.num_nextn_predict_layers, "draft layer count")?;
+    let decoder_roots = (0..target_layers)
+        .map(|layer| format!("layers.{layer}"))
+        .chain((0..draft_layers).map(|depth| format!("mtp.{depth}")));
+    for root in decoder_roots {
         for expert in 0..experts {
             for (projection, shape) in [
                 ("w1", vec![intermediate, hidden]),
@@ -62,7 +67,7 @@ pub(crate) fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpoint
                 ("w3", vec![intermediate, hidden]),
             ] {
                 tensors.push(SafetensorsTensorConstraint::required(
-                    format!("layers.{layer}.ffn.experts.{expert}.{projection}.weight"),
+                    format!("{root}.ffn.experts.{expert}.{projection}.weight"),
                     shape,
                     StoredDtypeConstraint::Floating,
                 ));
@@ -456,7 +461,180 @@ fn common_specs(args: &ModelArgs) -> Result<Vec<TensorSpec>, String> {
             }
         }
     }
+    append_draft_specs(
+        &mut tensors,
+        args,
+        layers,
+        hidden,
+        vocab,
+        hc_mult,
+        hc_hidden,
+        experts,
+        routed,
+    )?;
     Ok(tensors)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_draft_specs(
+    tensors: &mut Vec<TensorSpec>,
+    args: &ModelArgs,
+    target_layers: usize,
+    hidden: usize,
+    vocab: usize,
+    hc_mult: usize,
+    hc_hidden: usize,
+    experts: usize,
+    routed: usize,
+) -> Result<(), String> {
+    let draft_layers = count(args.num_nextn_predict_layers, "draft layer count")?;
+    if draft_layers == 0 {
+        return Ok(());
+    }
+    let template_root = format!("layers.{}", target_layers - 1);
+    let template_prefix = format!("{template_root}.");
+    let decoder_template = tensors
+        .iter()
+        .filter(|tensor| tensor.safetensors_name.starts_with(&template_prefix))
+        .filter(|tensor| {
+            !tensor.safetensors_name.contains(".attn.compressor.")
+                && !tensor.safetensors_name.contains(".attn.indexer.")
+                && !tensor.safetensors_name.ends_with(".ffn.gate.bias")
+                && !tensor.safetensors_name.ends_with(".ffn.gate.tid2eid")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let hash_layers = count(args.num_hash_layers, "hash layer count")?;
+    for depth in 0..draft_layers {
+        let root = format!("mtp.{depth}");
+        for template in &decoder_template {
+            let suffix = template
+                .safetensors_name
+                .strip_prefix(&template_prefix)
+                .expect("draft decoder template came from the selected target layer");
+            tensors.push(spec(
+                format!("{root}.{suffix}"),
+                format!("{root}.{suffix}"),
+                template.shape.clone(),
+                template.operation,
+            ));
+        }
+        let global_layer = target_layers + depth;
+        if global_layer < hash_layers {
+            tensors.push(spec(
+                format!("{root}.ffn.gate.tid2eid"),
+                format!("{root}.ffn.gate.tid2eid"),
+                vec![vocab, routed],
+                TensorOperation::I32,
+            ));
+        } else {
+            tensors.push(spec(
+                format!("{root}.ffn.gate.bias"),
+                format!("{root}.ffn.gate.bias"),
+                vec![experts],
+                TensorOperation::Vector,
+            ));
+        }
+    }
+
+    if let Some(dspark) = &args.dspark {
+        let last = draft_layers - 1;
+        let captured = checked_mul(
+            hidden,
+            dspark.target_layer_ids.len(),
+            "DSpark captured hidden width",
+        )?;
+        for (name, shape, operation) in [
+            (
+                "mtp.0.main_proj.weight".to_string(),
+                vec![hidden, captured],
+                TensorOperation::Matrix,
+            ),
+            (
+                "mtp.0.main_norm.weight".to_string(),
+                vec![hidden],
+                TensorOperation::Vector,
+            ),
+            (
+                format!("mtp.{last}.norm.weight"),
+                vec![hidden],
+                TensorOperation::Vector,
+            ),
+            (
+                format!("mtp.{last}.hc_head_fn"),
+                vec![hc_mult, hc_hidden],
+                TensorOperation::Matrix,
+            ),
+            (
+                format!("mtp.{last}.hc_head_base"),
+                vec![hc_mult],
+                TensorOperation::Vector,
+            ),
+            (
+                format!("mtp.{last}.hc_head_scale"),
+                vec![1],
+                TensorOperation::Vector,
+            ),
+            (
+                format!("mtp.{last}.markov_head.markov_w1.weight"),
+                vec![vocab, dimension(dspark.markov_rank, "DSpark Markov rank")?],
+                TensorOperation::Matrix,
+            ),
+            (
+                format!("mtp.{last}.markov_head.markov_w2.weight"),
+                vec![vocab, dimension(dspark.markov_rank, "DSpark Markov rank")?],
+                TensorOperation::Matrix,
+            ),
+            (
+                format!("mtp.{last}.confidence_head.proj.weight"),
+                vec![
+                    1,
+                    checked_add(
+                        hidden,
+                        dimension(dspark.markov_rank, "DSpark Markov rank")?,
+                        "DSpark confidence width",
+                    )?,
+                ],
+                TensorOperation::Matrix,
+            ),
+        ] {
+            tensors.push(spec(name.clone(), name, shape, operation));
+        }
+    } else {
+        for depth in 0..draft_layers {
+            let root = format!("mtp.{depth}");
+            for (name, shape, operation) in [
+                (
+                    "e_proj.weight",
+                    vec![hidden, hidden],
+                    TensorOperation::Matrix,
+                ),
+                (
+                    "h_proj.weight",
+                    vec![hidden, hidden],
+                    TensorOperation::Matrix,
+                ),
+                ("enorm.weight", vec![hidden], TensorOperation::Vector),
+                ("hnorm.weight", vec![hidden], TensorOperation::Vector),
+                ("norm.weight", vec![hidden], TensorOperation::Vector),
+                (
+                    "hc_head_fn",
+                    vec![hc_mult, hc_hidden],
+                    TensorOperation::Matrix,
+                ),
+                ("hc_head_base", vec![hc_mult], TensorOperation::Vector),
+                ("hc_head_scale", vec![1], TensorOperation::Vector),
+            ] {
+                tensors.push(spec(
+                    format!("{root}.{name}"),
+                    format!("{root}.{name}"),
+                    shape,
+                    operation,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn spec(

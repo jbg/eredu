@@ -167,6 +167,12 @@ impl WeightBinding {
         &self.name
     }
 
+    /// Replaces the stable name used to address this value inside its resident unit.
+    pub fn with_name(mut self, name: impl Into<String>) -> Result<Self, ResidencyDeclarationError> {
+        self.name = validate_name(name.into())?;
+        Ok(self)
+    }
+
     /// Returns the architecture-logical parameter destination.
     pub fn logical_target(&self) -> Option<&str> {
         self.logical_target.as_deref()
