@@ -56,18 +56,17 @@ use crate::{
             },
         },
         residency::expert_cache::{
-                ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
-                ExpertRouteBatch,
-            },
+            ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
+        },
     },
 };
 
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions, ResidencyReport};
 
 use super::model::{
-        load_prompt_cache_with_identity, prompt_cache_model_identity, save_prompt_cache_with_rank,
-        Cache, DecoderLayer, Model as ResidentModel, ModelArgs,
-    };
+    load_prompt_cache_with_identity, prompt_cache_model_identity, save_prompt_cache_with_rank,
+    Cache, DecoderLayer, Model as ResidentModel, ModelArgs,
+};
 
 const EMBEDDING_UNIT: &str = "deepseek_v4.static.embedding";
 const NORM_UNIT: &str = "deepseek_v4.static.norm";
@@ -1044,7 +1043,6 @@ pub struct DeepSeekV4LayerwiseAdapter {
     args: ModelArgs,
     static_model: ResidentModel,
     sparse_expert_cache: bool,
-    expert_cache: Option<ExpertCache>,
     parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
 }
 
@@ -1057,7 +1055,6 @@ impl DeepSeekV4LayerwiseAdapter {
         Ok(Self {
             static_model: resident,
             sparse_expert_cache: false,
-            expert_cache: None,
             parallel_topology: None,
             args,
         })

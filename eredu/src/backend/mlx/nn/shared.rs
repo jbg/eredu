@@ -387,6 +387,7 @@ impl<M: ModuleParameters> MlxParameterTree<M> {
     }
 
     /// Decomposes the cold-path view without cloning native parameter handles.
+    #[cfg(test)]
     pub(crate) fn into_inner(self) -> M {
         self.inner
     }

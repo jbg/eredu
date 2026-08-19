@@ -4,9 +4,11 @@
 //! quantization capabilities used by the backend-neutral layered runtime.
 
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
+#[cfg(test)]
+use eredu_runtime::OffloadUnit;
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
-    LayerWeightResidency, OffloadUnit, StaticUnitBindings, WeightBinding, WeightResidency,
+    LayerWeightResidency, StaticUnitBindings, WeightBinding, WeightResidency,
     DENSE_TRANSFER_WINDOW,
 };
 
@@ -19,12 +21,9 @@ use std::{
 
 use safemlx::{module::ModuleParameters, Array, Stream};
 
-
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::checkpoint::binding::{
-        binding_bytes, build_module_bindings, is_materialized_module_parameter, ModuleBindingError,
-    },
+    backend::mlx::runtime::checkpoint::binding::{build_module_bindings, ModuleBindingError},
     backend::mlx::runtime::checkpoint::bounded_quantization::{
         BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
     },
@@ -34,10 +33,12 @@ use crate::{
     backend::mlx::runtime::residency::manager::{
         ResidencyError, ResidencyManager, ResidentTransfer, ResidentUnitLease,
     },
-    core::residency::{
-        MemoryTier, OffloadConfig, OffloadUnitId, OffloadUnitSpec, ResidencyLedgerError,
-        ResidencyPolicy,
-    },
+    core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError},
+};
+#[cfg(test)]
+use crate::{
+    backend::mlx::runtime::checkpoint::binding::{binding_bytes, is_materialized_module_parameter},
+    core::residency::{OffloadUnitSpec, ResidencyPolicy},
 };
 
 use eredu_runtime::WeightMaterializationReport;
@@ -255,10 +256,12 @@ pub(crate) struct DenseTransferWindow {
 }
 
 impl DenseTransferWindow {
+    #[cfg(test)]
     fn has_ready(&self) -> bool {
         self.schedule.has_ready()
     }
 
+    #[cfg(test)]
     fn is_exhausted(&self) -> bool {
         self.schedule.is_exhausted()
     }
@@ -1106,6 +1109,7 @@ pub(crate) fn shard_layer_bindings(
     Ok(output)
 }
 
+#[cfg(test)]
 fn build_parallel_module_bindings(
     module: &impl ModuleParameters,
     prefix: &str,
@@ -1222,6 +1226,7 @@ fn build_parallel_module_bindings(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn add_unit(
     definitions: &mut Vec<OffloadUnit>,
     specs: &mut Vec<OffloadUnitSpec>,
@@ -1274,6 +1279,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error> {
     let mut largest = 0u64;
     for start in 0..layer_bytes.len() {

@@ -4,8 +4,6 @@
 //! members. This module converts those descriptions into rank-local placement
 //! and shape information without inspecting checkpoint-name substrings.
 
-use std::ops::Range;
-
 use eredu_runtime::{
     LocalModelLayout, LocalTensorLayout, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
     ParameterRole, ShardingPolicy, TensorPlacement,

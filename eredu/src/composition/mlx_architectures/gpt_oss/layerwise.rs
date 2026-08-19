@@ -1827,11 +1827,7 @@ pub struct GptOssLayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: MaybeQuantized<nn::Linear>,
-    parallel_embedding: Option<VocabParallelEmbedding>,
-    parallel_lm_head: Option<VocabParallelLmHead>,
-    parallel_kv_heads: Option<Vec<i32>>,
     sparse_expert_cache: bool,
-    expert_cache: Option<ExpertCache>,
 }
 
 impl GptOssLayerwiseAdapter {
@@ -1860,11 +1856,7 @@ impl GptOssLayerwiseAdapter {
             embedding,
             norm,
             lm_head,
-            parallel_embedding: None,
-            parallel_lm_head: None,
-            parallel_kv_heads: None,
             sparse_expert_cache: false,
-            expert_cache: None,
         })
     }
 

@@ -1,5 +1,6 @@
 //! Dense and MoE Qwen3.5 text and vision-language implementation and loader.
 
+#[cfg(test)]
 use eredu_checkpoint::AffineQuantization;
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
@@ -40,10 +41,6 @@ use crate::core::cache::{
 
 pub use crate::backend::mlx::nn::generation::sample;
 use crate::composition::mlx_architectures::qwen::vl::vision::VisionConfigSource;
-#[cfg(test)]
-pub(crate) use crate::composition::mlx_architectures::qwen::vl::vision::{
-    reverse_permutation, vision_window_index,
-};
 pub use crate::composition::mlx_architectures::qwen::vl::vision::{
     QwenVisionAttention, QwenVisionBlock, QwenVisionMlp, QwenVisionPatchEmbed,
     QwenVisionPatchMerger, QwenVisionPatchProjection, QwenVisionRmsNorm, QwenVisionTransformer,

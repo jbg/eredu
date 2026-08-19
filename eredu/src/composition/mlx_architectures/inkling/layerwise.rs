@@ -47,7 +47,6 @@ use crate::{
             VocabParallelLmHead,
         },
     },
-    backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
         build_module_binding_plan_with_recipes_excluding, packed_companion_checkpoint_name,
@@ -646,7 +645,6 @@ impl ParallelLayeredArchitecture<MlxBackend, Cache> for InklingArchitecture {
 
 struct InklingExecution {
     runtime: InklingRuntime,
-    metadata: eredu_runtime::LayerwiseModelMetadata,
     parallel_info:
         Option<eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
     topology: Option<crate::backend::mlx::MlxParallelContext>,
@@ -2178,7 +2176,6 @@ fn load_inkling_with_store(
     };
     Ok(InklingExecution {
         runtime,
-        metadata,
         parallel_info: None,
         topology: None,
     })
@@ -2289,7 +2286,6 @@ fn load_inkling_parallel_with_store(
     };
     Ok(InklingExecution {
         runtime,
-        metadata,
         parallel_info: Some(info),
         topology: Some(build.topology()),
     })

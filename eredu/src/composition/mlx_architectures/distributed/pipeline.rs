@@ -43,12 +43,14 @@ use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters},
     nn,
-    ops::{quantized_packed_dimension, stack_axis, tanh, GgufCheckpoint, GgufMetadataValue},
+    ops::{tanh, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
 };
 
+#[cfg(test)]
+use crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::shared::{MlxBackend, MlxModule},
@@ -71,7 +73,7 @@ use crate::{
         binding_bytes, materialize_module_bindings, populate_module_from_arrays_excluding,
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
-    backend::mlx::runtime::checkpoint::quantization::{quantize_tensor, should_quantize_on_load},
+    backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load,
     backend::mlx::runtime::checkpoint::store::{
         open_gguf_checkpoint_source, WeightStoreDiagnostics,
     },
@@ -142,6 +144,8 @@ use eredu_runtime::{
     CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
     PagedCacheOptions, WeightResidency,
 };
+#[cfg(test)]
+use safemlx::ops::{quantized_packed_dimension, stack_axis};
 
 use eredu_core::MtpStats;
 use eredu_runtime::ExecutionGroupReadySet;
@@ -7569,10 +7573,12 @@ fn validate_hidden_metadata(
     Ok(())
 }
 
+#[cfg(test)]
 fn checkpoint_name(parameter_name: &str) -> String {
     crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name)
 }
 
+#[cfg(test)]
 pub(crate) fn assign_module(
     module: &mut impl ModuleParameters,
     prefix: &str,
@@ -7583,6 +7589,7 @@ pub(crate) fn assign_module(
     assign_module_excluding(module, prefix, tensors, quantize_on_load, stream, |_| false)
 }
 
+#[cfg(test)]
 pub(crate) fn assign_module_excluding<F>(
     module: &mut impl ModuleParameters,
     prefix: &str,
@@ -23263,6 +23270,7 @@ impl DeepSeekStage {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn load_deepseek_experts(
     moe: &mut deepseek_v3::Moe,
     layer: usize,
@@ -23385,6 +23393,7 @@ pub(crate) fn load_deepseek_experts(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_expert_bank_shape(
     layer: usize,
     projection: &str,

@@ -388,7 +388,7 @@ impl ResidencyManager {
     }
 
     /// Ensures residency and returns an RAII lease protecting the requested copy.
-    pub fn acquire(
+    pub(crate) fn acquire(
         &self,
         id: &OffloadUnitId,
         tier: MemoryTier,
@@ -400,7 +400,7 @@ impl ResidencyManager {
     ///
     /// `demand` may be larger than one when duplicate routed-expert requests
     /// share a single acquisition. Frequency counters saturate on overflow.
-    pub fn acquire_with_demand(
+    pub(crate) fn acquire_with_demand(
         &self,
         id: &OffloadUnitId,
         tier: MemoryTier,
@@ -417,7 +417,7 @@ impl ResidencyManager {
     /// requested units are protected from eviction, all lazy outputs are
     /// evaluated together, and leases are published only after the batch is
     /// complete.
-    pub fn acquire_many_with_demand(
+    pub(crate) fn acquire_many_with_demand(
         &self,
         requests: &[(OffloadUnitId, u64)],
         tier: MemoryTier,
@@ -433,7 +433,7 @@ impl ResidencyManager {
     /// [`ResidentTransfer::order_after`] before evaluating work on another
     /// compatible stream. The transfer guard owns every source dependency
     /// until it is synchronized or dropped.
-    pub fn acquire_many_with_transfer(
+    pub(crate) fn acquire_many_with_transfer(
         &self,
         requests: &[(OffloadUnitId, u64)],
         tier: MemoryTier,
@@ -881,11 +881,11 @@ fn release_backend_copies(
     Ok(())
 }
 
-struct ResidentArrays {
+pub(crate) struct ResidentArrays {
     arrays: BTreeMap<String, Array>,
 }
 
-struct ResidentHostBuffers {
+pub(crate) struct ResidentHostBuffers {
     buffers: BTreeMap<String, ImmutableHostTransferBuffer>,
 }
 

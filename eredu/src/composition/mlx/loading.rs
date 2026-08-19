@@ -5,18 +5,9 @@ use eredu_checkpoint::WeightQuantization;
 use std::path::Path;
 
 use crate::composition::mlx_architectures::{
-    deepseek_v3::model as deepseek_v3,
-    deepseek_v4::model as deepseek_v4,
     gemma4::model as gemma4,
-    gpt_oss::model as gpt_oss,
     inkling::model as inkling,
-    kimi_linear::model as kimi_linear,
-    lfm2::model as lfm2,
-    qwen::{
-        dense as dense_qwen,
-        hybrid::{qwen3_5, qwen3_next},
-        vl::{model as qwen3_vl, moe as qwen3_vl_moe},
-    },
+    qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
 };
 use eredu_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
 use safemlx::{

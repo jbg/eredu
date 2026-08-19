@@ -24,10 +24,11 @@ pub use crate::composition::mlx::{
     MlxTextGenerationState, MlxTextToken, Model, ModelCache,
 };
 pub(crate) use crate::composition::mlx::{
-    gguf_eos_token_ids, resolve_model_config, submit_decode_with_cache, submit_prefill_with_cache,
-    validate_gemma4_drafter, validate_gguf_quantization_source, ModelConfigResolutionError,
-    ResolvedModelConfig,
+    gguf_eos_token_ids, submit_decode_with_cache, submit_prefill_with_cache,
+    validate_gguf_quantization_source,
 };
+#[cfg(test)]
+pub(crate) use crate::composition::mlx::{resolve_model_config, ResolvedModelConfig};
 pub(crate) use config::ensure_replicated_load_options;
 pub use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
@@ -59,7 +60,7 @@ use crate::{
 pub struct MlxModel {
     pub(crate) inner: MlxModelKind,
     #[cfg(feature = "mlx-media")]
-    processor: Option<ModelProcessor>,
+    pub(crate) processor: Option<ModelProcessor>,
 }
 
 pub(crate) enum MlxModelKind {
@@ -94,7 +95,7 @@ impl MlxModel {
     }
 
     #[cfg(feature = "mlx-media")]
-    fn with_processor(mut self, processor: Option<ModelProcessor>) -> Self {
+    pub(crate) fn with_processor(mut self, processor: Option<ModelProcessor>) -> Self {
         self.processor = processor;
         self
     }

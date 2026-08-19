@@ -343,8 +343,8 @@ where
     C: KeyValueCache,
 {
     let mut return_array = return_array.unwrap_or(false);
-    let T = h.shape()[1];
-    if T > 1 {
+    let t = h.shape()[1];
+    if t > 1 {
         let mut offset = 0;
         let mut window_size = None;
         if let Some(c) = cache {
@@ -353,12 +353,12 @@ where
                 window_size = Some(window_size_);
                 offset = offset.min(window_size_);
 
-                return_array = return_array || (offset + T) > window_size_;
+                return_array = return_array || (offset + t) > window_size_;
             }
         }
 
         if return_array {
-            create_causal_mask(T, Some(offset), window_size, None, stream)
+            create_causal_mask(t, Some(offset), window_size, None, stream)
                 .map(AttentionMask::Array)
                 .map(Some)
         } else {

@@ -44,7 +44,8 @@ use crate::{
     },
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
-        build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name, ModuleBindingPlan,
+        build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
+        ModuleBindingPlan,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{open_gguf_checkpoint_source, TensorSelection},

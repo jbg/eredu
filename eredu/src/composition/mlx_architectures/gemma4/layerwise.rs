@@ -3636,6 +3636,7 @@ impl Gemma4LayerwiseAdapter {
     }
 }
 
+#[cfg(test)]
 fn ignores_gemma4_checkpoint_key(key: &str) -> bool {
     key.starts_with("rope_freqs.")
         || [

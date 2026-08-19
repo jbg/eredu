@@ -68,7 +68,9 @@ use crate::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
             shard_layer_bindings,
         },
-        residency::expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch},
+        residency::expert_cache::{
+            ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
+        },
     },
 };
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
@@ -613,6 +615,7 @@ impl KimiLinearArchitecture {
     }
 }
 
+/// Per-forward attention state retained across streamed Kimi Linear layers.
 pub struct KimiLinearForwardContext {
     mask: Option<Array>,
 }
@@ -1121,6 +1124,7 @@ impl KimiLinearLayerwiseModel {
         self.parallel_info.as_ref()
     }
 
+    /// Returns the backend-neutral residency metadata for this model.
     pub fn residency_metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
         &self.metadata
     }
@@ -2270,11 +2274,7 @@ pub struct KimiLinearLayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
-    parallel_embedding: Option<VocabParallelEmbedding>,
-    parallel_lm_head: Option<VocabParallelLmHead>,
-    parallel_cache_geometry: Option<Vec<resident::KimiLayerCacheGeometry>>,
     sparse_expert_cache: bool,
-    expert_cache: Option<ExpertCache>,
 }
 
 impl KimiLinearLayerwiseAdapter {
@@ -2304,11 +2304,7 @@ impl KimiLinearLayerwiseAdapter {
                 stream,
             )?,
             lm_head,
-            parallel_embedding: None,
-            parallel_lm_head: None,
-            parallel_cache_geometry: None,
             sparse_expert_cache: false,
-            expert_cache: None,
             args,
         })
     }

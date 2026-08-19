@@ -85,8 +85,8 @@ use crate::{
         ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
     core::cache::{
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheTopology,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheTopology,
     },
 };
 use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
@@ -102,17 +102,23 @@ const HEAD_UNIT: &str = "dense_qwen.static.output";
 pub enum DenseQwenLayerwiseCache {
     /// Append-only device KV caches.
     Concat {
+        /// Layer-to-cache-slot assignment.
         layout: StateLayout,
+        /// Cache storage for each assigned layer.
         caches: Vec<Option<ConcatKeyValueCache>>,
     },
     /// Sliding device KV caches used by expert-parallel execution.
     Sliding {
+        /// Layer-to-cache-slot assignment.
         layout: StateLayout,
+        /// Cache storage for each assigned layer.
         caches: Vec<Option<SlidingKeyValueCache>>,
     },
     /// Paged KV caches used by expert-parallel execution.
     Paged {
+        /// Layer-to-cache-slot assignment.
         layout: StateLayout,
+        /// Cache storage for each assigned layer.
         caches: Vec<Option<PagedKeyValueCache>>,
     },
 }
@@ -2484,11 +2490,7 @@ pub struct DenseQwenLayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
-    parallel_embedding: Option<VocabParallelEmbedding>,
-    parallel_lm_head: Option<VocabParallelLmHead>,
-    parallel_kv_heads: Option<Vec<i32>>,
     sparse_expert_cache: bool,
-    expert_cache: Option<ExpertCache>,
 }
 
 impl DenseQwenLayerwiseAdapter {
@@ -2517,11 +2519,7 @@ impl DenseQwenLayerwiseAdapter {
             embedding,
             norm,
             lm_head,
-            parallel_embedding: None,
-            parallel_lm_head: None,
-            parallel_kv_heads: None,
             sparse_expert_cache: false,
-            expert_cache: None,
         })
     }
 

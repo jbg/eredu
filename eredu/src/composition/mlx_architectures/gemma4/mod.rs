@@ -9,5 +9,6 @@ pub mod layerwise;
 pub mod model;
 pub(crate) mod mtp;
 pub(crate) mod multimodal;
+#[cfg(feature = "mlx-media")]
 pub(crate) mod processor;
 pub(crate) mod vision;

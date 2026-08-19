@@ -2044,11 +2044,7 @@ pub struct Lfm2LayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
-    parallel_embedding: Option<VocabParallelEmbedding>,
-    parallel_lm_head: Option<VocabParallelLmHead>,
-    parallel_cache_geometry: Option<Vec<resident::Lfm2LayerCacheGeometry>>,
     sparse_expert_cache: bool,
-    expert_cache: Option<ExpertCache>,
 }
 
 impl Lfm2LayerwiseAdapter {
@@ -2077,11 +2073,7 @@ impl Lfm2LayerwiseAdapter {
             embedding,
             norm,
             lm_head,
-            parallel_embedding: None,
-            parallel_lm_head: None,
-            parallel_cache_geometry: None,
             sparse_expert_cache: false,
-            expert_cache: None,
         })
     }
 

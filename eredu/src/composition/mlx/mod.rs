@@ -13,7 +13,9 @@ pub mod speculative;
 pub(crate) mod structural;
 
 pub use capability::available_memory;
-pub(crate) use family::{resolve_model_config, ModelConfigResolutionError, ResolvedModelConfig};
+#[cfg(test)]
+pub(crate) use family::ResolvedModelConfig;
+pub(crate) use family::{resolve_model_config, ModelConfigResolutionError};
 pub use inspection::{inspect_model, MlxInspectionOptions};
 pub(crate) use loading::{gguf_eos_token_ids, validate_gguf_quantization_source};
 pub(crate) use model::validate_gemma4_drafter;

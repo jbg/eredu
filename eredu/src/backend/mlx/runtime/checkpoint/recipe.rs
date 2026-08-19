@@ -72,6 +72,7 @@ fn mlx_dtype(value: &RecipeDtype) -> Result<Dtype, WeightRecipeError> {
 
 /// MLX lowering operations for a backend-neutral recipe.
 pub(crate) trait MlxWeightRecipeExt {
+    #[cfg(test)]
     fn materialize(
         &self,
         store: &dyn CheckpointSource,
@@ -109,6 +110,7 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
     /// evaluated. If a multi-input join reaches the mapping bound, completed
     /// children are detached before retrying so cross-shard recipes can honor
     /// a one-mapping limit without serializing the normal batched path.
+    #[cfg(test)]
     fn materialize(
         &self,
         store: &dyn CheckpointSource,
@@ -328,6 +330,7 @@ impl PendingWeightRecipe {
         (self.output, self.sources)
     }
 
+    #[cfg(test)]
     fn finish(self) -> Result<Array, WeightRecipeError> {
         async_eval_with_event([&self.output])?.synchronize()?;
         for source in self.sources {

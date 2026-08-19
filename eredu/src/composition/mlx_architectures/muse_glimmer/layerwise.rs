@@ -499,17 +499,23 @@ impl ParallelLayeredArchitecture<MlxBackend, MuseGlimmerLayerwiseCache>
 pub enum MuseGlimmerLayerwiseCache {
     /// Append-only device KV caches.
     Concat {
+        /// Layer-to-cache-slot assignment.
         layout: StateLayout,
+        /// Cache storage for each assigned layer.
         caches: Vec<Option<ConcatKeyValueCache>>,
     },
     /// Sliding device KV caches used by expert-parallel execution.
     Sliding {
+        /// Layer-to-cache-slot assignment.
         layout: StateLayout,
+        /// Cache storage for each assigned layer.
         caches: Vec<Option<SlidingKeyValueCache>>,
     },
     /// Paged KV caches used by expert-parallel execution.
     Paged {
+        /// Layer-to-cache-slot assignment.
         layout: StateLayout,
+        /// Cache storage for each assigned layer.
         caches: Vec<Option<PagedKeyValueCache>>,
     },
 }
@@ -519,6 +525,7 @@ impl MuseGlimmerLayerwiseCache {
         Self::Concat { layout, caches }
     }
 
+    #[cfg(test)]
     pub(crate) fn sliding(layout: StateLayout, caches: Vec<Option<SlidingKeyValueCache>>) -> Self {
         Self::Sliding { layout, caches }
     }

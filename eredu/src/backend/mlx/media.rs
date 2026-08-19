@@ -15,7 +15,7 @@ impl MultimodalPreparationBackend for MlxBackend<'_> {
         encode_backend_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<Self::Prompt, MultimodalPreparationFailure<Self::Error, E>>
     where
-        E: std::backend::mlx::error::Error + Send + Sync + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         let processor = runtime.session().processor().ok_or_else(|| {
             MultimodalPreparationFailure::Backend(Error::Processor(format!(

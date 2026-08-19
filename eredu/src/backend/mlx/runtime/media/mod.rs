@@ -3,10 +3,12 @@
 /// Typed runtime inputs for model prefill.
 pub mod input;
 
+#[cfg(feature = "mlx-media")]
 use std::{fs, path::Path};
 
 #[cfg(feature = "mlx-image")]
 use eredu_core::VideoSampling as PortableVideoSampling;
+#[cfg(feature = "mlx-media")]
 use eredu_core::{Media as PortableMedia, TokenizedMultimodalRequest, TokenizedMultimodalSegment};
 use safemlx::{Array, Dtype};
 
@@ -20,10 +22,12 @@ use crate::{
 /// Shared PCM waveform validation and spectral operations.
 #[cfg(feature = "mlx-audio")]
 pub mod audio;
+#[cfg(feature = "mlx-media")]
 use crate::composition::mlx_architectures::gemma4::processor as gemma4;
 /// Shared decoded-image operations.
 #[cfg(feature = "mlx-image")]
 pub mod image;
+#[cfg(feature = "mlx-media")]
 use crate::composition::mlx_architectures::inkling::processor as inkling;
 #[cfg(feature = "mlx-image")]
 use crate::composition::mlx_architectures::muse_glimmer::processor as muse_glimmer;
@@ -40,6 +44,7 @@ pub(crate) use image::RgbImageView;
 
 /// One decoded media item supplied to a model processor.
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "mlx-media")]
 pub(crate) struct MediaInput<'a> {
     /// Declared modality of the item.
     pub(crate) modality: Modality,
@@ -47,6 +52,7 @@ pub(crate) struct MediaInput<'a> {
     pub(crate) payload: MediaPayload<'a>,
 }
 
+#[cfg(feature = "mlx-media")]
 impl<'a> MediaInput<'a> {
     /// Creates an RGB8 image input.
     #[cfg(feature = "mlx-image")]
@@ -86,6 +92,7 @@ impl<'a> MediaInput<'a> {
 
 /// One ordered input segment supplied to a model processor.
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "mlx-media")]
 pub(crate) enum ProcessorInput<'a> {
     /// Already-tokenized text IDs.
     TokenIds(&'a [u32]),
@@ -122,6 +129,7 @@ pub(crate) struct VideoFrames<'a> {
 
 /// Decoded data accepted by media processors.
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "mlx-media")]
 pub(crate) enum MediaPayload<'a> {
     /// Decoded RGB8 image pixels.
     #[cfg(feature = "mlx-image")]
@@ -204,6 +212,7 @@ pub struct PreparedInputPart {
 }
 
 impl PreparedInputPart {
+    #[cfg(any(test, feature = "mlx-media"))]
     pub(crate) fn text_token_ids(ids: &[u32]) -> Self {
         Self {
             modality: Modality::Text,
@@ -641,11 +650,13 @@ impl PreparedModelInput {
 
 /// Architecture-dispatched media processor loaded from a model directory.
 #[derive(Debug, Clone)]
+#[cfg(feature = "mlx-media")]
 pub(crate) struct ModelProcessor {
     kind: ProcessorKind,
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "mlx-media")]
 enum ProcessorKind {
     Gemma4(gemma4::Gemma4Processor),
     Inkling(inkling::InklingProcessor),
@@ -656,18 +667,21 @@ enum ProcessorKind {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "mlx-media")]
 pub(crate) enum ProcessorPreparationError<E> {
     Backend(Error),
     #[cfg_attr(not(feature = "mlx-image"), allow(dead_code))]
     Text(E),
 }
 
+#[cfg(feature = "mlx-media")]
 impl<E> From<Error> for ProcessorPreparationError<E> {
     fn from(error: Error) -> Self {
         Self::Backend(error)
     }
 }
 
+#[cfg(feature = "mlx-media")]
 enum PortableMediaView<'a> {
     #[cfg(feature = "mlx-image")]
     Image(RgbImageView<'a>),
@@ -686,6 +700,7 @@ enum PortableMediaView<'a> {
     Unavailable(std::marker::PhantomData<&'a ()>),
 }
 
+#[cfg(feature = "mlx-media")]
 impl<'a> PortableMediaView<'a> {
     fn new(media: &'a PortableMedia) -> Result<Self, Error> {
         match media {
@@ -781,6 +796,7 @@ impl<'a> PortableMediaView<'a> {
     }
 }
 
+#[cfg(feature = "mlx-media")]
 impl ModelProcessor {
     pub(crate) fn load_gemma4(model_dir: &Path) -> Result<Option<Self>, Error> {
         gemma4::Gemma4Processor::load(model_dir).map(|processor| {
@@ -900,6 +916,7 @@ impl ModelProcessor {
 }
 
 /// Loads a supported media processor without loading model weights.
+#[cfg(feature = "mlx-media")]
 pub(crate) fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcessor>, Error> {
     #[derive(serde::Deserialize)]
     struct Metadata {
@@ -951,6 +968,7 @@ pub(crate) fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<Model
     }
 }
 
+#[cfg(any(test, feature = "mlx-media"))]
 pub(crate) fn prepared_model_input(
     parts: Vec<PreparedInputPart>,
 ) -> Result<PreparedModelInput, Error> {
@@ -962,6 +980,7 @@ pub(crate) fn prepared_model_input(
     Ok(PreparedModelInput::new(parts))
 }
 
+#[cfg(any(test, feature = "mlx-media"))]
 pub(crate) fn push_text_token_ids(parts: &mut Vec<PreparedInputPart>, token_ids: &[u32]) {
     if !token_ids.is_empty() {
         parts.push(PreparedInputPart::text_token_ids(token_ids));

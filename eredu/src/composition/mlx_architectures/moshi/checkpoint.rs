@@ -5,21 +5,26 @@
 //! quantization companion declarations here. Generic checkpoint code only
 //! evaluates the resulting declarative plan.
 
+#[cfg(test)]
 use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use std::path::{Path, PathBuf};
 
 use super::model::ModelArgs;
+#[cfg(test)]
 use crate::{
     backend::mlx::error::Error, backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
 };
 use eredu_checkpoint::schema::{
     CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
 };
+#[cfg(test)]
 use eredu_checkpoint::store::WeightStore;
+#[cfg(test)]
 use eredu_checkpoint::validation;
 
+#[cfg(test)]
 pub(crate) fn validate_safetensors_path(
     path: impl AsRef<Path>,
     args: &ModelArgs,
@@ -42,6 +47,7 @@ pub(crate) fn source_path(model_dir: &Path, args: &ModelArgs) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn validate_safetensors(
     args: &ModelArgs,
     store: &SafetensorsWeightStore,
@@ -336,6 +342,7 @@ impl std::fmt::Display for PlanError {
     }
 }
 
+#[cfg(test)]
 fn invalid_geometry(detail: String) -> CheckpointValidation {
     CheckpointValidation::Invalid(vec![CheckpointIssue {
         kind: CheckpointIssueKind::InvalidGeometry,

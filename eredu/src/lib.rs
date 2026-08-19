@@ -4,6 +4,7 @@
 //! default `mlx` feature adds the MLX model implementations and runtime.
 
 #![warn(missing_docs)]
+#![cfg_attr(test, allow(dead_code))]
 
 /// High-level model loading, dispatch, and request APIs.
 pub mod api;

@@ -8,6 +8,6 @@ pub mod layerwise;
 pub mod model;
 /// Qwen3-VL-MoE specialization.
 pub(crate) mod moe;
-#[cfg(feature = "mlx-media")]
+#[cfg(feature = "mlx-image")]
 pub(crate) mod processor;
 pub(crate) mod vision;

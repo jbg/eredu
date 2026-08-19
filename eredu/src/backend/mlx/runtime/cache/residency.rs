@@ -744,7 +744,6 @@ impl DiskTicket {
 struct DiskSubmission {
     inner: RuntimeDiskSubmission,
     ticket: DiskTicket,
-    joined: bool,
     write_reservation_id: Option<u64>,
 }
 
@@ -803,7 +802,6 @@ impl DiskWorker {
         Ok(DiskSubmission {
             inner,
             ticket,
-            joined,
             write_reservation_id: if joined { None } else { write_reservation_id },
         })
     }
@@ -4824,7 +4822,7 @@ mod tests {
         let second = worker
             .prepare_read(3, &id, &location, CacheRepresentation::KeyValue)
             .unwrap();
-        assert!(second.joined);
+        assert!(second.inner.joined);
         let second_ticket = second.ticket.clone();
         first.enqueue().unwrap();
         second.enqueue().unwrap();

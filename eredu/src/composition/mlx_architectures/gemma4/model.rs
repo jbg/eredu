@@ -28,7 +28,7 @@ use safemlx::{
         concatenate_axis, dequantize_with_mode, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
         mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt,
-        sum_axis, tanh, topk_route_plan, GgufCheckpoint, GgufEndian, GgufMetadataValue, GgufType,
+        sum_axis, tanh, topk_route_plan, GgufCheckpoint, GgufEndian, GgufMetadataValue,
         QuantizationMode,
     },
     quantization::MaybeQuantized,

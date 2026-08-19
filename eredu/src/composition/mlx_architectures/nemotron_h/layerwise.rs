@@ -914,7 +914,6 @@ impl ParallelLayeredArchitecture<MlxBackend, Cache> for NemotronHArchitecture {
 
 struct NemotronHExecution {
     runtime: NemotronHRuntime,
-    metadata: eredu_runtime::LayerwiseModelMetadata,
     parallel_info:
         Option<eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
     topology: Option<crate::backend::mlx::MlxParallelContext>,
@@ -2347,7 +2346,6 @@ fn load_nemotron_h_with_store(
     };
     Ok(NemotronHExecution {
         runtime,
-        metadata,
         parallel_info: None,
         topology: None,
     })
@@ -2458,7 +2456,6 @@ fn load_nemotron_h_parallel_with_store(
     };
     Ok(NemotronHExecution {
         runtime,
-        metadata,
         parallel_info: Some(info),
         topology: Some(build.topology()),
     })

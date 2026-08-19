@@ -5,8 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(test)]
-use crate::composition::mlx::resolve_model_config;
 use crate::composition::mlx::structural::{self, GgufArchitectureValidation};
 use eredu_checkpoint::store::WeightStore;
 use eredu_core::{

@@ -250,6 +250,7 @@ pub(crate) fn prompt_cache_layer_layout_with_kv_heads(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
+#[cfg(test)]
 pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Error> {
     StateLayout::new(prompt_cache_layer_layout_with_kv_heads(
         args,

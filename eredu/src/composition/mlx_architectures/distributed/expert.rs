@@ -16,33 +16,29 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+use safemlx::module::ModuleParameters;
 use safemlx::{
     distributed::Group,
     error::Exception,
-    module::{ModuleParameters, Param},
+    module::Param,
     ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
-    transforms::eval,
     Array, Stream,
 };
 
 use crate::core::cache::{
     validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
-    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+    PromptCacheModelIdentity, PromptCacheOptions,
 };
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
+    backend::mlx::runtime::cache::residency::CacheResidencyManager,
     backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
-    backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
-    backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load,
     backend::mlx::runtime::checkpoint::store::{
         open_gguf_checkpoint_source, SafetensorsWeightStore,
     },
     backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-    backend::mlx::runtime::distributed::topology::{
-        load_partition_from_store_on_streams, PlacementPlan,
-    },
     backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::input as runtime_input,
@@ -54,7 +50,6 @@ use crate::{
     composition::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
-    composition::mlx_architectures::distributed::pipeline::{assign_module, load_deepseek_experts},
     composition::mlx_architectures::{
         deepseek_v3::model as deepseek_v3,
         deepseek_v4::model as deepseek_v4,
@@ -82,7 +77,7 @@ use eredu_runtime::{
 };
 
 use crate::{
-    backend::mlx::nn::moe::{quantize_expert_bank, PackedSwiGluExperts},
+    backend::mlx::nn::moe::PackedSwiGluExperts,
     composition::mlx_architectures::{
         deepseek_v3::model::RoutedExperts, qwen::dense as dense_qwen,
     },
@@ -166,6 +161,7 @@ pub enum RoutedExpertResidency {
 
 /// Immutable description of a rank-local expert-parallel model.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ExpertParallelInfo {
     /// Complete Cartesian topology and local TP/PP/EP coordinates.
     pub topology: MlxParallelContext,
@@ -207,6 +203,7 @@ pub enum ExpertParallelCache {
     /// Dense-Qwen standard key/value cache.
     DenseQwen(Vec<Option<ConcatKeyValueCache>>),
     /// Dense-Qwen bounded sliding-window key/value cache.
+    #[allow(dead_code)]
     DenseQwenSliding(Vec<Option<SlidingKeyValueCache>>),
     /// Dense-Qwen globally budgeted paged key/value cache.
     DenseQwenPaged(Vec<Option<PagedKeyValueCache>>),
@@ -698,6 +695,7 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
 
 impl ExpertParallelModel {
     /// Allocates a bounded Qwen3 sliding-window cache.
+    #[allow(dead_code)]
     pub fn new_qwen3_sliding_cache(
         &self,
         max_size: i32,
@@ -802,7 +800,6 @@ impl ExpertParallelModel {
             ExpertArchitecture::QwenHybridLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::Qwen3VlLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::Gemma4Layerwise(model) => model.dense_stream_report(),
-            _ => Ok(None),
         }
     }
 
@@ -1146,11 +1143,13 @@ impl ExpertParallelModel {
     }
 
     /// Returns the canonical cache-relevant architecture identity for this rank.
+    #[allow(dead_code)]
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
         Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
     }
 
     /// Returns this rank's exact ordered prompt-cache layout.
+    #[allow(dead_code)]
     pub fn prompt_cache_layer_layout(
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
@@ -1158,6 +1157,7 @@ impl ExpertParallelModel {
     }
 
     /// Returns each owned layer's processed-token delta from the persisted prefix.
+    #[allow(dead_code)]
     pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
         Ok(self.prompt_cache_model_identity()?.layer_prefix_offsets)
     }

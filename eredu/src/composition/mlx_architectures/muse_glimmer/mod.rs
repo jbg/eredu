@@ -7,6 +7,7 @@ pub(crate) mod checkpoint;
 pub mod layerwise;
 pub(crate) mod mtp;
 #[cfg(feature = "mlx-image")]
+#[cfg(feature = "mlx-image")]
 pub(crate) mod processor;
 pub(crate) mod vision;
 

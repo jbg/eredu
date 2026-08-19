@@ -23,6 +23,8 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+#[cfg(test)]
+use crate::backend::mlx::runtime::residency::manager::ResidentUnitLease;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::{
@@ -33,7 +35,7 @@ use crate::{
         store::TensorSelection,
     },
     backend::mlx::runtime::residency::manager::{
-        ResidencyError, ResidencyManager, ResidentTransfer, ResidentUnitLease,
+        ResidencyError, ResidencyManager, ResidentTransfer,
     },
     core::residency::{
         MemoryTier, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyLedgerError,
@@ -1137,7 +1139,8 @@ impl AcquiredExperts {
     }
 
     /// Returns source leases in the same order as [`Self::identities`].
-    pub fn leases(&self) -> &[ResidentUnitLease] {
+    #[cfg(test)]
+    pub(crate) fn leases(&self) -> &[ResidentUnitLease] {
         self.transfer.leases()
     }
 

@@ -251,6 +251,7 @@ pub(crate) fn safetensors_plan_with_root(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn is_redundant_tied_output_head_key(args: &DecoderConfig, key: &str) -> bool {
     args.tie_word_embeddings
         && matches!(

@@ -549,7 +549,7 @@ where
 /// `Array::clone` only clones the MLX handle; it does not copy the resident
 /// allocation. The caller must therefore keep `lease` alive through forward
 /// execution and synchronize before releasing it.
-pub fn populate_module_from_lease(
+pub(crate) fn populate_module_from_lease(
     module: &mut impl ModuleParameters,
     lease: &ResidentUnitLease,
 ) -> Result<(), ModuleBindingError> {
@@ -557,7 +557,7 @@ pub fn populate_module_from_lease(
 }
 
 /// Assigns non-excluded module parameters from a protected resident unit.
-pub fn populate_module_from_lease_excluding<F>(
+pub(crate) fn populate_module_from_lease_excluding<F>(
     module: &mut impl ModuleParameters,
     lease: &ResidentUnitLease,
     excluded: F,
