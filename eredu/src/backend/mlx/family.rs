@@ -20,7 +20,6 @@ use crate::backend::mlx::architectures::{
     },
 };
 use crate::backend::mlx::error::Error;
-use crate::integrations::llama_mlx::model as llama;
 
 /// Canonical resolution of a model configuration supported by MLX.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -78,7 +77,9 @@ fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<
         ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
         ModelKind::Inkling => inkling::validate_model_config_value(config),
         ModelKind::KimiLinear => kimi_linear::validate_model_config_value(config),
-        ModelKind::Llama => llama::validate_model_config_value(config),
+        ModelKind::Llama => eredu_architectures::llama::model_args_from_config_value(config)
+            .map(|_| ())
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
         ModelKind::MuseGlimmer => muse_glimmer::validate_model_config_value(config),
         ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),

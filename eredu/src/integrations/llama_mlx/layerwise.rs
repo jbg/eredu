@@ -69,6 +69,12 @@ const EMBEDDING_UNIT: &str = "llama.static.embedding";
 const NORM_UNIT: &str = "llama.static.norm";
 const HEAD_UNIT: &str = "llama.static.output";
 
+fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
+    let file = std::fs::File::open(model_dir.join("config.json"))?;
+    eredu_architectures::llama::model_args_from_config_reader(file)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 /// Per-layer Llama/Mistral KV state selected from the canonical schedule.
 #[derive(Debug, Clone)]
 pub enum LlamaCache {
@@ -454,7 +460,7 @@ pub(crate) fn load_llama_safetensors_mlx(
         ));
     }
     let execution_options = weight_residency.layers();
-    let args = resident::get_llama_model_args(model_dir)?;
+    let args = load_model_args(model_dir)?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Llama", args.weight_quantization(), requested)
@@ -502,7 +508,7 @@ pub(crate) fn load_llama_tensor_parallel_model(
         )
         .map(|(model, _)| model);
     }
-    let args = resident::get_llama_model_args(model_dir)?;
+    let args = load_model_args(model_dir)?;
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
     Ok(LlamaModel {
         execution: Box::new(load_tensor_parallel_layerwise_model(

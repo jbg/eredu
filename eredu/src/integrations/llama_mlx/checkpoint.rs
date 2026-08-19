@@ -21,7 +21,7 @@ pub(crate) fn validate_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
 ) -> CheckpointValidation {
-    let args = match model::model_args_from_config_value(config) {
+    let args = match eredu_architectures::llama::model_args_from_config_value(config) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };

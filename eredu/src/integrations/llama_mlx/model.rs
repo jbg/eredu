@@ -2,14 +2,13 @@
 
 use eredu_checkpoint::WeightQuantization;
 
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 use safemlx::{
     error::Exception,
     ops::{GgufCheckpoint, GgufMetadataValue},
     Array, Stream,
 };
-use serde_json::Value;
 
 use eredu_architectures::llama::ModelArgs;
 
@@ -85,24 +84,6 @@ impl
             )
             .map_err(|error| Exception::custom(error.to_string()))
     }
-}
-
-/// Reads and normalizes Llama model arguments from `config.json`.
-pub fn get_llama_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
-    let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
-    eredu_architectures::llama::model_args_from_config_reader(file)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
-pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
-    eredu_architectures::llama::model_args_from_config_value(config)
-        .map(|_| ())
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
-pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
-    eredu_architectures::llama::model_args_from_config_value(config)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 pub(crate) struct PreparedLlamaGguf {

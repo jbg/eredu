@@ -6,7 +6,6 @@ use super::*;
 
 use crate::api::{LoadedModel, PreparedChatInput, PreparedChatMtpBatchRequest, SpeculativeDraft};
 use crate::backend::mlx::architectures::gemma4::model as gemma4;
-use crate::integrations::llama_mlx::model as llama;
 use crate::{
     backend::mlx::architectures::{
         gpt_oss::model as gpt_oss,
@@ -1297,7 +1296,10 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
         let dir = temp_model_dir(config);
         match family {
             "llama" | "mistral" => {
-                let args = llama::get_llama_model_args(&dir).unwrap();
+                let args = eredu_architectures::llama::model_args_from_config_reader(
+                    std::fs::File::open(dir.join("config.json")).unwrap(),
+                )
+                .unwrap();
                 let model = eredu_architectures::llama::Model::<
                     crate::backend::mlx::nn::shared::MlxBackend,
                 >::new(&args, stream)

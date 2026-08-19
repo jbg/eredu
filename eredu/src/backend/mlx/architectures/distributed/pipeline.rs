@@ -8648,8 +8648,11 @@ pub(crate) fn load_pipeline_model_with_options(
     let store = open_safetensors_weight_store(model_dir, max_mapped_shards)?;
     match model_type {
         Some("llama" | "mistral") => {
+            let config = std::fs::File::open(model_dir.join("config.json"))?;
+            let args = eredu_architectures::llama::model_args_from_config_reader(config)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             load_llama_pipeline(
-                llama::get_llama_model_args(model_dir)?,
+                args,
                 store,
                 topology,
                 options.quantization,
