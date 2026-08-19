@@ -2056,6 +2056,23 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
         .unwrap();
     assert_eq!(logits.shape(), &[1, 32]);
 
+    let mut bounded =
+        crate::composition::mlx_architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
+            &dir,
+            eredu_runtime::LayerwiseLoadOptions::default(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+    let mut bounded_cache = bounded.new_cache();
+    let bounded_logits = bounded
+        .prefill(input::ModelInput::new(&parts), &mut bounded_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    assert_eq!(bounded_logits.shape(), &[1, 3, 32]);
+    assert!(bounded.residency_report().unwrap().initialized());
+
     let saved_dir = dir.with_extension("mxfp4");
     crate::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
         &dir,
