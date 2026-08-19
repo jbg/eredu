@@ -1,6 +1,6 @@
 //! Qwen3-VL conditional-generation model support.
 
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, RuntimeState, StateError, StateLayout};
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -250,6 +250,22 @@ pub(crate) fn prompt_cache_layer_layout_with_kv_heads(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
+pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Error> {
+    StateLayout::new(prompt_cache_layer_layout_with_kv_heads(
+        args,
+        &vec![args.text_config.num_key_value_heads; args.text_config.num_hidden_layers as usize],
+    )?)
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+pub(crate) fn state_layout_with_kv_heads(
+    args: &ModelArgs,
+    kv_heads: &[i32],
+) -> Result<StateLayout, Error> {
+    StateLayout::new(prompt_cache_layer_layout_with_kv_heads(args, kv_heads)?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 fn validate_qwen3_vl_model_args(args: &ModelArgs) -> Result<(), Error> {
     let vision = &args.vision_config;
     if vision.hidden_size <= 0
@@ -318,11 +334,91 @@ pub struct Model {
 }
 
 /// Generation state for Qwen3-VL, including multimodal RoPE offset state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Cache {
+    layout: StateLayout,
     /// Per-layer key/value caches.
     pub kv: Vec<Option<ConcatKeyValueCache>>,
     pub(crate) rope_delta: i32,
+}
+
+impl Cache {
+    pub(crate) fn new(args: &ModelArgs) -> Self {
+        Self::new_with_kv_heads(
+            args,
+            &vec![
+                args.text_config.num_key_value_heads;
+                args.text_config.num_hidden_layers as usize
+            ],
+        )
+        .expect("validated Qwen3-VL state geometry")
+    }
+
+    pub(crate) fn new_with_kv_heads(args: &ModelArgs, kv_heads: &[i32]) -> Result<Self, Error> {
+        Ok(Self {
+            layout: state_layout_with_kv_heads(args, kv_heads)?,
+            kv: (0..args.text_config.num_hidden_layers)
+                .map(|_| Some(ConcatKeyValueCache::default()))
+                .collect(),
+            rope_delta: 0,
+        })
+    }
+
+    pub(crate) fn validate(&self, args: &ModelArgs) -> Result<(), Error> {
+        if self.kv.len() != args.text_config.num_hidden_layers as usize {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Qwen3-VL cache has {} layers, expected {}",
+                self.kv.len(),
+                args.text_config.num_hidden_layers
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.kv
+            .iter_mut()
+            .flatten()
+            .for_each(ConcatKeyValueCache::clear);
+        self.rope_delta = 0;
+    }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() == 0 {
+            return Ok(Vec::new().into_iter());
+        }
+        if address.group() != 1 {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: 2,
+            });
+        }
+        self.kv
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.kv.len(),
+            })
+            .map(|cache| {
+                cache
+                    .as_ref()
+                    .map(KeyValueCache::retained_arrays)
+                    .unwrap_or_default()
+                    .into_iter()
+            })
+    }
 }
 
 struct PreparedPrefill {
@@ -373,7 +469,7 @@ impl Model {
 
     /// Creates an empty cache.
     pub fn new_cache(&self) -> Cache {
-        Cache::default()
+        Cache::new(&self.args)
     }
 
     pub(crate) fn save_prompt_cache(
@@ -485,6 +581,8 @@ impl Model {
             .ok_or_else(|| Exception::custom("Qwen-VL position delta is missing"))?
             .try_item::<i32>(stream)?;
         let mut cache = Cache {
+            layout: StateLayout::new(identity.layer_layout.clone())
+                .map_err(|error| Exception::custom(error.to_string()))?,
             kv: (0..args.text_config.num_hidden_layers)
                 .map(|layer| {
                     let window = args

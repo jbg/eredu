@@ -261,7 +261,7 @@ impl ExpertParallelCache {
             Self::Lfm2(cache) => cache.reset()?,
             Self::NemotronH(cache) => cache.reset()?,
             Self::QwenHybrid(cache) => cache.reset()?,
-            Self::Qwen3Vl(cache) => *cache = qwen3_vl::Cache::default(),
+            Self::Qwen3Vl(cache) => cache.reset(),
             Self::Gemma4(cache) => cache.clear()?,
         }
         Ok(())

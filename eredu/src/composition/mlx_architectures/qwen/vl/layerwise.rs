@@ -126,7 +126,7 @@ impl Qwen3VlLayerwiseModel {
 
     /// Creates empty KV and multimodal position state.
     pub fn new_cache(&self) -> Cache {
-        Cache::default()
+        Cache::new(self.args())
     }
 
     /// Returns rank-local generalized parallel information when applicable.
@@ -952,7 +952,7 @@ impl Qwen3VlLayerwiseAdapter {
         >,
         stream: &Stream,
     ) -> Result<Qwen3VlPipelineIngressState, Error> {
-        let mut cache = Cache::default();
+        let mut cache = Cache::new(&self.args);
         let forward = self.prepare_prefill(typed, &mut cache, execution, stream)?;
         Ok(Qwen3VlPipelineIngressState { cache, forward })
     }
@@ -1006,7 +1006,7 @@ impl Qwen3VlLayerwiseAdapter {
             stream,
         )?;
         Ok(Qwen3VlPipelineIngressState {
-            cache: Cache::default(),
+            cache: Cache::new(&self.args),
             forward: eredu_runtime::LayeredForwardState {
                 hidden,
                 context: Qwen3VlForwardContext {
@@ -1235,7 +1235,7 @@ impl Qwen3VlLayerwiseAdapter {
         >,
         stream: &Stream,
     ) -> Result<Qwen3VlPipelinePrepared, Error> {
-        let mut cache = Cache::default();
+        let mut cache = Cache::new(&self.args);
         let mut state = self.prepare_prefill(typed, &mut cache, execution, stream)?;
         if state.context.vision.is_some() {
             if vision_layers.len() != self.args.vision_config.layer_count() {
@@ -1730,19 +1730,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
     }
 
     fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
-        if cache.kv.is_empty() {
-            cache.kv = (0..self.args.text_config.num_hidden_layers)
-                .map(|_| Some(Default::default()))
-                .collect();
-        }
-        if cache.kv.len() != self.args.text_config.num_hidden_layers as usize {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Qwen3-VL cache has {} layers, expected {}",
-                cache.kv.len(),
-                self.args.text_config.num_hidden_layers
-            )));
-        }
-        Ok(())
+        cache.validate(&self.args)
     }
 
     fn begin_forward<'a>(
