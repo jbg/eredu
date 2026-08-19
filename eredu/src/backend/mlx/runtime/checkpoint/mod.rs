@@ -34,5 +34,3 @@ pub mod quantization;
 pub mod recipe;
 /// Persistent lazy checkpoint tensor storage.
 pub mod store;
-/// Header-only SafeTensors and GGUF plan evaluation.
-pub(crate) use eredu_checkpoint::validation;

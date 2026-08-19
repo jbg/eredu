@@ -11,13 +11,11 @@ use eredu_checkpoint::{StoredDtype, WeightQuantization};
 use serde_json::Value;
 
 use super::{model::ModelArgs, personaplex};
-use crate::backend::mlx::runtime::checkpoint::{
-    store::{SafetensorsWeightStore, WeightStore},
-    validation,
-};
+use crate::backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore};
 use eredu_checkpoint::schema::{
     CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
 };
+use eredu_checkpoint::validation;
 use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 pub(crate) fn validate_safetensors(

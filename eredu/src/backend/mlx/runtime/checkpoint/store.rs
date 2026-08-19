@@ -341,13 +341,13 @@ impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore + Send + Sync +
 /// independently.
 pub(crate) struct ContractWeightStore {
     source: Arc<dyn WeightStore + Send + Sync>,
-    contract: crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan,
+    contract: eredu_checkpoint::validation::ResolvedCheckpointPlan,
 }
 
 impl ContractWeightStore {
     pub(crate) fn new(
         source: Arc<dyn WeightStore + Send + Sync>,
-        contract: crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan,
+        contract: eredu_checkpoint::validation::ResolvedCheckpointPlan,
     ) -> Self {
         Self { source, contract }
     }
@@ -717,14 +717,13 @@ impl GgufWeightStoreBuilder {
     where
         F: FnMut(&str) -> String,
     {
-        let resolved =
-            crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan::for_test(
-                "test GGUF catalog",
-                checkpoint
-                    .catalog()
-                    .tensors()
-                    .map(|tensor| tensor.descriptor().name.clone()),
-            );
+        let resolved = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
+            "test GGUF catalog",
+            checkpoint
+                .catalog()
+                .tensors()
+                .map(|tensor| tensor.descriptor().name.clone()),
+        );
         self.inner = self
             .inner
             .add_resolved_checkpoint(checkpoint.catalog().clone(), &resolved, translate)
@@ -1944,11 +1943,10 @@ mod tests {
             ])
             .unwrap(),
         );
-        let contract =
-            crate::backend::mlx::runtime::checkpoint::validation::ResolvedCheckpointPlan::for_test(
-                "test architecture",
-                ["packed"],
-            );
+        let contract = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
+            "test architecture",
+            ["packed"],
+        );
         let store = ContractWeightStore::new(source, contract);
 
         assert_eq!(store.keys(), ["packed"]);

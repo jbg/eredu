@@ -12,10 +12,8 @@ use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
 
 use super::model;
-use crate::backend::mlx::runtime::checkpoint::{
-    store::{SafetensorsWeightStore, WeightStore},
-    validation,
-};
+use crate::backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore};
+use eredu_checkpoint::validation;
 use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 pub(crate) fn validate_safetensors(

@@ -87,15 +87,13 @@ pub(crate) fn resolve_checkpoint_store<A: ArchitectureAdapter>(
             ))
         })?;
     let plan = adapter.safetensors_checkpoint_plan()?;
-    let resolved = crate::backend::mlx::runtime::checkpoint::validation::resolve_safetensors_plan(
-        raw, &plan.plan,
-    )
-    .map_err(|validation| {
-        Error::UnsupportedArchitecture(format!(
-            "{} checkpoint contract did not resolve: {validation:?}",
-            adapter.model_type()
-        ))
-    })?;
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(raw, &plan.plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "{} checkpoint contract did not resolve: {validation:?}",
+                adapter.model_type()
+            ))
+        })?;
     Ok(Arc::new(
         crate::backend::mlx::runtime::checkpoint::store::ContractWeightStore::new(store, resolved),
     ))

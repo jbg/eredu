@@ -15,10 +15,7 @@ use serde_json::Value;
 use super::{qwen3_5 as qwen35, qwen3_next};
 use crate::backend::mlx::architectures::qwen::vl::model as qwen3_vl;
 use crate::{
-    backend::mlx::runtime::checkpoint::{
-        store::{SafetensorsWeightStore, WeightStore},
-        validation,
-    },
+    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
     core::attention::AttentionPolicy,
 };
 use eredu_checkpoint::schema::{
@@ -26,6 +23,7 @@ use eredu_checkpoint::schema::{
     GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
     StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::validation;
 use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

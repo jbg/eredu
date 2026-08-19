@@ -14,10 +14,7 @@ use serde_json::Value;
 
 use super::model::{self, FeedForwardPolicy, ModelArgs, OperatorPolicy};
 use crate::{
-    backend::mlx::runtime::checkpoint::{
-        store::{SafetensorsWeightStore, WeightStore},
-        validation,
-    },
+    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
     AttentionPolicy,
 };
 use eredu_checkpoint::schema::{
@@ -25,6 +22,7 @@ use eredu_checkpoint::schema::{
     GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
     StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::validation;
 use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
