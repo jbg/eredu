@@ -863,3 +863,4 @@ macro_rules! impl_attention_cache {
 impl_attention_cache!(ConcatKeyValueCache);
 impl_attention_cache!(SlidingKeyValueCache);
 impl_attention_cache!(PagedKeyValueCache);
+impl_attention_cache!(crate::backend::mlx::runtime::cache::state::MlxKeyValueLayerState);

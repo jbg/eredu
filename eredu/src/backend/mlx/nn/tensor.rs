@@ -325,12 +325,29 @@ pub(crate) fn create_attention_mask<C>(
 where
     C: KeyValueCache,
 {
+    create_attention_mask_from_cache(
+        h,
+        cache.first().and_then(Option::as_ref),
+        return_array,
+        stream,
+    )
+}
+
+pub(crate) fn create_attention_mask_from_cache<C>(
+    h: &Array,
+    cache: Option<&C>,
+    return_array: Option<bool>,
+    stream: &Stream,
+) -> Result<Option<AttentionMask>, Exception>
+where
+    C: KeyValueCache,
+{
     let mut return_array = return_array.unwrap_or(false);
     let T = h.shape()[1];
     if T > 1 {
         let mut offset = 0;
         let mut window_size = None;
-        if let Some(c) = cache.first().and_then(|c| c.as_ref()) {
+        if let Some(c) = cache {
             offset = c.offset();
             if let Some(window_size_) = c.max_size() {
                 window_size = Some(window_size_);

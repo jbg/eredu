@@ -6434,14 +6434,21 @@ mod tests {
             backend::mlx::architectures::gpt_oss::model::{
                 Cache as GptOssCache, LayerCache as GptOssLayerCache,
             },
-            backend::mlx::runtime::cache::PagedKeyValueCache,
-            integrations::llama_mlx::layerwise::LlamaCache,
+            backend::mlx::runtime::cache::{state::MlxKeyValueState, PagedKeyValueCache},
         };
 
         let manager = manager_with_leased_block();
-        let mut llama = LlamaCache::Paged(vec![Some(
-            PagedKeyValueCache::new(manager.clone(), 0, None).unwrap(),
-        )]);
+        let layout = eredu_runtime::StateLayout::new(
+            crate::LayerSchedule::new(
+                1,
+                vec![
+                    crate::LayerCachePolicy::key_value(crate::AttentionPolicy::Full, 1, 1).unwrap(),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut llama = MlxKeyValueState::paged(layout, manager.clone(), None).unwrap();
         assert!(llama.clear().is_err());
         assert_eq!(manager.lock().unwrap().blocks.len(), 1);
 

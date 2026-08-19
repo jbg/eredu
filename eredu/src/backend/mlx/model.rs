@@ -1276,8 +1276,8 @@ pub enum ModelCache {
     Inkling(inkling::Cache),
     /// Per-layer key/value caches whose bounds follow the model schedule.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
-    /// Unified Llama cache used by bounded layer execution.
-    Llama(crate::integrations::llama_mlx::layerwise::LlamaCache),
+    /// Runtime-policy-selected MLX key/value state.
+    Llama(crate::backend::mlx::runtime::cache::state::MlxKeyValueState),
     /// Qwen3-VL key/value cache and multimodal position state.
     Qwen3Vl(qwen3_vl::Cache),
     /// Qwen3-VL-MoE key/value cache and multimodal position state.

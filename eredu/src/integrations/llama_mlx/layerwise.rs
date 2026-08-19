@@ -1,8 +1,7 @@
 //! Unified Llama/Mistral loading across weight-residency policies.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::CausalModel;
-use eredu_runtime::WeightBinding;
+use eredu_runtime::{CausalModel, RuntimeState, WeightBinding};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -32,13 +31,12 @@ use crate::{
     backend::mlx::nn::shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxRmsNorm},
     backend::mlx::nn::{
         parallel::{planned_kv_head_layout, VocabParallelEmbedding, VocabParallelLmHead},
-        tensor::{create_attention_mask, AttentionMask},
+        tensor::{create_attention_mask_from_cache, AttentionMask},
     },
     backend::mlx::runtime::cache::residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions,
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
     },
-    backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
+    backend::mlx::runtime::cache::{state::MlxKeyValueState, KeyValueCache},
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes, populate_module_from_lease,
     },
@@ -67,86 +65,6 @@ fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.join("config.json"))?;
     eredu_architectures::llama::model_args_from_config_reader(file)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
-/// Per-layer Llama/Mistral KV state selected from the canonical schedule.
-#[derive(Debug, Clone)]
-pub enum LlamaCache {
-    /// Device caches, independently full or bounded for each layer.
-    Device(Vec<Option<ConcatKeyValueCache>>),
-    /// Block-addressable caches sharing one model-wide residency manager.
-    Paged(Vec<Option<PagedKeyValueCache>>),
-}
-
-impl LlamaCache {
-    /// Returns the common absolute token offset, or zero for an empty cache.
-    pub fn offset(&self) -> i32 {
-        match self {
-            Self::Device(caches) => caches
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
-            Self::Paged(caches) => caches
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
-        }
-    }
-
-    /// Clears retained arrays without changing cache type or window size.
-    pub fn clear(&mut self) -> Result<(), Error> {
-        match self {
-            Self::Device(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
-            Self::Paged(caches) => {
-                for cache in caches.iter_mut().flatten() {
-                    cache.clear()?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns aggregate cache-residency telemetry for a paged cache.
-    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Error> {
-        match self {
-            Self::Paged(caches) => caches
-                .iter()
-                .flatten()
-                .next()
-                .map(|cache| cache.report().map_err(Into::into))
-                .transpose(),
-            Self::Device(_) => Ok(None),
-        }
-    }
-
-    /// Finalizes every mutable tail and atomically persists a completed text prefix.
-    pub fn save_prompt_cache(
-        &mut self,
-        destination: impl AsRef<Path>,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-    ) -> Result<PromptCacheManifest, Error> {
-        let Self::Paged(caches) = self else {
-            return Err(Exception::custom(
-                "prompt-cache persistence requires an explicitly configured paged cache",
-            )
-            .into());
-        };
-        for cache in caches.iter_mut().flatten() {
-            cache.finalize()?;
-        }
-        let manager = caches
-            .iter()
-            .flatten()
-            .next()
-            .ok_or_else(|| Exception::custom("cannot persist an empty paged cache"))?
-            .manager()
-            .clone();
-        manager
-            .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
-            .map_err(|error| Exception::custom(error.to_string()).into())
-    }
 }
 
 /// Llama/Mistral causal LM whose execution engine follows its residency policy.
@@ -210,22 +128,19 @@ impl LlamaModel {
     }
 
     /// Creates the cache representation required by the model configuration.
-    pub fn new_cache(&self) -> LlamaCache {
-        let args = self.args();
-        LlamaCache::Device(
-            eredu_architectures::llama::create_caches(args, |_layer, window| match window {
-                Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
-                None => ConcatKeyValueCache::new(),
-            })
-            .expect("validated Llama configuration has a valid cache schedule"),
+    pub fn new_cache(&self) -> MlxKeyValueState {
+        MlxKeyValueState::device(
+            eredu_architectures::llama::state_layout(self.args())
+                .expect("validated Llama configuration has a valid state layout"),
         )
+        .expect("MLX key/value state supports the validated Llama layout")
     }
 
     /// Creates a device-resident or explicitly bounded paged model cache.
     pub fn new_cache_with_options(
         &self,
         policy: CacheResidencyPolicy,
-    ) -> Result<LlamaCache, Error> {
+    ) -> Result<MlxKeyValueState, Error> {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => {
@@ -242,7 +157,7 @@ impl LlamaModel {
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
         stream: &Stream,
-    ) -> Result<(LlamaCache, PromptCacheManifest), Error> {
+    ) -> Result<(MlxKeyValueState, PromptCacheManifest), Error> {
         self.execution
             .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
     }
@@ -250,7 +165,7 @@ impl LlamaModel {
     /// Persists a prefix through the generalized execution contract.
     pub fn save_prompt_cache(
         &self,
-        cache: &mut LlamaCache,
+        cache: &mut MlxKeyValueState,
         destination: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -272,7 +187,7 @@ impl LlamaModel {
         options: PagedCacheOptions,
         manager: Option<CacheResidencyManager>,
         rank: Option<crate::CacheRankIdentity>,
-    ) -> Result<LlamaCache, Error> {
+    ) -> Result<MlxKeyValueState, Error> {
         let manager = match manager {
             Some(manager) => manager,
             None => CacheResidencyManager::new(options)
@@ -285,23 +200,21 @@ impl LlamaModel {
         &self,
         manager: CacheResidencyManager,
         rank: Option<crate::CacheRankIdentity>,
-    ) -> Result<LlamaCache, Error> {
-        let args = self.args();
-        let caches = eredu_architectures::llama::create_caches(args, |layer, window| {
-            PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
-        })
-        .map_err(|error| Exception::custom(error.to_string()))?
-        .into_iter()
-        .map(|cache| cache.transpose())
-        .collect::<Result<Vec<_>, _>>()?;
-        Ok(LlamaCache::Paged(caches))
+    ) -> Result<MlxKeyValueState, Error> {
+        MlxKeyValueState::paged(
+            eredu_architectures::llama::state_layout(self.args())
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            manager,
+            rank,
+        )
+        .map_err(Into::into)
     }
 
     /// Runs embedding, decoder layers, final normalization, and projection.
     pub fn forward(
         &mut self,
         inputs: &Array,
-        cache: &mut LlamaCache,
+        cache: &mut MlxKeyValueState,
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
@@ -314,7 +227,7 @@ impl LlamaModel {
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
-        cache: &mut LlamaCache,
+        cache: &mut MlxKeyValueState,
         stream: &Stream,
         observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
@@ -331,7 +244,7 @@ impl LlamaModel {
     pub(crate) fn forward_tensor_parallel(
         &mut self,
         inputs: &Array,
-        cache: &mut LlamaCache,
+        cache: &mut MlxKeyValueState,
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
@@ -348,7 +261,7 @@ impl LlamaModel {
     pub fn prefill(
         &mut self,
         inputs: &Array,
-        cache: &mut LlamaCache,
+        cache: &mut MlxKeyValueState,
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.forward(inputs, cache, stream)?
@@ -360,7 +273,7 @@ impl LlamaModel {
     pub fn decode(
         &mut self,
         input_tokens: &Array,
-        cache: &mut LlamaCache,
+        cache: &mut MlxKeyValueState,
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.prefill(input_tokens, cache, stream)
@@ -378,42 +291,21 @@ impl LlamaModel {
         Ok(true)
     }
 
-    fn validate_cache(&self, cache: &LlamaCache) -> Result<(), Error> {
-        let expected_layers = usize::try_from(self.args().num_hidden_layers).map_err(|_| {
-            LlamaModelError::InvalidLayerCount {
-                count: self.args().num_hidden_layers,
-            }
-        })?;
-        let actual_layers = match cache {
-            LlamaCache::Device(caches) => caches.len(),
-            LlamaCache::Paged(caches) => caches.len(),
-        };
-        if actual_layers != expected_layers {
-            return Err(LlamaModelError::CacheLengthMismatch {
-                expected: expected_layers,
-                actual: actual_layers,
-            }
+    fn validate_cache(&self, cache: &MlxKeyValueState) -> Result<(), Error> {
+        let expected = eredu_architectures::llama::state_layout(self.args())
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if cache.layout() != &expected {
+            return Err(Exception::custom(format!(
+                "MLX key/value state layout {:?} does not match Llama layout {expected:?}",
+                cache.layout()
+            ))
             .into());
-        }
-        match cache {
-            LlamaCache::Device(caches) => eredu_architectures::llama::validate_caches::<
-                crate::backend::mlx::nn::shared::MlxBackend,
-                _,
-                _,
-            >(self.args(), caches)
-            .map_err(|error| Exception::custom(error.to_string()))?,
-            LlamaCache::Paged(caches) => eredu_architectures::llama::validate_caches::<
-                crate::backend::mlx::nn::shared::MlxBackend,
-                _,
-                _,
-            >(self.args(), caches)
-            .map_err(|error| Exception::custom(error.to_string()))?,
         }
         Ok(())
     }
 }
 
-impl CausalModel<LlamaCache> for LlamaModel {
+impl CausalModel<MlxKeyValueState> for LlamaModel {
     type Tensor = Array;
     type Input<'a> = input::ModelInput<'a>;
     type Error = Exception;
@@ -421,7 +313,7 @@ impl CausalModel<LlamaCache> for LlamaModel {
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,
-        cache: &mut LlamaCache,
+        cache: &mut MlxKeyValueState,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let tokens = input::text_token_ids(input, stream)?;
@@ -432,7 +324,7 @@ impl CausalModel<LlamaCache> for LlamaModel {
     fn decode_logits(
         &mut self,
         input_tokens: &Array,
-        cache: &mut LlamaCache,
+        cache: &mut MlxKeyValueState,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         self.decode(input_tokens, cache, stream)
@@ -698,7 +590,7 @@ pub struct LlamaAdapterInput<'a> {
 
 impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     type Input<'a> = LlamaAdapterInput<'a>;
-    type Cache = LlamaCache;
+    type Cache = MlxKeyValueState;
     type Layer = TransformerBlock;
     type ForwardContext = LlamaForwardContext;
 
@@ -772,7 +664,9 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         options: &PromptCacheOptions,
         _stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
-        cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+        cache
+            .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            .map_err(Into::into)
     }
 
     fn load_prompt_cache(
@@ -788,26 +682,13 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
             open_prompt_cache(directory, expected, identity, prefix_token_ids, options)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         let rank = identity.topology.cache_rank_identity();
-        let caches = self
-            .args
-            .attention_schedule
-            .iter()
-            .enumerate()
-            .map(|(layer, policy)| {
-                PagedKeyValueCache::new_with_layout(
-                    manager.clone(),
-                    layer,
-                    policy.window().map(|window| {
-                        i32::try_from(window.get())
-                            .expect("validated Llama attention window fits i32")
-                    }),
-                    0,
-                    rank,
-                )
-                .map(Some)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((LlamaCache::Paged(caches), manifest))
+        let state = MlxKeyValueState::paged(
+            eredu_architectures::llama::state_layout(&self.args)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            manager,
+            rank,
+        )?;
+        Ok((state, manifest))
     }
 
     fn static_units(
@@ -878,45 +759,14 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     }
 
     fn validate_cache(&self, cache: &mut Self::Cache) -> Result<(), Error> {
-        let expected = usize::try_from(self.args.num_hidden_layers).map_err(|_| {
-            LlamaModelError::InvalidLayerCount {
-                count: self.args.num_hidden_layers,
-            }
-        })?;
-        let actual = match cache {
-            LlamaCache::Device(caches) => {
-                if caches.is_empty() {
-                    *caches =
-                        eredu_architectures::llama::create_caches(&self.args, |_layer, window| {
-                            match window {
-                                Some(window) => {
-                                    ConcatKeyValueCache::new_for_sliding_attention(window)
-                                }
-                                None => ConcatKeyValueCache::new(),
-                            }
-                        })
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                }
-                eredu_architectures::llama::validate_caches::<
-                    crate::backend::mlx::nn::shared::MlxBackend,
-                    _,
-                    _,
-                >(&self.args, caches)
-                .map_err(|error| Exception::custom(error.to_string()))?;
-                caches.len()
-            }
-            LlamaCache::Paged(caches) => {
-                eredu_architectures::llama::validate_caches::<
-                    crate::backend::mlx::nn::shared::MlxBackend,
-                    _,
-                    _,
-                >(&self.args, caches)
-                .map_err(|error| Exception::custom(error.to_string()))?;
-                caches.len()
-            }
-        };
-        if actual != expected {
-            return Err(LlamaModelError::CacheLengthMismatch { expected, actual }.into());
+        let expected = eredu_architectures::llama::state_layout(&self.args)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if cache.layout() != &expected {
+            return Err(Exception::custom(format!(
+                "MLX key/value state layout {:?} does not match Llama layout {expected:?}",
+                cache.layout()
+            ))
+            .into());
         }
         Ok(())
     }
@@ -929,15 +779,9 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         let hidden = self.embedding.forward(input.inputs, stream)?;
         let allow_sliding_prefill = input.mask.is_none();
-        let mask = match cache {
-            LlamaCache::Device(caches) => match input.mask {
-                Some(mask) => Some(mask.clone()),
-                None => llama_attention_mask(&hidden, caches, stream)?,
-            },
-            LlamaCache::Paged(caches) => match input.mask {
-                Some(mask) => Some(mask.clone()),
-                None => llama_attention_mask(&hidden, caches, stream)?,
-            },
+        let mask = match input.mask {
+            Some(mask) => Some(mask.clone()),
+            None => llama_attention_mask(&hidden, cache.as_ref(), stream)?,
         };
         Ok(LayerwiseForwardState {
             hidden,
@@ -961,15 +805,9 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         };
         let hidden = embedding.forward(input.inputs, execution)?;
         let allow_sliding_prefill = input.mask.is_none();
-        let mask = match cache {
-            LlamaCache::Device(caches) => match input.mask {
-                Some(mask) => Some(mask.clone()),
-                None => llama_attention_mask(&hidden, caches, execution.stream())?,
-            },
-            LlamaCache::Paged(caches) => match input.mask {
-                Some(mask) => Some(mask.clone()),
-                None => llama_attention_mask(&hidden, caches, execution.stream())?,
-            },
+        let mask = match input.mask {
+            Some(mask) => Some(mask.clone()),
+            None => llama_attention_mask(&hidden, cache.as_ref(), execution.stream())?,
         };
         Ok(LayerwiseForwardState {
             hidden,
@@ -1163,30 +1001,18 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         context: &mut Self::ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        match cache {
-            LlamaCache::Device(caches) => Ok(layer.forward(
-                AttentionInput {
-                    hidden,
-                    mask: context.mask.as_ref(),
-                    cache: Some(
-                        caches[index]
-                            .as_mut()
-                            .expect("validated Llama device cache"),
-                    ),
-                    allow_sliding_prefill: context.allow_sliding_prefill,
-                },
-                stream,
-            )?),
-            LlamaCache::Paged(caches) => Ok(layer.forward(
-                AttentionInput {
-                    hidden,
-                    mask: context.mask.as_ref(),
-                    cache: Some(caches[index].as_mut().expect("validated Llama paged cache")),
-                    allow_sliding_prefill: context.allow_sliding_prefill,
-                },
-                stream,
-            )?),
-        }
+        let layer_state = cache
+            .layer(index)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(layer.forward(
+            AttentionInput {
+                hidden,
+                mask: context.mask.as_ref(),
+                cache: Some(layer_state),
+                allow_sliding_prefill: context.allow_sliding_prefill,
+            },
+            stream,
+        )?)
     }
 
     fn forward_layer_with_execution(
@@ -1212,24 +1038,17 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 execution.stream(),
             );
         };
-        match cache {
-            LlamaCache::Device(caches) => Ok(layer.forward_tensor_parallel(
-                hidden,
-                context.mask.as_ref(),
-                caches[index].as_mut(),
-                context.allow_sliding_prefill,
-                tp_group,
-                execution.stream(),
-            )?),
-            LlamaCache::Paged(caches) => Ok(layer.forward_tensor_parallel(
-                hidden,
-                context.mask.as_ref(),
-                caches[index].as_mut(),
-                context.allow_sliding_prefill,
-                tp_group,
-                execution.stream(),
-            )?),
-        }
+        let layer_state = cache
+            .layer(index)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(layer.forward_tensor_parallel(
+            hidden,
+            context.mask.as_ref(),
+            Some(layer_state),
+            context.allow_sliding_prefill,
+            tp_group,
+            execution.stream(),
+        )?)
     }
 
     fn retained_arrays<'a>(
@@ -1238,16 +1057,11 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         _group: usize,
         index: usize,
     ) -> Vec<&'a Array> {
-        match cache {
-            LlamaCache::Device(caches) => caches[index]
-                .as_ref()
-                .map(KeyValueCache::retained_arrays)
-                .unwrap_or_default(),
-            LlamaCache::Paged(caches) => caches[index]
-                .as_ref()
-                .map(KeyValueCache::retained_arrays)
-                .unwrap_or_default(),
-        }
+        cache
+            .as_ref()
+            .get(index)
+            .map(KeyValueCache::retained_arrays)
+            .unwrap_or_default()
     }
 
     fn finish(
@@ -1296,10 +1110,10 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
 fn llama_attention_mask<C: KeyValueCache>(
     hidden: &Array,
-    cache: &[Option<C>],
+    cache: &[C],
     stream: &Stream,
 ) -> Result<Option<Array>, Error> {
-    match create_attention_mask(hidden, cache, Some(true), stream)? {
+    match create_attention_mask_from_cache(hidden, cache.first(), Some(true), stream)? {
         Some(AttentionMask::Array(mask)) => Ok(Some(mask)),
         Some(AttentionMask::Causal) => Err(Exception::custom(
             "Llama-compatible decoders require an explicit attention mask",
@@ -1323,13 +1137,5 @@ pub enum LlamaModelError {
     LayerIndexOverflow {
         /// Invalid decoder index.
         index: usize,
-    },
-    /// A cache vector had the wrong number of layers.
-    #[error("Llama cache has {actual} layers, expected {expected}")]
-    CacheLengthMismatch {
-        /// Model decoder count.
-        expected: usize,
-        /// Supplied cache count.
-        actual: usize,
     },
 }

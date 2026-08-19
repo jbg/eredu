@@ -16,7 +16,7 @@ use crate::{
     core::cache::{CacheBlockId, CacheRankIdentity, CacheRepresentation},
 };
 
-type RetainedArrayIter<'a> =
+pub(crate) type RetainedArrayIter<'a> =
     std::iter::Chain<std::option::Iter<'a, Array>, std::option::Iter<'a, Array>>;
 
 // TODO: somehow move quantized methods to a separate trait?
