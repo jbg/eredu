@@ -6,6 +6,7 @@
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
     collections::BTreeMap,
@@ -30,8 +31,7 @@ use crate::{
         store::{TensorSelection, WeightStore},
     },
     backend::mlx::runtime::residency::manager::{
-        OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentTransfer,
-        ResidentUnitLease, WeightBinding,
+        ResidencyError, ResidencyManager, ResidencyReport, ResidentTransfer, ResidentUnitLease,
     },
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec,
@@ -1468,9 +1468,9 @@ mod tests {
             recipe::DerivedWeightRecipe,
             store::{SafetensorsWeightStore, TensorSelection},
         },
-        backend::mlx::runtime::residency::manager::WeightBinding,
         core::residency::CacheEvictionPolicy,
     };
+    use eredu_runtime::WeightBinding;
 
     fn stream() -> Stream {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))

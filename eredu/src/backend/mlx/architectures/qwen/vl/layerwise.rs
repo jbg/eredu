@@ -1,6 +1,7 @@
 //! Shared bounded layer execution for dense and MoE Qwen3-VL models.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::WeightBinding;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -71,7 +72,7 @@ use crate::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass, ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::{
-        ResidencyReport, ResidentUnitLease, WeightBinding,
+        ResidencyReport, ResidentUnitLease, WeightBindingExt,
     },
 };
 

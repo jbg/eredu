@@ -1,6 +1,7 @@
 //! Shared bounded layer execution for Qwen3-Next and Qwen3.5 text models.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -80,7 +81,7 @@ use crate::{
         ExpertPass, ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::{
-        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
+        ResidencyReport, ResidentUnitLease, WeightBindingExt,
     },
     core::attention::AttentionPolicy,
 };

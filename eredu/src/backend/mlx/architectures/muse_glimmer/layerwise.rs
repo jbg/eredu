@@ -1,6 +1,7 @@
 //! Bounded layer execution for the shared Muse-Glimmer decoder.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -73,7 +74,7 @@ use crate::{
         ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::{
-        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
+        ResidencyReport, ResidentUnitLease, WeightBindingExt,
     },
     core::cache::{
         LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,

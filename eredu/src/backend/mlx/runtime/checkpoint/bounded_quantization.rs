@@ -1209,15 +1209,13 @@ mod tests {
     use crate::{
         backend::mlx::runtime::{
             checkpoint::store::GgufWeightStore,
-            residency::manager::{
-                host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyManager,
-                WeightBinding,
-            },
+            residency::manager::{host_capacity_upper_bound_for_bindings, ResidencyManager},
         },
         core::residency::{
             MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
         },
     };
+    use eredu_runtime::{OffloadUnit, WeightBinding};
 
     fn cpu_context() -> ExecutionContext {
         ExecutionContext::new(Device::new(DeviceType::Cpu, 0))

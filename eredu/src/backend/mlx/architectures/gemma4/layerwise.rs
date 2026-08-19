@@ -1,6 +1,7 @@
 //! Text-decoder bounded layer execution for Gemma 4 checkpoints.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -74,9 +75,7 @@ use crate::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
         ExpertIdentity, ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{
-        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
-    },
+    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
     core::attention::AttentionPolicy,
 };
 

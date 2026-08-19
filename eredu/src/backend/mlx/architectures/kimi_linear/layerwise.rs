@@ -1,6 +1,7 @@
 //! Bounded-residency execution for Kimi Linear safetensors and GGUF checkpoints.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Instant};
 
@@ -62,7 +63,7 @@ use crate::{
                 ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry,
                 ExpertIdentity, ExpertPass, ExpertRouteBatch,
             },
-            manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+            manager::{ResidencyReport, ResidentUnitLease, WeightBindingExt},
         },
     },
 };

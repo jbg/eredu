@@ -1,6 +1,7 @@
 //! Bounded layer execution for Moshi and PersonaPlex realtime token models.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::WeightBinding;
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -34,7 +35,7 @@ use crate::{
     },
     backend::mlx::runtime::generation::sampler::Sampler,
     backend::mlx::runtime::residency::manager::{
-        ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease, WeightBinding,
+        ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease,
     },
     core::realtime::RealtimeSpeechConfig,
 };

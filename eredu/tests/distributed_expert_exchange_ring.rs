@@ -21,9 +21,9 @@ use eredu::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
         ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{OffloadUnit, WeightBinding},
     core::residency::OffloadConfig,
 };
+use eredu_runtime::{OffloadUnit, WeightBinding};
 use safemlx::{
     distributed::{self, Backend},
     module::Param,

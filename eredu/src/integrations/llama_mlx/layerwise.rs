@@ -1,6 +1,7 @@
 //! Unified Llama/Mistral loading across weight-residency policies.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::WeightBinding;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -61,9 +62,7 @@ use crate::{
         LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
     backend::mlx::runtime::media::input,
-    backend::mlx::runtime::residency::manager::{
-        ResidencyReport, ResidentUnitLease, WeightBinding,
-    },
+    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
     integrations::llama_mlx::model::{self as resident, AttentionInput, TransformerBlock},
 };
 

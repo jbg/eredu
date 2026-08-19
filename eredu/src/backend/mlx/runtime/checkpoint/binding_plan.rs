@@ -3,13 +3,14 @@
 #[cfg(test)]
 use eredu_checkpoint::StoredDtype;
 
+use eredu_runtime::WeightBinding;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     recipe::{DerivedWeightRecipe, RecipeDtype, WeightRecipeError},
     store::{TensorSelection, WeightStore},
 };
-use crate::backend::mlx::runtime::residency::manager::{ResidencyError, WeightBinding};
+use crate::backend::mlx::runtime::residency::manager::ResidencyError;
 
 /// One runtime target and the physical recipe that produces it.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -216,6 +217,8 @@ pub(crate) enum BindingPlanError {
     Recipe(#[from] WeightRecipeError),
     #[error(transparent)]
     NeutralRecipe(#[from] eredu_checkpoint::recipe::RecipeError),
+    #[error(transparent)]
+    Declaration(#[from] eredu_runtime::ResidencyDeclarationError),
     #[error(transparent)]
     Residency(#[from] ResidencyError),
 }

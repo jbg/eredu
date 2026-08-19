@@ -1,6 +1,7 @@
 //! Checkpoint-format-independent bounded-residency execution for DeepSeek V4.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -50,7 +51,7 @@ use crate::{
                 ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
                 ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
             },
-            manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+            manager::{ResidencyReport, ResidentUnitLease, WeightBindingExt},
         },
     },
 };

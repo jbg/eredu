@@ -9,12 +9,15 @@
 pub mod backend;
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
+/// Backend-neutral immutable-weight residency declarations and orchestration.
+pub mod residency;
 
 pub use backend::{CollectiveBackend, ParameterBackend, SubmissionBackend, TransferBackend};
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,
     ExecutionGroupSpec, ReadyGroupState,
 };
+pub use residency::{OffloadUnit, ResidencyDeclarationError, WeightBinding};
 
 /// Inspectable architecture/runtime topology without backend-native values.
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -377,9 +377,9 @@ mod tests {
     use super::*;
     use crate::{
         backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
-        backend::mlx::runtime::residency::manager::{OffloadUnit, WeightBinding},
         core::residency::{OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy},
     };
+    use eredu_runtime::{OffloadUnit, WeightBinding};
     use safemlx::{
         host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy, Stream,
     };

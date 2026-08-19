@@ -1,6 +1,7 @@
 //! Unified fully resident and bounded layer execution for GPT-OSS.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -64,7 +65,7 @@ use crate::{
         ExpertPass, ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::{
-        OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding,
+        ResidencyReport, ResidentUnitLease, WeightBindingExt,
     },
     core::attention::{AttentionPolicy, LayerSchedule},
 };

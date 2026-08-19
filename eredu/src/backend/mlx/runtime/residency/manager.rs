@@ -25,9 +25,7 @@ use safemlx::{
 
 use crate::{
     backend::mlx::residency::sample_allocator_memory,
-    backend::mlx::runtime::checkpoint::recipe::{
-        DerivedWeightRecipe, MlxWeightRecipeExt, WeightRecipeError,
-    },
+    backend::mlx::runtime::checkpoint::recipe::{MlxWeightRecipeExt, WeightRecipeError},
     backend::mlx::runtime::checkpoint::store::{
         PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore,
         WeightStoreDiagnostics, WeightStoreError,
@@ -39,220 +37,46 @@ use crate::{
     },
 };
 
-/// One named checkpoint selection within an atomic resident unit.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct WeightBinding {
-    name: String,
-    logical_target: Option<String>,
-    checkpoint_key: String,
-    selection: TensorSelection,
-    recipe: Option<DerivedWeightRecipe>,
-    expected_bytes: u64,
+use eredu_runtime::residency::{OffloadUnit, WeightBinding};
+
+/// MLX-only bounded-selection rewriting for a neutral weight binding.
+pub(crate) trait WeightBindingExt {
+    /// Pushes an output selection toward physical checkpoint sources.
+    fn select_bounded_output(
+        self,
+        store: &dyn WeightStore,
+        selection: TensorSelection,
+    ) -> Result<Self, ResidencyError>
+    where
+        Self: Sized;
 }
 
-impl WeightBinding {
-    /// Creates a binding with a stable local name and expected selected size.
-    pub fn new(
-        name: impl Into<String>,
-        checkpoint_key: impl Into<String>,
-        selection: TensorSelection,
-        expected_bytes: u64,
-    ) -> Result<Self, ResidencyError> {
-        let name = name.into();
-        if name.trim().is_empty() {
-            return Err(ResidencyError::InvalidBindingName);
-        }
-        let checkpoint_key = checkpoint_key.into();
-        if checkpoint_key.trim().is_empty() {
-            return Err(ResidencyError::InvalidCheckpointKey { name });
-        }
-        if expected_bytes == 0 {
-            return Err(ResidencyError::ZeroSizedBinding { name });
-        }
-        Ok(Self {
-            name,
-            logical_target: None,
-            checkpoint_key,
-            selection,
-            recipe: None,
-            expected_bytes,
-        })
-    }
-
-    /// Creates a binding backed by a composable derived-weight recipe.
-    ///
-    /// The recipe is validated against checkpoint metadata when the residency
-    /// manager is constructed and materialized once on the host during
-    /// initialization. Device promotion copies that transformed representation.
-    pub fn from_recipe(
-        name: impl Into<String>,
-        recipe: DerivedWeightRecipe,
-        expected_bytes: u64,
-    ) -> Result<Self, ResidencyError> {
-        let name = name.into();
-        if name.trim().is_empty() {
-            return Err(ResidencyError::InvalidBindingName);
-        }
-        let checkpoint_key = recipe
-            .source_keys()
-            .first()
-            .map(|key| (*key).to_string())
-            .ok_or_else(|| ResidencyError::Recipe {
-                binding: name.clone(),
-                source: WeightRecipeError::EmptyInputs,
-            })?;
-        if expected_bytes == 0 {
-            return Err(ResidencyError::ZeroSizedBinding { name });
-        }
-        Ok(Self {
-            name,
-            logical_target: None,
-            checkpoint_key,
-            selection: TensorSelection::Full,
-            recipe: Some(recipe),
-            expected_bytes,
-        })
-    }
-
-    /// Returns the stable name used to look up a resident array.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Returns the architecture-logical parameter target, when it differs
-    /// from the physical checkpoint source selected by this binding.
-    pub(crate) fn logical_target(&self) -> Option<&str> {
-        self.logical_target.as_deref()
-    }
-
-    /// Attaches the architecture-logical destination used by structural and
-    /// distributed placement plans.
-    pub(crate) fn with_logical_target(
-        mut self,
-        target: impl Into<String>,
-    ) -> Result<Self, ResidencyError> {
-        let target = target.into();
-        if target.trim().is_empty() {
-            return Err(ResidencyError::InvalidBindingName);
-        }
-        self.logical_target = Some(target);
-        Ok(self)
-    }
-
-    /// Returns the source checkpoint key.
-    pub fn checkpoint_key(&self) -> &str {
-        &self.checkpoint_key
-    }
-
-    /// Returns the checkpoint selection delegated to the weight store.
-    pub fn selection(&self) -> &TensorSelection {
-        &self.selection
-    }
-
-    /// Returns the derived recipe when this is not a direct binding.
-    pub const fn recipe(&self) -> Option<&DerivedWeightRecipe> {
-        self.recipe.as_ref()
-    }
-
-    /// Returns the complete semantic source recipe represented by this binding.
-    pub(crate) fn source_recipe(&self) -> DerivedWeightRecipe {
-        self.recipe.clone().unwrap_or_else(|| {
-            DerivedWeightRecipe::source(self.checkpoint_key.clone(), self.selection.clone())
-        })
-    }
-
-    /// Returns every checkpoint key consumed by this binding.
-    pub fn checkpoint_keys(&self) -> Vec<&str> {
-        match &self.recipe {
-            Some(recipe) => recipe.source_keys(),
-            None => vec![self.checkpoint_key.as_str()],
-        }
-    }
-
-    /// Returns the expected logical and materialized byte length.
-    pub const fn expected_bytes(&self) -> u64 {
-        self.expected_bytes
-    }
-    /// Pushes an output selection through this binding's direct source or
-    /// derived recipe before residency initialization.
-    pub(crate) fn select_bounded_output(
-        mut self,
+impl WeightBindingExt for WeightBinding {
+    fn select_bounded_output(
+        self,
         store: &dyn WeightStore,
         selection: TensorSelection,
     ) -> Result<Self, ResidencyError> {
-        let recipe = self.recipe.clone().unwrap_or_else(|| {
-            DerivedWeightRecipe::source(self.checkpoint_key.clone(), self.selection.clone())
-        });
+        let binding_name = self.name().to_owned();
+        let recipe = self.source_recipe();
         let recipe =
             recipe
                 .select_bounded(store, selection)
                 .map_err(|source| ResidencyError::Recipe {
-                    binding: self.name.clone(),
+                    binding: binding_name.clone(),
                     source,
                 })?;
         let metadata = recipe
             .infer(store)
             .map_err(WeightRecipeError::from)
             .map_err(|source| ResidencyError::Recipe {
-                binding: self.name.clone(),
+                binding: binding_name,
                 source,
             })?;
-        self.checkpoint_key = recipe
-            .source_keys()
-            .first()
-            .map(|key| (*key).to_string())
-            .ok_or_else(|| ResidencyError::Recipe {
-                binding: self.name.clone(),
-                source: WeightRecipeError::EmptyInputs,
-            })?;
-        self.selection = TensorSelection::Full;
-        self.recipe = Some(recipe);
-        self.expected_bytes = metadata.byte_len();
-        Ok(self)
+        Ok(self.with_source_recipe(recipe, metadata.byte_len())?)
     }
 }
-
-/// A deterministic group of weight bindings managed as one atomic unit.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct OffloadUnit {
-    id: OffloadUnitId,
-    bindings: Vec<WeightBinding>,
-}
-
-impl OffloadUnit {
-    /// Creates a non-empty unit and sorts its bindings by local name.
-    pub fn new(
-        id: OffloadUnitId,
-        bindings: impl IntoIterator<Item = WeightBinding>,
-    ) -> Result<Self, ResidencyError> {
-        let mut bindings = bindings.into_iter().collect::<Vec<_>>();
-        if bindings.is_empty() {
-            return Err(ResidencyError::EmptyUnit { id });
-        }
-        bindings.sort_by(|left, right| left.name.cmp(&right.name));
-        if let Some(pair) = bindings
-            .windows(2)
-            .find(|pair| pair[0].name == pair[1].name)
-        {
-            return Err(ResidencyError::DuplicateBindingName {
-                id,
-                name: pair[0].name.clone(),
-            });
-        }
-        Ok(Self { id, bindings })
-    }
-
-    /// Returns the plan identifier for this unit.
-    pub fn id(&self) -> &OffloadUnitId {
-        &self.id
-    }
-
-    /// Returns bindings in stable local-name order.
-    pub fn bindings(&self) -> &[WeightBinding] {
-        &self.bindings
-    }
-}
-
+/// A resident unit that prevents eviction of one tier until it is dropped.
 /// A resident unit that prevents eviction of one tier until it is dropped.
 pub struct ResidentUnitLease {
     id: OffloadUnitId,
@@ -485,6 +309,9 @@ impl Drop for ResidentTransfer {
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
+    /// A backend-neutral binding or offload-unit declaration was invalid.
+    #[error(transparent)]
+    Declaration(#[from] eredu_runtime::residency::ResidencyDeclarationError),
     /// Backend-neutral ownership or capacity transition failed.
     #[error(transparent)]
     Ledger(#[from] ResidencyLedgerError),
@@ -506,35 +333,6 @@ pub enum ResidencyError {
         index: usize,
         /// Available ordered units.
         layer_count: usize,
-    },
-    /// A binding name was empty or whitespace-only.
-    #[error("weight binding names must not be empty")]
-    InvalidBindingName,
-    /// A binding checkpoint key was empty.
-    #[error("weight binding {name:?} has an empty checkpoint key")]
-    InvalidCheckpointKey {
-        /// Invalid local binding name.
-        name: String,
-    },
-    /// A binding declared no bytes.
-    #[error("weight binding {name:?} must contain at least one byte")]
-    ZeroSizedBinding {
-        /// Invalid local binding name.
-        name: String,
-    },
-    /// A unit had no bindings.
-    #[error("residency unit {id} must contain at least one binding")]
-    EmptyUnit {
-        /// Invalid unit identifier.
-        id: OffloadUnitId,
-    },
-    /// Two bindings in one unit had the same local name.
-    #[error("residency unit {id} has duplicate binding name {name:?}")]
-    DuplicateBindingName {
-        /// Invalid unit identifier.
-        id: OffloadUnitId,
-        /// Duplicated local name.
-        name: String,
     },
     /// More than one definition used the same plan identifier.
     #[error("duplicate residency unit definition: {id}")]
@@ -1018,7 +816,7 @@ impl ResidencyManager {
 
         let mut definitions = BTreeMap::new();
         for unit in units {
-            let id = unit.id.clone();
+            let id = unit.id().clone();
             if definitions.insert(id.clone(), unit).is_some() {
                 return Err(ResidencyError::DuplicateUnitDefinition { id });
             }
@@ -1531,33 +1329,33 @@ fn validate_unit_bytes(
     unit: &OffloadUnit,
 ) -> Result<(), ResidencyError> {
     let mut total = 0u64;
-    for binding in &unit.bindings {
-        total = total.checked_add(binding.expected_bytes).ok_or(
+    for binding in unit.bindings() {
+        total = total.checked_add(binding.expected_bytes()).ok_or(
             ResidencyError::ArithmeticOverflow {
                 context: "unit binding byte total",
             },
         )?;
-        let actual = match &binding.recipe {
+        let actual = match binding.recipe() {
             Some(recipe) => {
                 recipe
                     .preflight_bounded(store)
                     .map_err(|source| ResidencyError::Recipe {
-                        binding: binding.name.clone(),
+                        binding: binding.name().to_owned(),
                         source,
                     })?;
                 recipe
                     .infer(store)
                     .map_err(WeightRecipeError::from)
                     .map_err(|source| ResidencyError::Recipe {
-                        binding: binding.name.clone(),
+                        binding: binding.name().to_owned(),
                         source,
                     })?
                     .byte_len()
             }
             None => {
                 let lease = store.acquire_with_policy(
-                    &binding.checkpoint_key,
-                    binding.selection.clone(),
+                    binding.checkpoint_key(),
+                    binding.selection().clone(),
                     WeightReadPolicy::RequireBounded,
                 )?;
                 u64::try_from(lease.selected_byte_len()).map_err(|_| {
@@ -1567,18 +1365,18 @@ fn validate_unit_bytes(
                 })?
             }
         };
-        if actual != binding.expected_bytes {
+        if actual != binding.expected_bytes() {
             return Err(ResidencyError::BindingByteMismatch {
-                id: unit.id.clone(),
-                binding: binding.name.clone(),
-                expected_bytes: binding.expected_bytes,
+                id: unit.id().clone(),
+                binding: binding.name().to_owned(),
+                expected_bytes: binding.expected_bytes(),
                 actual_bytes: actual,
             });
         }
     }
     if total != spec.bytes() {
         return Err(ResidencyError::UnitByteMismatch {
-            id: unit.id.clone(),
+            id: unit.id().clone(),
             planned_bytes: spec.bytes(),
             actual_bytes: total,
         });
@@ -1676,7 +1474,7 @@ fn ensure_many_resident(
                 if !is_missing {
                     continue;
                 }
-                let bindings = state.units[id].definition.bindings.clone();
+                let bindings = state.units[id].definition.bindings().to_vec();
                 let buffers = materialize_host_buffers(id, store, &bindings, &state.source_stream)?;
                 let logical = host_buffers_nbytes(&buffers)?;
                 let planned = state.ledger.spec(id)?.bytes();
@@ -1728,7 +1526,7 @@ fn ensure_many_resident(
             if !is_missing {
                 continue;
             }
-            let bindings = state.units[id].definition.bindings.clone();
+            let bindings = state.units[id].definition.bindings().to_vec();
             let item = loop {
                 let item = match tier {
                     MemoryTier::Device => {
@@ -1903,20 +1701,20 @@ fn materialize_host_buffers(
 ) -> Result<ResidentHostBuffers, ResidencyError> {
     let mut buffers = BTreeMap::new();
     for binding in bindings {
-        let (array, sources) = match &binding.recipe {
+        let (array, sources) = match binding.recipe() {
             Some(recipe) => {
                 let pending = recipe
                     .prepare_materialization(store, source_stream)
                     .map_err(|source| ResidencyError::Recipe {
-                        binding: binding.name.clone(),
+                        binding: binding.name().to_owned(),
                         source,
                     })?;
                 pending.into_parts()
             }
             None => {
                 let lease = store.acquire_with_policy(
-                    &binding.checkpoint_key,
-                    binding.selection.clone(),
+                    binding.checkpoint_key(),
+                    binding.selection().clone(),
                     WeightReadPolicy::RequireBounded,
                 )?;
                 let pending = lease.prepare_materialization(source_stream, source_stream)?;
@@ -1950,15 +1748,15 @@ fn materialize_host_buffers(
         .map_err(|_| ResidencyError::ArithmeticOverflow {
             context: "host-buffer byte conversion",
         })?;
-        if actual != binding.expected_bytes {
+        if actual != binding.expected_bytes() {
             return Err(ResidencyError::BindingByteMismatch {
                 id: id.clone(),
-                binding: binding.name.clone(),
-                expected_bytes: binding.expected_bytes,
+                binding: binding.name().to_owned(),
+                expected_bytes: binding.expected_bytes(),
                 actual_bytes: actual,
             });
         }
-        buffers.insert(binding.name.clone(), buffer.freeze());
+        buffers.insert(binding.name().to_owned(), buffer.freeze());
     }
     Ok(ResidentHostBuffers { buffers })
 }
@@ -1976,12 +1774,12 @@ fn prepare_from_disk(
     for binding in bindings {
         let mut retried_after_capacity = false;
         loop {
-            let prepared = (|| match &binding.recipe {
+            let prepared = (|| match binding.recipe() {
                 Some(recipe) => {
                     let pending = recipe
                         .prepare_materialization(store, source_stream)
                         .map_err(|source| ResidencyError::Recipe {
-                            binding: binding.name.clone(),
+                            binding: binding.name().to_owned(),
                             source,
                         })?;
                     let (host, sources) = pending.into_parts();
@@ -1990,7 +1788,7 @@ fn prepare_from_disk(
                     } else {
                         let output = host.copy(execution_stream).map_err(|source| {
                             ResidencyError::Recipe {
-                                binding: binding.name.clone(),
+                                binding: binding.name().to_owned(),
                                 source: WeightRecipeError::Mlx(source),
                             }
                         })?;
@@ -1999,8 +1797,8 @@ fn prepare_from_disk(
                 }
                 None => {
                     let lease = store.acquire_with_policy(
-                        &binding.checkpoint_key,
-                        binding.selection.clone(),
+                        binding.checkpoint_key(),
+                        binding.selection().clone(),
                         WeightReadPolicy::RequireBounded,
                     )?;
                     let pending = lease.prepare_materialization(source_stream, execution_stream)?;
@@ -2012,7 +1810,7 @@ fn prepare_from_disk(
                 Ok((output, sources, retained)) => {
                     pending_sources.extend(sources);
                     retained_arrays.extend(retained);
-                    arrays.insert(binding.name.clone(), output);
+                    arrays.insert(binding.name().to_owned(), output);
                     break;
                 }
                 Err(error)
@@ -2108,7 +1906,7 @@ fn resident_capacity_requirement(
     if tier != MemoryTier::Host {
         return Ok(planned_bytes);
     }
-    host_capacity_upper_bound_for_bindings(&unit.definition.bindings)
+    host_capacity_upper_bound_for_bindings(unit.definition.bindings())
 }
 
 /// Returns the complete charged host-transfer capacity for one atomic unit.
@@ -2116,7 +1914,7 @@ pub(crate) fn host_capacity_upper_bound_for_bindings(
     bindings: &[WeightBinding],
 ) -> Result<u64, ResidencyError> {
     bindings.iter().try_fold(0u64, |total, binding| {
-        let logical = usize::try_from(binding.expected_bytes).map_err(|_| {
+        let logical = usize::try_from(binding.expected_bytes()).map_err(|_| {
             ResidencyError::ArithmeticOverflow {
                 context: "host capacity-bound input conversion",
             }
@@ -2657,12 +2455,12 @@ mod tests {
         ));
         assert!(matches!(
             OffloadUnit::new(id("empty"), []),
-            Err(ResidencyError::EmptyUnit { .. })
+            Err(eredu_runtime::ResidencyDeclarationError::EmptyUnit { .. })
         ));
         let duplicate = binding("same", "a", TensorSelection::Full, 8);
         assert!(matches!(
             OffloadUnit::new(id("duplicate"), [duplicate.clone(), duplicate]),
-            Err(ResidencyError::DuplicateBindingName { .. })
+            Err(eredu_runtime::ResidencyDeclarationError::DuplicateBindingName { .. })
         ));
         let wrong = unit("a", [binding("weight", "a", TensorSelection::Full, 4)]);
         assert!(matches!(

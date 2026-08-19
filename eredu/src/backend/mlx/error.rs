@@ -55,6 +55,10 @@ pub enum Error {
     #[error(transparent)]
     Neural(#[from] eredu_nn::Error),
 
+    /// Invalid backend-neutral weight binding or offload-unit declaration.
+    #[error(transparent)]
+    ResidencyDeclaration(#[from] eredu_runtime::ResidencyDeclarationError),
+
     /// Invalid module-to-checkpoint or resident-lease binding.
     #[error(transparent)]
     ModuleBinding(#[from] crate::backend::mlx::runtime::checkpoint::binding::ModuleBindingError),

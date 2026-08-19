@@ -12,6 +12,7 @@
 
 use eredu_architectures::llama::ModelArgs as LlamaModelArgs;
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{OffloadUnit, WeightBinding};
 
 mod placement;
 
@@ -117,7 +118,7 @@ use crate::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
     },
     backend::mlx::runtime::residency::manager::{
-        host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyManager, ResidencyReport,
+        host_capacity_upper_bound_for_bindings, ResidencyManager, ResidencyReport,
         ResidentLayerGroup,
     },
     backend::mlx::speculative::embedded::{
@@ -7547,7 +7548,7 @@ where
 fn load_bound_module(
     module: &mut (impl ModuleParameters + ?Sized),
     store: &dyn WeightStore,
-    bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
+    bindings: &[WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
@@ -7567,7 +7568,7 @@ fn load_bound_module(
 fn load_bound_module_excluding(
     module: &mut (impl ModuleParameters + ?Sized),
     store: &dyn WeightStore,
-    bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
+    bindings: &[WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
@@ -7634,7 +7635,7 @@ impl PipelineLoadAccumulator {
         &mut self,
         module: &mut M,
         store: &dyn WeightStore,
-        bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
+        bindings: &[WeightBinding],
         quantize_on_load: Option<WeightQuantization>,
         weights_stream: &Stream,
         stream: &Stream,
@@ -7660,7 +7661,7 @@ impl PipelineLoadAccumulator {
         &mut self,
         module: &mut M,
         store: &dyn WeightStore,
-        bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
+        bindings: &[WeightBinding],
         quantize_on_load: Option<WeightQuantization>,
         weights_stream: &Stream,
         stream: &Stream,
@@ -7709,7 +7710,7 @@ impl PipelineLoadAccumulator {
 fn pipeline_static_bindings<'a>(
     units: &'a [StaticUnitBindings],
     role: &str,
-) -> Result<&'a [crate::backend::mlx::runtime::residency::manager::WeightBinding], Error> {
+) -> Result<&'a [WeightBinding], Error> {
     let suffix = format!(".static.{role}");
     units
         .iter()
@@ -7727,7 +7728,7 @@ fn pipeline_cartesian_static_bindings(
     role: &str,
     store: &dyn WeightStore,
     layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
-) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+) -> Result<Vec<WeightBinding>, Error> {
     let bindings = pipeline_static_bindings(units, role)?.to_vec();
     match layout {
         Some(layout) => shard_layer_bindings(bindings, "", store, layout),
@@ -7776,12 +7777,7 @@ fn build_pipeline_layer_storage<L, F, B>(
 where
     L: ModuleParameters,
     F: FnMut(usize, &Stream) -> Result<L, Error>,
-    B: FnMut(
-        usize,
-        &L,
-        &dyn WeightStore,
-    )
-        -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error>,
+    B: FnMut(usize, &L, &dyn WeightStore) -> Result<Vec<WeightBinding>, Error>,
 {
     let layer_count = range.len();
     let device_depth = match options {

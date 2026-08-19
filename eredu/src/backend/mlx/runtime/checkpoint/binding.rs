@@ -5,6 +5,7 @@
 //! accounting, and resident-lease assignment independent of model families.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::WeightBinding;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -28,7 +29,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::store::{
         TensorSelection, WeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreError,
     },
-    backend::mlx::runtime::residency::manager::{ResidentUnitLease, WeightBinding},
+    backend::mlx::runtime::residency::manager::ResidentUnitLease,
 };
 
 const MODEL_LOAD_MATERIALIZATION_BUFFERS: usize = 2;
@@ -746,6 +747,9 @@ pub enum ModuleBindingError {
     /// Backend-neutral recipe validation failed.
     #[error(transparent)]
     NeutralRecipe(#[from] eredu_checkpoint::recipe::RecipeError),
+    /// A backend-neutral residency declaration was invalid.
+    #[error(transparent)]
+    ResidencyDeclaration(#[from] eredu_runtime::ResidencyDeclarationError),
     /// Residency binding or lookup failed.
     #[error(transparent)]
     Residency(#[from] crate::backend::mlx::runtime::residency::manager::ResidencyError),

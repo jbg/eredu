@@ -6,6 +6,7 @@
 //! [`crate::backend::mlx::runtime::execution::layerwise::ArchitectureAdapter`].
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -39,8 +40,8 @@ use crate::{
         BackgroundLayerPrefetch, DenseDiskStreamLoadOptions, DENSE_TRANSFER_WINDOW,
     },
     backend::mlx::runtime::residency::manager::{
-        host_capacity_upper_bound_for_bindings, OffloadUnit, ResidencyError, ResidencyManager,
-        ResidencyReport, ResidentLayerGroup, ResidentTransfer, ResidentUnitLease,
+        host_capacity_upper_bound_for_bindings, ResidencyError, ResidencyManager, ResidencyReport,
+        ResidentLayerGroup, ResidentTransfer, ResidentUnitLease,
     },
     core::residency::BackgroundPrefetchReport,
     core::residency::{
@@ -1606,15 +1607,12 @@ impl LayerwiseModelMetadata {
 /// One pinned static module and its checkpoint bindings.
 pub struct StaticUnitBindings {
     id: OffloadUnitId,
-    bindings: Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>,
+    bindings: Vec<WeightBinding>,
 }
 
 impl StaticUnitBindings {
     /// Creates a pinned static unit definition.
-    pub(crate) fn new(
-        id: impl Into<String>,
-        bindings: Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>,
-    ) -> Result<Self, Error> {
+    pub(crate) fn new(id: impl Into<String>, bindings: Vec<WeightBinding>) -> Result<Self, Error> {
         Ok(Self {
             id: OffloadUnitId::new(id.into())?,
             bindings,
@@ -1627,9 +1625,7 @@ impl StaticUnitBindings {
     }
 
     /// Returns the authoritative checkpoint bindings for this static module.
-    pub(crate) fn bindings(
-        &self,
-    ) -> &[crate::backend::mlx::runtime::residency::manager::WeightBinding] {
+    pub(crate) fn bindings(&self) -> &[WeightBinding] {
         &self.bindings
     }
 }
@@ -1677,10 +1673,7 @@ pub trait ArchitectureAdapter: Sized {
     /// Returns whether a floating static matrix is represented by a packed
     /// parameter group in this adapter. Multimodal adapters override this for
     /// checkpoint components whose target modules intentionally stay dense.
-    fn quantizes_static_binding(
-        &self,
-        _binding: &crate::backend::mlx::runtime::residency::manager::WeightBinding,
-    ) -> bool {
+    fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
         true
     }
 
@@ -1954,7 +1947,7 @@ pub trait ArchitectureAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn WeightStore,
-    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<WeightBinding>, Error> {
         Ok(build_module_bindings(
             layer,
             &self.layer_checkpoint_prefix(group, index),
@@ -1971,7 +1964,7 @@ pub trait ArchitectureAdapter: Sized {
         store: &dyn WeightStore,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         _stream: &Stream,
-    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<WeightBinding>, Error> {
         build_parallel_module_bindings(
             layer,
             &self.layer_checkpoint_prefix(group, index),
@@ -1992,7 +1985,7 @@ pub trait ArchitectureAdapter: Sized {
         _store: &dyn WeightStore,
         _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         _stream: &Stream,
-    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<WeightBinding>, Error> {
         Err(Error::Parallel(format!(
             "architecture adapter {} has not implemented expert-local checkpoint bindings",
             std::any::type_name::<Self>()
@@ -2015,7 +2008,7 @@ pub trait ArchitectureAdapter: Sized {
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<WeightBinding>, Error> {
         let bindings =
             self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
         shard_layer_bindings(
@@ -2038,7 +2031,7 @@ pub trait ArchitectureAdapter: Sized {
         layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
         assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
-    ) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+    ) -> Result<Vec<WeightBinding>, Error> {
         match (layout, assignment) {
             (None, None) => {
                 // The execution layer can have transformed target geometry
@@ -3785,7 +3778,7 @@ where
 {
     let mut recipes = BTreeMap::new();
     let mut collect =
-        |bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
+        |bindings: &[WeightBinding],
          selected_local_weights: Option<&BTreeMap<String, RecipeDtype>>| {
             for binding in bindings {
                 let recipe = binding.source_recipe();
@@ -4025,7 +4018,7 @@ where
 {
     let mut recipes = BTreeMap::new();
     let mut collect =
-        |bindings: &[crate::backend::mlx::runtime::residency::manager::WeightBinding],
+        |bindings: &[WeightBinding],
          selected_local_weights: Option<&BTreeMap<String, RecipeDtype>>| {
             for binding in bindings {
                 let recipe = binding.source_recipe();
@@ -4808,11 +4801,11 @@ fn stored_tensor_selection(
 }
 
 pub(crate) fn shard_layer_bindings(
-    bindings: Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>,
+    bindings: Vec<WeightBinding>,
     prefix: &str,
     store: &dyn WeightStore,
     layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
-) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+) -> Result<Vec<WeightBinding>, Error> {
     use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
 
     let store_keys = store.keys().into_iter().collect::<BTreeSet<_>>();
@@ -4893,14 +4886,12 @@ pub(crate) fn shard_layer_bindings(
                         binding.name()
                     ))
                 })?;
-            output.push(
-                crate::backend::mlx::runtime::residency::manager::WeightBinding::new(
-                    binding.name(),
-                    binding.checkpoint_key(),
-                    selection,
-                    expected_bytes,
-                )?,
-            );
+            output.push(WeightBinding::new(
+                binding.name(),
+                binding.checkpoint_key(),
+                selection,
+                expected_bytes,
+            )?);
             continue;
         }
         let recipe = binding.source_recipe();
@@ -4912,11 +4903,7 @@ pub(crate) fn shard_layer_bindings(
         }
         let recipe = recipe.select_bounded(store, selection)?;
         let expected_bytes = recipe.infer(store)?.byte_len();
-        let sharded = crate::backend::mlx::runtime::residency::manager::WeightBinding::from_recipe(
-            binding.name(),
-            recipe,
-            expected_bytes,
-        )?;
+        let sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?;
         output.push(sharded);
     }
     Ok(output)
@@ -4927,7 +4914,7 @@ fn build_parallel_module_bindings(
     prefix: &str,
     store: &dyn WeightStore,
     layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
-) -> Result<Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>, Error> {
+) -> Result<Vec<WeightBinding>, Error> {
     use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
@@ -5027,14 +5014,12 @@ fn build_parallel_module_bindings(
             }
             (TensorSelection::Full, metadata.logical_byte_len as u64)
         };
-        bindings.push(
-            crate::backend::mlx::runtime::residency::manager::WeightBinding::new(
-                local_name,
-                checkpoint_key,
-                selection,
-                expected_bytes,
-            )?,
-        );
+        bindings.push(WeightBinding::new(
+            local_name,
+            checkpoint_key,
+            selection,
+            expected_bytes,
+        )?);
     }
     Ok(bindings)
 }
@@ -5045,7 +5030,7 @@ fn add_unit(
     specs: &mut Vec<OffloadUnitSpec>,
     consumed: &mut BTreeSet<String>,
     id: OffloadUnitId,
-    bindings: Vec<crate::backend::mlx::runtime::residency::manager::WeightBinding>,
+    bindings: Vec<WeightBinding>,
     policy: ResidencyPolicy,
     tier: MemoryTier,
     byte_total: &mut u64,
