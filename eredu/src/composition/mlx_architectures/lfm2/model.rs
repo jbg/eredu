@@ -1208,8 +1208,18 @@ pub struct Cache {
 
 impl Cache {
     pub(crate) fn new(args: &ModelArgs) -> Result<Self, Error> {
+        Self::new_with_geometry(args, None)
+    }
+
+    pub(crate) fn new_with_geometry(
+        args: &ModelArgs,
+        geometry: Option<&[Lfm2LayerCacheGeometry]>,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            layout: state_layout(args)?,
+            layout: match geometry {
+                Some(geometry) => state_layout_with_geometry(args, geometry)?,
+                None => state_layout(args)?,
+            },
             layers: args
                 .layer_schedule
                 .iter()
@@ -1224,10 +1234,23 @@ impl Cache {
         options: PagedCacheOptions,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
+        Self::new_paged_with_geometry(args, options, rank, None)
+    }
+
+    pub(crate) fn new_paged_with_geometry(
+        args: &ModelArgs,
+        options: PagedCacheOptions,
+        rank: Option<CacheRankIdentity>,
+        geometry: Option<&[Lfm2LayerCacheGeometry]>,
+    ) -> Result<Self, Exception> {
         let manager = CacheResidencyManager::new(options)
             .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(Self {
-            layout: state_layout(args).map_err(|error| Exception::custom(error.to_string()))?,
+            layout: match geometry {
+                Some(geometry) => state_layout_with_geometry(args, geometry),
+                None => state_layout(args),
+            }
+            .map_err(|error| Exception::custom(error.to_string()))?,
             layers: args
                 .layer_schedule
                 .iter()
@@ -1307,7 +1330,14 @@ pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Error> {
             },
         })
         .collect::<Vec<_>>();
-    StateLayout::new(prompt_cache_layer_layout_with_geometry(args, &geometry)?)
+    state_layout_with_geometry(args, &geometry)
+}
+
+pub(crate) fn state_layout_with_geometry(
+    args: &ModelArgs,
+    geometry: &[Lfm2LayerCacheGeometry],
+) -> Result<StateLayout, Error> {
+    StateLayout::new(prompt_cache_layer_layout_with_geometry(args, geometry)?)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 

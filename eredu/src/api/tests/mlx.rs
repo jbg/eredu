@@ -18,6 +18,7 @@ use crate::{
     },
     composition::mlx_architectures::{
         gpt_oss::model as gpt_oss,
+        lfm2::model as lfm2,
         qwen::dense as dense_qwen,
         qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
     },
@@ -1561,6 +1562,102 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     safemlx::transforms::eval([&cached_expert_logits]).unwrap();
     assert_eq!(cached_expert_logits.shape(), logits.shape());
     assert!(cached_experts.expert_cache_report().unwrap().is_some());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let dir = temp_model_dir(
+        r#"{
+              "model_type":"lfm2","vocab_size":16,"hidden_size":12,
+              "intermediate_size":17,"num_hidden_layers":2,
+              "num_attention_heads":6,"num_key_value_heads":3,
+              "max_position_embeddings":64,"norm_eps":0.00001,
+              "layer_types":["conv","full_attention"],"conv_L_cache":3,
+              "conv_bias":true,"block_auto_adjust_ff_dim":false,
+              "tie_word_embeddings":false
+            }"#,
+    );
+    let args = lfm2::get_model_args(&dir).unwrap();
+    save_zero_checkpoint(&lfm2::Model::new(args, stream).unwrap(), &dir, stream);
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+
+    let mut resident =
+        crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_layerwise_model(
+            &dir,
+            eredu_runtime::LayerWeightResidency::FullyResident,
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+    let mut resident_cache = resident.new_cache();
+    let resident_logits = resident
+        .forward(&tokens, &mut resident_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&resident_logits]).unwrap();
+    assert_eq!(resident_logits.shape(), &[1, 2, 16]);
+
+    let mut bounded =
+        crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_layerwise_model(
+            &dir,
+            eredu_runtime::LayerwiseLoadOptions::default(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+    let mut bounded_cache = bounded.new_cache();
+    let bounded_logits = bounded
+        .forward(&tokens, &mut bounded_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    assert_eq!(bounded_logits.shape(), resident_logits.shape());
+    assert!(bounded.residency_report().unwrap().initialized());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn tiny_lfm2_moe_neutral_runtime_executes_independent_expert_cache() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let dir = temp_model_dir(
+        r#"{
+              "model_type":"lfm2_moe","vocab_size":16,"hidden_size":12,
+              "intermediate_size":17,"num_hidden_layers":2,
+              "num_attention_heads":6,"num_key_value_heads":3,
+              "max_position_embeddings":64,"norm_eps":0.00001,
+              "layer_types":["conv","full_attention"],"conv_L_cache":3,
+              "conv_bias":true,"block_auto_adjust_ff_dim":false,
+              "tie_word_embeddings":false,"moe_intermediate_size":9,
+              "num_dense_layers":1,"num_experts":2,"num_experts_per_tok":1,
+              "norm_topk_prob":true,"use_expert_bias":true
+            }"#,
+    );
+    let args = lfm2::get_model_args(&dir).unwrap();
+    save_zero_checkpoint(&lfm2::Model::new(args, stream).unwrap(), &dir, stream);
+    let mut model =
+        crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_expert_cache_model(
+            &dir,
+            eredu_runtime::NonExpertWeightResidency::FullyResident,
+            eredu_runtime::ExpertCacheLoadOptions::default(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let mut cache = model.new_cache();
+    let logits = model.forward(&tokens, &mut cache, stream).unwrap();
+    safemlx::transforms::eval([&logits]).unwrap();
+    assert_eq!(logits.shape(), &[1, 2, 16]);
+    assert!(model.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
 }
 
