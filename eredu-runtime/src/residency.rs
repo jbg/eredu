@@ -1,6 +1,9 @@
 //! Backend-neutral immutable-weight residency declarations and control state.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeCatalog, RecipeError},
@@ -466,6 +469,40 @@ impl ResidencyController {
             self.ledger.rollback_reserved(id, tier)?;
         }
         Ok(())
+    }
+
+    /// Publishes one realized copy and records its backend transfer observation.
+    pub fn publish_acquisition_copy(
+        &mut self,
+        id: &OffloadUnitId,
+        tier: MemoryTier,
+        actual_bytes: u64,
+        transferred_bytes: u64,
+        transfer_generation: Option<u64>,
+        direction: eredu_core::residency::TransferDirection,
+        duration: Duration,
+    ) -> Result<(), ResidencyLedgerError> {
+        self.ledger
+            .publish_reserved(id, tier, actual_bytes, transfer_generation)?;
+        self.ledger
+            .record_transfer(direction, transferred_bytes, duration);
+        Ok(())
+    }
+
+    /// Records a prefetch hit or miss before backend realization begins.
+    pub fn begin_prefetch(
+        &mut self,
+        id: &OffloadUnitId,
+        tier: MemoryTier,
+    ) -> Result<PrefetchOutcome, ResidencyLedgerError> {
+        self.ledger.require_initialized()?;
+        let outcome = if self.ledger.is_resident(id, tier)? {
+            PrefetchOutcome::Hit
+        } else {
+            PrefetchOutcome::Miss
+        };
+        self.ledger.record_prefetch(tier, outcome);
+        Ok(outcome)
     }
 
     /// Replaces one protected window and selects unique bounded lookahead in caller order.
@@ -1230,6 +1267,36 @@ mod tests {
             .ledger()
             .is_resident(&ids[1], MemoryTier::Device)
             .unwrap());
+
+        let acquisition = controller
+            .plan_acquisition(&[ids[0].clone()], MemoryTier::Device)
+            .unwrap();
+        controller
+            .reserve_acquisition(&acquisition, &[(ids[0].clone(), 4)], MemoryTier::Device)
+            .unwrap();
+        controller
+            .publish_acquisition_copy(
+                &ids[0],
+                MemoryTier::Device,
+                4,
+                4,
+                None,
+                eredu_core::residency::TransferDirection::DiskToDevice,
+                Duration::from_millis(2),
+            )
+            .unwrap();
+        assert!(controller
+            .ledger()
+            .is_resident(&ids[0], MemoryTier::Device)
+            .unwrap());
+        assert_eq!(
+            controller
+                .ledger()
+                .telemetry()
+                .transfer(eredu_core::residency::TransferDirection::DiskToDevice)
+                .bytes(),
+            4
+        );
     }
 
     #[test]

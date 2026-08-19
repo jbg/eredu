@@ -1002,13 +1002,7 @@ fn prefetch_locked(
     id: &OffloadUnitId,
     tier: MemoryTier,
 ) -> Result<PrefetchOutcome, ResidencyError> {
-    let hit = state.control.ledger_mut().is_resident(id, tier)?;
-    let outcome = if hit {
-        PrefetchOutcome::Hit
-    } else {
-        PrefetchOutcome::Miss
-    };
-    state.control.ledger_mut().record_prefetch(tier, outcome);
+    let outcome = state.control.begin_prefetch(id, tier)?;
     ensure_resident(state, store, id, tier, false)?;
     Ok(outcome)
 }
@@ -1115,20 +1109,20 @@ fn ensure_many_resident(
                 prepared.push((id.clone(), buffers, logical, capacity, reserved_capacity));
             }
             for (id, buffers, logical, capacity, _) in prepared {
-                state
-                    .control
-                    .ledger_mut()
-                    .publish_reserved(&id, tier, capacity, None)?;
+                state.control.publish_acquisition_copy(
+                    &id,
+                    tier,
+                    capacity,
+                    logical,
+                    None,
+                    TransferDirection::DiskToHost,
+                    started.elapsed(),
+                )?;
                 state
                     .storage
                     .get_mut(&id)
                     .ok_or(ResidencyError::StatePoisoned)?
                     .host = Some(Arc::new(buffers));
-                state.control.ledger_mut().record_transfer(
-                    TransferDirection::DiskToHost,
-                    logical,
-                    started.elapsed(),
-                );
             }
             state.control.touch_acquisition_hits(&acquisition, tier)?;
             return Ok((created.clone(), None));
@@ -1259,11 +1253,14 @@ fn ensure_many_resident(
                 retained.retained_events.append(&mut item.retained_events);
             }
             let actual = arrays_nbytes(&item.arrays)?;
-            state.control.ledger_mut().publish_reserved(
+            state.control.publish_acquisition_copy(
                 &id,
                 tier,
                 actual,
+                actual,
                 return_transfer.then_some(generation),
+                item.direction,
+                started.elapsed(),
             )?;
             let unit = state
                 .storage
@@ -1277,10 +1274,6 @@ fn ensure_many_resident(
                 }
                 MemoryTier::Host | MemoryTier::Disk => unreachable!("validated above"),
             }
-            state
-                .control
-                .ledger_mut()
-                .record_transfer(item.direction, actual, started.elapsed());
         }
         state.control.touch_acquisition_hits(&acquisition, tier)?;
         let submitted = return_transfer.then_some(SubmittedResidentTransfer {
