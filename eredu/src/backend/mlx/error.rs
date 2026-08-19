@@ -47,6 +47,10 @@ pub enum Error {
     #[error(transparent)]
     LayerwiseModel(#[from] crate::backend::mlx::runtime::execution::layerwise::LayerwiseModelError),
 
+    /// Invalid backend-neutral execution-group graph.
+    #[error(transparent)]
+    ExecutionGraph(#[from] eredu_runtime::ExecutionGraphError),
+
     /// Invalid module-to-checkpoint or resident-lease binding.
     #[error(transparent)]
     ModuleBinding(#[from] crate::backend::mlx::runtime::checkpoint::binding::ModuleBindingError),

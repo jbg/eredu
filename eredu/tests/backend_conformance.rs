@@ -28,25 +28,25 @@ use eredu::{
     },
     load_realtime_model_with_options, AdmissionRequest, AdmissionResult, ArtifactFormat,
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningBackend, AutomaticPlanningError,
-    Backend, BackendCapabilities, BackendDescriptor, BackendId, BackendSession, CacheStateStrategy,
-    CapabilityError, CollectiveScope, DeviceDescriptor, DevicePlan, DistributedBackend,
-    DistributedCapabilities, DistributedSession, DistributedSessionDescriptor, DraftPlacementPlan,
-    DraftingPlan, EstimationCompleteness, ExecutionPlan, ExecutionPlanBackendFactory,
-    ExecutionPlanTarget, ExternalDraftArtifact, FinishReason, GenerationConfigOverrides,
-    GrowingState, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
-    HardwareProfile, InputModalities, InputTokenCount, MemoryTier, ModelCapabilities,
-    ModelCapabilityBackend, ModelKind, ModelLoadingBackend, ModelResourceProfile, ModelRuntime,
-    MtpCapability, MtpCheckpointKind, MultimodalPreparationBackend, Observed, OffloadConfig,
-    OffloadPlan, OffloadUnitId, OffloadUnitSpec, ParallelAxis, ParallelTopology,
-    PhysicalMemorySemantics, PreparedModel, RealizedDrafting, RealtimeBackend,
-    RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig,
-    RequestId, ResidencyLedger, ResidencyPlan, ResidencyPolicy, RuntimeStateEstimate,
-    SchedulerLimits, SemanticEvent, SemanticStateTransaction, SpeculativeDraft,
-    SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, SpeculativeGenerationRequest,
-    SpeculativeTokenFilterController, StateLayout, StaticMemoryReport, Submission,
-    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
-    WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
+    BackendCapabilities, BackendDescriptor, BackendId, BackendProvider, BackendSession,
+    CacheStateStrategy, CapabilityError, CollectiveScope, DeviceDescriptor, DevicePlan,
+    DistributedBackend, DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
+    DraftPlacementPlan, DraftingPlan, EstimationCompleteness, ExecutionPlan,
+    ExecutionPlanBackendFactory, ExecutionPlanTarget, ExternalDraftArtifact, FinishReason,
+    GenerationConfigOverrides, GrowingState, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, MemoryTier,
+    ModelCapabilities, ModelCapabilityBackend, ModelKind, ModelLoadingBackend,
+    ModelResourceProfile, ModelRuntime, MtpCapability, MtpCheckpointKind,
+    MultimodalPreparationBackend, Observed, OffloadConfig, OffloadPlan, OffloadUnitId,
+    OffloadUnitSpec, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, PreparedModel,
+    RealizedDrafting, RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling,
+    RealtimeScheduler, RealtimeSpeechConfig, RequestId, ResidencyLedger, ResidencyPlan,
+    ResidencyPolicy, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
+    SemanticStateTransaction, SpeculativeDraft, SpeculativeGenerationBackend,
+    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
+    SpeculativeGenerationOutput, SpeculativeGenerationRequest, SpeculativeTokenFilterController,
+    StateLayout, StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig,
+    TokenFilter, TokenOutput, ValueDescriptor, WorkDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_core::Completion;
 use tokenizers::{
@@ -120,7 +120,7 @@ impl Completion for Done {
     }
 }
 
-impl Backend for MockBackend {
+impl BackendProvider for MockBackend {
     type ModelConfig = ();
     type Model = ();
     type Session = MockSession;

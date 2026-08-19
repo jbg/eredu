@@ -8,10 +8,10 @@ use eredu::api::{
 #[allow(unused_imports)]
 use eredu::backend as _;
 use eredu::{
-    ArtifactFormat, Backend, BackendCapabilities, BackendDescriptor, BackendSession, Completion,
-    DeviceDescriptor, GenerationConfigOverrides, InspectionReadiness, ModelInspectionReport,
-    ModelRuntime, PreparedModel, Submission, TextGenerationBackend, TextGenerationConfig,
-    TokenFilter, TokenOutput,
+    ArtifactFormat, BackendCapabilities, BackendDescriptor, BackendProvider, BackendSession,
+    Completion, DeviceDescriptor, GenerationConfigOverrides, InspectionReadiness,
+    ModelInspectionReport, ModelRuntime, PreparedModel, Submission, TextGenerationBackend,
+    TextGenerationConfig, TokenFilter, TokenOutput,
 };
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
@@ -47,7 +47,7 @@ impl TokenOutput for MockToken {
     }
 }
 
-impl Backend for MockBackend {
+impl BackendProvider for MockBackend {
     type ModelConfig = ();
     type Model = ();
     type Session = MockSession;

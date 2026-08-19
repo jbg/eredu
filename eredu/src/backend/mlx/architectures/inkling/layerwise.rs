@@ -59,8 +59,8 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
-        LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -2988,11 +2988,12 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         })
     }
 
-    fn execution_graph(&self) -> Result<ExecutionGroupDag, Error> {
+    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
         if self.vision_depth > 0 {
-            ExecutionGroupDag::chain(["vision_encoder", "text_decoder"])
+            eredu_runtime::ExecutionGraph::chain(["vision_encoder", "text_decoder"])
+                .map_err(Into::into)
         } else {
-            ExecutionGroupDag::chain(["text_decoder"])
+            eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
         }
     }
 

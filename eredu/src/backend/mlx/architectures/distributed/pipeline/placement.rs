@@ -10,10 +10,8 @@ use std::{
     ops::Range,
 };
 
-use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::runtime::execution::layerwise::{ExecutionGroupDag, ExecutionGroupSpec},
-};
+use crate::backend::mlx::error::Error;
+use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
 
 /// Semantic role of one placed execution group.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -240,7 +238,7 @@ pub struct PlacementRoute {
 pub struct PlacedExecutionDag {
     groups: Vec<ExecutionGroupPlacement>,
     routes: Vec<PlacementRoute>,
-    semantic: ExecutionGroupDag,
+    semantic: ExecutionGraph,
 }
 
 /// Runtime reason that two graph-ready groups cannot overlap.
@@ -289,7 +287,7 @@ impl PlacedExecutionDag {
                 "placed execution DAG requires at least one PP rank".into(),
             ));
         }
-        let semantic = ExecutionGroupDag::new(
+        let semantic = ExecutionGraph::new(
             requests
                 .iter()
                 .map(|request| request.spec.clone())
@@ -407,7 +405,7 @@ impl PlacedExecutionDag {
         self.semantic.execution_order()
     }
     /// Returns the shared semantic DAG used by the ready-set scheduler.
-    pub(crate) const fn semantic(&self) -> &ExecutionGroupDag {
+    pub(crate) const fn semantic(&self) -> &ExecutionGraph {
         &self.semantic
     }
     /// Resolves a group by identity.

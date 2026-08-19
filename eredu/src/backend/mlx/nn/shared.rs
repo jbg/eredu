@@ -5,8 +5,8 @@ use eredu_checkpoint::WeightQuantization;
 use std::ops::{Deref, DerefMut};
 
 use eredu_nn::{
-    AttentionCache, Backend, EmbeddingOperator, Error as ComputeError, LinearOperator, LinearSpec,
-    NormalizationOperator, RopeValue, RotaryOperator, RotarySpec,
+    AttentionCache, EmbeddingOperator, Error as ComputeError, LinearOperator, LinearSpec,
+    NeuralBackend, NormalizationOperator, RopeValue, RotaryOperator, RotarySpec,
 };
 use safemlx::{
     builder::Builder,
@@ -175,7 +175,7 @@ impl RotaryOperator<Array> for MlxRotary {
 #[derive(Debug, Clone, Copy)]
 pub struct MlxBackend;
 
-impl Backend for MlxBackend {
+impl NeuralBackend for MlxBackend {
     type Tensor = Array;
     type Linear = MlxLinear;
     type Embedding = MlxEmbedding;

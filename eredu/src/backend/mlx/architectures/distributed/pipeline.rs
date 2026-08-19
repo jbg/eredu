@@ -107,9 +107,8 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
         ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
-        ExecutionGroupReadySet, LayerWeightResidency, LayerwiseLoadOptions,
-        LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection, SharedWeightStore,
-        StaticUnitBindings,
+        LayerWeightResidency, LayerwiseLoadOptions, LoadTimeQuantizableAdapter,
+        PipelineStageQuantizationSelection, SharedWeightStore, StaticUnitBindings,
     },
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
@@ -137,6 +136,7 @@ use crate::{
     integrations::llama_mlx::model as llama,
 };
 use eredu_core::MtpStats;
+use eredu_runtime::ExecutionGroupReadySet;
 
 #[cfg(test)]
 use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
@@ -7155,9 +7155,7 @@ fn decoder_only_placement(
     PlacedExecutionDag::plan(
         pipeline_stages,
         vec![ExecutionGroupPlacementRequest {
-            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::root(
-                "text_decoder",
-            ),
+            spec: eredu_runtime::ExecutionGroupSpec::root("text_decoder"),
             kind: ExecutionGroupKind::Decoder,
             unit_count: global_layers,
             rank_path: (0..pipeline_stages).collect(),
@@ -7199,9 +7197,7 @@ fn multimodal_placement(
     let mut projected = Vec::new();
     if let Some(depth) = vision_depth {
         requests.push(ExecutionGroupPlacementRequest {
-            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::root(
-                "vision_encoder",
-            ),
+            spec: eredu_runtime::ExecutionGroupSpec::root("vision_encoder"),
             kind: ExecutionGroupKind::VisionEncoder,
             unit_count: depth,
             rank_path: all_ranks(),
@@ -7218,7 +7214,7 @@ fn multimodal_placement(
             checkpoint_group: "vision_encoder".into(),
         });
         requests.push(ExecutionGroupPlacementRequest {
-            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+            spec: eredu_runtime::ExecutionGroupSpec::with_dependencies(
                 "vision_projector",
                 ["vision_encoder"],
             ),
@@ -7241,9 +7237,7 @@ fn multimodal_placement(
     }
     if let Some(depth) = audio_depth {
         requests.push(ExecutionGroupPlacementRequest {
-            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::root(
-                "audio_encoder",
-            ),
+            spec: eredu_runtime::ExecutionGroupSpec::root("audio_encoder"),
             kind: ExecutionGroupKind::AudioEncoder,
             // Static dMel ingress remains a placed unit even when the family
             // has no repeated audio blocks.
@@ -7262,7 +7256,7 @@ fn multimodal_placement(
             checkpoint_group: "audio_encoder".into(),
         });
         requests.push(ExecutionGroupPlacementRequest {
-            spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+            spec: eredu_runtime::ExecutionGroupSpec::with_dependencies(
                 "audio_projector",
                 ["audio_encoder"],
             ),
@@ -7287,7 +7281,7 @@ fn multimodal_placement(
         return decoder_only_placement(decoder_layers, pipeline_stages);
     }
     requests.push(ExecutionGroupPlacementRequest {
-        spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+        spec: eredu_runtime::ExecutionGroupSpec::with_dependencies(
             "modality_merger",
             projected.iter().copied(),
         ),
@@ -7307,7 +7301,7 @@ fn multimodal_placement(
         checkpoint_group: "modality_merger".into(),
     });
     requests.push(ExecutionGroupPlacementRequest {
-        spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+        spec: eredu_runtime::ExecutionGroupSpec::with_dependencies(
             "modality_finalization",
             ["modality_merger"],
         ),
@@ -7327,7 +7321,7 @@ fn multimodal_placement(
         checkpoint_group: "modality_finalization".into(),
     });
     requests.push(ExecutionGroupPlacementRequest {
-        spec: crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupSpec::with_dependencies(
+        spec: eredu_runtime::ExecutionGroupSpec::with_dependencies(
             "text_decoder",
             ["modality_finalization"],
         ),

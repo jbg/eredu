@@ -6,7 +6,7 @@
 
 use crate::{
     artifact::{ArtifactFormat, ModelKind},
-    backend::{Backend, ModelLoadingBackend, ModelRuntime},
+    backend::{BackendProvider, ModelLoadingBackend, ModelRuntime},
     execution::{
         DevicePlan, DraftingPlan, ExecutionPlan, ExpertCachePlan, ResidencyPlan,
         DEFAULT_MAX_MAPPED_SHARDS,

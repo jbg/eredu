@@ -62,8 +62,8 @@ pub use automatic::{
     ResidencyTelemetry, TimingTelemetry, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use backend::{
-    load_model, prepare_inspected_model, Backend, BackendCapabilities, BackendDescriptor,
-    BackendError, BackendSession, CollectiveScope, Completion, ControlledTextGeneration,
+    load_model, prepare_inspected_model, BackendCapabilities, BackendDescriptor, BackendError,
+    BackendProvider, BackendSession, CollectiveScope, Completion, ControlledTextGeneration,
     ControlledTextGenerationError, ControlledToken, DeviceDescriptor, DistributedBackend,
     DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
     ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend, ModelRuntime,

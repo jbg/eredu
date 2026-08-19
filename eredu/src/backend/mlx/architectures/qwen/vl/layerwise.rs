@@ -1765,13 +1765,8 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         }
     }
 
-    fn execution_graph(
-        &self,
-    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
-            "vision_encoder",
-            "text_decoder",
-        ])
+    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+        eredu_runtime::ExecutionGraph::chain(["vision_encoder", "text_decoder"]).map_err(Into::into)
     }
 
     fn should_execute_group(&self, group: usize, context: &Self::ForwardContext) -> bool {

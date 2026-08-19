@@ -1576,12 +1576,8 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         })
     }
 
-    fn execution_graph(
-        &self,
-    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
-            "text_decoder",
-        ])
+    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {

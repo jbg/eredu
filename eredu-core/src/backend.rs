@@ -247,7 +247,7 @@ impl<M> std::ops::DerefMut for PreparedModel<M> {
 }
 
 /// One backend selected for an entire prepared model and all its sessions.
-pub trait Backend: Sized {
+pub trait BackendProvider: Sized {
     /// Portable model preparation request.
     type ModelConfig;
     /// Opaque backend model/executable.
@@ -281,9 +281,9 @@ pub trait Backend: Sized {
 ///
 /// Core owns checkpoint inspection and preparation planning. Implementations
 /// translate the resulting neutral plan and their associated load options into
-/// the backend's concrete [`Backend::ModelConfig`]. Tensor materialization
-/// remains entirely inside [`Backend::prepare_model`].
-pub trait ModelLoadingBackend: Backend {
+/// the backend's concrete [`BackendProvider::ModelConfig`]. Tensor materialization
+/// remains entirely inside [`BackendProvider::prepare_model`].
+pub trait ModelLoadingBackend: BackendProvider {
     /// Backend load policy exposed to a generic caller.
     type LoadOptions;
 
@@ -353,7 +353,7 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
 /// The session owns its prepared executable and cache. The contract
 /// intentionally models language-model submissions rather than primitive
 /// tensor operations. Input, output, cache and completion stay opaque.
-pub trait BackendSession<B: Backend> {
+pub trait BackendSession<B: BackendProvider> {
     /// Backend-owned prefill input.
     type PrefillInput;
     /// Backend-owned decode input.
@@ -385,12 +385,12 @@ pub trait BackendSession<B: Backend> {
 /// it impossible to submit a session through a different backend instance.
 /// Backend-owned executable, cache, tensor, and completion types remain
 /// associated types and never enter the portable API.
-pub struct ModelRuntime<B: Backend> {
+pub struct ModelRuntime<B: BackendProvider> {
     backend: B,
     session: B::Session,
 }
 
-impl<B: Backend> ModelRuntime<B> {
+impl<B: BackendProvider> ModelRuntime<B> {
     /// Prepares `config` and creates its sole execution session.
     pub fn prepare(backend: B, config: B::ModelConfig) -> Result<Self, B::Error> {
         let model = backend.prepare_model(config)?;
@@ -608,7 +608,7 @@ impl TokenFilterController for UnconstrainedTokens {
 /// The contract deliberately combines model execution and sampling. Core does
 /// not see logits or ask a backend to implement tensor primitives. The token,
 /// sampling state, cache state, and exact completion remain backend-owned.
-pub trait TextGenerationBackend: Backend {
+pub trait TextGenerationBackend: BackendProvider {
     /// Opaque prepared prompt, including any backend-owned multimodal values.
     type Prompt;
     /// Backend-owned generated token handle.
@@ -1049,7 +1049,7 @@ pub trait DistributedSession {
 }
 
 /// Backend extension exposing communication attached to a model session.
-pub trait DistributedBackend: Backend {
+pub trait DistributedBackend: BackendProvider {
     /// Selected distributed session implementation.
     type DistributedSession: DistributedSession<Error = Self::Error>;
 
@@ -1074,7 +1074,7 @@ mod tests {
         }
     }
     struct Mock;
-    impl Backend for Mock {
+    impl BackendProvider for Mock {
         type ModelConfig = u32;
         type Model = u32;
         type Session = MockSession;
@@ -1103,7 +1103,7 @@ mod tests {
     struct LoadingMock;
     struct LoadingMockSession;
 
-    impl Backend for LoadingMock {
+    impl BackendProvider for LoadingMock {
         type ModelConfig = (ModelPreparationPlan, u32);
         type Model = u32;
         type Session = LoadingMockSession;

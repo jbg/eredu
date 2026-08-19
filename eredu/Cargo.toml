@@ -148,6 +148,7 @@ eredu-text = { workspace = true, default-features = false }
 eredu-gguf.workspace = true
 eredu-checkpoint.workspace = true
 eredu-nn = { workspace = true, default-features = false }
+eredu-runtime.workspace = true
 eredu-architectures.workspace = true
 
 # External dependencies

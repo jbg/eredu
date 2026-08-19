@@ -1450,13 +1450,9 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         })
     }
 
-    fn execution_graph(
-        &self,
-    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag::chain([
-            "temporal_transformer",
-            "depth_codebook_slices",
-        ])
+    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+        eredu_runtime::ExecutionGraph::chain(["temporal_transformer", "depth_codebook_slices"])
+            .map_err(Into::into)
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {

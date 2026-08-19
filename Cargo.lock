@@ -851,6 +851,7 @@ dependencies = [
  "eredu-core",
  "eredu-gguf",
  "eredu-nn",
+ "eredu-runtime",
  "eredu-text",
  "half",
  "idna_adapter",
@@ -881,6 +882,7 @@ dependencies = [
  "eredu-core",
  "eredu-gguf",
  "eredu-nn",
+ "eredu-runtime",
  "serde",
  "serde_json",
  "thiserror",
@@ -962,6 +964,16 @@ dependencies = [
  "safemlx",
  "serde",
  "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "eredu-runtime"
+version = "0.1.0"
+dependencies = [
+ "eredu-checkpoint",
+ "eredu-core",
+ "eredu-nn",
  "thiserror",
 ]
 

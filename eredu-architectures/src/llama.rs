@@ -15,7 +15,7 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_core::cache::LayerCachePolicy;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, Backend, EmbeddingOperator, Error, LinearOperator, LinearSpec,
+    AttentionCache, EmbeddingOperator, Error, LinearOperator, LinearSpec, NeuralBackend,
     NormalizationOperator, RotaryOperator, RotarySpec, Tensor,
 };
 
@@ -114,7 +114,7 @@ pub fn create_caches<C: Config, K>(
 /// Validates that concrete backend caches implement the architecture's policy.
 pub fn validate_caches<B, C, K>(config: &C, caches: &[Option<K>]) -> Result<(), Error>
 where
-    B: Backend,
+    B: NeuralBackend,
     C: Config,
     K: AttentionCache<B::Tensor>,
 {
@@ -174,7 +174,7 @@ pub struct AttentionInput<'a, T, C> {
 
 /// Llama grouped-query self attention.
 #[derive(Debug, Clone)]
-pub struct Attention<B: Backend> {
+pub struct Attention<B: NeuralBackend> {
     /// Number of query heads.
     pub query_heads: i32,
     /// Number of key/value heads.
@@ -203,7 +203,7 @@ struct AttentionProjections<T> {
     sequence: i32,
 }
 
-impl<B: Backend> Attention<B> {
+impl<B: NeuralBackend> Attention<B> {
     fn new<C: Config>(
         config: &C,
         layer: usize,
@@ -367,7 +367,7 @@ impl<B: Backend> Attention<B> {
 
 /// Llama SwiGLU feed-forward network.
 #[derive(Debug, Clone)]
-pub struct Mlp<B: Backend> {
+pub struct Mlp<B: NeuralBackend> {
     /// Gating projection.
     pub gate: B::Linear,
     /// Up projection.
@@ -376,7 +376,7 @@ pub struct Mlp<B: Backend> {
     pub down: B::Linear,
 }
 
-impl<B: Backend> Mlp<B> {
+impl<B: NeuralBackend> Mlp<B> {
     fn new<C: Config>(
         config: &C,
         layer: usize,
@@ -443,7 +443,7 @@ impl<B: Backend> Mlp<B> {
 
 /// One Llama decoder block.
 #[derive(Debug, Clone)]
-pub struct TransformerBlock<B: Backend> {
+pub struct TransformerBlock<B: NeuralBackend> {
     /// Self-attention operator.
     pub self_attention: Attention<B>,
     /// Feed-forward operator.
@@ -454,7 +454,7 @@ pub struct TransformerBlock<B: Backend> {
     pub post_attention_norm: B::Normalization,
 }
 
-impl<B: Backend> TransformerBlock<B> {
+impl<B: NeuralBackend> TransformerBlock<B> {
     /// Builds an unloaded block for one global layer index.
     pub fn new<C: Config>(
         config: &C,
@@ -522,7 +522,7 @@ impl<B: Backend> TransformerBlock<B> {
 
 /// Llama transformer body without its language-model head.
 #[derive(Debug, Clone)]
-pub struct Decoder<B: Backend> {
+pub struct Decoder<B: NeuralBackend> {
     /// Token embedding table.
     pub embeddings: B::Embedding,
     /// Decoder blocks.
@@ -531,7 +531,7 @@ pub struct Decoder<B: Backend> {
     pub norm: B::Normalization,
 }
 
-impl<B: Backend> Decoder<B> {
+impl<B: NeuralBackend> Decoder<B> {
     /// Builds an unloaded decoder.
     pub fn new<C: Config>(
         config: &C,
@@ -614,14 +614,14 @@ impl<B: Backend> Decoder<B> {
 
 /// Complete Llama causal language model.
 #[derive(Debug, Clone)]
-pub struct Model<B: Backend> {
+pub struct Model<B: NeuralBackend> {
     /// Transformer body.
     pub decoder: Decoder<B>,
     /// Optional untied output projection.
     pub lm_head: Option<B::Linear>,
 }
 
-impl<B: Backend> Model<B> {
+impl<B: NeuralBackend> Model<B> {
     /// Builds an unloaded model.
     pub fn new<C: Config>(
         config: &C,

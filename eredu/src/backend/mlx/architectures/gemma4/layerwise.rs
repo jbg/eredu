@@ -3304,12 +3304,8 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         })
     }
 
-    fn execution_graph(
-        &self,
-    ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ExecutionGroupDag, Error> {
-        use crate::backend::mlx::runtime::execution::layerwise::{
-            ExecutionGroupDag, ExecutionGroupSpec,
-        };
+    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+        use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
         let mut groups = Vec::new();
         let mut ingress = Vec::new();
         if self.vision_depth > 0 {
@@ -3328,7 +3324,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                 ingress,
             ));
         }
-        ExecutionGroupDag::new(groups, "text_decoder")
+        ExecutionGraph::new(groups, "text_decoder").map_err(Into::into)
     }
 
     fn should_execute_group(&self, group: usize, context: &Self::ForwardContext) -> bool {

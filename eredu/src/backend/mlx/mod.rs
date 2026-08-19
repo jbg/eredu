@@ -66,7 +66,7 @@ pub use session::{
 pub use topology::{DeviceAssignment, MlxParallelContext};
 
 use eredu_core::backend::{
-    Backend, BackendCapabilities, BackendDescriptor, Completion, DeviceDescriptor,
+    BackendCapabilities, BackendDescriptor, BackendProvider, Completion, DeviceDescriptor,
     ModelLoadingBackend, PreparedModel, Submission,
 };
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
@@ -275,7 +275,7 @@ impl<'a> MlxBackend<'a> {
     }
 }
 
-impl<'a> Backend for MlxBackend<'a> {
+impl<'a> BackendProvider for MlxBackend<'a> {
     type ModelConfig = MlxModelConfig;
     type Model = MlxModel;
     type Session = MlxModelSession<'a>;

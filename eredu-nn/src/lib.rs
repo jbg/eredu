@@ -159,7 +159,7 @@ pub trait AttentionCache<T: Tensor> {
 ///
 /// Associated concrete types make calls statically dispatched. Implementations
 /// retain ownership of tensor storage, fusion, quantization, and collectives.
-pub trait Backend: Sized + 'static {
+pub trait NeuralBackend: Sized + 'static {
     /// Backend tensor handle.
     type Tensor: Tensor;
     /// Native affine projection, including packed quantized variants.

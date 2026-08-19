@@ -1644,312 +1644,7 @@ pub struct LayerwiseForwardState<C> {
     pub context: C,
 }
 
-/// One named execution group and the groups whose completed outputs it consumes.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ExecutionGroupSpec {
-    id: String,
-    dependencies: Vec<String>,
-}
-
-impl ExecutionGroupSpec {
-    /// Declares a root execution group.
-    pub fn root(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            dependencies: Vec::new(),
-        }
-    }
-
-    /// Declares a group with named input dependencies.
-    pub fn with_dependencies(
-        id: impl Into<String>,
-        dependencies: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            dependencies: dependencies.into_iter().map(Into::into).collect(),
-        }
-    }
-
-    /// Returns the stable group identifier.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Returns dependency identifiers in declaration order.
-    pub fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-}
-
-/// Validated execution-group dependency graph with one authoritative output.
-///
-/// Group slots retain declaration order for architecture callbacks. Execution
-/// follows the stable topological order derived here, never numeric adjacency.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ExecutionGroupDag {
-    groups: Vec<ExecutionGroupSpec>,
-    dependencies: Vec<Vec<usize>>,
-    dependents: Vec<Vec<usize>>,
-    execution_order: Vec<usize>,
-    output: usize,
-}
-
-impl ExecutionGroupDag {
-    /// Validates unique names, dependency references, acyclicity, and that
-    /// every declared group contributes transitively to `output`.
-    pub fn new(groups: Vec<ExecutionGroupSpec>, output: impl AsRef<str>) -> Result<Self, Error> {
-        if groups.is_empty() {
-            return Err(LayerwiseModelError::EmptyExecutionGraph.into());
-        }
-        let mut by_id = BTreeMap::new();
-        for (index, group) in groups.iter().enumerate() {
-            if group.id.is_empty() {
-                return Err(LayerwiseModelError::EmptyExecutionGroupId.into());
-            }
-            if by_id.insert(group.id.clone(), index).is_some() {
-                return Err(LayerwiseModelError::DuplicateExecutionGroup(group.id.clone()).into());
-            }
-        }
-        let output_name = output.as_ref();
-        let output = by_id.get(output_name).copied().ok_or_else(|| {
-            LayerwiseModelError::UnknownExecutionGraphOutput(output_name.to_string())
-        })?;
-        let mut dependencies = Vec::with_capacity(groups.len());
-        let mut dependents = vec![Vec::new(); groups.len()];
-        let mut indegree = vec![0usize; groups.len()];
-        for (index, group) in groups.iter().enumerate() {
-            let mut seen = BTreeSet::new();
-            let mut resolved = Vec::with_capacity(group.dependencies.len());
-            for dependency in &group.dependencies {
-                let dependency_index = by_id.get(dependency).copied().ok_or_else(|| {
-                    LayerwiseModelError::UnknownExecutionGroupDependency {
-                        group: group.id.clone(),
-                        dependency: dependency.clone(),
-                    }
-                })?;
-                if dependency_index == index {
-                    return Err(
-                        LayerwiseModelError::SelfDependentExecutionGroup(group.id.clone()).into(),
-                    );
-                }
-                if !seen.insert(dependency_index) {
-                    return Err(LayerwiseModelError::DuplicateExecutionGroupDependency {
-                        group: group.id.clone(),
-                        dependency: dependency.clone(),
-                    }
-                    .into());
-                }
-                resolved.push(dependency_index);
-                dependents[dependency_index].push(index);
-            }
-            indegree[index] = resolved.len();
-            dependencies.push(resolved);
-        }
-        let mut ready = indegree
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &degree)| (degree == 0).then_some(index))
-            .collect::<BTreeSet<_>>();
-        let mut execution_order = Vec::with_capacity(groups.len());
-        while let Some(index) = ready.pop_first() {
-            execution_order.push(index);
-            for &dependent in &dependents[index] {
-                indegree[dependent] -= 1;
-                if indegree[dependent] == 0 {
-                    ready.insert(dependent);
-                }
-            }
-        }
-        if execution_order.len() != groups.len() {
-            return Err(LayerwiseModelError::CyclicExecutionGraph.into());
-        }
-        let mut contributes = BTreeSet::new();
-        let mut pending = vec![output];
-        while let Some(index) = pending.pop() {
-            if contributes.insert(index) {
-                pending.extend(dependencies[index].iter().copied());
-            }
-        }
-        if contributes.len() != groups.len() {
-            let disconnected = groups
-                .iter()
-                .enumerate()
-                .filter_map(|(index, group)| {
-                    (!contributes.contains(&index)).then_some(group.id.clone())
-                })
-                .collect();
-            return Err(LayerwiseModelError::DisconnectedExecutionGroups { disconnected }.into());
-        }
-        Ok(Self {
-            groups,
-            dependencies,
-            dependents,
-            execution_order,
-            output,
-        })
-    }
-
-    /// Creates a dependency chain in iterator order whose final group is the output.
-    pub fn chain(ids: impl IntoIterator<Item = impl Into<String>>) -> Result<Self, Error> {
-        let ids = ids.into_iter().map(Into::into).collect::<Vec<String>>();
-        let output = ids
-            .last()
-            .cloned()
-            .ok_or(LayerwiseModelError::EmptyExecutionGraph)?;
-        let groups = ids
-            .iter()
-            .enumerate()
-            .map(|(index, id)| match index.checked_sub(1) {
-                Some(previous) => {
-                    ExecutionGroupSpec::with_dependencies(id.clone(), [ids[previous].clone()])
-                }
-                None => ExecutionGroupSpec::root(id.clone()),
-            })
-            .collect();
-        Self::new(groups, output)
-    }
-
-    /// Returns group specifications in stable architecture slot order.
-    pub fn groups(&self) -> &[ExecutionGroupSpec] {
-        &self.groups
-    }
-
-    /// Returns stable topological execution slots.
-    pub fn execution_order(&self) -> &[usize] {
-        &self.execution_order
-    }
-
-    /// Returns dependency slots for an architecture group slot.
-    pub fn dependencies(&self, group: usize) -> Option<&[usize]> {
-        self.dependencies.get(group).map(Vec::as_slice)
-    }
-
-    /// Returns dependent slots in stable architecture declaration order.
-    pub fn dependents(&self, group: usize) -> Option<&[usize]> {
-        self.dependents.get(group).map(Vec::as_slice)
-    }
-
-    /// Returns the authoritative output group slot.
-    pub const fn output(&self) -> usize {
-        self.output
-    }
-
-    fn consumer_counts(&self) -> Vec<usize> {
-        let mut counts = vec![0; self.groups.len()];
-        for dependencies in &self.dependencies {
-            for &dependency in dependencies {
-                counts[dependency] += 1;
-            }
-        }
-        counts
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ReadyGroupState {
-    Pending,
-    Ordered,
-    Failed,
-    #[cfg(test)]
-    Cancelled,
-    Blocked,
-}
-
-/// Deterministic dependency bookkeeping for the same-thread multi-stream executor.
-///
-/// A group becomes ready when all dependency completion events have been recorded.
-/// `ordered` therefore means that consumers can insert backend event waits; it does
-/// not imply a host synchronization. Failures and cancellation close the affected
-/// subgraph before any newly ready dependent can be submitted.
-#[derive(Debug)]
-pub(crate) struct ExecutionGroupReadySet<'a> {
-    graph: &'a ExecutionGroupDag,
-    remaining_dependencies: Vec<usize>,
-    states: Vec<ReadyGroupState>,
-    ready: BTreeSet<usize>,
-}
-
-impl<'a> ExecutionGroupReadySet<'a> {
-    pub(crate) fn new(graph: &'a ExecutionGroupDag) -> Self {
-        let remaining_dependencies = graph.dependencies.iter().map(Vec::len).collect::<Vec<_>>();
-        let ready = remaining_dependencies
-            .iter()
-            .enumerate()
-            .filter_map(|(group, &remaining)| (remaining == 0).then_some(group))
-            .collect();
-        Self {
-            graph,
-            remaining_dependencies,
-            states: vec![ReadyGroupState::Pending; graph.groups.len()],
-            ready,
-        }
-    }
-
-    pub(crate) fn ready_groups(&self) -> impl Iterator<Item = usize> + '_ {
-        self.ready.iter().copied()
-    }
-
-    pub(crate) fn ordered(&mut self, group: usize) {
-        debug_assert_eq!(self.states[group], ReadyGroupState::Pending);
-        self.ready.remove(&group);
-        self.states[group] = ReadyGroupState::Ordered;
-        for &dependent in &self.graph.dependents[group] {
-            if self.states[dependent] != ReadyGroupState::Pending {
-                continue;
-            }
-            self.remaining_dependencies[dependent] -= 1;
-            if self.remaining_dependencies[dependent] == 0 {
-                self.ready.insert(dependent);
-            }
-        }
-    }
-
-    pub(crate) fn fail(&mut self, group: usize) {
-        self.close_subgraph(group, ReadyGroupState::Failed);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cancel(&mut self, group: usize) {
-        self.close_subgraph(group, ReadyGroupState::Cancelled);
-    }
-
-    fn close_subgraph(&mut self, group: usize, terminal: ReadyGroupState) {
-        self.ready.remove(&group);
-        self.states[group] = terminal;
-        let mut pending = self.graph.dependents[group].clone();
-        while let Some(dependent) = pending.pop() {
-            if self.states[dependent] != ReadyGroupState::Pending {
-                continue;
-            }
-            self.ready.remove(&dependent);
-            self.states[dependent] = ReadyGroupState::Blocked;
-            pending.extend(self.graph.dependents[dependent].iter().copied());
-        }
-    }
-
-    /// Selects a deterministic maximal compatible subset of the current ready set.
-    ///
-    /// The stable greedy order is shared by local layerwise execution and placed
-    /// distributed execution. Callers supply only resource/collective policy;
-    /// dependency readiness and failure closure remain centralized here.
-    pub(crate) fn compatible_batch(
-        &self,
-        mut compatible: impl FnMut(usize, usize) -> bool,
-    ) -> Vec<usize> {
-        let mut selected = Vec::new();
-        for candidate in self.ready_groups() {
-            if selected
-                .iter()
-                .copied()
-                .all(|group| compatible(group, candidate))
-            {
-                selected.push(candidate);
-            }
-        }
-        selected
-    }
-}
+use eredu_runtime::{ExecutionGraph, ExecutionGroupReadySet};
 
 /// Architecture contract for resident, bounded-residency, and distributed
 /// execution.
@@ -2083,7 +1778,7 @@ pub trait ArchitectureAdapter: Sized {
     }
 
     /// Declares the complete named execution-group dependency graph.
-    fn execution_graph(&self) -> Result<ExecutionGroupDag, Error>;
+    fn execution_graph(&self) -> Result<ExecutionGraph, Error>;
 
     /// Returns whether a group is needed for this particular forward pass.
     ///
@@ -2593,7 +2288,7 @@ pub(crate) trait LoadTimeQuantizableAdapter: ArchitectureAdapter {
 /// architecture math, cache validation, and runtime-unit construction.
 pub struct LayerwiseModel<A: ArchitectureAdapter> {
     adapter: A,
-    graph: ExecutionGroupDag,
+    graph: ExecutionGraph,
     store: SharedWeightStore,
     residency: ResidencyManager,
     groups: Vec<ResidentLayerGroup>,
@@ -2707,7 +2402,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     /// Creates an engine from a validated residency manager and execution groups.
     pub fn new(
         adapter: A,
-        graph: ExecutionGroupDag,
+        graph: ExecutionGraph,
         store: SharedWeightStore,
         residency: ResidencyManager,
         groups: Vec<ResidentLayerGroup>,
@@ -3024,7 +2719,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     }
 
     /// Returns the validated dependency graph governing group execution.
-    pub const fn execution_graph(&self) -> &ExecutionGroupDag {
+    pub const fn execution_graph(&self) -> &ExecutionGraph {
         &self.graph
     }
 
@@ -5451,46 +5146,6 @@ fn validate_device_budget(
 /// Structured failures produced by the generic layerwise execution engine.
 #[derive(Debug, thiserror::Error)]
 pub enum LayerwiseModelError {
-    /// An adapter declared no execution groups.
-    #[error("execution-group graph must contain at least one group")]
-    EmptyExecutionGraph,
-    /// A group has no stable identity.
-    #[error("execution-group identifiers must not be empty")]
-    EmptyExecutionGroupId,
-    /// Two groups use the same stable identity.
-    #[error("duplicate execution-group identifier {0:?}")]
-    DuplicateExecutionGroup(String),
-    /// The declared graph output does not exist.
-    #[error("execution-group graph output {0:?} does not exist")]
-    UnknownExecutionGraphOutput(String),
-    /// A dependency does not exist.
-    #[error("execution group {group:?} depends on unknown group {dependency:?}")]
-    UnknownExecutionGroupDependency {
-        /// Dependent group.
-        group: String,
-        /// Missing dependency.
-        dependency: String,
-    },
-    /// A group lists itself as an input.
-    #[error("execution group {0:?} cannot depend on itself")]
-    SelfDependentExecutionGroup(String),
-    /// A group repeats one dependency.
-    #[error("execution group {group:?} repeats dependency {dependency:?}")]
-    DuplicateExecutionGroupDependency {
-        /// Dependent group.
-        group: String,
-        /// Repeated dependency.
-        dependency: String,
-    },
-    /// The graph contains a cycle.
-    #[error("execution-group graph contains a dependency cycle")]
-    CyclicExecutionGraph,
-    /// Some groups do not contribute to the declared graph output.
-    #[error("execution groups do not contribute to the graph output: {disconnected:?}")]
-    DisconnectedExecutionGroups {
-        /// Stable disconnected group identifiers.
-        disconnected: Vec<String>,
-    },
     /// A multi-input group did not define how to combine its dependencies.
     #[error(
         "execution group slot {group} has {inputs} dependency outputs but no merge implementation"
