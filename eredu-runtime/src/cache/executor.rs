@@ -261,7 +261,8 @@ pub enum CacheIoExecutionStateError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{CacheBlockId, CacheIoOperationKind};
+    use crate::cache::CacheIoOperationKind;
+    use eredu_core::cache::{CacheBlockId, CacheRepresentation};
 
     fn key(block: i64) -> CacheIoOperationKey {
         CacheIoOperationKey {
@@ -269,7 +270,7 @@ mod tests {
             id: CacheBlockId {
                 session_id: 1,
                 global_layer: 0,
-                representation: crate::cache::CacheRepresentation::KeyValue,
+                representation: CacheRepresentation::KeyValue,
                 start: block,
                 end: block + 1,
                 rank: None,

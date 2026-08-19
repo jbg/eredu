@@ -12,8 +12,10 @@ description = "Backend-neutral model execution runtime for Eredu"
 eredu-checkpoint.workspace = true
 eredu-core.workspace = true
 eredu-nn.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 safetensors = "0.8"
+serde_json.workspace = true
 tempfile.workspace = true

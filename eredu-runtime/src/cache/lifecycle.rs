@@ -4,9 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::residency::CacheEvictionPolicy;
-
-use super::CacheBlockId;
+use eredu_core::{cache::CacheBlockId, residency::CacheEvictionPolicy};
 
 /// Device-resident mutable state that has not yet become an immutable block.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -363,7 +361,7 @@ pub enum CacheLifecycleError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::CacheRepresentation;
+    use eredu_core::cache::CacheRepresentation;
 
     fn id(layer: usize, start: i64) -> CacheBlockId {
         CacheBlockId {

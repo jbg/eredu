@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{CacheBlockId, CacheTier};
+use eredu_core::cache::{CacheBlockId, CacheTier};
 
 /// Stable phase of one cache block's physical resources.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -518,7 +518,7 @@ pub enum CacheStorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::CacheRepresentation;
+    use eredu_core::cache::CacheRepresentation;
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct HostOp {

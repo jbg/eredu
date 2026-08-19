@@ -79,10 +79,11 @@ use crate::{
     backend::mlx::runtime::media::input as runtime_input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
-        CacheRankIdentity, CacheResidencyPool, LayerCachePolicy, StateTensorDimension,
-        StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+        CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
+        StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
 };
+use eredu_runtime::CacheResidencyPool;
 
 #[cfg(test)]
 #[cfg(test)]

@@ -7,6 +7,8 @@
 
 /// Backend execution, parameter, transfer, and collective capabilities.
 pub mod backend;
+/// Backend-neutral mutable-cache ownership, storage, and admission algorithms.
+pub mod cache;
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
 /// Backend-neutral causal-model and token-sampling contracts.
@@ -23,6 +25,14 @@ pub mod residency;
 pub mod state;
 
 pub use backend::{CollectiveBackend, ParameterBackend, SubmissionBackend, TransferBackend};
+pub use cache::{
+    CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion,
+    CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
+    CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
+    CacheIoPreparation, CacheIoStartDisposition, CacheLifecycleError, CachePoolError,
+    CachePoolLimits, CachePoolMembership, CachePoolReport, CachePoolReservation, CachePoolResource,
+    CachePoolUsage, CacheResidencyPool, CacheStorageError, CacheStoragePhase, MutableCacheTail,
+};
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,
     ExecutionGroupSpec, ReadyGroupState,

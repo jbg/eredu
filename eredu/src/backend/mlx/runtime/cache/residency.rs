@@ -28,21 +28,23 @@ use safemlx::{
 use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    core::cache::{
+use eredu_core::{
+    cache::{
         prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, CacheBlockId,
-        CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheIoAdmission,
-        CacheIoCompletionDisposition, CacheIoExecutionState, CacheIoExecutionStateError,
-        CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind, CacheIoPreparation,
-        CacheIoStartDisposition, CacheLifecycleError, CachePolicyError, CachePoolError,
-        CachePoolLimits, CachePoolMembership, CachePoolReservation, CachePoolResource,
-        CachePoolUsage, CacheRankIdentity, CacheRepresentation, CacheResidencyPool,
-        CacheStorageError, CacheStoragePhase, CacheTier, MutableCacheTail, PromptCacheBlock,
+        CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier, PromptCacheBlock,
         PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
         PromptCacheOptions, PromptCacheStateTensor, StateTensorOwner, StateTensorRole,
         PROMPT_CACHE_SCHEMA_VERSION,
     },
-    core::residency::CacheEvictionPolicy,
+    residency::CacheEvictionPolicy,
+};
+use eredu_runtime::{
+    CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheIoAdmission,
+    CacheIoCompletionDisposition, CacheIoExecutionState, CacheIoExecutionStateError,
+    CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind, CacheIoPreparation,
+    CacheIoStartDisposition, CacheLifecycleError, CachePoolError, CachePoolLimits,
+    CachePoolMembership, CachePoolReservation, CachePoolResource, CachePoolUsage,
+    CacheResidencyPool, CacheStorageError, CacheStoragePhase, MutableCacheTail,
 };
 
 const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;

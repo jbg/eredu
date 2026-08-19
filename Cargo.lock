@@ -991,6 +991,8 @@ dependencies = [
  "eredu-core",
  "eredu-nn",
  "safetensors",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

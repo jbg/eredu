@@ -78,17 +78,12 @@ mod distributed_pipeline_ring;
 
 pub use eredu_core::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use eredu_core::cache::{
-    CacheBlockId, CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation,
-    CacheHostPromotion, CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
-    CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
-    CacheIoPreparation, CacheIoStartDisposition, CacheLifecycleError, CachePolicyError,
-    CachePoolError, CachePoolLimits, CachePoolReport, CachePoolResource, CacheRankIdentity,
-    CacheRepresentation, CacheResidencyPool, CacheStorageError, CacheStoragePhase, CacheTier,
-    LayerCachePolicy, MutableCacheTail, MutableStateResidency, PoolingStateComponent,
-    PromptCacheBlock, PromptCacheDescriptor, PromptCacheError, PromptCacheManifest,
-    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology,
-    StateResidencyClass, StateTensorDimension, StateTensorDtype, StateTensorOwner,
-    StateTensorPolicy, StateTensorPresence, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
+    CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
+    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, PromptCacheBlock,
+    PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
+    PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass,
+    StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
+    StateTensorPresence, StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
 };
 pub use eredu_core::residency::{
     AllocatorMemoryMetrics, BackgroundPrefetchReport, CacheEvictionPolicy, EvictionMetrics,
@@ -107,4 +102,12 @@ pub use eredu_core::scheduler::{
 pub use eredu_core::scheduler::{
     SchedulerCapabilities as RealtimeSchedulerCapabilities,
     SchedulerReport as RealtimeSchedulerReport,
+};
+pub use eredu_runtime::{
+    CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion,
+    CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
+    CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
+    CacheIoPreparation, CacheIoStartDisposition, CacheLifecycleError, CachePoolError,
+    CachePoolLimits, CachePoolReport, CachePoolResource, CacheResidencyPool, CacheStorageError,
+    CacheStoragePhase, MutableCacheTail,
 };

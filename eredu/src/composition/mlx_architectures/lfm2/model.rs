@@ -59,10 +59,11 @@ use crate::{
     composition::mlx_architectures::qwen::dense::gguf_string,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
-        CacheRankIdentity, CacheResidencyPool, LayerCachePolicy, StateTensorDimension,
-        StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+        CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
+        StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
 };
+use eredu_runtime::CacheResidencyPool;
 
 fn default_true() -> bool {
     true

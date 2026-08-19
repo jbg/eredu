@@ -125,6 +125,41 @@ fn mlx_sampling_contains_only_backend_primitives() {
 }
 
 #[test]
+fn cache_execution_algorithms_are_runtime_owned() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let core_cache = workspace.join("eredu-core/src/cache");
+    for removed in ["executor.rs", "lifecycle.rs", "storage.rs"] {
+        assert!(
+            !core_cache.join(removed).exists(),
+            "cache execution algorithm {removed} remains in eredu-core"
+        );
+    }
+
+    let core = std::fs::read_to_string(workspace.join("eredu-core/src/cache.rs"))
+        .expect("core cache schema module must be readable");
+    for runtime_owned in [
+        "CacheResidencyPool",
+        "CacheBlockLifecycle",
+        "CacheBlockStorage",
+        "CacheIoExecutionState",
+    ] {
+        assert!(
+            !core.contains(runtime_owned),
+            "runtime cache implementation {runtime_owned} leaked into eredu-core"
+        );
+    }
+
+    let runtime = std::fs::read_to_string(workspace.join("eredu-runtime/src/cache.rs"))
+        .expect("runtime cache module must be readable");
+    assert!(runtime.contains("pub struct CacheResidencyPool"));
+    assert!(runtime.contains("mod executor;"));
+    assert!(runtime.contains("mod lifecycle;"));
+    assert!(runtime.contains("mod storage;"));
+}
+
+#[test]
 fn llama_hot_path_remains_statically_dispatched_and_device_native() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

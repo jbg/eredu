@@ -110,19 +110,19 @@ fn facade_exports_are_the_canonical_core_types() {
     );
     assert_eq!(
         TypeId::of::<eredu::CacheIoExecutionState>(),
-        TypeId::of::<eredu::core::cache::CacheIoExecutionState>(),
+        TypeId::of::<eredu_runtime::CacheIoExecutionState>(),
     );
     assert_eq!(
         TypeId::of::<eredu::CachePoolLimits>(),
-        TypeId::of::<eredu::core::cache::CachePoolLimits>(),
+        TypeId::of::<eredu_runtime::CachePoolLimits>(),
     );
     assert_eq!(
         TypeId::of::<eredu::CacheResidencyPool>(),
-        TypeId::of::<eredu::core::cache::CacheResidencyPool>(),
+        TypeId::of::<eredu_runtime::CacheResidencyPool>(),
     );
     assert_eq!(
         TypeId::of::<eredu::CachePoolReport>(),
-        TypeId::of::<eredu::core::cache::CachePoolReport>(),
+        TypeId::of::<eredu_runtime::CachePoolReport>(),
     );
     assert_eq!(
         TypeId::of::<eredu::CacheBlockId>(),
@@ -150,27 +150,27 @@ fn facade_exports_are_the_canonical_core_types() {
     );
     assert_eq!(
         TypeId::of::<eredu::CacheBlockLifecycle>(),
-        TypeId::of::<eredu::core::cache::CacheBlockLifecycle>(),
+        TypeId::of::<eredu_runtime::CacheBlockLifecycle>(),
     );
     assert_eq!(
         TypeId::of::<eredu::MutableCacheTail>(),
-        TypeId::of::<eredu::core::cache::MutableCacheTail>(),
+        TypeId::of::<eredu_runtime::MutableCacheTail>(),
     );
     assert_eq!(
         TypeId::of::<eredu::CacheLifecycleError>(),
-        TypeId::of::<eredu::core::cache::CacheLifecycleError>(),
+        TypeId::of::<eredu_runtime::CacheLifecycleError>(),
     );
     assert_eq!(
         TypeId::of::<eredu::CacheStoragePhase>(),
-        TypeId::of::<eredu::core::cache::CacheStoragePhase>(),
+        TypeId::of::<eredu_runtime::CacheStoragePhase>(),
     );
     assert_eq!(
         TypeId::of::<eredu::CacheIoOperationKey>(),
-        TypeId::of::<eredu::core::cache::CacheIoOperationKey>(),
+        TypeId::of::<eredu_runtime::CacheIoOperationKey>(),
     );
     assert_eq!(
         TypeId::of::<eredu::CacheStorageError>(),
-        TypeId::of::<eredu::core::cache::CacheStorageError>(),
+        TypeId::of::<eredu_runtime::CacheStorageError>(),
     );
     assert_eq!(
         TypeId::of::<eredu::DistributedCapabilities>(),
