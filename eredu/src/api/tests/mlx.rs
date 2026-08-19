@@ -20,6 +20,7 @@ use crate::{
         deepseek_v3::model as deepseek_v3,
         deepseek_v4::model as deepseek_v4,
         gpt_oss::model as gpt_oss,
+        kimi_linear::model as kimi_linear,
         lfm2::model as lfm2,
         qwen::dense as dense_qwen,
         qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
@@ -1660,6 +1661,113 @@ fn tiny_lfm2_moe_neutral_runtime_executes_independent_expert_cache() {
     safemlx::transforms::eval([&logits]).unwrap();
     assert_eq!(logits.shape(), &[1, 2, 16]);
     assert!(model.expert_cache_report().unwrap().is_some());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let dir = temp_model_dir(
+        r#"{
+              "model_type":"kimi_linear","vocab_size":16,"hidden_size":8,
+              "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,
+              "intermediate_size":12,"head_dim":4,"model_max_length":64,
+              "rms_norm_eps":0.00001,"rope_theta":10000.0,
+              "linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],
+                "num_heads":2,"head_dim":4,"short_conv_kernel_size":3},
+              "num_experts":2,"moe_intermediate_size":4,"kv_lora_rank":4,
+              "q_lora_rank":null,"qk_nope_head_dim":2,"qk_rope_head_dim":2,
+              "v_head_dim":4,"mla_use_nope":true,"num_experts_per_token":1,
+              "num_shared_experts":1,"moe_router_activation_func":"sigmoid",
+              "moe_renormalize":true,"routed_scaling_factor":1.0,
+              "first_k_dense_replace":1,"moe_layer_freq":1,"use_grouped_topk":true,
+              "num_expert_group":1,"topk_group":1,"tie_word_embeddings":false,
+              "num_nextn_predict_layers":0
+            }"#,
+    );
+    let args = kimi_linear::get_model_args(&dir).unwrap();
+    let plan =
+        crate::composition::mlx_architectures::kimi_linear::checkpoint::safetensors_plan(&args)
+            .unwrap();
+    let mut tensors = plan.common_tensors;
+    for group in plan.layout_groups {
+        let packed = group
+            .variants
+            .into_iter()
+            .find(|variant| variant.id == "packed")
+            .unwrap();
+        tensors.extend(packed.tensors);
+    }
+    let arrays = tensors
+        .iter()
+        .map(|tensor| {
+            let shape = tensor
+                .shape
+                .iter()
+                .map(|dimension| i32::try_from(*dimension).unwrap())
+                .collect::<Vec<_>>();
+            (
+                tensor.key.clone(),
+                zeros_dtype(&shape, Dtype::Float32, stream).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Array::save_safetensors(
+        arrays.iter().map(|(name, array)| (name.as_str(), array)),
+        None,
+        dir.join("model.safetensors"),
+    )
+    .unwrap();
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+
+    let mut resident = crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
+        &dir,
+        eredu_runtime::LayerWeightResidency::FullyResident,
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let mut resident_cache = resident.new_cache();
+    let resident_logits = resident
+        .forward(&tokens, &mut resident_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&resident_logits]).unwrap();
+    assert_eq!(resident_logits.shape(), &[1, 2, 16]);
+
+    let mut bounded = crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
+        &dir,
+        eredu_runtime::LayerwiseLoadOptions::default(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let mut bounded_cache = bounded.new_cache();
+    let bounded_logits = bounded
+        .forward(&tokens, &mut bounded_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    assert_eq!(bounded_logits.shape(), resident_logits.shape());
+    assert!(bounded.residency_report().unwrap().initialized());
+
+    let mut sparse = crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_expert_cache_model(
+        &dir,
+        eredu_runtime::NonExpertWeightResidency::FullyResident,
+        eredu_runtime::ExpertCacheLoadOptions::default(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let mut sparse_cache = sparse.new_cache();
+    let sparse_logits = sparse.forward(&tokens, &mut sparse_cache, stream).unwrap();
+    safemlx::transforms::eval([&sparse_logits]).unwrap();
+    assert_eq!(sparse_logits.shape(), resident_logits.shape());
+    assert!(sparse.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
 }
 

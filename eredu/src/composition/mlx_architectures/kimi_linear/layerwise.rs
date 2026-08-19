@@ -1,8 +1,9 @@
 //! Bounded-residency execution for Kimi Linear safetensors and GGUF checkpoints.
 
 use eredu_runtime::{
-    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
-    NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
+    ExecutionGraph, ExecutionUnitLayout, ExpertCacheLoadOptions, ExpertIdentity, ExpertPass,
+    LayerWeightResidency, LayeredArchitecture, LayeredForwardState, LayerwiseRuntime,
+    NonExpertWeightResidency, ParallelLayeredArchitecture, StaticUnitBindings, WeightResidency,
 };
 
 use eredu_checkpoint::WeightQuantization;
@@ -15,6 +16,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Instant};
 
 use safemlx::{
     error::Exception,
+    macros::ModuleParameters,
     module::{Module, ModuleParameters, Param},
     nn,
     ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
@@ -38,13 +40,14 @@ use crate::{
             planned_optional_partition_widths, register_swiglu_projection_group,
             SwiGluProjectionNames, VocabParallelEmbedding, VocabParallelLmHead,
         },
+        shared::{MlxBackend, MlxParameterTree},
         tensor::create_causal_mask,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::{
         checkpoint::{
             binding::{
-                build_module_binding_plan_with_recipes,
+                binding_bytes, build_module_binding_plan_with_recipes,
                 build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
                 populate_module_from_lease, populate_module_from_lease_excluding,
             },
@@ -58,10 +61,13 @@ use crate::{
             register_projection_module, register_replicated_module, ParallelPlanBuilder,
             ProjectionSharding,
         },
+        execution::generic::{
+            prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+            MlxUnitFactory,
+        },
         execution::layerwise::{
-            load_layerwise_model, load_layerwise_model_with_quantization,
-            load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-            ArchitectureAdapter, LayerwiseModel, LoadTimeQuantizableAdapter,
+            open_safetensors_weight_store, quantize_module_store_with_bindings,
+            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
         },
         residency::{
             expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch},
@@ -397,36 +403,709 @@ fn register_kimi_layer_parallel_plan(
     Ok(())
 }
 
+type KimiLinearUnit = MlxParameterTree<DecoderLayer>;
+type KimiLinearStatic = MlxParameterTree<KimiLinearStaticModules>;
+type KimiLinearResidentRuntime =
+    LayerwiseRuntime<KimiLinearArchitecture, MlxBackend, Cache, MlxResidentPolicy<KimiLinearUnit>>;
+type KimiLinearBoundedRuntime = LayerwiseRuntime<
+    KimiLinearArchitecture,
+    MlxBackend,
+    Cache,
+    MlxLayerwisePolicy<KimiLinearUnit, KimiLinearUnitFactory>,
+>;
+
+enum KimiLinearExecution {
+    Resident(KimiLinearResidentRuntime),
+    Layerwise(KimiLinearBoundedRuntime),
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct KimiLinearReplicatedStatic {
+    #[param]
+    embedding: MaybeQuantized<nn::Embedding>,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct KimiLinearParallelStatic {
+    #[param]
+    embedding: VocabParallelEmbedding,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: Option<VocabParallelLmHead>,
+}
+
+#[derive(Debug, Clone)]
+enum KimiLinearStaticModules {
+    Replicated(KimiLinearReplicatedStatic),
+    Parallel(KimiLinearParallelStatic),
+}
+
+impl ModuleParameters for KimiLinearStaticModules {
+    fn num_parameters(&self) -> usize {
+        match self {
+            Self::Replicated(module) => module.num_parameters(),
+            Self::Parallel(module) => module.num_parameters(),
+        }
+    }
+
+    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        match self {
+            Self::Replicated(module) => module.parameters(),
+            Self::Parallel(module) => module.parameters(),
+        }
+    }
+
+    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+        match self {
+            Self::Replicated(module) => module.parameters_mut(),
+            Self::Parallel(module) => module.parameters_mut(),
+        }
+    }
+
+    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        match self {
+            Self::Replicated(module) => module.trainable_parameters(),
+            Self::Parallel(module) => module.trainable_parameters(),
+        }
+    }
+
+    fn freeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Replicated(module) => module.freeze_parameters(recursive),
+            Self::Parallel(module) => module.freeze_parameters(recursive),
+        }
+    }
+
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Replicated(module) => module.unfreeze_parameters(recursive),
+            Self::Parallel(module) => module.unfreeze_parameters(recursive),
+        }
+    }
+
+    fn all_frozen(&self) -> Option<bool> {
+        match self {
+            Self::Replicated(module) => module.all_frozen(),
+            Self::Parallel(module) => module.all_frozen(),
+        }
+    }
+
+    fn any_frozen(&self) -> Option<bool> {
+        match self {
+            Self::Replicated(module) => module.any_frozen(),
+            Self::Parallel(module) => module.any_frozen(),
+        }
+    }
+}
+
+impl KimiLinearStaticModules {
+    fn replicated(args: &ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        Ok(Self::Replicated(KimiLinearReplicatedStatic {
+            embedding: unloaded_maybe_quantized_embedding(
+                args.vocab_size,
+                args.hidden_size,
+                args.weight_quantization_for("model.embed_tokens.weight"),
+                stream,
+            )?,
+            norm: nn::RmsNorm::unloaded(
+                args.hidden_size,
+                args.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?,
+            lm_head: if args.tie_word_embeddings {
+                None
+            } else {
+                Some(unloaded_maybe_quantized_linear(
+                    args.hidden_size,
+                    args.vocab_size,
+                    false,
+                    args.weight_quantization_for("lm_head.weight"),
+                    stream,
+                )?)
+            },
+        }))
+    }
+
+    fn parallel(
+        args: &ModelArgs,
+        build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        Ok(Self::Parallel(KimiLinearParallelStatic {
+            embedding: VocabParallelEmbedding::unloaded(
+                args.vocab_size as usize,
+                args.hidden_size,
+                args.weight_quantization_for("model.embed_tokens.weight"),
+                build,
+                stream,
+            )?,
+            norm: nn::RmsNorm::unloaded(
+                args.hidden_size,
+                args.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?,
+            lm_head: if args.tie_word_embeddings {
+                None
+            } else {
+                Some(VocabParallelLmHead::unloaded(
+                    args.hidden_size,
+                    args.vocab_size as usize,
+                    args.weight_quantization_for("lm_head.weight"),
+                    build,
+                    stream,
+                )?)
+            },
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct KimiLinearUnitFactory {
+    args: ModelArgs,
+    parallel_layout: Option<Arc<eredu_runtime::LocalModelLayout>>,
+    sparse_experts: bool,
+}
+
+impl MlxUnitFactory<KimiLinearUnit> for KimiLinearUnitFactory {
+    fn build(&mut self, index: usize, stream: &Stream) -> Result<KimiLinearUnit, Error> {
+        let layer =
+            build_kimi_linear_unit(&self.args, index, self.parallel_layout.as_deref(), stream)?;
+        MlxParameterTree::new_filtered(layer, "", |name| {
+            !self.sparse_experts || !name.starts_with("mlp.experts.")
+        })
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+}
+
+struct KimiLinearArchitecture {
+    args: ModelArgs,
+    static_modules: KimiLinearStatic,
+    sparse_experts: bool,
+    expert_cache: Option<ExpertCache>,
+    parallel_cache_geometry: Option<Vec<resident::KimiLayerCacheGeometry>>,
+    parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
+}
+
+impl KimiLinearArchitecture {
+    fn new(args: ModelArgs, sparse_experts: bool, stream: &Stream) -> Result<Self, Error> {
+        Ok(Self {
+            static_modules: MlxParameterTree::new(
+                KimiLinearStaticModules::replicated(&args, stream)?,
+                "",
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+            args,
+            sparse_experts,
+            expert_cache: None,
+            parallel_cache_geometry: None,
+            parallel_topology: None,
+        })
+    }
+
+    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
+        if cache.layers.is_empty() {
+            *cache = Cache::new(&self.args);
+        }
+        cache.validate(&self.args.layer_schedule)
+    }
+}
+
+pub struct KimiLinearForwardContext {
+    mask: Option<Array>,
+}
+
+impl LayeredArchitecture<MlxBackend, Cache> for KimiLinearArchitecture {
+    type Input<'a> = &'a Array;
+    type StaticModules = KimiLinearStatic;
+    type Unit = KimiLinearUnit;
+    type ForwardContext = KimiLinearForwardContext;
+    type RetainedContextValues<'a> = std::option::Iter<'a, Array>;
+    type Error = Error;
+
+    fn model_identity(&self) -> &str {
+        &self.args.model_type
+    }
+
+    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+        ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
+    }
+
+    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
+        if group == 0 {
+            Ok(self.args.layer_schedule.len())
+        } else {
+            Err(Error::UnsupportedArchitecture(format!(
+                "Kimi Linear decoder has no execution group {group}"
+            )))
+        }
+    }
+
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+        if index >= self.group_unit_count(group)? {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Kimi Linear has no decoder unit {index}"
+            )));
+        }
+        Ok(format!("model.layers.{index}"))
+    }
+
+    fn static_modules(&self) -> &Self::StaticModules {
+        &self.static_modules
+    }
+
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        &mut self.static_modules
+    }
+
+    fn build_unit(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Unit, Error> {
+        self.group_unit_count(group)?;
+        let layer = build_kimi_linear_unit(&self.args, index, None, stream)?;
+        MlxParameterTree::new_filtered(layer, "", |name| {
+            !self.sparse_experts || !name.starts_with("mlp.experts.")
+        })
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.validate_cache(cache)?;
+        let KimiLinearStaticModules::Replicated(modules) = &mut *self.static_modules else {
+            return Err(Error::Parallel(
+                "Kimi Linear replicated execution received parallel static modules".into(),
+            ));
+        };
+        let hidden = modules.embedding.forward(input, stream)?;
+        let mask = kimi_linear_mask(&hidden, cache, stream)?;
+        Ok(LayeredForwardState {
+            hidden,
+            context: KimiLinearForwardContext { mask },
+        })
+    }
+
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial: &Array,
+        dependencies: &[&Array],
+        _cache: &mut Cache,
+        _forward: &mut Self::ForwardContext,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        match (group, dependencies) {
+            (0, []) => Ok(initial.clone()),
+            _ => Err(Error::UnsupportedArchitecture(format!(
+                "Kimi Linear group {group} received {} dependencies",
+                dependencies.len()
+            ))),
+        }
+    }
+
+    fn forward_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.group_unit_count(group)?;
+        let policy = self.args.layer_policy(index).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("missing Kimi Linear layer policy {index}"))
+        })?;
+        if self.sparse_experts && policy.feed_forward == FeedForwardPolicy::SparseMoe {
+            let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "Kimi Linear sparse expert cache was not initialized".into(),
+                )
+            })?;
+            let pass = if hidden.dim(1) > 1 {
+                ExpertPass::Prefill
+            } else {
+                ExpertPass::Decode
+            };
+            return Ok(layer.forward_sparse_experts(
+                hidden,
+                forward.mask.as_ref(),
+                Some(&mut cache.layers[index]),
+                stream,
+                |flat, indices, weights, stream| {
+                    execute_cached_kimi_experts(
+                        expert_cache,
+                        &self.args,
+                        index,
+                        pass,
+                        flat,
+                        indices,
+                        weights,
+                        stream,
+                    )
+                },
+            )?);
+        }
+        let mut observer = None;
+        Ok(layer.forward_impl(
+            hidden,
+            forward.mask.as_ref(),
+            Some(&mut cache.layers[index]),
+            stream,
+            &format!("model.layers.{index}"),
+            &mut observer,
+        )?)
+    }
+
+    fn finish_forward(
+        &mut self,
+        hidden: &Array,
+        _cache: &mut Cache,
+        _forward: &Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let KimiLinearStaticModules::Replicated(modules) = &mut *self.static_modules else {
+            return Err(Error::Parallel(
+                "Kimi Linear replicated execution received parallel static modules".into(),
+            ));
+        };
+        let hidden = modules.norm.forward(hidden, stream)?;
+        Ok(project_logits_maybe_quantized(
+            &mut modules.lm_head,
+            &mut modules.embedding,
+            &hidden,
+            stream,
+        )?)
+    }
+
+    fn retained_context_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _group: usize,
+        _index: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.mask.iter()
+    }
+}
+
+impl ParallelLayeredArchitecture<MlxBackend, Cache> for KimiLinearArchitecture {
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.validate_cache(cache)?;
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Kimi Linear parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        let KimiLinearStaticModules::Parallel(modules) = &mut *self.static_modules else {
+            return Err(Error::Parallel(
+                "Kimi Linear parallel execution received replicated static modules".into(),
+            ));
+        };
+        let hidden = modules.embedding.forward(input, &execution)?;
+        let mask = kimi_linear_mask(&hidden, cache, stream)?;
+        Ok(LayeredForwardState {
+            hidden,
+            context: KimiLinearForwardContext { mask },
+        })
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group_index: usize,
+        index: usize,
+        layer: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.group_unit_count(group_index)?;
+        Ok(layer.forward_tensor_parallel(
+            hidden,
+            forward.mask.as_ref(),
+            Some(&mut cache.layers[index]),
+            group,
+            stream,
+        )?)
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &Array,
+        _cache: &mut Cache,
+        _forward: &Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Kimi Linear parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        let KimiLinearStaticModules::Parallel(modules) = &mut *self.static_modules else {
+            return Err(Error::Parallel(
+                "Kimi Linear parallel execution received replicated static modules".into(),
+            ));
+        };
+        let hidden = modules.norm.forward(hidden, stream)?;
+        let logits = match &mut modules.lm_head {
+            Some(head) => head.forward(&hidden, &execution)?,
+            None => modules.embedding.project_logits(&hidden, &execution)?,
+        };
+        logits.all_gather(&execution)
+    }
+}
+
+fn kimi_linear_mask(
+    hidden: &Array,
+    cache: &Cache,
+    stream: &Stream,
+) -> Result<Option<Array>, Error> {
+    let offset = cache.offset();
+    if hidden.dim(1) > 1 && offset > 0 {
+        Ok(Some(create_causal_mask(
+            hidden.dim(1),
+            Some(offset),
+            None,
+            None,
+            stream,
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn build_kimi_linear_unit(
+    args: &ModelArgs,
+    index: usize,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
+    stream: &Stream,
+) -> Result<DecoderLayer, Error> {
+    let Some(layout) = layout else {
+        return Ok(DecoderLayer::new(args, index, stream)?);
+    };
+    let prefix = format!("model.layers.{index}");
+    let find = |name: &str| {
+        layout
+            .tensor(&format!("{prefix}.{name}.weight"))
+            .or_else(|| layout.tensor(&format!("{prefix}.{name}.inner.weight")))
+    };
+    let mut local = args.clone();
+    match args
+        .layer_policy(index)
+        .ok_or_else(|| Error::Parallel(format!("missing Kimi layer policy {index}")))?
+        .attention
+    {
+        resident::AttentionKind::Kda => {
+            let query = find("self_attn.q_proj")
+                .ok_or_else(|| Error::Parallel(format!("missing KDA query layout for {prefix}")))?;
+            let width = i32::try_from(query.local_shape()[0])
+                .map_err(|_| Error::Parallel("Kimi local KDA query width exceeds i32".into()))?;
+            if width % args.kda_config.head_dim != 0 {
+                return Err(Error::Parallel(format!(
+                    "Kimi local KDA query width {width} splits head dimension {}",
+                    args.kda_config.head_dim
+                )));
+            }
+            local.kda_config.num_heads = width / args.kda_config.head_dim;
+        }
+        resident::AttentionKind::Mla => {
+            let query = find(if args.q_lora_rank.is_some() {
+                "self_attn.q_b_proj"
+            } else {
+                "self_attn.q_proj"
+            })
+            .ok_or_else(|| Error::Parallel(format!("missing MLA query layout for {prefix}")))?;
+            let head_width = args.qk_nope_head_dim + args.qk_rope_head_dim;
+            let width = i32::try_from(query.local_shape()[0])
+                .map_err(|_| Error::Parallel("Kimi local MLA query width exceeds i32".into()))?;
+            if width % head_width != 0 {
+                return Err(Error::Parallel(format!(
+                    "Kimi local MLA query width {width} splits head width {head_width}"
+                )));
+            }
+            local.num_attention_heads = width / head_width;
+        }
+    }
+    let dense = find("mlp.gate_proj")
+        .map(|value| {
+            i32::try_from(value.local_shape()[0])
+                .map_err(|_| Error::Parallel("Kimi local dense width exceeds i32".into()))
+        })
+        .transpose()?
+        .unwrap_or(local.intermediate_size);
+    let routed = layout
+        .tensor(&format!("{prefix}.mlp.experts.gate_up_proj"))
+        .map(|value| {
+            let packed = i32::try_from(value.local_shape()[1]).map_err(|_| {
+                Error::Parallel("Kimi local routed expert width exceeds i32".into())
+            })?;
+            if packed % 2 != 0 {
+                return Err(Error::Parallel(format!(
+                    "Kimi local packed expert width {packed} is not even"
+                )));
+            }
+            Ok(packed / 2)
+        })
+        .transpose()?
+        .unwrap_or(local.moe_intermediate_size);
+    let shared = find("mlp.shared_experts.gate_proj")
+        .map(|value| {
+            i32::try_from(value.local_shape()[0])
+                .map_err(|_| Error::Parallel("Kimi local shared expert width exceeds i32".into()))
+        })
+        .transpose()?
+        .unwrap_or(local.moe_intermediate_size * local.num_shared_experts);
+    Ok(DecoderLayer::new_with_widths(
+        &local, index, dense, routed, shared, stream,
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_cached_kimi_experts(
+    expert_cache: &ExpertCache,
+    args: &ModelArgs,
+    index: usize,
+    pass: ExpertPass,
+    flat: &Array,
+    indices: &Array,
+    weights: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    expert_cache
+        .execute_routes_bounded(
+            ExpertRouteBatch::new(index, flat, indices, weights, pass),
+            stream,
+            |flat, acquired, weights, stream| {
+                let started = Instant::now();
+                let prefix = format!("model.layers.{index}.mlp.experts");
+                let load_time = expert_cache.weight_quantization();
+                let mut bank = crate::backend::mlx::nn::moe::PackedSwiGluExperts::new(
+                    acquired.identities().len() as i32,
+                    args.hidden_size,
+                    args.moe_intermediate_size,
+                    load_time.or_else(|| {
+                        args.weight_quantization_for(&format!("{prefix}.gate_up_proj"))
+                    }),
+                    load_time
+                        .or_else(|| args.weight_quantization_for(&format!("{prefix}.down_proj"))),
+                    stream,
+                )?;
+                bank.gate_up_proj = Param::new(
+                    acquired
+                        .compact_binding("gate_up_proj", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.gate_up_proj_scales = Param::new(
+                    acquired
+                        .optional_compact_binding("gate_up_proj_scales", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.gate_up_proj_biases = Param::new(
+                    acquired
+                        .optional_compact_binding("gate_up_proj_biases", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.down_proj = Param::new(
+                    acquired
+                        .compact_binding("down_proj", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.down_proj_scales = Param::new(
+                    acquired
+                        .optional_compact_binding("down_proj_scales", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.down_proj_biases = Param::new(
+                    acquired
+                        .optional_compact_binding("down_proj_biases", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                expert_cache.record_compact_bank(
+                    pass,
+                    acquired.scratch_bytes(),
+                    started.elapsed(),
+                )?;
+                Ok(bank.forward(flat, acquired.compact_routes(), weights, stream)?)
+            },
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
+}
+
 /// Kimi Linear causal LM with a bounded decoder-layer window.
 pub struct KimiLinearLayerwiseModel {
-    execution: LayerwiseModel<KimiLinearLayerwiseAdapter>,
+    execution: KimiLinearExecution,
+    metadata: eredu_runtime::LayerwiseModelMetadata,
+    parallel_info:
+        Option<eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
 }
 
 impl KimiLinearLayerwiseModel {
+    fn architecture(&self) -> &KimiLinearArchitecture {
+        match &self.execution {
+            KimiLinearExecution::Resident(execution) => execution.architecture(),
+            KimiLinearExecution::Layerwise(execution) => execution.architecture(),
+        }
+    }
+
+    fn architecture_mut(&mut self) -> &mut KimiLinearArchitecture {
+        match &mut self.execution {
+            KimiLinearExecution::Resident(execution) => execution.architecture_mut(),
+            KimiLinearExecution::Layerwise(execution) => execution.architecture_mut(),
+        }
+    }
+
+    fn prompt_cache_rank_identity(&self) -> Option<crate::core::cache::CacheRankIdentity> {
+        self.parallel_topology
+            .map(crate::backend::mlx::cache::prompt_cache_topology)
+            .and_then(|topology| topology.cache_rank_identity())
+    }
+
     /// Returns the validated architecture configuration.
     pub fn args(&self) -> &ModelArgs {
-        self.execution.adapter().args()
+        &self.architecture().args
     }
 
     pub(crate) fn bind_parallel_topology(
         &mut self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) {
-        self.execution.bind_parallel_topology(topology);
+        self.parallel_topology = Some(topology);
+        self.architecture_mut().parallel_topology = Some(topology);
     }
 
     /// Creates an empty heterogeneous KDA/MLA cache.
     pub fn new_cache(&self) -> Cache {
-        Cache::new(self.args())
+        Cache::new_with_geometry(
+            self.args(),
+            self.architecture().parallel_cache_geometry.as_deref(),
+        )
+        .expect("validated Kimi Linear state geometry")
     }
 
     /// Creates device-resident or blockwise-paged MLA state. KDA's bounded
     /// convolution and recurrent tensors remain resident under either policy.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
-        Cache::new_with_options_and_rank(
+        Cache::new_with_options_geometry(
             self.args(),
             policy,
-            self.execution.prompt_cache_rank_identity(),
+            self.prompt_cache_rank_identity(),
+            self.architecture().parallel_cache_geometry.as_deref(),
         )
         .map_err(Into::into)
     }
@@ -443,19 +1122,27 @@ impl KimiLinearLayerwiseModel {
     pub fn parallel_info(
         &self,
     ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
-        self.execution.parallel_info()
+        self.parallel_info.as_ref()
+    }
+
+    pub fn residency_metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
+        &self.metadata
     }
 
     /// Returns this rank's exact prompt-cache state layout.
     pub fn prompt_cache_layer_layout(
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
-        self.execution.prompt_cache_layer_layout()
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
     }
 
     /// Returns the exact rank-local prompt-cache identity.
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        self.execution.prompt_cache_model_identity()
+        kimi_linear_prompt_cache_identity(
+            self.args(),
+            self.parallel_topology,
+            self.architecture().parallel_cache_geometry.as_deref(),
+        )
     }
 
     /// Returns the cache-relevant architecture fingerprint for this rank.
@@ -471,16 +1158,18 @@ impl KimiLinearLayerwiseModel {
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-        stream: &Stream,
+        _stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
-        self.execution.save_prompt_cache(
+        let rank = descriptor.topology.cache_rank_identity();
+        resident::Model::save_prompt_cache_with_rank(
             cache,
             destination,
             descriptor,
             prefix_token_ids,
             options,
-            stream,
+            rank,
         )
+        .map_err(Into::into)
     }
 
     /// Restores a compatible prefix cache.
@@ -492,37 +1181,56 @@ impl KimiLinearLayerwiseModel {
         options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(Cache, PromptCacheManifest), Error> {
-        self.execution
-            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+        resident::Model::load_paged_prompt_cache_with_identity(
+            self.args(),
+            directory,
+            expected,
+            prefix_token_ids,
+            &self.prompt_cache_model_identity()?,
+            options,
+            stream,
+        )
+        .map_err(Into::into)
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
-        self.execution.checkpoint_store()
+    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
+        match &self.execution {
+            KimiLinearExecution::Resident(execution) => execution.policy().checkpoint_store(),
+            KimiLinearExecution::Layerwise(execution) => execution.policy().checkpoint_store(),
+        }
     }
 
     pub(crate) fn checkpoint_store_arc(
         &self,
     ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
-        self.execution.checkpoint_store_arc()
+        match &self.execution {
+            KimiLinearExecution::Resident(execution) => execution.policy().checkpoint_store_arc(),
+            KimiLinearExecution::Layerwise(execution) => execution.policy().checkpoint_store_arc(),
+        }
     }
 
     /// Returns current weight-residency telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
-        self.execution.residency_report()
+        match &self.execution {
+            KimiLinearExecution::Resident(execution) => execution.policy().residency_report(),
+            KimiLinearExecution::Layerwise(execution) => execution.policy().residency_report(),
+        }
     }
 
     /// Returns disk-stream telemetry when that policy is active.
     pub fn dense_stream_report(
         &self,
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
-        self.execution.dense_stream_report()
+        match &self.execution {
+            KimiLinearExecution::Resident(_) => Ok(None),
+            KimiLinearExecution::Layerwise(execution) => execution.policy().dense_stream_report(),
+        }
     }
 
     /// Returns sparse routed-expert cache telemetry when enabled.
     pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
-        self.execution
-            .adapter()
+        self.architecture()
             .expert_cache
             .as_ref()
             .map(ExpertCache::report)
@@ -537,7 +1245,14 @@ impl KimiLinearLayerwiseModel {
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        self.execution.forward(inputs, cache, stream)
+        match &mut self.execution {
+            KimiLinearExecution::Resident(execution) => execution
+                .forward(inputs, cache, stream)
+                .map_err(kimi_linear_layerwise_error),
+            KimiLinearExecution::Layerwise(execution) => execution
+                .forward(inputs, cache, stream)
+                .map_err(kimi_linear_layerwise_error),
+        }
     }
 
     /// Runs the canonical execution path with stable per-layer observation points.
@@ -548,8 +1263,31 @@ impl KimiLinearLayerwiseModel {
         stream: &Stream,
         observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
-        self.execution
-            .forward_with_observer(inputs, cache, stream, observer)
+        let hook = |_architecture: &mut KimiLinearArchitecture,
+                    _group: usize,
+                    index: usize,
+                    layer: &mut KimiLinearUnit,
+                    hidden: &Array,
+                    cache: &mut Cache,
+                    context: &mut KimiLinearForwardContext,
+                    stream: &Stream| {
+            Ok(layer.forward_stage_with_observer(
+                hidden,
+                context.mask.as_ref(),
+                Some(&mut cache.layers[index]),
+                stream,
+                &format!("model.layers.{index}"),
+                observer,
+            )?)
+        };
+        match &mut self.execution {
+            KimiLinearExecution::Resident(execution) => execution
+                .forward_with_unit_executor(inputs, cache, stream, hook)
+                .map_err(kimi_linear_layerwise_error),
+            KimiLinearExecution::Layerwise(execution) => execution
+                .forward_with_unit_executor(inputs, cache, stream, hook)
+                .map_err(kimi_linear_layerwise_error),
+        }
     }
 
     /// Runs a rank-local tensor-parallel KDA/MLA forward pass.
@@ -560,8 +1298,14 @@ impl KimiLinearLayerwiseModel {
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        self.execution
-            .forward_tensor_parallel(inputs, cache, group, stream)
+        match &mut self.execution {
+            KimiLinearExecution::Resident(execution) => execution
+                .forward_parallel(inputs, cache, group, stream)
+                .map_err(kimi_linear_layerwise_error),
+            KimiLinearExecution::Layerwise(execution) => execution
+                .forward_parallel(inputs, cache, group, stream)
+                .map_err(kimi_linear_layerwise_error),
+        }
     }
 
     /// Runs streamed layers while delegating routed experts to a caller.
@@ -576,20 +1320,30 @@ impl KimiLinearLayerwiseModel {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        self.execution.forward_with_layer_executor(
-            inputs,
-            cache,
-            stream,
-            |_adapter, _group, index, layer, hidden, cache, context, stream| {
-                Ok(layer.forward_sparse_experts(
-                    hidden,
-                    mask.or(context.mask.as_ref()),
-                    Some(&mut cache.layers[index]),
-                    stream,
-                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
-                )?)
-            },
-        )
+        let execute_unit = |_architecture: &mut KimiLinearArchitecture,
+                            _group: usize,
+                            index: usize,
+                            layer: &mut KimiLinearUnit,
+                            hidden: &Array,
+                            cache: &mut Cache,
+                            context: &mut KimiLinearForwardContext,
+                            stream: &Stream| {
+            Ok(layer.forward_sparse_experts(
+                hidden,
+                mask.or(context.mask.as_ref()),
+                Some(&mut cache.layers[index]),
+                stream,
+                |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+            )?)
+        };
+        match &mut self.execution {
+            KimiLinearExecution::Resident(execution) => execution
+                .forward_with_unit_executor(inputs, cache, stream, execute_unit)
+                .map_err(kimi_linear_layerwise_error),
+            KimiLinearExecution::Layerwise(execution) => execution
+                .forward_with_unit_executor(inputs, cache, stream, execute_unit)
+                .map_err(kimi_linear_layerwise_error),
+        }
     }
 
     /// Runs TP-sharded KDA/MLA and dense/shared projections while delegating
@@ -606,32 +1360,56 @@ impl KimiLinearLayerwiseModel {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        self.execution.forward_tensor_parallel_with_layer_executor(
-            inputs,
-            cache,
-            tensor_group,
-            stream,
-            |_adapter, _group, index, layer, hidden, cache, context, execution| {
-                let tp_group = execution.group().ok_or_else(|| {
-                    Error::Parallel(
-                        "Kimi Linear TP+EP execution requires an active TP group".into(),
-                    )
-                })?;
-                Ok(layer.forward_tensor_with_expert_executor(
-                    hidden,
-                    mask.or(context.mask.as_ref()),
-                    Some(&mut cache.layers[index]),
-                    tp_group,
-                    execution.stream(),
-                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
-                )?)
-            },
-        )
+        let execute_unit = |_architecture: &mut KimiLinearArchitecture,
+                            _group: usize,
+                            index: usize,
+                            layer: &mut KimiLinearUnit,
+                            hidden: &Array,
+                            cache: &mut Cache,
+                            context: &mut KimiLinearForwardContext,
+                            group: &safemlx::distributed::Group,
+                            stream: &Stream| {
+            Ok(layer.forward_tensor_with_expert_executor(
+                hidden,
+                mask.or(context.mask.as_ref()),
+                Some(&mut cache.layers[index]),
+                group,
+                stream,
+                |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+            )?)
+        };
+        match &mut self.execution {
+            KimiLinearExecution::Resident(execution) => execution
+                .forward_parallel_with_unit_executor(
+                    inputs,
+                    cache,
+                    tensor_group,
+                    stream,
+                    execute_unit,
+                )
+                .map_err(kimi_linear_layerwise_error),
+            KimiLinearExecution::Layerwise(execution) => execution
+                .forward_parallel_with_unit_executor(
+                    inputs,
+                    cache,
+                    tensor_group,
+                    stream,
+                    execute_unit,
+                )
+                .map_err(kimi_linear_layerwise_error),
+        }
     }
 
     /// Evicts temporary decoder layers from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
-        self.execution.clear_device_group("text_decoder")
+        match &self.execution {
+            KimiLinearExecution::Resident(execution) => {
+                execution.policy().clear_device_group("text_decoder")
+            }
+            KimiLinearExecution::Layerwise(execution) => {
+                execution.policy().clear_device_group("text_decoder")
+            }
+        }
     }
 }
 
@@ -664,6 +1442,548 @@ impl CausalModel<Cache> for KimiLinearLayerwiseModel {
     }
 }
 
+fn kimi_linear_layerwise_error(error: impl std::fmt::Display) -> Error {
+    Error::Parallel(error.to_string())
+}
+
+fn kimi_linear_execution_layout(args: &ModelArgs) -> Result<ExecutionUnitLayout, Error> {
+    let graph = ExecutionGraph::chain(["text_decoder"])?;
+    ExecutionUnitLayout::new(&graph, [args.layer_schedule.len()])
+        .map_err(|error| Error::Parallel(error.to_string()))
+}
+
+fn kimi_linear_prompt_cache_identity(
+    args: &ModelArgs,
+    topology: Option<crate::backend::mlx::MlxParallelContext>,
+    parallel_geometry: Option<&[resident::KimiLayerCacheGeometry]>,
+) -> Result<PromptCacheModelIdentity, Error> {
+    let geometry = match topology {
+        Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => parallel_geometry
+            .ok_or_else(|| {
+                Error::Parallel(
+                    "Kimi parallel cache identity requested before local layout configuration"
+                        .into(),
+                )
+            })?
+            .to_vec(),
+        _ => args
+            .layer_schedule
+            .iter()
+            .map(|policy| resident::KimiLayerCacheGeometry {
+                kda_heads: (policy.attention == resident::AttentionKind::Kda)
+                    .then_some(args.kda_config.num_heads),
+            })
+            .collect(),
+    };
+    let layer_count = args.layer_schedule.len();
+    Ok(PromptCacheModelIdentity {
+        model_family: "kimi_linear".into(),
+        effective_model_type: args.model_type.clone(),
+        architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(args),
+        layer_count,
+        global_layer_start: 0,
+        global_layer_end: layer_count,
+        sink_tokens: 0,
+        layer_prefix_offsets: vec![0; layer_count],
+        topology: topology.map_or_else(
+            PromptCacheTopology::default,
+            crate::backend::mlx::cache::prompt_cache_topology,
+        ),
+        layer_layout: resident::prompt_cache_layer_layout_with_geometry(args, &geometry)
+            .map_err(|error| Exception::custom(error.to_string()))?,
+    })
+}
+
+fn name_kimi_binding(binding: WeightBinding, name: String) -> Result<WeightBinding, Error> {
+    binding.with_name(name).map_err(Into::into)
+}
+
+fn kimi_linear_static_bindings(
+    modules: &KimiLinearStaticModules,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    let KimiLinearStaticModules::Replicated(modules) = modules else {
+        return Err(Error::Parallel(
+            "Kimi global static binding model is sharded".into(),
+        ));
+    };
+    let mut bindings = build_module_binding_plan_with_recipes(
+        &modules.embedding,
+        "model.embed_tokens",
+        store,
+        BTreeMap::new(),
+    )?
+    .build_bindings(store)?
+    .into_iter()
+    .map(|binding| {
+        let name = format!("embedding.{}", binding.name());
+        name_kimi_binding(binding, name)
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    bindings.extend(
+        build_module_binding_plan_with_recipes(
+            &modules.norm,
+            "model.norm",
+            store,
+            BTreeMap::new(),
+        )?
+        .build_bindings(store)?
+        .into_iter()
+        .map(|binding| {
+            let name = format!("norm.{}", binding.name());
+            name_kimi_binding(binding, name)
+        })
+        .collect::<Result<Vec<_>, _>>()?,
+    );
+    if let Some(head) = &modules.lm_head {
+        bindings.extend(
+            build_module_binding_plan_with_recipes(head, "lm_head", store, BTreeMap::new())?
+                .build_bindings(store)?
+                .into_iter()
+                .map(|binding| {
+                    let name = format!("lm_head.{}", binding.name());
+                    name_kimi_binding(binding, name)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    Ok(bindings)
+}
+
+fn kimi_split_expert_recipe(
+    args: &ModelArgs,
+    local_name: &str,
+    prefix: &str,
+    normalized: &BTreeMap<String, String>,
+) -> Result<Option<DerivedWeightRecipe>, Error> {
+    let component = if local_name == "mlp.experts.gate_up_proj" {
+        Some(("gate_up", "weight", ""))
+    } else if local_name == "mlp.experts.gate_up_proj_scales" {
+        Some(("gate_up", "scales", "_scales"))
+    } else if local_name == "mlp.experts.gate_up_proj_biases" {
+        Some(("gate_up", "biases", "_biases"))
+    } else if local_name == "mlp.experts.down_proj" {
+        Some(("down", "weight", ""))
+    } else {
+        None
+    };
+    let Some((projection, checkpoint_component, suffix)) = component else {
+        return Ok(None);
+    };
+    if projection == "gate_up" {
+        match (
+            normalized.get(&format!("{prefix}.mlp.experts.gate_proj{suffix}")),
+            normalized.get(&format!("{prefix}.mlp.experts.up_proj{suffix}")),
+        ) {
+            (Some(gate), Some(up)) => {
+                return Ok(Some(DerivedWeightRecipe::Concatenate {
+                    axis: 1,
+                    inputs: vec![
+                        DerivedWeightRecipe::source(gate.clone(), TensorSelection::Full),
+                        DerivedWeightRecipe::source(up.clone(), TensorSelection::Full),
+                    ],
+                }));
+            }
+            (None, None) => {}
+            _ => {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Kimi checkpoint {prefix} has mismatched packed gate/up expert tensors"
+                )));
+            }
+        }
+    }
+    if checkpoint_component != "weight" {
+        return Ok(None);
+    }
+    let mut experts = Vec::with_capacity(args.num_experts as usize);
+    for expert in 0..args.num_experts {
+        let source = |name: &str| -> Result<DerivedWeightRecipe, Error> {
+            let runtime = format!("{prefix}.mlp.experts.{expert}.{name}.{checkpoint_component}");
+            let raw = normalized.get(&runtime).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Kimi Linear checkpoint is missing expert tensor {runtime}"
+                ))
+            })?;
+            Ok(DerivedWeightRecipe::source(
+                raw.clone(),
+                TensorSelection::Full,
+            ))
+        };
+        experts.push(if projection == "gate_up" {
+            DerivedWeightRecipe::Concatenate {
+                axis: 0,
+                inputs: vec![source("w1")?, source("w3")?],
+            }
+        } else {
+            source("w2")?
+        });
+    }
+    Ok(Some(DerivedWeightRecipe::Stack {
+        axis: 0,
+        inputs: experts,
+    }))
+}
+
+fn kimi_linear_layer_recipes(
+    args: &ModelArgs,
+    layer: &DecoderLayer,
+    index: usize,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
+    let prefix = format!("model.layers.{index}");
+    let normalized = normalized_checkpoint_keys(store);
+    let keys = store.source_keys();
+    let gguf = store.source_diagnostics()?.backend == WeightStoreBackend::Gguf;
+    let mut recipes = BTreeMap::new();
+    for local_name in layer.parameters().flatten().keys() {
+        let destination = format!("{prefix}.{local_name}");
+        let canonical = canonical_checkpoint_name(&destination);
+        if let Some(raw) = normalized.get(&canonical) {
+            let mut recipe = DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full);
+            if local_name.ends_with("q_conv1d.weight")
+                || local_name.ends_with("k_conv1d.weight")
+                || local_name.ends_with("v_conv1d.weight")
+            {
+                recipe = DerivedWeightRecipe::Reshape {
+                    input: Box::new(recipe),
+                    shape: vec![
+                        (args.kda_config.num_heads * args.kda_config.head_dim) as usize,
+                        1,
+                        args.kda_config.short_conv_kernel_size as usize,
+                    ],
+                };
+            } else if local_name.ends_with("A_log") {
+                recipe = DerivedWeightRecipe::Reshape {
+                    input: Box::new(recipe),
+                    shape: vec![1, 1, args.kda_config.num_heads as usize, 1],
+                };
+                if gguf {
+                    recipe = DerivedWeightRecipe::NegLog {
+                        input: Box::new(recipe),
+                    };
+                }
+            } else if keys.contains(&destination) || keys.contains(&canonical) {
+                continue;
+            }
+            recipes.insert(local_name.to_string(), recipe);
+        } else if let Some(recipe) =
+            kimi_split_expert_recipe(args, local_name.as_ref(), &prefix, &normalized)?
+        {
+            recipes.insert(local_name.to_string(), recipe);
+        } else {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Kimi Linear checkpoint is missing runtime parameter {canonical}"
+            )));
+        }
+    }
+    Ok(recipes)
+}
+
+fn kimi_linear_unit_bindings(
+    args: &ModelArgs,
+    index: usize,
+    layer: &DecoderLayer,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    sparse_experts: bool,
+) -> Result<Vec<WeightBinding>, Error> {
+    Ok(build_module_binding_plan_with_recipes_excluding(
+        layer,
+        &format!("model.layers.{index}"),
+        store,
+        kimi_linear_layer_recipes(args, layer, index, store)?,
+        |name| sparse_experts && name.starts_with("mlp.experts."),
+    )?
+    .build_bindings(store)?)
+}
+
+fn resolve_kimi_linear_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    args: &ModelArgs,
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
+    if store.is_checkpoint_contract_resolved()
+        || store.source_diagnostics()?.backend != WeightStoreBackend::Safetensors
+    {
+        return Ok(store);
+    }
+    let plan = super::checkpoint::safetensors_plan(args).map_err(Error::UnsupportedArchitecture)?;
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "Kimi Linear checkpoint contract did not resolve: {validation:?}"
+            ))
+        })?;
+    Ok(Arc::new(
+        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
+    ))
+}
+
+fn quantize_kimi_linear_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    source_args: &ModelArgs,
+    sparse_experts: bool,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<
+    (
+        Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        ModelArgs,
+        eredu_runtime::WeightMaterializationReport,
+    ),
+    Error,
+> {
+    let mut target_args = source_args.clone();
+    target_args.quantization = Some(quantization);
+    target_args.quantized_weight_configs = None;
+    let source_static = KimiLinearStaticModules::replicated(source_args, stream)?;
+    let target_static = KimiLinearStaticModules::replicated(&target_args, stream)?;
+    let source_units = source_args.clone();
+    let target_units = target_args.clone();
+    let binding_args = source_args.clone();
+    let (store, report) = quantize_module_store_with_bindings(
+        store,
+        &source_static,
+        &target_static,
+        move |index, stream| DecoderLayer::new(&source_units, index, stream).map_err(Into::into),
+        move |index, stream| DecoderLayer::new(&target_units, index, stream).map_err(Into::into),
+        source_args.layer_schedule.len(),
+        quantization,
+        stream,
+        |modules, store| kimi_linear_static_bindings(modules, store),
+        move |index, layer, store| {
+            kimi_linear_unit_bindings(&binding_args, index, layer, store, sparse_experts)
+        },
+    )?;
+    Ok((store, target_args, report))
+}
+
+fn load_kimi_linear_with_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    args: ModelArgs,
+    options: LayerWeightResidency,
+    quantization: Option<WeightQuantization>,
+    sparse_experts: bool,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<KimiLinearLayerwiseModel, Error> {
+    let store = resolve_kimi_linear_store(store, &args)?;
+    let (store, args, materialization) = match quantization {
+        Some(quantization) => {
+            let (store, args, report) =
+                quantize_kimi_linear_store(store, &args, sparse_experts, quantization, stream)?;
+            (store, args, Some(report))
+        }
+        None => (store, args, None),
+    };
+    let mut architecture = KimiLinearArchitecture::new(args.clone(), sparse_experts, stream)?;
+    let factory = KimiLinearUnitFactory {
+        args: args.clone(),
+        parallel_layout: None,
+        sparse_experts,
+    };
+    let binding_args = args.clone();
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        kimi_linear_execution_layout(&args)?,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse_experts && key.contains(".mlp.experts."),
+        |modules, store| kimi_linear_static_bindings(&**modules, store),
+        move |index, unit, store, _| {
+            kimi_linear_unit_bindings(&binding_args, index, &unit, store, sparse_experts)
+        },
+    )?;
+    metadata.set_model_type(args.model_type.clone());
+    metadata.set_quantization(args.quantization);
+    metadata.set_materialization(materialization);
+    let execution = if options.is_fully_resident() {
+        KimiLinearExecution::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        KimiLinearExecution::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(KimiLinearLayerwiseModel {
+        execution,
+        metadata,
+        parallel_info: None,
+        parallel_topology: None,
+    })
+}
+
+fn register_kimi_linear_parallel_parameters(
+    planner: &mut ParallelPlanBuilder,
+    args: &ModelArgs,
+    stream: &Stream,
+) -> Result<(), Error> {
+    let KimiLinearStaticModules::Replicated(modules) =
+        KimiLinearStaticModules::replicated(args, stream)?
+    else {
+        unreachable!()
+    };
+    planner.register(
+        crate::backend::mlx::nn::parallel::vocab_embedding_parameter_group(
+            &modules.embedding,
+            "model.embed_tokens",
+            args.vocab_size as usize,
+            args.hidden_size,
+            false,
+        )?,
+    )?;
+    crate::backend::mlx::nn::parallel::register_replicated_parameter_group(
+        planner,
+        &modules.norm,
+        "model.norm",
+    )?;
+    if let Some(head) = &modules.lm_head {
+        planner.register(
+            crate::backend::mlx::nn::parallel::vocab_lm_head_parameter_group(
+                head,
+                "lm_head",
+                args.hidden_size,
+                args.vocab_size as usize,
+                false,
+            )?,
+        )?;
+    }
+    for index in 0..args.layer_schedule.len() {
+        let layer = DecoderLayer::new(args, index, stream)?;
+        register_kimi_layer_parallel_plan(planner, &layer, args, index)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_kimi_linear_parallel_with_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    args: ModelArgs,
+    options: LayerWeightResidency,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    sparse_experts: bool,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<KimiLinearLayerwiseModel, Error> {
+    let store = resolve_kimi_linear_store(store, &args)?;
+    let mut planner = build.planner();
+    register_kimi_linear_parallel_parameters(&mut planner, &args, stream)?;
+    let (_, local_layout) = planner.finish()?;
+    if local_layout.is_empty() {
+        return Err(Error::Parallel(
+            "Kimi Linear declared no tensor-parallel parameters".into(),
+        ));
+    }
+    let mut architecture = KimiLinearArchitecture::new(args.clone(), sparse_experts, stream)?;
+    architecture.static_modules =
+        MlxParameterTree::new(KimiLinearStaticModules::parallel(&args, build, stream)?, "")
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+    architecture.parallel_topology = Some(build.topology());
+    let kda_heads = planned_optional_partition_widths(
+        &local_layout,
+        args.layer_schedule
+            .iter()
+            .map(|policy| policy.attention == resident::AttentionKind::Kda),
+        args.kda_config.head_dim,
+        "model.layers",
+        "self_attn.q_proj",
+    )?;
+    architecture.parallel_cache_geometry = Some(
+        kda_heads
+            .into_iter()
+            .map(|kda_heads| resident::KimiLayerCacheGeometry { kda_heads })
+            .collect(),
+    );
+
+    let global_static = KimiLinearStaticModules::replicated(&args, stream)?;
+    let static_bindings = kimi_linear_static_bindings(&global_static, store.as_ref())?;
+    let mut global_parameter_bytes = binding_bytes(&static_bindings)?;
+    for index in 0..args.layer_schedule.len() {
+        let layer = DecoderLayer::new(&args, index, stream)?;
+        global_parameter_bytes = global_parameter_bytes
+            .checked_add(binding_bytes(&kimi_linear_unit_bindings(
+                &args,
+                index,
+                &layer,
+                store.as_ref(),
+                sparse_experts,
+            )?)?)
+            .ok_or_else(|| Error::Parallel("Kimi global parameter bytes overflowed".into()))?;
+    }
+    let shared_layout = Arc::new(local_layout);
+    let factory = KimiLinearUnitFactory {
+        args: args.clone(),
+        parallel_layout: Some(Arc::clone(&shared_layout)),
+        sparse_experts,
+    };
+    let static_layout = Arc::clone(&shared_layout);
+    let unit_layout = Arc::clone(&shared_layout);
+    let binding_args = args.clone();
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        kimi_linear_execution_layout(&args)?,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse_experts && key.contains(".mlp.experts."),
+        move |_, store| shard_layer_bindings(static_bindings, "", store, &static_layout),
+        move |index, _local, store, stream| {
+            let global = DecoderLayer::new(&binding_args, index, stream)?;
+            let bindings =
+                kimi_linear_unit_bindings(&binding_args, index, &global, store, sparse_experts)?;
+            shard_layer_bindings(
+                bindings,
+                &format!("model.layers.{index}"),
+                store,
+                &unit_layout,
+            )
+        },
+    )?;
+    metadata.set_model_type(args.model_type.clone());
+    metadata.set_quantization(args.quantization);
+    let local_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.layer_parameter_bytes())
+        .ok_or_else(|| Error::Parallel("Kimi local parameter bytes overflowed".into()))?;
+    let maximum_device_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.maximum_device_layer_bytes())
+        .ok_or_else(|| Error::Parallel("Kimi device parameter bytes overflowed".into()))?;
+    let info = eredu_runtime::ParallelModelInfo::new(
+        build.topology(),
+        args.model_type.clone(),
+        shared_layout
+            .tensors()
+            .map(|(target, _)| target.to_string())
+            .collect(),
+        local_parameter_bytes,
+        global_parameter_bytes,
+        if options.is_fully_resident() {
+            local_parameter_bytes
+        } else {
+            metadata.static_device_bytes()
+        },
+        maximum_device_parameter_bytes,
+    );
+    let execution = if options.is_fully_resident() {
+        KimiLinearExecution::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        KimiLinearExecution::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(KimiLinearLayerwiseModel {
+        execution,
+        metadata,
+        parallel_info: Some(info),
+        parallel_topology: Some(build.topology()),
+    })
+}
+
 /// Loads Kimi Linear through the shared generalized execution engine.
 pub fn load_kimi_linear_layerwise_model(
     model_dir: impl AsRef<Path>,
@@ -683,18 +2003,16 @@ pub fn load_kimi_linear_layerwise_model(
         })
         .transpose()?
         .flatten();
-    let adapter = KimiLinearLayerwiseAdapter::new(args, stream)?;
     let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
-    Ok(KimiLinearLayerwiseModel {
-        execution: load_layerwise_model_with_quantization(
-            store,
-            adapter,
-            options,
-            quantize_on_load,
-            stream,
-            weights_stream,
-        )?,
-    })
+    load_kimi_linear_with_store(
+        store,
+        args,
+        options,
+        quantize_on_load,
+        false,
+        stream,
+        weights_stream,
+    )
 }
 
 /// Loads Kimi Linear through the generalized tensor-parallel engine.
@@ -725,16 +2043,15 @@ pub(crate) fn load_kimi_linear_tensor_parallel_model(
     }
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
-    Ok(KimiLinearLayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
-            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
-            KimiLinearLayerwiseAdapter::new(args, stream)?,
-            options,
-            build,
-            stream,
-            weights_stream,
-        )?,
-    })
+    load_kimi_linear_parallel_with_store(
+        open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
+        args,
+        options,
+        build,
+        false,
+        stream,
+        weights_stream,
+    )
 }
 
 pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
@@ -758,18 +2075,16 @@ pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
-    let execution = load_tensor_parallel_layerwise_model(
+    let model = load_kimi_linear_parallel_with_store(
         store,
-        KimiLinearLayerwiseAdapter::new(prepared.args, stream)?,
+        prepared.args,
         options,
         build,
+        false,
         stream,
         weights_stream,
     )?;
-    Ok((
-        KimiLinearLayerwiseModel { execution },
-        prepared.eos_token_ids,
-    ))
+    Ok((model, prepared.eos_token_ids))
 }
 
 pub(crate) fn load_kimi_linear_gguf_layerwise_model(
@@ -804,18 +2119,16 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
             prepared.eos_token_ids,
         ));
     }
-    let execution = load_layerwise_model_with_quantization(
+    let model = load_kimi_linear_with_store(
         store,
-        KimiLinearLayerwiseAdapter::new(args, stream)?,
+        args,
         residency.layers(),
         quantization,
+        false,
         stream,
         weights_stream,
     )?;
-    Ok((
-        KimiLinearLayerwiseModel { execution },
-        prepared.eos_token_ids,
-    ))
+    Ok((model, prepared.eos_token_ids))
 }
 
 /// Loads only the replicated Kimi Linear GGUF parameters needed by sparse
@@ -842,19 +2155,19 @@ pub fn load_kimi_linear_expert_cache_model(
         })
         .transpose()?
         .flatten();
-    let source_adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
-    let mut execution = load_layerwise_model_with_quantization(
+    let mut model = load_kimi_linear_with_store(
         store,
-        source_adapter,
-        non_expert,
+        args.clone(),
+        non_expert.layers(),
         quantize_on_load,
+        true,
         stream,
         weights_stream,
     )?;
-    let store = execution.checkpoint_store_arc();
+    let store = model.checkpoint_store_arc();
     let entries = kimi_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(match quantize_on_load {
+    model.architecture_mut().expert_cache = Some(match quantize_on_load {
         Some(quantization) => ExpertCache::new_quantized_shared(
             store,
             entries,
@@ -871,7 +2184,7 @@ pub fn load_kimi_linear_expert_cache_model(
             stream.clone(),
         )?,
     });
-    Ok(KimiLinearLayerwiseModel { execution })
+    Ok(model)
 }
 
 fn load_kimi_linear_sparse_with_store(
@@ -883,18 +2196,18 @@ fn load_kimi_linear_sparse_with_store(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
-    let adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution = load_layerwise_model_with_quantization(
+    let mut model = load_kimi_linear_with_store(
         store,
-        adapter,
-        non_expert,
+        args.clone(),
+        non_expert.into(),
         quantization,
+        true,
         stream,
         weights_stream,
     )?;
-    let store = execution.checkpoint_store_arc();
+    let store = model.checkpoint_store_arc();
     let entries = kimi_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(match quantization {
+    model.architecture_mut().expert_cache = Some(match quantization {
         Some(quantization) => ExpertCache::new_quantized_shared(
             store,
             entries,
@@ -911,7 +2224,7 @@ fn load_kimi_linear_sparse_with_store(
             stream.clone(),
         )?,
     });
-    Ok(KimiLinearLayerwiseModel { execution })
+    Ok(model)
 }
 
 /// Builds the streamed nonexpert Kimi execution base used by distributed EP.
@@ -923,9 +2236,15 @@ pub(crate) fn load_kimi_linear_sparse_ep_base_with_store(
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     args.validate()?;
-    let adapter = KimiLinearLayerwiseAdapter::new_sparse(args, stream)?;
-    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
-    Ok(KimiLinearLayerwiseModel { execution })
+    load_kimi_linear_with_store(
+        store,
+        args,
+        non_expert.into(),
+        None,
+        true,
+        stream,
+        weights_stream,
+    )
 }
 
 /// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
@@ -938,17 +2257,15 @@ pub(crate) fn load_kimi_linear_sparse_tp_ep_base_with_store(
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     args.validate()?;
-    let mut adapter = KimiLinearLayerwiseAdapter::new(args, stream)?;
-    adapter.sparse_expert_cache = true;
-    let execution = load_tensor_parallel_layerwise_model(
+    load_kimi_linear_parallel_with_store(
         store,
-        adapter,
-        non_expert,
+        args,
+        non_expert.into(),
         build,
+        true,
         stream,
         weights_stream,
-    )?;
-    Ok(KimiLinearLayerwiseModel { execution })
+    )
 }
 
 /// Adapter for Kimi's heterogeneous KDA/MLA decoder layers.
@@ -1177,11 +2494,6 @@ fn normalized_checkpoint_keys(
             (runtime, raw)
         })
         .collect()
-}
-
-/// Per-forward causal state shared by all MLA layers.
-pub struct KimiLinearForwardContext {
-    mask: Option<Array>,
 }
 
 impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
@@ -2201,3 +3513,41 @@ fn optional_expert_component_recipe(
 /// Token generation over a bounded Kimi model.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     crate::backend::mlx::nn::generation::Generate<'a, KimiLinearLayerwiseModel, Cache, S>;
+
+#[cfg(test)]
+mod neutral_runtime_tests {
+    #[test]
+    fn production_model_and_loaders_use_the_neutral_layerwise_runtime() {
+        let source = include_str!("layerwise.rs");
+        let wrapper_start = source
+            .find("pub struct KimiLinearLayerwiseModel")
+            .expect("Kimi Linear production wrapper");
+        let adapter_start = source
+            .find("/// Adapter for Kimi's heterogeneous KDA/MLA decoder layers.")
+            .expect("pipeline-only legacy adapter marker");
+        let production = &source[wrapper_start..adapter_start];
+        assert!(production.contains("KimiLinearExecution"));
+        for legacy in ["LayerwiseModel<", ".adapter()", ".adapter_mut()"] {
+            assert!(
+                !production.contains(legacy),
+                "production Kimi Linear wrapper still references {legacy}"
+            );
+        }
+        let loaders_start = source
+            .find("fn resolve_kimi_linear_store")
+            .expect("neutral Kimi Linear loader");
+        let loaders = &source[loaders_start..adapter_start];
+        for legacy in [
+            "load_layerwise_model(",
+            "load_layerwise_model_with_quantization(",
+            "load_tensor_parallel_layerwise_model(",
+            "KimiLinearLayerwiseAdapter::new(",
+            "KimiLinearLayerwiseAdapter::new_sparse(",
+        ] {
+            assert!(
+                !loaders.contains(legacy),
+                "production Kimi Linear loaders still reference {legacy}"
+            );
+        }
+    }
+}

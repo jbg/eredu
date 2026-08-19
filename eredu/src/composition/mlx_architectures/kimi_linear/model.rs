@@ -683,6 +683,14 @@ pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Error> {
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
+fn state_layout_with_geometry(
+    args: &ModelArgs,
+    geometry: &[KimiLayerCacheGeometry],
+) -> Result<StateLayout, Error> {
+    StateLayout::new(prompt_cache_layer_layout_with_geometry(args, geometry)?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 /// Rank-local state geometry for one Kimi hybrid layer. MLA stores its
 /// compressed latent before head expansion, while KDA state follows the
 /// planner-owned head partition.
@@ -879,8 +887,18 @@ pub struct Cache {
 impl Cache {
     /// Creates an empty cache matching the configured hybrid layout.
     pub fn new(args: &ModelArgs) -> Self {
-        Self {
-            layout: state_layout(args).expect("validated Kimi Linear state geometry"),
+        Self::new_with_geometry(args, None).expect("validated Kimi Linear state geometry")
+    }
+
+    pub(crate) fn new_with_geometry(
+        args: &ModelArgs,
+        geometry: Option<&[KimiLayerCacheGeometry]>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            layout: match geometry {
+                Some(geometry) => state_layout_with_geometry(args, geometry)?,
+                None => state_layout(args)?,
+            },
             layers: args
                 .layer_schedule
                 .iter()
@@ -892,7 +910,7 @@ impl Cache {
                     }
                 })
                 .collect(),
-        }
+        })
     }
 
     /// Creates device-resident or blockwise-paged MLA state while KDA keeps
@@ -909,12 +927,22 @@ impl Cache {
         policy: CacheResidencyPolicy,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
+        Self::new_with_options_geometry(args, policy, rank, None)
+    }
+
+    pub(crate) fn new_with_options_geometry(
+        args: &ModelArgs,
+        policy: CacheResidencyPolicy,
+        rank: Option<CacheRankIdentity>,
+        geometry: Option<&[KimiLayerCacheGeometry]>,
+    ) -> Result<Self, Exception> {
         match policy {
-            CacheResidencyPolicy::Device => Ok(Self::new(args)),
+            CacheResidencyPolicy::Device => Self::new_with_geometry(args, geometry)
+                .map_err(|error| Exception::custom(error.to_string())),
             CacheResidencyPolicy::Paged(options) => {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Exception::custom(error.to_string()))?;
-                Self::new_with_manager(args, manager, rank)
+                Self::new_with_manager(args, manager, rank, geometry)
             }
         }
     }
@@ -923,6 +951,7 @@ impl Cache {
         args: &ModelArgs,
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
+        geometry: Option<&[KimiLayerCacheGeometry]>,
     ) -> Result<Self, Exception> {
         let layers = args
             .layer_schedule
@@ -937,7 +966,11 @@ impl Cache {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            layout: state_layout(args).map_err(|error| Exception::custom(error.to_string()))?,
+            layout: match geometry {
+                Some(geometry) => state_layout_with_geometry(args, geometry),
+                None => state_layout(args),
+            }
+            .map_err(|error| Exception::custom(error.to_string()))?,
             layers,
         })
     }
@@ -1791,6 +1824,19 @@ impl DecoderLayer {
         Ok(output)
     }
 
+    pub(super) fn forward_stage_with_observer(
+        &mut self,
+        input: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerCache>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut dyn ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let mut observer = Some(observer);
+        self.forward_impl(input, mask, cache, stream, prefix, &mut observer)
+    }
+
     /// Executes this layer from semantic operator state without requiring the
     /// resident model's family-specific cache container.
     pub(crate) fn forward_with_operator_cache(
@@ -2451,7 +2497,9 @@ impl Model {
         let end = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Kimi prompt length exceeds i32"))?;
         let mut cache =
-            Cache::new_with_manager(args, manager, identity.topology.cache_rank_identity())?;
+            Cache::new_with_manager(args, manager, identity.topology.cache_rank_identity(), None)?;
+        cache.layout = StateLayout::new(identity.layer_layout.clone())
+            .map_err(|error| Exception::custom(error.to_string()))?;
         for (layer, layer_cache) in cache.layers.iter_mut().enumerate() {
             if let LayerCache::Kda(cache) = layer_cache {
                 for (slot, convolution) in [&mut cache.q_conv, &mut cache.k_conv, &mut cache.v_conv]
