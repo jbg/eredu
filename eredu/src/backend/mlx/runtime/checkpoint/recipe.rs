@@ -8,6 +8,7 @@
 pub use eredu_checkpoint::recipe::{
     DerivedWeightRecipe, RecipeDtype, RecipeMetadata as WeightRecipeMetadata,
 };
+use eredu_checkpoint::{recipe::BoundedRecipeSource, store::StoreError};
 
 use safemlx::{
     ops::{concatenate_axis, contiguous, stack_axis},
@@ -18,6 +19,82 @@ use safemlx::{
 use crate::backend::mlx::runtime::checkpoint::store::{
     PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore, WeightStoreError,
 };
+
+impl BoundedRecipeSource for dyn WeightStore + '_ {
+    fn verify_bounded_source(
+        &self,
+        key: &str,
+        selection: TensorSelection,
+    ) -> Result<(), StoreError> {
+        verify_bounded_source(self, key, selection)
+    }
+}
+
+impl BoundedRecipeSource for dyn WeightStore + Send + Sync + '_ {
+    fn verify_bounded_source(
+        &self,
+        key: &str,
+        selection: TensorSelection,
+    ) -> Result<(), StoreError> {
+        verify_bounded_source(self, key, selection)
+    }
+}
+
+fn verify_bounded_source(
+    store: &dyn WeightStore,
+    key: &str,
+    selection: TensorSelection,
+) -> Result<(), StoreError> {
+    drop(
+        store
+            .acquire_with_policy(key, selection, WeightReadPolicy::RequireBounded)
+            .map_err(recipe_store_error)?,
+    );
+    Ok(())
+}
+
+fn recipe_store_error(error: WeightStoreError) -> StoreError {
+    match error {
+        WeightStoreError::InvalidMappedShardLimit => StoreError::InvalidMappedShardLimit,
+        WeightStoreError::UnknownTensor { key } => StoreError::UnknownTensor { key },
+        WeightStoreError::UnauthorizedTensor { contract, key } => {
+            StoreError::UnauthorizedTensor { contract, key }
+        }
+        WeightStoreError::MissingShard { path } => StoreError::MissingShard { path },
+        WeightStoreError::MalformedIndex { path, message } => {
+            StoreError::MalformedIndex { path, message }
+        }
+        WeightStoreError::MalformedSafetensors { path, message } => {
+            StoreError::MalformedSafetensors { path, message }
+        }
+        WeightStoreError::UnsafeShardPath { path } => StoreError::UnsafeShardPath { path },
+        WeightStoreError::ContradictoryIndexMapping { key, path } => {
+            StoreError::ContradictoryIndexMapping { key, path }
+        }
+        WeightStoreError::InvalidSelection { key, message } => {
+            StoreError::InvalidSelection { key, message }
+        }
+        WeightStoreError::BoundedSelectionUnavailable { key, message } => {
+            StoreError::BoundedSelectionUnavailable { key, message }
+        }
+        WeightStoreError::Overflow { context } => StoreError::Overflow { context },
+        WeightStoreError::CapacityExhausted {
+            max_mapped_shards,
+            leased_shards,
+        } => StoreError::CapacityExhausted {
+            maximum: max_mapped_shards,
+            leased: leased_shards,
+        },
+        WeightStoreError::Io { path, source } | WeightStoreError::Mmap { path, source } => {
+            StoreError::Io {
+                path,
+                message: source.to_string(),
+            }
+        }
+        WeightStoreError::Gguf { key, message } => StoreError::Gguf { key, message },
+        other => StoreError::Internal(other.to_string()),
+    }
+}
 
 /// Converts an MLX scalar type into the backend-neutral recipe representation.
 pub fn recipe_dtype_from_mlx(value: Dtype) -> RecipeDtype {
@@ -70,7 +147,6 @@ fn mlx_dtype(value: &RecipeDtype) -> Result<Dtype, WeightRecipeError> {
 
 /// MLX lowering operations for a backend-neutral recipe.
 pub(crate) trait MlxWeightRecipeExt {
-    fn preflight_bounded(&self, store: &dyn WeightStore) -> Result<(), WeightRecipeError>;
     fn materialize(
         &self,
         store: &dyn WeightStore,
@@ -102,32 +178,6 @@ pub(crate) trait MlxWeightRecipeExt {
 }
 
 impl MlxWeightRecipeExt for DerivedWeightRecipe {
-    /// complete-tensor fallback.
-    fn preflight_bounded(&self, store: &dyn WeightStore) -> Result<(), WeightRecipeError> {
-        match self {
-            Self::Source { key, selection } => {
-                drop(store.acquire_with_policy(
-                    key,
-                    selection.clone(),
-                    WeightReadPolicy::RequireBounded,
-                )?);
-            }
-            Self::Concatenate { inputs, .. } | Self::Stack { inputs, .. } => {
-                for input in inputs {
-                    input.preflight_bounded(store)?;
-                }
-            }
-            Self::Select { input, .. }
-            | Self::Reshape { input, .. }
-            | Self::Transpose { input, .. }
-            | Self::Cast { input, .. }
-            | Self::View { input, .. }
-            | Self::NegLog { input }
-            | Self::SubtractOne { input } => input.preflight_bounded(store)?,
-        }
-        Ok(())
-    }
-
     ///
     /// Source leases remain live until their dependent output has been
     /// evaluated. If a multi-input join reaches the mapping bound, completed

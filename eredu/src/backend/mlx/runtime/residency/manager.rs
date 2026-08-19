@@ -816,7 +816,7 @@ impl ResidencyManager {
                     .preflight_bounded(store.as_ref())
                     .map_err(|source| ResidencyError::Recipe {
                         binding: binding.name().to_owned(),
-                        source,
+                        source: source.into(),
                     })?;
             }
         }

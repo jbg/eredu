@@ -11,6 +11,32 @@ pub trait RecipeCatalog {
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError>;
 }
 
+/// Cold-path capability for proving that every recipe source can be read with
+/// its declared physical bound.
+pub trait BoundedRecipeSource: RecipeCatalog {
+    /// Acquires and immediately releases one source under bounded-read policy.
+    fn verify_bounded_source(
+        &self,
+        key: &str,
+        selection: TensorSelection,
+    ) -> Result<(), StoreError>;
+}
+
+impl<T: WeightStore> BoundedRecipeSource for T {
+    fn verify_bounded_source(
+        &self,
+        key: &str,
+        selection: TensorSelection,
+    ) -> Result<(), StoreError> {
+        drop(self.acquire(crate::store::TensorReadRequest {
+            key: key.to_owned(),
+            selection,
+            policy: crate::store::ReadPolicy::RequireBounded,
+        })?);
+        Ok(())
+    }
+}
+
 impl<T: WeightStore> RecipeCatalog for T {
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
         self.metadata(key)
@@ -20,6 +46,21 @@ impl<T: WeightStore> RecipeCatalog for T {
 impl RecipeCatalog for dyn CheckpointSource + '_ {
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
         self.source_metadata(key)
+    }
+}
+
+impl BoundedRecipeSource for dyn CheckpointSource + '_ {
+    fn verify_bounded_source(
+        &self,
+        key: &str,
+        selection: TensorSelection,
+    ) -> Result<(), StoreError> {
+        drop(self.acquire_lease(crate::store::TensorReadRequest {
+            key: key.to_owned(),
+            selection,
+            policy: crate::store::ReadPolicy::RequireBounded,
+        })?);
+        Ok(())
     }
 }
 
@@ -171,6 +212,31 @@ impl DerivedWeightRecipe {
             key: key.into(),
             selection,
         }
+    }
+
+    /// Proves that every physical source can honor its declared bounded read.
+    pub fn preflight_bounded<S: BoundedRecipeSource + ?Sized>(
+        &self,
+        source: &S,
+    ) -> Result<(), RecipeError> {
+        match self {
+            Self::Source { key, selection } => {
+                source.verify_bounded_source(key, selection.clone())?;
+            }
+            Self::Concatenate { inputs, .. } | Self::Stack { inputs, .. } => {
+                for input in inputs {
+                    input.preflight_bounded(source)?;
+                }
+            }
+            Self::Select { input, .. }
+            | Self::Reshape { input, .. }
+            | Self::Transpose { input, .. }
+            | Self::Cast { input, .. }
+            | Self::View { input, .. }
+            | Self::NegLog { input }
+            | Self::SubtractOne { input } => input.preflight_bounded(source)?,
+        }
+        Ok(())
     }
 
     /// Rewrites an output selection toward physically bounded sources.
@@ -1346,9 +1412,35 @@ mod tests {
     use super::*;
     use crate::store::{EncodedTensorLease, TensorReadRequest, WeightStoreDiagnostics};
     use std::path::Path;
+    use std::sync::Mutex;
 
     struct Catalog;
     struct Lease;
+
+    #[derive(Default)]
+    struct BoundedCatalog {
+        requests: Mutex<Vec<(String, TensorSelection)>>,
+    }
+
+    impl RecipeCatalog for BoundedCatalog {
+        fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+            Catalog.metadata(key)
+        }
+    }
+
+    impl BoundedRecipeSource for BoundedCatalog {
+        fn verify_bounded_source(
+            &self,
+            key: &str,
+            selection: TensorSelection,
+        ) -> Result<(), StoreError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((key.to_owned(), selection));
+            Ok(())
+        }
+    }
 
     impl EncodedTensorLease for Lease {
         fn metadata(&self) -> &TensorMetadata {
@@ -1422,6 +1514,44 @@ mod tests {
         assert_eq!(metadata.dtype(), &RecipeDtype::F16);
         assert_eq!(metadata.byte_len(), 18);
         assert_eq!(recipe.source_keys(), ["left", "right"]);
+    }
+
+    #[test]
+    fn bounded_preflight_walks_exact_physical_source_selections() {
+        let catalog = BoundedCatalog::default();
+        let recipe = DerivedWeightRecipe::Concatenate {
+            axis: 0,
+            inputs: vec![
+                DerivedWeightRecipe::source(
+                    "left",
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: 0,
+                        end: 1,
+                    },
+                ),
+                DerivedWeightRecipe::Reshape {
+                    input: Box::new(DerivedWeightRecipe::source("right", TensorSelection::Full)),
+                    shape: vec![2, 3],
+                },
+            ],
+        };
+
+        recipe.preflight_bounded(&catalog).unwrap();
+        assert_eq!(
+            *catalog.requests.lock().unwrap(),
+            vec![
+                (
+                    "left".into(),
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: 0,
+                        end: 1,
+                    },
+                ),
+                ("right".into(), TensorSelection::Full),
+            ]
+        );
     }
 
     #[test]

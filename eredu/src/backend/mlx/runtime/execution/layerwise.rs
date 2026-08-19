@@ -33,7 +33,7 @@ use crate::{
         BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
         BoundedQuantizedWeightStore,
     },
-    backend::mlx::runtime::checkpoint::recipe::{MlxWeightRecipeExt, RecipeDtype},
+    backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
     backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
     backend::mlx::runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
     backend::mlx::runtime::residency::dense_stream::{
