@@ -497,6 +497,14 @@ impl PendingHostTransfer {
         &self.completion
     }
 
+    /// Decompose the submission for integration with stream-ordered runtimes.
+    ///
+    /// The returned buffer must not be read until the returned event reports
+    /// exact completion.
+    pub fn into_parts(self) -> (HostTransferBuffer, Event) {
+        (self.buffer, self.completion)
+    }
+
     /// Wait for the transfer and expose the initialized host buffer.
     pub fn synchronize(self) -> Result<HostTransferBuffer> {
         self.completion.synchronize()?;

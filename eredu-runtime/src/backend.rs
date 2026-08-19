@@ -63,7 +63,7 @@ pub trait TransferBackend: SubmissionBackend + ParameterBackend {
     /// Backend-owned host representation.
     type HostBuffer;
     /// In-flight transfer guard retaining all source and destination storage.
-    type Transfer;
+    type Transfer: Completion<Error = Self::TransferError>;
     /// Backend-specific transfer failure.
     type TransferError: std::error::Error + Send + Sync + 'static;
 

@@ -1,18 +1,21 @@
 //! MLX implementation of backend-neutral neural operators.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
     rc::Rc,
+    sync::Arc,
 };
 
+use eredu_core::Completion;
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, EmbeddingOperator, EmbeddingSpec,
     Error as ComputeError, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
     NormalizationSpec, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
     Parameterized, RopeValue, RotaryOperator, RotarySpec,
 };
-use eredu_runtime::ParameterBackend;
+use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
 use safemlx::{
     builder::Builder,
     distributed::Group,
@@ -21,7 +24,8 @@ use safemlx::{
     nested::NestedValue,
     nn,
     quantization::MaybeQuantized,
-    Array, Dtype, Stream,
+    Array, Dtype, Event, HostTransferBuffer, HostTransferPolicy, ImmutableHostTransferBuffer,
+    Stream,
 };
 
 use crate::backend::mlx::{
@@ -426,6 +430,103 @@ impl Parameterized<Array> for MlxRotary {
 /// Zero-sized MLX backend selector. All calls are statically dispatched.
 #[derive(Debug, Clone, Copy)]
 pub struct MlxBackend;
+
+/// Exact MLX completion retaining every Rust-side submission resource.
+pub struct MlxSubmissionCompletion {
+    event: Event,
+    retained: RefCell<Vec<Box<dyn Send>>>,
+}
+
+impl MlxSubmissionCompletion {
+    fn new(event: Event) -> Self {
+        Self {
+            event,
+            retained: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn retain<T: Send + 'static>(&self, value: T) {
+        self.retained.borrow_mut().push(Box::new(value));
+    }
+
+    /// Orders a consumer stream after this exact completion without blocking.
+    pub fn wait_on(&self, stream: &Stream) -> Result<(), safemlx::error::Exception> {
+        self.event.wait_on(stream)
+    }
+}
+
+impl Completion for MlxSubmissionCompletion {
+    type Error = safemlx::error::Exception;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        let complete = self.event.is_complete()?;
+        if complete {
+            self.retained.borrow_mut().clear();
+        }
+        Ok(complete)
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        self.event.synchronize()?;
+        self.retained.borrow_mut().clear();
+        Ok(())
+    }
+}
+
+impl Drop for MlxSubmissionCompletion {
+    fn drop(&mut self) {
+        if !matches!(self.event.is_complete(), Ok(true)) {
+            let _ = self.event.synchronize();
+        }
+        self.retained.get_mut().clear();
+    }
+}
+
+impl SubmissionBackend for MlxBackend {
+    type Executor = Stream;
+    type Completion = MlxSubmissionCompletion;
+
+    fn retain_until_complete<T: Send + 'static>(
+        _executor: &Self::Executor,
+        completion: &Self::Completion,
+        value: T,
+    ) -> Result<(), <Self::Completion as Completion>::Error> {
+        completion.retain(value);
+        Ok(())
+    }
+}
+
+impl TransferBackend for MlxBackend {
+    type HostBuffer = Arc<ImmutableHostTransferBuffer>;
+    type Transfer = MlxSubmissionCompletion;
+    type TransferError = safemlx::error::Exception;
+
+    fn promote(
+        executor: &Self::Executor,
+        host: &Self::HostBuffer,
+    ) -> Result<(Self::MaterializedWeight, Self::Transfer), Self::TransferError> {
+        let submitted = host.copy_to_array(executor)?;
+        let (weight, event) = submitted.into_parts();
+        let completion = MlxSubmissionCompletion::new(event);
+        completion.retain(Arc::clone(host));
+        completion.retain(weight.clone());
+        Ok((weight, completion))
+    }
+
+    fn demote(
+        executor: &Self::Executor,
+        weight: &Self::MaterializedWeight,
+    ) -> Result<(Self::HostBuffer, Self::Transfer), Self::TransferError> {
+        let submitted =
+            HostTransferBuffer::copy_from_array(weight, HostTransferPolicy::Transfer, executor)?;
+        let (host, event) = submitted.into_parts();
+        let host = Arc::new(host.freeze());
+        let completion = MlxSubmissionCompletion::new(event);
+        completion.retain(weight.clone());
+        completion.retain(Arc::clone(&host));
+        Ok((host, completion))
+    }
+}
 
 /// MLX failure while lowering a neutral checkpoint lease or recipe.
 #[derive(Debug, thiserror::Error)]
