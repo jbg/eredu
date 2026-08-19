@@ -883,8 +883,10 @@ dependencies = [
  "eredu-gguf",
  "eredu-nn",
  "eredu-runtime",
+ "safetensors",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

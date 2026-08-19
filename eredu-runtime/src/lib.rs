@@ -11,6 +11,8 @@ pub mod backend;
 pub mod execution;
 /// Backend-neutral causal-model session contracts.
 pub mod generation;
+/// Statically dispatched layered architecture lifecycle and resident policy.
+pub mod layered;
 /// Architecture-declared parallel parameter semantics and local layouts.
 pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.
@@ -26,6 +28,7 @@ pub use execution::{
     ExecutionGroupSpec, ReadyGroupState,
 };
 pub use generation::CausalModel;
+pub use layered::{LayeredArchitecture, LayeredForwardState, ResidentRuntime};
 pub use parallel::{
     aligned_partition_units, module_parameter_group, partitioned_projection_group,
     projection_parameter_group, LocalModelLayout, LocalTensorLayout, MemberSharding,

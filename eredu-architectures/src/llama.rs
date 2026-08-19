@@ -20,8 +20,9 @@ use eredu_nn::{
     RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_projection_group, MemberSharding,
-    ModelStateIdentity, ParallelPlanError, ParameterGroupSpec, ParameterRole, ProjectionSharding,
+    aligned_partition_units, module_parameter_group, partitioned_projection_group,
+    LayeredArchitecture, LayeredForwardState, MemberSharding, ModelStateIdentity,
+    ParallelPlanError, ParameterGroupSpec, ParameterRole, ProjectionSharding, RuntimeState,
     StateLayout,
 };
 
@@ -920,5 +921,222 @@ impl<B: NeuralBackend> Model<B> {
             context,
         )?;
         self.logits(&hidden, context)
+    }
+}
+
+/// Pinned modules shared by resident and bounded-residency execution.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct StaticModules<B: NeuralBackend> {
+    /// Token embedding table.
+    pub embeddings: B::Embedding,
+    /// Final RMSNorm.
+    pub norm: B::Normalization,
+    /// Optional untied vocabulary projection.
+    pub lm_head: Option<B::Linear>,
+}
+
+impl<B: NeuralBackend> StaticModules<B> {
+    fn new<C: Config>(config: &C, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        let embeddings = B::embedding(
+            EmbeddingSpec {
+                vocabulary: config.vocabulary_size(),
+                dimensions: config.hidden_size(),
+                weight: ParameterSpec::trainable("model.embed_tokens.weight")
+                    .map_err(Error::backend)?,
+                quantization: config.weight_quantization("model.embed_tokens.weight"),
+            },
+            context,
+        )?;
+        let norm = B::rms_norm(
+            NormalizationSpec {
+                dimensions: config.hidden_size(),
+                epsilon: config.rms_norm_epsilon(),
+                weight: ParameterSpec::trainable("model.norm.weight").map_err(Error::backend)?,
+            },
+            context,
+        )?;
+        let lm_head = if config.tie_word_embeddings() {
+            None
+        } else {
+            Some(B::linear(
+                LinearSpec {
+                    input: config.hidden_size(),
+                    output: config.vocabulary_size(),
+                    weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
+                    bias: None,
+                    quantization: config.weight_quantization("lm_head.weight"),
+                },
+                context,
+            )?)
+        };
+        Ok(Self {
+            embeddings,
+            norm,
+            lm_head,
+        })
+    }
+}
+
+/// Borrowed token input for the shared layered lifecycle.
+pub struct LayeredInput<'a, T> {
+    /// Token ids shaped `[batch, sequence]`.
+    pub tokens: &'a T,
+    /// Optional caller-provided attention mask.
+    pub mask: Option<&'a T>,
+}
+
+/// Architecture-owned values retained across one layered forward pass.
+pub struct ForwardContext<T> {
+    mask: Option<T>,
+    allow_sliding_prefill: bool,
+}
+
+/// Shared Llama lifecycle instantiated over a concrete neural backend.
+///
+/// The type owns only architecture semantics and pinned modules. Runtime
+/// policies own ordered unit residency and mutable-state realization.
+pub struct LayeredModel<B: NeuralBackend> {
+    args: ModelArgs,
+    static_modules: StaticModules<B>,
+}
+
+impl<B: NeuralBackend> LayeredModel<B> {
+    /// Builds unloaded pinned modules from normalized architecture arguments.
+    pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        args.validate().map_err(Error::backend)?;
+        let static_modules = StaticModules::new(&args, context)?;
+        Ok(Self {
+            args,
+            static_modules,
+        })
+    }
+
+    /// Returns the normalized architecture arguments.
+    pub const fn args(&self) -> &ModelArgs {
+        &self.args
+    }
+
+    /// Borrows pinned modules for neutral checkpoint loading.
+    pub const fn static_modules(&self) -> &StaticModules<B> {
+        &self.static_modules
+    }
+
+    /// Mutably borrows pinned modules for neutral checkpoint binding.
+    pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
+        &mut self.static_modules
+    }
+}
+
+impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    type Input<'a> = LayeredInput<'a, B::Tensor>;
+    type StaticModules = StaticModules<B>;
+    type Unit = TransformerBlock<B>;
+    type ForwardContext = ForwardContext<B::Tensor>;
+    type Error = Error;
+
+    fn model_identity(&self) -> &str {
+        &self.args.model_type
+    }
+
+    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
+        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Error::backend)
+    }
+
+    fn unit_count(&self) -> Result<usize, Self::Error> {
+        usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)
+    }
+
+    fn static_modules(&self) -> &Self::StaticModules {
+        &self.static_modules
+    }
+
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        &mut self.static_modules
+    }
+
+    fn build_unit(
+        &self,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Unit, Self::Error> {
+        TransformerBlock::new(&self.args, index, context)
+    }
+
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = state_layout(&self.args)?;
+        if state.layout() != &expected {
+            return Err(Error::backend(format!(
+                "Llama runtime state layout {:?} does not match architecture layout {expected:?}",
+                state.layout()
+            )));
+        }
+        let hidden = self
+            .static_modules
+            .embeddings
+            .forward(input.tokens, context)?;
+        let sequence = hidden.dim(1);
+        let mask = if let Some(mask) = input.mask {
+            Some(mask.clone())
+        } else if sequence > 1 {
+            let cache = state.layer(0).map_err(Error::backend)?;
+            let window = cache.max_size();
+            let offset = window.map_or(cache.offset(), |window| cache.offset().min(window));
+            Some(B::causal_mask(sequence, offset, window, context)?)
+        } else {
+            None
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                mask,
+                allow_sliding_prefill: input.mask.is_none(),
+            },
+        })
+    }
+
+    fn forward_unit(
+        &mut self,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let cache = state.layer(index).map_err(Error::backend)?;
+        unit.forward(
+            AttentionInput {
+                hidden,
+                mask: forward.mask.as_ref(),
+                cache: Some(cache),
+                allow_sliding_prefill: forward.allow_sliding_prefill,
+            },
+            context,
+        )
+    }
+
+    fn finish_forward(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let hidden = self.static_modules.norm.forward(hidden, context)?;
+        match &mut self.static_modules.lm_head {
+            Some(head) => head.forward(&hidden, context),
+            None => self.static_modules.embeddings.as_linear(&hidden, context),
+        }
     }
 }
