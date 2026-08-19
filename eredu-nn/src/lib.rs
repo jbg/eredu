@@ -51,10 +51,157 @@ pub enum PadMode {
 /// Attention masking selected by architecture code.
 #[derive(Debug, Clone, Copy)]
 pub enum AttentionMask<'a, T> {
+    /// No attention mask.
+    None,
     /// Standard causal mask.
     Causal,
     /// Backend tensor added to attention logits.
     Tensor(&'a T),
+}
+
+/// Shape and checkpoint identity for an affine projection.
+#[derive(Debug, Clone, Copy)]
+pub struct LinearSpec<'a> {
+    /// Input feature count.
+    pub input: i32,
+    /// Output feature count.
+    pub output: i32,
+    /// Whether the projection owns a bias.
+    pub bias: bool,
+    /// Stable checkpoint weight name.
+    pub weight_name: &'a str,
+}
+
+/// Backend-native affine projection used by shared architectures.
+pub trait LinearOperator<T: Tensor>: Clone + Debug {
+    /// Applies the projection without host materialization.
+    fn forward(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
+}
+
+/// Backend-native token embedding used by shared architectures.
+pub trait EmbeddingOperator<T: Tensor>: Clone + Debug {
+    /// Looks up token embeddings.
+    fn forward(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
+    /// Projects hidden states through the transposed embedding table.
+    fn as_linear(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
+}
+
+/// Backend-native normalization operator.
+pub trait NormalizationOperator<T: Tensor>: Clone + Debug {
+    /// Applies normalization.
+    fn forward(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
+}
+
+/// Backend-native rotary-position operator.
+pub trait RotaryOperator<T: Tensor>: Clone + Debug {
+    /// Applies rotary positions at the supplied sequence offset.
+    fn forward(&mut self, input: &T, offset: i32, context: &T::Context) -> Result<T, Error>;
+}
+
+/// Backend-native key/value cache operations required by attention.
+pub trait AttentionCache<T: Tensor> {
+    /// Current absolute sequence offset.
+    fn offset(&self) -> i32;
+    /// Maximum retained history for a sliding cache.
+    fn max_size(&self) -> Option<i32>;
+    /// Appends projected keys and values and returns the tensors used by attention.
+    fn update_for_attention(
+        &mut self,
+        keys: T,
+        values: T,
+        context: &T::Context,
+    ) -> Result<(T, T), Error>;
+    /// Runs cache-aware attention, including paged or quantized kernels where applicable.
+    #[allow(clippy::too_many_arguments)]
+    fn attention(
+        &mut self,
+        queries: T,
+        keys: T,
+        values: T,
+        scale: f32,
+        mask: Option<&T>,
+        context: &T::Context,
+    ) -> Result<T, Error>;
+}
+
+/// General neural-operator family selected by a shared architecture.
+///
+/// Associated concrete types make calls statically dispatched. Implementations
+/// retain ownership of tensor storage, fusion, quantization, and collectives.
+pub trait Backend: Sized + 'static {
+    /// Backend tensor handle.
+    type Tensor: Tensor;
+    /// Backend-specific model construction metadata.
+    type Config: ?Sized;
+    /// Native affine projection, including packed quantized variants.
+    type Linear: LinearOperator<Self::Tensor>;
+    /// Native embedding table.
+    type Embedding: EmbeddingOperator<Self::Tensor>;
+    /// Native normalization operator.
+    type Normalization: NormalizationOperator<Self::Tensor>;
+    /// Native rotary-position operator.
+    type Rotary: RotaryOperator<Self::Tensor>;
+    /// Backend collective context used by tensor-parallel execution.
+    type ParallelContext: ?Sized;
+
+    /// Builds one affine projection.
+    fn linear(
+        config: &Self::Config,
+        spec: LinearSpec<'_>,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Linear, Error>;
+    /// Builds one token embedding table.
+    fn embedding(
+        config: &Self::Config,
+        vocabulary: i32,
+        dimensions: i32,
+        weight_name: &str,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Embedding, Error>;
+    /// Builds one RMS normalization operator.
+    fn rms_norm(
+        dimensions: i32,
+        epsilon: f32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Normalization, Error>;
+    /// Builds the model's rotary-position operator.
+    fn rotary(
+        config: &Self::Config,
+        dimensions: i32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Rotary, Error>;
+    /// Applies SiLU using a backend-native implementation.
+    fn silu(
+        input: Self::Tensor,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
+    /// Runs un-cached scaled dot-product attention.
+    fn attention(
+        queries: Self::Tensor,
+        keys: Self::Tensor,
+        values: Self::Tensor,
+        scale: f32,
+        mask: Option<&Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
+    /// Runs causal sliding-window prefill attention without a square mask.
+    #[allow(clippy::too_many_arguments)]
+    fn sliding_window_attention(
+        queries: Self::Tensor,
+        keys: Self::Tensor,
+        values: Self::Tensor,
+        scale: f32,
+        window: i32,
+        position_offset: i32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
+    /// Applies a row-parallel projection and its collective reduction.
+    fn row_parallel_linear(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
 }
 
 /// Opaque tensor handle and the neural operations required by shared Eredu

@@ -712,7 +712,7 @@ fn register_llama_layer_parallel_plan(
     args: &ModelArgs,
     prefix: &str,
 ) -> Result<(), Error> {
-    let attention = &layer.self_attn;
+    let attention = &layer.inner.self_attention;
     register_gqa_projection_group(
         planner,
         &format!("{prefix}.self_attn"),
@@ -722,17 +722,17 @@ fn register_llama_layer_parallel_plan(
             value: "v_proj",
             output: "o_proj",
         },
-        &attention.q_proj,
-        &attention.k_proj,
-        &attention.v_proj,
-        &attention.o_proj,
-        attention.n_heads,
-        attention.n_kv_heads,
+        &attention.query.0,
+        &attention.key.0,
+        &attention.value.0,
+        &attention.output.0,
+        attention.query_heads,
+        attention.key_value_heads,
         args.head_dim,
     )?;
     register_replicated_module(
         planner,
-        &attention.rope,
+        &attention.rotary,
         &format!("{prefix}.self_attn.rope"),
     )?;
     register_swiglu_projection_group(
@@ -743,19 +743,19 @@ fn register_llama_layer_parallel_plan(
             up: "up_proj",
             down: "down_proj",
         },
-        &layer.mlp.gate_proj,
-        &layer.mlp.up_proj,
-        &layer.mlp.down_proj,
+        &layer.inner.mlp.gate.0,
+        &layer.inner.mlp.up.0,
+        &layer.inner.mlp.down.0,
         args.intermediate_size,
     )?;
     register_replicated_module(
         planner,
-        &layer.input_layernorm,
+        &layer.inner.input_norm,
         &format!("{prefix}.input_layernorm"),
     )?;
     register_replicated_module(
         planner,
-        &layer.post_attention_layernorm,
+        &layer.inner.post_attention_norm,
         &format!("{prefix}.post_attention_layernorm"),
     )
 }
@@ -1267,7 +1267,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         match cache {
             LlamaCache::Device(caches) => Ok(layer.forward(
                 AttentionInput {
-                    x: hidden,
+                    hidden,
                     mask: context.mask.as_ref(),
                     cache: Some(
                         caches[index]
@@ -1280,7 +1280,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
             )?),
             LlamaCache::Paged(caches) => Ok(layer.forward(
                 AttentionInput {
-                    x: hidden,
+                    hidden,
                     mask: context.mask.as_ref(),
                     cache: Some(caches[index].as_mut().expect("validated Llama paged cache")),
                     allow_sliding_prefill: context.allow_sliding_prefill,

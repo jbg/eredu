@@ -10,6 +10,7 @@ members = [
     "eredu-core",
     "eredu-text",
     "eredu-nn",
+    "eredu-architectures",
     "eredu-codec",
     "eredu-cli",
     "examples/eredu-ios/native",
@@ -36,6 +37,7 @@ eredu = { version = "0.4.1", path = "eredu" }
 eredu-core = { version = "0.1.0", path = "eredu-core" }
 eredu-text = { version = "0.1.4", path = "eredu-text", default-features = false }
 eredu-nn = { version = "0.1.0", path = "eredu-nn", default-features = false }
+eredu-architectures = { version = "0.1.0", path = "eredu-architectures" }
 eredu-codec = { version = "0.1.0", path = "eredu-codec", default-features = false }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

@@ -846,8 +846,10 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "eredu-architectures",
  "eredu-core",
  "eredu-gguf",
+ "eredu-nn",
  "eredu-text",
  "half",
  "idna_adapter",
@@ -868,6 +870,14 @@ dependencies = [
  "tokenizers 0.23.1",
  "toktrie_hf_tokenizers",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "eredu-architectures"
+version = "0.1.0"
+dependencies = [
+ "eredu-core",
+ "eredu-nn",
 ]
 
 [[package]]

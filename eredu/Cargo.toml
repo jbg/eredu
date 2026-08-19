@@ -123,6 +123,7 @@ features = ["mlx-image", "mlx-audio"]
 default = ["mlx", "onig", "esaxx_fast"]
 
 mlx = [
+    "eredu-nn/mlx",
     "dep:safemlx",
     "dep:safetensors",
     "dep:memmap2",
@@ -145,6 +146,8 @@ safemlx = { workspace = true, features = ["safetensors"], optional = true }
 eredu-core.workspace = true
 eredu-text = { workspace = true, default-features = false }
 eredu-gguf.workspace = true
+eredu-nn = { workspace = true, default-features = false }
+eredu-architectures.workspace = true
 
 # External dependencies
 serde = { version = "1", features = ["derive"] }

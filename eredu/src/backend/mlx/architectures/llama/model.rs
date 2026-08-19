@@ -1,4 +1,4 @@
-//! Llama decoder-only model implementation.
+//! MLX configuration, checkpoint integration, and resident binding for shared Llama.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -7,13 +7,10 @@ use std::{
 
 use safemlx::{
     error::Exception,
-    macros::{ModuleParameters, Quantizable},
-    module::{Module, ModuleParametersExt},
-    nn,
+    module::{Module, ModuleParameters},
     ops::indexing::TryIndexOp,
     ops::{GgufCheckpoint, GgufMetadataValue},
-    quantization::MaybeQuantized,
-    Array, Dtype, Stream,
+    Array, Stream,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -25,23 +22,13 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::tensor::{
         create_attention_mask,
-        rope::{initialize_rope, validate_rope_scaling_config, FloatOrString, RopeVariant},
+        rope::{validate_rope_scaling_config, FloatOrString},
         AttentionMask,
     },
-    backend::mlx::nn::{
-        self as common,
-        attention::{
-            apply_rope_and_update_cache, attention_probabilities, batch_seq, finish_attention,
-            reshape_attention_projection,
-        },
-        generation::CausalLm,
-        layers::SwiGluMlp,
-        linear::project_logits_maybe_quantized,
-    },
+    backend::mlx::nn::{self as common, generation::CausalLm},
     backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
     backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
-    backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::derive_prompt_cache_architecture_fingerprint,
@@ -152,6 +139,45 @@ impl ModelArgs {
     }
 }
 
+impl eredu_architectures::llama::Config for ModelArgs {
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+    fn num_key_value_heads(&self) -> i32 {
+        self.num_key_value_heads
+    }
+    fn head_dim(&self) -> i32 {
+        self.head_dim
+    }
+    fn rms_norm_epsilon(&self) -> f32 {
+        self.rms_norm_eps
+    }
+    fn vocabulary_size(&self) -> i32 {
+        self.vocab_size
+    }
+    fn attention_bias(&self) -> bool {
+        self.attention_bias
+    }
+    fn mlp_bias(&self) -> bool {
+        self.mlp_bias
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+    fn attention_schedule(&self) -> &LayerSchedule<AttentionPolicy> {
+        &self.attention_schedule
+    }
+}
+
 pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
     let rope_scaling = args.rope_scaling.as_ref().map_or_else(
         || "none".to_string(),
@@ -236,347 +262,18 @@ fn default_rope_theta() -> f32 {
     10_000.0
 }
 
-/// Internal input shared by Llama-compatible attention and decoder blocks.
-pub struct AttentionInput<'a, C> {
-    /// Hidden states with shape `[batch, sequence, hidden]`.
-    pub x: &'a Array,
-    /// Optional attention mask.
-    pub mask: Option<&'a Array>,
-    /// Optional mutable key/value cache.
-    pub cache: Option<&'a mut C>,
-    /// Whether a layer may generate its canonical sliding-prefill mask.
-    pub allow_sliding_prefill: bool,
-}
+/// MLX specialization of the backend-neutral Llama block input.
+pub type AttentionInput<'a, C> = eredu_architectures::llama::AttentionInput<'a, Array, C>;
 
-#[derive(Debug, Clone, ModuleParameters, Quantizable)]
-/// Llama attention layer.
-pub struct Attention {
-    /// Number of query heads.
-    pub n_heads: i32,
-    /// Number of key/value heads.
-    pub n_kv_heads: i32,
-    /// Attention scaling factor.
-    pub scale: f32,
-
-    #[quantizable]
-    #[param]
-    /// Query projection.
-    pub q_proj: MaybeQuantized<nn::Linear>,
-    #[quantizable]
-    #[param]
-    /// Key projection.
-    pub k_proj: MaybeQuantized<nn::Linear>,
-    #[quantizable]
-    #[param]
-    /// Value projection.
-    pub v_proj: MaybeQuantized<nn::Linear>,
-    #[quantizable]
-    #[param]
-    /// Output projection.
-    pub o_proj: MaybeQuantized<nn::Linear>,
-    #[param]
-    /// Rotary position embedding module.
-    pub rope: RopeVariant,
-    /// Layer-local attention window; absent for full causal attention.
-    pub sliding_window: Option<i32>,
-}
-
-impl Attention {
-    /// Creates an unloaded attention layer from model arguments.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let policy = args.attention_schedule.get(0).ok_or_else(|| {
-            Exception::custom("Llama attention schedule has no policy for layer 0")
-        })?;
-        Self::new_with_prefix(args, None, *policy, stream)
-    }
-
-    fn new_for_layer(
-        args: &ModelArgs,
-        layer_index: i32,
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        let layer = usize::try_from(layer_index)
-            .map_err(|_| Exception::custom(format!("invalid Llama layer index {layer_index}")))?;
-        let policy = args.attention_schedule.get(layer).ok_or_else(|| {
-            Exception::custom(format!(
-                "Llama attention schedule has no policy for layer {layer_index}"
-            ))
-        })?;
-        Self::new_with_prefix(
-            args,
-            Some(format!("model.layers.{layer_index}.self_attn")),
-            *policy,
-            stream,
-        )
-    }
-
-    fn new_with_prefix(
-        args: &ModelArgs,
-        prefix: Option<String>,
-        policy: AttentionPolicy,
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        let dim = args.hidden_size;
-        let n_heads = args.num_attention_heads;
-        let n_kv_heads = args.num_key_value_heads;
-
-        let head_dim = args.head_dim;
-        let scale = (head_dim as f32).sqrt().recip();
-
-        let q_proj = common::linear::unloaded_maybe_quantized_linear(
-            dim,
-            n_heads * head_dim,
-            args.attention_bias,
-            prefix
-                .as_ref()
-                .and_then(|prefix| args.affine_quantization_for(&format!("{prefix}.q_proj.weight")))
-                .or_else(|| {
-                    prefix
-                        .is_none()
-                        .then(|| args.weight_quantization())
-                        .flatten()
-                }),
-            stream,
-        )?;
-        let k_proj = common::linear::unloaded_maybe_quantized_linear(
-            dim,
-            n_kv_heads * head_dim,
-            args.attention_bias,
-            prefix
-                .as_ref()
-                .and_then(|prefix| args.affine_quantization_for(&format!("{prefix}.k_proj.weight")))
-                .or_else(|| {
-                    prefix
-                        .is_none()
-                        .then(|| args.weight_quantization())
-                        .flatten()
-                }),
-            stream,
-        )?;
-        let v_proj = common::linear::unloaded_maybe_quantized_linear(
-            dim,
-            n_kv_heads * head_dim,
-            args.attention_bias,
-            prefix
-                .as_ref()
-                .and_then(|prefix| args.affine_quantization_for(&format!("{prefix}.v_proj.weight")))
-                .or_else(|| {
-                    prefix
-                        .is_none()
-                        .then(|| args.weight_quantization())
-                        .flatten()
-                }),
-            stream,
-        )?;
-        let o_proj = common::linear::unloaded_maybe_quantized_linear(
-            n_heads * head_dim,
-            dim,
-            args.attention_bias,
-            prefix
-                .as_ref()
-                .and_then(|prefix| args.affine_quantization_for(&format!("{prefix}.o_proj.weight")))
-                .or_else(|| {
-                    prefix
-                        .is_none()
-                        .then(|| args.weight_quantization())
-                        .flatten()
-                }),
-            stream,
-        )?;
-
-        let rope = initialize_rope(
-            head_dim,
-            args.rope_theta,
-            args.rope_traditional,
-            &args.rope_scaling,
-            args.max_position_embeddings,
-            stream,
-        )?;
-
-        Ok(Self {
-            n_heads,
-            n_kv_heads,
-            scale,
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            rope,
-            sliding_window: policy
-                .window()
-                .map(|window| i32::try_from(window.get()))
-                .transpose()
-                .map_err(|_| Exception::custom("Llama sliding window exceeds i32"))?,
-        })
-    }
-
-    /// Forward pass that reports attention activations to an observer.
-    pub fn forward_with_observer<C>(
-        &mut self,
-        input: AttentionInput<'_, C>,
-        stream: &Stream,
-        prefix: &str,
-        observer: &mut impl ActivationObserver,
-    ) -> Result<Array, Exception>
-    where
-        C: KeyValueCache,
-    {
-        let AttentionInput {
-            x,
-            mask,
-            mut cache,
-            allow_sliding_prefill,
-        } = input;
-
-        let (batch, seq_len) = batch_seq(x);
-
-        let queries = self.q_proj.forward(x, stream)?;
-        observer.observe(&format!("{prefix}.q_proj"), &queries)?;
-        let keys = self.k_proj.forward(x, stream)?;
-        observer.observe(&format!("{prefix}.k_proj"), &keys)?;
-        let values = self.v_proj.forward(x, stream)?;
-        observer.observe(&format!("{prefix}.v_proj"), &values)?;
-
-        let queries = reshape_attention_projection(queries, batch, seq_len, self.n_heads, stream)?;
-        observer.observe(&format!("{prefix}.queries"), &queries)?;
-        let keys = reshape_attention_projection(keys, batch, seq_len, self.n_kv_heads, stream)?;
-        observer.observe(&format!("{prefix}.keys"), &keys)?;
-        let values = reshape_attention_projection(values, batch, seq_len, self.n_kv_heads, stream)?;
-        observer.observe(&format!("{prefix}.values"), &values)?;
-
-        let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
-        let (queries, keys, values) =
-            apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
-        observer.observe(&format!("{prefix}.queries_rope"), &queries)?;
-        observer.observe(&format!("{prefix}.keys_rope"), &keys)?;
-        observer.observe(&format!("{prefix}.values_cache"), &values)?;
-        let output = if let Some(window) = self
-            .sliding_window
-            .filter(|_| allow_sliding_prefill && seq_len > 1)
-        {
-            common::attention::sliding_window_prefill_attention(
-                queries,
-                keys,
-                values,
-                self.scale,
-                window,
-                position_offset,
-                batch,
-                seq_len,
-                stream,
-            )?
-        } else {
-            let attention_probs =
-                attention_probabilities(&queries, &keys, self.scale, mask, stream)?;
-            observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
-            finish_attention(
-                queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
-            )?
-        };
-        observer.observe(&format!("{prefix}.attention"), &output)?;
-
-        let output = self.o_proj.forward(&output, stream)?;
-        observer.observe(&format!("{prefix}.o_proj"), &output)?;
-        Ok(output)
-    }
-}
-
-impl<C> Module<AttentionInput<'_, C>> for Attention
-where
-    C: KeyValueCache,
-{
-    type Output = Array;
-
-    type Error = Exception;
-
-    #[allow(non_snake_case)]
-    fn forward(
-        &mut self,
-        input: AttentionInput<'_, C>,
-        stream: &Stream,
-    ) -> Result<Self::Output, Self::Error> {
-        let AttentionInput {
-            x,
-            mask,
-            mut cache,
-            allow_sliding_prefill,
-        } = input;
-
-        let (B, L) = batch_seq(x);
-
-        let queries = self.q_proj.forward(x, stream)?;
-        let keys = self.k_proj.forward(x, stream)?;
-        let values = self.v_proj.forward(x, stream)?;
-
-        let queries = reshape_attention_projection(queries, B, L, self.n_heads, stream)?;
-        let keys = reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?;
-        let values = reshape_attention_projection(values, B, L, self.n_kv_heads, stream)?;
-        let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
-        let (queries, keys, values) =
-            apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
-        let output = if let Some(window_size) = self
-            .sliding_window
-            .filter(|_| allow_sliding_prefill && L > 1)
-        {
-            common::attention::sliding_window_prefill_attention(
-                queries,
-                keys,
-                values,
-                self.scale,
-                window_size,
-                position_offset,
-                B,
-                L,
-                stream,
-            )?
-        } else {
-            finish_attention(queries, keys, values, cache, self.scale, mask, B, L, stream)?
-        };
-
-        self.o_proj.forward(&output, stream)
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.q_proj.training_mode(mode);
-        self.k_proj.training_mode(mode);
-        self.v_proj.training_mode(mode);
-        self.o_proj.training_mode(mode);
-        <RopeVariant as Module<nn::RopeInput>>::training_mode(&mut self.rope, mode);
-    }
-}
-
-/// Llama feed-forward block.
-pub type Mlp = SwiGluMlp;
-
-#[derive(Debug, Clone, ModuleParameters, Quantizable)]
-/// Llama decoder block.
+/// MLX specialization of one backend-neutral Llama decoder block.
+#[derive(Debug, Clone)]
 pub struct TransformerBlock {
-    /// Number of attention heads.
-    pub num_attention_heads: i32,
-    /// Transformer hidden size.
-    pub hidden_size: i32,
-
-    #[quantizable]
-    #[param]
-    /// Self-attention layer.
-    pub self_attn: Attention,
-
-    #[quantizable]
-    #[param]
-    /// Feed-forward layer.
-    pub mlp: Mlp,
-
-    #[param]
-    /// Pre-attention RMSNorm.
-    pub input_layernorm: nn::RmsNorm,
-
-    #[param]
-    /// Pre-MLP RMSNorm.
-    pub post_attention_layernorm: nn::RmsNorm,
+    /// Shared architecture implementation specialized to MLX operators.
+    pub inner: super::backend::SharedTransformerBlock,
 }
 
 impl TransformerBlock {
-    /// Creates an unloaded decoder block from model arguments.
+    /// Creates layer zero using normalized model geometry.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Self::new_for_layer(args, 0, stream)
     }
@@ -586,113 +283,31 @@ impl TransformerBlock {
         layer_index: i32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let num_attention_heads = args.num_attention_heads;
-        let hidden_size = args.hidden_size;
-
-        let self_attn = Attention::new_for_layer(args, layer_index, stream)?;
-        let mlp_prefix = format!("model.layers.{layer_index}.mlp");
-        let mlp = SwiGluMlp {
-            gate_proj: common::linear::unloaded_maybe_quantized_linear(
-                args.hidden_size,
-                args.intermediate_size,
-                args.mlp_bias,
-                args.affine_quantization_for(&format!("{mlp_prefix}.gate_proj.weight")),
-                stream,
-            )?,
-            down_proj: common::linear::unloaded_maybe_quantized_linear(
-                args.intermediate_size,
-                args.hidden_size,
-                args.mlp_bias,
-                args.affine_quantization_for(&format!("{mlp_prefix}.down_proj.weight")),
-                stream,
-            )?,
-            up_proj: common::linear::unloaded_maybe_quantized_linear(
-                args.hidden_size,
-                args.intermediate_size,
-                args.mlp_bias,
-                args.affine_quantization_for(&format!("{mlp_prefix}.up_proj.weight")),
-                stream,
-            )?,
-        };
-        let input_layernorm =
-            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
-        let post_attention_layernorm =
-            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
-
-        Ok(Self {
-            num_attention_heads,
-            hidden_size,
-            self_attn,
-            mlp,
-            input_layernorm,
-            post_attention_layernorm,
-        })
+        let layer = usize::try_from(layer_index)
+            .map_err(|_| Exception::custom(format!("invalid Llama layer index {layer_index}")))?;
+        eredu_architectures::llama::TransformerBlock::<super::backend::MlxBackend>::new(
+            args, layer, stream,
+        )
+        .map(|inner| Self { inner })
+        .map_err(|error| Exception::custom(error.to_string()))
     }
 
-    /// Forward pass that reports block activations to an observer.
-    pub fn forward_with_observer<C>(
+    /// Executes one replicated decoder block.
+    pub fn forward<C>(
         &mut self,
         input: AttentionInput<'_, C>,
         stream: &Stream,
-        prefix: &str,
-        observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception>
     where
-        C: KeyValueCache,
+        C: eredu_nn::AttentionCache<Array>,
     {
-        let AttentionInput {
-            x,
-            mask,
-            cache,
-            allow_sliding_prefill,
-        } = input;
-
-        observer.observe(&format!("{prefix}.input"), x)?;
-        observer.observe(&format!("{prefix}.residual_before_attention"), x)?;
-        let normed = self.input_layernorm.forward(x, stream)?;
-        observer.observe(&format!("{prefix}.input_layernorm"), &normed)?;
-
-        let self_attn_input = AttentionInput {
-            x: &normed,
-            mask,
-            cache,
-            allow_sliding_prefill,
-        };
-        let r = self.self_attn.forward_with_observer(
-            self_attn_input,
-            stream,
-            &format!("{prefix}.self_attn"),
-            observer,
-        )?;
-        observer.observe(&format!("{prefix}.self_attn_output"), &r)?;
-        observer.observe(&format!("{prefix}.residual_delta_attention"), &r)?;
-        let h = x.add(r, stream)?;
-        observer.observe(&format!("{prefix}.post_attention_residual"), &h)?;
-        observer.observe(&format!("{prefix}.residual_after_attention"), &h)?;
-
-        observer.observe(&format!("{prefix}.residual_before_mlp"), &h)?;
-        let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
-        observer.observe(&format!("{prefix}.post_attention_layernorm"), &post_normed)?;
-        let r = self.mlp.forward_with_observer(
-            &post_normed,
-            stream,
-            &format!("{prefix}.mlp"),
-            observer,
-        )?;
-        observer.observe(&format!("{prefix}.mlp_output"), &r)?;
-        observer.observe(&format!("{prefix}.residual_delta_mlp"), &r)?;
-        let output = h.add(r, stream)?;
-        let output = observer
-            .intervene(&format!("{prefix}.output"), &output)?
-            .unwrap_or(output);
-        observer.observe(&format!("{prefix}.output"), &output)?;
-        observer.observe(&format!("{prefix}.residual_after_mlp"), &output)?;
-        Ok(output)
+        self.inner
+            .forward(input, stream)
+            .map_err(|error| Exception::custom(error.to_string()))
     }
 
-    /// Executes a block whose attention heads and MLP intermediates are
-    /// rank-local, reducing each row projection exactly once.
-    pub(crate) fn forward_tensor_parallel<C: KeyValueCache>(
+    /// Executes a block with rank-local heads and MLP intermediates.
+    pub(crate) fn forward_tensor_parallel<C>(
         &mut self,
         hidden: &Array,
         mask: Option<&Array>,
@@ -700,339 +315,283 @@ impl TransformerBlock {
         allow_sliding_prefill: bool,
         group: &safemlx::distributed::Group,
         stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let normalized = self.input_layernorm.forward(hidden, stream)?;
-        let attention = &mut self.self_attn;
-        let (batch, sequence) = batch_seq(&normalized);
-        let queries = attention.q_proj.forward(&normalized, stream)?;
-        let keys = attention.k_proj.forward(&normalized, stream)?;
-        let values = attention.v_proj.forward(&normalized, stream)?;
-        let queries =
-            reshape_attention_projection(queries, batch, sequence, attention.n_heads, stream)?;
-        let keys =
-            reshape_attention_projection(keys, batch, sequence, attention.n_kv_heads, stream)?;
-        let values =
-            reshape_attention_projection(values, batch, sequence, attention.n_kv_heads, stream)?;
-        let offset = cache.as_ref().map_or(0, |cache| cache.offset());
-        let mut cache = cache;
-        let (queries, keys, values) = apply_rope_and_update_cache(
-            &mut attention.rope,
-            queries,
-            keys,
-            values,
-            &mut cache,
-            stream,
-        )?;
-        let attended = if let Some(window) = attention
-            .sliding_window
-            .filter(|_| allow_sliding_prefill && sequence > 1)
-        {
-            common::attention::sliding_window_prefill_attention(
-                queries,
-                keys,
-                values,
-                attention.scale,
-                window,
-                offset,
-                batch,
-                sequence,
-                stream,
-            )?
-        } else {
-            finish_attention(
-                queries,
-                keys,
-                values,
-                cache,
-                attention.scale,
-                mask,
-                batch,
-                sequence,
-                stream,
-            )?
-        };
-        let attention = crate::backend::mlx::nn::parallel::forward_row_parallel(
-            &mut attention.o_proj,
-            &attended,
-            group,
-            stream,
-        )?;
-        let hidden = hidden.add(attention, stream)?;
-        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
-        let gate = crate::backend::mlx::nn::layers::silu(
-            self.mlp.gate_proj.forward(&normalized, stream)?,
-            stream,
-        )?;
-        let up = self.mlp.up_proj.forward(&normalized, stream)?;
-        let mlp = crate::backend::mlx::nn::parallel::forward_row_parallel(
-            &mut self.mlp.down_proj,
-            &gate.multiply(up, stream)?,
-            group,
-            stream,
-        )?;
-        hidden.add(mlp, stream)
-    }
-}
-
-impl<C> Module<AttentionInput<'_, C>> for TransformerBlock
-where
-    C: KeyValueCache,
-{
-    type Output = Array;
-
-    type Error = Exception;
-
-    fn forward(
-        &mut self,
-        input: AttentionInput<'_, C>,
-        stream: &Stream,
-    ) -> Result<Self::Output, Self::Error> {
-        let AttentionInput {
-            x,
-            mask,
-            cache,
-            allow_sliding_prefill,
-        } = input;
-
-        let normed = self.input_layernorm.forward(x, stream)?;
-        let self_attn_input = AttentionInput {
-            x: &normed,
-            mask,
-            cache,
-            allow_sliding_prefill,
-        };
-        let r = self.self_attn.forward(self_attn_input, stream)?;
-        let h = x.add(r, stream)?;
-
-        let post_normed = self.post_attention_layernorm.forward(&h, stream)?;
-        let r = self.mlp.forward(&post_normed, stream)?;
-        h.add(r, stream)
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        <Attention as Module<AttentionInput<'_, C>>>::training_mode(&mut self.self_attn, mode);
-        self.mlp.training_mode(mode);
-        self.input_layernorm.training_mode(mode);
-        self.post_attention_layernorm.training_mode(mode);
-    }
-}
-
-#[derive(Debug, Clone, ModuleParameters, Quantizable)]
-/// Llama transformer body without the language-model head.
-pub struct ResidentDecoder {
-    /// Token vocabulary size.
-    pub vocab_size: i32,
-    /// Number of decoder layers.
-    pub num_hidden_layers: i32,
-    #[quantizable]
-    #[param]
-    /// Token embedding table.
-    pub embed_tokens: MaybeQuantized<nn::Embedding>,
-
-    #[quantizable]
-    #[param]
-    /// Decoder blocks.
-    pub layers: Vec<TransformerBlock>,
-
-    #[param]
-    /// Final RMSNorm.
-    pub norm: nn::RmsNorm,
-}
-
-impl ResidentDecoder {
-    /// Creates an unloaded Llama transformer body.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        assert!(args.vocab_size.is_positive());
-
-        let vocab_size = args.vocab_size;
-        let num_hidden_layers = args.num_hidden_layers;
-
-        let embed_tokens = common::linear::unloaded_maybe_quantized_embedding(
-            args.vocab_size,
-            args.hidden_size,
-            args.affine_quantization_for("model.embed_tokens.weight"),
-            stream,
-        )?;
-        let layers = (0..num_hidden_layers)
-            .map(|layer_index| TransformerBlock::new_for_layer(args, layer_index, stream))
-            .collect::<Result<Vec<_>, _>>()?;
-        let norm =
-            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
-
-        Ok(Self {
-            vocab_size,
-            num_hidden_layers,
-            embed_tokens,
-            layers,
-            norm,
-        })
-    }
-
-    fn attention_mask<C>(
-        &self,
-        h: &Array,
-        cache: &[Option<C>],
-        stream: &Stream,
-    ) -> Result<Option<Array>, Exception>
-    where
-        C: KeyValueCache,
-    {
-        match create_attention_mask(h, cache, Some(true), stream)? {
-            Some(AttentionMask::Array(mask)) => Ok(Some(mask)),
-            Some(AttentionMask::Causal) => Err(Exception::custom(
-                "Llama-compatible decoders require an explicit attention mask",
-            )),
-            None => Ok(None),
-        }
-    }
-
-    /// Forward pass that reports transformer-body activations to an observer.
-    pub fn forward_with_observer<C>(
-        &mut self,
-        input: ModelInput<'_, C>,
-        stream: &Stream,
-        observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception>
     where
-        C: KeyValueCache,
+        C: eredu_nn::AttentionCache<Array>,
     {
-        let ModelInput {
-            inputs,
-            mask,
-            cache,
-        } = input;
-
-        let mut h = self.embed_tokens.forward(inputs, stream)?;
-        observer.observe("model.embed_tokens", &h)?;
-
-        let allow_sliding_prefill = mask.is_none();
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => self.attention_mask(&h, cache, stream)?,
-        };
-        if let Some(mask) = mask.as_ref() {
-            observer.observe("model.attention_mask", mask)?;
-        }
-
-        for (i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
-            let layer_input = AttentionInput {
-                x: &h,
-                mask: mask.as_ref(),
-                cache: c.as_mut(),
-                allow_sliding_prefill,
-            };
-            h = layer.forward_with_observer(
-                layer_input,
+        self.inner
+            .forward_tensor_parallel(
+                AttentionInput {
+                    hidden,
+                    mask,
+                    cache,
+                    allow_sliding_prefill,
+                },
+                group,
                 stream,
-                &format!("model.layers.{i}"),
-                observer,
-            )?;
-        }
-
-        let output = self.norm.forward(&h, stream)?;
-        observer.observe("model.norm", &output)?;
-        Ok(output)
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
     }
 }
 
-/// Input for a Llama forward pass.
+fn insert_module_ref<'a>(
+    map: &mut safemlx::module::ModuleParamRef<'a>,
+    name: &str,
+    module: &'a impl safemlx::module::ModuleParameters,
+) {
+    map.insert(
+        name.into(),
+        safemlx::nested::NestedValue::Map(module.parameters().entries),
+    );
+}
+
+fn insert_module_mut<'a>(
+    map: &mut safemlx::module::ModuleParamMut<'a>,
+    name: &str,
+    module: &'a mut impl safemlx::module::ModuleParameters,
+) {
+    map.insert(
+        name.into(),
+        safemlx::nested::NestedValue::Map(module.parameters_mut().entries),
+    );
+}
+
+fn insert_trainable_ref<'a>(
+    map: &mut safemlx::module::ModuleParamRef<'a>,
+    name: &str,
+    module: &'a impl safemlx::module::ModuleParameters,
+) {
+    map.insert(
+        name.into(),
+        safemlx::nested::NestedValue::Map(module.trainable_parameters().entries),
+    );
+}
+
+fn attention_parameters(
+    attention: &eredu_architectures::llama::Attention<super::backend::MlxBackend>,
+) -> safemlx::module::ModuleParamRef<'_> {
+    let mut map = safemlx::module::ModuleParamRef::new();
+    insert_module_ref(&mut map, "q_proj", &attention.query);
+    insert_module_ref(&mut map, "k_proj", &attention.key);
+    insert_module_ref(&mut map, "v_proj", &attention.value);
+    insert_module_ref(&mut map, "o_proj", &attention.output);
+    insert_module_ref(&mut map, "rope", &attention.rotary);
+    map
+}
+
+fn attention_parameters_mut(
+    attention: &mut eredu_architectures::llama::Attention<super::backend::MlxBackend>,
+) -> safemlx::module::ModuleParamMut<'_> {
+    let mut map = safemlx::module::ModuleParamMut::new();
+    insert_module_mut(&mut map, "q_proj", &mut attention.query);
+    insert_module_mut(&mut map, "k_proj", &mut attention.key);
+    insert_module_mut(&mut map, "v_proj", &mut attention.value);
+    insert_module_mut(&mut map, "o_proj", &mut attention.output);
+    insert_module_mut(&mut map, "rope", &mut attention.rotary);
+    map
+}
+
+fn mlp_parameters(
+    mlp: &eredu_architectures::llama::Mlp<super::backend::MlxBackend>,
+) -> safemlx::module::ModuleParamRef<'_> {
+    let mut map = safemlx::module::ModuleParamRef::new();
+    insert_module_ref(&mut map, "gate_proj", &mlp.gate);
+    insert_module_ref(&mut map, "up_proj", &mlp.up);
+    insert_module_ref(&mut map, "down_proj", &mlp.down);
+    map
+}
+
+fn mlp_parameters_mut(
+    mlp: &mut eredu_architectures::llama::Mlp<super::backend::MlxBackend>,
+) -> safemlx::module::ModuleParamMut<'_> {
+    let mut map = safemlx::module::ModuleParamMut::new();
+    insert_module_mut(&mut map, "gate_proj", &mut mlp.gate);
+    insert_module_mut(&mut map, "up_proj", &mut mlp.up);
+    insert_module_mut(&mut map, "down_proj", &mut mlp.down);
+    map
+}
+
+fn block_parameters(
+    block: &super::backend::SharedTransformerBlock,
+) -> safemlx::module::ModuleParamRef<'_> {
+    let mut map = safemlx::module::ModuleParamRef::new();
+    map.insert(
+        "self_attn".into(),
+        safemlx::nested::NestedValue::Map(attention_parameters(&block.self_attention).entries),
+    );
+    map.insert(
+        "mlp".into(),
+        safemlx::nested::NestedValue::Map(mlp_parameters(&block.mlp).entries),
+    );
+    insert_module_ref(&mut map, "input_layernorm", &block.input_norm);
+    insert_module_ref(
+        &mut map,
+        "post_attention_layernorm",
+        &block.post_attention_norm,
+    );
+    map
+}
+
+fn block_parameters_mut(
+    block: &mut super::backend::SharedTransformerBlock,
+) -> safemlx::module::ModuleParamMut<'_> {
+    let mut map = safemlx::module::ModuleParamMut::new();
+    map.insert(
+        "self_attn".into(),
+        safemlx::nested::NestedValue::Map(
+            attention_parameters_mut(&mut block.self_attention).entries,
+        ),
+    );
+    map.insert(
+        "mlp".into(),
+        safemlx::nested::NestedValue::Map(mlp_parameters_mut(&mut block.mlp).entries),
+    );
+    insert_module_mut(&mut map, "input_layernorm", &mut block.input_norm);
+    insert_module_mut(
+        &mut map,
+        "post_attention_layernorm",
+        &mut block.post_attention_norm,
+    );
+    map
+}
+
+fn block_trainable_parameters(
+    block: &super::backend::SharedTransformerBlock,
+) -> safemlx::module::ModuleParamRef<'_> {
+    let attention = &block.self_attention;
+    let mut attention_map = safemlx::module::ModuleParamRef::new();
+    insert_trainable_ref(&mut attention_map, "q_proj", &attention.query);
+    insert_trainable_ref(&mut attention_map, "k_proj", &attention.key);
+    insert_trainable_ref(&mut attention_map, "v_proj", &attention.value);
+    insert_trainable_ref(&mut attention_map, "o_proj", &attention.output);
+    insert_trainable_ref(&mut attention_map, "rope", &attention.rotary);
+
+    let mut mlp_map = safemlx::module::ModuleParamRef::new();
+    insert_trainable_ref(&mut mlp_map, "gate_proj", &block.mlp.gate);
+    insert_trainable_ref(&mut mlp_map, "up_proj", &block.mlp.up);
+    insert_trainable_ref(&mut mlp_map, "down_proj", &block.mlp.down);
+
+    let mut map = safemlx::module::ModuleParamRef::new();
+    map.insert(
+        "self_attn".into(),
+        safemlx::nested::NestedValue::Map(attention_map.entries),
+    );
+    map.insert(
+        "mlp".into(),
+        safemlx::nested::NestedValue::Map(mlp_map.entries),
+    );
+    insert_trainable_ref(&mut map, "input_layernorm", &block.input_norm);
+    insert_trainable_ref(
+        &mut map,
+        "post_attention_layernorm",
+        &block.post_attention_norm,
+    );
+    map
+}
+
+fn block_frozen_states(
+    block: &super::backend::SharedTransformerBlock,
+) -> impl Iterator<Item = Option<bool>> + '_ {
+    [
+        block.self_attention.query.all_frozen(),
+        block.self_attention.key.all_frozen(),
+        block.self_attention.value.all_frozen(),
+        block.self_attention.output.all_frozen(),
+        block.self_attention.rotary.all_frozen(),
+        block.mlp.gate.all_frozen(),
+        block.mlp.up.all_frozen(),
+        block.mlp.down.all_frozen(),
+        block.input_norm.all_frozen(),
+        block.post_attention_norm.all_frozen(),
+    ]
+    .into_iter()
+}
+
+fn freeze_block(block: &mut super::backend::SharedTransformerBlock, mode: bool, recursive: bool) {
+    let attention = &mut block.self_attention;
+    let mlp = &mut block.mlp;
+    if mode {
+        attention.query.freeze_parameters(recursive);
+        attention.key.freeze_parameters(recursive);
+        attention.value.freeze_parameters(recursive);
+        attention.output.freeze_parameters(recursive);
+        attention.rotary.freeze_parameters(recursive);
+        mlp.gate.freeze_parameters(recursive);
+        mlp.up.freeze_parameters(recursive);
+        mlp.down.freeze_parameters(recursive);
+        block.input_norm.freeze_parameters(recursive);
+        block.post_attention_norm.freeze_parameters(recursive);
+    } else {
+        attention.query.unfreeze_parameters(recursive);
+        attention.key.unfreeze_parameters(recursive);
+        attention.value.unfreeze_parameters(recursive);
+        attention.output.unfreeze_parameters(recursive);
+        attention.rotary.unfreeze_parameters(recursive);
+        mlp.gate.unfreeze_parameters(recursive);
+        mlp.up.unfreeze_parameters(recursive);
+        mlp.down.unfreeze_parameters(recursive);
+        block.input_norm.unfreeze_parameters(recursive);
+        block.post_attention_norm.unfreeze_parameters(recursive);
+    }
+}
+
+impl safemlx::module::ModuleParameters for TransformerBlock {
+    fn num_parameters(&self) -> usize {
+        self.parameters().flatten().len()
+    }
+    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        block_parameters(&self.inner)
+    }
+    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+        block_parameters_mut(&mut self.inner)
+    }
+    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        block_trainable_parameters(&self.inner)
+    }
+    fn freeze_parameters(&mut self, recursive: bool) {
+        freeze_block(&mut self.inner, true, recursive);
+    }
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        freeze_block(&mut self.inner, false, recursive);
+    }
+    fn all_frozen(&self) -> Option<bool> {
+        let mut states = block_frozen_states(&self.inner).flatten().peekable();
+        states.peek()?;
+        Some(states.all(|frozen| frozen))
+    }
+    fn any_frozen(&self) -> Option<bool> {
+        let mut states = block_frozen_states(&self.inner).flatten().peekable();
+        states.peek()?;
+        Some(states.any(|frozen| frozen))
+    }
+}
+
+/// Input for a resident Llama forward pass.
 pub struct ModelInput<'a, C> {
     /// Token ids with shape `[batch, sequence]`.
     pub inputs: &'a Array,
-    /// Optional attention mask.
+    /// Optional caller-provided attention mask.
     pub mask: Option<&'a Array>,
     /// Mutable per-layer key/value cache.
     pub cache: &'a mut Vec<Option<C>>,
 }
 
-impl<C> Module<ModelInput<'_, C>> for ResidentDecoder
-where
-    C: KeyValueCache,
-{
-    type Output = Array;
-
-    type Error = Exception;
-
-    fn forward(
-        &mut self,
-        input: ModelInput<'_, C>,
-        stream: &Stream,
-    ) -> Result<Self::Output, Self::Error> {
-        let ModelInput {
-            inputs,
-            mask,
-            cache,
-        } = input;
-
-        let mut h = self.embed_tokens.forward(inputs, stream)?;
-
-        let allow_sliding_prefill = mask.is_none();
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => self.attention_mask(&h, cache, stream)?,
-        };
-
-        for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
-            let layer_input = AttentionInput {
-                x: &h,
-                mask: mask.as_ref(),
-                cache: c.as_mut(),
-                allow_sliding_prefill,
-            };
-            h = layer.forward(layer_input, stream)?;
-        }
-
-        self.norm.forward(&h, stream)
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.embed_tokens.training_mode(mode);
-        for layer in &mut self.layers {
-            <TransformerBlock as Module<AttentionInput<'_, C>>>::training_mode(layer, mode);
-        }
-        self.norm.training_mode(mode);
-    }
-}
-
-#[derive(Debug, Clone, ModuleParameters, Quantizable)]
-/// Llama causal language model.
+/// Resident MLX specialization of the shared Llama model.
+#[derive(Debug, Clone)]
 pub struct ResidentModel {
-    /// Model configuration.
+    /// Normalized model configuration and MLX weight encoding metadata.
     pub args: ModelArgs,
-
-    #[quantizable]
-    #[param]
-    /// Transformer body.
-    pub model: ResidentDecoder,
-
-    #[quantizable]
-    #[param]
-    /// Optional untied language-model head.
-    pub lm_head: Option<MaybeQuantized<nn::Linear>>,
+    /// Shared architecture specialized to native MLX modules.
+    pub inner: eredu_architectures::llama::Model<super::backend::MlxBackend>,
 }
 
 impl ResidentModel {
-    /// Creates an unloaded Llama causal language model.
+    /// Creates an unloaded resident model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let model = ResidentDecoder::new(&args, stream)?;
-        let lm_head = if !args.tie_word_embeddings {
-            Some(
-                common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
-                    args.hidden_size,
-                    args.vocab_size,
-                    args.affine_quantization_for("lm_head.weight"),
-                    stream,
-                )?,
-            )
-        } else {
-            None
-        };
-
-        Ok(Self {
-            args,
-            model,
-            lm_head,
-        })
+        let inner =
+            eredu_architectures::llama::Model::<super::backend::MlxBackend>::new(&args, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(Self { args, inner })
     }
 
     /// Returns the configured model type.
@@ -1048,8 +607,7 @@ impl ResidentModel {
             .map(|policy| {
                 Some(match policy.window() {
                     Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
-                        i32::try_from(window.get())
-                            .expect("validated Llama attention window fits i32"),
+                        i32::try_from(window.get()).expect("validated Llama window fits i32"),
                     ),
                     None => ConcatKeyValueCache::new(),
                 })
@@ -1057,7 +615,10 @@ impl ResidentModel {
             .collect()
     }
 
-    fn validate_cache<C: KeyValueCache>(&self, cache: &[Option<C>]) -> Result<(), Exception> {
+    fn validate_cache<C: eredu_nn::AttentionCache<Array>>(
+        &self,
+        cache: &[Option<C>],
+    ) -> Result<(), Exception> {
         if cache.len() != self.args.attention_schedule.len() {
             return Err(Exception::custom(format!(
                 "Llama cache has {} layers, expected {}",
@@ -1074,70 +635,229 @@ impl ResidentModel {
                 Exception::custom(format!("Llama cache is missing layer {layer}"))
             })?;
             let expected = policy.window().map(|window| {
-                i32::try_from(window.get()).expect("validated Llama attention window fits i32")
+                i32::try_from(window.get()).expect("validated Llama window fits i32")
             });
-            if cache.max_size() != expected {
-                return Err(Exception::custom(format!(
-                    "Llama cache policy mismatch at layer {layer}: expected {policy:?}, cache window is {:?}",
-                    cache.max_size()
-                )));
+            if eredu_nn::AttentionCache::max_size(cache) != expected {
+                return Err(Exception::custom(format!("Llama cache policy mismatch at layer {layer}: expected {policy:?}, cache window is {:?}", eredu_nn::AttentionCache::max_size(cache))));
             }
         }
         Ok(())
     }
 
-    /// Forward pass that reports activations to an observer.
-    pub fn forward_with_observer<C>(
+    fn forward_shared<C>(
         &mut self,
         input: ModelInput<'_, C>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception>
     where
-        C: KeyValueCache,
+        C: eredu_nn::AttentionCache<Array> + KeyValueCache,
     {
         self.validate_cache(input.cache)?;
-        let out = self.model.forward_with_observer(input, stream, observer)?;
-        observer.observe("model.output", &out)?;
-        let logits = project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.model.embed_tokens,
-            &out,
-            stream,
-        )?;
-        observer.observe("lm_head.logits", &logits)?;
-        Ok(logits)
+        let allow_sliding_prefill = input.mask.is_none();
+        let hidden = self
+            .inner
+            .decoder
+            .embed(input.inputs, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mask = match input.mask {
+            Some(mask) => Some(mask.clone()),
+            None => match create_attention_mask(&hidden, input.cache, Some(true), stream)? {
+                Some(AttentionMask::Array(mask)) => Some(mask),
+                Some(AttentionMask::Causal) => {
+                    return Err(Exception::custom(
+                        "Llama decoders require an explicit attention mask",
+                    ))
+                }
+                None => None,
+            },
+        };
+        let hidden = self
+            .inner
+            .decoder
+            .forward_embedded(
+                hidden,
+                mask.as_ref(),
+                allow_sliding_prefill,
+                input.cache,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        self.inner
+            .logits(&hidden, stream)
+            .map_err(|error| Exception::custom(error.to_string()))
     }
 }
 
 impl<C> Module<ModelInput<'_, C>> for ResidentModel
 where
-    C: KeyValueCache,
+    C: eredu_nn::AttentionCache<Array> + KeyValueCache,
 {
     type Output = Array;
-
     type Error = Exception;
-
-    fn forward(
-        &mut self,
-        input: ModelInput<'_, C>,
-        stream: &Stream,
-    ) -> Result<Self::Output, Self::Error> {
-        self.validate_cache(input.cache)?;
-        let out = self.model.forward(input, stream)?;
-        project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.model.embed_tokens,
-            &out,
-            stream,
-        )
+    fn forward(&mut self, input: ModelInput<'_, C>, stream: &Stream) -> Result<Array, Exception> {
+        self.forward_shared(input, stream)
     }
-
     fn training_mode(&mut self, mode: bool) {
-        <ResidentDecoder as Module<ModelInput<'_, C>>>::training_mode(&mut self.model, mode);
-        if let Some(lm_head) = &mut self.lm_head {
-            lm_head.training_mode(mode);
+        self.inner.decoder.embeddings.training_mode(mode);
+        for layer in &mut self.inner.decoder.layers {
+            layer.self_attention.query.training_mode(mode);
+            layer.self_attention.key.training_mode(mode);
+            layer.self_attention.value.training_mode(mode);
+            layer.self_attention.output.training_mode(mode);
+            layer.mlp.gate.training_mode(mode);
+            layer.mlp.up.training_mode(mode);
+            layer.mlp.down.training_mode(mode);
+            layer.input_norm.training_mode(mode);
+            layer.post_attention_norm.training_mode(mode);
         }
+        self.inner.decoder.norm.training_mode(mode);
+        if let Some(head) = &mut self.inner.lm_head {
+            head.training_mode(mode);
+        }
+    }
+}
+
+impl safemlx::module::ModuleParameters for ResidentModel {
+    fn num_parameters(&self) -> usize {
+        self.parameters().flatten().len()
+    }
+    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        let mut model = safemlx::module::ModuleParamRef::new();
+        insert_module_ref(&mut model, "embed_tokens", &self.inner.decoder.embeddings);
+        let mut layers = safemlx::module::ModuleParamRef::new();
+        for (index, layer) in self.inner.decoder.layers.iter().enumerate() {
+            layers.insert(
+                index.to_string().into(),
+                safemlx::nested::NestedValue::Map(block_parameters(layer).entries),
+            );
+        }
+        model.insert(
+            "layers".into(),
+            safemlx::nested::NestedValue::Map(layers.entries),
+        );
+        insert_module_ref(&mut model, "norm", &self.inner.decoder.norm);
+        let mut root = safemlx::module::ModuleParamRef::new();
+        root.insert(
+            "model".into(),
+            safemlx::nested::NestedValue::Map(model.entries),
+        );
+        if let Some(head) = &self.inner.lm_head {
+            insert_module_ref(&mut root, "lm_head", head);
+        }
+        root
+    }
+    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+        let mut model = safemlx::module::ModuleParamMut::new();
+        insert_module_mut(
+            &mut model,
+            "embed_tokens",
+            &mut self.inner.decoder.embeddings,
+        );
+        let mut layers = safemlx::module::ModuleParamMut::new();
+        for (index, layer) in self.inner.decoder.layers.iter_mut().enumerate() {
+            layers.insert(
+                index.to_string().into(),
+                safemlx::nested::NestedValue::Map(block_parameters_mut(layer).entries),
+            );
+        }
+        model.insert(
+            "layers".into(),
+            safemlx::nested::NestedValue::Map(layers.entries),
+        );
+        insert_module_mut(&mut model, "norm", &mut self.inner.decoder.norm);
+        let mut root = safemlx::module::ModuleParamMut::new();
+        root.insert(
+            "model".into(),
+            safemlx::nested::NestedValue::Map(model.entries),
+        );
+        if let Some(head) = &mut self.inner.lm_head {
+            insert_module_mut(&mut root, "lm_head", head);
+        }
+        root
+    }
+    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        let mut model = safemlx::module::ModuleParamRef::new();
+        insert_trainable_ref(&mut model, "embed_tokens", &self.inner.decoder.embeddings);
+        let mut layers = safemlx::module::ModuleParamRef::new();
+        for (index, layer) in self.inner.decoder.layers.iter().enumerate() {
+            layers.insert(
+                index.to_string().into(),
+                safemlx::nested::NestedValue::Map(block_trainable_parameters(layer).entries),
+            );
+        }
+        model.insert(
+            "layers".into(),
+            safemlx::nested::NestedValue::Map(layers.entries),
+        );
+        insert_trainable_ref(&mut model, "norm", &self.inner.decoder.norm);
+        let mut root = safemlx::module::ModuleParamRef::new();
+        root.insert(
+            "model".into(),
+            safemlx::nested::NestedValue::Map(model.entries),
+        );
+        if let Some(head) = &self.inner.lm_head {
+            insert_trainable_ref(&mut root, "lm_head", head);
+        }
+        root
+    }
+    fn freeze_parameters(&mut self, recursive: bool) {
+        self.inner.decoder.embeddings.freeze_parameters(recursive);
+        for layer in &mut self.inner.decoder.layers {
+            freeze_block(layer, true, recursive);
+        }
+        self.inner.decoder.norm.freeze_parameters(recursive);
+        if let Some(head) = &mut self.inner.lm_head {
+            head.freeze_parameters(recursive);
+        }
+    }
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        self.inner.decoder.embeddings.unfreeze_parameters(recursive);
+        for layer in &mut self.inner.decoder.layers {
+            freeze_block(layer, false, recursive);
+        }
+        self.inner.decoder.norm.unfreeze_parameters(recursive);
+        if let Some(head) = &mut self.inner.lm_head {
+            head.unfreeze_parameters(recursive);
+        }
+    }
+    fn all_frozen(&self) -> Option<bool> {
+        let mut states = std::iter::once(self.inner.decoder.embeddings.all_frozen())
+            .chain(
+                self.inner
+                    .decoder
+                    .layers
+                    .iter()
+                    .flat_map(block_frozen_states),
+            )
+            .chain(std::iter::once(self.inner.decoder.norm.all_frozen()))
+            .chain(self.inner.lm_head.iter().map(ModuleParameters::all_frozen))
+            .flatten()
+            .peekable();
+        states.peek()?;
+        Some(states.all(|frozen| frozen))
+    }
+    fn any_frozen(&self) -> Option<bool> {
+        let mut states = std::iter::once(self.inner.decoder.embeddings.any_frozen())
+            .chain(self.inner.decoder.layers.iter().flat_map(|block| {
+                [
+                    block.self_attention.query.any_frozen(),
+                    block.self_attention.key.any_frozen(),
+                    block.self_attention.value.any_frozen(),
+                    block.self_attention.output.any_frozen(),
+                    block.self_attention.rotary.any_frozen(),
+                    block.mlp.gate.any_frozen(),
+                    block.mlp.up.any_frozen(),
+                    block.mlp.down.any_frozen(),
+                    block.input_norm.any_frozen(),
+                    block.post_attention_norm.any_frozen(),
+                ]
+            }))
+            .chain(std::iter::once(self.inner.decoder.norm.any_frozen()))
+            .chain(self.inner.lm_head.iter().map(ModuleParameters::any_frozen))
+            .flatten()
+            .peekable();
+        states.peek()?;
+        Some(states.any(|frozen| frozen))
     }
 }
 
@@ -1592,7 +1312,7 @@ pub struct WeightMap {
 
 impl<C> CausalLm<Vec<Option<C>>> for ResidentModel
 where
-    C: KeyValueCache,
+    C: KeyValueCache + eredu_nn::AttentionCache<Array>,
 {
     fn prefill_input_logits(
         &mut self,

@@ -49,6 +49,27 @@ fn portable_facade_graph_has_no_accelerator_runtime() {
 }
 
 #[test]
+fn shared_architectures_do_not_depend_on_accelerator_runtimes() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let architecture = root.join("eredu-architectures");
+    let manifest = std::fs::read_to_string(architecture.join("Cargo.toml"))
+        .expect("architecture manifest must be readable");
+    assert!(!manifest.contains("safemlx"));
+
+    let mut sources = Vec::new();
+    rust_sources(&architecture.join("src"), &mut sources);
+    for source in sources {
+        let text = std::fs::read_to_string(&source).expect("architecture source must be readable");
+        assert!(
+            !text.contains("safemlx"),
+            "backend type leaked into {source:?}"
+        );
+    }
+}
+
+#[test]
 fn backend_and_example_dependencies_have_the_correct_manifest_ownership() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let output = Command::new(env!("CARGO"))

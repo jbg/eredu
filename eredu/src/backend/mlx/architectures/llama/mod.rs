@@ -1,7 +1,9 @@
 //! Llama and Mistral-compatible model family.
 
+pub(crate) mod backend;
 pub(crate) mod checkpoint;
 /// Bounded-residency execution and unified loading.
 pub mod layerwise;
-/// Reusable decoder operators; checkpoint loading is exposed only by [`layerwise`].
+/// MLX model configuration and resident binding; shared operators live in
+/// `eredu-architectures`.
 pub mod model;

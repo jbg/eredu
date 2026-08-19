@@ -9359,7 +9359,7 @@ impl LlamaStage {
                     ..
                 } if *cached_layer == global_layer => Ok(layer.forward(
                     llama::AttentionInput {
-                        x: hidden,
+                        hidden,
                         mask,
                         cache: Some(cache),
                         allow_sliding_prefill,
@@ -9372,7 +9372,7 @@ impl LlamaStage {
                     ..
                 } if *cached_layer == global_layer => Ok(layer.forward(
                     llama::AttentionInput {
-                        x: hidden,
+                        hidden,
                         mask,
                         cache: Some(cache),
                         allow_sliding_prefill,

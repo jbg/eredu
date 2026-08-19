@@ -250,17 +250,12 @@ impl Tensor for Array {
         context: &Self::Context,
     ) -> Result<Self, Error> {
         let mask = match mask {
-            AttentionMask::Causal => ScaledDotProductAttentionMask::Causal,
-            AttentionMask::Tensor(mask) => ScaledDotProductAttentionMask::Array(mask),
+            AttentionMask::None => None,
+            AttentionMask::Causal => Some(ScaledDotProductAttentionMask::Causal),
+            AttentionMask::Tensor(mask) => Some(ScaledDotProductAttentionMask::Array(mask)),
         };
         backend(scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale,
-            Some(mask),
-            None,
-            context,
+            queries, keys, values, scale, mask, None, context,
         ))
     }
 }

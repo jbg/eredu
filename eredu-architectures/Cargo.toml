@@ -1,0 +1,14 @@
+[package]
+name = "eredu-architectures"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Backend-neutral text model architectures for Eredu"
+
+[dependencies]
+eredu-core.workspace = true
+eredu-nn.workspace = true
+
