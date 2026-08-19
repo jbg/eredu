@@ -1,5 +1,4 @@
-use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{cell::Cell, convert::Infallible};
 
 use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, Completion, LayerSchedule};
 use eredu_nn::{
@@ -290,9 +289,11 @@ impl NeuralBackend for FakeBackend {
 #[derive(Debug)]
 struct Done;
 
-static FORK_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SUBMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
-static ORDER_COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static FORK_COUNT: Cell<usize> = const { Cell::new(0) };
+    static SUBMIT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static ORDER_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 impl Completion for Done {
     type Error = Infallible;
@@ -309,7 +310,7 @@ impl SubmissionBackend for FakeBackend {
     type OwnedExecutor = ();
     type Completion = Done;
     fn fork_executors(_: &(), count: usize) -> Result<Vec<Self::OwnedExecutor>, Infallible> {
-        FORK_COUNT.fetch_add(1, Ordering::Relaxed);
+        FORK_COUNT.set(FORK_COUNT.get() + 1);
         Ok(vec![(); count])
     }
     fn submit<'a, I>(_: &(), _: I) -> Result<Self::Completion, Infallible>
@@ -317,11 +318,11 @@ impl SubmissionBackend for FakeBackend {
         FakeTensor: 'a,
         I: IntoIterator<Item = &'a FakeTensor>,
     {
-        SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        SUBMIT_COUNT.set(SUBMIT_COUNT.get() + 1);
         Ok(Done)
     }
     fn order_after(_: &Done, _: &()) -> Result<(), Infallible> {
-        ORDER_COUNT.fetch_add(1, Ordering::Relaxed);
+        ORDER_COUNT.set(ORDER_COUNT.get() + 1);
         Ok(())
     }
     fn retain_until_complete<T: Send + 'static>(_: &(), _: &Done, _: T) -> Result<(), Infallible> {
@@ -694,9 +695,9 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
 
 #[test]
 fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
-    FORK_COUNT.store(0, Ordering::Relaxed);
-    SUBMIT_COUNT.store(0, Ordering::Relaxed);
-    ORDER_COUNT.store(0, Ordering::Relaxed);
+    FORK_COUNT.set(0);
+    SUBMIT_COUNT.set(0);
+    ORDER_COUNT.set(0);
     let policies = (0..4)
         .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap())
         .collect();
@@ -733,9 +734,9 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
         runtime.policy().addresses,
         vec![(0, 0, 0), (1, 1, 0), (2, 2, 0), (3, 2, 1)]
     );
-    assert_eq!(FORK_COUNT.load(Ordering::Relaxed), 1);
-    assert_eq!(SUBMIT_COUNT.load(Ordering::Relaxed), 4);
-    assert_eq!(ORDER_COUNT.load(Ordering::Relaxed), 5);
+    assert_eq!(FORK_COUNT.get(), 1);
+    assert_eq!(SUBMIT_COUNT.get(), 4);
+    assert_eq!(ORDER_COUNT.get(), 5);
 }
 
 #[test]
