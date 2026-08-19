@@ -329,6 +329,85 @@ impl<M: ModuleParameters> Parameterized<Array> for MlxNamedModule<M> {
     }
 }
 
+/// Generic neutral parameter view over an existing native MLX module tree.
+///
+/// The tree is inspected once during model construction and its complete
+/// checkpoint-facing identities are then frozen for all loading and residency
+/// operations. This capability is architecture-agnostic and never runs in a
+/// forward loop.
+#[derive(Debug, Clone)]
+pub(crate) struct MlxParameterTree<M> {
+    inner: M,
+    topology: BTreeMap<String, ParameterSpec>,
+}
+
+impl<M: ModuleParameters> MlxParameterTree<M> {
+    /// Captures one native module's complete stable parameter topology.
+    pub(crate) fn new(inner: M, prefix: &str) -> Result<Self, ComputeError> {
+        let mut topology = BTreeMap::new();
+        for local in inner.parameters().flatten().into_keys() {
+            let id = if prefix.is_empty() {
+                local.to_string()
+            } else {
+                format!("{prefix}.{local}")
+            };
+            let group = ["scales", "biases"].into_iter().find_map(|component| {
+                id.strip_suffix(&format!(".{component}"))
+                    .map(|base| format!("{base}.weight"))
+            });
+            topology.insert(
+                local.to_string(),
+                ParameterSpec {
+                    id: eredu_nn::ParameterId::new(id).map_err(ComputeError::backend)?,
+                    trainable: true,
+                    alias_of: None,
+                    group,
+                },
+            );
+        }
+        Ok(Self { inner, topology })
+    }
+
+    /// Decomposes the cold-path view without cloning native parameter handles.
+    pub(crate) fn into_inner(self) -> M {
+        self.inner
+    }
+}
+
+impl<M> std::ops::Deref for MlxParameterTree<M> {
+    type Target = M;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<M> std::ops::DerefMut for MlxParameterTree<M> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<M: ModuleParameters> Parameterized<Array> for MlxParameterTree<M> {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, Array>,
+    {
+        visit_module_parameters(&self.inner, &self.topology, visitor);
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, Array>,
+    {
+        visit_module_parameters_mut(&mut self.inner, &self.topology, visitor);
+    }
+
+    fn set_trainable(&mut self, trainable: bool) {
+        set_module_trainable(&mut self.inner, trainable);
+    }
+}
+
 macro_rules! delegate_parameters {
     ($type:ty, $field:tt) => {
         impl ModuleParameters for $type {
