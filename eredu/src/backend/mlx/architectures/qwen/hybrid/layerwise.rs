@@ -80,9 +80,7 @@ use crate::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
         ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{
-        ResidencyReport, ResidentUnitLease, WeightBindingExt,
-    },
+    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
     core::attention::AttentionPolicy,
 };
 

@@ -24,7 +24,7 @@ pub use parameter::{
 };
 pub use residency::{
     OffloadUnit, ResidencyController, ResidencyControllerError, ResidencyDeclarationError,
-    WeightBinding,
+    WeightBinding, WeightBindingSelectionError,
 };
 
 /// Inspectable architecture/runtime topology without backend-native values.

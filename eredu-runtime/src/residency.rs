@@ -129,6 +129,28 @@ impl WeightBinding {
         self.expected_bytes = expected_bytes;
         Ok(self)
     }
+
+    /// Rewrites one logical output selection into bounded physical sources.
+    pub fn select_bounded_output<C: RecipeCatalog + ?Sized>(
+        self,
+        catalog: &C,
+        selection: TensorSelection,
+    ) -> Result<Self, WeightBindingSelectionError> {
+        let recipe = self.source_recipe().select_bounded(catalog, selection)?;
+        let bytes = recipe.infer(catalog)?.byte_len();
+        Ok(self.with_source_recipe(recipe, bytes)?)
+    }
+}
+
+/// Failure while rewriting a binding into bounded physical selections.
+#[derive(Debug, thiserror::Error)]
+pub enum WeightBindingSelectionError {
+    /// Neutral recipe inference or selection pushdown failed.
+    #[error(transparent)]
+    Recipe(#[from] RecipeError),
+    /// The rewritten binding declaration was invalid.
+    #[error(transparent)]
+    Declaration(#[from] ResidencyDeclarationError),
 }
 
 /// A deterministic group of weight bindings managed as one atomic unit.
@@ -453,6 +475,38 @@ mod tests {
         let unit = OffloadUnit::new(id, [b, a]).unwrap();
         assert_eq!(unit.bindings()[0].name(), "a");
         assert_eq!(unit.bindings()[1].name(), "b");
+    }
+
+    #[test]
+    fn binding_selection_rewrites_sources_and_exact_bytes_neutrally() {
+        let catalog = Catalog(BTreeMap::from([(
+            "weight".into(),
+            metadata("weight", vec![2, 2]),
+        )]));
+        let binding = WeightBinding::new("weight", "weight", TensorSelection::Full, 16)
+            .unwrap()
+            .select_bounded_output(
+                &catalog,
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 2,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(binding.expected_bytes(), 8);
+        assert!(matches!(
+            binding.source_recipe(),
+            DerivedWeightRecipe::Source {
+                selection: TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 2,
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

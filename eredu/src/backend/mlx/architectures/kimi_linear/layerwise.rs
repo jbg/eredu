@@ -63,7 +63,7 @@ use crate::{
                 ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry,
                 ExpertIdentity, ExpertPass, ExpertRouteBatch,
             },
-            manager::{ResidencyReport, ResidentUnitLease, WeightBindingExt},
+            manager::{ResidencyReport, ResidentUnitLease},
         },
     },
 };

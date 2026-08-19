@@ -59,6 +59,10 @@ pub enum Error {
     #[error(transparent)]
     ResidencyDeclaration(#[from] eredu_runtime::ResidencyDeclarationError),
 
+    /// Invalid backend-neutral bounded selection for a weight binding.
+    #[error(transparent)]
+    WeightBindingSelection(#[from] eredu_runtime::WeightBindingSelectionError),
+
     /// Invalid module-to-checkpoint or resident-lease binding.
     #[error(transparent)]
     ModuleBinding(#[from] crate::backend::mlx::runtime::checkpoint::binding::ModuleBindingError),

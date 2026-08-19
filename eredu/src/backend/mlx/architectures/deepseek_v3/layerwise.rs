@@ -64,9 +64,7 @@ use crate::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{
-        ResidencyReport, ResidentUnitLease, WeightBindingExt,
-    },
+    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
 };
 
 const EMBEDDING_UNIT: &str = "deepseek_v3.static.embedding";

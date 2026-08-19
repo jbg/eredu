@@ -71,9 +71,7 @@ use crate::{
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{
-        ResidencyReport, ResidentUnitLease, WeightBindingExt,
-    },
+    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
 };
 
 const VISION_STATIC_UNIT: &str = "qwen3_vl.static.vision";

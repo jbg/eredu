@@ -27,8 +27,8 @@ use crate::{
     backend::mlx::residency::sample_allocator_memory,
     backend::mlx::runtime::checkpoint::recipe::{MlxWeightRecipeExt, WeightRecipeError},
     backend::mlx::runtime::checkpoint::store::{
-        PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore,
-        WeightStoreDiagnostics, WeightStoreError,
+        PendingWeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreDiagnostics,
+        WeightStoreError,
     },
     core::residency::{
         EvictedResidencyCopy, MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId,
@@ -40,44 +40,6 @@ use eredu_runtime::residency::{
     OffloadUnit, ResidencyController, ResidencyControllerError, WeightBinding,
 };
 
-/// MLX-only bounded-selection rewriting for a neutral weight binding.
-pub(crate) trait WeightBindingExt {
-    /// Pushes an output selection toward physical checkpoint sources.
-    fn select_bounded_output(
-        self,
-        store: &dyn WeightStore,
-        selection: TensorSelection,
-    ) -> Result<Self, ResidencyError>
-    where
-        Self: Sized;
-}
-
-impl WeightBindingExt for WeightBinding {
-    fn select_bounded_output(
-        self,
-        store: &dyn WeightStore,
-        selection: TensorSelection,
-    ) -> Result<Self, ResidencyError> {
-        let binding_name = self.name().to_owned();
-        let recipe = self.source_recipe();
-        let recipe = recipe
-            .select_bounded(store, selection)
-            .map_err(WeightRecipeError::from)
-            .map_err(|source| ResidencyError::Recipe {
-                binding: binding_name.clone(),
-                source,
-            })?;
-        let metadata = recipe
-            .infer(store)
-            .map_err(WeightRecipeError::from)
-            .map_err(|source| ResidencyError::Recipe {
-                binding: binding_name,
-                source,
-            })?;
-        Ok(self.with_source_recipe(recipe, metadata.byte_len())?)
-    }
-}
-/// A resident unit that prevents eviction of one tier until it is dropped.
 /// A resident unit that prevents eviction of one tier until it is dropped.
 pub struct ResidentUnitLease {
     id: OffloadUnitId,
@@ -320,6 +282,9 @@ pub enum ResidencyError {
     /// Backend-neutral plan and declaration validation failed.
     #[error(transparent)]
     Controller(#[from] ResidencyControllerError),
+    /// Backend-neutral binding selection rewrite failed.
+    #[error(transparent)]
+    BindingSelection(#[from] eredu_runtime::residency::WeightBindingSelectionError),
     /// An ordered layer window had no units.
     #[error("device layer window requires at least one ordered unit")]
     EmptyLayerWindow,
