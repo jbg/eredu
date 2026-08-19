@@ -2,6 +2,8 @@
 
 use std::marker::PhantomData;
 
+use eredu_runtime::CausalModel;
+
 use safemlx::{
     argmax_axis, array,
     error::Exception,
@@ -38,35 +40,6 @@ pub fn sample(
     }
 }
 
-/// Minimal interface required by the generic token generator.
-pub trait CausalLm<C> {
-    /// Computes logits for an initial typed input and fills `cache`.
-    fn prefill_input_logits(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut C,
-        stream: &Stream,
-    ) -> Result<Array, Exception>;
-
-    /// Computes logits for one or more decode tokens using an existing cache.
-    fn decode_logits(
-        &mut self,
-        input_tokens: &Array,
-        cache: &mut C,
-        stream: &Stream,
-    ) -> Result<Array, Exception>;
-
-    /// Gives implementations a chance to adjust prefill logits before sampling.
-    fn adjust_prefill_logits(
-        &mut self,
-        logits: Array,
-        _cache: &mut C,
-        _stream: &Stream,
-    ) -> Result<Array, Exception> {
-        Ok(logits)
-    }
-}
-
 /// Current state of a generic generation iterator.
 pub enum GenerateState<'a> {
     /// The iterator has not consumed the prompt yet.
@@ -84,7 +57,8 @@ pub enum GenerateState<'a> {
 /// Generic token iterator for a causal LM.
 pub struct Generate<'a, M, C, S = DefaultSampler>
 where
-    M: CausalLm<C>,
+    M: CausalModel<C, Tensor = Array, Error = Exception>,
+    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
     S: Sampler,
 {
     model: &'a mut M,
@@ -99,7 +73,8 @@ where
 
 impl<'a, M, C> Generate<'a, M, C, DefaultSampler>
 where
-    M: CausalLm<C>,
+    M: CausalModel<C, Tensor = Array, Error = Exception>,
+    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
 {
     /// Creates a generation iterator over token-id arrays using the default sampler.
     pub fn new(
@@ -116,7 +91,8 @@ where
 
 impl<'a, M, C, S> Generate<'a, M, C, S>
 where
-    M: CausalLm<C>,
+    M: CausalModel<C, Tensor = Array, Error = Exception>,
+    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
     S: Sampler,
 {
     /// Creates a generation iterator over token-id arrays using a caller-provided sampler.
@@ -149,7 +125,8 @@ where
 
 impl<M, C, S> Iterator for Generate<'_, M, C, S>
 where
-    M: CausalLm<C>,
+    M: CausalModel<C, Tensor = Array, Error = Exception>,
+    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
     S: Sampler,
 {
     type Item = Result<Array, Exception>;

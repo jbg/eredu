@@ -1,5 +1,6 @@
 //! Qwen3-VL conditional-generation model support.
 
+use eredu_runtime::CausalModel;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -36,7 +37,6 @@ use crate::{
     backend::mlx::nn::{
         self as common,
         attention::AttentionInput,
-        generation::CausalLm,
         tensor::{create_attention_mask, AttentionMask},
     },
     backend::mlx::runtime::cache::{
@@ -1214,7 +1214,11 @@ pub(crate) fn find_qwen3_vl_mmproj(gguf_file: &Path) -> Result<PathBuf, Error> {
         })
 }
 
-impl CausalLm<Cache> for Model {
+impl CausalModel<Cache> for Model {
+    type Tensor = Array;
+    type Input<'a> = runtime_input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: runtime_input::ModelInput<'_>,

@@ -1,6 +1,7 @@
 //! Nemotron-H configuration parsing, runtime blocks, and strict checkpoint loading.
 
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+use eredu_runtime::CausalModel;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -39,7 +40,6 @@ use crate::{
         self as common,
         attention::{batch_seq, finish_attention, reshape_attention_projection},
         convolution::DepthwiseConv1d,
-        generation::CausalLm,
         layers::relu2,
         linear::project_logits_maybe_quantized,
         moe::{packed_grouped_linear, weighted_route_sum, TopKRouterScoreFunction},
@@ -4031,7 +4031,11 @@ impl Module<ModelInput<'_>> for Model {
     }
 }
 
-impl CausalLm<Cache> for Model {
+impl CausalModel<Cache> for Model {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

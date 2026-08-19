@@ -9,6 +9,8 @@
 pub mod backend;
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
+/// Backend-neutral causal-model session contracts.
+pub mod generation;
 /// Neutral checkpoint materialization and stable parameter binding.
 pub mod parameter;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
@@ -21,6 +23,7 @@ pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,
     ExecutionGroupSpec, ReadyGroupState,
 };
+pub use generation::CausalModel;
 pub use parameter::{
     bind_materialized_unit, materialize_bindings, MaterializedUnit, ParameterOrchestrationError,
 };

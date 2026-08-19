@@ -1,6 +1,7 @@
 //! Shared bounded layer execution for dense and MoE Qwen3-VL models.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 use eredu_runtime::WeightBinding;
 
 use std::{
@@ -45,7 +46,6 @@ use crate::{
     backend::mlx::nn::{
         self as common,
         attention::AttentionInput,
-        generation::CausalLm,
         parallel::{
             planned_kv_head_layout, vocab_embedding_parameter_group, vocab_lm_head_parameter_group,
             VocabParallelEmbedding, VocabParallelLmHead,
@@ -422,7 +422,11 @@ impl Qwen3VlLayerwiseModel {
     }
 }
 
-impl CausalLm<Cache> for Qwen3VlLayerwiseModel {
+impl CausalModel<Cache> for Qwen3VlLayerwiseModel {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

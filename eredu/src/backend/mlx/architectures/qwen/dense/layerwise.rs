@@ -1,6 +1,7 @@
 //! Bounded layer execution for the shared dense-Qwen decoder.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
@@ -26,7 +27,6 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
         attention::AttentionInput,
-        generation::CausalLm,
         linear::{
             build_unloaded_maybe_quantized_lm_head_with_quantization,
             project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
@@ -719,7 +719,11 @@ where
     )?)
 }
 
-impl CausalLm<Vec<Option<ConcatKeyValueCache>>> for LayerwiseDecoder {
+impl CausalModel<Vec<Option<ConcatKeyValueCache>>> for LayerwiseDecoder {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,
@@ -744,7 +748,11 @@ impl CausalLm<Vec<Option<ConcatKeyValueCache>>> for LayerwiseDecoder {
     }
 }
 
-impl CausalLm<Vec<Option<PagedKeyValueCache>>> for LayerwiseDecoder {
+impl CausalModel<Vec<Option<PagedKeyValueCache>>> for LayerwiseDecoder {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

@@ -6,6 +6,7 @@
 //! fused DSpark checkpoints therefore share one validation path.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -39,10 +40,7 @@ use crate::{
         QwenLinear as Linear, QwenWeightFormat as WeightFormat,
     },
     backend::mlx::error::Error,
-    backend::mlx::nn::{
-        generation::CausalLm,
-        hyper_connections::{expand, HyperConnection, HyperHead},
-    },
+    backend::mlx::nn::hyper_connections::{expand, HyperConnection, HyperHead},
     backend::mlx::runtime::cache::residency::{
         load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
         CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
@@ -2222,7 +2220,11 @@ fn gguf_uniform_f32_array(
     Ok(first)
 }
 
-impl CausalLm<Cache> for Model {
+impl CausalModel<Cache> for Model {
+    type Tensor = Array;
+    type Input<'a> = runtime_input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: runtime_input::ModelInput<'_>,

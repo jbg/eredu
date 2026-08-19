@@ -1,6 +1,7 @@
 //! Bounded-residency execution for Kimi Linear safetensors and GGUF checkpoints.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Instant};
@@ -22,7 +23,6 @@ use crate::core::cache::{
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
-        generation::CausalLm,
         linear::{
             project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
             unloaded_maybe_quantized_linear,
@@ -639,7 +639,11 @@ impl KimiLinearLayerwiseModel {
     }
 }
 
-impl CausalLm<Cache> for KimiLinearLayerwiseModel {
+impl CausalModel<Cache> for KimiLinearLayerwiseModel {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

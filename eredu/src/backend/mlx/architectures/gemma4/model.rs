@@ -2,6 +2,7 @@
 
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_nn::RopeValue;
+use eredu_runtime::CausalModel;
 
 use std::{
     cell::RefCell,
@@ -61,7 +62,6 @@ use crate::{
         attention::{
             attention_probabilities, batch_seq, finish_attention, reshape_attention_projection,
         },
-        generation::CausalLm,
         moe::{packed_grouped_linear_with_options, top_k_softmax_routing, weighted_route_sum},
     },
     backend::mlx::runtime::cache::{
@@ -5513,10 +5513,14 @@ pub(crate) struct Gemma4StepOutput {
     pub shared_kv_states: HashMap<AttentionPolicy, (Array, Array)>,
 }
 
-impl<C> CausalLm<Vec<Option<C>>> for Model
+impl<C> CausalModel<Vec<Option<C>>> for Model
 where
     C: KeyValueCache + Default,
 {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,
@@ -5858,7 +5862,11 @@ pub(crate) fn multimodal_attention_masks(
     }
 }
 
-impl CausalLm<Cache> for Model {
+impl CausalModel<Cache> for Model {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

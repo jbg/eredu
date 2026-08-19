@@ -12,6 +12,7 @@ pub(crate) mod vision;
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
+use eredu_runtime::CausalModel;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -51,7 +52,6 @@ use crate::{
             apply_rope_and_update_cache, attention_probabilities, batch_seq, finish_attention,
             reshape_attention_projection, AttentionInput,
         },
-        generation::CausalLm,
         layers::SwiGluMlp,
         linear::project_logits_maybe_quantized,
         moe::TopKRouterScoreFunction,
@@ -2829,10 +2829,14 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-impl<C> CausalLm<Vec<Option<C>>> for Model
+impl<C> CausalModel<Vec<Option<C>>> for Model
 where
     C: KeyValueCache + Default,
 {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

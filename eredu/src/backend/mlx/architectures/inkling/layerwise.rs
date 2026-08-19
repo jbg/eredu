@@ -1,6 +1,7 @@
 //! Text-decoder bounded layer execution for Thinking Machines Lab Inkling.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
@@ -36,7 +37,6 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
         self as common,
-        generation::CausalLm,
         moe::PackedSwiGluExperts,
         parallel::{
             vocab_embedding_parameter_group, vocab_lm_head_parameter_group, VocabParallelEmbedding,
@@ -849,7 +849,11 @@ impl InklingLayerwiseModel {
     }
 }
 
-impl CausalLm<Cache> for InklingLayerwiseModel {
+impl CausalModel<Cache> for InklingLayerwiseModel {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

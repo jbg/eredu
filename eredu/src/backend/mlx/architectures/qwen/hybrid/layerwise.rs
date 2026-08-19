@@ -1,6 +1,7 @@
 //! Shared bounded layer execution for Qwen3-Next and Qwen3.5 text models.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
@@ -41,7 +42,6 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
         self as common,
-        generation::CausalLm,
         linear::project_logits_maybe_quantized,
         parallel::{VocabParallelEmbedding, VocabParallelLmHead},
         tensor::{create_attention_mask, AttentionMask},
@@ -1020,7 +1020,11 @@ impl QwenHybridLayerwiseModel {
     }
 }
 
-impl CausalLm<Cache> for QwenHybridLayerwiseModel {
+impl CausalModel<Cache> for QwenHybridLayerwiseModel {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

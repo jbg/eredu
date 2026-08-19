@@ -1,6 +1,7 @@
 //! Kimi Linear hybrid KDA/MLA causal language model.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -37,7 +38,6 @@ use crate::{
     backend::mlx::nn::{
         convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
         gated_delta::gated_delta_scan,
-        generation::CausalLm,
         layers::{silu, SwiGluMlp},
         linear::{
             project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
@@ -2545,7 +2545,11 @@ impl Module<ModelInput<'_>> for Model {
     fn training_mode(&mut self, _mode: bool) {}
 }
 
-impl CausalLm<Cache> for Model {
+impl CausalModel<Cache> for Model {
+    type Tensor = Array;
+    type Input<'a> = runtime_input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: runtime_input::ModelInput<'_>,

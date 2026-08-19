@@ -2,6 +2,7 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
+use eredu_runtime::CausalModel;
 
 use std::{collections::HashMap, path::Path};
 
@@ -32,7 +33,6 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
         self as common,
-        generation::CausalLm,
         tensor::{
             create_causal_mask,
             rope::{initialize_rope, validate_rope_scaling_config, RopeVariant},
@@ -1578,7 +1578,11 @@ impl Model {
     }
 }
 
-impl CausalLm<Cache> for Model {
+impl CausalModel<Cache> for Model {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

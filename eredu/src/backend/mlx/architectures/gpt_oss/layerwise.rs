@@ -1,6 +1,7 @@
 //! Unified fully resident and bounded layer execution for GPT-OSS.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
@@ -33,7 +34,7 @@ use crate::{
         gqa_projection_members, planned_kv_head_layout, GqaProjectionNames, VocabParallelEmbedding,
         VocabParallelLmHead,
     },
-    backend::mlx::nn::{self as common, generation::CausalLm},
+    backend::mlx::nn::{self as common},
     backend::mlx::runtime::cache::residency::{
         open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
     },
@@ -382,7 +383,11 @@ impl GptOssLayerwiseModel {
     }
 }
 
-impl CausalLm<Cache> for GptOssLayerwiseModel {
+impl CausalModel<Cache> for GptOssLayerwiseModel {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

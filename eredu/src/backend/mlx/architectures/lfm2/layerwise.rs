@@ -1,6 +1,7 @@
 //! Unified fully resident and bounded layer execution for LFM2/LFM2.5.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
@@ -32,7 +33,6 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
         self as common,
-        generation::CausalLm,
         linear::project_logits_maybe_quantized,
         moe::PackedSwiGluExperts,
         parallel::{
@@ -531,7 +531,11 @@ impl Lfm2LayerwiseModel {
     }
 }
 
-impl CausalLm<Cache> for Lfm2LayerwiseModel {
+impl CausalModel<Cache> for Lfm2LayerwiseModel {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

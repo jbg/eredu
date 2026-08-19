@@ -1,6 +1,7 @@
 //! Unified Llama/Mistral loading across weight-residency policies.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 use eredu_runtime::WeightBinding;
 
 use std::{
@@ -28,10 +29,7 @@ use crate::core::cache::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::{
-        generation::CausalLm,
-        shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxRmsNorm},
-    },
+    backend::mlx::nn::shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxRmsNorm},
     backend::mlx::nn::{
         parallel::{
             planned_kv_head_layout, register_gqa_projection_group,
@@ -415,7 +413,11 @@ impl LlamaModel {
     }
 }
 
-impl CausalLm<LlamaCache> for LlamaModel {
+impl CausalModel<LlamaCache> for LlamaModel {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

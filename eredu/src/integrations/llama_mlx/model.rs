@@ -1,6 +1,7 @@
 //! MLX configuration, checkpoint integration, and resident binding for shared Llama.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 
 use std::{collections::HashMap, path::Path};
 
@@ -17,7 +18,6 @@ use eredu_architectures::llama::ModelArgs;
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::generation::CausalLm,
     backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
     backend::mlx::runtime::media::input,
@@ -324,10 +324,14 @@ pub(crate) fn model_args_from_gguf_catalog(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
-impl<C> CausalLm<Vec<Option<C>>> for ResidentModel
+impl<C> CausalModel<Vec<Option<C>>> for ResidentModel
 where
     C: KeyValueCache + eredu_nn::AttentionCache<Array>,
 {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

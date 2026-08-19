@@ -1,9 +1,9 @@
 //! Dense and MoE Qwen3.5 text and vision-language implementation and loader.
 
-#[cfg(test)]
 use eredu_checkpoint::AffineQuantization;
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
+use eredu_runtime::CausalModel;
 
 use safemlx::{
     builder::Builder,
@@ -59,7 +59,7 @@ use crate::{
         AttentionMask,
     },
     backend::mlx::nn::{
-        self as common, attention::attention_probabilities, generation::CausalLm, layers::silu,
+        self as common, attention::attention_probabilities, layers::silu,
         linear::project_logits_maybe_quantized, moe::TopKRouterScoreFunction,
     },
     backend::mlx::runtime::cache::{
@@ -7031,7 +7031,11 @@ fn video_embedding_chunks(
     Ok(chunks)
 }
 
-impl CausalLm<Cache> for Model {
+impl CausalModel<Cache> for Model {
+    type Tensor = Array;
+    type Input<'a> = runtime_input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: runtime_input::ModelInput<'_>,

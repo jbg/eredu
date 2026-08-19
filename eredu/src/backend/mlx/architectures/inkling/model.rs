@@ -7,6 +7,7 @@
 #![allow(missing_docs)]
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::CausalModel;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -42,7 +43,6 @@ use crate::{
     backend::mlx::nn::{
         self as common,
         convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
-        generation::CausalLm,
         layers::SwiGluMlp,
         moe::PackedSwiGluExperts,
     },
@@ -3588,7 +3588,11 @@ impl Model {
     }
 }
 
-impl CausalLm<Cache> for Model {
+impl CausalModel<Cache> for Model {
+    type Tensor = Array;
+    type Input<'a> = input::ModelInput<'a>;
+    type Error = Exception;
+
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,

@@ -4,7 +4,9 @@ use eredu_core::{
     BackendSession, Completion, ModelRuntime, Submission, TextGenerationBackend,
     TextGenerationConfig, TokenFilter, TokenOutput,
 };
+use eredu_runtime::CausalModel;
 use safemlx::{
+    error::Exception,
     ops::indexing::{NewAxis, TryIndexOp},
     random::RandomState,
     Array, Stream,
@@ -19,7 +21,6 @@ use crate::{
         expert::ExpertParallelCache,
         pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
     },
-    backend::mlx::nn::generation::CausalLm,
     backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     backend::mlx::runtime::media::input,
@@ -1044,7 +1045,8 @@ fn prefill_pair<M, C>(
     stream: &Stream,
 ) -> Result<Array, Error>
 where
-    M: CausalLm<C>,
+    M: CausalModel<C, Tensor = Array, Error = Exception>,
+    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
 {
     let logits = model.prefill_input_logits(input, cache, stream)?;
     model
@@ -1059,7 +1061,8 @@ fn decode_pair<M, C>(
     stream: &Stream,
 ) -> Result<Array, Error>
 where
-    M: CausalLm<C>,
+    M: CausalModel<C, Tensor = Array, Error = Exception>,
+    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
 {
     model
         .decode_logits(input, cache, stream)

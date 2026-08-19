@@ -7,9 +7,7 @@
 use std::marker::PhantomData;
 
 use eredu_core::{
-    cache::{
-        LayerCachePolicy, PromptCacheError, PromptCacheModelIdentity, PromptCacheTopology,
-    },
+    cache::{LayerCachePolicy, PromptCacheError, PromptCacheModelIdentity, PromptCacheTopology},
     LayerSchedule,
 };
 use eredu_nn::NeuralBackend;
@@ -27,10 +25,12 @@ impl StateLayout {
             return Err(StateError::EmptyLayout);
         }
         for (layer, policy) in layers.iter().enumerate() {
-            policy.validate().map_err(|error| StateError::InvalidLayer {
-                layer,
-                reason: error.to_string(),
-            })?;
+            policy
+                .validate()
+                .map_err(|error| StateError::InvalidLayer {
+                    layer,
+                    reason: error.to_string(),
+                })?;
         }
         Ok(Self { layers })
     }
