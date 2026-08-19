@@ -5,26 +5,15 @@
 //! window. The current layer's completion orders its compute stream while the
 //! next layer may continue transferring independently.
 
-use std::{
-    panic::{catch_unwind, AssertUnwindSafe},
-    sync::{mpsc, Arc, Condvar, Mutex},
-    thread::{self, JoinHandle},
-    time::Instant,
-};
+use std::sync::Arc;
 
 use crate::{
     backend::mlx::runtime::residency::manager::{ResidencyManager, ResidentUnitLease},
     core::residency::{
-        BackgroundPrefetchReport, MemoryTier, OffloadUnitId, PrefetchAdmission,
-        PrefetchDemandResolution, PrefetchExecutionState,
+        BackgroundPrefetchReport, MemoryTier, OffloadUnitId, PrefetchDemandResolution,
     },
 };
-
-#[derive(Debug)]
-enum WorkerMessage {
-    WorkAvailable,
-    Shutdown,
-}
+use eredu_runtime::BackgroundPrefetchWorker;
 
 type HostPrefetchOperation =
     Arc<dyn Fn(&OffloadUnitId) -> Result<(), String> + Send + Sync + 'static>;
@@ -32,9 +21,7 @@ type HostPrefetchOperation =
 /// One bounded, deterministically joined disk-to-host worker.
 pub(crate) struct BackgroundLayerPrefetch {
     manager: ResidencyManager,
-    sender: mpsc::Sender<WorkerMessage>,
-    shared: Arc<(Mutex<PrefetchExecutionState<String>>, Condvar)>,
-    worker: Option<JoinHandle<()>>,
+    worker: BackgroundPrefetchWorker,
 }
 
 impl BackgroundLayerPrefetch {
@@ -57,210 +44,55 @@ impl BackgroundLayerPrefetch {
         capacity: usize,
         operation: HostPrefetchOperation,
     ) -> Result<Self, DenseStreamError> {
-        if capacity == 0 {
-            return Err(DenseStreamError::ZeroWorkerCapacity);
-        }
-        let (sender, receiver) = mpsc::channel();
-        let shared = Arc::new((
-            Mutex::new(PrefetchExecutionState::new(capacity)?),
-            Condvar::new(),
-        ));
-        let worker_shared = Arc::clone(&shared);
-        let worker = thread::Builder::new()
-            .name("safemlx-dense-layer-prefetch".into())
-            .spawn(move || worker_loop(operation, receiver, worker_shared))?;
-        Ok(Self {
-            manager,
-            sender,
-            shared,
-            worker: Some(worker),
-        })
+        let worker =
+            BackgroundPrefetchWorker::new(capacity, "safemlx-dense-layer-prefetch", move |id| {
+                operation(id)
+            })?;
+        Ok(Self { manager, worker })
     }
 
     pub(crate) fn submit(&self, id: &OffloadUnitId) -> Result<(), DenseStreamError> {
-        let started = Instant::now();
-        let mut backpressured = false;
-        loop {
-            let resident = self.manager.is_resident(id, MemoryTier::Host)?;
-            let mut state = self
-                .shared
-                .0
-                .lock()
-                .map_err(|_| DenseStreamError::StatePoisoned)?;
-            match state.admit(id.clone(), resident) {
-                PrefetchAdmission::Coalesced => {
-                    if backpressured {
-                        state.record_backpressure(started.elapsed());
-                    }
-                    return Ok(());
-                }
-                PrefetchAdmission::AtCapacity => {
-                    backpressured = true;
-                    drop(
-                        self.shared
-                            .1
-                            .wait(state)
-                            .map_err(|_| DenseStreamError::StatePoisoned)?,
-                    );
-                }
-                PrefetchAdmission::Admitted(work) => {
-                    if backpressured {
-                        state.record_backpressure(started.elapsed());
-                    }
-                    if self.sender.send(WorkerMessage::WorkAvailable).is_ok() {
-                        return Ok(());
-                    }
-                    state.rollback_admission(&work)?;
-                    self.shared.1.notify_all();
-                    return Err(DenseStreamError::WorkerDisconnected);
-                }
-            }
-        }
+        let resident = self.manager.is_resident(id, MemoryTier::Host)?;
+        Ok(self.worker.submit(id, resident)?)
     }
 
     pub(crate) fn acquire(
         &self,
         id: &OffloadUnitId,
     ) -> Result<ResidentUnitLease, DenseStreamError> {
-        let started = Instant::now();
-        let mut state = self
-            .shared
-            .0
-            .lock()
-            .map_err(|_| DenseStreamError::StatePoisoned)?;
-        let waited = state.observe_demand(id).is_pending();
-        while state.is_pending(id) {
-            state = self
-                .shared
-                .1
-                .wait(state)
-                .map_err(|_| DenseStreamError::StatePoisoned)?;
-        }
-        let resolution = state.resolve_demand(id, waited.then(|| started.elapsed()))?;
+        let resolution = self.worker.wait(id)?;
         if let PrefetchDemandResolution::Failed(message) = resolution {
             return Err(DenseStreamError::PrefetchFailed {
                 id: id.clone(),
                 message,
             });
         }
-        drop(state);
         Ok(self.manager.acquire(id, MemoryTier::Host)?)
     }
 
     pub(crate) fn cancel(&self) -> Result<(), DenseStreamError> {
-        let mut state = self
-            .shared
-            .0
-            .lock()
-            .map_err(|_| DenseStreamError::StatePoisoned)?;
-        state.cancel_all()?;
-        self.shared.1.notify_all();
-        while !state.is_idle() {
-            state = self
-                .shared
-                .1
-                .wait(state)
-                .map_err(|_| DenseStreamError::StatePoisoned)?;
-        }
-        let failure = state.finish_cancellation()?;
-        self.shared.1.notify_all();
-        match failure {
-            Some((id, message)) => Err(DenseStreamError::PrefetchFailed { id, message }),
-            None => Ok(()),
-        }
+        Ok(self.worker.cancel()?)
     }
 
     pub(crate) fn report(&self) -> Result<BackgroundPrefetchReport, DenseStreamError> {
-        Ok(self
-            .shared
-            .0
-            .lock()
-            .map_err(|_| DenseStreamError::StatePoisoned)?
-            .report())
+        Ok(self.worker.report()?)
     }
 
     #[cfg(test)]
     fn wait_idle(&self) -> Result<(), DenseStreamError> {
-        let mut state = self
-            .shared
-            .0
-            .lock()
-            .map_err(|_| DenseStreamError::StatePoisoned)?;
-        while !state.is_idle() {
-            state = self
-                .shared
-                .1
-                .wait(state)
-                .map_err(|_| DenseStreamError::StatePoisoned)?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for BackgroundLayerPrefetch {
-    fn drop(&mut self) {
-        let _ = self.cancel();
-        let _ = self.sender.send(WorkerMessage::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-fn worker_loop(
-    operation: HostPrefetchOperation,
-    receiver: mpsc::Receiver<WorkerMessage>,
-    shared: Arc<(Mutex<PrefetchExecutionState<String>>, Condvar)>,
-) {
-    while let Ok(message) = receiver.recv() {
-        let WorkerMessage::WorkAvailable = message else {
-            break;
-        };
-        let work = {
-            let Ok(mut state) = shared.0.lock() else {
-                break;
-            };
-            let work = state.begin_next();
-            shared.1.notify_all();
-            work
-        };
-        let Some(work) = work else {
-            continue;
-        };
-        let result = catch_unwind(AssertUnwindSafe(|| operation(work.id())))
-            .map_err(|payload| {
-                payload
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "background materialization panicked".to_string())
-            })
-            .and_then(|result| result);
-        let Ok(mut state) = shared.0.lock() else {
-            break;
-        };
-        state
-            .complete(work, result)
-            .expect("worker completion matches core-owned admitted work");
-        shared.1.notify_all();
+        Ok(self.worker.wait_idle()?)
     }
 }
 
 /// Structured validation and worker failures for dense disk streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum DenseStreamError {
-    /// A physical background worker was constructed without queue capacity.
-    #[error("dense disk streaming worker capacity must be nonzero")]
-    ZeroWorkerCapacity,
-    /// Shared worker state was poisoned.
-    #[error("dense disk streaming worker state is poisoned")]
+    /// Shared dense-stream telemetry state was poisoned.
+    #[error("dense streaming state is poisoned")]
     StatePoisoned,
     /// Forward telemetry lifecycle calls were inconsistent.
     #[error("invalid dense streaming forward telemetry state: {0}")]
     InvalidForwardTelemetry(&'static str),
-    /// The worker ended before accepting or completing required work.
-    #[error("dense disk streaming worker disconnected")]
-    WorkerDisconnected,
     /// A worker-side materialization failed and was observed by demand.
     #[error("background materialization of {id} failed: {message}")]
     PrefetchFailed {
@@ -272,12 +104,9 @@ pub enum DenseStreamError {
     /// A residency transition failed.
     #[error(transparent)]
     Residency(#[from] crate::backend::mlx::runtime::residency::manager::ResidencyError),
-    /// Backend-neutral prefetch lifecycle misuse.
+    /// Backend-neutral background-prefetch execution failed.
     #[error(transparent)]
-    PrefetchState(#[from] crate::core::residency::PrefetchStateError),
-    /// Worker creation failed.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    PrefetchWorker(#[from] eredu_runtime::BackgroundPrefetchWorkerError),
 }
 
 #[cfg(test)]
@@ -292,6 +121,10 @@ mod tests {
         host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy, Stream,
     };
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use std::{
+        sync::{mpsc, Condvar, Mutex},
+        thread,
+    };
 
     #[derive(Default)]
     struct OperationGate {
@@ -504,41 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_skips_queued_and_active_generations() {
-        let (_directory, manager, ids) = i32_manager(2, 16);
-        let gate = Arc::new(OperationGate::default());
-        let prefetch = Arc::new(
-            BackgroundLayerPrefetch::new_with_operation(
-                manager.clone(),
-                1,
-                blocking_operation(manager, Arc::clone(&gate)),
-            )
-            .unwrap(),
-        );
-        prefetch.submit(&ids[0]).unwrap();
-        gate.wait_for_starts(1);
-        prefetch.submit(&ids[1]).unwrap();
-
-        let shared = Arc::clone(&prefetch.shared);
-        let cancelling = Arc::clone(&prefetch);
-        let (cancelled_tx, cancelled_rx) = mpsc::channel();
-        thread::spawn(move || cancelled_tx.send(cancelling.cancel()).unwrap());
-        let mut state = shared.0.lock().unwrap();
-        while state.generation() == 0 {
-            state = shared.1.wait(state).unwrap();
-        }
-        drop(state);
-        gate.release();
-        cancelled_rx.recv().unwrap().unwrap();
-
-        let report = prefetch.report().unwrap();
-        assert_eq!(report.started(), 1);
-        assert_eq!(report.completed(), 0);
-        assert_eq!(report.cancelled(), 2);
-        assert_eq!(report.failed(), 0);
-    }
-
-    #[test]
     fn worker_errors_and_panics_reach_demand_and_release_reservations() {
         let unsupported = vec![("unsupported".to_string(), Dtype::F8_E5M2, vec![0x3c, 0x40])];
         let (_directory, manager, ids) = test_manager(unsupported, 2);
@@ -583,43 +381,5 @@ mod tests {
         prefetch.submit(&ids[0]).unwrap();
         prefetch.wait_idle().unwrap();
         assert_eq!(prefetch.report().unwrap().evicted_before_use(), 1);
-    }
-
-    #[test]
-    fn disconnected_submission_rolls_back_and_drop_joins_worker() {
-        let (_directory, manager, ids) = i32_manager(1, 8);
-        let mut disconnected = BackgroundLayerPrefetch::new(manager, 1).unwrap();
-        disconnected.sender.send(WorkerMessage::Shutdown).unwrap();
-        disconnected.worker.take().unwrap().join().unwrap();
-        assert!(matches!(
-            disconnected.submit(&ids[0]),
-            Err(DenseStreamError::WorkerDisconnected)
-        ));
-        assert_eq!(disconnected.report().unwrap().submitted(), 0);
-        disconnected.cancel().unwrap();
-
-        let (_directory, manager, ids) = i32_manager(1, 8);
-        let gate = Arc::new(OperationGate::default());
-        let prefetch = BackgroundLayerPrefetch::new_with_operation(
-            manager.clone(),
-            1,
-            blocking_operation(manager, Arc::clone(&gate)),
-        )
-        .unwrap();
-        prefetch.submit(&ids[0]).unwrap();
-        gate.wait_for_starts(1);
-        let shared = Arc::clone(&prefetch.shared);
-        let (finished_tx, finished_rx) = mpsc::channel();
-        thread::spawn(move || {
-            drop(prefetch);
-            finished_tx.send(()).unwrap();
-        });
-        let mut state = shared.0.lock().unwrap();
-        while state.generation() == 0 {
-            state = shared.1.wait(state).unwrap();
-        }
-        drop(state);
-        gate.release();
-        finished_rx.recv().unwrap();
     }
 }

@@ -302,6 +302,44 @@ fn execution_group_orchestration_is_runtime_owned() {
 }
 
 #[test]
+fn weight_prefetch_execution_is_runtime_owned() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let runtime = std::fs::read_to_string(workspace.join("eredu-runtime/src/prefetch.rs"))
+        .expect("runtime background prefetch worker must be readable");
+    assert!(runtime.contains("pub struct BackgroundPrefetchWorker"));
+    for behavior in [
+        "catch_unwind",
+        "record_backpressure",
+        "cancel_all",
+        "worker.join",
+    ] {
+        assert!(
+            runtime.contains(behavior),
+            "runtime prefetch worker does not own {behavior}"
+        );
+    }
+
+    let mlx = std::fs::read_to_string(
+        workspace.join("eredu/src/backend/mlx/runtime/residency/dense_stream.rs"),
+    )
+    .expect("MLX dense-stream realization must be readable");
+    for runtime_owned in [
+        "enum WorkerMessage",
+        "fn worker_loop",
+        "PrefetchExecutionState",
+        "catch_unwind",
+        "JoinHandle",
+    ] {
+        assert!(
+            !mlx.contains(runtime_owned),
+            "MLX dense-stream realization retained worker algorithm {runtime_owned}"
+        );
+    }
+}
+
+#[test]
 fn llama_hot_path_remains_statically_dispatched_and_device_native() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

@@ -19,6 +19,8 @@ pub mod layered;
 pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.
 pub mod parameter;
+/// Backend-neutral bounded background weight-prefetch execution.
+pub mod prefetch;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
 pub mod residency;
 /// Architecture-declared mutable state and concrete runtime realizations.
@@ -65,6 +67,7 @@ pub use parallel::{
 pub use parameter::{
     bind_materialized_unit, materialize_bindings, MaterializedUnit, ParameterOrchestrationError,
 };
+pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, ResidencyController, ResidencyControllerError,
     ResidencyDeclarationError, ResidencyReport, ResidencyWindowError, ResidencyWindowManager,
